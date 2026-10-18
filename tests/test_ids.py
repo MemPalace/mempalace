@@ -14,7 +14,6 @@ import hashlib
 
 from mempalace import ids
 
-
 # ── ID_RECIPE constant ─────────────────────────────────────────────────
 
 

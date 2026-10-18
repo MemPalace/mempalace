@@ -29,12 +29,15 @@ import re
 import stat
 from pathlib import Path
 
+from mempalace import paths
+from mempalace.fsio import decode_source
+
 HOME = Path.home()
 LUMI_DIR = Path(os.environ.get("MEMPALACE_SOURCE_DIR", str(HOME / "Desktop/transcripts")))
 
 # People we know about (for name detection in content)
 # Loaded from ~/.mempalace/known_names.json if it exists; no built-in fallback names.
-_KNOWN_NAMES_PATH = HOME / ".mempalace" / "known_names.json"
+_KNOWN_NAMES_PATH = paths.state_path("known_names.json")
 _KNOWN_NAMES_CACHE = None
 
 
@@ -177,18 +180,10 @@ def extract_subject(lines):
 
 
 def _read_lines(path: Path) -> list[str]:
-    """Lines of ``path`` with their endings, never through ``errors='replace'``.
-
-    UTF-8 when it decodes, otherwise cp1252, then latin-1, which maps every
-    byte, so no byte turns into U+FFFD.
-    """
-    raw = path.read_bytes()
-    for codec in ("utf-8", "cp1252"):
-        try:
-            return raw.decode(codec).splitlines(keepends=True)
-        except UnicodeDecodeError:
-            pass
-    return raw.decode("latin-1").splitlines(keepends=True)
+    """Lines of ``path`` with their endings, decoded by ``fsio.decode_source``
+    so no byte turns into U+FFFD. Parts are written as UTF-8 with
+    ``surrogateescape``, which puts a stray byte back as it was."""
+    return decode_source(path.read_bytes())[0].splitlines(keepends=True)
 
 
 def _session_segments(lines: list[str], boundaries: list[int]) -> list[tuple[list[str], bool, int]]:
@@ -301,7 +296,7 @@ def split_file(filepath, output_dir, dry_run=False):
 
     for position, (chunk, is_preamble, index) in enumerate(segments, 1):
         name = _output_name(path, chunk, is_preamble, index)
-        data = "".join(chunk).encode("utf-8")
+        data = "".join(chunk).encode("utf-8", "surrogateescape")
         out_path, new = _write_chunk(out_dir, name, data, reserved, dry_run)
         if dry_run:
             print(f"  [{position}/{len(segments)}] {out_path.name}  ({len(chunk)} lines)")

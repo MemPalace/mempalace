@@ -11,7 +11,6 @@ from mempalace.backends.embedding_wrapper import (
     EmbeddingCollection,
 )
 
-
 CREATED = "2020-01-01T00:00:00"
 MODIFIED = "2020-02-01T00:00:00"
 
@@ -209,6 +208,7 @@ def test_add_drawer_stores_matching_creation_and_modification_time(
 
 def test_update_drawer_stamps_last_modified_and_preserves_filed_at(
     monkeypatch,
+    tmp_path,
 ):
     collection = MagicMock()
 
@@ -240,6 +240,7 @@ def test_update_drawer_stamps_last_modified_and_preserves_filed_at(
         "_config",
         SimpleNamespace(
             chunk_size=800,
+            palace_path=str(tmp_path),
         ),
     )
 

@@ -265,11 +265,15 @@ def _apply_candidate_strategy(
     source_file: str = None,
     since_dt=None,
     before_dt=None,
+    stats: dict = None,
+    known_distances: dict = None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
     Strategy validity is assumed (``_validate_candidate_strategy`` runs
-    earlier); ``"vector"`` is a no-op.
+    earlier); ``"vector"`` is a no-op. ``stats`` collects what the merger
+    dropped or could not do, for the response envelope. ``known_distances``
+    maps stored ids the vector path already measured to their distance.
     """
     merger = _CANDIDATE_MERGERS[strategy]
     if merger is not None:
@@ -284,6 +288,8 @@ def _apply_candidate_strategy(
             source_file=source_file,
             since_dt=since_dt,
             before_dt=before_dt,
+            stats=stats,
+            known_distances=known_distances,
         )
 
 
@@ -301,6 +307,8 @@ def _finalize_candidate_hits(
     stop_words: frozenset = frozenset(),
     since_dt=None,
     before_dt=None,
+    stats: dict = None,
+    known_distances: dict = None,
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -315,6 +323,8 @@ def _finalize_candidate_hits(
             source_file=source_file,
             since_dt=since_dt,
             before_dt=before_dt,
+            stats=stats,
+            known_distances=known_distances,
         )
     except UnsupportedCapabilityError:
         return [], _search_error_result(
@@ -387,13 +397,18 @@ def _search_result_envelope(
     candidates_fetched: int,
     pool_size: int,
     date_window_active: bool,
+    stats: dict = None,
+    distance_metric: str = None,
 ) -> dict:
     """Assemble the ``search_memories`` response dict.
 
     When a date window is active and the widened candidate pool came back
     full, drawers beyond the pool never got a chance to match the window —
     ``date_filter_pool_truncated`` flags it so a thin result under a date
-    filter is never mistaken for "that's all there was".
+    filter is never mistaken for "that's all there was". ``stats`` adds what
+    a filter dropped (``filtered_by_max_distance``) or a candidate source
+    that failed (``candidate_strategy_fallback``). ``distance_metric`` names
+    the scale each hit's raw ``distance`` is on.
     """
     result = {
         "query": query,
@@ -407,8 +422,12 @@ def _search_result_envelope(
         "total_before_filter": candidates_fetched,
         "results": hits,
     }
+    if distance_metric:
+        result["distance_metric"] = distance_metric
     if date_window_active and candidates_fetched >= pool_size:
         result["date_filter_pool_truncated"] = True
+    if stats:
+        result.update(stats)
     return result
 
 
@@ -463,20 +482,34 @@ def _window_and_fallback_gate(
     return since_dt, before_dt, active, None
 
 
-def _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt) -> bool:
-    """True when a drawer candidate fails the distance or date-window gate.
+def _has_distance_cutoff(max_distance) -> bool:
+    """``None``, ``0`` or a negative ``max_distance`` means no cutoff."""
+    return max_distance is not None and max_distance > 0.0
 
-    Distance is checked on the raw value before rounding to avoid precision
-    loss (pre-existing behavior); the date window applies whenever a bound
-    is set, with the shared ``[since, before)`` semantics.
+
+def _beyond_max_distance(dist, max_distance, metric) -> bool:
+    """True when ``dist`` is past a ``max_distance`` cutoff given on the cosine scale.
+
+    Compared on the raw value before rounding.
     """
-    if max_distance > 0.0 and dist > max_distance:
-        return True
+    return _has_distance_cutoff(max_distance) and (
+        _cosine_scale_distance(dist, metric) > max_distance
+    )
+
+
+def _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt, metric="cosine"):
+    """Which gate a drawer candidate fails: ``"distance"``, ``"window"``, or ``None``.
+
+    The date window applies whenever a bound is set, with the shared
+    ``[since, before)`` semantics.
+    """
+    if _beyond_max_distance(dist, max_distance, metric):
+        return "distance"
     if (since_dt is not None or before_dt is not None) and not filed_at_in_window(
         meta.get("filed_at"), since_dt, before_dt
     ):
-        return True
-    return False
+        return "window"
+    return None
 
 
 def _vector_disabled_with_window(

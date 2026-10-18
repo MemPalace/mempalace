@@ -30,7 +30,8 @@ def _collection_has_rows(collection, palace_path, collection_name) -> Optional[b
     wake-up that reads ten drawers. Other backends, and a Chroma database the
     read cannot reach, fall back to ``count()``.
     """
-    from ..backends.chroma import ChromaCollection, _sqlite_collection_has_rows
+    from ..backends.chroma import ChromaCollection
+    from ..backends.chroma_sqlite import _sqlite_collection_has_rows
 
     inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
     if isinstance(inner, ChromaCollection):
@@ -38,8 +39,8 @@ def _collection_has_rows(collection, palace_path, collection_name) -> Optional[b
         if has_rows is not None:
             return has_rows
     # Preflight HNSW divergence before touching count(): count() on a diverged
-    # segment can raise chromadb's rust-level PanicException or hard-segfault
-    # (#1222), which no try/except can catch. This bookkeeping-only check
+    # segment can raise chromadb's rust-level PanicException or hard-segfault,
+    # which no try/except can catch. This bookkeeping-only check
     # skips itself on a diverged palace instead.
     try:
         from ..backends.chroma import hnsw_capacity_status
@@ -216,18 +217,27 @@ def _enforce_embedder_identity(
 # store. Mirrored independently in repair.py as ``CLOSETS_COLLECTION_NAME``.
 CLOSETS_COLLECTION_NAME = "mempalace_closets"
 ASSETS_COLLECTION_NAME = "mempalace_assets"
+# Lossy AAAK summaries written by ``mempalace compress``. They used to share
+# the closets collection, where they boosted search like real closet pointers.
+AAAK_COLLECTION_NAME = "mempalace_aaak"
 
 
 def _allowed_wrapper_collection_names() -> List[str]:
     """The collection names the ``get_collection`` wrapper routes through.
 
-    The configured drawers collection, closets collection, and fixed media
-    assets collection are first-class to MemPalace. Every other name points at a store the search/CLI/MCP
-    layer never reads — the exact silent-miss failure of issue ``#2347``.
+    The configured drawers collection, closets collection, fixed media assets
+    collection and AAAK summary collection are first-class to MemPalace. Every
+    other name points at a store the search/CLI/MCP layer never reads — the
+    silent-miss failure this guards against.
     """
     from ..config import get_configured_collection_name
 
-    allowed = [get_configured_collection_name(), CLOSETS_COLLECTION_NAME, ASSETS_COLLECTION_NAME]
+    allowed = [
+        get_configured_collection_name(),
+        CLOSETS_COLLECTION_NAME,
+        ASSETS_COLLECTION_NAME,
+        AAAK_COLLECTION_NAME,
+    ]
     seen: set[str] = set()
     out: list[str] = []
     for name in allowed:
@@ -272,8 +282,8 @@ class CollectionNameMismatchError(ValueError):
             f"names — the drawers collection name (default "
             f"'mempalace_drawers', overridable in config; expose it with "
             f"``get_configured_collection_name()``), the closets collection "
-            f"``get_closets_collection()``, or the fixed ``mempalace_assets`` "
-            f"collection — not an ad-hoc string."
+            f"``get_closets_collection()``, the fixed ``mempalace_assets`` "
+            f"collection, or ``get_aaak_collection()`` — not an ad-hoc string."
         )
 
 
@@ -306,7 +316,7 @@ def get_collection(
     upserted through it stays invisible to search/CLI/MCP. ``get_collection``
     therefore raises :class:`CollectionNameMismatchError` (a ``ValueError``)
     naming both the offending and allowed strings, instead of silently creating
-    that orphan collection (issue ``#2347``). Passing ``collection_name=None``
+    that orphan collection. Passing ``collection_name=None``
     resolves to the configured drawers name and always succeeds.
 
     ``read_only=True`` asks local backends to open storage without schema
@@ -511,6 +521,27 @@ def get_closets_collection(
     return get_collection(
         palace_path,
         collection_name="mempalace_closets",
+        create=create,
+        backend=backend,
+        **({"read_only": True} if read_only else {}),
+    )
+
+
+def get_aaak_collection(
+    palace_path: str,
+    create: bool = True,
+    backend: Optional[str] = None,
+    *,
+    read_only: bool = False,
+):
+    """Get the AAAK collection — lossy ``mempalace compress`` summaries.
+
+    Rows are keyed by the drawer id they summarize and carry ``kind="aaak"``.
+    Search never reads them; closets hold only closet pointers.
+    """
+    return get_collection(
+        palace_path,
+        collection_name=AAAK_COLLECTION_NAME,
         create=create,
         backend=backend,
         **({"read_only": True} if read_only else {}),

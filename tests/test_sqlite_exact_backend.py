@@ -7,7 +7,6 @@ import sys
 import threading
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite, make_minimal_sqlite_exact_sqlite
 
 import mempalace.backends.sqlite_exact as sqlite_exact_module
@@ -930,7 +929,7 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
 def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeypatch):
     import mempalace.backends.embedding_wrapper as embedding_wrapper
     from mempalace.backends.sqlite_exact import SQLiteExactCollection
-    from mempalace.palace import get_collection, get_closets_collection
+    from mempalace.palace import get_closets_collection, get_collection
     from mempalace.searcher import search_memories
 
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
@@ -1376,6 +1375,7 @@ def test_sqlite_exact_equality_where_uses_locus_column(tmp_path):
 
 def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     import numpy as np
+
     from mempalace.backends.sqlite_exact import (
         _LOCUS_FIELDS,
         _LOCUS_INDEX,
@@ -1497,8 +1497,8 @@ def test_top_k_preserves_stable_cutoff_ties(tmp_path, k):
 def test_search_open_works_while_other_process_holds_writer_lease(
     tmp_path, monkeypatch, backend_name
 ):
-    from mempalace.searcher import _open_search_collection
     from mempalace.palace import _open_collection_or_explain
+    from mempalace.searcher import _open_search_collection
 
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
     backend, col = _collection(tmp_path)
@@ -1576,8 +1576,9 @@ b.close()
 def test_legacy_schema_search_is_read_only(tmp_path, monkeypatch, backend_name, dimension_column):
     import json
     import struct
-    from mempalace.searcher import _open_search_collection
+
     from mempalace.palace import get_backend
+    from mempalace.searcher import _open_search_collection
 
     db_path = tmp_path / "sqlite_exact.sqlite3"
     with sqlite3.connect(db_path) as conn:
@@ -1633,9 +1634,9 @@ with mine_palace_lock(sys.argv[1]):
 
 @pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
 def test_hybrid_search_keeps_closet_boost_under_writer_lease(tmp_path, monkeypatch, backend_name):
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
     from mempalace.backends import get_backend
     from mempalace.searcher import search_memories
-    import mempalace.backends.embedding_wrapper as embedding_wrapper
 
     backend, drawers = _collection(tmp_path)
     closets = backend.get_collection(str(tmp_path), "mempalace_closets", create=True)

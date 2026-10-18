@@ -40,7 +40,6 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Tunable constants. Hardcoded for v1; future PRs may expose via
 # MempalaceConfig if real-palace empirical tuning calls for it.

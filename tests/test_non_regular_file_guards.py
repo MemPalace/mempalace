@@ -46,15 +46,14 @@ from mempalace.cli import (
 from mempalace.convo_miner import _is_regular_source_file, scan_convos
 from mempalace.entity_detector import detect_entities
 from mempalace.format_miner import ExtractionStatus, extract_text
-from mempalace.hook_shell import count_human_messages
+from mempalace.hooks_cli import _count_human_messages as count_human_messages
 from mempalace.llm_refine import collect_corpus_text
 from mempalace.miner import _read_text_no_follow, load_config, mine, scan_project
 from mempalace.normalize import _read_transcript_file
 from mempalace.project_scanner import _collect_manifest_names, _parse_gradle
 from mempalace.repair import _copy_file_no_follow, _open_regular_file_no_follow
 from mempalace.room_detector_local import detect_rooms_local
-from mempalace.split_mega_files import main as split_main
-from mempalace.split_mega_files import split_file
+from mempalace.split_mega_files import main as split_main, split_file
 from mempalace.sweeper import parse_claude_jsonl, sweep_directory
 
 # ``os.mkfifo`` and ``SIGALRM`` are both POSIX-only. Windows has no FIFO in
@@ -717,7 +716,8 @@ def test_read_text_no_follow_still_reads_a_large_regular_file_whole(tmp_path):
     with hard_timeout(TIMEOUT_SECONDS, "_read_text_no_follow on a 2 MB file"):
         result = _read_text_no_follow(regular, tmp_path)
     assert result is not None
-    content, mtime = result
+    content, mtime, encoding = result
+    assert encoding == "utf-8"
     assert content == payload
     assert mtime == os.path.getmtime(regular)
 
@@ -1090,14 +1090,6 @@ def test_count_human_messages_ignores_a_fifo_transcript(tmp_path):
         assert count_human_messages(str(fifo)) == 0
 
 
-def test_count_human_messages_still_raises_for_a_missing_path(tmp_path):
-    """The type gate is narrowed to paths that exist, so a missing transcript
-    keeps failing the way the plain ``open`` did.
-    """
-    with pytest.raises(FileNotFoundError):
-        count_human_messages(str(tmp_path / "nope.jsonl"))
-
-
 def test_count_human_messages_still_counts_a_regular_transcript(tmp_path):
     path = write_regular(
         tmp_path,
@@ -1252,7 +1244,8 @@ def test_read_text_no_follow_retries_when_a_lease_break_returns_eagain(tmp_path,
     with hard_timeout(TIMEOUT_SECONDS, "_read_text_no_follow under an injected EAGAIN"):
         result = _read_text_no_follow(target, tmp_path)
     assert result is not None
-    content, mtime = result
+    content, mtime, encoding = result
+    assert encoding == "utf-8"
     assert content == payload
     assert mtime == os.path.getmtime(target)
     # An unrelated open must not affect the retry count (CI runs other workers).

@@ -5,13 +5,12 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
-
-from mempalace.backends import chroma as cb
-from mempalace.backends.base import GetResult
-from mempalace.backends._inproc_sqlite import release
-from mempalace import palace as mined
-from mempalace import hallways
 from test_chroma_metadata_contracts import synthetic_db
+
+from mempalace import hallways, palace as mined
+from mempalace.backends import chroma as cb
+from mempalace.backends._inproc_sqlite import release
+from mempalace.backends.base import GetResult
 
 
 @pytest.mark.parametrize("caller", ["scan", "prefetch", "hallways"])

@@ -24,6 +24,7 @@ Commands:
     mempalace wake-up                     Show L0 + L1 wake-up context
     mempalace wake-up --wing my_app       Wake-up for a specific project
     mempalace status                      Show what's been filed
+    mempalace export <dir>                Export the palace as markdown files
     mempalace audit                       Score how well organized the palace is
 
 Examples:
@@ -48,18 +49,16 @@ import sys
 import warnings
 from pathlib import Path
 
-from ..config import MempalaceConfig
+from .. import paths
 from ..cli_write_routing import (
     add_cli_write_routing_flags,
     resolve_cli_write_routing,
 )
-from ..write_routing import WriteRoutingError
+from ..config import MempalaceConfig
 from ..corpus_origin import detect_origin_heuristic, detect_origin_llm
 from ..llm_client import LLMError, get_provider
 from ..version import __version__
-
-
-_MEMPALACE_PROJECT_FILES = ("mempalace.yaml", "entities.json")
+from ..write_routing import WriteRoutingError
 
 # Pass 0 corpus-origin sampling caps. Tier 1 reads FULL file content (no
 # front-bias sampling) but bounds total memory on enormous corpora. Tier 2

@@ -6,8 +6,8 @@ import sqlite3
 
 import chromadb
 import pytest
-
 from _mcp_server_helpers import _patch_mcp_server
+
 from mempalace.backends import _inproc_sqlite
 
 
@@ -17,7 +17,7 @@ def test_overview_observes_wal_commits_with_unchanged_main_file(
 ):
     """F6: both overview caches must see a commit made outside MCP dispatch."""
     from mempalace import mcp_server
-    from mempalace.backends import chroma
+    from mempalace.backends import chroma_sqlite as chroma
 
     db = os.path.join(palace_path, "chroma.sqlite3")
     with contextlib.closing(sqlite3.connect(db)) as setup:

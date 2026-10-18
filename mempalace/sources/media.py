@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 from typing import Iterator
 
+from .. import paths
 from .base import (
     AdapterSchema,
     BaseSourceAdapter,
@@ -34,7 +35,7 @@ _SKIP_DIRS = frozenset(
         ".hg",
         ".svn",
         ".cache",
-        ".mempalace",
+        paths.DIRNAME,
         ".venv",
         "venv",
         "env",

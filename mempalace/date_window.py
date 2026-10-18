@@ -1,13 +1,13 @@
 """Shared date-window parsing for read-path filters.
 
-``list_drawers`` (#1128) and ``search`` (#463) accept the same optional
+``list_drawers`` and ``search`` accept the same optional
 ``since``/``before`` bounds and compare them against drawer ``filed_at``
 metadata. The parsing and window semantics live here — a side-effect-free
 module — so ``searcher`` can use them without importing ``mcp_server``
 (whose import installs MCP stdio protection) and ``mcp_server`` keeps its
 existing behavior by aliasing these functions.
 
-Semantics (issue spec, #1128):
+Semantics:
 * ``since`` is inclusive, ``before`` is exclusive: ``[since, before)``.
 * Comparison is wall-clock and timezone-naive. ``filed_at`` values are
   written as naive local ISO strings (``datetime.now().isoformat()``)

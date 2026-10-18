@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name, sanitize_name
+from .fsio import atomic_write_json, atomic_write_text
 
 SPLIT_SCHEMA_VERSION = 1
 _PAGE_SIZE = 2000
@@ -202,10 +203,7 @@ def split_plan_path(config: MempalaceConfig, wing: str) -> str:
 def save_split_plan(config: MempalaceConfig, plan: dict) -> str:
     path = split_plan_path(config, plan["wing"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic_write_json(path, plan, private=False, follow_symlinks=False)
     return path
 
 
@@ -304,11 +302,8 @@ def write_split_pending(config: MempalaceConfig, wing: str, plan: dict) -> str:
         "started_at": datetime.now(timezone.utc).isoformat(),
         "plan_sha256": split_plan_fingerprint(plan),
     }
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    atomic_write_text(path, text, private=False, follow_symlinks=False)
     return path
 
 

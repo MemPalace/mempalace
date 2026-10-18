@@ -17,7 +17,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import ClassVar, Optional, Protocol, runtime_checkable
 
-
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -31,7 +30,7 @@ class PalaceNotFoundError(BackendError, FileNotFoundError):
     """Raised when ``get_collection(create=False)`` is called on a missing palace.
 
     Subclass of ``FileNotFoundError`` so legacy callers that catch the latter
-    (pre-#413 seam) keep working unchanged.
+    (the pre-plugin seam) keep working unchanged.
     """
 
 
@@ -417,7 +416,7 @@ def recency_sort_key(meta: Optional[dict], order_field: str = "filed_at") -> tup
 
     This compares the timestamps as *text*, which is chronological only while
     every value shares one offset representation. It is not a new assumption:
-    Layer 1 has sorted ``filed_at`` as text since #1630 and this key just
+    Layer 1 has sorted ``filed_at`` as text and this key just
     names the behaviour. It is also not currently true of ``filed_at`` --
     ``diary_ingest`` writes ``datetime.now(timezone.utc).isoformat()``
     (``...+00:00``) while every other writer uses ``datetime.now().isoformat()``
@@ -467,6 +466,21 @@ def initialize_last_modified_metadata(metadatas):
         result.append(updated)
 
     return result
+
+
+def validate_write_batch(ids, *, unique_ids: bool = False, **columns) -> None:
+    """Raise ``ValueError`` for a malformed write batch.
+
+    Each column passed (``None`` is skipped) must match ``ids`` in length,
+    checked in the order given; ``unique_ids`` also refuses repeated ids, as
+    ``add`` does on backends that report a duplicate instead of overwriting.
+    """
+    n = len(ids)
+    for label, value in columns.items():
+        if value is not None and len(value) != n:
+            raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
+    if unique_ids and len(set(ids)) != n:
+        raise ValueError("add ids must be unique")
 
 
 class BaseCollection(ABC):
@@ -585,7 +599,7 @@ class BaseCollection(ABC):
         return None
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
-        """Return every matching record's metadata in one logical pass (#1796).
+        """Return every matching record's metadata in one logical pass.
 
         Default implementation pages through :meth:`get` using
         ``limit``/``offset`` -- correct for backends with a real server-side
@@ -598,7 +612,7 @@ class BaseCollection(ABC):
         cursor exactly once instead. Calling the default implementation on
         such a backend is O(n^2) in collection size: each page re-walks the
         entire collection just to discard everything outside the requested
-        slice. See issue #1796.
+        slice.
         """
         all_meta: list[dict] = []
         offset = 0
@@ -621,7 +635,7 @@ class BaseCollection(ABC):
         self, where: Optional[dict] = None, include: Optional[list[str]] = None
     ) -> GetResult:
         """Return every matching record -- ids plus the ``include``d fields --
-        in one logical pass (#2452).
+        in one logical pass.
 
         The ids-carrying sibling of :meth:`get_all_metadata`, for callers that
         need to know *which* rows they got (``list_drawers`` collapses chunk
@@ -685,7 +699,7 @@ class BaseCollection(ABC):
         when the collection holds no more than ``limit`` records matching
         ``where``, and *approximate* above that: the window is whatever the
         backend hands back first, so the genuinely newest records can fall
-        outside it (issue #1630's known limitation for Layer 1 wake-up).
+        outside it (a known limitation for Layer 1 wake-up).
         Backends able to push the ordering into storage MUST override this and
         advertise the ``supports_recency_order`` capability token. What that
         token promises, exactly:
@@ -808,40 +822,52 @@ class BaseCollection(ABC):
     ) -> None:
         """Default non-atomic update: get + merge + upsert.
 
+        Ids that do not exist are skipped, as on every built-in backend; an
+        update never creates a record. Stored embeddings are kept when the
+        caller passes none and the backend returns one for every row; if any
+        row has none, the whole batch is re-embedded in the same single upsert.
+
         Backends advertising ``supports_update`` MUST override with an atomic
         single-round-trip implementation.
         """
         if documents is None and metadatas is None and embeddings is None:
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
 
-        n = len(ids)
-        for label, value in (
-            ("documents", documents),
-            ("metadatas", metadatas),
-            ("embeddings", embeddings),
-        ):
-            if value is not None and len(value) != n:
-                raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
+        validate_write_batch(ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
 
-        existing = self.get(ids=ids, include=["documents", "metadatas"])
+        existing = self.get(ids=list(ids), include=["documents", "metadatas", "embeddings"])
+        stored_embeddings = existing.embeddings
         by_id = {
-            rid: (existing.documents[i], existing.metadatas[i])
+            rid: (
+                existing.documents[i],
+                existing.metadatas[i],
+                stored_embeddings[i] if stored_embeddings is not None else None,
+            )
             for i, rid in enumerate(existing.ids)
         }
-        merged_docs: list[str] = []
-        merged_metas: list[dict] = []
+        out_ids, out_docs, out_metas, out_embeddings = [], [], [], []
         for i, rid in enumerate(ids):
-            prev_doc, prev_meta = by_id.get(rid, ("", {}))
-            merged_docs.append(documents[i] if documents is not None else prev_doc)
+            if rid not in by_id:
+                continue
+            prev_doc, prev_meta, prev_embedding = by_id[rid]
+            out_ids.append(rid)
+            out_docs.append(documents[i] if documents is not None else prev_doc)
             new_meta = dict(prev_meta or {})
             if metadatas is not None:
                 new_meta.update(metadatas[i] or {})
-            merged_metas.append(new_meta)
+            out_metas.append(new_meta)
+            out_embeddings.append(embeddings[i] if embeddings is not None else prev_embedding)
+        if not out_ids:
+            return
+        # One upsert, so the batch lands whole or not at all. If any row came
+        # back without a stored vector, the backend re-embeds the whole batch.
+        if any(vector is None for vector in out_embeddings):
+            out_embeddings = None
         self.upsert(
-            documents=merged_docs,
-            ids=list(ids),
-            metadatas=merged_metas,
-            embeddings=embeddings,
+            documents=out_docs,
+            ids=out_ids,
+            metadatas=out_metas,
+            embeddings=out_embeddings,
         )
 
 

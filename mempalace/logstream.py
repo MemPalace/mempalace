@@ -44,7 +44,9 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Optional
 
+from . import paths
 from .config import sanitize_iso_temporal, strip_lone_surrogates
+from .fsio import atomic_publish, read_published_bytes
 
 logger = logging.getLogger("mempalace_logstream")
 
@@ -331,8 +333,7 @@ def sanitize_watch_state_basename(agent: str) -> str:
 
 def default_watch_state_file(agent: str, *, home: Optional[str] = None) -> str:
     """``~/.mempalace/watch/<sanitized-agent>.json`` for ``logstream watch``."""
-    base = Path(home) if home is not None else Path.home()
-    return str(base / ".mempalace" / "watch" / f"{sanitize_watch_state_basename(agent)}.json")
+    return str(paths.state_path("watch", f"{sanitize_watch_state_basename(agent)}.json", home=home))
 
 
 def resolve_watch_state_file(state_file: Optional[str], agent: Optional[str]) -> Optional[str]:
@@ -382,8 +383,7 @@ def read_watch_state(path: str) -> tuple:
     # (permissions, a directory in the way, I/O error) mean corrupt — which
     # replays. It also closes the exists()/open() race.
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        payload = json.loads(read_published_bytes(path).decode("utf-8"))
     except FileNotFoundError:
         return None, WATCH_STATE_ABSENT
     except (OSError, ValueError):
@@ -396,16 +396,6 @@ def read_watch_state(path: str) -> tuple:
     if "cursor" in payload:
         return None, WATCH_STATE_EMPTY
     return None, WATCH_STATE_CORRUPT
-
-
-def read_watch_cursor(path: str) -> Optional[str]:
-    """The cursor from a watch state file, or ``None``.
-
-    Convenience wrapper over :func:`read_watch_state` for callers that do not
-    need to tell a first run from a corrupt file. Watchers should prefer
-    ``read_watch_state``, because those two cases must not behave alike.
-    """
-    return read_watch_state(path)[0]
 
 
 def write_watch_cursor(path: str, cursor: str, agent: str = None, required: bool = False) -> None:
@@ -431,20 +421,18 @@ def write_watch_cursor(path: str, cursor: str, agent: str = None, required: bool
     payload = {"cursor": cursor or None, "updated_at": _utc_now_iso()}
     if agent:
         payload["agent"] = agent
-    tmp = f"{path}.tmp"
     try:
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        os.replace(tmp, path)
+        atomic_publish(
+            path,
+            lambda handle: json.dump(payload, handle),
+            private=False,
+            follow_symlinks=False,
+        )
     except OSError:
         logger.debug("could not persist watch cursor to %s", path, exc_info=True)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
         if required:
             raise
 

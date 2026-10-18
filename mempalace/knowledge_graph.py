@@ -36,7 +36,6 @@ Usage:
 """
 
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -44,12 +43,138 @@ import unicodedata
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from . import paths
 from .config import sanitize_iso_temporal
 from .ids import make_triple_id
 
-
-DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+DEFAULT_KG_PATH = paths.legacy_knowledge_graph_path()
 _MIN_ENTITY_CANDIDATE_LEN = 3
+
+
+def knowledge_graph_notice(
+    palace_path: str, legacy: Optional[str] = None, explicit: bool = False
+) -> Optional[str]:
+    """Say so when a graph that belongs to ``palace_path`` holds facts it does not read.
+
+    That happens when the palace's own graph and the one it used before both
+    hold facts: the palace reads its own, and this names the other file and the
+    explicit command that copies its facts in. Graphs are never merged
+    automatically.
+    """
+    used = paths.knowledge_graph_path(palace_path, legacy=legacy, explicit=explicit)
+    other = paths.historical_knowledge_graph_path(palace_path, legacy=legacy, explicit=explicit)
+    if other is None or paths.same_path(other, used) or not paths.knowledge_graph_has_rows(other):
+        return None
+    return (
+        f"The knowledge graph at {other} holds facts this palace does not read; it reads "
+        f"{used}. Graphs are never merged automatically; review and copy them in with "
+        f"`mempalace kg import-legacy --from {other}`."
+    )
+
+
+def open_graph(path: str, read: bool = False) -> "KnowledgeGraph":
+    """The graph at ``path``; for a read, an empty in-memory one when there is no file.
+
+    A read never creates the graph file: an empty file would then be taken
+    for the palace's graph.
+    """
+    if read and not Path(path).is_file():
+        return KnowledgeGraph.empty()
+    return KnowledgeGraph(db_path=path)
+
+
+def _read_only(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def import_graph_rows(source_path: str, target_path: str, apply: bool = False) -> dict:
+    """Copy one graph file's entities and triples into another, keeping what is there.
+
+    The source is only read. An entity the target already has (same id) is left
+    as it is; so is a fact it already records with the same subject, predicate,
+    object and validity window, whenever it was recorded. A current fact whose
+    subject and predicate already hold a different current object in the target
+    is not copied but listed under ``conflicts``, so the two never both read as
+    current. With ``apply`` false nothing is written and the target is not even
+    created; the counts say what would be copied.
+    """
+    if paths.same_path(source_path, target_path):
+        raise ValueError("the source and the target are the same knowledge graph")
+    source = _read_only(source_path)
+    target = None
+    kg = None
+    if apply:
+        kg = KnowledgeGraph(db_path=target_path)
+        target = kg._conn()
+    elif Path(target_path).is_file():
+        target = _read_only(target_path)
+
+    def found(sql, args):
+        return target is not None and target.execute(sql, args).fetchone() is not None
+
+    counts = {}
+    try:
+        for table, columns in KnowledgeGraph._REPLICATION_TABLES.items():
+            available = {r["name"] for r in source.execute(f"PRAGMA table_info({table})")}
+            cols = [c for c in columns if c in available]
+            numbers = {"added": 0, "present": 0}
+            if table == "triples":
+                numbers["conflicts"] = []
+            counts[table] = numbers
+            if "id" not in cols:
+                continue
+            insert = (
+                f"INSERT OR IGNORE INTO {table} ({', '.join(cols)}) "
+                f"VALUES ({', '.join('?' for _ in cols)})"
+            )
+            for row in source.execute(f"SELECT {', '.join(cols)} FROM {table}"):
+                if table == "triples":
+                    fact = (row["subject"], row["predicate"], row["object"])
+                    window = (row["valid_from"], row["valid_to"])
+                    if found(
+                        "SELECT 1 FROM triples WHERE subject = ? AND predicate = ? "
+                        "AND object = ? AND valid_from IS ? AND valid_to IS ?",
+                        fact + window,
+                    ):
+                        numbers["present"] += 1
+                        continue
+                    clash = (
+                        target.execute(
+                            "SELECT object FROM triples WHERE subject = ? AND predicate = ? "
+                            "AND object != ? AND valid_to IS NULL",
+                            fact,
+                        ).fetchone()
+                        if target is not None and row["valid_to"] is None
+                        else None
+                    )
+                    if clash is not None:
+                        numbers["conflicts"].append(
+                            {
+                                "subject": row["subject"],
+                                "predicate": row["predicate"],
+                                "object": row["object"],
+                                "current_object": clash[0],
+                            }
+                        )
+                        continue
+                elif found(f"SELECT 1 FROM {table} WHERE id = ?", (row["id"],)):
+                    numbers["present"] += 1
+                    continue
+                numbers["added"] += 1
+                if apply:
+                    target.execute(insert, tuple(row))
+        if apply:
+            target.commit()
+    finally:
+        source.close()
+        if kg is not None:
+            kg.close()
+        elif target is not None:
+            target.close()
+    return counts
 
 
 def _escape_like(value: str) -> str:
@@ -185,6 +310,16 @@ class KnowledgeGraph:
         self._connection = None
         self._lock = threading.Lock()
         self._init_db()
+
+    @classmethod
+    def empty(cls) -> "KnowledgeGraph":
+        """An in-memory graph with no facts, for reading a palace that has none yet."""
+        kg = cls.__new__(cls)
+        kg.db_path = ":memory:"
+        kg._connection = None
+        kg._lock = threading.Lock()
+        kg._init_db()
+        return kg
 
     def _init_db(self):
         conn = self._conn()

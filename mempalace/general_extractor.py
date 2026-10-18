@@ -20,10 +20,10 @@ Usage:
 """
 
 import re
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
 from .config import DEFAULT_CHUNK_SIZE
-
+from .fsio import decode_source
 
 # =============================================================================
 # MARKER SETS — One per memory type
@@ -245,7 +245,7 @@ def _get_sentiment(text: str) -> str:
     neg = len(words & NEGATIVE_WORDS)
     if pos > neg:
         return "positive"
-    elif neg > pos:
+    if neg > pos:
         return "negative"
     return "neutral"
 
@@ -529,8 +529,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     filepath = sys.argv[1]
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
+    with open(filepath, "rb") as f:
+        text = decode_source(f.read(), universal_newlines=True)[0]
 
     memories = extract_memories(text)
 

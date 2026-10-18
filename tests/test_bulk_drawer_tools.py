@@ -10,8 +10,7 @@ import json
 
 import pytest
 
-from mempalace import mcp_server
-from mempalace import service
+from mempalace import mcp_server, service
 
 
 class _CountingCollection:

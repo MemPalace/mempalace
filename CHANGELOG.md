@@ -10,6 +10,129 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
+- **Every tool now picks a palace's knowledge graph the same way, and none
+  switches graphs under you.** The MCP server, the CLI, the audit, the fact
+  checker, mining and the Hermes provider share one rule. A palace uses its
+  own `knowledge_graph.sqlite3` once that file holds facts. Until then it
+  keeps reading and writing the graph it used before, if that one holds
+  facts, so its facts never split across two files: for the default palace
+  `~/.mempalace/palace`, and for any palace selected through
+  `MEMPALACE_PALACE_PATH` or `config.json` rather than `--palace`, that is
+  `~/.mempalace/knowledge_graph.sqlite3`; for the Hermes provider it is the
+  graph beside its palace directory. Otherwise a new graph is created inside
+  the palace. An empty graph file counts as no graph, so an empty palace-local
+  file created by an older release no longer hides the facts. A palace named
+  with `--palace` keeps its graph inside itself, as before. Reading the graph
+  (MCP `kg_query`, `kg_timeline`, `kg_stats`, the fact checker) no longer
+  creates the file. Graphs are never merged: when the palace's own graph and
+  the one it used before both hold facts, the palace reads its own, and the
+  MCP KG tools add a `notice` to their response (logged once) and
+  `mempalace status` prints a note naming the other file. To bring those
+  facts in, run `mempalace kg import-legacy` (it shows what it would copy;
+  add `--yes` to copy, `--from <file>` for another graph). It skips facts the
+  palace already records, matching on subject, predicate, object and
+  validity window, and lists, rather than copies, a current fact whose
+  subject and predicate already hold a different current value in the
+  palace.
+
+- **A project now has one wing, whichever tool files into it.** Wing names
+  come from one slug rule (lower case, spaces and hyphens become `_`), used by
+  `mempalace init`, the miners, the diary, and the Claude Code, Codex, Cursor
+  and Antigravity hooks. A session's diary checkpoints now land in the same
+  wing as its transcript and as `mempalace mine` of the project, for example
+  `my_app` instead of `wing_my_app`; a session started in the home directory
+  files both into the machine's workstation wing. Cursor's hooks now turn
+  hyphens into `_` like every other producer, the Cursor and Antigravity hooks
+  ask that same Python function for a folder name with non-ASCII characters
+  (`Café Notes` is `café_notes` everywhere), and an agent's default diary wing
+  slugs the same way (`wing_cursor_ide`). Existing drawers are not renamed: a
+  wing filter in search (the BM25 fallback included), `list_drawers`,
+  `list_rooms`, `diary_read`, wake-up, `compress`, `sync` and closet
+  regeneration also matches the older spellings: `wing_<slug>`, the
+  hyphenated slug, the old Cursor rule (every byte outside `[a-z0-9_-]`
+  written as `_`, so `café_notes` also reads `caf_notes`; skipped when it
+  would drop a whole word, as `日本_api` → `api`), any stored wing whose name
+  slugs to the same thing (`c_tool` reads `c++tool`; the palace's first
+  10,000 wing names are checked), and, for the workstation wing, the
+  `wing_<user>` wing home-directory diaries used. Two things to know:
+  `list_wings`, `status` and the taxonomy still show one project under each
+  raw spelling it was filed with, until those drawers are moved; and because
+  the old Cursor rule wrote dots as `_`, a filter on `my.app` also returns a
+  separate `my_app` project's drawers.
+
+- **Every hook wrapper now picks its interpreter the same way.** The Claude
+  Code plugin's Stop and PreCompact hooks now honour `MEMPAL_PYTHON`, and the
+  Codex plugin hook now falls back to `python3` or `python` when `mempalace`
+  is not on `PATH` (before, it tried only `mempalace`). The order everywhere is
+  `MEMPAL_PYTHON`, `mempalace`, `python3`, `python`, taking the first that can
+  import mempalace. Plugin hooks still exit 1 when none can; the legacy hooks
+  under `hooks/` still reply `{}`.
+- **A hook no longer imports a `mempalace` from the project directory.** Hooks
+  run in your project directory, and Python puts that directory first on its
+  import path, so a project holding `mempalace/` or `mempalace.py` (a mempalace
+  checkout included) ran its own code instead of the installed package. The
+  hook wrappers and the mines a hook starts now keep the working directory off
+  the import path, on every supported Python version.
+
+- **`python -m mempalace.dedup` is gone.** It deleted near-duplicate drawers
+  and also any drawer shorter than 20 characters, so it could remove real
+  memories. Nothing else in MemPalace called it. A re-mine already replaces a
+  file's own drawers without duplicating them, and search folds identical text
+  from different files at read time.
+- **`python -m mempalace.onboarding` is gone.** `mempalace init` does project
+  setup, and the one choice only onboarding offered, the embedding model, is
+  now `mempalace init --embedding-model embeddinggemma` (or `minilm`,
+  `embeddinggemma2`, `openai-compat`), which records it in `config.json`.
+  `MEMPALACE_EMBEDDING_MODEL` and `embedding_model` in `config.json` work as
+  before. Onboarding's `aaak_entities.md` and `critical_facts.md` bootstrap
+  files are no longer written; nothing read them.
+- **`mempalace export <dir>` writes the palace out as markdown.** One folder
+  per wing, one file per room, with an `index.md`; it was only reachable from
+  Python before.
+- **`mempalace init` records a backend chosen with `MEMPALACE_BACKEND`.** The
+  backend is read from `config.json` before the environment, and a palace init
+  has not created yet has nothing on disk to detect it from, so the first
+  `mine` run without the variable used the default backend. When `config.json`
+  names no backend, init now writes the one `MEMPALACE_BACKEND` selects. This is
+  the one setting init takes from the environment; it never replaces a backend
+  `config.json` already names, and an unknown name is reported and skipped.
+- **The next mine re-reads every source once.** The drawer normalization
+  version moves to 3, so each mined file reads as stale and is filed again
+  through the write-then-prune path. Drawers whose text comes out the same
+  keep their stored embedding, so the pass mostly costs reading files, not
+  embedding them. A file whose text did not change also keeps its closets,
+  LLM-generated ones included, and its AAAK summaries; in a changed file only
+  the summaries of rewritten or removed drawers go. What changes: user turns
+  are stored as written instead of spell-corrected, ChatGPT exports follow the
+  branch the conversation ended on, lossy parsing steps are stamped in
+  `transforms`, a conversation is filed under every file that holds it (files
+  once skipped as duplicates get their own drawers), and non-UTF-8 sources
+  keep their exact bytes.
+- **A loopback HTTP MCP server needs no token; anything reachable from another
+  machine does.** `mempalace serve` and `mempalace-mcp --transport http` on
+  `127.0.0.1`, `::1` or `localhost` serve local clients with no header, as
+  before. Without a token the hub refuses browser pages (any `Origin` other
+  than its own exact address, any cross-site `Sec-Fetch-Site`) and DNS-rebound
+  `Host` names, and it refuses requests carrying the usual proxy headers
+  (`X-Forwarded-*`, `X-Real-IP`, `Forwarded`, `Via`, `Tailscale-*` and others).
+  That proxy check is best effort: a forwarder that adds no headers, or a TCP
+  forwarder such as `ssh -R` or `socat`, makes a tokenless hub public, so
+  configure a token whenever anything forwards to it. `POST /mcp` now needs
+  `Content-Type: application/json` on every hub, so a page cannot post to it
+  without a CORS preflight. Pass `--token` or set `MEMPALACE_MCP_HTTP_TOKEN` to
+  require a token on loopback. A network bind, or a loopback bind fronted by a
+  proxy (`MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS` set), reuses or creates the palace's
+  token at `~/.mempalace/server/<key>/token` (`0600`), where local `mempalace`
+  clients already look; remote clients send `Authorization: Bearer <token>`.
+  `--no-token` does nothing on a plain loopback bind and is refused on any
+  other; only `--allow-insecure` serves a reachable hub without a token. The
+  token is never printed at startup; its path is.
+- **MCP tool arguments are checked against the tool's schema before the tool
+  runs.** Wrong types, out-of-range limits, unknown enum values and over-long
+  strings return `-32602` with the parameter named, instead of reaching the tool
+  (`"false"` used to arrive as a truthy string). Numeric and boolean strings
+  (`"5"`, `"false"`) are still accepted and converted. An internal tool error
+  reports its error class without the exception text.
 - **`closet_llm` reads `MEMPALACE_LLM_ENDPOINT`, `MEMPALACE_LLM_MODEL` and
   `MEMPALACE_LLM_KEY` instead of the generic `LLM_ENDPOINT`, `LLM_MODEL` and
   `LLM_KEY`.** Generic names are often set for other tools, and reading them
@@ -18,6 +141,214 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   endpoint also needs `--accept-external-llm` or `MEMPALACE_ACCEPT_EXTERNAL_LLM=1`,
   the same consent `init`, `rooms propose` and `kg normalize` ask for, and every
   LLM provider now refuses a non-local endpoint until that consent is given.
+- **The legacy shell hooks under `hooks/` no longer read `MEMPAL_VERBOSE`.**
+  `mempal_save_hook.sh` and `mempal_precompact_hook.sh` now hand off to
+  `mempalace hook run` like the plugin hooks, through a shared
+  `mempal_hook_run.sh` that must stay next to them. To have the Stop hook block
+  and ask the AI to save instead of saving silently, set `hooks.silent_save` to
+  `false` in `~/.mempalace/config.json`. When no interpreter can import
+  mempalace, the hooks print `{}` and exit 0 as before.
+- **Conversation mining no longer spell-corrects your messages by default.**
+  When the optional `autocorrect` package was installed, chat imports rewrote
+  user turns before filing them. Turns are now stored as written. To keep the
+  old behaviour, set `"convo": {"spellcheck": true}` in `config.json` or
+  `MEMPALACE_CONVO_SPELLCHECK=1`; it corrects user messages only, and every
+  drawer from a file whose text the speller changed carries
+  `spellcheck_user` in its `transforms` metadata. Drawers filed before this
+  release keep their corrected text until the source file is mined again.
+- **`mempalace_search` no longer applies a default distance cutoff.** It used to
+  drop every hit past cosine distance 1.5, which could hide a relevant but
+  distant drawer. Pass `max_distance` to keep a cutoff; it is now read on the
+  cosine scale (0 = identical, 2 = opposite) whatever metric the palace uses,
+  and the response reports how many hits it dropped in
+  `filtered_by_max_distance`. In `candidate_strategy: "union"`, a lexical-only
+  hit whose vector distance can't be computed is kept with `distance: null` and
+  `fallback_reason: "distance_unavailable"` instead of disappearing.
+
+- **A conversation that appears in more than one file is filed under each of
+  them.** Conversation mining used to drop a conversation it had already filed
+  from another file in the same wing, so a re-exported bundle or a copied
+  transcript had no drawers of its own and anything scoped to that file missed
+  it. Each file now keeps its own drawers; re-mining a file still files nothing
+  new. Files an older palace registered as duplicates are mined again once the
+  conversation parsing version changes.
+
+- **`mempalace init` writes only what you chose into a new `config.json`.**
+  It used to copy the palace path, collection name, topic wings and hall
+  keywords into the file, which froze those defaults against later releases
+  and froze a `MEMPALACE_PALACE_PATH` from your shell into the config. A new
+  file now holds only `--palace`, `--lang` and `--backend`; the defaults keep
+  applying from the code and the default palace keeps following the config
+  directory. `--palace` together with `--lang` now records both (`--lang` used
+  to create the file first, so the palace path was lost). Existing
+  `config.json` files are not touched. If you rely on `MEMPALACE_PALACE_PATH`
+  for processes started without it, pass `--palace` to `init` or set
+  `palace_path` in `config.json`.
+
+### Bug Fixes
+
+- **Bookkeeping rows stay out of what you see.** The convo miner files a
+  registry row (`ingest_mode="registry"`) for a transcript with no chunks, and
+  the format miner a sentinel for a document that extracted to nothing. Search
+  (vector, union and the BM25 fallback, MCP and CLI), `list_drawers`, wake-up
+  and the L2/L3 layers, status (MCP and `mempalace status`), wing/room listings
+  and the taxonomy, export and `compress` now leave them out, and the readers
+  that return a page widen past them so the page still fills. The mining checks
+  still read them. A real room a project names `_registry` is shown as usual.
+- **Chat transcripts keep their own blank lines and Gemini messages join as
+  written.** Claude Code messages used to have every run of three or more
+  blank lines collapsed, even where no tool chrome was stripped; they now keep
+  them, and where stripping chrome collapses a run the drawer carries
+  `whitespace_collapse_internal`. Gemini messages split into several text parts
+  were joined with spaces (JSON) or newlines (JSONL); the parts now join with
+  nothing between them, the way Gemini's own clients read a message. Both
+  apply on the re-read the version bump above already schedules.
+- **Re-ingesting a diary no longer deletes the day before writing it.** A diary
+  rebuild now goes through the same write-then-prune path as the miners, so a
+  failed write keeps the previous entries and a failed prune is retried on the
+  next ingest instead of leaving removed entries behind for good. Two diary
+  files whose names start with the same date, in one wing, map to the same
+  drawer ids; ingest now stops with a `CollisionError` naming both files
+  instead of letting one silently overwrite the other. Rename one, or ingest
+  them into separate wings. The collision check no longer treats a source
+  re-filing its own drawer at a moved `chunk_index` as a collision.
+- **A failed dimension probe no longer erases a recorded embedder dimension.**
+  `mempalace palace set-embedder` and repair record the embedder in the palace
+  sidecar. When the model's dimension probe failed, they wrote a dimension of 0
+  over the one already recorded. A failed probe now keeps the recorded dimension
+  for the same model, and records a new model as unknown with a warning.
+- **`mempalace repair --mode max-seq-id` no longer runs alongside a writer.**
+  The repair rewrote Chroma's `max_seq_id` rows without the palace lease, so a
+  mine or an MCP write could land in the middle of it. It now takes the lease,
+  works out the repair again once it holds it, and exits with code 2 without
+  changing anything when another writer holds the palace. Its backup is taken
+  through SQLite's backup API, so writes still in the WAL are part of it. The
+  same applies to the max_seq_id check that runs before a repair rebuild.
+- **Graph tools no longer report an unreadable palace as an empty one.**
+  `traverse`, `find_tunnels` and explicit `create_tunnel` used to treat any
+  failure to open the palace (a lock, a corrupt index) as "no rooms", and an
+  explicit tunnel was let through when its room check failed. A palace that
+  does not exist yet is still an empty graph, and any other failure, while
+  opening the palace or reading its drawers, returns "palace could not be
+  read" instead. Graph reads ask for a read-only open: on sqlite_exact that
+  is a read-only connection; on Chroma it creates no files and skips the HNSW
+  thread pin, but chromadb's own client still updates its bookkeeping when it
+  opens a palace, so drawers and their metadata are left as they were rather
+  than the file bytes.
+- **Search says when it rewrote your query.** The `sanitizer` block on a
+  sanitized `mempalace_search` result now carries `truncated` and
+  `replaced_lone_surrogates`, and a query whose only change was a replaced
+  lone surrogate is reported as sanitized. `original_length` counts the
+  query as sent. `mempalace search` on the command line and the Hermes
+  search tool now sanitize the same way: the CLI notes the rewrite on stderr,
+  and Hermes returns the same `sanitizer` block.
+- **Drawer bookkeeping fields are stored as numbers, flags and ISO text.**
+  `chunk_index`, `chunk_total`, `line_start`, `line_end`, `entry_index` and
+  the version stamps are stored as integers, `source_mtime` and
+  `compression_ratio` as floats, `is_sentinel` as a boolean, and `filed_at`
+  / `created_at` datetimes as ISO text, whatever form a writer passed. Range
+  filters such as `{"chunk_index": {"$gt": 9}}` compare numbers instead of
+  text, and the already-mined check reads legacy rows that hold `"1"` as 1
+  instead of re-mining them. A value that does not parse, or an integer too
+  big for 64 bits, is stored as given. Hallways, room proposals and sync no
+  longer treat an old row whose `is_sentinel` is `"false"` as a sentinel.
+
+- **Embedding a single string gives one vector.** The MiniLM and
+  OpenAI-compatible embedding functions treated a bare string as a list of
+  characters and returned one vector per character. Every embedding function
+  now reads a bare string as one document.
+- **A failed embedding dimension probe is retried.** When the embedder could
+  not answer the first probe (a local server still starting, a model still
+  loading), the dimension was cached as unknown for the rest of the process, so
+  a later identity record, such as the one a repair writes, kept no dimension.
+  Only a successful probe is cached now, and the first failure for a model is
+  logged as a warning.
+- MemPalace's own project files are handled under every name the miner
+  reads. A project using `mempalace.yml` or the legacy `mempal.yaml` no longer
+  has that file sampled by entity and corpus-origin detection on a re-run of
+  `init`, and `init` adds the config file the project actually uses to
+  `.gitignore` instead of always `mempalace.yaml`. The skip lists now come
+  from one place. `init` also no longer overwrites an `entities.json` that
+  holds AAAK entity codes for `mempalace compress`.
+- **Mining no longer turns bytes that are not UTF-8 into U+FFFD.** Project,
+  conversation, diary and sweep ingest decoded files as UTF-8 and replaced
+  anything else with the replacement character, so a cp1252 file lost its
+  smart quotes and accented letters for good. Now a UTF-8 file with a few
+  stray bytes (its valid UTF-8 characters outnumber them) keeps its text
+  exactly, with only the stray bytes held as lone surrogates, so `café` stays
+  searchable. Any other file decodes as windows-1252, with every byte mapped.
+  The palace stores every byte exactly. MCP responses show a stray byte as
+  U+FFFD, because some clients' JSON parsers reject the escape that would
+  carry it; `mempalace_get_drawer` with `include_source_bytes: true` returns
+  the drawer's exact source bytes as base64. Exports write the original
+  bytes, and MemPalace processes talking to each other (proxy and hub, the
+  daemon, peer sync) pass them exactly. `mempalace_update_drawer` with new
+  content drops `source_encoding` and `transforms`, since that text did not
+  come from the source file. A drawer whose source was not plain UTF-8 carries
+  `source_encoding` (`utf-8-sig`, `utf-8+surrogateescape`,
+  `utf-8-sig+surrogateescape` or `windows-1252`), and
+  `fsio.encode_source(text, source_encoding)` gives the source bytes back.
+  The encoding-repair script (`scripts/mempalace_repair_encoding.py`) leaves
+  those drawers alone. Drawers filed before this release keep their
+  replacement characters until their file is mined again.
+- **A re-mine no longer loses a file's drawers when it fails part-way.** The
+  project and conversation miners deleted a changed file's drawers before
+  writing the new ones, so a crash or backend error during the write left the
+  file with nothing in the palace. All three miners now file through one
+  write path: the new drawers are written first, marked unfinished, then the
+  stale ones are removed and the marker is cleared. A failure at any point
+  leaves the old or the new text readable, and the next mine finishes the file.
+- **A mine stops when it cannot read which files are already filed.** The
+  already-mined check used to answer "not mined" on any palace read error, so a
+  re-mine re-filed files it could not see. It now raises `MinedSetUnavailable`
+  and the project, conversation and format miners all abort the run on it. A
+  pass that crashed between batches (fewer drawers than the largest
+  `chunk_total` any of them names) reads as unfinished on every check.
+- ChatGPT imports file the branch the conversation ended on (`current_node`),
+  not the first draft of every regenerated or edited turn.
+- A Slack message with `"user": null` is filed under `unknown` instead of
+  failing the whole export.
+- **Conversation drawers now say when their text is not the source as
+  written.** Mining a chat transcript truncates long tool output, leaves out
+  some tool results, cuts tool calls down to one line, strips UI chrome, drops
+  thinking, image and system content, and adds its own markers, and none of
+  that was recorded. Every drawer from a file whose parse did any of these now
+  carries a `transforms` field listing the RFC 002 names, sorted and
+  comma-joined (for example `strip_tool_chrome,tool_result_truncate`). The
+  stamp covers the whole file, so in a bundle export it also lands on
+  conversations the step did not touch. The text itself is unchanged. Drawers
+  filed before this release carry no stamp until their file is mined again.
+- `mempalace search` no longer hands a search to the running hub when the
+  hub would ignore one of your settings. Hybrid-rank weights, the pgvector
+  shared namespace and the EmbeddingGemma 2 dimension, modalities and
+  revision now keep the search local when set in the environment, and a
+  change to them in `config.json` no longer reuses a hub started with the
+  old values.
+- **A closet match keeps lifting its drawer in the final search order.** The
+  hybrid re-rank scored every hit from its raw vector distance, so the rank
+  boost a matching closet gave a drawer was dropped and a closet-backed drawer
+  could fall behind a plain one. The boost is now part of the hybrid score. The
+  boost's distance cap and clamp, and the light server's relevance confidence,
+  now read distances on the cosine scale, so palaces using `l2` or `ip` rank and
+  report the same way as cosine ones. Search responses name the raw distance's
+  scale in `distance_metric`.
+- **`mempalace compress` no longer writes into the closets that search reads.**
+  Its lossy AAAK summaries were stored alongside closet pointers, so they
+  boosted search results like real closets. They now go to their own
+  `mempalace_aaak` collection, one row per drawer with `kind="aaak"`, and
+  repair and migrate carry it over. Deleting or rewriting a drawer (by any
+  delete tool, `sync`, or a re-mine) deletes its summary too. Search already
+  ignores summaries an older `compress` left in the closets; the next
+  `compress`, `repair --mode from-sqlite` or `migrate` moves them out.
+- **`wake-up` no longer says "No memories yet" when it could not read the
+  palace.** A recent-memories read that failed, for example while a mine held
+  the database, was swallowed and the wake-up reported an empty palace; a scan
+  that failed part-way showed whatever it had read as the whole window. Each
+  read is now retried briefly, and one that still fails says the palace could
+  not be read right now.
+- A backend's `update` never creates a record for an id that does not exist.
+  The built-in backends already skipped missing ids; the default that
+  third-party backends inherit wrote them as empty records.
 
 ### Added
 

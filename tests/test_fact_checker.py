@@ -35,7 +35,6 @@ from mempalace.fact_checker import (
 )
 from mempalace.knowledge_graph import KnowledgeGraph
 
-
 # ── claim extraction ─────────────────────────────────────────────────
 
 

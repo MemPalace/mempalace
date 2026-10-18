@@ -22,30 +22,11 @@ def _result_drawer_id(meta, stored_drawer_id):
     Chunk metadata carries the logical-group id under ``parent_drawer_id``
     (``tool_add_drawer``) or ``parent_entry_id`` (``tool_diary_write``);
     resolving both means a hit on a chunked diary entry reports the id that
-    fetches the WHOLE entry rather than the one chunk that matched (#2185).
+    fetches the WHOLE entry rather than the one chunk that matched.
     Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
     """
     meta = meta or {}
     return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
-
-
-def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
-    """Lowercase + strip to alphanumeric tokens of length ≥ 2.
-
-    Tolerates ``None`` documents — Chroma can return ``None`` in the
-    ``documents`` field for drawers without text content, which would
-    otherwise raise ``AttributeError`` mid-rerank.
-
-    When ``stop_words`` is non-empty, filters tokens that match any entry.
-    The set is expected to already be lowercased so callers can share one
-    instance across query + document tokenization.
-    """
-    if not text:
-        return []
-    tokens = _TOKEN_RE.findall(text.lower())
-    if stop_words:
-        return [t for t in tokens if t not in stop_words]
-    return tokens
 
 
 @functools.lru_cache(maxsize=16)
@@ -102,7 +83,7 @@ def _resolve_stop_words(lang: Optional[str]) -> frozenset:
 
 
 def _resolve_hybrid_rank_weights() -> tuple:
-    """Resolve the vector/BM25 weights for the hybrid re-rank (#2298).
+    """Resolve the vector/BM25 weights for the hybrid re-rank.
 
     Reads ``MempalaceConfig().hybrid_rank_vector_weight`` /
     ``.hybrid_rank_bm25_weight`` — which themselves resolve env var
@@ -123,79 +104,24 @@ def _resolve_hybrid_rank_weights() -> tuple:
         return 0.6, 0.4
 
 
-def _bm25_scores(
-    query: str,
-    documents: list,
-    k1: float = 1.5,
-    b: float = 0.75,
-    stop_words: frozenset = frozenset(),
-) -> list:
-    """Compute Okapi-BM25 scores for ``query`` against each document.
-
-    IDF is computed over the *provided corpus* using the Lucene/BM25+
-    smoothed formula ``log((N - df + 0.5) / (df + 0.5) + 1)``, which is
-    always non-negative. This is well-defined for re-ranking a small
-    candidate set returned by vector retrieval — IDF then reflects how
-    discriminative each query term is *within the candidates*, exactly
-    what's needed to reorder them.
-
-    Parameters mirror Okapi-BM25 conventions:
-        k1 — term-frequency saturation (1.2-2.0 typical, 1.5 default)
-        b  — length normalization (0.0 = none, 1.0 = full, 0.75 default)
-
-    Returns a list of scores in the same order as ``documents``.
-    """
-    n_docs = len(documents)
-    query_terms = set(_tokenize(query, stop_words))
-    if not query_terms or n_docs == 0:
-        return [0.0] * n_docs
-
-    tokenized = [_tokenize(d, stop_words) for d in documents]
-    doc_lens = [len(toks) for toks in tokenized]
-    if not any(doc_lens):
-        return [0.0] * n_docs
-    avgdl = sum(doc_lens) / n_docs or 1.0
-
-    # Document frequency: how many docs contain each query term?
-    df = {term: 0 for term in query_terms}
-    for toks in tokenized:
-        seen = set(toks) & query_terms
-        for term in seen:
-            df[term] += 1
-
-    idf = {term: math.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1) for term in query_terms}
-
-    scores = []
-    for toks, dl in zip(tokenized, doc_lens):
-        if dl == 0:
-            scores.append(0.0)
-            continue
-        tf: dict = {}
-        for t in toks:
-            if t in query_terms:
-                tf[t] = tf.get(t, 0) + 1
-        score = 0.0
-        for term, freq in tf.items():
-            num = freq * (k1 + 1)
-            den = freq + k1 * (1 - b + b * dl / avgdl)
-            score += idf[term] * num / den
-        scores.append(score)
-    return scores
-
-
 def _vector_distance(
     query_vector: list[float], candidate_vector: list[float], metric: str
 ) -> float:
-    """Return a backend-style distance between two already-normalized vectors."""
+    """Return the distance Chroma's own query reports for ``metric``.
+
+    Chroma's ``l2`` space reports squared Euclidean distance and its ``ip``
+    space reports ``1 - dot``, so a recomputed candidate ranks and filters on
+    the same scale as a queried one.
+    """
     if not query_vector or not candidate_vector or len(query_vector) != len(candidate_vector):
         raise ValueError("embedding dimensions do not match")
 
     if metric == "l2":
-        return math.sqrt(sum((a - b) ** 2 for a, b in zip(query_vector, candidate_vector)))
+        return sum((a - b) ** 2 for a, b in zip(query_vector, candidate_vector))
 
     dot = sum(a * b for a, b in zip(query_vector, candidate_vector))
     if metric == "ip":
-        return -dot
+        return 1.0 - dot
 
     q_norm = math.sqrt(sum(a * a for a in query_vector))
     c_norm = math.sqrt(sum(b * b for b in candidate_vector))
@@ -260,6 +186,10 @@ def _hybrid_rank(
       themselves. Since the absolute scale is unbounded, BM25 is min-max
       normalized within the candidate set so weights are commensurable.
 
+    * A candidate with a ``closet_boost`` is scored from its boosted
+      distance (cosine scale, taken back to ``metric``'s scale), the distance
+      the vector pass ranked it by, so re-scoring doesn't drop the boost.
+
     Candidates with ``distance=None`` are treated as vector-unknown
     (no vector signal available) and scored on BM25 contribution alone.
     Used by candidate-union mode to merge BM25-only candidates that the
@@ -272,24 +202,32 @@ def _hybrid_rank(
         return results
 
     docs = [r.get("text", "") for r in results]
-    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
+    bm25_raw = bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 
     scored = []
     for r, raw, norm in zip(results, bm25_raw, bm25_norm):
-        vec_sim = _distance_to_similarity(r.get("distance"), metric)
+        distance = r.get("distance")
+        boost = r.get("closet_boost") or 0.0
+        if boost and distance is not None:
+            boosted = _boosted_cosine_distance(distance, boost, metric)
+            distance = _metric_scale_distance(boosted, metric)
+        vec_sim = _distance_to_similarity(distance, metric)
         r["bm25_score"] = round(raw, 3)
         scored.append((vector_weight * vec_sim + bm25_weight * norm, r))
 
-    # Break exact score ties toward the more recently authored drawer so equal-score
-    # candidates rank chronologically instead of in arbitrary backend order. ISO-8601
-    # ``authored_at`` strings sort chronologically; missing dates sort oldest.
+    # Break exact score ties by raw vector distance first: boosted drawers closer
+    # than their boost all clamp to the same score and must keep vector order.
+    # Then toward the more recently authored drawer, so equal-score candidates rank
+    # chronologically instead of in arbitrary backend order. ISO-8601 ``authored_at``
+    # strings sort chronologically; missing dates and distances sort last.
     # authored_at lives at the top level on the search_memories path and nested under
     # "metadata" on the candidate-union path; check both so the tie-break works for each.
     scored.sort(
         key=lambda pair: (
             pair[0],
+            -pair[1]["distance"] if pair[1].get("distance") is not None else -math.inf,
             pair[1].get("authored_at") or pair[1].get("metadata", {}).get("authored_at") or "",
         ),
         reverse=True,

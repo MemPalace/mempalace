@@ -5,8 +5,9 @@ or network access. Live-provider smoke tests live outside the unit-test
 suite.
 """
 
+import io
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -15,12 +16,12 @@ from mempalace.llm_client import (
     LLMError,
     OllamaProvider,
     OpenAICompatProvider,
-    _http_post_json,
     endpoint_is_local,
     get_provider,
+    parse_json_reply,
+    post_json,
     require_external_consent,
 )
-
 
 # ── factory ─────────────────────────────────────────────────────────────
 
@@ -48,45 +49,201 @@ def test_get_provider_unknown_raises():
         get_provider("nonsense", "x")
 
 
-# ── _http_post_json ─────────────────────────────────────────────────────
+# ── post_json ─────────────────────────────────────────────────────
 
 
-def test_http_post_json_success():
+def test_post_json_success():
     mock_resp = MagicMock()
     mock_resp.read.return_value = b'{"ok": true}'
     mock_resp.__enter__.return_value = mock_resp
     mock_resp.__exit__.return_value = False
     with patch("mempalace.llm_client.urlopen", return_value=mock_resp):
-        result = _http_post_json("http://x/y", {"a": 1}, {}, timeout=5)
+        result = post_json("http://x/y", {"a": 1}, {}, timeout=5)
     assert result == {"ok": True}
 
 
-def test_http_post_json_http_error_wraps_as_llm_error():
-    from urllib.error import HTTPError
+def test_post_json_http_error_wraps_as_llm_error():
     import io
+    from urllib.error import HTTPError
 
     err = HTTPError("http://x", 404, "Not Found", {}, io.BytesIO(b"model missing"))
     with patch("mempalace.llm_client.urlopen", side_effect=err):
         with pytest.raises(LLMError, match="HTTP 404"):
-            _http_post_json("http://x", {}, {}, timeout=5)
+            post_json("http://x", {}, {}, timeout=5)
 
 
-def test_http_post_json_url_error_wraps_as_llm_error():
+def test_post_json_url_error_wraps_as_llm_error():
     from urllib.error import URLError
 
     with patch("mempalace.llm_client.urlopen", side_effect=URLError("conn refused")):
         with pytest.raises(LLMError, match="Cannot reach"):
-            _http_post_json("http://x", {}, {}, timeout=5)
+            post_json("http://x", {}, {}, timeout=5)
 
 
-def test_http_post_json_malformed_response():
+def test_post_json_malformed_response():
     mock_resp = MagicMock()
     mock_resp.read.return_value = b"not json"
     mock_resp.__enter__.return_value = mock_resp
     mock_resp.__exit__.return_value = False
     with patch("mempalace.llm_client.urlopen", return_value=mock_resp):
         with pytest.raises(LLMError, match="Malformed"):
-            _http_post_json("http://x", {}, {}, timeout=5)
+            post_json("http://x", {}, {}, timeout=5)
+
+
+def test_post_json_http_error_carries_the_status():
+    from urllib.error import HTTPError
+
+    err = HTTPError("http://x", 429, "Too Many Requests", {}, None)
+    with patch("mempalace.llm_client.urlopen", side_effect=err):
+        with pytest.raises(LLMError) as raised:
+            post_json("http://x", {}, {}, timeout=5)
+    assert raised.value.status == 429
+
+
+def test_post_json_wraps_protocol_faults_and_bad_urls():
+    import http.client
+
+    with patch("mempalace.llm_client.urlopen", side_effect=http.client.BadStatusLine("garbage")):
+        with pytest.raises(LLMError, match="Cannot reach"):
+            post_json("http://x", {}, {}, timeout=5)
+    with pytest.raises(LLMError, match="Cannot reach"):
+        post_json("not-a-url", {}, {}, timeout=5)
+
+
+def test_post_json_sends_a_lone_surrogate_as_replacement_char():
+    captured = {}
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b"{}"
+    mock_resp.__enter__.return_value = mock_resp
+    mock_resp.__exit__.return_value = False
+
+    def fake_urlopen(req, timeout):
+        captured["body"] = req.data
+        return mock_resp
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        post_json("http://x", {"input": "stray \udcff byte"}, {}, timeout=5)
+    assert "stray � byte" in captured["body"].decode("utf-8")
+
+
+# ── parse_json_reply ────────────────────────────────────────────────────
+# One golden reply per caller's format: kg normalize, rooms propose, corpus
+# origin, entity refine and LLM closets.
+
+
+@pytest.mark.parametrize(
+    "reply, expected",
+    [
+        # kg normalize: a fenced object
+        ('```json\n{"facts": [{"index": 1}]}\n```', {"facts": [{"index": 1}]}),
+        # rooms propose: an untagged fence after a sentence
+        (
+            'Here are the rooms:\n```\n{"rooms": [{"name": "infra"}]}\n```',
+            {"rooms": [{"name": "infra"}]},
+        ),
+        # corpus origin: prose before and after the object
+        (
+            'My answer: {"is_ai_dialogue_corpus": true, "confidence": 0.8} — done.',
+            {"is_ai_dialogue_corpus": True, "confidence": 0.8},
+        ),
+        # entity refine: a top-level list with no wrapper
+        ('[{"name": "Y", "label": "PERSON"}]', [{"name": "Y", "label": "PERSON"}]),
+        # entity refine: prose brackets before the payload
+        (
+            'See [note] first. JSON: {"classifications": []}',
+            {"classifications": []},
+        ),
+        # closets: a fence tagged with another language
+        (
+            '```javascript\n{"topics": ["x"], "quotes": [], "summary": "s"}\n```',
+            {"topics": ["x"], "quotes": [], "summary": "s"},
+        ),
+        # braces and quotes inside strings don't end the object
+        ('ok {"summary": "a } b \\" {", "n": 1} tail', {"summary": 'a } b " {', "n": 1}),
+        # a reply cut off before its closing fence
+        ('```json\n{"topics": ["t"]}', {"topics": ["t"]}),
+    ],
+)
+def test_parse_json_reply_reads_every_callers_format(reply, expected):
+    assert parse_json_reply(reply) == expected
+
+
+def test_parse_json_reply_prefers_an_object_over_a_stray_list_before_it():
+    reply = 'Per rule [1] here is the plan: {"facts": [{"index": 1, "object": "Acme"}]}'
+    assert parse_json_reply(reply) == {"facts": [{"index": 1, "object": "Acme"}]}
+    assert parse_json_reply(reply, expect=(dict, list)) == parse_json_reply(reply)
+
+
+def test_parse_json_reply_falls_back_to_a_list_when_no_object_parses():
+    assert parse_json_reply('prefix [{"name": "Y"}] suffix') == [{"name": "Y"}]
+
+
+def test_parse_json_reply_expect_skips_values_of_another_type():
+    reply = 'Counts: [1, 2]. Result: {"user_name": null}'
+    assert parse_json_reply(reply, expect=dict) == {"user_name": None}
+    assert parse_json_reply(reply, expect=list) == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        # trailing comma: the nested "rooms" list must not stand in for the object
+        '{"rooms": [{"slug": "a"}], "assignments": [{"room": "a"}],}',
+        # unescaped quote: the quoted code object must not stand in for the reply
+        '{"topics": ["cfg"], "quotes": ["[User] set "{"debug": true}" in it"], "summary": "s"}',
+        # cut at the token limit, with a complete object quoted inside
+        '{"topics": ["cfg"], "quotes": ["{\\"debug\\": true}", "an unfinished quo',
+    ],
+)
+def test_parse_json_reply_never_returns_a_value_nested_in_a_failed_candidate(reply):
+    with pytest.raises(ValueError, match="held no JSON"):
+        parse_json_reply(reply, expect=dict)
+
+
+@pytest.mark.parametrize("reply", ["", "   ", "no json here", "{broken", None])
+def test_parse_json_reply_raises_when_the_reply_holds_none(reply):
+    with pytest.raises(ValueError, match="held no JSON"):
+        parse_json_reply(reply)
+
+
+def test_post_json_drops_the_body_of_an_auth_error():
+    from urllib.error import HTTPError
+
+    body = io.BytesIO(b'{"error": "Incorrect API key provided: sk-SECRET1234567"}')
+    err = HTTPError("http://x", 401, "Unauthorized", {}, body)
+    with patch("mempalace.llm_client.urlopen", side_effect=err):
+        with pytest.raises(LLMError) as raised:
+            post_json("http://x", {}, {}, timeout=5)
+    assert "SECRET" not in str(raised.value)
+    assert "Unauthorized" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "secret, leak",
+    [
+        ("token sk-SECRET1234567 rejected", "SECRET1234567"),
+        ("header was Bearer abc.DEF-123_xyz", "abc.DEF-123_xyz"),
+        ('{"api_key": "LONGSECRETVALUE99"}', "LONGSECRETVALUE99"),
+    ],
+)
+def test_post_json_masks_keys_in_other_error_bodies(secret, leak):
+    from urllib.error import HTTPError
+
+    err = HTTPError("http://x", 500, "Server Error", {}, io.BytesIO(secret.encode()))
+    with patch("mempalace.llm_client.urlopen", side_effect=err):
+        with pytest.raises(LLMError) as raised:
+            post_json("http://x", {}, {}, timeout=5)
+    assert leak not in str(raised.value)
+
+
+def test_post_json_masks_a_key_in_the_url():
+    from urllib.error import URLError
+
+    url = "http://x/v1?key=SECRETQUERYKEY"
+    with patch("mempalace.llm_client.urlopen", side_effect=URLError("refused")):
+        with pytest.raises(LLMError) as raised:
+            post_json(url, {}, {}, timeout=5)
+    assert "SECRETQUERYKEY" not in str(raised.value)
 
 
 # ── OllamaProvider ──────────────────────────────────────────────────────

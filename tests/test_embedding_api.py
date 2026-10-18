@@ -3,7 +3,7 @@
 Covers ``OpenAICompatEmbeddingFunction``, the ``embedding_model ==
 "openai-compat"`` selection branch in ``get_embedding_function``, and the
 ``MempalaceConfig`` properties that are the single source of truth for the
-endpoint settings. No server required — ``urllib.request.urlopen`` is mocked.
+endpoint settings. No server required — ``llm_client``'s ``urlopen`` is mocked.
 """
 
 import json
@@ -98,7 +98,7 @@ def test_name_encodes_model():
 
 
 def test_embeds_and_l2_normalizes(monkeypatch):
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(dim=4))
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(dim=4))
     ef = embedding.OpenAICompatEmbeddingFunction("http://h:8420", "small")
     out = ef(["a", "b"])
     assert len(out) == 2
@@ -108,7 +108,7 @@ def test_embeds_and_l2_normalizes(monkeypatch):
 
 
 def test_sorts_response_by_index(monkeypatch):
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(one_hot=True, shuffle=True))
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(one_hot=True, shuffle=True))
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     out = ef(["x", "y", "z"])
     # Server returned rows reversed; the EF must realign by index so out[i]
@@ -119,7 +119,7 @@ def test_sorts_response_by_index(monkeypatch):
 
 def test_sends_bearer_header_when_key_set(monkeypatch):
     captured = []
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(captured=captured))
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(captured=captured))
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m", api_key="sk-secret")
     ef(["a"])
     assert captured[0].get_header("Authorization") == "Bearer sk-secret"
@@ -127,7 +127,7 @@ def test_sends_bearer_header_when_key_set(monkeypatch):
 
 def test_no_auth_header_without_key(monkeypatch):
     captured = []
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(captured=captured))
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(captured=captured))
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     ef(["a"])
     assert captured[0].get_header("Authorization") is None
@@ -135,7 +135,7 @@ def test_no_auth_header_without_key(monkeypatch):
 
 def test_batches_large_input(monkeypatch):
     captured = []
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(captured=captured))
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(captured=captured))
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     out = ef([f"t{i}" for i in range(130)])  # > _EF_API_BATCH (64)
     assert len(out) == 130
@@ -143,7 +143,7 @@ def test_batches_large_input(monkeypatch):
 
 
 def test_embed_query_delegates_to_call(monkeypatch):
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(dim=4))
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(dim=4))
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     assert ef.embed_query(["q"]) == ef(["q"])
 
@@ -152,7 +152,7 @@ def test_raises_on_count_mismatch(monkeypatch):
     def short(req, timeout=None):
         return _FakeResp(json.dumps({"data": [{"index": 0, "embedding": [1.0]}]}).encode())
 
-    monkeypatch.setattr("urllib.request.urlopen", short)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", short)
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     with pytest.raises(RuntimeError, match="embeddings for"):
         ef(["a", "b"])
@@ -164,7 +164,7 @@ def test_raises_on_transport_error(monkeypatch):
     def boom(req, timeout=None):
         raise URLError("connection refused")
 
-    monkeypatch.setattr("urllib.request.urlopen", boom)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", boom)
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     with pytest.raises(RuntimeError, match="failed"):
         ef(["a"])
@@ -185,7 +185,7 @@ def test_get_embedding_function_selects_openai_compat(monkeypatch):
     monkeypatch.setattr(
         "mempalace.config.MempalaceConfig", lambda *a, **k: _FakeCfg("http://h:8420", "small")
     )
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(dim=4))
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(dim=4))
     ef = embedding.get_embedding_function(device="cpu", model="openai-compat")
     assert isinstance(ef, embedding.OpenAICompatEmbeddingFunction)
     assert ef.name() == "openai_compat_emb_small"
@@ -257,7 +257,7 @@ def test_config_api_blank_env_falls_through_to_file(tmp_path, monkeypatch):
 
 def test_request_targets_v1_embeddings_with_expected_body(monkeypatch):
     captured = []
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen(captured=captured))
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(captured=captured))
     embedding.OpenAICompatEmbeddingFunction("http://h:8420", "small")(["a", "b"])
     req = captured[0]
     assert req.full_url == "http://h:8420/v1/embeddings"
@@ -279,7 +279,7 @@ def test_raises_on_missing_embedding_key(monkeypatch):
     def bad(req, timeout=None):
         return _FakeResp(json.dumps({"data": [{"index": 0}]}).encode())  # no "embedding"
 
-    monkeypatch.setattr("urllib.request.urlopen", bad)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", bad)
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     with pytest.raises(embedding.EmbeddingAPIError, match="malformed embeddings"):
         ef(["a"])
@@ -292,7 +292,7 @@ def test_raises_on_non_contiguous_indices(monkeypatch):
         rows = [{"index": 64, "embedding": [1.0]}, {"index": 65, "embedding": [2.0]}]
         return _FakeResp(json.dumps({"data": rows}).encode())
 
-    monkeypatch.setattr("urllib.request.urlopen", bad)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", bad)
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     with pytest.raises(embedding.EmbeddingAPIError, match="non-contiguous"):
         ef(["a", "b"])
@@ -305,7 +305,7 @@ def test_raises_on_http_protocol_exception(monkeypatch):
     def boom(req, timeout=None):
         raise HTTPException("incomplete read")
 
-    monkeypatch.setattr("urllib.request.urlopen", boom)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", boom)
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     with pytest.raises(embedding.EmbeddingAPIError, match="failed"):
         ef(["a"])
@@ -316,7 +316,7 @@ def test_raises_on_value_error_from_urlopen(monkeypatch):
     def boom(req, timeout=None):
         raise ValueError("unknown url type")
 
-    monkeypatch.setattr("urllib.request.urlopen", boom)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", boom)
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     with pytest.raises(embedding.EmbeddingAPIError, match="failed"):
         ef(["a"])
@@ -326,7 +326,7 @@ def test_raises_on_non_object_response(monkeypatch):
     def bad(req, timeout=None):
         return _FakeResp(json.dumps([1, 2, 3]).encode())  # JSON list, not an object
 
-    monkeypatch.setattr("urllib.request.urlopen", bad)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", bad)
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     with pytest.raises(embedding.EmbeddingAPIError, match="non-object response"):
         ef(["a"])
@@ -337,7 +337,7 @@ def test_raises_and_surfaces_server_error_body(monkeypatch):
     def err(req, timeout=None):
         return _FakeResp(json.dumps({"error": {"message": "model not found"}}).encode())
 
-    monkeypatch.setattr("urllib.request.urlopen", err)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", err)
     ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
     with pytest.raises(embedding.EmbeddingAPIError, match="model not found"):
         ef(["a"])

@@ -6,10 +6,10 @@ redirects stdout and loads the vector stack.
 
 Each tool is ``read``, ``write``, or ``maintenance``, plus flags:
 
-* ``mutating``: changes palace state, so it needs the peer-writer lease (#1818).
+* ``mutating``: changes palace state, so it needs the peer-writer lease.
 * ``peer_exempt``: mutating, but writes only logstream.sqlite3 or the knowledge
   graph, never Chroma, so the lease that serialises two Chroma clients has no
-  claim on it (#2297). Read-only mode still refuses it.
+  claim on it. Read-only mode still refuses it.
 * ``vector_write``: mutating and reaches the HNSW segment, where a write into a
   diverged index blocks inside chromadb with no timeout.
 * ``read_only_allowed``: not a read, but read-only mode keeps it. Reconnect is
@@ -21,7 +21,7 @@ Each tool is ``read``, ``write``, or ``maintenance``, plus flags:
 * ``embedding_release``: HTTP drops the request lock around its one embedding call.
 * ``yielding``: HTTP lets queued requests run between its steps (a mine between files).
 
-Read-only mode (#1877) refuses every tool that is not a read, unless it is
+Read-only mode refuses every tool that is not a read, unless it is
 ``read_only_allowed``. That covers hook_settings, which writes config.json, and
 memories_filed_away, which unlinks the checkpoint ack: writes the peer-writer
 lease does not arbitrate.
@@ -114,7 +114,6 @@ def _tools(capability=None, flag=None) -> frozenset:
 
 READ_TOOLS = _tools(capability="read")
 WRITE_TOOLS = _tools(capability="write")
-MAINTENANCE_TOOLS = _tools(capability="maintenance")
 MUTATING_TOOLS = _tools(flag="mutating")
 PEER_WRITER_EXEMPT_TOOLS = _tools(flag="peer_exempt")
 VECTOR_WRITE_TOOLS = _tools(flag="vector_write")

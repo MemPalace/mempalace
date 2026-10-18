@@ -18,15 +18,14 @@ from mempalace.dynamics import (
     DEFAULT_STABILITY,
     DEFAULT_STRENGTH,
     MAX_STRENGTH,
-    effective_strength,
     POTENTIATION_INCREMENT,
     STABILITY_INCREMENT,
     STRENGTH_FLOOR,
     apply_decay,
+    effective_strength,
     initialize_dynamics_fields,
     potentiate,
 )
-
 
 # Fixed reference point so test arithmetic is exact.
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)

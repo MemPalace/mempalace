@@ -5,7 +5,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from coverage.config import read_coverage_config
-
 from coverage_gate import (
     apply_platform_threshold,
     cli_requested_fail_under,

@@ -70,6 +70,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from mempalace import paths
 from mempalace.config import (
     MempalaceConfig,
     sanitize_iso_temporal,
@@ -77,9 +78,11 @@ from mempalace.config import (
     sanitize_name,
 )
 from mempalace.convo_miner import file_conversation_exchange
-from mempalace.knowledge_graph import KnowledgeGraph
-from mempalace.layers import Layer0
+from mempalace.knowledge_graph import KnowledgeGraph, open_graph
+from mempalace.layers import Layer0, fetch_recent_window, recent_read_failure
 from mempalace.palace import MineAlreadyRunning, get_collection
+from mempalace.query_sanitizer import sanitize_query, sanitizer_report
+from mempalace.search_util import build_where_filter
 from mempalace.searcher import search_memories
 
 # When this plugin is loaded by Hermes, ``agent.memory_provider`` is on the
@@ -112,28 +115,12 @@ def _l1_story_from_collection(
     from collections import defaultdict
     from pathlib import Path as _Path
 
-    docs: list = []
-    metas: list = []
-    batch = 500
-    offset = 0
-    max_scan = 2000
-    while True:
-        kwargs = {"include": ["documents", "metadatas"], "limit": batch, "offset": offset}
-        if wing:
-            kwargs["where"] = {"wing": wing}
-        try:
-            chunk = collection.get(**kwargs)
-        except Exception:
-            break
-        batch_docs = chunk.get("documents") or []
-        batch_metas = chunk.get("metadatas") or []
-        if not batch_docs:
-            break
-        docs.extend(batch_docs)
-        metas.extend(batch_metas)
-        offset += len(batch_docs)
-        if len(batch_docs) < batch or len(docs) >= max_scan:
-            break
+    try:
+        # Inline, no deadline: the caller holds _collection_lock for the whole
+        # read, and an abandoned reader thread would outlive it.
+        docs, metas = fetch_recent_window(collection, wing=wing or None, max_scan=2000, budget=None)
+    except Exception as exc:
+        return f"## L1 -- {recent_read_failure(exc)}"
 
     if not docs:
         return "## L1 -- No memories yet."
@@ -622,8 +609,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
     """Hermes memory provider backed by MemPalace."""
 
     DEFAULT_COLLECTION_NAME = "mempalace_drawers"
-    DEFAULT_PALACE_PATH = "~/.mempalace/palace"
-    DEFAULT_IDENTITY_PATH = "~/.mempalace/identity.txt"
+    DEFAULT_PALACE_PATH = paths.display_state_path("palace")
+    DEFAULT_IDENTITY_PATH = paths.display_state_path("identity.txt")
     WORKER_QUEUE_MAX = 500
     # Waits for a palace lock held by a mine before a turn is dropped: ~30s.
     LOCK_RETRY_DELAYS = (1, 2, 4, 8, 16)
@@ -1041,9 +1028,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             # ``initialize`` bridges this provider's resolved palace into
             # that variable (see ``_bridge_palace_env``) — so passthrough
             # reads and writes land in the same palace as live filing and
-            # search. KG tools are NOT passed through: mcp_server resolves
-            # its KG from ``DEFAULT_KG_PATH`` unless its own ``--palace``
-            # CLI flag was given, which no env bridge can influence.
+            # search. KG tools are NOT passed through: this provider also
+            # honours a graph kept next to the palace dir (see _kg_db_path),
+            # which mcp_server does not know about.
             # New tools (everything that has a matching ``tool_*`` in
             # mempalace.mcp_server) dispatch by name derivation. One
             # mempalace asymmetry to remap: ``mempalace_traverse`` maps to
@@ -1380,8 +1367,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if not query:
             return {"error": "Missing required parameter: query"}
         n = max(1, min(int(n_results or 5), 50))
+        sanitized = sanitize_query(query)
         data = search_memories(
-            query,
+            sanitized["clean_query"],
             palace_path=self._palace_path,
             wing=wing or "",
             room=room or "",
@@ -1390,7 +1378,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if isinstance(data, dict) and "error" in data:
             return data
         hits = data.get("results", []) if isinstance(data, dict) else []
-        return {"results": hits, "count": len(hits)}
+        result = {"results": hits, "count": len(hits)}
+        report = sanitizer_report(sanitized)
+        if report:
+            result["query_sanitized"] = True
+            result["sanitizer"] = report
+        return result
 
     def _scan_metadatas(
         self, col: Any, where: Optional[Dict[str, Any]] = None
@@ -1472,7 +1465,8 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             col = self._collection
         if col is None:
             return {"error": "MemPalace not initialized"}
-        metas, truncated = self._scan_metadatas(col, where={"wing": wing})
+        where = build_where_filter(wing, col=col)
+        metas, truncated = self._scan_metadatas(col, where=where)
         rooms: Dict[str, int] = {}
         for m in metas:
             r = (m or {}).get("room", "unknown")
@@ -1488,18 +1482,20 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         return out
 
     def _kg_db_path(self) -> str:
-        """The provider's knowledge-graph DB — sibling of the palace dir.
+        """The provider's knowledge-graph DB.
 
-        Single source of truth for every KG access in this plugin; the KG
-        tools must never fall back to mempalace's global ``DEFAULT_KG_PATH``
-        or they would read a different graph than the one live turns feed.
+        Single source of truth for every KG access in this plugin. The
+        palace's own graph wins once it holds facts; until then a graph
+        earlier releases kept next to the palace dir, if it holds facts,
+        keeps taking reads and writes.
         """
-        return str(Path(self._palace_path).parent / "knowledge_graph.sqlite3")
+        sibling = Path(self._palace_path).parent / paths.KNOWLEDGE_GRAPH_FILENAME
+        return paths.knowledge_graph_path(self._palace_path, legacy=str(sibling))
 
     def _tool_kg_query(self, entity: str, since: Optional[str] = None) -> Dict[str, Any]:
         if not entity:
             return {"error": "Missing required parameter: entity"}
-        kg = KnowledgeGraph(db_path=self._kg_db_path())
+        kg = open_graph(self._kg_db_path(), read=True)
         try:
             relations = kg.query_entity(entity, as_of=since or "")
         finally:
@@ -1559,7 +1555,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 entity = sanitize_kg_value(entity, "entity")
             except ValueError as exc:
                 return {"error": str(exc)}
-        kg = KnowledgeGraph(db_path=self._kg_db_path())
+        kg = open_graph(self._kg_db_path(), read=True)
         try:
             results = kg.timeline(entity) if entity else kg.timeline()
         finally:
@@ -1570,7 +1566,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         return {"entity": entity or "all", "timeline": results, "count": len(results)}
 
     def _tool_kg_stats(self) -> Dict[str, Any]:
-        kg = KnowledgeGraph(db_path=self._kg_db_path())
+        kg = open_graph(self._kg_db_path(), read=True)
         try:
             return kg.stats()
         finally:

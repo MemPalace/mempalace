@@ -12,16 +12,17 @@ No internet. No API key. Your files stay on your machine.
 import logging
 import os
 import sys
-import yaml
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
+
+import yaml
 
 from .project_config import find_project_config
 
 logger = logging.getLogger(__name__)
 
-# Common room patterns — detected from folder names and filenames
-# Format: {folder_keyword: room_name}
+# Common room patterns, detected from folder names and filenames. Each key
+# is a folder keyword and its value the room it maps to.
 FOLDER_ROOM_MAP = {
     "frontend": "frontend",
     "front-end": "frontend",
@@ -333,7 +334,7 @@ def save_config(project_dir: str, project_name: str, rooms: list):
     # Update the config the miner will actually read. A project that already
     # has ``mempalace.yml`` (or a legacy ``mempal.*``) keeps it: writing a new
     # ``mempalace.yaml`` beside it would shadow it, and every setting in it
-    # would stop applying without a word (#2676).
+    # would stop applying without a word.
     existing_path = find_project_config(project_path)
     config_path = existing_path or project_path / "mempalace.yaml"
     if existing_path is not None:

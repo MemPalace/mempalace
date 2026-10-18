@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Iterator, Literal, Optional
 
 if TYPE_CHECKING:
-    from .context import PalaceContext  # noqa: F401  (used in string annotation)
+    from .context import PalaceContext
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ from itertools import combinations
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name
+from .fsio import atomic_write_json
 from .hallways import entity_spelling_key, is_generic_entity, same_file_spelling
 
 logger = logging.getLogger(__name__)
@@ -307,10 +308,7 @@ def proposal_path(config: MempalaceConfig) -> str:
 def save_proposal(config: MempalaceConfig, plan: dict) -> str:
     path = proposal_path(config)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic_write_json(path, plan, private=False, follow_symlinks=False)
     return path
 
 

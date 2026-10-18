@@ -6,8 +6,12 @@ import types
 from hashlib import sha256
 
 import pytest
-
-from _backend_conformance import assert_partition_isolation
+from _backend_conformance import (
+    assert_partition_isolation,
+    assert_update_skips_missing_ids,
+    assert_where_filters_conform,
+    assert_write_batch_validated,
+)
 
 from mempalace.backends import (
     BackendError,
@@ -16,21 +20,21 @@ from mempalace.backends import (
     DimensionMismatchError,
     PalaceRef,
     available_backends,
+    pgvector as pgvector_module,
 )
-from mempalace.backends import pgvector as pgvector_module
-from mempalace.backends.base import UnsupportedCapabilityError
-from mempalace.backends.base import recency_sort_key as _recency_sort_key
+from mempalace.backends._filters import matches_where
+from mempalace.backends._remote_common import as_vector_array
+from mempalace.backends.base import (
+    UnsupportedCapabilityError,
+    recency_sort_key as _recency_sort_key,
+)
 from mempalace.backends.pgvector import (
     PgVectorBackend,
     _PgVectorClient,
     _PgVectorConfig,
-    _matches_where,
-    _vector_distance,
-    _as_vector_array,
     _shared_namespace_key,
     _shared_namespace_slug,
-    _strip_nul,
-    _json_dumps,
+    _vector_distance,
 )
 
 
@@ -49,6 +53,7 @@ class _FakePgVectorClient:
         self.tables: dict = {}
         self.query_calls: list = []
         self.scroll_calls: list = []
+        self.id_lookups: list = []
         self.facet_calls: list = []
         _FakePgVectorClient.instances.append(self)
 
@@ -77,11 +82,11 @@ class _FakePgVectorClient:
 
     def _filtered(self, table, where):
         rows = list(self.tables.get(table, {"rows": {}})["rows"].values())
-        return [row for row in rows if _matches_where(row.get("metadata") or {}, where)]
+        return [row for row in rows if matches_where(row.get("metadata") or {}, where)]
 
     def query_rows(self, table, *, vector, limit, where, with_embedding):
         self.query_calls.append(where)
-        q = _as_vector_array(vector)
+        q = as_vector_array(vector)
         scored = []
         for row in self._filtered(table, where):
             distance = _vector_distance(q, row.get("embedding"))
@@ -105,6 +110,7 @@ class _FakePgVectorClient:
         table,
         *,
         where=None,
+        ids=None,
         with_embedding=False,
         with_document=True,
         limit=None,
@@ -120,7 +126,13 @@ class _FakePgVectorClient:
                 "order_field": order_field,
             }
         )
-        rows = self._filtered(table, where)
+        if ids is not None:
+            self.id_lookups.append(list(ids))
+            store = self.tables.get(table, {"rows": {}})["rows"]
+            rows = [store[item] for item in ids if item in store]
+            rows = [row for row in rows if matches_where(row.get("metadata") or {}, where)]
+        else:
+            rows = self._filtered(table, where)
         if order_field is not None:
             # Mirror the real backend: ORDER BY metadata->>field DESC NULLS
             # LAST, id — then LIMIT/OFFSET. Sorting by id first and then
@@ -164,7 +176,7 @@ class _FakePgVectorClient:
                 rows.pop(doc_id, None)
             return
         for doc_id, row in list(rows.items()):
-            if _matches_where(row.get("metadata") or {}, where):
+            if matches_where(row.get("metadata") or {}, where):
                 rows.pop(doc_id, None)
 
     def count_rows(self, table):
@@ -372,6 +384,27 @@ def test_pgvector_cross_palace_isolation_conformance(tmp_path, fake_pgvector):
     # Same backend + same DSN → same client instance, distinct tables.
     assert cols[0]._table != cols[1]._table
     assert_partition_isolation(backend, cols[0], cols[1], embedding=[1.0, 0.0])
+
+
+def test_pgvector_update_skips_missing_ids_conformance(tmp_path, fake_pgvector):
+    backend = PgVectorBackend()
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+    assert_update_skips_missing_ids(backend, col, embedding=[1.0, 0.0])
+
+
+def test_pgvector_where_filters_conformance(tmp_path, fake_pgvector):
+    backend = PgVectorBackend()
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+    assert_where_filters_conform(backend, col, embedding=[1.0, 0.0])
+
+
+def test_pgvector_write_batch_validated_conformance(tmp_path, fake_pgvector):
+    backend = PgVectorBackend()
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+    assert_write_batch_validated(backend, col, embedding=[1.0, 0.0], add_refuses_duplicates=True)
 
 
 def test_pgvector_namespace_isolation_conformance(tmp_path, fake_pgvector):
@@ -665,7 +698,7 @@ def test_pgvector_get_filtered_page_stays_on_full_scan(tmp_path, fake_pgvector):
     page = col.get(where={"wing": "x"}, limit=1, offset=1, include=["metadatas"])
 
     # A filtered get keeps the full-scan path (no LIMIT/OFFSET pushed) so the
-    # exact _matches_where re-filter runs before pagination.
+    # exact matches_where re-filter runs before pagination.
     assert client.scroll_calls == [
         {
             "where": {"wing": "x"},
@@ -785,9 +818,9 @@ def test_pgvector_get_all_metadata_skips_document_column(tmp_path, fake_pgvector
 def test_pgvector_get_all_metadata_filtered_uses_fast_path(tmp_path, fake_pgvector):
     """Filtered get_all_metadata uses the single-pass metadata-only fast path.
 
-    ``_matches_where`` only reads ``metadata``, so we keep ``with_document=False``
+    ``matches_where`` only reads ``metadata``, so we keep ``with_document=False``
     and apply the post-filter locally on the metadata dicts. SQL pushdown still
-    happens when the filter is pushdownable; the local ``_matches_where`` re-runs
+    happens when the filter is pushdownable; the local ``matches_where`` re-runs
     for array/object semantics #1840's filtered path required.
     """
     _backend, col = _collection(tmp_path)
@@ -1078,6 +1111,56 @@ def test_pgvector_get_recent_custom_order_field(tmp_path, fake_pgvector):
         embeddings=[[1, 0], [0, 1]],
     )
     assert col.get_recent(limit=2, order_field="authored_at").ids == ["b", "a"]
+
+
+def test_pgvector_id_lookup_uses_the_primary_key():
+    """``get(ids=...)`` is a primary-key fetch, not a scan of the table.
+
+    ``id`` is the primary key, so ``id = ANY(%s)`` is an index lookup. The
+    unfiltered ``WHERE TRUE`` form is what used to read every row.
+    """
+    captured = {}
+
+    class _Recorder(_PgVectorClient):
+        def __init__(self):
+            self._config = None
+
+        def _execute(self, sql, params=None, *, fetch=False, many=False):
+            captured["sql"] = sql
+            captured["params"] = params
+            return []
+
+    _Recorder().scroll_rows("tbl", ids=["b", "a"])
+
+    assert "id = ANY(%s)" in captured["sql"]
+    assert captured["params"] == [["b", "a"]]
+
+    captured.clear()
+    assert _Recorder().scroll_rows("tbl", ids=[]) == []
+    assert captured == {}
+
+    _Recorder().scroll_rows("tbl", where={"wing": "x"}, ids=["b"])
+    assert "metadata @>" in captured["sql"]
+    assert "id = ANY(%s)" in captured["sql"]
+    assert captured["params"][-1] == ["b"]
+
+
+def test_pgvector_get_by_id_reads_only_the_requested_ids(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["alpha", "beta", "gamma"],
+        metadatas=[{"wing": "x"}, {"wing": "y"}, {"wing": "x"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.id_lookups.clear()
+
+    got = col.get(ids=["b"], include=["documents"])
+
+    assert got.ids == ["b"]
+    assert got.documents == ["beta"]
+    assert client.id_lookups == [["b"]]
 
 
 def test_pgvector_scroll_rows_sql_orders_by_metadata_field():
@@ -1442,164 +1525,128 @@ def _fake_upsert_client(monkeypatch):
     return client, captured
 
 
-def test_pgvector_upsert_strips_nul_bytes(monkeypatch):
-    """A NUL (0x00) byte in id/document/metadata must never reach Postgres.
+def test_pgvector_upsert_escapes_nul_bytes(monkeypatch):
+    """A NUL in a document is stored as a reversible escape, not deleted.
 
-    psycopg's text/jsonb dumpers reject NUL outright ("PostgreSQL text fields
-    cannot contain NUL (0x00) bytes"), which aborts the entire mine run (#1829)
-    when a single transcript captured a NUL in tool output. ChromaDB and the
-    SQLite backend store the byte verbatim, so pgvector strips it to keep the
-    same inputs ingestible. Strip, not reject: rejecting would re-abort the
-    mine or drop the drawer entirely (recall loss).
+    Postgres text cannot hold NUL. The id is rejected instead of rewritten.
+    The document and metadata values round-trip through the same escape
+    every backend uses. Chroma does not keep the raw byte either.
     """
+    from mempalace.stored_text import FLAG, StoredTextError, decode_record
+
     client, captured = _fake_upsert_client(monkeypatch)
+    with pytest.raises(StoredTextError):
+        client.upsert_rows(
+            "drawers",
+            [
+                {
+                    "id": "draw\x00er",
+                    "document": "before\x00after",
+                    "metadata": {},
+                    "embedding": [1.0, 0.0],
+                }
+            ],
+        )
+
     client.upsert_rows(
         "drawers",
         [
             {
-                "id": "draw\x00er",
+                "id": "drawer",
                 "document": "before\x00after",
-                "metadata": {"go\x00od": "v\x00w", "nested": ["a\x00b", 7]},
+                "metadata": {"good": "v\x00w", "nested": ["a\x00b", 7]},
                 "embedding": [1.0, 0.0],
                 "updated_at": "2026-06-20T00:00:00Z",
             }
         ],
     )
-
-    assert len(captured) == 1, "upsert_rows should bind exactly one row"
     row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
-
-    # No NUL survives into any text-bound parameter (id, document, metadata).
-    assert "\x00" not in row_id
-    assert "\x00" not in document
-    assert "\x00" not in metadata_json
-
-    # Stripping removes only the NUL; surrounding content is otherwise preserved.
+    for field in (row_id, document, metadata_json):
+        assert "\x00" not in field
+        field.encode("utf-8")
     assert row_id == "drawer"
-    assert document == "beforeafter"
-    assert json.loads(metadata_json) == {"good": "vw", "nested": ["ab", 7]}
+    assert json.loads(metadata_json)[FLAG] == 1
+    doc, meta = decode_record(document, json.loads(metadata_json))
+    assert doc == "before\x00after"
+    assert meta == {"good": "v\x00w", "nested": ["a\x00b", 7]}
 
 
-def test_strip_nul_helper():
-    """``_strip_nul`` removes NUL from strings, list/tuple items, and dict keys
-    and values; NUL-free input and non-string scalars are returned unchanged."""
-    assert _strip_nul("a\x00b") == "ab"
-    assert _strip_nul("clean") == "clean"
-    assert _strip_nul("") == ""
-    assert _strip_nul("\x00") == ""
-    # Keys, values, list items, and nested structures are all stripped.
-    assert _strip_nul({"k\x00": "v\x00", "n": [1, "x\x00y"]}) == {"k": "v", "n": [1, "xy"]}
-    assert _strip_nul([{"a\x00": "b\x00"}, "c\x00"]) == [{"a": "b"}, "c"]
-    # Tuples recurse too and stay tuples (defends direct callers that pass
-    # un-normalized metadata before the JSON round-trip).
-    assert _strip_nul(("a\x00b", 1, ["c\x00"])) == ("ab", 1, ["c"])
-    # Keys differing only by a NUL collapse, last wins (documented, harmless:
-    # real metadata keys are fixed field names, never NUL-only-distinguished).
-    assert _strip_nul({"a\x00": 1, "a": 2}) == {"a": 2}
-    # Non-string scalars pass through unchanged (bool stays bool, not int).
-    assert _strip_nul(7) == 7
-    assert _strip_nul(3.5) == 3.5
-    assert _strip_nul(True) is True
-    assert _strip_nul(None) is None
+def test_pgvector_upsert_escapes_lone_surrogates(monkeypatch):
+    """A lone surrogate is escaped, not replaced with U+FFFD, and ids are rejected."""
+    from mempalace.stored_text import StoredTextError, decode_record
 
-
-def test_pgvector_upsert_replaces_lone_surrogates(monkeypatch):
-    """A lone UTF-16 surrogate in id/document/metadata must never reach Postgres.
-
-    psycopg encodes text/jsonb parameters as UTF-8, and a lone surrogate has no
-    UTF-8 encoding, so it raises UnicodeEncodeError ("surrogates not allowed") and
-    aborts the entire mine run (the surrogate sibling of the NUL abort in #1829).
-    ChromaDB sanitizes document text via config.strip_lone_surrogates;
-    pgvector matches it (for document and metadata) by replacing the surrogate with
-    U+FFFD rather than dropping the drawer (recall loss) or re-aborting the mine.
-    """
-    # Build the surrogates with chr() so this source file stays valid UTF-8 (a raw
-    # lone surrogate has no UTF-8 encoding and would not parse).
-    hi, lo, s3, s4, s5 = (chr(c) for c in (0xD800, 0xDFFF, 0xD834, 0xDCA1, 0xDC00))
-    repl = chr(0xFFFD)
+    hi, lo, s4, s5 = (chr(c) for c in (0xD800, 0xDFFF, 0xDCA1, 0xDC00))
     client, captured = _fake_upsert_client(monkeypatch)
+    with pytest.raises(StoredTextError):
+        client.upsert_rows(
+            "drawers",
+            [{"id": f"draw{hi}er", "document": "x", "metadata": {}, "embedding": [1.0, 0.0]}],
+        )
     client.upsert_rows(
         "drawers",
         [
             {
-                "id": f"draw{hi}er",
+                "id": "drawer",
                 "document": f"before{lo}after",
-                "metadata": {f"go{s3}od": f"v{s4}w", "nested": [f"a{s5}b", 7]},
+                "metadata": {"good": f"v{s4}w", "nested": [f"a{s5}b", 7]},
                 "embedding": [1.0, 0.0],
                 "updated_at": "2026-06-20T00:00:00Z",
             }
         ],
     )
-
-    assert len(captured) == 1, "upsert_rows should bind exactly one row"
     row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
-
-    # Every text-bound parameter must now be UTF-8 encodable (what psycopg does to
-    # bind it); a surviving lone surrogate would raise here.
     for field in (row_id, document, metadata_json):
         field.encode("utf-8")
+        assert lo not in field and s4 not in field and s5 not in field
+    doc, meta = decode_record(document, json.loads(metadata_json))
+    assert doc == f"before{lo}after"
+    assert meta["good"] == f"v{s4}w"
+    assert meta["nested"] == [f"a{s5}b", 7]
 
-    # Surrogates are replaced with U+FFFD, not dropped: surrounding content stays
-    # and each lone surrogate maps to exactly one replacement character.
-    assert row_id == f"draw{repl}er"
-    assert document == f"before{repl}after"
-    assert json.loads(metadata_json) == {f"go{repl}od": f"v{repl}w", "nested": [f"a{repl}b", 7]}
 
+def test_pgvector_upsert_escapes_nul_and_surrogate_together(monkeypatch):
+    """One row can carry both a NUL and a lone surrogate and still round-trip."""
+    from mempalace.stored_text import decode_record
 
-def test_pgvector_upsert_strips_nul_and_surrogate_together(monkeypatch):
-    """A single row carrying *both* a NUL and a lone surrogate must come out
-    clean on every text-bound field.
-
-    This pins the composition of the two sibling fixes (#1829 NUL, #1833
-    surrogate), which edit the same ``upsert_rows`` binding: NUL is stripped
-    pre-serialization and the surrogate replaced post-serialization. A rebase
-    that kept only one strip would regress the other byte class silently, since
-    neither sibling test exercises both at once.
-    """
     sur = chr(0xD800)
-    repl = chr(0xFFFD)
     client, captured = _fake_upsert_client(monkeypatch)
     client.upsert_rows(
         "drawers",
         [
             {
-                "id": f"id\x00{sur}x",
+                "id": "drawer",
                 "document": f"doc\x00{sur}y",
-                "metadata": {f"k\x00{sur}": f"v\x00{sur}", "nested": [f"a\x00{sur}b", 7]},
+                "metadata": {"key": f"v\x00{sur}", "nested": [f"a\x00{sur}b", 7]},
                 "embedding": [1.0, 0.0],
                 "updated_at": "2026-06-20T00:00:00Z",
             }
         ],
     )
-
-    assert len(captured) == 1, "upsert_rows should bind exactly one row"
-    row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
-
-    # Neither unstorable byte survives, and each bound field is UTF-8 encodable.
-    for field in (row_id, document, metadata_json):
+    document, metadata_json = captured[0][1], captured[0][2]
+    for field in (document, metadata_json):
         assert "\x00" not in field
         assert sur not in field
         field.encode("utf-8")
+    doc, meta = decode_record(document, json.loads(metadata_json))
+    assert doc == f"doc\x00{sur}y"
+    assert meta["key"] == f"v\x00{sur}"
+    assert meta["nested"] == [f"a\x00{sur}b", 7]
 
-    # NUL dropped, surrogate -> U+FFFD, surrounding content preserved.
-    assert row_id == f"id{repl}x"
-    assert document == f"doc{repl}y"
-    assert json.loads(metadata_json) == {f"k{repl}": f"v{repl}", "nested": [f"a{repl}b", 7]}
 
+def test_pgvector_write_uses_the_shared_escape_not_a_replacement_character():
+    """The pgvector docstring used to claim Chroma stores NUL verbatim.
 
-def test_strip_lone_surrogates_reuses_config_util():
-    """The pgvector write path strips surrogates via ``config.strip_lone_surrogates``
-    applied to id/document and the serialized metadata JSON (no pgvector-local
-    helper). End-to-end coverage is ``test_pgvector_upsert_replaces_lone_surrogates``;
-    the utility's own edge cases live in ``tests/test_clean_lone_surrogates.py``."""
-    from mempalace.config import strip_lone_surrogates
+    Both backends now escape it. ``strip_lone_surrogates`` is not the write path.
+    """
+    from mempalace.stored_text import decode_record, encode_record
 
-    # ensure_ascii=False leaves a metadata surrogate raw in the JSON, so a single
-    # pass over the serialized string cleans it (the property the write path relies on).
-    raw = _json_dumps({"k": f"v{chr(0xD800)}w"})
-    cleaned = strip_lone_surrogates(raw)
-    assert chr(0xD800) not in cleaned
-    assert json.loads(cleaned) == {"k": f"v{chr(0xFFFD)}w"}
+    original = f"v{chr(0xD800)}w\x00"
+    stored, meta = encode_record(original, None)
+    stored.encode("utf-8")
+    assert "\x00" not in stored
+    assert chr(0xD800) not in stored
+    assert chr(0xFFFD) not in stored
+    assert decode_record(stored, meta) == (original, {})
 
 
 def test_pgvector_backend_advertises_supports_metadata_facets():
@@ -1680,7 +1727,7 @@ def test_pgvector_facet_counts_empty_collection(tmp_path, fake_pgvector):
 
 def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvector):
     """Pushdown filters reach the SQL layer (proves the where path goes through
-    ``_where_to_sql``, not the local ``_matches_where`` post-filter)."""
+    ``_where_to_sql``, not the local ``matches_where`` post-filter)."""
     _backend, col = _collection(tmp_path)
     col.upsert(
         ids=["1"],

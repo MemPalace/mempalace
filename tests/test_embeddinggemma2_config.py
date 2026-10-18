@@ -6,7 +6,6 @@ import pytest
 
 from mempalace.config import DEFAULT_EMBEDDINGGEMMA2_REVISION, MempalaceConfig
 
-
 _ENV_KEYS = (
     "MEMPALACE_EMBEDDINGGEMMA2_DIMENSION",
     "MEMPALACE_EMBEDDINGGEMMA2_MODALITIES",

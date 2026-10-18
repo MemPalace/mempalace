@@ -4,7 +4,6 @@ from unittest.mock import Mock
 
 import chromadb
 import pytest
-
 from _mcp_server_helpers import _patch_mcp_server
 
 
@@ -285,7 +284,7 @@ def test_diary_sqlite_invalid_names_do_not_probe_sql_or_open_collection(
 
 @pytest.mark.parametrize("backend", ["sqlite_exact", "custom_backend"])
 def test_diary_sqlite_unsupported_backend_keeps_legacy_paging(diary_palace, monkeypatch, backend):
-    from mempalace.backends import chroma as chroma_backend
+    from mempalace.backends import chroma_sqlite as chroma_backend
 
     server, collection = diary_palace
     _seed(collection, [(f"entry-{i}", f"Entry {i}", _diary_metadata(str(i))) for i in range(3)])
@@ -304,7 +303,7 @@ def test_diary_sqlite_unsupported_backend_keeps_legacy_paging(diary_palace, monk
 
 
 def test_diary_sqlite_unavailable_schema_keeps_legacy_paging(diary_palace, monkeypatch, config):
-    from mempalace.backends import chroma as chroma_backend
+    from mempalace.backends import chroma_sqlite as chroma_backend
 
     server, collection = diary_palace
     _seed(collection, [(f"entry-{i}", f"Entry {i}", _diary_metadata(str(i))) for i in range(3)])

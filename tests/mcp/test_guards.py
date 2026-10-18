@@ -9,7 +9,6 @@ import re
 import sqlite3
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 
@@ -187,15 +186,16 @@ def test_read_only_refuses_exactly_the_refused_set(monkeypatch):
 def test_read_only_refuses_every_daemon_write_tool():
     """Read-only must not be laxer than the daemon's own write classification.
 
-    service.WRITE_TOOLS is a security allowlist: execute_job lets the generic
+    WRITE_TOOLS is a security allowlist: execute_job lets the generic
     mcp_tool escape hatch run write-classified tools only. A tool the daemon
-    calls a write while read-only serves it is the exact gap this fixes, and
-    mempalace_hook_settings was that tool.
+    calls a write while read-only serves it would slip through, and
+    mempalace_hook_settings was such a tool.
     """
-    from mempalace import mcp_server, service
+    from mempalace import mcp_server
+    from mempalace.tool_capabilities import WRITE_TOOLS
 
-    assert service.WRITE_TOOLS <= mcp_server._READ_ONLY_REFUSED_TOOLS
-    assert "mempalace_hook_settings" in service.WRITE_TOOLS
+    assert WRITE_TOOLS <= mcp_server._READ_ONLY_REFUSED_TOOLS
+    assert "mempalace_hook_settings" in WRITE_TOOLS
 
 
 def test_peer_writer_guard_does_not_gate_hook_settings(monkeypatch):

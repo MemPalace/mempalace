@@ -26,7 +26,7 @@ next) never touches the sync logic here.
 import logging
 
 from .transport import (
-    PEERS_FILENAME,  # noqa: F401 — re-exported for existing importers
+    PEERS_FILENAME,
     TransportError,
     get_transport,
     http_request,

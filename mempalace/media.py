@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 _MEDIA_MODALITY = {"image": "vision", "audio": "audio", "video": "vision"}
 _SUPPORTED_MEDIA_TYPES = frozenset(_MEDIA_MODALITY)
 _SUPPORTED_EMBEDDING_DIMENSIONS = frozenset({768, 512, 256, 128})
-ASSET_EMBEDDING_DIMENSION = 768  # default only; each asset records the configured width
 
 
 class MediaAssetError(RuntimeError):
@@ -148,12 +147,6 @@ class MediaAsset:
         if self.duration is not None:
             metadata["duration"] = float(self.duration)
         return metadata
-
-
-def media_asset_exists(asset: MediaAsset | dict[str, Any]) -> bool:
-    """Check whether a stored reference still resolves to a local file."""
-    source_file = asset.source_file if isinstance(asset, MediaAsset) else asset.get("source_file")
-    return isinstance(source_file, str) and Path(source_file).is_file()
 
 
 def stable_asset_id(source_file: str | os.PathLike[str]) -> str:
