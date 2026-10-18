@@ -92,3 +92,39 @@ def test_purge_removes_the_file_when_nothing_is_left(tmp_path):
 
     assert purge_drawer_revisions(palace, ["d1"]) == 1
     assert not revisions_path(palace).exists()
+
+
+class _SharingViolation(PermissionError):
+    winerror = 32
+
+
+def test_purge_retries_a_rewrite_a_reader_blocks(tmp_path, monkeypatch):
+    """Windows refuses to replace the file while a reader has it open; the
+    purge retries instead of failing the delete it follows."""
+    import errno
+    import os
+
+    import mempalace.fsio as fsio
+
+    palace = str(tmp_path)
+    append_drawer_revision(palace, "d1", "gone")
+    append_drawer_revision(palace, "d2", "kept")
+    real_replace = os.replace
+    refusals = []
+
+    def held_twice(src, dst):
+        if len(refusals) < 2:
+            refusals.append(dst)
+            raise _SharingViolation(errno.EACCES, "being used by another process")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", held_twice)
+    monkeypatch.setattr(fsio.time, "sleep", lambda s: None)
+
+    assert purge_drawer_revisions(palace, ["d1"]) == 1
+
+    assert len(refusals) == 2
+    raw = revisions_path(palace).read_bytes()
+    assert b"\r" not in raw
+    assert [r["content"] for r in load_drawer_revisions(palace)] == ["kept"]
+    assert list(tmp_path.iterdir()) == [revisions_path(palace)]

@@ -1281,7 +1281,7 @@ def test_sqlite_wing_room_counts_exact_tally(palace_path, seeded_collection):
     join multiplied rows (e.g. a drawer carrying several metadata keys), the
     total would exceed 4 and the room counts would inflate.
     """
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     assert result is not None
@@ -1299,7 +1299,7 @@ def test_status_falls_back_to_chroma_when_sqlite_unreadable(palace_path, seeded_
     correct tally — not crash or print nothing."""
     from unittest.mock import patch
 
-    with patch("mempalace.backends.chroma._sqlite_wing_room_counts", return_value=None):
+    with patch("mempalace.backends.chroma_sqlite._sqlite_wing_room_counts", return_value=None):
         status(palace_path)
 
     out = capsys.readouterr().out
@@ -1313,7 +1313,7 @@ def test_sqlite_wing_room_counts_none_when_collection_absent(palace_path):
     printing a misleading ``0 drawers`` tally (State C, #1498)."""
     import chromadb
 
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     chromadb.PersistentClient(path=palace_path)  # creates chroma.sqlite3, no collection
     assert _sqlite_wing_room_counts(palace_path, "mempalace_drawers") is None
@@ -1325,7 +1325,7 @@ def test_sqlite_wing_room_counts_numeric_wing_not_dropped(palace_path, collectio
     ChromaDB path, which surfaces the native number — not silently bucketed
     under '?'. Without the int/float COALESCE this row would vanish into '?'
     while returning a non-None result that skips the fallback."""
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     collection.add(
         ids=["drawer_numeric_meta"],
@@ -1343,7 +1343,7 @@ def test_sqlite_wing_room_counts_partial_metadata_buckets_question_mark(palace_p
     '?' for the missing axis, never dropped. Guards the LEFT JOINs against
     being narrowed to inner joins, which would silently discard partial
     drawers and undercount the total."""
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     collection.add(
         ids=["drawer_wing_only", "drawer_room_only"],
@@ -1368,7 +1368,7 @@ def test_sqlite_wing_room_counts_returns_none_on_locked_db(palace_path, seeded_c
     import sqlite3 as _sqlite3
     from unittest.mock import patch
 
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     with patch(
         "mempalace.backends.chroma.sqlite3.connect",
@@ -1510,7 +1510,7 @@ def test_process_file_stamps_metadata_with_read_time_mtime_not_a_later_restat(
     monkeypatch.setattr(
         miner,
         "_read_text_no_follow",
-        lambda filepath, root: ("print('hello')\n" * 20, read_time_mtime),
+        lambda filepath, root: ("print('hello')\n" * 20, read_time_mtime, "utf-8"),
     )
     monkeypatch.setattr(os.path, "getmtime", lambda path: later_disk_mtime)
     chunks = [{"content": "chunk 0 " * 20, "chunk_index": 0}]
@@ -1722,8 +1722,10 @@ def test_process_file_leaves_a_failed_write_marked_unfinished(tmp_path, monkeypa
             self.upsert_calls = 0
             self.deleted_sources = []
 
-        def get(self, where=None, limit=None, offset=0, include=None):
+        def get(self, ids=None, where=None, limit=None, offset=0, include=None):
             records = self.records
+            if ids is not None:
+                records = [record for record in records if record["id"] in ids]
             if where and "source_file" in where:
                 records = [
                     record
@@ -2092,8 +2094,9 @@ def _make_minable_project(project_root: Path, n_files: int = 3) -> None:
 
 def test_mine_keyboard_interrupt_prints_summary_and_exits_130(tmp_path, capsys):
     """A KeyboardInterrupt mid-loop produces the clean summary + exit 130."""
-    import pytest
     from unittest.mock import patch
+
+    import pytest
 
     project_root = tmp_path / "proj"
     project_root.mkdir()
@@ -2126,8 +2129,9 @@ def test_mine_keyboard_interrupt_quotes_path_with_spaces_in_resume_hint(tmp_path
     spaces / metacharacters yields a copy-paste-safe `mempalace mine ...`
     command. Otherwise users on a path like "My Project" hit a broken
     invocation when they re-run after Ctrl-C."""
-    import pytest
     from unittest.mock import patch
+
+    import pytest
 
     project_root = tmp_path / "my project"
     project_root.mkdir()
@@ -2466,8 +2470,9 @@ def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
     banner before propagating, so users don't see a silent exit-0 with no
     completion message (#1296 Failure 2). Re-raise preserves the traceback
     and yields a non-zero exit code."""
-    import pytest
     from unittest.mock import patch
+
+    import pytest
 
     project_root = tmp_path / "proj"
     project_root.mkdir()
@@ -2496,8 +2501,9 @@ def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
 
 def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
     """Our own per-target PID slot is removed in the finally clause."""
-    import pytest
     from unittest.mock import patch
+
+    import pytest
 
     project_root = tmp_path / "proj"
     project_root.mkdir()
@@ -3198,8 +3204,7 @@ def test_process_file_records_the_directory_it_mined_from(tmp_path, monkeypatch)
     from, which is the directory ``sync`` asks about later. Without it, sync
     cannot tell a witness in that directory from a witness on a volume
     mounted there since (#2320)."""
-    from mempalace import miner
-    from mempalace import source_identity as si
+    from mempalace import miner, source_identity as si
 
     class FakeCol:
         def __init__(self):
@@ -3258,8 +3263,7 @@ def test_recording_the_directory_writes_nothing_into_the_project(tmp_path):
     and the real one has to come back with the identity actually recorded, or
     this would pass against a tree where nothing takes it.
     """
-    from mempalace import miner
-    from mempalace import source_identity as si
+    from mempalace import miner, source_identity as si
 
     project = tmp_path / "proj"
     project.mkdir()
@@ -3371,7 +3375,7 @@ def test_metadata_scan_reads_a_schema_without_bool_value():
     the table has instead of failing on the missing one."""
     import sqlite3
 
-    from mempalace.backends.chroma import _sqlite_iter_metadata
+    from mempalace.backends.chroma_sqlite import _sqlite_iter_metadata
 
     with sqlite3.connect(":memory:") as conn:
         conn.executescript(
@@ -3527,8 +3531,8 @@ def _prefetch_cases_palace(tmp_path):
         # 2 drawers short of 3 is a partial pass.
         *drawers("mixed_totals", 1, source_mtime=mtime["mixed_totals"], chunk_total=2),
         *drawers("mixed_totals", 1, source_mtime=mtime["mixed_totals"], chunk_total=3),
-        # A string total cannot prove completeness -> not mined.
-        *drawers("text_total", 1, source_mtime=mtime["text_total"], chunk_total="1"),
+        # A total that is not a number cannot prove completeness -> not mined.
+        *drawers("text_total", 1, source_mtime=mtime["text_total"], chunk_total="one"),
     ]
     col.add(
         ids=[f"d{i}" for i in range(len(rows))],
@@ -3723,9 +3727,17 @@ def test_prefetch_mined_set_reads_mixed_totals_the_same_in_any_order(totals):
 
 
 def test_prefetch_mined_set_leaves_an_unprovable_source_to_the_per_file_check():
-    col = _RowsCollection(_exchange_rows("s.jsonl", "1"))
+    col = _RowsCollection(_exchange_rows("s.jsonl", "one"))
     assert prefetch_mined_set(col, extract_mode="exchange") == {}
     assert file_already_mined(col, "s.jsonl", extract_mode="exchange") is False
+
+
+def test_a_legacy_numeric_string_total_reads_as_a_number():
+    # Rows written before typed metadata may hold "1" for chunk_total; both
+    # checks read it as 1 instead of re-mining the file forever.
+    col = _RowsCollection(_exchange_rows("s.jsonl", "1"))
+    assert prefetch_mined_set(col, extract_mode="exchange") == {"s.jsonl": 1.0}
+    assert file_already_mined(col, "s.jsonl", extract_mode="exchange") is True
 
 
 @pytest.mark.parametrize("totals", [(None, "x"), ("x", None)])

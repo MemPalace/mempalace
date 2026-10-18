@@ -32,18 +32,19 @@ Usage:
 
 from __future__ import annotations
 
-import json
-import re
-import os
 import functools
-from pathlib import Path
+import json
+import os
+import re
 from collections import defaultdict
+from pathlib import Path
 
 from mempalace.i18n import get_entity_patterns
 from mempalace.project_config import MEMPALACE_PROJECT_FILES
 
+from . import paths
 
-# ==================== COCA CONTENT-WORD FILTER (Tier 2 linguistics cleanup) ====================
+# ==================== COCA CONTENT-WORD FILTER ====================
 #
 # Common English content words that frequently appear capitalized (sentence
 # start, headings, markdown emphasis) but are NOT proper nouns. Filtering
@@ -54,10 +55,8 @@ from mempalace.project_config import MEMPALACE_PROJECT_FILES
 # once on first call via ``_get_coca_filter``. Matching is case-insensitive:
 # callers must lowercase the candidate before lookup.
 #
-# Tier 3 (planned) will add a known-systems lexicon that protects compound
-# names like "Claude Code" — for now, the multi-word path in
-# ``extract_candidates`` is intentionally NOT filtered, so legitimate
-# compounds remain detectable.
+# The multi-word path in ``extract_candidates`` is intentionally NOT
+# filtered, so legitimate compounds like "Claude Code" remain detectable.
 
 
 @functools.lru_cache(maxsize=1)
@@ -79,13 +78,13 @@ def _get_coca_filter() -> frozenset[str]:
         return frozenset()
 
 
-# ==================== KNOWN-SYSTEMS COMPOUND LEXICON (Tier 3 linguistics cleanup) ====================
+# ==================== KNOWN-SYSTEMS COMPOUND LEXICON ====================
 #
 # Multi-word product / system names that must be detected atomically — NOT
 # decomposed into their constituent words. When "Claude Code" appears in
 # content, the entity detector counts the compound, not the parts. Without
 # this pre-pass, the single-word loop would split "Claude Code" into
-# "Claude" + "Code", and the COCA filter (Tier 2) would drop "Code" as a
+# "Claude" + "Code", and the COCA filter would drop "Code" as a
 # content word — leaving "Claude" alone with the wrong attribution.
 #
 # Data file: ``mempalace/data/known_systems.json``. Loaded once on first
@@ -236,7 +235,7 @@ READABLE_EXTENSIONS = {
     ".rb",
     ".go",
     ".rs",
-    # Mirrors miner.READABLE_EXTENSIONS: Business Central AL (#278) and
+    # Mirrors miner.READABLE_EXTENSIONS: Business Central AL and
     # PowerShell, so an AL-only repo still has files to sample.
     ".al",
     ".ps1",
@@ -253,7 +252,7 @@ SKIP_DIRS = {
     "build",
     ".next",
     "coverage",
-    ".mempalace",
+    paths.DIRNAME,
     ".terraform",
     "vendor",
     "target",
@@ -280,7 +279,7 @@ SKIP_FILENAMES = {
 # Entity-candidate matching is ReDoS-prone: the English candidate pattern's
 # nested alternation (i18n/en.json) backtracks catastrophically on a long
 # unbroken run of printable ASCII (base64, minified JS, hashes, data URIs),
-# pinning a mine on one ~5000-char window for hours (#2063). Such a run is never
+# pinning a mine on one ~5000-char window for hours. Such a run is never
 # a name, so it is collapsed to a space before single-word matching. Scope:
 #   * ASCII-only ([!-~]): non-ASCII scripts (CJK, Cyrillic, Devanagari,
 #     accented Latin) are deliberately left untouched — a CJK paragraph is one
@@ -296,7 +295,7 @@ _LONG_ASCII_RUN_RX = re.compile(rf"[!-~]{{{_MAX_CANDIDATE_TOKEN_LEN},}}")
 
 
 def _collapse_long_ascii_runs(text: str) -> str:
-    """Collapse a long unbroken run of printable ASCII to a single space (#2063).
+    """Collapse a long unbroken run of printable ASCII to a single space.
 
     Applied only before single-word candidate matching — the whitespace-delimited
     multi-word patterns cannot backtrack on such runs. See ``_LONG_ASCII_RUN_RX``
@@ -321,7 +320,7 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
 
     counts: defaultdict = defaultdict(int)
 
-    # Tier 3 — known-systems compound pre-pass. Find compound product names
+    # Known-systems compound pre-pass. Find compound product names
     # ("Claude Code", "GitHub Copilot", ...) FIRST and mask them out of the
     # working text so the subsequent single-word + multi-word loops don't
     # re-decompose them into their constituent tokens.
@@ -330,7 +329,7 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
         counts[compound] += n
 
     # Single-word candidates — one pre-wrapped pattern per language.
-    # Collapse long ASCII blobs first (base64/minified) to defuse ReDoS (#2063).
+    # Collapse long ASCII blobs first (base64/minified) to defuse ReDoS.
     candidate_text = _collapse_long_ascii_runs(working_text)
     for wrapped_pat in patterns["candidate_patterns"]:
         try:
@@ -341,7 +340,7 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
             wl = word.lower()
             if wl in stopwords:
                 continue
-            # Tier 2 linguistics cleanup: block common English content words
+            # Block common English content words
             # (Code, Brutal, Phase, Line, Note, ...) from entity candidacy.
             # Multi-word path below is intentionally not filtered so
             # compound names like "Claude Code" still get detected.

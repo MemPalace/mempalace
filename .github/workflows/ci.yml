@@ -108,10 +108,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
       - run: cargo fmt --all --check
+      - name: Clippy (warnings fail the job)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo check --workspace --locked
       - run: cargo test -p mempalace-core -p mempalace-cli --locked
       - run: pip install -e ".[dev]" "maturin>=1.7,<2"

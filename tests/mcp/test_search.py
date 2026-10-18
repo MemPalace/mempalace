@@ -1,13 +1,12 @@
 """MCP server tests — search tool and date-window filters."""
 
 import json
-from types import SimpleNamespace
 import sys
 import warnings
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 from _mcp_server_helpers import (
     _patch_mcp_server,
 )
@@ -24,6 +23,18 @@ class TestSearchTool:
         # Top result should be the auth drawer
         top = result["results"][0]
         assert "JWT" in top["text"] or "authentication" in top["text"].lower()
+
+    def test_search_reports_a_truncated_query(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        query = "You are a helpful assistant with tools. " * 20 + "How do JWT tokens work?"
+        result = tool_search(query=query)
+        assert result["query_sanitized"] is True
+        assert result["sanitizer"]["truncated"] is True
+        assert result["sanitizer"]["replaced_lone_surrogates"] is False
 
     def test_search_with_wing_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -375,10 +386,20 @@ class TestSearchTool:
 
         monkeypatch.setattr(mcp_server, "search_memories", lambda *a, **kw: pytest.fail())
 
-        result = mcp_server.tool_search(query="rareterm", candidate_strategy="bm25")
+        response = mcp_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "mempalace_search",
+                    "arguments": {"query": "rareterm", "candidate_strategy": "bm25"},
+                },
+            }
+        )
 
-        assert "error" in result
-        assert "candidate_strategy" in result["error"]
+        assert response["error"]["code"] == -32602
+        assert "candidate_strategy" in response["error"]["message"]
 
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)

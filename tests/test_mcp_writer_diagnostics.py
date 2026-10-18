@@ -5,6 +5,7 @@ import json
 import pytest
 
 from mempalace import mcp_server as mcp, palace
+from mempalace.hub_client import HubClient
 
 
 @pytest.fixture
@@ -121,16 +122,15 @@ def test_light_dispatch_writes_and_reads_after_config_repair(isolated_writer, mo
 def test_light_hub_forward_does_not_acquire_local_writer(isolated_writer, monkeypatch):
     from mempalace import mcp_light_server
 
-    monkeypatch.setattr(mcp, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
+    hub = HubClient("/p", {"host": "127.0.0.1", "port": 9})
+    monkeypatch.setattr(
+        hub, "post", lambda *a, **kw: {"jsonrpc": "2.0", "id": 1, "result": {"content": []}}
+    )
+    monkeypatch.setattr(mcp, "_hub_proxy_target", lambda: hub)
     monkeypatch.setattr(
         mcp,
         "_acquire_mcp_writer_lock",
         lambda: pytest.fail("Client must not acquire the hub's writer lease"),
-    )
-    monkeypatch.setattr(
-        mcp,
-        "_forward_request_to_hub",
-        lambda *a: {"jsonrpc": "2.0", "id": 1, "result": {"content": []}},
     )
     result = mcp_light_server.dispatch_light_stdio_request(
         {
@@ -154,6 +154,7 @@ def test_light_hub_forward_does_not_acquire_local_writer(isolated_writer, monkey
 def test_peer_sync_thread_does_not_pollute_unrelated_palace(tmp_path, monkeypatch):
     """Issue #2493: peer sync thread must not create or mutate other palaces."""
     import threading
+
     import mempalace.logsync as logsync_mod
     from mempalace.config import MempalaceConfig
 

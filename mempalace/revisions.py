@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from .fsio import atomic_write_bytes
+from .stored_text import dumps_internal
+from .timeutil import utc_now_iso
 
 _REVISION_FILENAME = "drawer_revisions.jsonl"
 
@@ -43,9 +46,9 @@ def append_drawer_revision(
         "drawer_id": drawer_id,
         "content": content,
         "metadata": metadata or {},
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "recorded_at": utc_now_iso(),
     }
-    line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+    line = dumps_internal(record, default=str) + "\n"
     with _revisions_lock(path):
         if _ends_mid_line(path):
             line = "\n" + line  # a crash tore the last append; start a fresh line
@@ -108,7 +111,7 @@ def purge_drawer_revisions(
 
     A revision matches when its ``drawer_id`` is in ``drawer_ids`` or its
     recorded ``source_file`` equals ``source_file``. The file is rewritten
-    through a temp file and ``os.replace``, so a crash leaves either the old
+    through ``fsio.atomic_write_bytes``, so a crash leaves either the old
     or the new file. Lines a crash tore are unreadable, so they are dropped
     too. The file is removed once nothing is left.
     """
@@ -147,15 +150,5 @@ def _purge_locked(path: Path, ids: set, source_file: str | None) -> int:
     if not kept:
         path.unlink()
         return removed
-    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-    try:
-        with os.fdopen(os.open(str(tmp), flags, 0o600), "wb") as handle:
-            handle.write(b"\n".join(kept) + b"\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(str(tmp), str(path))
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+    atomic_write_bytes(path, b"\n".join(kept) + b"\n")
     return removed

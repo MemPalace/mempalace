@@ -80,9 +80,7 @@ mempalace/
 ├── entity_detector.py   # Auto-detect people/projects from content
 ├── entity_registry.py   # Entity storage and disambiguation
 ├── layers.py            # L0-L3 memory wake-up stack
-├── onboarding.py        # Interactive first-run setup
 ├── repair.py            # Palace repair and consistency checks
-├── dedup.py             # Deduplication
 ├── migrate.py           # ChromaDB version migration
 ├── spellcheck.py        # Auto-correct user messages
 ├── exporter.py          # Palace data export

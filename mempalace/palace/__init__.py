@@ -22,8 +22,8 @@ import time
 from pathlib import Path
 from typing import List, Optional, Union
 
+from .. import paths
 from .._source_state import source_fingerprint
-
 from ..backends import (
     BackendClosedError,
     BackendError,
@@ -44,8 +44,9 @@ from ..entity_detector import (
     _collapse_long_ascii_runs,
     _get_coca_filter,
 )
+from ..metadata_types import coerce_metadata_types
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 SKIP_DIRS = {
     ".git",
@@ -58,7 +59,7 @@ SKIP_DIRS = {
     "build",
     ".next",
     "coverage",
-    ".mempalace",
+    paths.DIRNAME,
     ".ruff_cache",
     ".mypy_cache",
     ".pytest_cache",
@@ -84,7 +85,13 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 #
 # v2 (2026-04): introduced strip_noise() for Claude Code JSONL; previous
 #               drawers stored system tags / hook chrome verbatim.
-NORMALIZE_VERSION = 2
+# v3 (2026-10): user turns are no longer spell-corrected by default, ChatGPT
+#               exports follow the active branch, lossy parsing steps are
+#               stamped in ``transforms``, a conversation is filed under every
+#               file that holds it, and non-UTF-8 sources decode losslessly.
+#               Text that comes out the same keeps its stored embedding, so
+#               the re-mine embeds only what changed.
+NORMALIZE_VERSION = 3
 
 # Revision of the conversation exchange chunker (``convo_miner.chunk_exchanges``),
 # stamped on exchange-mode convo rows as ``convo_chunker_version``. The

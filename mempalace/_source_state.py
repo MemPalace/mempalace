@@ -3,6 +3,10 @@
 import os
 
 
+class SourceChangedDuringReadError(OSError):
+    """A source changed while it was being read; retry on a later pass."""
+
+
 def source_fingerprint(file_stat: os.stat_result) -> str:
     """Encode the source's identity and change state as backend-safe metadata.
 

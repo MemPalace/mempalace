@@ -34,9 +34,9 @@ class TestSanitizeContentStillRejectsNuls:
     """
 
     def test_sanitize_content_rejects_nul(self):
-        from mempalace.config import sanitize_content
-
         import pytest
+
+        from mempalace.config import sanitize_content
 
         with pytest.raises(ValueError, match="null bytes"):
             sanitize_content("hello\x00world")

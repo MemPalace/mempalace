@@ -3,6 +3,7 @@ test_query_parser.py — Unit tests for MemPalace Query and Command Parser.
 """
 
 import pytest
+
 from mempalace.query_parser import (
     QueryParseError,
     parse_coordinate_input,

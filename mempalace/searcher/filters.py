@@ -3,31 +3,17 @@ if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
 
-def _extract_drawer_ids_from_closet(closet_doc: str) -> list:
-    """Parse all `→drawer_id_a,drawer_id_b` pointers out of a closet document.
-
-    Preserves order and dedupes.
-    """
-    seen: dict = {}
-    for match in _CLOSET_DRAWER_REF_RE.findall(closet_doc):
-        for did in match.split(","):
-            did = did.strip()
-            if did and did not in seen:
-                seen[did] = None
-    return list(seen.keys())
-
-
 def _scoped_source_filter(source_file: str, parent_drawer_id=None) -> dict:
     """Build a Chroma ``where`` clause that scopes a query to ``source_file``,
     additionally constrained by ``parent_drawer_id`` when one is supplied.
 
-    Two unrelated oversized ``tool_add_drawer`` writes (chunked path from
-    #1539) can pass the same ``source_file`` (e.g. two pastes tagged
+    Two unrelated oversized ``tool_add_drawer`` writes (the chunked path)
+    can pass the same ``source_file`` (e.g. two pastes tagged
     ``"chat.log"``); each call stores its own ``parent_drawer_id`` group
     of chunks but the bare ``source_file`` filter pulls chunks from both
-    groups as if they were siblings (#1580). When the matched chunk
+    groups as if they were siblings. When the matched chunk
     carries a ``parent_drawer_id`` the filter narrows to that logical
-    group. Otherwise (pre-#1539 drawers, single-chunk writes, and
+    group. Otherwise (drawers without ``parent_drawer_id``, single-chunk writes, and
     ``diary_ingest`` drawers grouped by real file path) the original
     file-global shape is preserved. Mirrors the conditional-``$and``
     precedent in ``build_where_filter``.
@@ -86,7 +72,7 @@ def _hnsw_capacity_diverged(palace_path: str) -> bool:
     CLI search path to short-circuit to the BM25-only fallback before
     opening a Chroma client. Client construction and collection identity
     checks can themselves touch the damaged index, so guarding only
-    ``col.query()`` is too late (#1222 covers the MCP path via the module-level
+    ``col.query()`` is too late (the MCP path is covered by the module-level
     ``_vector_disabled`` flag; this covers the CLI path).
 
     A probe that raises falls through to ``False`` so the caller proceeds

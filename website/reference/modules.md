@@ -18,7 +18,6 @@ mempalace/
 │   ├── searcher/              ← hybrid BM25 + vector search package
 │   ├── palace/                ← collection access, closets, mine locks
 │   ├── layers.py              ← 4-layer memory stack
-│   ├── onboarding.py          ← guided setup
 │   ├── config.py              ← configuration loading
 │   ├── normalize.py           ← chat format converter
 │   ├── entity_detector.py     ← auto-detect people/projects
@@ -120,10 +119,6 @@ Loads settings from `~/.mempalace/config.json` and environment variables.
 ### `split_mega_files.py` — Transcript Splitting
 
 Splits concatenated transcripts into per-session files based on session boundary detection.
-
-### `onboarding.py` — Guided Setup
-
-Interactive setup wizard for `mempalace init`. Generates AAAK bootstrap and wing config.
 
 ### `spellcheck.py` — Spell Checking
 

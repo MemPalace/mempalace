@@ -21,7 +21,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Fixtures: stub the Hermes ABC, then import the provider module by path.
 # ---------------------------------------------------------------------------
@@ -556,8 +555,8 @@ def test_list_rooms_tool_marks_truncated_without_wing_total(provider_on_seeded_p
 # ----- Knowledge-graph tool handlers --------------------------------------
 
 
-def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_path):
-    """The provider writes to ``<palace_path>/../knowledge_graph.sqlite3``."""
+def test_kg_add_persists_to_palace_local_sqlite(initialized_provider, palace_path):
+    """A new provider writes to ``<palace_path>/knowledge_graph.sqlite3``."""
     from mempalace.knowledge_graph import KnowledgeGraph
 
     result = json.loads(
@@ -568,7 +567,7 @@ def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_p
     )
     assert result["status"] == "ok"
 
-    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    db_path = str(Path(palace_path) / "knowledge_graph.sqlite3")
     independent_kg = KnowledgeGraph(db_path=db_path)
     try:
         relations = independent_kg.query_entity("user")
@@ -995,9 +994,9 @@ def test_hermes_config_defers_to_mempalace_config_when_unset(
         provider.shutdown()
 
 
-def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path):
-    # All five KG tools must hit the SAME database: the sibling of the
-    # provider's palace dir — never mcp_server's global DEFAULT_KG_PATH.
+def test_kg_tools_all_use_the_provider_palace_kg(initialized_provider, palace_path):
+    # All five KG tools must hit the SAME database: the provider's palace's
+    # own graph, never the global legacy one.
     add = json.loads(
         initialized_provider.handle_tool_call(
             "mempalace_kg_add",
@@ -1023,8 +1022,9 @@ def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path)
     )
     assert inv["success"] is True
 
-    # And the file itself lives next to the palace dir.
-    assert (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
+    # And the file itself lives in the palace dir.
+    assert (Path(palace_path) / "knowledge_graph.sqlite3").exists()
+    assert not (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
 
 
 def test_kg_invalidate_rejects_invalid_input(initialized_provider):
@@ -1052,7 +1052,7 @@ def test_on_memory_write_mirrors_both_targets(initialized_provider, palace_path)
     initialized_provider.on_memory_write("add", "memory", "repo uses uv for deps")
     initialized_provider._worker_queue.join()
 
-    kg = KnowledgeGraph(db_path=str(Path(palace_path).parent / "knowledge_graph.sqlite3"))
+    kg = KnowledgeGraph(db_path=str(Path(palace_path) / "knowledge_graph.sqlite3"))
     try:
         user_relations = kg.query_entity("user")
         agent_relations = kg.query_entity("hermes")
@@ -1074,3 +1074,82 @@ def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):
     initialized_provider.on_memory_write("replace", "memory", "x")
     initialized_provider.on_memory_write("remove", "user", "x")
     assert initialized_provider._worker_queue.qsize() == pre
+
+
+def test_tool_search_sanitizes_the_query_and_says_so(provider, integration_module, monkeypatch):
+    seen = {}
+
+    def fake_search(query, **kwargs):
+        seen["query"] = query
+        return {"results": [{"text": "hit"}]}
+
+    monkeypatch.setattr(integration_module, "search_memories", fake_search)
+    provider._palace_path = "/fake/palace"
+    contaminated = "You are a helpful assistant. " * 40 + "Where is the config?"
+    result = provider._tool_search(contaminated)
+    assert seen["query"] == "Where is the config"
+    assert result["query_sanitized"] is True
+    assert result["sanitizer"]["truncated"] is True
+    assert result["count"] == 1
+
+
+def test_tool_search_leaves_a_clean_query_alone(provider, integration_module, monkeypatch):
+    monkeypatch.setattr(integration_module, "search_memories", lambda q, **kw: {"results": []})
+    provider._palace_path = "/fake/palace"
+    result = provider._tool_search("where is the config?")
+    assert "sanitizer" not in result
+
+
+def test_l1_story_reports_an_unreadable_collection(integration_module, monkeypatch):
+    """A collection that cannot be read is not "No memories yet"."""
+    import sqlite3
+
+    monkeypatch.setattr("mempalace.layers._READ_RETRY_DELAY", 0)
+
+    class _Locked:
+        def get_recent(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        def get(self, **kwargs):
+            raise AssertionError("the same palace error must not be re-run as a scan")
+
+    story = integration_module._l1_story_from_collection(_Locked())
+    assert "No memories" not in story
+    assert "could not be read right now (OperationalError)" in story
+
+
+def test_l1_story_reads_inline_while_the_caller_holds_the_collection_lock(integration_module):
+    """The read runs on the caller's thread and is never cut off, so the
+    provider's _collection_lock is held for all of it (no abandoned reader
+    racing a writer on the shared Chroma client)."""
+    import time
+
+    lock = threading.Lock()
+    seen = []
+
+    class _Slow:
+        def get(self, **kwargs):
+            time.sleep(0.5)  # longer than the wake-up budget
+            seen.append((threading.current_thread() is caller, lock.locked()))
+            return {"documents": ["A slow but complete read."], "metadatas": [{"room": "r"}]}
+
+    caller = threading.current_thread()
+    with lock:
+        story = integration_module._l1_story_from_collection(_Slow())
+
+    assert seen and seen[0] == (True, True)
+    assert "A slow but complete read." in story
+
+
+def test_l1_story_reads_the_newest_drawers(integration_module):
+    class _Col:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"documents": [], "metadatas": []}
+            return {
+                "documents": ["A memory filed through the provider's own client."],
+                "metadatas": [{"room": "r", "filed_at": "2026-10-01"}],
+            }
+
+    story = integration_module._l1_story_from_collection(_Col(), wing="w")
+    assert "A memory filed through the provider's own client." in story

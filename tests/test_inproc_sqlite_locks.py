@@ -20,8 +20,8 @@ import time
 import pytest
 
 from mempalace.backends import PalaceRef, _inproc_sqlite
-from mempalace.backends.chroma import (
-    ChromaBackend,
+from mempalace.backends.chroma import ChromaBackend
+from mempalace.backends.chroma_sqlite import (
     _sqlite_embedding_count,
     _sqlite_wing_room_counts,
     sqlite_room_wing_hall_counts,

@@ -19,21 +19,16 @@ Supported:
 No API key. No internet. Everything local.
 """
 
-import errno
 import json
 import os
 import re
-import stat
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, Tuple
 
-from ._source_state import source_fingerprint
-
-
-class SourceChangedDuringReadError(OSError):
-    """A transcript changed while it was being read; retry on a later pass."""
+from ._source_state import SourceChangedDuringReadError
+from .fsio import read_source_text
 
 
 class UnparsedCodexTranscriptError(ValueError):
@@ -140,11 +135,19 @@ def strip_noise(text: str) -> str:
     ):
         text, n = pat.subn("", text)
         removed += n
-    if removed:
-        _record("strip_tool_chrome")
-    # Collapse runs of blank lines created by the removals
-    text = re.sub(r"\n{4,}", "\n\n\n", text)
-    return text.strip()
+    if not removed:
+        # Nothing was stripped, so the message keeps its own blank lines.
+        return text
+    _record("strip_tool_chrome")
+    # Collapse the runs of blank lines the removals left behind; one the
+    # writer typed is collapsed too, so say so when it happens.
+    collapsed = re.sub(r"\n{4,}", "\n\n\n", text)
+    if collapsed != text:
+        _record("whitespace_collapse_internal")
+    return collapsed.strip()
+
+
+_MAX_TRANSCRIPT_BYTES = 500 * 1024 * 1024  # 500 MB safety limit
 
 
 def _read_transcript_file(filepath: str, *, source_metadata: Optional[dict] = None) -> str:
@@ -161,52 +164,22 @@ def _read_transcript_file_with_mtime(
     """``_read_transcript_file`` plus the mtime from the ``fstat`` taken
     before the read. A stat after the read can record an mtime for bytes
     the read never saw, and the next mine then skips the appended tail.
+
+    Inside ``recording_transforms`` the codec the bytes decoded with is kept
+    on the run as ``encoding``.
     """
-    # O_NONBLOCK keeps the "not a regular file" check below reachable: a
-    # blocking open of a FIFO waits in the kernel for a writer, so the
-    # S_ISREG test never runs. See ``miner._read_text_no_follow``, including
-    # why the EAGAIN branch re-checks the type and retries without the flag.
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    if os.path.islink(filepath):
-        raise IOError(f"Could not read {filepath}: symlinked files are skipped")
-    fd = -1
     try:
-        try:
-            fd = os.open(filepath, flags)
-        except OSError as exc:
-            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
-                raise
-            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            # Text stays prefix-free: this raise is inside the ``try``, so the
-            # ``except OSError`` below composes "Could not read <path>: ...".
-            raise IOError("not a regular file")
-        if file_stat.st_size > 500 * 1024 * 1024:  # 500 MB safety limit
-            # Prefix-free for the same reason as the branch above.
-            raise IOError(f"file too large ({file_stat.st_size // (1024 * 1024)} MB)")
-        with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
-            fd = -1
-            content = f.read()
-            if source_metadata is not None:
-                fingerprint = source_fingerprint(file_stat)
-                if source_fingerprint(os.fstat(f.fileno())) != fingerprint:
-                    raise SourceChangedDuringReadError(f"Source changed while reading {filepath}")
-                source_metadata.update(
-                    source_mtime=file_stat.st_mtime,
-                    source_fingerprint=fingerprint,
-                )
-            return content, file_stat.st_mtime
+        text, encoding, mtime = read_source_text(
+            filepath, max_bytes=_MAX_TRANSCRIPT_BYTES, source_metadata=source_metadata
+        )
     except SourceChangedDuringReadError:
         raise
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
-    finally:
-        if fd != -1:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    run = _NORMALIZE_RUN.get()
+    if run is not None:
+        run.encoding = encoding
+    return text, mtime
 
 
 def normalize(filepath: str) -> str:
@@ -499,8 +472,8 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
     ``session_metadata`` are discarded — they are treated as preamble
     noise, not conversational turns. ``message_update`` entries are
     skipped — they have no message text. Multiple text blocks within a
-    single message's content array are concatenated in order, separated
-    by newlines.
+    single message's content array are concatenated in order with nothing
+    between them, as Gemini's own clients read a message.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
@@ -536,14 +509,14 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
             if not isinstance(block, dict):
                 continue
             text = block.get("text", "")
-            if isinstance(text, str) and text.strip():
+            if isinstance(text, str) and text:
                 parts.append(text)
             elif any(key != "text" for key in block):
                 # functionCall, functionResponse, inlineData and the like.
                 _record("conversations.content_block_drop")
-        if not parts:
+        joined = "".join(parts)
+        if not joined.strip():
             continue
-        joined = "\n".join(parts)
 
         if entry_type == "user":
             messages.append(("user", joined))
@@ -654,27 +627,25 @@ def _try_gemini_json(data) -> Optional[str]:
         # Extract text — try "parts" first (Gemini API), then "content" (flat).
         text = ""
         parts = item.get("parts")
-        joined_parts = 0
         if isinstance(parts, list):
             text_parts = []
             for p in parts:
                 if isinstance(p, str):
                     text_parts.append(p)
-                elif isinstance(p, dict) and "text" in p:
+                elif isinstance(p, dict) and isinstance(p.get("text"), str):
                     text_parts.append(p["text"])
                 elif p:
                     # inlineData, functionCall, functionResponse and the like.
                     _record("conversations.content_block_drop")
-            joined_parts = len([t for t in text_parts if t])
-            text = " ".join(text_parts).strip()
+            # Gemini's own clients read a message as its text parts
+            # concatenated, so that is the message as written.
+            text = "".join(text_parts).strip()
         else:
             text = _extract_content(item.get("content", ""))
 
         if not text:
             continue
 
-        if role in ("user", "model", "assistant") and joined_parts > 1:
-            _record("line_join_spaces")
         if role == "user":
             messages.append(("user", text))
         elif role == "model":
@@ -825,7 +796,7 @@ def _chatgpt_root_path(mapping: dict) -> list:
             if node.get("message") is None:
                 root_id = node_id
                 break
-            elif fallback_root is None:
+            if fallback_root is None:
                 fallback_root = node_id
     path = []
     visited = set()
@@ -1194,12 +1165,14 @@ def _format_tool_result(content, tool_name: str) -> str:
 
 
 class NormalizeRun:
-    """The RFC 002 transformations one file's parse inside
-    ``recording_transforms`` applied (``applied``)."""
+    """What one file's parse inside ``recording_transforms`` did: the RFC 002
+    transformations it applied (``applied``) and the codec its bytes decoded
+    with (``encoding``)."""
 
     def __init__(self, spellcheck: bool):
         self.spellcheck = spellcheck
         self.applied: set = set()
+        self.encoding = "utf-8"
 
     @property
     def transforms(self) -> str:

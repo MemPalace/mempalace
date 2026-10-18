@@ -1,7 +1,7 @@
 """Tests for the local, text-free private Palace benchmark."""
 
-import json
 import importlib.util
+import json
 import os
 import stat
 import sys
@@ -408,31 +408,28 @@ def test_local_palace_source_explains_missing_embedding_runtime():
         source.vector_ranking(case, 10)
 
 
-def test_hub_search_client_reuses_authenticated_transport_and_parses_tool_result(monkeypatch):
+def test_hub_search_client_reuses_authenticated_transport_and_parses_tool_result():
     calls = []
 
-    def fake_forward(base_url, headers, request, *, timeout):
-        calls.append((base_url, headers, request, timeout))
-        return {
-            "jsonrpc": "2.0",
-            "id": request["id"],
-            "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": json.dumps(
-                            {"results": [{"drawer_id": "answer", "similarity": 0.8}]}
-                        ),
-                    }
-                ]
-            },
-        }
+    class _Hub:
+        def post(self, request, *, timeout):
+            calls.append((request, timeout))
+            return {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"results": [{"drawer_id": "answer", "similarity": 0.8}]}
+                            ),
+                        }
+                    ]
+                },
+            }
 
-    monkeypatch.setattr("mempalace.hub_client.forward_json_rpc", fake_forward)
-    client = HubSearchClient(
-        "http://127.0.0.1:9",
-        {"Content-Type": "application/json", "Authorization": "Bearer local-secret"},
-    )
+    client = HubSearchClient(_Hub())
 
     result = client(
         "private query",
@@ -448,9 +445,7 @@ def test_hub_search_client_reuses_authenticated_transport_and_parses_tool_result
     )
 
     assert result["results"][0]["drawer_id"] == "answer"
-    base_url, headers, request, timeout = calls[0]
-    assert base_url == "http://127.0.0.1:9"
-    assert headers["Authorization"] == "Bearer local-secret"
+    request, timeout = calls[0]
     assert timeout == 120
     assert request["params"] == {
         "name": "mempalace_search",

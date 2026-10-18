@@ -30,7 +30,8 @@ def _collection_has_rows(collection, palace_path, collection_name) -> Optional[b
     wake-up that reads ten drawers. Other backends, and a Chroma database the
     read cannot reach, fall back to ``count()``.
     """
-    from ..backends.chroma import ChromaCollection, _sqlite_collection_has_rows
+    from ..backends.chroma import ChromaCollection
+    from ..backends.chroma_sqlite import _sqlite_collection_has_rows
 
     inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
     if isinstance(inner, ChromaCollection):
@@ -38,8 +39,8 @@ def _collection_has_rows(collection, palace_path, collection_name) -> Optional[b
         if has_rows is not None:
             return has_rows
     # Preflight HNSW divergence before touching count(): count() on a diverged
-    # segment can raise chromadb's rust-level PanicException or hard-segfault
-    # (#1222), which no try/except can catch. This bookkeeping-only check
+    # segment can raise chromadb's rust-level PanicException or hard-segfault,
+    # which no try/except can catch. This bookkeeping-only check
     # skips itself on a diverged palace instead.
     try:
         from ..backends.chroma import hnsw_capacity_status
@@ -227,7 +228,7 @@ def _allowed_wrapper_collection_names() -> List[str]:
     The configured drawers collection, closets collection, fixed media assets
     collection and AAAK summary collection are first-class to MemPalace. Every
     other name points at a store the search/CLI/MCP layer never reads — the
-    exact silent-miss failure of issue ``#2347``.
+    silent-miss failure this guards against.
     """
     from ..config import get_configured_collection_name
 
@@ -315,7 +316,7 @@ def get_collection(
     upserted through it stays invisible to search/CLI/MCP. ``get_collection``
     therefore raises :class:`CollectionNameMismatchError` (a ``ValueError``)
     naming both the offending and allowed strings, instead of silently creating
-    that orphan collection (issue ``#2347``). Passing ``collection_name=None``
+    that orphan collection. Passing ``collection_name=None``
     resolves to the configured drawers name and always succeeds.
 
     ``read_only=True`` asks local backends to open storage without schema

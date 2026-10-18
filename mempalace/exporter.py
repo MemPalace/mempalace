@@ -17,6 +17,7 @@ import re
 from collections import defaultdict
 from datetime import datetime
 
+from .metadata_types import is_bookkeeping
 from .palace import get_collection
 
 
@@ -48,6 +49,9 @@ def _safe_open_for_write(path: str, mode: str, encoding: str = "utf-8"):
     a symlink — closing the TOCTOU window between an islink check and the open.
     On platforms without O_NOFOLLOW (Windows), pre-checks ``os.path.islink``,
     which is narrower than no check at all.
+
+    Writes with ``surrogateescape``: a stray source byte, held in drawer text
+    as a lone surrogate, goes back out as the byte it was.
     """
     o_nofollow = getattr(os, "O_NOFOLLOW", 0)
     if o_nofollow:
@@ -59,13 +63,13 @@ def _safe_open_for_write(path: str, mode: str, encoding: str = "utf-8"):
             if e.errno == errno.ELOOP:
                 raise ValueError(f"refusing to write: {path!r} is a symbolic link.") from None
             raise
-        return os.fdopen(fd, mode, encoding=encoding)
+        return os.fdopen(fd, mode, encoding=encoding, errors="surrogateescape")
     if os.path.islink(path):
         raise ValueError(f"refusing to write: {path!r} is a symbolic link.")
-    return open(path, mode, encoding=encoding)
+    return open(path, mode, encoding=encoding, errors="surrogateescape")
 
 
-def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -> dict:
+def export_palace(palace_path: str, output_dir: str) -> dict:
     """Export all palace drawers as markdown files organized by wing/room.
 
     Streams drawers in batches of 1000 and writes each wing/room file
@@ -75,7 +79,6 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
     Args:
         palace_path: Path to the ChromaDB palace directory.
         output_dir: Where to write the exported markdown tree.
-        format: Output format (currently only "markdown").
 
     Returns:
         Stats dict: {"wings": N, "rooms": N, "drawers": N}
@@ -112,6 +115,8 @@ def export_palace(palace_path: str, output_dir: str, format: str = "markdown") -
         # Group this batch by wing/room so we do one file write per room per batch
         batch_grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
         for doc_id, doc, meta in zip(batch["ids"], batch["documents"], batch["metadatas"]):
+            if is_bookkeeping(meta, doc_id):
+                continue
             wing = meta.get("wing", "unknown")
             room = meta.get("room", "general")
             batch_grouped[wing][room].append(

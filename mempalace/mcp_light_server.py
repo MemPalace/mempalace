@@ -28,19 +28,20 @@ except (OSError, AttributeError):
     pass
 sys.stdout = sys.stderr
 
-from .version import __version__  # noqa: E402
-from .search_util import _cosine_scale_distance  # noqa: E402
+import inspect  # noqa: E402
+
+from . import mcp_server  # noqa: E402
 from .query_parser import (  # noqa: E402
     QueryParseError,
     parse_coordinate_input,
     parse_exec_input,
     parse_query_input,
 )
-from . import mcp_server  # noqa: E402
+from .search_util import _cosine_scale_distance  # noqa: E402
+from .timeutil import recency_key  # noqa: E402
+from .version import __version__  # noqa: E402
 
-import inspect  # noqa: E402
-
-logger = logging.getLogger("mempalace_mcp_light")
+logger = logging.getLogger(__name__)
 
 _PQL_KEYWORDS = {
     "FIND",
@@ -117,11 +118,13 @@ def _unwrap_wrapper_input(arguments: Any) -> Any:
     return arguments
 
 
-def _call_handler_safe(handler, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Invoke handler safely by filtering extra kwargs that the handler doesn't accept."""
-    if not callable(handler):
-        return {"success": False, "error": f"Handler {handler} is not callable"}
-    mapped = _alias_args_for_handler(handler, params)
+def _call_handler_safe(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Run tool ``name`` with the kwargs its handler accepts, checked like any tools/call."""
+    handler = mcp_server.TOOLS[name]["handler"]
+    try:
+        mapped = mcp_server.validate_tool_arguments(name, _alias_args_for_handler(handler, params))
+    except mcp_server.ToolArgumentError as e:
+        return {"success": False, "error": f"Invalid params for tool {name}: {e}"}
     return handler(**mapped)
 
 
@@ -195,7 +198,7 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
 
     by_recency = sorted(
         range(len(results_list)),
-        key=lambda i: _search_timestamp(results_list[i]),
+        key=lambda i: recency_key(_search_timestamp(results_list[i])),
         reverse=True,
     )
     for recency_rank, orig_i in enumerate(by_recency, 1):
@@ -248,7 +251,7 @@ def tool_palace_query(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     name = _allowlisted_tool(_QUERY_TARGET_TO_TOOL, target)
     if name is None:
         return {"success": False, "error": f"Unknown palace_query target: '{target}'"}
-    res = _call_handler_safe(mcp_server.TOOLS[name]["handler"], _query_arguments(name, params))
+    res = _call_handler_safe(name, _query_arguments(name, params))
     if name == "mempalace_search":
         return _enrich_search_results(res)
     if name == "mempalace_get_taxonomy" and params.get("wing") and isinstance(res, dict):
@@ -271,7 +274,7 @@ def tool_palace_exec(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     name = _allowlisted_tool(_EXEC_ACTION_TO_TOOL, action)
     if name is None:
         return {"success": False, "error": f"Unknown palace_exec action: '{action}'"}
-    return _call_handler_safe(mcp_server.TOOLS[name]["handler"], params)
+    return _call_handler_safe(name, params)
 
 
 def tool_palace_coordinate(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
@@ -286,7 +289,7 @@ def tool_palace_coordinate(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     name = _allowlisted_tool(_COORD_ACTION_TO_TOOL, action)
     if name is None:
         return {"success": False, "error": f"Unknown palace_coordinate action: '{action}'"}
-    return _call_handler_safe(mcp_server.TOOLS[name]["handler"], params)
+    return _call_handler_safe(name, params)
 
 
 # ==================== LIGHTWEIGHT MCP TOOL DEFINITIONS ====================
@@ -757,11 +760,11 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "serverInfo": {"name": "mempalace-light", "version": __version__},
             },
         }
-    elif method == "ping":
+    if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    elif method.startswith("notifications/"):
+    if method.startswith("notifications/"):
         return None
-    elif method == "tools/list":
+    if method == "tools/list":
         # In read-only mode, only palace_query is exposed
         tools_list = []
         for name, tool_def in LIGHT_TOOLS.items():
@@ -779,7 +782,7 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "id": req_id,
             "result": {"tools": tools_list},
         }
-    elif method == "tools/call":
+    if method == "tools/call":
         if not isinstance(params, dict) or "name" not in params:
             return {
                 "jsonrpc": "2.0",
@@ -826,7 +829,9 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 },
             }
         except Exception as e:
-            return mcp_server._internal_tool_error(req_id, tool_name, e)
+            return mcp_server._internal_tool_error(
+                req_id, tool_name, e, include_message=isinstance(e, ValueError)
+            )
 
     if req_id is None:
         return None
@@ -989,7 +994,9 @@ def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, 
             try:
                 resp = mcp_server._dispatch_stdio_request(forwarded)
             except Exception as exc:
-                return mcp_server._internal_tool_error(request.get("id"), underlying, exc)
+                return mcp_server._internal_tool_error(
+                    request.get("id"), underlying, exc, include_message=isinstance(exc, ValueError)
+                )
             return _postprocess_light_response(rewritten, resp)
     return handle_light_request(request)
 

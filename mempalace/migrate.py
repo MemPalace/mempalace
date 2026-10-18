@@ -24,10 +24,11 @@ import shutil
 import tempfile
 import uuid
 from collections import defaultdict
-from datetime import datetime
 
 from .backups import _uncopyable_reason, copy_palace_dir, prune_backups
 from .config import MempalaceConfig
+from .fsio import atomic_write_json
+from .timeutil import filename_stamp
 
 
 def _restore_stale_palace(palace_path: str, stale_path: str) -> None:
@@ -124,7 +125,7 @@ def _rebuilt_counts_match(source_palace: str, dest_palace: str, counts: dict) ->
 
 def _unique_aside_path(palace_path: str) -> str:
     """A rollback directory this call creates, never an existing ``.old``."""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = filename_stamp("_")
     candidate = f"{palace_path}.old.{stamp}.{os.getpid()}"
     if not os.path.lexists(candidate):
         return candidate
@@ -274,7 +275,7 @@ def _migrate_locked(palace_path: str, dry_run: bool = False, confirm: bool = Fal
     # migrate must rebuild from SQLite instead of returning "No migration needed."
     #
     # Preflight HNSW divergence before touching the collection at all: the
-    # #1222 SIGSEGV/panic class crashes on count() against a diverged
+    # SIGSEGV/panic class crashes on count() against a diverged
     # segment, and a native crash can't be caught by the except Exception
     # below -- a diverged palace must never reach col.count() in the first
     # place. The already-diverged case degrades to exactly the same
@@ -346,7 +347,7 @@ def _migrate_locked(palace_path: str, dry_run: bool = False, confirm: bool = Fal
         return False
 
     # Backup the old palace
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = filename_stamp("_")
     backup_path = f"{palace_path}.pre-migrate.{timestamp}"
     print(f"\n  Backing up to {backup_path}...")
     copy_palace_dir(palace_path, backup_path, symlinks=True, log=print)
@@ -414,7 +415,7 @@ def _migrate_locked(palace_path: str, dry_run: bool = False, confirm: bool = Fal
 
 
 # ---------------------------------------------------------------------------
-# Wing-name normalization migration (#1675 follow-up)
+# Wing-name normalization migration
 # ---------------------------------------------------------------------------
 #
 # normalize_wing_name now strips leading/trailing separators, so a path-encoded
@@ -443,10 +444,10 @@ def _normalized_wing_target(wing):
     if not isinstance(wing, str) or not wing:
         return None
     # Apply the full normalization and explicitly strip leading/trailing
-    # separators. The strip is this migration's whole purpose (#1675); doing it
+    # separators. The strip is this migration's whole purpose; doing it
     # here rather than relying on normalize_wing_name keeps the migration correct
-    # even when run against a build whose normalize_wing_name predates #1675, and
-    # matches the post-#1675 derivation exactly.
+    # even when run against a build whose normalize_wing_name predates the separator strip, and
+    # matches the current derivation exactly.
     target = normalize_wing_name(wing).strip("_")
     if not target or target == wing:
         return None
@@ -518,8 +519,6 @@ def _apply_topics_by_wing_renames(renames):
     """Re-key ``topics_by_wing`` in known_entities.json, merging on collision."""
     if not renames:
         return
-    import json
-
     from .miner import _ENTITY_REGISTRY_PATH, _load_known_entities_raw
 
     try:
@@ -543,20 +542,12 @@ def _apply_topics_by_wing_renames(renames):
             tbw[new] = old_topics
     reg["topics_by_wing"] = tbw
     os.makedirs(os.path.dirname(_ENTITY_REGISTRY_PATH), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(_ENTITY_REGISTRY_PATH), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(reg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _ENTITY_REGISTRY_PATH)
-    except Exception:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        raise
+    atomic_write_json(_ENTITY_REGISTRY_PATH, reg)
 
 
 def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = False) -> bool:
     """Normalize legacy wing names in ``palace_path`` (strip leading/trailing
-    separators), so palaces built before #1675 keep their memories discoverable.
+    separators), so palaces built before the separator strip keep their memories discoverable.
 
     Re-keys the ``wing`` metadata on drawers and closets in place (IDs untouched)
     and the ``topics_by_wing`` registry, merging collisions. Idempotent.

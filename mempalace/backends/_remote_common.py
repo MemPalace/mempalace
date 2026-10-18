@@ -10,12 +10,12 @@ marker that reads as a mismatch.
 import json
 import logging
 import os
-from datetime import datetime, timezone
 from typing import Any, ClassVar, Optional
 
 import numpy as np
 
 from ..fsio import atomic_write_json
+from ..timeutil import utc_now_iso
 from .base import BackendMismatchError, DimensionMismatchError, PalaceRef
 
 logger = logging.getLogger(__name__)
@@ -130,7 +130,7 @@ class RemoteMarkerMixin:
         marker = {
             "backend": self.name,
             "schema_version": 1,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": utc_now_iso(),
             "palace_id": palace.id,
             self.name: self._marker_target(palace, config),
         }

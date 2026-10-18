@@ -14,7 +14,7 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     e.g. the sweeper's ``ingest_mode="sweep"`` rows -- must not match: the
     legacy-compat rule otherwise scoops every sweeper drawer for a shared
     transcript into convo_miner's default "exchange" purge/idempotency
-    scope and silently deletes them on the very next re-mine (#104).
+    scope and silently deletes them on the very next re-mine.
     """
     if extract_mode is None:
         return True
@@ -113,7 +113,7 @@ def _scan_collection_metadata(collection, keys, absorb, reset) -> None:
     discarded through ``reset`` and the collection is paged instead. If paging
     fails too, :class:`MinedSetUnavailable` stops the caller.
     """
-    from ..backends.chroma import MetadataRecoveryPending
+    from ..backends.chroma_sqlite import MetadataRecoveryPending
 
     fast = _fast_collection_metadata(collection, keys)
     if fast is not None:
@@ -183,7 +183,7 @@ def file_already_mined(
     for the same source transcript. Legacy drawers without extract_mode are
     treated as exchange-mode drawers.
 
-    A drawer whose metadata carries ``chunk_total`` (see #21) is only
+    A drawer whose metadata carries ``chunk_total`` is only
     counted toward a match once its stored_mtime group has accumulated at
     least that many drawers -- guarding against a mid-file crash between
     upsert batches, where the surviving drawers share the current mtime
@@ -230,7 +230,7 @@ def file_already_mined(
             ) from exc
         ids = results.get("ids") or []
         for meta in results.get("metadatas") or []:
-            meta = meta or {}
+            meta = coerce_metadata_types(meta or {})
             if extract_mode is not None and not _metadata_matches_extract_mode(meta, extract_mode):
                 continue
             if not _is_comparable(meta, extract_mode):
@@ -290,8 +290,8 @@ def prefetch_mined_set(
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
 
-    Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule
-    (#2183): a source that only has a mid-file partial (surviving drawers
+    Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule:
+    a source that only has a mid-file partial (surviving drawers
     share the current mtime but are short of ``chunk_total``) is **omitted**
     from the result so the bulk skip path re-mines instead of permanently
     stranding the missing exchanges. Drawers with no ``chunk_total``
@@ -323,7 +323,7 @@ def prefetch_mined_set(
         unprovable.clear()
 
     def _absorb(meta):
-        meta = meta or {}
+        meta = coerce_metadata_types(meta or {})
         src = meta.get("source_file")
         if not src:
             return
@@ -392,7 +392,7 @@ _PROJECT_MINED_KEYS = ("source_file", "source_mtime", "chunk_total", "normalize_
 
 def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tuple]]:
     """``source_file -> stored mtimes of its complete drawer groups``, in one
-    sqlite pass, for the project miner's skip check (#2684).
+    sqlite pass, for the project miner's skip check.
 
     ``file_already_mined(collection, src, check_mtime=True)`` costs one
     ``get(where={"source_file": src})`` per file, ~0.1 s on a 1M-drawer
@@ -419,11 +419,11 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
     # whether some drawer has no chunk_total].
     groups: dict[str, dict] = {}
     unprovable: set = set()
-    from ..backends.chroma import MetadataRecoveryPending
+    from ..backends.chroma_sqlite import MetadataRecoveryPending
 
     try:
         for meta in rows:
-            meta = meta or {}
+            meta = coerce_metadata_types(meta or {})
             src = meta.get("source_file")
             if src not in wanted or src in unprovable:
                 continue

@@ -23,6 +23,8 @@ import pytest
 
 from mempalace import mcp_server as mcp
 
+pytestmark = pytest.mark.usefixtures("tokenless_http_hub")
+
 N_FILES = 6
 
 

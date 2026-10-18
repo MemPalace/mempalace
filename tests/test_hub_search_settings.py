@@ -75,6 +75,7 @@ _NOT_SEARCH_SETTINGS = {
 
 _SETTING_SOURCES = (
     "config.py",
+    "paths.py",
     "embedding.py",
     "backends/chroma.py",
     "backends/milvus.py",
@@ -166,3 +167,28 @@ def test_every_row_in_scope_feeds_the_fingerprint(monkeypatch, tmp_path, attr, s
     first = MempalaceConfig(palace_path=str(tmp_path)).search_config_fingerprint
     monkeypatch.setattr(MempalaceConfig, attr, property(lambda self: "two"))
     assert MempalaceConfig(palace_path=str(tmp_path)).search_config_fingerprint != first
+
+
+def test_search_settings_overridden_by_env_or_explicit_backend(monkeypatch):
+    from mempalace.hub_client import SEARCH_OVERRIDE_ENV_VARS, search_settings_overridden
+
+    for name in SEARCH_OVERRIDE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    assert not search_settings_overridden()
+    assert search_settings_overridden("sqlite_exact")
+    monkeypatch.setenv("MEMPALACE_HYBRID_VECTOR_WEIGHT", "0.2")
+    assert search_settings_overridden()
+    monkeypatch.setenv("MEMPALACE_HYBRID_VECTOR_WEIGHT", "  ")
+    assert not search_settings_overridden()
+
+
+def test_search_fingerprint_matches_compares_with_this_process(monkeypatch, tmp_path):
+    from mempalace.config import MempalaceConfig
+    from mempalace.hub_client import search_fingerprint_matches
+
+    monkeypatch.setattr(
+        MempalaceConfig, "search_config_fingerprint", property(lambda self: "abc"), raising=False
+    )
+    assert search_fingerprint_matches({"search_config_fingerprint": "abc"}, str(tmp_path))
+    assert not search_fingerprint_matches({"search_config_fingerprint": "xyz"}, str(tmp_path))
+    assert not search_fingerprint_matches({}, str(tmp_path))

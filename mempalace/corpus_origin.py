@@ -34,11 +34,11 @@ Default stance (when evidence is thin):
 
 from __future__ import annotations
 
-import json
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
+from .llm_client import parse_json_reply
 
 # ── Well-known AI brand terms (expand as new platforms emerge) ────────────
 # Detection is by PATTERN + CONTEXT, not by capitalization or English-language
@@ -329,48 +329,6 @@ classification; false-positives are recoverable later.
 """
 
 
-def _extract_json(text: str) -> Optional[dict]:
-    """Pull the first JSON object out of a possibly-messy LLM response."""
-    text = text.strip()
-    if not text:
-        return None
-    # Try straight parse first
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Try to find a {...} block
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : i + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    return None
-    return None
-
-
 def detect_origin_llm(samples: list[str], provider) -> CorpusOriginResult:
     """LLM-assisted detection. Takes samples (list of drawer-text excerpts)
     and an LLMProvider (mempalace.llm_client.LLMProvider). Returns the
@@ -397,8 +355,11 @@ def detect_origin_llm(samples: list[str], provider) -> CorpusOriginResult:
             evidence=[f"LLM provider error (fallback to default stance): {e}"],
         )
 
-    parsed = _extract_json(raw)
-    if not parsed or not isinstance(parsed, dict):
+    try:
+        parsed = parse_json_reply(raw, expect=dict)
+    except ValueError:
+        parsed = None
+    if not parsed:
         return CorpusOriginResult(
             likely_ai_dialogue=True,
             confidence=0.3,

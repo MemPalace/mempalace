@@ -8,19 +8,19 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
-import errno
-import os
-import sys
 import json
 import logging
+import os
 import stat
-from pathlib import Path
-from datetime import datetime
+import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 
 from ._source_state import source_fingerprint
 from .backends import PalaceNotFoundError
+from .entities import entities_metadata
+from .fsio import encoding_metadata, open_source_file
 from .ids import (
     ID_RECIPE,
     make_convo_drawer_id,
@@ -32,8 +32,6 @@ from .normalize import (
     normalize_conversations_with_mtime,
     recording_transforms,
 )
-from .source_identity import identity_metadata, source_directory_identity
-from .entities import entities_metadata
 from .palace import (
     CHUNKER_VERSIONS,
     CONVO_CHUNKER_VERSION,
@@ -53,8 +51,10 @@ from .palace import (
     raise_if_files_failed,
     write_file_drawers,
 )
+from .source_identity import identity_metadata, source_directory_identity
+from .timeutil import utc_now_iso
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 # Cached hall keywords — avoids re-reading config per drawer
 _HALL_KEYWORDS_CACHE = None
@@ -128,7 +128,7 @@ def file_conversation_exchange(
             "file_conversation_exchange: invalid room %r — filing under conversations", room
         )
         room = "conversations"
-    filed_at = datetime.now().isoformat()
+    filed_at = utc_now_iso()
     drawer_id = make_exchange_drawer_id(wing, room, source_file, filed_at, text)
     metadata = {
         "wing": wing,
@@ -149,7 +149,7 @@ def file_conversation_exchange(
         "convo_chunker_version": CONVO_CHUNKER_VERSION,
         "id_recipe": ID_RECIPE,
         # Same directory identity a mined drawer carries, so ``sync`` decides
-        # a live exchange and a historical one by the same rule (#2320).
+        # a live exchange and a historical one by the same rule.
         **identity_metadata(source_file),
     }
     if extra_metadata:
@@ -202,30 +202,12 @@ def _path_within_root(path: Path, root: Path) -> bool:
 def _is_regular_source_file(filepath: Path, root: Path) -> bool:
     if not _path_within_root(filepath, root):
         return False
-    # O_NONBLOCK keeps the S_ISREG verdict below reachable: a blocking open
-    # of a FIFO waits in the kernel for a writer, so a named pipe called
-    # ``session.jsonl`` would hang this check instead of failing it. See the
-    # matching comment in ``miner._read_text_no_follow``, including why the
-    # EAGAIN branch re-checks the type and then opens without the flag.
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    fd = -1
     try:
-        try:
-            fd = os.open(filepath, flags)
-        except OSError as exc:
-            if exc.errno != errno.EAGAIN or not stat.S_ISREG(os.lstat(filepath).st_mode):
-                raise
-            fd = os.open(filepath, flags & ~getattr(os, "O_NONBLOCK", 0))
-        st = os.fstat(fd)
-        return stat.S_ISREG(st.st_mode) and st.st_size <= MAX_FILE_SIZE
+        fd, st = open_source_file(filepath)
     except OSError:
         return False
-    finally:
-        if fd != -1:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    os.close(fd)
+    return st.st_size <= MAX_FILE_SIZE
 
 
 def _register_file(
@@ -254,7 +236,7 @@ def _register_file(
         "room": "_registry",
         "source_file": source_file,
         "added_by": agent,
-        "filed_at": datetime.now().isoformat(),
+        "filed_at": utc_now_iso(),
         "ingest_mode": "registry",
         "extract_mode": extract_mode,
         "normalize_version": NORMALIZE_VERSION,
@@ -312,8 +294,7 @@ def chunk_exchanges(
 
     if quote_lines >= 3:
         return _chunk_by_exchange(lines, chunk_size, min_chunk_size)
-    else:
-        return _chunk_by_paragraph(content, chunk_size, min_chunk_size)
+    return _chunk_by_paragraph(content, chunk_size, min_chunk_size)
 
 
 def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> list:
@@ -571,8 +552,8 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
                 # Skip files exceeding size limit, or those whose stat() raises
                 # (permission denied, racing delete, broken symlink that
                 # survived the earlier is_symlink check). Both branches log
-                # to stderr to match the SKIP: (symlink) line above; silent
-                # drops at this gate were the original #923 complaint.
+                # to stderr to match the SKIP: (symlink) line above, so no
+                # file is dropped here without a word.
                 try:
                     file_stat = filepath.stat()
                     # Drop non-regular entries (FIFO, socket, device node)
@@ -658,6 +639,7 @@ def _file_chunks_locked(
     source_mtime: Optional[float] = None,
     source_metadata: Optional[dict] = None,
     transforms: str = "",
+    source_encoding: str = "utf-8",
     aaak_col=None,
 ):
     """Lock the source file and replace its drawers in this extraction mode.
@@ -690,7 +672,7 @@ def _file_chunks_locked(
         # One filed_at per source file so all transcript drawers share an
         # ingest timestamp. Prefer the mtime captured with the read: a fresh
         # stat here can observe an append that this pass did not ingest.
-        filed_at = datetime.now().isoformat()
+        filed_at = utc_now_iso()
         drawers = []
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
@@ -721,10 +703,11 @@ def _file_chunks_locked(
                 # Every drawer of a file whose parse changed its text: the
                 # RFC 002 transformations it applied.
                 meta["transforms"] = transforms
+            meta.update(encoding_metadata(source_encoding))
             if source_dir_ino:
                 # Which directory this transcript was read from, so ``sync``
                 # can tell a neighbour in the same directory from one on a
-                # volume mounted there since (#2320).
+                # volume mounted there since.
                 meta["source_dir_ino"] = source_dir_ino
             drawer_id = make_convo_drawer_id(
                 wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
@@ -794,7 +777,7 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
          (lowercase, spaces/hyphens collapsed to underscores). Shared
          single source of truth with ``cmd_init``,
          ``room_detector_local``, and ``miner.load_config`` so all
-         wing-slug producers stay in sync (per #1194 consolidation).
+         wing-slug producers stay in sync.
     """
     from .config import normalize_wing_name
 
@@ -1160,6 +1143,7 @@ def _mine_convos_impl(
                 source_mtime=source_mtime,
                 source_metadata=source_metadata,
                 transforms=normalize_run.transforms,
+                source_encoding=normalize_run.encoding,
                 aaak_col=aaak_col,
             )
             if skipped:
@@ -1198,12 +1182,3 @@ def _mine_convos_impl(
     print(f"{'=' * 55}\n")
     # After the summary, so the operator still sees what was filed.
     raise_if_files_failed(files_failed, files_processed)
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python convo_miner.py <convo_dir> [--palace PATH] [--limit N] [--dry-run]")
-        sys.exit(1)
-    from .config import MempalaceConfig
-
-    mine_convos(sys.argv[1], palace_path=MempalaceConfig().palace_path)

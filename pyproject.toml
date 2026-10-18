@@ -30,13 +30,10 @@ dependencies = [
     "chromadb>=1.5.4,<2",
     "pyyaml>=6.0,<7",
     "tomli>=2.0.0; python_version < '3.11'",
-    # Multilingual embedding model deps. Onboarding now offers the
-    # embeddinggemma-300m ONNX model as the default for new installs, so
-    # these are required core deps (not optional extras). The 300 MB ONNX
-    # model itself is lazy-downloaded on first use, not at install time.
-    # Users who pick minilm during onboarding still get these installed
-    # but unused — small wheel-size cost in exchange for one fewer pip
-    # command in the multilingual setup path.
+    # Multilingual embedding model deps (embeddinggemma-300m ONNX), kept as
+    # core deps rather than optional extras so choosing the multilingual model
+    # needs no extra pip command. The 300 MB ONNX model itself is
+    # lazy-downloaded on first use, not at install time.
     "huggingface_hub>=0.20",
     "tokenizers>=0.15",
     "numpy>=1.24",
@@ -201,8 +198,21 @@ target-version = "py39"
 extend-exclude = ["benchmarks", "*.md"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "C901"]
-ignore = ["E501"]
+select = ["E", "F", "W", "C901", "I", "RUF100", "B", "RET", "ERA"]
+# RET501: an explicit `return None` in a no-op default or a test fake shows
+# the reader it stands in for a call that returns a value.
+# RET503: every hit ends in a call that always raises, a retry loop whose last
+# attempt re-raises, or an endless generator; an added `return` would be dead.
+ignore = ["E501", "RET501", "RET503"]
+# Codes of rules planned for later lint stages. Their noqa marks are
+# deliberate, so RUF100 must not strip them before those rules are on.
+external = ["A002", "ARG001", "ARG002", "BLE001", "S310"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mempalace"]
+# Keep `x as y` names in the statement they came from, so a noqa on that
+# statement still covers them.
+combine-as-imports = true
 
 [tool.ruff.lint.per-file-ignores]
 # mcp_server fragments exec into the package namespace. Names they use live
@@ -228,6 +238,11 @@ ignore = ["E501"]
 # palace fragments exec into the package namespace.
 "mempalace/palace/__init__.py" = ["F401"]
 "mempalace/palace/*.py" = ["F821"]
+# pytest idioms: `pytest.raises(Exception)` around backends that raise their
+# own driver errors, and bare attribute reads inside `pytest.raises` blocks.
+"tests/**" = ["B017", "B018"]
+# The comment blocks document transcript formats with sample JSON lines.
+"tests/test_normalize.py" = ["ERA001"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25

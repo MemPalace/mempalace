@@ -14,19 +14,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from mempalace import timeutil
 from mempalace.dynamics import (
     DEFAULT_STABILITY,
     DEFAULT_STRENGTH,
     MAX_STRENGTH,
-    effective_strength,
     POTENTIATION_INCREMENT,
     STABILITY_INCREMENT,
     STRENGTH_FLOOR,
     apply_decay,
+    effective_strength,
     initialize_dynamics_fields,
     potentiate,
 )
-
 
 # Fixed reference point so test arithmetic is exact.
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -365,15 +365,31 @@ class TestEffectiveStrength:
         conn = {"strength": 2.0, "stability": 5.0, "last_activated": "not-a-date"}
         assert effective_strength(conn, now=T0) == 2.0
 
-    def test_naive_now_is_read_as_utc(self):
-        """A caller passing datetime.now() must not get a TypeError. The
-        stored timestamp is forced tz-aware by _parse_iso, so an unaware
-        ``now`` would otherwise fail the subtraction."""
+    def test_naive_now_is_read_as_local_time(self, monkeypatch):
+        """A caller passing datetime.now() gets local time, not a TypeError."""
+        zone = timezone(timedelta(hours=9))
+        monkeypatch.setattr(timeutil, "_LOCAL_TZ", zone)
         conn = {"strength": 1.0, "stability": 5.0, "last_activated": T0.isoformat()}
-        naive = (T0 + timedelta(days=10)).replace(tzinfo=None)
+        later = T0 + timedelta(days=10)
+        naive = later.astimezone(zone).replace(tzinfo=None)
 
         assert effective_strength(conn, now=naive) == pytest.approx(
-            effective_strength(conn, now=T0 + timedelta(days=10))
+            effective_strength(conn, now=later)
+        )
+
+    @pytest.mark.parametrize("hours", [-3, 9, 14])
+    def test_naive_stored_timestamp_is_local_time(self, monkeypatch, hours):
+        """Tunnels written before timestamps were UTC hold naive local times;
+        reading them as UTC would skew decay by the zone offset."""
+        zone = timezone(timedelta(hours=hours))
+        monkeypatch.setattr(timeutil, "_LOCAL_TZ", zone)
+        naive_local = T0.astimezone(zone).replace(tzinfo=None).isoformat()
+        legacy = {"strength": 1.0, "stability": 5.0, "last_activated": naive_local}
+        current = {"strength": 1.0, "stability": 5.0, "last_activated": T0.isoformat()}
+        now = T0 + timedelta(days=10)
+
+        assert effective_strength(legacy, now=now) == pytest.approx(
+            effective_strength(current, now=now)
         )
 
     def test_never_below_the_floor(self):

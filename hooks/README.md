@@ -126,7 +126,7 @@ behavior. `mempalace hook run` owns that:
 
 - **Save interval** — `SAVE_INTERVAL` in `mempalace/hooks_cli.py` (15 human messages).
 - **`MEMPAL_DIR`** — Optional project directory. When set in the environment, the Python hook mines it with `--mode projects` in addition to the transcript. The wrappers do not set this variable.
-- **`MEMPAL_PYTHON`** — Interpreter used by the legacy wrappers. Resolution (`mempal_hook_run.sh`): `$MEMPAL_PYTHON`, then `mempalace` on `PATH`, then `python3`, then `python`, taking the first that can import mempalace. When none can, the hook prints `{}` and exits 0.
+- **`MEMPAL_PYTHON`** — Interpreter used by every hook wrapper, legacy and plugin. Resolution (`mempal_hook_run.sh`): `$MEMPAL_PYTHON`, then `mempalace` on `PATH`, then `python3`, then `python`, taking the first that can import mempalace. When none can, the legacy hooks print `{}` and exit 0; the Claude Code and Codex plugin hooks exit 1 so the harness reports the failure.
 - **`MEMPAL_VERBOSE`** — No longer read by the legacy Stop wrapper. To have the Stop hook block and ask the AI to save instead of saving silently, set `hooks.silent_save` to `false` in `~/.mempalace/config.json`.
 
 ### Disabling Auto-Save (Silent Mode)
@@ -194,7 +194,7 @@ Example output:
 export MEMPAL_PYTHON="$HOME/.venvs/mempalace/bin/python"
 ```
 
-Resolution: `$MEMPAL_PYTHON`, then `mempalace` on `PATH`, then `python3`, then `python`, taking the first that can import mempalace. The plugin wrappers in `.claude-plugin/hooks/` try `mempalace` on `PATH` first and do not read `MEMPAL_PYTHON` for Stop and PreCompact.
+Resolution: `$MEMPAL_PYTHON`, then `mempalace` on `PATH`, then `python3`, then `python`, taking the first that can import mempalace. The Claude Code and Codex plugins resolve the same way: each ships a byte-identical copy of `mempal_hook_run.sh` in its own `hooks/` folder, and a test keeps the copies in step.
 
 ## Backfill Past Conversations
 

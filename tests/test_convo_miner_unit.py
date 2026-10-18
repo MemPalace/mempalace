@@ -1136,8 +1136,7 @@ class TestSourceDirectoryIdentity:
 def test_mine_convos_passes_the_directory_it_read_from(tmp_path, monkeypatch):
     """The storing half is covered above; this covers the wiring, so removing
     the call in ``_mine_convos_impl`` cannot pass unnoticed (#2320)."""
-    from mempalace import convo_miner
-    from mempalace import source_identity as si
+    from mempalace import convo_miner, source_identity as si
 
     transcripts = tmp_path / "transcripts"
     transcripts.mkdir()

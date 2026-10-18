@@ -89,7 +89,7 @@ def _candidate_entity_words(text: str) -> list:
             except re.error:
                 continue
         _CANDIDATE_RX_CACHE = rxs
-    # Defuse ReDoS on long ASCII blobs before matching (#2063); see
+    # Defuse ReDoS on long ASCII blobs before matching; see
     # entity_detector._collapse_long_ascii_runs.
     stripped = _collapse_long_ascii_runs(text)
     words = []
@@ -248,25 +248,94 @@ def open_aaak_collection(palace_path: str):
         return None
 
 
-def purge_aaak_rows(aaak_col, *, source_file=None, drawer_ids=(), batch_size: int = 500) -> int:
-    """Delete the AAAK summaries of deleted or rewritten drawers.
+def purge_source_closets(palace_path: str, source_file: str, *, commit: bool = True) -> int:
+    """Count, and with ``commit`` delete, the closets of ``source_file``.
 
-    A summary quotes its drawer, so it goes with it: rows keyed by any of
-    ``drawer_ids`` and every row of ``source_file``. Returns the number deleted.
+    Closets are keyed by source, not by drawer, so they go whenever a drawer
+    of that source does. Never raises: the drawer change has already committed.
     """
-    if aaak_col is None:
+    try:
+        closets_col = get_closets_collection(palace_path, create=False)
+    except Exception as exc:
+        logger.warning("Closet purge skipped (collection unavailable): %s", exc)
         return 0
+    if closets_col is None:
+        return 0
+    try:
+        ids = closets_col.get(where={"source_file": source_file}, include=[]).get("ids") or []
+        if commit and ids:
+            closets_col.delete(where={"source_file": source_file})
+        return len(ids)
+    except Exception as exc:
+        logger.warning("Closet purge failed for %s: %s", source_file, exc)
+        return 0
+
+
+def drawers_removed(
+    palace_path,
+    *,
+    aaak_ids=(),
+    aaak_source=None,
+    closet_sources=(),
+    revision_ids=None,
+    revision_source=None,
+    aaak_col=None,
+    reraise=(),
+) -> dict:
+    """Purge what was derived from drawers just deleted or rewritten.
+
+    Call it after the drawer change commits. AAAK summaries go by drawer id
+    (``aaak_ids``) or for a whole file (``aaak_source``), closets per source in
+    ``closet_sources``, and saved revisions by ``revision_ids`` or
+    ``revision_source`` when either is given. A failure is logged and reported,
+    never raised, so it cannot undo the drawer change; only errors in
+    ``reraise`` propagate. Returns ``closets_deleted`` when closets were asked
+    for, and ``revisions_deleted`` (None plus ``revisions_error`` on failure)
+    when revisions were.
+    """
+    result = {}
+    if closet_sources:
+        result["closets_deleted"] = sum(
+            purge_source_closets(palace_path, source) for source in dict.fromkeys(closet_sources)
+        )
+    if aaak_ids or aaak_source:
+        try:
+            if aaak_col is None and palace_path:
+                aaak_col = open_aaak_collection(palace_path)
+            if aaak_col is not None:
+                _delete_aaak_rows(aaak_col, aaak_ids, aaak_source)
+        except reraise:
+            raise
+        except Exception:
+            logger.warning("AAAK purge failed for %s", aaak_source or "drawers", exc_info=True)
+    if revision_ids is None and revision_source is None:
+        return result
+    if not revision_ids and revision_source is None:
+        return {**result, "revisions_deleted": 0}
+    from ..revisions import purge_drawer_revisions
+
+    try:
+        result["revisions_deleted"] = purge_drawer_revisions(
+            palace_path, drawer_ids=revision_ids or (), source_file=revision_source
+        )
+    except Exception as exc:
+        logger.exception("Revision purge failed after a drawer delete")
+        result["revisions_deleted"] = None
+        result["revisions_error"] = f"revision purge failed: {type(exc).__name__}"
+    return result
+
+
+def _delete_aaak_rows(aaak_col, drawer_ids, source_file, batch_size: int = 500) -> None:
+    # A summary quotes its drawer, so it goes by the drawer's id or its whole file.
     ids = set()
     drawer_ids = list(dict.fromkeys(drawer_ids))
     for start in range(0, len(drawer_ids), batch_size):
-        batch = drawer_ids[start : start + batch_size]
-        ids.update(aaak_col.get(ids=batch, include=[]).get("ids") or [])
+        ids.update(aaak_col.get(ids=drawer_ids[start : start + batch_size], include=[])["ids"])
     if source_file:
-        ids.update(aaak_col.get(where={"source_file": source_file}, include=[]).get("ids") or [])
+        ids.update(aaak_col.get(where={"source_file": source_file}, include=[])["ids"])
     ordered = sorted(ids)
     for start in range(0, len(ordered), batch_size):
         aaak_col.delete(ids=ordered[start : start + batch_size])
-    return len(ordered)
 
 
 def is_aaak_row(metadata) -> bool:

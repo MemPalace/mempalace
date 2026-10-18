@@ -1,20 +1,20 @@
 import json
 import os
-import tempfile
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
 import chromadb
 import pytest
 
+from mempalace import palace
 from mempalace.convo_miner import (
     _is_ai_tool_path,
     _register_file,
     _resolve_wing,
     mine_convos,
 )
-from mempalace import palace
 from mempalace.palace import (
     CONVO_CHUNKER_VERSION,
     GENERAL_EXTRACTOR_VERSION,

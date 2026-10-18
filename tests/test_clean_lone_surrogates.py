@@ -21,7 +21,6 @@ import hashlib
 
 from mempalace.config import strip_lone_surrogates
 
-
 # ── Unit tests ─────────────────────────────────────────────────────────────
 
 

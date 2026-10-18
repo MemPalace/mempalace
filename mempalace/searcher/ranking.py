@@ -22,30 +22,11 @@ def _result_drawer_id(meta, stored_drawer_id):
     Chunk metadata carries the logical-group id under ``parent_drawer_id``
     (``tool_add_drawer``) or ``parent_entry_id`` (``tool_diary_write``);
     resolving both means a hit on a chunked diary entry reports the id that
-    fetches the WHOLE entry rather than the one chunk that matched (#2185).
+    fetches the WHOLE entry rather than the one chunk that matched.
     Kept in sync with ``mcp_server._PARENT_ID_KEYS``.
     """
     meta = meta or {}
     return meta.get("parent_drawer_id") or meta.get("parent_entry_id") or stored_drawer_id
-
-
-def _tokenize(text: str, stop_words: frozenset = frozenset()) -> list:
-    """Lowercase + strip to alphanumeric tokens of length ≥ 2.
-
-    Tolerates ``None`` documents — Chroma can return ``None`` in the
-    ``documents`` field for drawers without text content, which would
-    otherwise raise ``AttributeError`` mid-rerank.
-
-    When ``stop_words`` is non-empty, filters tokens that match any entry.
-    The set is expected to already be lowercased so callers can share one
-    instance across query + document tokenization.
-    """
-    if not text:
-        return []
-    tokens = _TOKEN_RE.findall(text.lower())
-    if stop_words:
-        return [t for t in tokens if t not in stop_words]
-    return tokens
 
 
 @functools.lru_cache(maxsize=16)
@@ -102,7 +83,7 @@ def _resolve_stop_words(lang: Optional[str]) -> frozenset:
 
 
 def _resolve_hybrid_rank_weights() -> tuple:
-    """Resolve the vector/BM25 weights for the hybrid re-rank (#2298).
+    """Resolve the vector/BM25 weights for the hybrid re-rank.
 
     Reads ``MempalaceConfig().hybrid_rank_vector_weight`` /
     ``.hybrid_rank_bm25_weight`` — which themselves resolve env var
@@ -121,66 +102,6 @@ def _resolve_hybrid_rank_weights() -> tuple:
     except Exception:
         logger.debug("hybrid rank weight resolution failed, using defaults", exc_info=True)
         return 0.6, 0.4
-
-
-def _bm25_scores(
-    query: str,
-    documents: list,
-    k1: float = 1.5,
-    b: float = 0.75,
-    stop_words: frozenset = frozenset(),
-) -> list:
-    """Compute Okapi-BM25 scores for ``query`` against each document.
-
-    IDF is computed over the *provided corpus* using the Lucene/BM25+
-    smoothed formula ``log((N - df + 0.5) / (df + 0.5) + 1)``, which is
-    always non-negative. This is well-defined for re-ranking a small
-    candidate set returned by vector retrieval — IDF then reflects how
-    discriminative each query term is *within the candidates*, exactly
-    what's needed to reorder them.
-
-    Parameters mirror Okapi-BM25 conventions:
-        k1 — term-frequency saturation (1.2-2.0 typical, 1.5 default)
-        b  — length normalization (0.0 = none, 1.0 = full, 0.75 default)
-
-    Returns a list of scores in the same order as ``documents``.
-    """
-    n_docs = len(documents)
-    query_terms = set(_tokenize(query, stop_words))
-    if not query_terms or n_docs == 0:
-        return [0.0] * n_docs
-
-    tokenized = [_tokenize(d, stop_words) for d in documents]
-    doc_lens = [len(toks) for toks in tokenized]
-    if not any(doc_lens):
-        return [0.0] * n_docs
-    avgdl = sum(doc_lens) / n_docs or 1.0
-
-    # Document frequency: how many docs contain each query term?
-    df = {term: 0 for term in query_terms}
-    for toks in tokenized:
-        seen = set(toks) & query_terms
-        for term in seen:
-            df[term] += 1
-
-    idf = {term: math.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1) for term in query_terms}
-
-    scores = []
-    for toks, dl in zip(tokenized, doc_lens):
-        if dl == 0:
-            scores.append(0.0)
-            continue
-        tf: dict = {}
-        for t in toks:
-            if t in query_terms:
-                tf[t] = tf.get(t, 0) + 1
-        score = 0.0
-        for term, freq in tf.items():
-            num = freq * (k1 + 1)
-            den = freq + k1 * (1 - b + b * dl / avgdl)
-            score += idf[term] * num / den
-        scores.append(score)
-    return scores
 
 
 def _vector_distance(
@@ -281,7 +202,7 @@ def _hybrid_rank(
         return results
 
     docs = [r.get("text", "") for r in results]
-    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
+    bm25_raw = bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
 

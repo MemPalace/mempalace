@@ -31,7 +31,7 @@ def _strip_leaked_pythonpath_from_sys_path() -> None:
     def _norm(path: str) -> str:
         return os.path.normcase(os.path.normpath(path))
 
-    # Preserve this interpreter's package directories (#2484), not every
+    # Preserve this interpreter's package directories, not every
     # descendant of sys.prefix: shared installations and nested venvs can
     # contain packages built for another Python ABI under the same prefix.
     paths = sysconfig.get_paths()
@@ -69,18 +69,8 @@ logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICA
 # so an operator who deliberately exports the variable still wins. (GHSA-8h77)
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
-# NOTE: the previous block set ``ORT_DISABLE_COREML=1`` on macOS arm64 as a
-# supposed workaround for the #74 ARM64 segfault.  Two problems:
-#
-# 1. ONNX Runtime does not read that env var -- it has no global way to
-#    disable a single execution provider, so the setdefault was a no-op.
-# 2. #74 is a null-pointer crash in ``chromadb_rust_bindings.abi3.so``, not
-#    an ONNX issue, so disabling CoreML would not have fixed it anyway.
-#
-# #521 has since traced the actual macOS arm64 crashes (both in mine and
-# search paths) to the 0.x chromadb hnswlib binding.  Filtering
-# CoreMLExecutionProvider at the ONNX layer leaves the hnswlib C++ crash
-# intact, so the real fix is upgrading chromadb to 1.5.4+, which #581
-# proposes.  See #397 for the history of this line.
+# Don't set ``ORT_DISABLE_COREML`` here for macOS arm64 crashes: ONNX Runtime
+# ignores that variable, and those crashes come from the chromadb 0.x hnswlib
+# binding, not from ONNX.
 
 __all__ = ["__version__"]

@@ -20,10 +20,12 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from .fsio import CorruptStateError
-from .fsio import atomic_write_text as _atomic_write_text
-from .fsio import refuse_unparsed as _refuse_unparsed
-
+from . import paths
+from .fsio import (
+    CorruptStateError,
+    atomic_write_text as _atomic_write_text,
+    refuse_unparsed as _refuse_unparsed,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Common English words that could be confused with names
@@ -157,7 +159,7 @@ class EntityRegistry:
     }
     """
 
-    DEFAULT_PATH = Path.home() / ".mempalace" / "entity_registry.json"
+    DEFAULT_PATH = paths.state_path("entity_registry.json")
 
     def __init__(self, data: dict, path: Path):
         self._data = data
@@ -379,7 +381,7 @@ class EntityRegistry:
                 "needs_disambiguation": False,
                 "disambiguated_by": "context_patterns",
             }
-        elif concept_score > person_score:
+        if concept_score > person_score:
             return {
                 "type": "concept",
                 "confidence": min(0.90, 0.7 + concept_score * 0.1),
@@ -391,94 +393,6 @@ class EntityRegistry:
 
         # Truly ambiguous — return None to fall through to person (registered name)
         return None
-
-    # ── Learn from sessions ──────────────────────────────────────────────────
-
-    def learn_from_text(self, text: str, min_confidence: float = 0.75, languages=("en",)) -> list:
-        """
-        Scan session text for new entity candidates.
-        Returns list of newly discovered candidates for review.
-
-        ``languages`` is forwarded to entity detection — pass the user's
-        configured ``MempalaceConfig().entity_languages`` to match the
-        locales used at ``mempalace init`` time.
-        """
-        from mempalace.entity_detector import extract_candidates, score_entity, classify_entity
-
-        lines = text.splitlines()
-        candidates = extract_candidates(text, languages=languages)
-        new_candidates = []
-
-        for name, frequency in candidates.items():
-            # Skip if already known
-            if name in self.people or name in self.projects:
-                continue
-
-            scores = score_entity(name, text, lines, languages=languages)
-            entity = classify_entity(name, frequency, scores)
-
-            if entity["type"] == "person" and entity["confidence"] >= min_confidence:
-                self._data["people"][name] = {
-                    "source": "learned",
-                    "contexts": [self.mode if self.mode != "combo" else "personal"],
-                    "aliases": [],
-                    "relationship": "",
-                    "confidence": entity["confidence"],
-                    "seen_count": frequency,
-                }
-                if name.lower() in COMMON_ENGLISH_WORDS:
-                    flags = self._data.setdefault("ambiguous_flags", [])
-                    if name.lower() not in flags:
-                        flags.append(name.lower())
-                new_candidates.append(entity)
-
-        if new_candidates:
-            self.save()
-
-        return new_candidates
-
-    # ── Query helpers for retrieval ──────────────────────────────────────────
-
-    def extract_people_from_query(self, query: str) -> list:
-        """
-        Extract known person names from a query string.
-        Returns list of canonical names found.
-        """
-        found = []
-
-        for canonical, info in self.people.items():
-            names_to_check = [canonical] + info.get("aliases", [])
-            for name in names_to_check:
-                # Word boundary match
-                if re.search(rf"\b{re.escape(name)}\b", query, re.IGNORECASE):
-                    # For ambiguous words, check context
-                    if name.lower() in self.ambiguous_flags:
-                        result = self._disambiguate(name, query, info)
-                        if result and result["type"] == "person":
-                            if canonical not in found:
-                                found.append(canonical)
-                    else:
-                        if canonical not in found:
-                            found.append(canonical)
-        return found
-
-    def extract_unknown_candidates(self, query: str) -> list:
-        """
-        Find capitalized words in query that aren't in registry or common words.
-        These are candidates for the caller to resolve — the registry itself
-        never looks anything up off the machine.
-        """
-        from .palace import _candidate_entity_words
-
-        candidates = _candidate_entity_words(query)
-        unknown = []
-        for word in set(candidates):
-            if word.lower() in COMMON_ENGLISH_WORDS:
-                continue
-            result = self.lookup(word)
-            if result["type"] == "unknown":
-                unknown.append(word)
-        return unknown
 
     # ── Summary ──────────────────────────────────────────────────────────────
 

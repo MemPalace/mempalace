@@ -63,8 +63,8 @@ def cmd_mine(args):
         EmbeddingFunctionUnavailableError,
         UnknownEmbeddingModelError,
     )
-    from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
     from ..media import MediaAssetError, MediaAssetSetupError
+    from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
 
     model_errors = (
         UnknownEmbeddingModelError,
@@ -87,6 +87,7 @@ def cmd_mine(args):
                 source_path=args.dir,
                 palace_path=palace_path,
                 dry_run=args.dry_run,
+                explicit_palace=bool(args.palace),
                 **(
                     {
                         "project": getattr(args, "wing", None),
@@ -297,6 +298,7 @@ def mine_source_adapter(
     dry_run: bool = False,
     project: Optional[str] = None,
     related_drawer_id: Optional[str] = None,
+    explicit_palace: bool = False,
 ) -> int:
     """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
 
@@ -307,16 +309,16 @@ def mine_source_adapter(
     import logging
 
     from ..knowledge_graph import KnowledgeGraph
+    from ..media import MediaAsset, MediaAssetError, MediaAssetSetupError, store_media_asset
     from ..palace import get_collection, mine_palace_lock
     from ..sources import (
         DrawerRecord,
         PalaceContext,
-        SourceRef,
         SourceItemMetadata,
+        SourceRef,
         get_adapter,
         resolve_adapter_for_source,
     )
-    from ..media import MediaAsset, MediaAssetError, MediaAssetSetupError, store_media_asset
 
     logger = logging.getLogger(__name__)
 
@@ -349,7 +351,7 @@ def mine_source_adapter(
             else:
                 drawer_collection = get_collection(palace_path)
                 knowledge_graph = KnowledgeGraph(
-                    db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
+                    db_path=paths.knowledge_graph_path(palace_path, explicit=explicit_palace)
                 )
             context = PalaceContext(
                 drawer_collection=drawer_collection,

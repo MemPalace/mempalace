@@ -49,7 +49,6 @@ def _query_drawers_with_filter_fallback(
     drawers are ingested via two different paths (e.g. bulk import vs MCP tool
     calls), leaving the vector index inconsistent with the metadata store. We
     retry unfiltered (over-fetching) and re-apply the wing/room/source_file filter in Python.
-    See #1245 / #1035.
     """
     where = dkwargs.get("where")
     try:
@@ -69,6 +68,7 @@ def _query_drawers_with_filter_fallback(
         raw_docs = _first_or_empty(raw, "documents")
         raw_ids = _aligned_query_ids(raw, len(raw_docs))
         fids, fdocs, fmetas, fdists = [], [], [], []
+        wings = set(palace_wing_aliases(wing, drawers_col)) if wing else None
         for stored_drawer_id, doc, meta, dist in zip(
             raw_ids,
             raw_docs,
@@ -76,7 +76,7 @@ def _query_drawers_with_filter_fallback(
             _first_or_empty(raw, "distances"),
         ):
             meta = meta or {}
-            if wing and meta.get("wing") != wing:
+            if wings and meta.get("wing") not in wings:
                 continue
             if room and meta.get("room") != room:
                 continue
@@ -174,12 +174,15 @@ def _scaled_pool_limits(limits: tuple, scale: int) -> tuple:
     )
 
 
-def _copies_left_results_short(hits, n_results, candidates_fetched, pool_size) -> bool:
-    """Whether folded copies left the page short while the pool was full."""
+def _pool_left_results_short(
+    hits, n_results, candidates_fetched, pool_size, bookkeeping_dropped=0
+) -> bool:
+    """Whether folded copies or skipped bookkeeping rows left the page short
+    while the pool came back full, so more candidates exist."""
     return (
         len(hits) < n_results
         and candidates_fetched >= pool_size
-        and any(hit.get("also_in") for hit in hits)
+        and (bookkeeping_dropped > 0 or any(hit.get("also_in") for hit in hits))
     )
 
 
@@ -218,11 +221,11 @@ def search_memories(
         wing: Optional wing filter.
         room: Optional room filter.
         source_file: Optional exact source_file filter. Matches the full
-            stored source_file value verbatim (#1815).
+            stored source_file value verbatim.
         since: Optional inclusive ISO date/datetime lower bound on a
             drawer's ``filed_at`` (ingest time, the ``created_at`` shown in
             results) — ``[since, before)`` window semantics shared with
-            ``list_drawers`` (#1128): wall-clock naive comparison, drawers
+            ``list_drawers``: compared as instants (see ``date_window``), drawers
             with missing/unparseable ``filed_at`` excluded while a bound is
             active. Filtering happens after retrieval (ChromaDB rejects
             string operands for ``$gte``/``$lt``), so the candidate pool is
@@ -235,8 +238,8 @@ def search_memories(
             ``ip`` distances are converted before comparing). Candidates past
             it are dropped and counted in ``filtered_by_max_distance``.
             ``None`` (the default), ``0`` or a negative value applies no cutoff.
-        vector_disabled: When True, route to the sqlite-only BM25 fallback
-            (#1222). Set by the MCP server when the HNSW capacity probe
+        vector_disabled: When True, route to the sqlite-only BM25 fallback.
+            Set by the MCP server when the HNSW capacity probe
             detects a divergence that would segfault chromadb on segment
             load.
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
@@ -316,7 +319,7 @@ def search_memories(
         return open_error
 
     metric = _metric_for_collection(drawers_col)
-    where = build_where_filter(wing, room, source_file)
+    where = build_where_filter(wing, room, source_file, col=drawers_col)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -370,6 +373,7 @@ def search_memories(
     # Every candidate the vector path measured, kept or dropped, so union
     # mode neither re-admits nor re-counts a drawer this loop already gated.
     measured: dict = {}
+    bookkeeping_dropped = 0
     drawer_docs = _first_or_empty(drawer_results, "documents")
     stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
     for stored_drawer_id, doc, meta, dist in zip(
@@ -382,6 +386,9 @@ def search_memories(
         doc = doc or ""
         if stored_drawer_id:
             measured[stored_drawer_id] = dist
+        if is_bookkeeping(meta, stored_drawer_id):
+            bookkeeping_dropped += 1
+            continue
         gate = _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt, metric)
         if gate == "distance":
             stats["filtered_by_max_distance"] = stats.get("filtered_by_max_distance", 0) + 1
@@ -478,7 +485,9 @@ def search_memories(
         stats=stats,
         distance_metric=metric,
     )
-    if _copies_left_results_short(hits, n_results, candidates_fetched, pool_size):
+    if _pool_left_results_short(
+        hits, n_results, candidates_fetched, pool_size, bookkeeping_dropped
+    ):
         if _pool_scale < _MAX_POOL_SCALE and pool_size < _MAX_FOLD_POOL:
             return search_memories(
                 query,

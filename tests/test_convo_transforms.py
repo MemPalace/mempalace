@@ -169,17 +169,18 @@ def test_a_tool_result_with_no_turn_before_it_is_recorded_as_omitted():
     assert run.applied == {"tool_result_omitted"}
 
 
-def test_gemini_json_records_dropped_parts_roles_and_joined_parts():
+def test_gemini_json_records_dropped_parts_and_roles():
     session = {
         "contents": [
             {"role": "system", "parts": [{"text": "be brief"}]},
-            {"role": "user", "parts": [{"text": "what is"}, {"text": "this"}, {"inlineData": {}}]},
+            {"role": "user", "parts": [{"text": "what is "}, {"text": "this"}, {"inlineData": {}}]},
             {"role": "model", "parts": [{"text": "A chart."}, {"functionCall": {"name": "f"}}]},
         ]
     }
     with recording_transforms() as run:
-        assert _try_gemini_json(session)
-    assert run.applied == {"conversations.content_block_drop", "line_join_spaces"}
+        transcript = _try_gemini_json(session)
+    assert "> what is this\n" in transcript
+    assert run.applied == {"conversations.content_block_drop"}
 
     clean = {
         "contents": [
@@ -313,12 +314,47 @@ def test_continue_records_system_messages_tool_markers_and_orphan_output():
 
 def test_strip_noise_records_only_when_it_removes_chrome():
     with recording_transforms() as run:
-        assert strip_noise("plain words\n") == "plain words"
+        assert strip_noise("plain words\n") == "plain words\n"
     assert run.applied == set()
 
     with recording_transforms() as run:
         assert strip_noise("<system-reminder>\nnote\n</system-reminder>\nkeep") == "keep"
     assert run.applied == {"strip_tool_chrome"}
+
+
+def test_strip_noise_keeps_blank_lines_the_writer_typed():
+    typed = "first paragraph\n\n\n\n\nafter a long gap"
+    with recording_transforms() as run:
+        assert strip_noise(typed) == typed
+    assert run.applied == set()
+
+    with recording_transforms() as run:
+        cleaned = strip_noise("<system-reminder>\nnote\n</system-reminder>\n" + typed)
+    assert cleaned == "first paragraph\n\n\nafter a long gap"
+    assert run.applied == {"strip_tool_chrome", "whitespace_collapse_internal"}
+
+
+def test_gemini_parts_join_as_written():
+    streamed = _claude_code(
+        {"type": "session_metadata"},
+        {"type": "user", "content": [{"text": "list the "}, {"text": "files\n\nplease"}]},
+        {"type": "gemini", "content": [{"text": "Here th"}, {"text": "ey are."}]},
+    )
+    with recording_transforms() as run:
+        transcript = _try_gemini_jsonl(streamed)
+    assert "> list the files\n\nplease\nHere they are.\n" in transcript
+    assert run.applied == set()
+
+    session = {
+        "contents": [
+            {"role": "user", "parts": [{"text": "Hel"}, {"text": "lo there"}]},
+            {"role": "model", "parts": [{"text": "Hi."}]},
+        ]
+    }
+    with recording_transforms() as run:
+        transcript = _try_gemini_json(session)
+    assert "> Hello there\n" in transcript
+    assert run.applied == set()
 
 
 def test_slack_records_assigned_roles_and_its_footer():

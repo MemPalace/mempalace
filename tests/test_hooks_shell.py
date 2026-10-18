@@ -240,8 +240,8 @@ class TestSessionEndWrapper:
         shim = tmp_path / "python3"
         shim.write_text(
             f"""#!/bin/bash
-if [ "$1" = "-c" ]; then exit 0; fi
-if [ "$1" = "-m" ] && [ "$2" = "mempalace" ]; then
+case "$1:${{2:-}}" in -c:*run_module*) ;; -c:*) exit 0 ;; esac
+if [ "$1" = "-c" ]; then
   shift 2
   cat >/dev/null
   printf '%s' "$*" > "{args_file}"

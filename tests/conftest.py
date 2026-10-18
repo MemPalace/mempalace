@@ -10,9 +10,9 @@ mempalace imports — so that module-level initialisations (e.g.
 instead of the real user profile.
 """
 
-import os
 import hashlib
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -99,8 +99,9 @@ class _StableTestEmbeddingFunction:
 # don't re-download the 79 MB model on every run. The HOME redirect above
 # would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
 try:
-    from pathlib import Path  # noqa: E402
-    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (  # noqa: E402
+    from pathlib import Path
+
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (
         ONNXMiniLM_L6_V2,
     )
 
@@ -129,10 +130,11 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
 
     ef = _StableTestEmbeddingFunction()
 
+    from chromadb.api.types import DefaultEmbeddingFunction
+
     import mempalace.backends.chroma as chroma_mod
     import mempalace.backends.embedding_wrapper as embedding_wrapper
     import mempalace.embedding as embedding_mod
-    from chromadb.api.types import DefaultEmbeddingFunction
 
     monkeypatch.setattr(DefaultEmbeddingFunction, "__call__", lambda self, input: ef(input=input))
     monkeypatch.setattr(
@@ -188,6 +190,44 @@ def _release_palace_anchors():
     inproc = sys.modules.get("mempalace.backends._inproc_sqlite")
     if inproc is not None:
         inproc.release_all()
+
+
+def _realign_default_backend(palace_module):
+    """Make ``palace._DEFAULT_BACKEND`` the registry's chroma instance again.
+
+    In production the two are the same object. ``reset_backends()`` (called by
+    several test modules) closes that instance and empties the registry, so the
+    next ``get_backend("chroma")`` builds a second one while ``_DEFAULT_BACKEND``
+    keeps pointing at the closed original. Later tests then patch one object
+    and the code under test uses the other.
+    """
+    from mempalace.backends import registry
+    from mempalace.backends.chroma import ChromaBackend
+
+    current = registry.get_backend("chroma")
+    if isinstance(current, ChromaBackend) and current is not palace_module._DEFAULT_BACKEND:
+        palace_module._DEFAULT_BACKEND = current
+
+
+@pytest.fixture(autouse=True)
+def _fresh_one_shot_warnings():
+    """Let every test see the warnings that fire once per process."""
+    from mempalace import _once
+
+    _once.reset()
+
+
+@pytest.fixture(autouse=True)
+def _utc_local_zone(monkeypatch):
+    """Read naive legacy timestamps as UTC so results don't depend on the host zone.
+
+    Tests that need another zone set ``timeutil._LOCAL_TZ`` themselves.
+    """
+    from datetime import timezone
+
+    from mempalace import timeutil
+
+    monkeypatch.setattr(timeutil, "_LOCAL_TZ", timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -277,6 +317,10 @@ def _reset_mcp_cache(monkeypatch):
         except (ImportError, AttributeError):
             pass
 
+        from mempalace import search_util
+
+        search_util._known_wings_cache.clear()
+
         # Release chromadb clients opened through the backend layer. Many tests
         # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
         # which caches one PersistentClient per palace_path on the long-lived
@@ -289,6 +333,7 @@ def _reset_mcp_cache(monkeypatch):
         try:
             from mempalace import palace as _palace
 
+            _realign_default_backend(_palace)
             backend = getattr(_palace, "_DEFAULT_BACKEND", None)
             clients = getattr(backend, "_clients", None)
             if clients:
@@ -320,6 +365,17 @@ def _isolate_home():
         else:
             os.environ[var] = orig
     shutil.rmtree(_session_tmp, ignore_errors=True)
+
+
+@pytest.fixture
+def tokenless_http_hub(monkeypatch):
+    """Serve MCP HTTP without a bearer token, as ``mempalace serve --no-token`` does.
+
+    The transport requires a token by default; suites that drive a loopback
+    hub with raw HTTP requests opt out with this rather than carry a token.
+    """
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN", "1")
 
 
 @pytest.fixture

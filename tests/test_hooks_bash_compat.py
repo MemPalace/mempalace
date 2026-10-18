@@ -120,15 +120,17 @@ class TestNoBash4OnlyBuiltins:
 
 
 def _shim(path: Path, recorded: Path, copied: Path, *, importable: bool = True) -> Path:
-    """A fake interpreter that records its argv and stdin.
+    """A fake interpreter that records the ``mempalace`` argv and stdin.
 
-    ``-c`` is the resolver's import check: it answers with ``importable``
-    and touches nothing, so only the real ``hook run`` call is recorded.
+    The resolver calls ``-c <code>`` twice: an import check, answered with
+    ``importable`` and touching nothing, and the launch (its code calls
+    ``run_module``), whose arguments after the code are recorded.
     """
     import_rc = 0 if importable else 1
     path.write_text(
         "#!/bin/bash\n"
-        f'if [ "${{1:-}}" = "-c" ]; then exit {import_rc}; fi\n'
+        'case "${2:-}" in *run_module*) ;; *) exit ' + str(import_rc) + " ;; esac\n"
+        "shift 2\n"
         f'printf \'%s\\n\' "$@" > "{recorded}"\n'
         f'cat > "{copied}"\n'
         "printf '{}'\n",
@@ -174,8 +176,6 @@ class TestLegacyWrappersDelegate:
         args = recorded.read_text(encoding="utf-8").splitlines()
         hook_name = self._HOOK_NAME[hook.name]
         assert args == [
-            "-m",
-            "mempalace",
             "hook",
             "run",
             "--hook",
@@ -201,7 +201,7 @@ class TestLegacyWrappersDelegate:
             extra_env={"MEMPAL_PYTHON": str(broken), "PATH": f"{bin_dir}:/usr/bin:/bin"},
         )
         assert out == "{}"
-        assert recorded.read_text(encoding="utf-8").splitlines()[:2] == ["-m", "mempalace"]
+        assert recorded.read_text(encoding="utf-8").splitlines()[:2] == ["hook", "run"]
 
     def test_no_usable_interpreter_replies_empty_and_exits_zero(self, tmp_path):
         bin_dir = tmp_path / "bin"
@@ -232,13 +232,8 @@ class TestSessionEndWrappers:
     @_SESSION_END_HOOKS
     def test_dispatches_session_end_through_cli(self, hook):
         src = _hook_src_no_comments(hook)
-        # The plugin dispatches ``mempalace hook run "$@"`` itself; the legacy
-        # hook hands the same arguments to the shared resolver.
-        if hook == SESSION_END_HOOK:
-            assert "mempal_hook_run.sh" in src
-        else:
-            assert "hook run" in src
-            assert "MEMPAL_PYTHON" in src
+        # Both hand the same arguments to the shared resolver next to them.
+        assert "mempal_hook_run.sh" in src
         assert "--hook session-end --harness" in src
         assert "MEMPALACE_HOOK_HARNESS" in src
 

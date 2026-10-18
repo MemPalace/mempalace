@@ -7,11 +7,9 @@ import threading
 import time
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace import daemon
-from mempalace import service
+from mempalace import daemon, service
 
 _LOCK_CONTENDER = """
 from mempalace.palace import MineAlreadyRunning, mine_palace_lock
@@ -956,8 +954,7 @@ def test_token_file_is_owner_only(tmp_path, monkeypatch):
 
 
 def test_health_rejects_missing_and_wrong_token(tmp_path, monkeypatch):
-    from urllib import error as urlerror
-    from urllib import request as urlrequest
+    from urllib import error as urlerror, request as urlrequest
 
     client, thread, palace, holders = _start_server(
         tmp_path, monkeypatch, lambda k, p: {"success": True}
@@ -1349,6 +1346,7 @@ def test_mcp_tool_knowledge_graph_writes_land_beside_the_daemons_palace(monkeypa
     tool it runs writes beside that palace, as a server started with
     ``--palace`` does, and not into the per-user default graph."""
     from _mcp_server_helpers import _keep_server_command_line_state
+
     import mempalace.mcp_server as mcp
     from mempalace import service
 

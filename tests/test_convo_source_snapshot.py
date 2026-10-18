@@ -4,19 +4,17 @@ import os
 
 import pytest
 
-from mempalace import convo_miner
-from mempalace import normalize as normalize_module
+from mempalace import convo_miner, normalize as normalize_module
 from mempalace._source_state import source_fingerprint
 from mempalace.palace import (
     CHUNKER_VERSIONS,
-    MinedSetUnavailable,
     CONVO_CHUNKER_VERSION,
     NORMALIZE_VERSION,
+    MinedSetUnavailable,
     file_already_mined,
     get_collection,
     prefetch_mined_set,
 )
-
 
 _INITIAL = (
     "> What is the plan?\nStart with the schema, then the API.\n\n"
@@ -140,7 +138,7 @@ def test_change_during_read_is_recovered_on_next_stable_mine(tmp_path, monkeypat
             if size != -1 or changed:
                 return self.stream.read(size)
             prefix = self.stream.read(32)
-            assert "DECISION_OLD" in prefix
+            assert b"DECISION_OLD" in prefix
             # Rewrite bytes the reader has already consumed, before it reads
             # the rest. Both reads and the intervening write use the real file.
             source.write_text(revised, encoding="utf-8")
@@ -670,7 +668,7 @@ def test_restored_mtime_rewrite_during_read_preserves_prior_drawers(tmp_path, mo
             if size != -1 or changed:
                 return self.stream.read(size)
             prefix = self.stream.read(32)
-            assert "DECISION_OLD" in prefix
+            assert b"DECISION_OLD" in prefix
             source.write_text(revised, encoding="utf-8")
             os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
             changed_stat = source.stat()
@@ -773,3 +771,50 @@ def test_snapshot_read_failure_aborts_instead_of_returning_a_partial_registry(tm
         )
     with pytest.raises(MinedSetUnavailable):
         prefetch_mined_set(BrokenLaterPage(), extract_mode="exchange", source_fingerprints=True)
+
+
+@pytest.mark.parametrize(
+    ("raw_turn", "expected", "encoding"),
+    [
+        (b"\x93caf\xe9\x94", "“café”", "windows-1252"),
+        ("café résumé ".encode() + b"\xff", "café résumé \udcff", "utf-8+surrogateescape"),
+    ],
+    ids=["cp1252", "utf8-stray-byte"],
+)
+def test_lossless_decoding_keeps_snapshot_freshness(
+    tmp_path, monkeypatch, raw_turn, expected, encoding
+):
+    """The shared decoder and snapshot check must survive each other's updates."""
+    source = tmp_path / "session.txt"
+    source.write_bytes(_INITIAL.encode() + b"\n> Original words?\n" + raw_turn + b"\n")
+    palace = tmp_path / "palace"
+    original_stat = source.stat()
+    _mine(source, palace)
+    rows = get_collection(str(palace)).get(include=["documents", "metadatas"])
+    assert any(expected in doc for doc in rows["documents"])
+    assert all(meta["source_encoding"] == encoding for meta in rows["metadatas"])
+    assert all(
+        meta["source_fingerprint"] == source_fingerprint(original_stat)
+        for meta in rows["metadatas"]
+    )
+
+    with monkeypatch.context() as unchanged:
+
+        def unexpected_read(*args, **kwargs):
+            pytest.fail("an unchanged losslessly decoded source should be skipped")
+
+        unchanged.setattr(convo_miner, "normalize_conversations_with_mtime", unexpected_read)
+        _mine(source, palace)
+
+    with source.open("ab") as stream:
+        stream.write(_APPEND.encode())
+    os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    _mine(source, palace)
+    rows = get_collection(str(palace)).get(include=["documents", "metadatas"])
+    assert any("APPENDED_TURN_MARKER" in doc for doc in rows["documents"])
+    assert any(expected in doc for doc in rows["documents"])
+    assert all(meta["source_encoding"] == encoding for meta in rows["metadatas"])
+    assert all(
+        meta["source_fingerprint"] == source_fingerprint(source.stat())
+        for meta in rows["metadatas"]
+    )

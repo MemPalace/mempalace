@@ -21,7 +21,6 @@ from mempalace.palace import (
     _validate_palace_fts5_after_mine,
 )
 
-
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
@@ -275,8 +274,7 @@ def test_full_chain_raises_through_mine_impl(tmp_path, monkeypatch):
     by test_full_chain_auto_heals_isolated_fts5_corruption below, and would
     never reach this raise path at all now that it's auto-healed.
     """
-    from mempalace import miner as miner_mod
-    from mempalace import palace as palace_mod
+    from mempalace import miner as miner_mod, palace as palace_mod
 
     palace = tmp_path / "palace"
     src = tmp_path / "src"
@@ -537,8 +535,7 @@ def test_mine_impl_does_not_print_partial_summary_on_validation_error(
     (ChromaDB's own Rust bindings panic opening a sufficiently corrupted
     file, before this test's validator would ever run).
     """
-    from mempalace import miner as miner_mod
-    from mempalace import palace as palace_mod
+    from mempalace import miner as miner_mod, palace as palace_mod
 
     palace = tmp_path / "palace"
     src = tmp_path / "src"

@@ -12,7 +12,6 @@ Coverage map:
   * purge_file_closets — scoped to source_file.
   * Project-miner end-to-end rebuild — re-mining with fewer topics fully
     purges leftover numbered closets from a larger prior run.
-  * _extract_drawer_ids_from_closet — pointer parsing + dedup.
   * search_memories hybrid path — drawer query always the floor,
     closets boost matching source_file, matched_via reflects both signals,
     no whole-file glue, max_distance enforcement.
@@ -34,6 +33,7 @@ import time
 import pytest
 import yaml
 
+from mempalace.lexical import bm25_scores
 from mempalace.miner import (
     _extract_entities_for_metadata,
     _load_known_entities,
@@ -55,13 +55,10 @@ from mempalace.palace_graph import (
     list_tunnels,
 )
 from mempalace.searcher import (
-    _bm25_scores,
     _enrich_closet_hits,
-    _extract_drawer_ids_from_closet,
     _hybrid_rank,
     search_memories,
 )
-
 
 # ── mine_lock ────────────────────────────────────────────────────────────
 
@@ -503,26 +500,6 @@ class TestMinerClosetRebuild:
                     )
 
 
-# ── _extract_drawer_ids_from_closet ───────────────────────────────────
-
-
-class TestExtractDrawerIds:
-    def test_parses_single_pointer(self):
-        assert _extract_drawer_ids_from_closet("topic|;|→drawer_x") == ["drawer_x"]
-
-    def test_parses_multiple_pointers_per_line(self):
-        line = "topic|ent|→drawer_a,drawer_b,drawer_c"
-        assert _extract_drawer_ids_from_closet(line) == ["drawer_a", "drawer_b", "drawer_c"]
-
-    def test_dedupes_across_lines(self):
-        doc = "one|;|→drawer_a,drawer_b\ntwo|;|→drawer_b,drawer_c"
-        assert _extract_drawer_ids_from_closet(doc) == ["drawer_a", "drawer_b", "drawer_c"]
-
-    def test_empty_doc_returns_empty(self):
-        assert _extract_drawer_ids_from_closet("") == []
-        assert _extract_drawer_ids_from_closet("no arrows here") == []
-
-
 # ── search_memories closet-first path ────────────────────────────────
 
 
@@ -701,7 +678,7 @@ class TestEntityMetadata:
 
 class TestBM25:
     def test_scores_positive_for_matching_doc(self):
-        scores = _bm25_scores(
+        scores = bm25_scores(
             "database migration",
             ["We migrated the database to Postgres.", "unrelated cookery tips"],
         )
@@ -709,13 +686,13 @@ class TestBM25:
         assert scores[1] == 0.0
 
     def test_scores_zero_when_no_overlap(self):
-        scores = _bm25_scores("quantum physics", ["We built a web app in React"])
+        scores = bm25_scores("quantum physics", ["We built a web app in React"])
         assert scores == [0.0]
 
     def test_idf_downweights_terms_present_in_every_doc(self):
         # "database" appears in every candidate → low IDF → low contribution.
         # "vacuum" is unique to one → high IDF → that doc dominates.
-        scores = _bm25_scores(
+        scores = bm25_scores(
             "database vacuum",
             [
                 "database backup nightly schedule",
@@ -726,9 +703,9 @@ class TestBM25:
         assert scores[1] == max(scores), "doc with the rare query term should win on IDF"
 
     def test_empty_inputs_return_zeros(self):
-        assert _bm25_scores("", ["hello world"]) == [0.0]
-        assert _bm25_scores("query here", []) == []
-        assert _bm25_scores("query", [""]) == [0.0]
+        assert bm25_scores("", ["hello world"]) == [0.0]
+        assert bm25_scores("query here", []) == []
+        assert bm25_scores("query", [""]) == [0.0]
 
     def test_hybrid_rank_promotes_keyword_match(self):
         results = [
@@ -1059,7 +1036,7 @@ class TestDiaryIngest:
         )
         palace_dir = tmp_path / "palace"
 
-        from mempalace.diary_ingest import _state_file_for, _split_entries, ingest_diaries
+        from mempalace.diary_ingest import _split_entries, _state_file_for, ingest_diaries
 
         ingest_diaries(str(diary_dir), str(palace_dir), force=True)
 

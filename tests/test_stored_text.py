@@ -7,6 +7,7 @@ from mempalace.stored_text import (
     FLAG,
     StoredTextError,
     decode_record,
+    encode_filter,
     encode_record,
     prepare_stored_write,
 )
@@ -227,6 +228,22 @@ def test_a_filter_matches_the_value_read_back(tmp_path, make, value):
     assert col.get(where={"source_file": stored}).ids == ["f1"]
     assert col.get(where={"source_file": {"$in": [stored]}}).ids == ["f1"]
     assert col.get(where={"source_file": {"$ne": stored}}).ids == ["f2"]
+
+
+@pytest.mark.parametrize("value", ["a\x00b", "a" + chr(0xD800) + "b"])
+def test_a_tuple_in_filter_matches_the_value_read_back(tmp_path, value):
+    encoded = encode_filter({"$in": (value, "other")})["$in"]
+    assert list(encoded) == encode_filter({"$in": [value, "other"]})["$in"]
+    col = _chroma(tmp_path)
+    col.add(
+        documents=["rollout hit", "rollout miss"],
+        ids=["t1", "t2"],
+        metadatas=[{"wing": value}, {"wing": "elsewhere"}],
+    )
+    where = {"wing": {"$in": (value, "other")}}
+    hits = col.lexical_search(query="rollout", n_results=5, where=where).hits
+    assert [(h.id, h.metadata["wing"]) for h in hits] == [("t1", value)]
+    assert col.get_recent(limit=5, where=where).ids == ["t1"]
 
 
 def test_a_forged_flag_cannot_store_raw_text(tmp_path):

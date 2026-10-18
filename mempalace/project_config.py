@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Project config filenames, in resolution order (#2676). The first regular
+# Project config filenames, in resolution order. The first regular
 # file wins; ``mempal.*`` is the legacy name. ``mempalace init`` writes the
 # first one when none exists.
 PROJECT_CONFIG_FILENAMES = (

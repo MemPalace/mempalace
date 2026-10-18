@@ -246,8 +246,11 @@ Fetch a single drawer by ID — returns full content and metadata.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
+| `include_source_bytes` | boolean | No | Also return `source_bytes_base64` for a drawer whose metadata names a `source_encoding` |
 
 **Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+
+A drawer mined from a file with bytes that are not valid UTF-8 carries `metadata.source_encoding`. Responses show such a byte as U+FFFD, because some clients' JSON parsers reject the escape that would carry it; the palace keeps the byte. With `include_source_bytes: true` the response adds `source_bytes_base64`, the drawer text's exact source bytes.
 
 ---
 

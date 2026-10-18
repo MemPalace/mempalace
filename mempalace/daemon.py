@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
-import math
 import os
 import secrets
 import sqlite3
@@ -20,23 +19,26 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib import error as urlerror
-from urllib import request as urlrequest
+from urllib import error as urlerror, request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
-from ._proc import kernel32 as _kernel32
-from ._proc import pid_alive as _pid_alive
+from . import paths
+from ._env import env_float, env_int
+from ._proc import kernel32 as _kernel32, pid_alive as _pid_alive
 from .config import MempalaceConfig
+from .fsio import atomic_write_text, read_published_bytes
 from .palace import (
     MineAlreadyRunning,
     backend_requires_single_writer,
     mine_palace_lock,
     resolve_backend_name,
 )
+from .stored_text import dumps_internal
+from .timeutil import utc_now, utc_now_iso
 
 HOST = "127.0.0.1"
 STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
@@ -64,19 +66,10 @@ def _lock_defer_backoff_seconds() -> float:
     not a positive, finite number yields the default: a typo must not crash the
     daemon at import; ``0`` or a negative value would make the cooldown expire
     instantly and spin the worker against a lock it cannot take; and ``inf``
-    would park the job until the daemon restarts, which is the dropped work
-    #2014 is about.
+    would park the job until the daemon restarts, silently dropping its work.
     """
-    try:
-        value = float(
-            os.environ.get("MEMPALACE_DAEMON_LOCK_BACKOFF_SECONDS", "")
-            or _DEFAULT_LOCK_BACKOFF_SECONDS
-        )
-    except ValueError:
-        return _DEFAULT_LOCK_BACKOFF_SECONDS
-    if not math.isfinite(value) or value <= 0:
-        return _DEFAULT_LOCK_BACKOFF_SECONDS
-    return value
+    value = env_float("MEMPALACE_DAEMON_LOCK_BACKOFF_SECONDS", _DEFAULT_LOCK_BACKOFF_SECONDS)
+    return value if value > 0 else _DEFAULT_LOCK_BACKOFF_SECONDS
 
 
 # Override via env for operators; tests patch the module attribute directly.
@@ -86,7 +79,7 @@ SHUTDOWN_DRAIN_SECONDS = 10.0
 # Terminal jobs are kept for diagnostics then pruned so the queue DB (which
 # holds verbatim payloads) doesn't grow without bound across a long-lived
 # daemon. Override via env for operators who want a longer/shorter window.
-JOB_RETENTION_DAYS = int(os.environ.get("MEMPALACE_DAEMON_RETENTION_DAYS", "7") or "7")
+JOB_RETENTION_DAYS = env_int("MEMPALACE_DAEMON_RETENTION_DAYS", 7)
 try:
     import fcntl as _fcntl  # POSIX only; absent on Windows
 except ImportError:  # pragma: no cover - Windows fallback
@@ -112,26 +105,22 @@ class DaemonError(RuntimeError):
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return utc_now_iso()
 
 
 def canonical_palace_path(path: str | None = None) -> str:
-    value = path or MempalaceConfig().palace_path
-    return os.path.abspath(os.path.realpath(os.path.expanduser(value)))
+    return paths.canonical_palace_path(path or MempalaceConfig().palace_path)
 
 
 def palace_key(palace_path: str) -> str:
-    import hashlib
-
-    normalized = os.path.normcase(canonical_palace_path(palace_path))
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    return paths.palace_key(canonical_palace_path(palace_path))
 
 
 def state_root() -> Path:
     raw = os.environ.get(STATE_ROOT_ENV)
     if raw:
         return Path(raw).expanduser()
-    return Path.home() / ".mempalace" / "daemon"
+    return paths.state_path("daemon")
 
 
 def state_dir(palace_path: str) -> Path:
@@ -140,9 +129,7 @@ def state_dir(palace_path: str) -> Path:
 
 def _write_private(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    atomic_write_text(path, text)
 
 
 def ensure_token(palace_path: str) -> str:
@@ -159,7 +146,7 @@ def ensure_token(palace_path: str) -> str:
 def read_token(palace_path: str) -> str:
     token_path = state_dir(palace_path) / "token"
     try:
-        return token_path.read_text(encoding="utf-8").strip()
+        return read_published_bytes(token_path).decode("utf-8").strip()
     except OSError as exc:
         raise DaemonError(f"daemon token not found for {palace_path}") from exc
 
@@ -178,9 +165,8 @@ def queue_path(palace_path: str) -> Path:
 
 def _read_endpoint(palace_path: str) -> dict[str, Any]:
     try:
-        with open(endpoint_path(palace_path), encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError) as exc:
+        return json.loads(read_published_bytes(endpoint_path(palace_path)).decode("utf-8"))
+    except (OSError, ValueError) as exc:
         raise DaemonError("daemon endpoint not found") from exc
 
 
@@ -281,7 +267,7 @@ class QueueStore:
         """
         if older_than_days <= 0:
             return 0
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        cutoff = (utc_now() - timedelta(days=older_than_days)).isoformat(timespec="microseconds")
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 """
@@ -589,7 +575,7 @@ class QueueStore:
 def job_deferred_by_lock(job: dict[str, Any]) -> bool:
     """True when a job's last claim was refused the palace lock.
 
-    Such a job is deferred, not failed (#2014): it went back to the queue and
+    Such a job is deferred, not failed: it went back to the queue and
     runs once the lock frees. That makes it non-terminal, so a caller blocking
     until ``TERMINAL_STATES`` would wait out the holder -- which can be a
     long-lived session. Interactive callers use this to report the parked job
@@ -633,7 +619,7 @@ class DaemonRuntime:
         self.active_job_id: str | None = None
         self.worker_thread: threading.Thread | None = None
         # job_id -> monotonic deadline before which a lock-refused job is not
-        # re-claimed (#2014). Worker-owned; only _worker_loop touches it.
+        # re-claimed. Worker-owned; only _worker_loop touches it.
         self._deferred_until: dict[str, float] = {}
 
     def start_worker(self) -> threading.Thread:
@@ -713,7 +699,7 @@ class DaemonRuntime:
                 ok = bool(result.get("success", True))
                 if not ok and result.get("error_class") == LOCK_REFUSAL_ERROR_CLASS:
                     # Refused the palace write lock: no drawer was filed, so this
-                    # is a deferral, not a failure (#2014). Dead-lettering it
+                    # is a deferral, not a failure. Dead-lettering it
                     # here would silently drop the work -- only hook-submitted
                     # kinds get re-emitted, and the hook is not a retry
                     # mechanism.
@@ -734,7 +720,7 @@ class DaemonRuntime:
                     # every unrelated job behind a lock that has nothing to do
                     # with them, and a job merely queued behind this one would
                     # never be claimed, so it would never get the refusal marker
-                    # its caller waits on: the #2014 hang wearing a different hat.
+                    # its caller waits on, and that caller would hang.
                     self._deferred_until[job.id] = time.monotonic() + LOCK_DEFER_BACKOFF_SECONDS
                     continue
                 state = "succeeded" if ok else "failed"
@@ -745,8 +731,7 @@ class DaemonRuntime:
                 # deliberate. Without it, a sys.exit() in a dependency would slip
                 # past `except Exception`, kill this worker thread, leave the job
                 # stuck in 'running' forever, and stall every later job while
-                # /health keeps reporting ok. (See mcp_server.py tool_mine for the
-                # same BaseException-slip-past semantics, documented in comments.)
+                # /health keeps reporting ok.
                 self._safe_finish(
                     job.id,
                     state="failed",
@@ -758,7 +743,7 @@ class DaemonRuntime:
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    body = dumps_internal(payload).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
@@ -1082,7 +1067,7 @@ class DaemonClient:
         *,
         timeout: float = 5.0,
     ) -> dict[str, Any]:
-        data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        data = None if body is None else dumps_internal(body).encode("utf-8")
         req = urlrequest.Request(
             self.base_url + path,
             data=data,
@@ -1151,7 +1136,7 @@ class DaemonClient:
                 return job
             # A job parked behind the palace lock never becomes terminal on its
             # own, so an interactive caller must be able to stop here instead of
-            # waiting out the holder (#2014). Background callers keep the old
+            # waiting out the holder. Background callers keep the old
             # behaviour and simply wait.
             if stop_on_lock_deferral and job_deferred_by_lock(job):
                 return job
@@ -1183,14 +1168,14 @@ def _detached_kwargs(log_path: Path) -> dict[str, Any]:
     (which takes no args and opens no log file). On Windows we use
     ``CREATE_NO_WINDOW`` rather than ``DETACHED_PROCESS``: the latter gives the
     child no console, so a console-subsystem grandchild later allocates a fresh
-    *visible* window (#1783); ``CREATE_NO_WINDOW`` gives a hidden console that
+    *visible* window; ``CREATE_NO_WINDOW`` gives a hidden console that
     descendants inherit instead. Surviving the launching terminal is carried by
     ``CREATE_BREAKAWAY_FROM_JOB`` (escapes the parent Job Object's kill-on-close)
     plus the daemon never being attached to that console -- not by the console
     flag -- while ``CREATE_NEW_PROCESS_GROUP`` isolates Ctrl-C/Ctrl-Break routing.
     ``CREATE_NO_WINDOW`` is ignored when OR'd with ``DETACHED_PROCESS``, so this
     replaces that flag rather than adding it. ``stdin=DEVNULL`` and stdout/stderr
-    redirected to the log avoid the #1268 parent hang.
+    redirected to the log keep the parent from hanging on inherited pipes.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fh = open(log_path, "a", encoding="utf-8")
@@ -1329,7 +1314,7 @@ def _registration_state(palace_path: str) -> tuple[str, int | None]:
     after the registration was written (pid reuse after a crash), and
     ``("live", pid)`` when the pid is alive and is, or may be, the daemon that
     registered. An unreadable start time counts as live: refusing is
-    recoverable, discarding a live owner's registration is not (#2442).
+    recoverable, discarding a live owner's registration is not.
     """
     pid = _registered_pid(palace_path)
     if pid is None:
@@ -1355,7 +1340,7 @@ def _refuse_live_registration(palace_path: str) -> None:
 
     Its process may still own the palace (the lock, or for backends without a
     single-writer lease, the endpoint), so a second server must not start and
-    the registration must stay for when it answers again (#2442).
+    the registration must stay for when it answers again.
     """
     state, registered_pid = _registration_state(palace_path)
     if state == "live":
@@ -1486,7 +1471,7 @@ def start_daemon(
     # The health probe above can fail while the registered daemon is alive but
     # busy (a long mine) or wedged. Its process still owns the palace lock, so
     # a replacement would die at startup -- and unlinking the registration
-    # first would leave the live owner unreachable (#2442). Refuse instead of
+    # first would leave the live owner unreachable. Refuse instead of
     # spawning; ``daemon stop`` is the explicit way to replace it.
     # A pid that is dead, or that now belongs to a process started after the
     # registration was written (pid reuse after a crash), is stale and is
@@ -1594,7 +1579,7 @@ def stop_daemon(palace_path: str) -> bool:
     pid, or a pid reused by an unrelated process, is a stale registration and
     is removed so the next ``daemon start`` works. A live daemon that does not
     answer cannot be asked to stop over HTTP, so its registration is left in
-    place (#2442) and the error names the process to stop instead.
+    place and the error names the process to stop instead.
     """
     client = get_client_if_running(palace_path)
     if client is not None:

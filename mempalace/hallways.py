@@ -34,20 +34,24 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import logging
 import os
+import re
 from collections import defaultdict
-from datetime import datetime, timezone
 from itertools import combinations
 from typing import Optional
 
+from . import paths
 from .dynamics import initialize_dynamics_fields
-from .fsio import atomic_write_json as _atomic_write_json
-from .fsio import read_json_for_update as _read_json_for_update
-from .fsio import refuse_unparsed as _refuse_unparsed
+from .fsio import (
+    atomic_write_json as _atomic_write_json,
+    read_json_for_update as _read_json_for_update,
+    refuse_unparsed as _refuse_unparsed,
+)
+from .metadata_types import is_bookkeeping
+from .timeutil import utc_now_iso
 
-logger = logging.getLogger("mempalace_hallways")
+logger = logging.getLogger(__name__)
 
 # Persistence target is resolved through ``_get_hallway_file`` below, which
 # mirrors ``palace_graph._get_tunnel_file`` (the 3.3.6 palace-scoped pattern)
@@ -96,7 +100,7 @@ def _hallway_file_lock(config=None):
 
 def _legacy_hallway_file() -> str:
     """The pre-palace-scoped hardcoded path. Kept only for one-time orphan detection."""
-    return os.path.join(os.path.expanduser("~"), ".mempalace", "hallways.json")
+    return str(paths.state_path("hallways.json"))
 
 
 def _load_hallways_for_write(config=None) -> list[dict]:
@@ -539,7 +543,7 @@ def _wing_file_keys(metadatas) -> dict[str, str]:
     """
     by_base: dict[str, set[str]] = defaultdict(set)
     for meta in metadatas:
-        if not isinstance(meta, dict) or meta.get("is_sentinel"):
+        if not isinstance(meta, dict) or is_bookkeeping(meta):
             continue
         for spelling in _parse_entities(meta.get("entities")):
             by_base[entity_spelling_key(spelling)].add(spelling)
@@ -562,7 +566,7 @@ def _wing_metadata_from_sqlite(col, wing: str) -> Optional[list]:
     Returns ``None`` when ``col`` has no such stream or reading it failed, and
     the caller pages instead. Paging is ``get(where={"wing": ...}, offset=N)``,
     which Chroma runs as SQL ``OFFSET``: every page re-walks the rows before
-    it, so a large wing costs the square of its size (#2684).
+    it, so a large wing costs the square of its size.
 
     The read is scoped to the wing in sqlite, and only drawers holding
     ``entities`` are read, both through the ``(key, string_value)`` index, so
@@ -573,8 +577,8 @@ def _wing_metadata_from_sqlite(col, wing: str) -> Optional[list]:
     scoped read, stopped at its first row, tells it apart from a wing with no
     drawers at all.
     """
+    from .backends.chroma_sqlite import MetadataRecoveryPending
     from .palace import _fast_collection_metadata
-    from .backends.chroma import MetadataRecoveryPending
 
     scope = {"wing": wing}
     try:
@@ -608,10 +612,10 @@ def _wing_metadata_paged(col, wing: str) -> list:
 
     An unbounded get(where={"wing": wing}) binds one SQL variable per matched
     id and overflows SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) on wings >
-    ~32k drawers (#1619); a bounded page binds at most batch_size ids. Walking
+    ~32k drawers; a bounded page binds at most batch_size ids. Walking
     the WHOLE collection instead and filtering client-side cost O(total palace
     drawers) on every mine, so filing one small session into an 800k-drawer
-    palace pegged the CPU for minutes (#2466). The client-side wing check
+    palace pegged the CPU for minutes. The client-side wing check
     stays as a guard for stores that ignore ``where``. The loop ends on a
     short page: count() counts every wing, so it cannot bound a scoped walk.
     """
@@ -664,9 +668,9 @@ def compute_hallways_for_wing(
             The fetch is scoped to ``wing`` server-side AND paginated: an
             unbounded ``.get(where=...)`` binds one SQL variable per matched
             id and overflows SQLite's ``SQLITE_MAX_VARIABLE_NUMBER`` on wings
-            above ~32k drawers (#1619), while an unscoped page walk costs
+            above ~32k drawers, while an unscoped page walk costs
             O(total palace drawers) on every mine, pegging the CPU for
-            minutes on large palaces (#2466). A bounded page never binds more
+            minutes on large palaces. A bounded page never binds more
             than ``batch_size`` ids. Fake collections and alternate backends
             must implement this shape. If ``None``, returns ``[]`` (caller
             didn't supply a backing store, so nothing to compute against).
@@ -711,7 +715,7 @@ def compute_hallways_for_wing(
     min_count = max(1, int(threshold))
 
     # 1. Query drawers for this wing. On Chroma, one linear pass over the
-    #    drawers holding entities (#2684); elsewhere, wing-scoped pages.
+    #    drawers holding entities; elsewhere, wing-scoped pages.
     try:
         metadatas = _wing_metadata_from_sqlite(col, wing)
         if metadatas is None:
@@ -741,7 +745,7 @@ def compute_hallways_for_wing(
         if not isinstance(meta, dict):
             continue
         # Sentinel drawers carry no real content — skip them.
-        if meta.get("is_sentinel"):
+        if is_bookkeeping(meta):
             continue
         entities = []
         for spelling in _parse_entities(meta.get("entities")):
@@ -801,8 +805,7 @@ def compute_hallways_for_wing(
             # match the symmetric ID generation in _hallway_id (which also
             # sorts). Without this, a persisted record with reversed entity
             # order would silently miss the lookup and lose its accumulated
-            # dynamics on every recompute. Per PR #1578 review
-            # (gemini-code-assist, HIGH priority).
+            # dynamics on every recompute.
             key = tuple(
                 sorted(
                     [
@@ -820,7 +823,7 @@ def compute_hallways_for_wing(
             }
 
         created: list[dict] = []
-        created_at = datetime.now(timezone.utc).isoformat()
+        created_at = utc_now_iso()
         for key in sorted(pair_counts.keys()):
             count = pair_counts[key]
             if count < min_count:

@@ -8,6 +8,7 @@ chromadb 1.5.x writes (``{"id_to_label": {...}, ...}``).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pickle
 import shutil
@@ -17,15 +18,13 @@ import time
 import pytest
 
 from mempalace.backends.chroma import (
-    _fts_tokens,
     _hnsw_element_count,
-    _whole_words_first,
     _vector_segment_id,
     hnsw_capacity_status,
     reset_hnsw_capacity_cache,
 )
+from mempalace.backends.chroma_sqlite import _fts_tokens, _whole_words_first
 from mempalace.searcher import _bm25_only_via_sqlite
-
 
 COLLECTION = "mempalace_drawers"
 
@@ -639,6 +638,12 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     monkeypatch.setattr(mcp_server, "_config", _Cfg())
     monkeypatch.setattr(mcp_server, "_vector_disabled", True)
     monkeypatch.setattr(mcp_server, "_vector_disabled_reason", "test divergence")
+    # Chroma files drawers under the METADATA segment, which the tally reads.
+    with contextlib.closing(sqlite3.connect(palace_with_drawers / "chroma.sqlite3")) as conn:
+        conn.execute(
+            "UPDATE embeddings SET segment_id = (SELECT id FROM segments WHERE scope = 'METADATA')"
+        )
+        conn.commit()
 
     out = mcp_server._tool_status_via_sqlite()
     assert out["vector_disabled"] is True
@@ -648,6 +653,25 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     # ops×2 (incident + repair runbook), design×1 (metaphor).
     assert out["wings"].get("ops") == 2
     assert out["wings"].get("design") == 1
+
+
+def test_tool_status_via_sqlite_logs_an_unreadable_database(tmp_path, monkeypatch, caplog):
+    from mempalace import mcp_server
+
+    (tmp_path / "chroma.sqlite3").write_bytes(b"not a database")
+
+    class _Cfg:
+        palace_path = str(tmp_path)
+        collection_name = "mempalace_drawers"
+
+    monkeypatch.setattr(mcp_server, "_config", _Cfg())
+    monkeypatch.setattr(mcp_server, "_vector_disabled", True)
+    monkeypatch.setattr(mcp_server, "_vector_disabled_reason", "test divergence")
+
+    with caplog.at_level("ERROR"):
+        out = mcp_server._tool_status_via_sqlite()
+    assert out["total_drawers"] == 0 and out["wings"] == {}
+    assert "tool_status sqlite fallback read failed" in caplog.text
 
 
 def test_capacity_status_flags_small_gap_with_explicit_low_sync_threshold(tmp_path):
@@ -1343,7 +1367,7 @@ def _fts_conn(rows):
 def test_fts_candidates_reach_a_name_ranked_past_the_scan_cap():
     """50,009 higher-ranked substring hits (``Avenue``) and one drawer that says
     ``Aven``: the ranked window of 50,000 misses it, the continuation finds it."""
-    from mempalace.backends.chroma import _FTS_SCAN_CAP, _fts_candidate_rows
+    from mempalace.backends.chroma_sqlite import _FTS_SCAN_CAP, _fts_candidate_rows
 
     noise = [(i, "Avenue Avenue Avenue") for i in range(1, _FTS_SCAN_CAP + 10)]
     target = _FTS_SCAN_CAP + 10
@@ -1354,7 +1378,7 @@ def test_fts_candidates_reach_a_name_ranked_past_the_scan_cap():
 
 
 def test_fts_candidates_reach_the_oldest_lowest_ranked_name(monkeypatch):
-    import mempalace.backends.chroma as chroma
+    import mempalace.backends.chroma_sqlite as chroma
 
     monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 50)
     rows = [(1, "Aven " + "quiet lantern room " * 20)]
@@ -1364,7 +1388,7 @@ def test_fts_candidates_reach_the_oldest_lowest_ranked_name(monkeypatch):
 
 
 def test_fts_candidates_say_when_the_continuation_budget_ran_out(monkeypatch):
-    import mempalace.backends.chroma as chroma
+    import mempalace.backends.chroma_sqlite as chroma
 
     monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 50)
     monkeypatch.setattr(chroma, "_FTS_CONTINUATION_BUDGET", 60)
@@ -1376,7 +1400,7 @@ def test_fts_candidates_say_when_the_continuation_budget_ran_out(monkeypatch):
 
 
 def test_bm25_fallback_reports_truncated_candidates(tmp_path, monkeypatch):
-    import mempalace.backends.chroma as chroma
+    import mempalace.backends.chroma_sqlite as chroma
 
     monkeypatch.setattr(chroma, "_FTS_SCAN_CAP", 20)
     monkeypatch.setattr(chroma, "_FTS_CONTINUATION_BUDGET", 25)

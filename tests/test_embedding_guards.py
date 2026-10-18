@@ -12,9 +12,7 @@ import mempalace.embedding as embedding
 @pytest.fixture(autouse=True)
 def isolate_embedding_state(monkeypatch):
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
-    monkeypatch.setattr(embedding, "_WARNED", set())
     monkeypatch.setattr(embedding, "_DIM_CACHE", {})
-    monkeypatch.setattr(embedding, "_DIM_PROBE_WARNED", set())
 
 
 @pytest.mark.parametrize(
@@ -69,7 +67,7 @@ def test_openai_compat_sends_a_bare_string_as_one_input(monkeypatch):
         }
         return _FakeEmbeddingResponse(json.dumps(body).encode("utf-8"))
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("mempalace.llm_client.urlopen", fake_urlopen)
     ef = embedding.OpenAICompatEmbeddingFunction("http://127.0.0.1:1234/v1", "local-model")
 
     assert len(ef("hello")) == 1

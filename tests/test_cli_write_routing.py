@@ -23,7 +23,6 @@ from mempalace.write_routing import (
     choose_write_route,
 )
 
-
 _SERVICE_ENV_KEYS = (
     "MEMPALACE_PALACE_PATH",
     "MEMPAL_PALACE_PATH",
@@ -143,8 +142,8 @@ def test_cli_direct_policy_selects_direct():
             operation="mine",
         )
 
-    assert routing.use_direct is True
     assert routing.use_daemon is False
+    assert routing.decision.blocked is False
 
 
 def test_explicit_direct_overrides_require_policy():
@@ -157,7 +156,8 @@ def test_explicit_direct_overrides_require_policy():
         )
 
     config.assert_not_called()
-    assert routing.use_direct is True
+    assert routing.use_daemon is False
+    assert routing.decision.blocked is False
     assert routing.source == "--direct"
     assert routing.explicit is True
 

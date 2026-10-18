@@ -17,18 +17,15 @@ from unittest.mock import patch
 
 import pytest
 
-from mempalace.palace import MineFileErrors
-
-
-from mempalace.format_miner import (  # noqa: E402
+from mempalace.format_miner import (
     DEFAULT_MAX_FILE_SIZE,
     SUPPORTED_FORMATS,
     ExtractionStatus,
-    decode_robust,
     extract_text,
     is_icloud_dataless,
     scan_formats,
 )
+from mempalace.palace import MineFileErrors
 
 
 def _make_symlink_or_skip(link: Path, target: Path) -> None:
@@ -238,34 +235,6 @@ def test_fringe_icloud_skip_extraction(tmp_path: Path):
     assert text is None
     assert status == ExtractionStatus.SKIP_CLOUD_ONLY
     mocked.assert_not_called()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Fringe Case 8 — encoding fallback (utf-8 → cp1252 → utf-8-replace)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_decode_robust_clean_utf8():
-    assert decode_robust(b"hello \xe2\x9c\xa8 world") == "hello ✨ world"
-
-
-def test_decode_robust_cp1252_fallback():
-    # 0x91 = U+2018 left single quote in cp1252; invalid as standalone utf-8
-    raw = b"hello \x91world\x92"
-    result = decode_robust(raw)
-    assert isinstance(result, str)
-    assert "world" in result
-
-
-def test_decode_robust_never_raises():
-    raw = b"\xff\xfe\xfd\xfc" + b"some text"
-    result = decode_robust(raw)
-    assert isinstance(result, str)
-    assert "some text" in result
-
-
-def test_decode_robust_empty():
-    assert decode_robust(b"") == ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -548,21 +517,6 @@ def test_scan_formats_returns_empty_for_missing_dir(tmp_path: Path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# decode_robust — exercise the cp1252 path explicitly
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_decode_robust_pure_cp1252():
-    """Bytes that are invalid UTF-8 but valid CP1252 → second-attempt success."""
-    raw = b"\x91hello\x92"
-    result = decode_robust(raw)
-    assert isinstance(result, str)
-    assert "hello" in result
-    # 0x91 / 0x92 are CP1252 smart quotes that decode without error
-    assert "�" not in result, "CP1252 path should not need the replace fallback"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Note on stat() error branches in extract_text:
 # Dedicated PermissionError / FileNotFoundError / OSError stat-handler tests
 # were attempted but tripped on Python 3.13 pathlib internals (patching
@@ -659,8 +613,8 @@ def _mine_formats_mocks(tmp_path: Path):
       - file_already_mined : False (file not yet mined)
       - _extract_via_striprtf / _extract_via_markitdown : mocked at test level
     """
-    from unittest.mock import MagicMock, patch
     from contextlib import contextmanager
+    from unittest.mock import MagicMock, patch
 
     collection = MagicMock()
     collection.delete = MagicMock()
@@ -689,6 +643,7 @@ def _mine_formats_mocks(tmp_path: Path):
 def test_mine_formats_walks_directory(_mine_formats_mocks):
     """mine_formats must use scan_formats to discover supported files."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -704,6 +659,7 @@ def test_mine_formats_walks_directory(_mine_formats_mocks):
 def test_mine_formats_skips_already_mined_files(_mine_formats_mocks):
     """If file_already_mined returns True, extract_text should not be called."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -726,6 +682,7 @@ def test_mine_formats_skips_extraction_failures(_mine_formats_mocks):
     from a content drawer.
     """
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -751,6 +708,7 @@ def test_mine_formats_skips_extraction_failures(_mine_formats_mocks):
 def test_mine_formats_files_drawers_for_ok_extractions(_mine_formats_mocks):
     """When extract_text returns OK + text, mine_formats chunks and upserts drawers."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -769,6 +727,7 @@ def test_mine_formats_files_drawers_for_ok_extractions(_mine_formats_mocks):
 def test_mine_formats_dry_run_does_not_open_collection(_mine_formats_mocks):
     """dry_run=True must not call get_collection or upsert any drawers."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -787,6 +746,7 @@ def test_mine_formats_dry_run_does_not_open_collection(_mine_formats_mocks):
 def test_mine_formats_respects_limit(_mine_formats_mocks):
     """limit=N should restrict processing to the first N files."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -809,6 +769,7 @@ def test_mine_formats_respects_limit(_mine_formats_mocks):
 def test_mine_formats_limit_skips_already_mined(_mine_formats_mocks):
     """--limit N counts only new work, not already-mined skips (#1535)."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -839,6 +800,7 @@ def test_mine_formats_limit_skips_already_mined(_mine_formats_mocks):
 def test_mine_formats_wing_defaults_from_directory_name(_mine_formats_mocks):
     """When wing=None, the directory's basename becomes the wing."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -861,6 +823,7 @@ def test_mine_formats_wing_defaults_from_directory_name(_mine_formats_mocks):
 def test_mine_formats_wing_override(_mine_formats_mocks):
     """Explicit wing= param overrides the directory-name default."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -885,6 +848,7 @@ def test_mine_formats_ingest_mode_metadata_is_extract(_mine_formats_mocks):
     """Drawers from mine_formats must carry ingest_mode='extract' so they're
     distinguishable from project / convo drawers in the palace."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -926,6 +890,7 @@ def test_mine_formats_uses_check_mtime_true(_mine_formats_mocks):
     """mine_formats must call file_already_mined with check_mtime=True so
     updated documents get re-mined (matches miner.py semantics)."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -949,6 +914,7 @@ def test_mine_formats_records_source_mtime_in_drawer_metadata(_mine_formats_mock
     """Each drawer must carry source_mtime so file_already_mined(check_mtime=True)
     can detect updates on re-mine."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -976,6 +942,7 @@ def test_mine_formats_records_source_mtime_in_drawer_metadata(_mine_formats_mock
 def test_mine_formats_records_hall_in_drawer_metadata(_mine_formats_mocks):
     """Each drawer must carry a 'hall' tag — matches miner.py drawer quality."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -1002,6 +969,7 @@ def test_mine_formats_records_hall_in_drawer_metadata(_mine_formats_mocks):
 def test_mine_formats_continues_after_per_file_error(_mine_formats_mocks):
     """One bad file must not crash the whole mine — the loop continues."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -1059,6 +1027,7 @@ def test_mine_formats_calls_load_config_for_rooms(_mine_formats_mocks):
     rooms list — same as miner.py:1154. Without this, drawers fall back to
     a single 'documents' room."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -1082,6 +1051,7 @@ def test_mine_formats_calls_detect_room_per_file(_mine_formats_mocks):
     for each file — same as miner.py:904. Hardcoding room='documents' is the
     bug; this test fails until detect_room is wired in."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -1099,9 +1069,8 @@ def test_mine_formats_calls_detect_room_per_file(_mine_formats_mocks):
     ):
         mine_formats(format_dir=str(tmp), palace_path=str(tmp / "palace"))
     p_room.assert_called_once()
-    # First positional arg should be the file Path; last arg should be project_path
+    # detect_room takes the file path, its content, the rooms and the project path.
     call_args = p_room.call_args
-    # detect_room(filepath, content, rooms, project_path)
     assert len(call_args.args) == 4 or "filepath" in call_args.kwargs
 
 
@@ -1110,6 +1079,7 @@ def test_mine_formats_uses_detected_room_in_drawer_metadata(_mine_formats_mocks)
     returned, NOT the hardcoded 'documents'. This is the visible bug from
     the 2026-05-19 mine: every drawer landed in room='documents'."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -1148,6 +1118,7 @@ def test_mine_formats_calls_compute_topic_tunnels_after_loop(_mine_formats_mocks
     Without this, cross-wing topic tunnels never materialize for format-mined
     wings (audit confirmed 0 tunnels in the 2026-05-19 v6 mine)."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -1175,6 +1146,7 @@ def test_mine_formats_tunnel_failure_does_not_crash_mine(_mine_formats_mocks):
     complete (summary still prints, no exception propagates). Mirrors the
     try/except wrap at miner.py:1244-1249."""
     from unittest.mock import patch
+
     from mempalace.format_miner import mine_formats
 
     tmp = _mine_formats_mocks["tmp_path"]
@@ -1608,8 +1580,7 @@ def test_file_chunks_locked_stamps_the_source_filesystem_identity(monkeypatch, t
 def test_mine_formats_passes_the_directory_it_read_from(tmp_path, monkeypatch):
     """The storing half is covered above; this covers the wiring, so removing
     the call in ``mine_formats`` cannot pass unnoticed (#2320)."""
-    from mempalace import format_miner
-    from mempalace import source_identity as si
+    from mempalace import format_miner, source_identity as si
 
     docs = tmp_path / "docs"
     docs.mkdir()

@@ -13,9 +13,19 @@ import pytest
 from _mcp_server_helpers import _UNLOADABLE_JSON_KINDS, _unloadable_json_line
 
 from mempalace import mcp_light_server, mcp_server
+from mempalace.hub_client import HubClient
 from mempalace.palace_graph import invalidate_graph_cache
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _hub_forwarding_to(monkeypatch, forward):
+    """Route stdio dispatch to a live hub whose answers come from ``forward``."""
+    hub = HubClient("/p", {"host": "127.0.0.1", "port": 9})
+    monkeypatch.setattr(
+        hub, "post", lambda request, **kw: forward(hub.base_url, {}, request, hub.palace_path)
+    )
+    monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: hub)
 
 
 def _patch_light_server(monkeypatch, config, kg):
@@ -577,8 +587,6 @@ class TestHubDispatch:
         _patch_light_server(monkeypatch, config, kg)
         captured = {}
 
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
-
         def fake_forward(base_url, headers, request, palace_path):
             captured["name"] = request["params"]["name"]
             captured["arguments"] = request["params"]["arguments"]
@@ -588,7 +596,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": json.dumps({"ok": True})}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 90,
@@ -607,7 +615,6 @@ class TestHubDispatch:
     def test_tools_call_maps_sync_project_to_project_dir(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
         captured = {}
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             captured["name"] = request["params"]["name"]
@@ -618,7 +625,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": "{}"}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 91,
@@ -636,7 +643,6 @@ class TestHubDispatch:
 
     def test_taxonomy_in_wing_is_filtered_after_hub_rewrite(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             assert request["params"]["name"] == "mempalace_get_taxonomy"
@@ -648,7 +654,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": json.dumps(payload)}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 92,
@@ -661,7 +667,6 @@ class TestHubDispatch:
 
     def test_exec_add_resolves_unique_suffix_wing_before_forward(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
         monkeypatch.setattr(
             mcp_server,
             "tool_list_wings",
@@ -678,7 +683,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": "{}"}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 93,
@@ -697,13 +702,12 @@ class TestHubDispatch:
         _patch_light_server(monkeypatch, config, kg)
         monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
         forwarded = []
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             forwarded.append(request)
             return {"jsonrpc": "2.0", "id": request["id"], "result": {}}
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 94,
@@ -737,7 +741,6 @@ class TestHubDispatch:
     def test_tools_call_maps_kg_invalidate_valid_to_to_ended(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
         captured = {}
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             captured["name"] = request["params"]["name"]
@@ -748,7 +751,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": "{}"}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 96,
@@ -772,7 +775,6 @@ class TestHubDispatch:
     def test_tools_call_maps_traverse_to_registered_tool(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
         captured = {}
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             captured["name"] = request["params"]["name"]
@@ -783,7 +785,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": "{}"}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 97,

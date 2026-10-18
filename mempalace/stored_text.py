@@ -20,12 +20,26 @@ may decode a single value with :func:`decode_value`. Filters pushed down to
 a backend compare stored form, so their operands go through
 :func:`encode_where` / :func:`encode_filter`; a filter evaluated in Python
 on decoded rows keeps the caller's values.
+
+A lone surrogate (a stray source byte) leaves the process one of three ways.
+Between MemPalace processes (proxy to hub requests, daemon, peer sync, the
+revision log) :func:`dumps_internal` keeps it as an exact ``\\udcXX``
+escape. A response to an external MCP client goes through
+:func:`dumps_client`, which shows it as U+FFFD, because some clients' JSON
+parsers reject a lone-surrogate escape outright; the stored text keeps the
+byte, and ``mempalace_get_drawer(include_source_bytes=True)`` returns it.
+A service that only takes valid Unicode (an embedder, an LLM API) gets
+``config.strip_lone_surrogates``.
 """
 
+import json
 import re
+
+from .metadata_types import coerce_metadata_types
 
 FLAG = "_mempalace_escaped"
 _PREFIX = "\x01mpesc:"
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
 _BAD = re.compile(r"[\x00\ud800-\udfff]")
 _ESCAPE = re.compile(r"[\\\x00\ud800-\udfff]")
 _UNESCAPE = re.compile(r"\\(\\|0|u[0-9A-F]{4})")
@@ -63,8 +77,8 @@ def _encode(value, changed: list):
             return value
         changed.append(True)
         return _PREFIX + _ESCAPE.sub(_escape_char, value)
-    if isinstance(value, list):
-        return [_encode(item, changed) for item in value]
+    if isinstance(value, (list, tuple)):
+        return type(value)(_encode(item, changed) for item in value)
     return value
 
 
@@ -183,7 +197,7 @@ def prepare_stored_write(documents, ids, metadatas=None):
     metas = metadatas if metadatas is not None else [None] * len(ids)
     out_docs, out_metas = [], []
     for doc, meta in zip(docs if docs is not None else [None] * len(ids), metas):
-        doc, meta = encode_record(doc, meta)
+        doc, meta = encode_record(doc, coerce_metadata_types(meta))
         out_docs.append(doc)
         out_metas.append(meta)
     if metadatas is None:
@@ -218,3 +232,32 @@ def restore_rows(documents, metadatas):
         [doc for doc, _ in pairs] if documents else documents,
         [meta for _, meta in pairs],
     )
+
+
+def _surrogate_escape(match) -> str:
+    return f"\\u{ord(match.group()):04x}"
+
+
+# Sent by a MemPalace process calling the hub's MCP endpoint, so the hub
+# answers with :func:`dumps_internal` instead of :func:`dumps_client`.
+EXACT_WIRE_HEADER = "X-MemPalace-Exact"
+
+
+def dumps_internal(obj, **kwargs) -> str:
+    """JSON for a hop between MemPalace processes, exact.
+
+    Non-ASCII stays as written and each lone surrogate becomes a ``\\udcXX``
+    escape, so the text encodes as UTF-8 and the reader's ``json.loads``
+    gets the surrogate back.
+    """
+    text = json.dumps(obj, ensure_ascii=False, **kwargs)
+    return _LONE_SURROGATE.sub(_surrogate_escape, text)
+
+
+def dumps_client(obj, **kwargs) -> str:
+    """JSON for an external MCP client: each lone surrogate shown as U+FFFD.
+
+    Some clients' JSON parsers reject a lone-surrogate escape and with it the
+    whole response. The display is lossy; the stored text is not.
+    """
+    return _LONE_SURROGATE.sub("�", json.dumps(obj, ensure_ascii=False, **kwargs))
