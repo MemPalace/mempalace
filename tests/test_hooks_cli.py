@@ -1093,6 +1093,27 @@ def test_wing_from_transcript_path_cwd_collapses_dot_worktrees(tmp_path):
     assert _wing_from_transcript_path(str(transcript)) == "webui_app"
 
 
+def test_wing_from_transcript_path_cwd_uses_project_wings_override(tmp_path, monkeypatch):
+    """A ``project_wings`` entry keeps a renamed folder (and its worktrees) in
+    the configured wing instead of one named after the new folder."""
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"project_wings": {"/Users/me/nd/console": "nodeum-console"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(cfg_dir))
+    for cwd in ("/Users/me/nd/console", "/Users/me/nd/console/.worktrees/42-fix-login"):
+        transcript = tmp_path / f"{abs(hash(cwd))}.jsonl"
+        transcript.write_text(json.dumps({"type": "user", "cwd": cwd}) + "\n", encoding="utf-8")
+        assert _wing_from_transcript_path(str(transcript)) == "nodeum_console"
+    other = tmp_path / "other.jsonl"
+    other.write_text(
+        json.dumps({"type": "user", "cwd": "/Users/me/nd/console-old"}) + "\n", encoding="utf-8"
+    )
+    assert _wing_from_transcript_path(str(other)) == "console_old"
+
+
 def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):
     """When the JSONL records ``cwd``, the leaf segment of cwd is the wing —
     even if the encoded folder name would have produced a different (and

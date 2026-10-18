@@ -1384,12 +1384,30 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
     return None
 
 
+def _project_wing_override(cwd_norm: str) -> Optional[str]:
+    """Configured project name (``project_wings``) for ``cwd_norm``, or ``None``.
+
+    The longest configured directory containing ``cwd_norm`` wins.
+    """
+    try:
+        overrides = MempalaceConfig().project_wings
+    except Exception:
+        return None
+    best = None
+    for directory, name in overrides.items():
+        if cwd_norm == directory or cwd_norm.startswith(directory + "/"):
+            if best is None or len(directory) > len(best[0]):
+                best = (directory, name)
+    return best[1] if best else None
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
-    """The project wing from the transcript's cwd leaf, or ``None``."""
+    """The project wing from the transcript's cwd leaf (or its ``project_wings``
+    override), or ``None``."""
     cwd_norm = _cwd_from_jsonl(transcript_path)
     if not cwd_norm:
         return None
-    project = cwd_norm.rsplit("/", 1)[-1]
+    project = _project_wing_override(cwd_norm) or cwd_norm.rsplit("/", 1)[-1]
     if project:
         return _wing_slug(project)
     return None
