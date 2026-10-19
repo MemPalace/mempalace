@@ -1,6 +1,6 @@
 # Experimental EmbeddingGemma 2 and local media
 
-This optional backend uses [Google's `embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) through Sentence Transformers. It supports asymmetric text retrieval, native code queries and local image/audio/video assets in one embedding space. Existing MiniLM, EmbeddingGemma ONNX and OpenAI-compatible backends remain available; the default model and drawer-only search are unchanged.
+This optional backend uses [Google's `embeddinggemma-2`](https://huggingface.co/google/embeddinggemma-2) through Sentence Transformers. It supports asymmetric text retrieval, native code queries and local image/audio/video assets in one embedding space. Existing MiniLM, EmbeddingGemma ONNX and OpenAI-compatible backends remain available; the default model and drawer-only search are unchanged. To compare the options, or to switch a populated palace without downtime, see [choosing-an-embedder.md](choosing-an-embedder.md).
 
 ## Install and isolate
 
