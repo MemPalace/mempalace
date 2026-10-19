@@ -8,17 +8,16 @@ from argparse import Namespace
 import pytest
 
 from mempalace import palace_audit
-from mempalace.hallways import is_generic_entity
+from mempalace.hallways import entity_spelling_key, is_generic_entity
 from mempalace.palace_audit import (
     _analyze_hallways,
-    _name_list,
     _analyze_naming,
     _analyze_rooms,
     _analyze_tunnels,
+    _name_list,
     _read_kg,
     audit_palace,
     drift_key,
-    hallway_entity_key,
     render_audit,
     terminal_progress,
 )
@@ -53,13 +52,13 @@ def test_drift_key_keeps_distinct_names_apart():
         ("device.zig", "src\\wireguard\\device.zig"),
     ],
 )
-def test_hallway_entity_key_collapses_self_links(a, b):
-    assert hallway_entity_key(a) == hallway_entity_key(b)
+def test_entity_spelling_key_collapses_self_links(a, b):
+    assert entity_spelling_key(a) == entity_spelling_key(b)
 
 
-def test_hallway_entity_key_keeps_methods_and_domains_apart():
-    assert hallway_entity_key("ChatStore") != hallway_entity_key("ChatStore.send")
-    assert hallway_entity_key("MemPalace") != hallway_entity_key("github.com")
+def test_entity_spelling_key_keeps_methods_and_domains_apart():
+    assert entity_spelling_key("ChatStore") != entity_spelling_key("ChatStore.send")
+    assert entity_spelling_key("MemPalace") != entity_spelling_key("github.com")
 
 
 def test_generic_entity_heuristic():
@@ -600,36 +599,6 @@ def test_score_tunnels_is_quality_times_coverage_and_never_traversal():
         ]
         is None
     )
-
-
-def test_resolve_kg_path_uses_the_home_graph_only_for_the_legacy_default_palace(
-    tmp_path, monkeypatch
-):
-    import mempalace.config as config_mod
-    import mempalace.knowledge_graph as kg_mod
-    from mempalace.palace_audit import resolve_kg_path
-
-    home = tmp_path / "home"
-    default_palace = home / "palace"
-    default_palace.mkdir(parents=True)
-    home_graph = home / "knowledge_graph.sqlite3"
-    home_graph.write_text("")
-    monkeypatch.setattr(config_mod, "DEFAULT_PALACE_PATH", str(default_palace))
-    monkeypatch.setattr(kg_mod, "DEFAULT_KG_PATH", str(home_graph))
-
-    # The legacy default palace without a local graph uses the home graph...
-    assert resolve_kg_path(str(default_palace)) == str(home_graph)
-    # ...but a custom palace never does, however it was selected
-    # (--palace, MEMPALACE_PALACE_PATH, config.json): no fallback.
-    custom = tmp_path / "custom"
-    custom.mkdir()
-    assert resolve_kg_path(str(custom)) == str(custom / "knowledge_graph.sqlite3")
-    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(custom))
-    assert resolve_kg_path(str(custom)) == str(custom / "knowledge_graph.sqlite3")
-    # A palace-local graph always wins, and --palace forces the local path.
-    (default_palace / "knowledge_graph.sqlite3").write_text("")
-    assert resolve_kg_path(str(default_palace)) == str(default_palace / "knowledge_graph.sqlite3")
-    assert resolve_kg_path(str(custom), explicit=True) == str(custom / "knowledge_graph.sqlite3")
 
 
 def test_analyze_hallways_does_not_count_same_named_files_as_duplicates():

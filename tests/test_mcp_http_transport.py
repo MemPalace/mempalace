@@ -30,6 +30,9 @@ import pytest
 
 from mempalace import mcp_server as mcp
 
+# Most tests drive an open loopback hub; the default token has its own tests.
+pytestmark = pytest.mark.usefixtures("tokenless_http_hub")
+
 
 def _post(port, path, body, headers=None, host_header=None):
     """Raw POST with full control over Host / Origin / Authorization headers."""
@@ -309,6 +312,269 @@ class TestPalaceReadsDoNotStarveTheHub:
         second.join(timeout=10)
         names = [name for name, _ in log]
         assert names.index("a:file1:end") < names.index("b:file0:start"), names
+
+
+class TestEmbeddingDoesNotHoldTheHttpLock:
+    """Embedding inference must not extend how long unrelated requests wait."""
+
+    @staticmethod
+    def _request(port, body, timeout=10):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+        try:
+            conn.request(
+                "POST",
+                "/mcp",
+                json.dumps(body),
+                headers={"Content-Type": "application/json"},
+            )
+            response = conn.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            conn.close()
+
+    def _call(self, port, name, arguments, req_id=1, timeout=10):
+        status, payload = self._request(
+            port,
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+            timeout=timeout,
+        )
+        assert status == 200, payload
+        text = payload["result"]["content"][0]["text"]
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return payload["result"]
+
+    def test_status_completes_while_diary_write_embeds(self, http_server, monkeypatch):
+        """A write's embedding phase must not stall an unrelated status read."""
+
+        port, _ = http_server
+        # Make diary_write call embedding_section then return success.
+        embed_started = threading.Event()
+
+        def slow_diary(**_kwargs):
+            from mempalace.embedding import embedding_section
+
+            with embedding_section():
+                embed_started.set()
+                time.sleep(1.0)
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_diary_write"], "handler", slow_diary)
+
+        def quick_status(**_kwargs):
+            return {"total_drawers": 0, "wings": {}, "rooms": {}}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_status"], "handler", quick_status)
+
+        errors = []
+
+        def writer():
+            try:
+                self._call(
+                    port,
+                    "mempalace_diary_write",
+                    {"agent_name": "a", "entry": "x"},
+                    req_id=61,
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        assert embed_started.wait(timeout=3)
+        started_at = time.perf_counter()
+        result = self._call(port, "mempalace_status", {}, req_id=62)
+        elapsed = time.perf_counter() - started_at
+        thread.join(timeout=5)
+
+        assert not errors, errors
+        assert result["total_drawers"] == 0
+        assert elapsed < 0.5, f"status waited on diary embedding: {elapsed:.3f}s"
+
+    def test_status_completes_while_search_embeds(self, http_server, monkeypatch):
+        port, _ = http_server
+        embed_started = threading.Event()
+
+        def slow_search(**_kwargs):
+            from mempalace.embedding import embedding_section
+
+            with embedding_section():
+                embed_started.set()
+                time.sleep(1.0)
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", slow_search)
+
+        def quick_status(**_kwargs):
+            return {"total_drawers": 0, "wings": {}, "rooms": {}}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_status"], "handler", quick_status)
+
+        errors = []
+
+        def searcher():
+            try:
+                self._call(port, "mempalace_search", {"query": "x"}, req_id=71)
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=searcher)
+        thread.start()
+        assert embed_started.wait(timeout=3)
+        started_at = time.perf_counter()
+        self._call(port, "mempalace_status", {}, req_id=72)
+        elapsed = time.perf_counter() - started_at
+        thread.join(timeout=5)
+
+        assert not errors, errors
+        assert elapsed < 0.5, f"status waited on search embedding: {elapsed:.3f}s"
+
+    def test_write_still_waits_for_search_backend_phase(self, http_server, monkeypatch):
+        """Releasing only around embedding must not let writes overlap a read's backend work."""
+        port, _ = http_server
+        search_backend_started = threading.Event()
+        search_release = threading.Event()
+        write_started = threading.Event()
+
+        def search_with_backend_hold(**_kwargs):
+            from mempalace.embedding import embedding_section
+
+            with embedding_section():
+                time.sleep(0.05)  # brief embed window — lock released
+            search_backend_started.set()
+            search_release.wait(timeout=5)
+            return {"query": "x", "results": []}
+
+        def state_change(**_kwargs):
+            write_started.set()
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", search_with_backend_hold)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_add_drawer"], "handler", state_change)
+
+        search_thread = threading.Thread(
+            target=lambda: self._call(port, "mempalace_search", {"query": "x"}, req_id=81)
+        )
+        search_thread.start()
+        assert search_backend_started.wait(timeout=3)
+        write_thread = threading.Thread(
+            target=lambda: self._call(
+                port,
+                "mempalace_add_drawer",
+                {"wing": "w", "room": "r", "content": "c"},
+                req_id=82,
+            )
+        )
+        write_thread.start()
+        time.sleep(0.25)
+        assert not write_started.is_set(), "write ran during search backend phase"
+        search_release.set()
+        search_thread.join(timeout=5)
+        write_thread.join(timeout=5)
+        assert write_started.is_set()
+
+    def test_cli_compatible_search_keeps_the_request_lock(self, http_server, monkeypatch):
+        """The CLI capture lock is held across embed, so this path must not drop the lease."""
+        port, _ = http_server
+        seen = []
+
+        def cli_search(**_kwargs):
+            from mempalace.embedding import _embedding_section_hook_local
+
+            seen.append(getattr(_embedding_section_hook_local, "hook", None))
+            return {"query": "x", "cli_output": "ok"}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", cli_search)
+        result = self._call(
+            port,
+            "mempalace_search",
+            {"query": "x", "cli_compatible": True},
+            req_id=91,
+        )
+        assert result["cli_output"] == "ok"
+        assert seen == [None]
+
+    def test_plain_search_installs_the_embedding_hook(self, http_server, monkeypatch):
+        port, _ = http_server
+        seen = []
+
+        def plain_search(**_kwargs):
+            from mempalace.embedding import _embedding_section_hook_local
+
+            seen.append(getattr(_embedding_section_hook_local, "hook", None))
+            return {"query": "x", "results": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", plain_search)
+        self._call(port, "mempalace_search", {"query": "x"}, req_id=92)
+        assert seen[0] is not None
+
+
+def test_embedding_reacquires_the_request_lock_before_releasing_lifecycle():
+    """Reconnect takes the lifecycle lock first, so it must not win that lock
+    until the embedding request holds its lease again."""
+    entered = threading.Event()
+    release_embed = threading.Event()
+    still_holding = threading.Event()
+    lifecycle_seen = threading.Event()
+    left_request = threading.Event()
+    errors = []
+
+    def embedder():
+        try:
+            with mcp._HTTP_REQUEST_LOCK:
+                with mcp._http_release_request_lock_for_embedding("write"):
+                    entered.set()
+                    assert release_embed.wait(timeout=3)
+                still_holding.set()
+                assert lifecycle_seen.wait(timeout=3)
+            left_request.set()
+        except Exception as exc:
+            errors.append(exc)
+            still_holding.set()
+            left_request.set()
+
+    def reconnect():
+        try:
+            assert entered.wait(timeout=3)
+            with mcp._http_embedding_lifecycle():
+                assert still_holding.is_set()
+                assert mcp._HTTP_REQUEST_LOCK._writer is True
+                lifecycle_seen.set()
+                assert left_request.wait(timeout=3)
+                with mcp._HTTP_REQUEST_LOCK:
+                    assert mcp._HTTP_REQUEST_LOCK._writer is True
+        except Exception as exc:
+            errors.append(exc)
+            lifecycle_seen.set()
+            left_request.set()
+
+    embed_thread = threading.Thread(target=embedder)
+    reconnect_thread = threading.Thread(target=reconnect)
+    embed_thread.start()
+    try:
+        assert entered.wait(timeout=3)
+        reconnect_thread.start()
+        time.sleep(0.2)
+        assert not still_holding.is_set()
+        release_embed.set()
+        embed_thread.join(timeout=5)
+        reconnect_thread.join(timeout=5)
+    finally:
+        release_embed.set()
+        lifecycle_seen.set()
+        left_request.set()
+        embed_thread.join(timeout=5)
+        reconnect_thread.join(timeout=5)
+
+    assert not errors, errors
+    assert still_holding.is_set()
+    assert left_request.is_set()
 
 
 class TestRWLockYield:
@@ -657,15 +923,27 @@ def test_rejects_cross_origin(http_server):
     assert status == 403
 
 
-def test_allows_loopback_origin(http_server):
-    port, _ = http_server
-    status, _ = _post(
-        port,
-        "/mcp",
-        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
-        headers={"Origin": "http://localhost:5173"},
+def test_a_token_hub_allows_any_loopback_origin(monkeypatch):
+    """With a token the bearer check guards the hub, so a local dev page on
+    another port may call it; a tokenless hub accepts only its own origin."""
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "s3cret")
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
     )
-    assert status == 200
+    thread.start()
+    try:
+        status, _ = _post(
+            port,
+            "/mcp",
+            {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+            headers={"Origin": "http://localhost:5173", "Authorization": "Bearer s3cret"},
+        )
+        assert status == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_bearer_token_enforced_when_configured(monkeypatch):
@@ -697,6 +975,193 @@ def test_bearer_token_enforced_when_configured(monkeypatch):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+def _tokenless_loopback_hub(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN", raising=False)
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    monkeypatch.setattr(mcp, "_config", SimpleNamespace(palace_path=palace, backend="chroma"))
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    return httpd, palace
+
+
+def test_loopback_hub_needs_no_token_by_default(monkeypatch, tmp_path):
+    """A loopback hub serves local clients with no token and mints no token file."""
+    from mempalace import server_registry
+
+    httpd, palace = _tokenless_loopback_hub(monkeypatch, tmp_path)
+    port = httpd.server_address[1]
+    try:
+        assert httpd.auth_token == ""
+        assert not server_registry.server_token_path(palace).exists()
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        assert _post(port, "/mcp", ping)[0] == 200
+        assert _get(port, "/healthz")[0] == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_tokenless_loopback_hub_still_refuses_other_hosts_and_origins(monkeypatch, tmp_path):
+    """No token on loopback leans on the Host pin and Origin check: a page that
+    rebinds a domain to 127.0.0.1, or a cross-origin browser call, is refused."""
+    httpd, _palace = _tokenless_loopback_hub(monkeypatch, tmp_path)
+    port = httpd.server_address[1]
+    ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    try:
+        assert _post(port, "/mcp", ping, host_header=f"evil.example:{port}")[0] == 403
+        assert _post(port, "/mcp", ping, headers={"Origin": "https://evil.example"})[0] == 403
+        assert _post(port, "/mcp", ping, headers={"Origin": f"http://127.0.0.1:{port}"})[0] == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_tokenless_loopback_hub_refuses_proxied_requests(monkeypatch, tmp_path):
+    """A local proxy relaying outside traffic must not reach a hub with no token."""
+    httpd, _palace = _tokenless_loopback_hub(monkeypatch, tmp_path)
+    port = httpd.server_address[1]
+    ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    try:
+        for header in (
+            {"X-Forwarded-For": "203.0.113.7"},
+            {"X-Forwarded-Host": "box.example.ts.net"},
+            {"X-Real-IP": "203.0.113.7"},
+            {"Forwarded": "for=203.0.113.7"},
+            {"Tailscale-User-Login": "someone@example.com"},
+            {"X-Forwarded-Proto": "https"},
+            {"X-Forwarded-Server": "proxy"},
+            {"X-Original-Host": "memory.example.com"},
+            {"CF-Connecting-IP": "203.0.113.7"},
+            {"True-Client-IP": "203.0.113.7"},
+            {"X-Client-IP": "203.0.113.7"},
+            {"Via": "1.1 proxy"},
+        ):
+            status, body = _post(port, "/mcp", ping, headers=header)
+            assert status == 403, header
+            assert b"token" in body
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_tokenless_loopback_hub_refuses_cross_site_browser_requests(monkeypatch, tmp_path):
+    """A page's <img src=.../logstream/stream> sends no Origin but does send
+    Sec-Fetch-Site, so it can't hold a stream slot; own clients send neither."""
+    httpd, _palace = _tokenless_loopback_hub(monkeypatch, tmp_path)
+    port = httpd.server_address[1]
+    try:
+        for site, expected in (("cross-site", 403), ("same-site", 403)):
+            status, _ = _get(port, "/logstream/stream", headers={"Sec-Fetch-Site": site})
+            assert status == expected, site
+        assert _get(port, "/healthz", headers={"Sec-Fetch-Site": "none"})[0] == 200
+        assert _get(port, "/healthz", headers={"Sec-Fetch-Site": "same-origin"})[0] == 200
+        assert _get(port, "/healthz")[0] == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_tokenless_loopback_hub_accepts_only_its_own_origin(monkeypatch, tmp_path):
+    httpd, _palace = _tokenless_loopback_hub(monkeypatch, tmp_path)
+    port = httpd.server_address[1]
+    ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    try:
+        assert _post(port, "/mcp", ping)[0] == 200
+        assert _post(port, "/mcp", ping, headers={"Origin": f"http://localhost:{port}"})[0] == 200
+        other = port + 1 if port < 65535 else port - 1
+        assert _post(port, "/mcp", ping, headers={"Origin": f"http://localhost:{other}"})[0] == 403
+        assert _post(port, "/mcp", ping, headers={"Origin": "http://127.0.0.1"})[0] == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_post_mcp_requires_a_json_content_type(monkeypatch, tmp_path):
+    """text/plain is what a browser can send cross-origin without a preflight."""
+    httpd, _palace = _tokenless_loopback_hub(monkeypatch, tmp_path)
+    port = httpd.server_address[1]
+    raw = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode("utf-8")
+    try:
+        for content_type, expected in (
+            ("text/plain", 415),
+            ("application/x-www-form-urlencoded", 415),
+            ("application/json; charset=utf-8", 200),
+        ):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                conn.request("POST", "/mcp", body=raw, headers={"Content-Type": content_type})
+                assert conn.getresponse().status == expected, content_type
+            finally:
+                conn.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_loopback_hub_enforces_an_explicit_token(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN", raising=False)
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "explicit-token")
+    monkeypatch.setattr(
+        mcp, "_config", SimpleNamespace(palace_path=str(tmp_path / "palace"), backend="chroma")
+    )
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    try:
+        assert _post(port, "/mcp", ping)[0] == 401
+        auth = {"Authorization": "Bearer explicit-token"}
+        assert _post(port, "/mcp", ping, headers=auth)[0] == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_proxied_loopback_hub_requires_the_stored_token(monkeypatch, tmp_path):
+    """A loopback hub fronted by a proxy (EXTRA_ALLOWED_HOSTS set) is reachable
+    from other machines, so it mints and requires the palace's token."""
+    from types import SimpleNamespace
+
+    from mempalace import server_registry
+
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN", raising=False)
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setenv("MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS", "box.example.ts.net")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    monkeypatch.setattr(mcp, "_config", SimpleNamespace(palace_path=palace, backend="chroma"))
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    try:
+        tokens = server_registry.load_server_tokens(palace)
+        assert tokens and httpd.auth_token == tokens[0]
+    finally:
+        httpd.server_close()
+
+
+def test_network_hub_without_token_or_palace_refuses_to_start(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN", raising=False)
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setattr(mcp, "_config", SimpleNamespace(palace_path="", backend="chroma"))
+    with pytest.raises(ValueError, match="bearer token"):
+        mcp._build_http_server("0.0.0.0", 0)
 
 
 def test_read_only_hides_and_refuses_mutating_tools(http_server, monkeypatch):
@@ -1004,6 +1469,9 @@ def test_read_only_refuses_the_hook_settings_config_write(http_server, monkeypat
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HOMEDRIVE", os.path.splitdrive(str(home))[0] or "C:")
     monkeypatch.setenv("HOMEPATH", os.path.splitdrive(str(home))[1] or str(home))
+    # MEMPALACE_CONFIG_DIR wins over HOME: an inherited one would point the
+    # tool at another config.json and fail the control below.
+    monkeypatch.delenv("MEMPALACE_CONFIG_DIR", raising=False)
     pristine = cfg_file.read_bytes()
 
     port, _ = http_server
@@ -1108,7 +1576,7 @@ def test_handle_error_quiets_client_disconnect(caplog, monkeypatch, disconnect_e
         )
         addr = ("127.0.0.1", 51234)
 
-        with caplog.at_level(logging.DEBUG, logger="mempalace_mcp"):
+        with caplog.at_level(logging.DEBUG, logger="mempalace"):
             try:
                 raise disconnect_exc
             except type(disconnect_exc):
@@ -1117,7 +1585,7 @@ def test_handle_error_quiets_client_disconnect(caplog, monkeypatch, disconnect_e
         assert delegated == []  # noisy default handler NOT invoked
         rec = next(r for r in caplog.records if "disconnect" in r.getMessage().lower())
         assert rec.levelno == logging.DEBUG
-        assert rec.name == "mempalace_mcp"
+        assert rec.name == "mempalace.mcp_server"
     finally:
         httpd.server_close()
 

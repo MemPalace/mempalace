@@ -95,7 +95,7 @@ class PalaceContext:
         Applies the spec-mandated ``adapter_name`` and ``adapter_version``
         metadata stamps (§5.1), which an adapter may set for itself, and the
         ``source_dir_ino`` stamp core records for every drawer that names a
-        source file (§5.1, #2320), which it may not: that one is a reading of
+        source file (§5.1), which it may not: that one is a reading of
         this machine's filesystem, and a value from anywhere else would be a
         number ``sync`` weighs a removal against.
         """
@@ -103,7 +103,7 @@ class PalaceContext:
         meta.setdefault("source_file", record.source_file)
         meta.setdefault("chunk_index", record.chunk_index)
         # A drawer an adapter files names a source the same way a mined one
-        # does, and ``sync`` decides both by the same rule (#2320). A source
+        # does, and ``sync`` decides both by the same rule. A source
         # that is not a path on this machine stats to nothing and records
         # nothing, which is what a drawer with no identity already means.
         #

@@ -1,7 +1,7 @@
 """Tests for mempalace.wing_split — one wing per source project."""
 
-import os
 import json
+import os
 from argparse import Namespace
 
 import pytest

@@ -18,7 +18,6 @@ import yaml
 from mempalace.miner import load_config
 from mempalace.room_detector_local import save_config
 
-
 CJK_DESCRIPTION = "Files from 20-專案/"
 
 

@@ -22,6 +22,8 @@ from mempalace.hlc import MAX_FUTURE_DRIFT_MS, HybridLogicalClock, parse, render
 from mempalace.logstream import Logstream
 from mempalace.replica import get_replica_id
 
+pytestmark = pytest.mark.usefixtures("tokenless_http_hub")
+
 
 @pytest.fixture
 def palace_a(tmp_dir):

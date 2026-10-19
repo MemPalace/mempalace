@@ -3,6 +3,7 @@ test_query_parser.py — Unit tests for MemPalace Query and Command Parser.
 """
 
 import pytest
+
 from mempalace.query_parser import (
     QueryParseError,
     parse_coordinate_input,
@@ -195,6 +196,65 @@ class TestPalaceExecParser:
             assert target == "update_drawer"
             assert params["content"] == quoted
             assert isinstance(params["content"], str)
+
+    def test_update_content_keeps_backslash_escapes(self):
+        target, params = parse_exec_input(
+            r'UPDATE drw_1 CONTENT "path C:\new\table and regex \t\\d+"'
+        )
+        assert target == "update_drawer"
+        assert params["content"] == "path C:\\new\\table and regex \\t\\d+"
+        assert "\n" not in params["content"]
+        assert "\t" not in params["content"]
+
+    def test_add_and_diary_keep_space_runs(self):
+        target, params = parse_exec_input("ADD IN notes/day keep   these    spaces")
+        assert target == "add_drawer"
+        assert params["content"] == "keep   these    spaces"
+
+        target, params = parse_exec_input("DIARY WRITE ada keep   these    spaces")
+        assert target == "diary_write"
+        assert params["entry"] == "keep   these    spaces"
+
+    def test_keywords_between_content_runs_are_not_stored(self):
+        target, params = parse_exec_input("ADD hello  world IN w/r more words SOURCE x.md tail")
+        assert target == "add_drawer"
+        assert params["content"] == "hello  world more words tail"
+        assert (params["wing"], params["room"], params["source_file"]) == ("w", "r", "x.md")
+
+        _, params = parse_exec_input('ADD "quoted part" IN w/r trailing')
+        assert params["content"] == "quoted part trailing"
+
+        target, params = parse_exec_input("DIARY WRITE agent1 did a thing TOPIC work then more")
+        assert target == "diary_write"
+        assert params["entry"] == "did a thing then more"
+        assert params["topic"] == "work"
+
+    def test_update_content_keeps_trailing_zero_in_version(self):
+        target, params = parse_exec_input("UPDATE drw_1 CONTENT 3.10")
+        assert target == "update_drawer"
+        assert params["content"] == "3.10"
+        assert isinstance(params["content"], str)
+
+        target, params = parse_exec_input("UPDATE drw_1 content:3.10")
+        assert params["content"] == "3.10"
+
+    def test_update_content_keeps_leading_zeros(self):
+        target, params = parse_exec_input("UPDATE drw_1 CONTENT 007")
+        assert target == "update_drawer"
+        assert params["content"] == "007"
+        assert isinstance(params["content"], str)
+
+    def test_update_content_keeps_null_as_text(self):
+        target, params = parse_exec_input("UPDATE drw_1 CONTENT null")
+        assert target == "update_drawer"
+        assert params["content"] == "null"
+        assert isinstance(params["content"], str)
+
+    def test_filter_values_still_coerce(self):
+        target, params = parse_exec_input("MINE /repo MODE projects LIMIT 007")
+        assert target == "mine"
+        assert params["limit"] == 7
+        assert isinstance(params["limit"], int)
 
     def test_structured_agent_name_plus_content_is_diary_write(self):
         action, params = parse_exec_input({"agent_name": "bot", "content": "observation"})
@@ -391,6 +451,76 @@ class TestPalaceCoordinateParser:
         assert params["stream"] == "project/mempalace"
         assert params["correlation_id"] == "task_1"
         assert params["timeout_ms"] == 5000
+
+        # 'from:' in a list/wait query filters by writer; from_agent stays the caller's identity.
+        target, params = parse_coordinate_input("EVENT LIST correlation:task_1 from:agent2")
+        assert target == "event_list"
+        assert params["writer"] == "agent2" and "from_agent" not in params
+        target, params = parse_coordinate_input("EVENT WAIT correlation:task_1 from:agent2")
+        assert target == "event_wait"
+        assert params["writer"] == "agent2" and "from_agent" not in params
+
+    def test_structured_from_filters_list_and_wait_by_writer(self):
+        action, params = parse_coordinate_input({"action": "event_list", "from": "alice"})
+        assert action == "event_list"
+        assert params["writer"] == "alice"
+        assert "from_agent" not in params
+        assert "from" not in params
+
+        action, params = parse_coordinate_input({"action": "event_wait", "from": "alice"})
+        assert action == "event_wait"
+        assert params["writer"] == "alice"
+        assert "from_agent" not in params
+
+        action, params = parse_coordinate_input(
+            {"action": "inbox", "from": "alice", "writer": "bob"}
+        )
+        assert action == "event_list"
+        assert params["writer"] == "bob"
+        assert "from" not in params
+
+        action, params = parse_coordinate_input(
+            {
+                "action": "event_append",
+                "from": "alice",
+                "type": "status",
+                "stream": "s",
+                "room": "r",
+            }
+        )
+        assert action == "event_append"
+        assert params["from_agent"] == "alice"
+        assert "writer" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT LIST correlation:task_1", "from": "alice"}
+        )
+        assert action == "event_list"
+        assert params["writer"] == "alice"
+        assert params["correlation_id"] == "task_1"
+        assert "from_agent" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT WAIT correlation:task_1", "from": "alice"}
+        )
+        assert action == "event_wait"
+        assert params["writer"] == "alice"
+        assert "from_agent" not in params
+
+        action, params = parse_coordinate_input(
+            {"command": "EVENT LIST from:bob", "from": "alice", "writer": "carol"}
+        )
+        assert action == "event_list"
+        assert params["writer"] == "carol"
+
+        action, params = parse_coordinate_input(
+            {
+                "command": "EVENT APPEND type:status stream:s room:r from:bob",
+                "from": "alice",
+            }
+        )
+        assert action == "event_append"
+        assert params["from_agent"] == "alice"
 
         target, params = parse_coordinate_input(
             'EVENT ACK id:evt_123 from:agent1 status:applied body:"Done"'

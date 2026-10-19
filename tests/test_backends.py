@@ -16,13 +16,14 @@ from mempalace.backends import (
     QueryResult,
     UnsupportedFilterError,
     available_backends,
+    chroma as chroma_module,
+    chroma_sqlite,
     get_backend,
 )
-from mempalace.backends import chroma as chroma_module
 from mempalace.backends.chroma import (
+    _HNSW_MISSING_METADATA_DATA_FLOOR,
     ChromaBackend,
     ChromaCollection,
-    _HNSW_MISSING_METADATA_DATA_FLOOR,
     _fix_blob_seq_ids,
     _fix_missing_collection_type,
     _pin_hnsw_threads,
@@ -357,6 +358,37 @@ def test_chroma_lexical_search_ids_roundtrip_through_get(tmp_path):
     # Every returned id must resolve back through get() — proving it is a public id.
     fetched = col.get(ids=hit_ids)
     assert set(fetched.ids) == set(hit_ids)
+    backend.close()
+
+
+def test_chroma_lexical_search_window_keeps_best_match_filed_last(tmp_path):
+    """The capped FTS window holds the best matches, not the first ones filed.
+
+    Regression for #2667: with more than 500 matches and no ``where``, the
+    window was read in rowid order, so a strong match filed late was never
+    scored.
+    """
+    backend = ChromaBackend()
+    palace = tmp_path / "palace"
+    ref = PalaceRef(id=str(palace), local_path=str(palace))
+    col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+    ids = [f"filler-{i:03d}" for i in range(600)] + ["target"]
+    documents = [
+        f"Note {i}: a kestrel was seen near the north field during the morning survey."
+        for i in range(600)
+    ] + ["The kestrel migration is blocked on the kestrel migration permit."]
+    for start in range(0, len(ids), 200):
+        batch = slice(start, start + 200)
+        col.add(
+            ids=ids[batch],
+            documents=documents[batch],
+            embeddings=[[1.0, 0.0, 0.0]] * len(ids[batch]),
+            metadatas=[{"wing": "w"}] * len(ids[batch]),
+        )
+
+    hits = col.lexical_search(query="kestrel migration", n_results=5).hits
+
+    assert [hit.id for hit in hits][:1] == ["target"]
     backend.close()
 
 
@@ -920,13 +952,16 @@ def test_chroma_get_recent_matches_exact_order_from_sqlite(tmp_path, monkeypatch
     from mempalace.backends.base import BaseCollection
 
     col = _recent_palace(tmp_path)
-    monkeypatch.setattr(chroma_module, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
+    monkeypatch.setattr(chroma_sqlite, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
     wheres = [
         None,
         {"wing": "a"},
         {"wing": "rare"},
         {"$and": [{"room": "x"}, {"wing": {"$eq": "b"}}]},
         {"wing": "missing"},
+        # A wing with its old spellings (wing_aliases).
+        {"wing": {"$in": ["rare", "missing", "b"]}},
+        {"$and": [{"wing": {"$in": ["a", "rare"]}}, {"room": "y"}]},
     ]
     exact = {
         repr(where): BaseCollection.get_recent(col, limit=10_000, where=where) for where in wheres
@@ -950,7 +985,7 @@ def test_chroma_get_recent_falls_back_for_filters_sqlite_does_not_evaluate(tmp_p
 
     col = _recent_palace(tmp_path)
     where = {"n": {"$gte": 150}}
-    assert chroma_module._string_equalities(where) is None
+    assert chroma_sqlite._string_equalities(where) is None
     got = col.get_recent(limit=5, where=where)
     assert got.ids == BaseCollection.get_recent(col, limit=5, where=where).ids
     assert all(meta["n"] >= 150 for meta in got.metadatas)
@@ -1011,7 +1046,7 @@ def test_chroma_sqlite_readers_skip_vector_segment_rows(tmp_path, monkeypatch, f
         backend.close()
     _insert_vector_segment_ghost(palace)
 
-    monkeypatch.setattr(chroma_module, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
+    monkeypatch.setattr(chroma_sqlite, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
     backend = ChromaBackend()
     try:
         col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=False)
@@ -1055,6 +1090,26 @@ def test_chroma_iter_metadata_projects_keys_and_requires_a_key(tmp_path):
     assert len(dated) == len(holding) > 0  # an empty string is still a string value
     assert col.iter_metadata(["wing"], require_key="missing_key") is not None
     assert list(col.iter_metadata(["wing"], require_key="missing_key")) == []
+
+
+def test_chroma_iter_metadata_equals_scopes_the_scan(tmp_path):
+    col = _recent_palace(tmp_path)
+    everything = [m for m in col.get_all_metadata() if m]
+    rare = list(col.iter_metadata(["wing", "room"], equals={"wing": "rare"}))
+    assert rare == [
+        {"wing": m["wing"], "room": m["room"]} for m in everything if m["wing"] == "rare"
+    ]
+    assert len(rare) == 4
+    # Several equalities all apply, and they combine with require_key.
+    rare_x = list(col.iter_metadata(["room"], equals={"wing": "rare", "room": "x"}))
+    assert rare_x == [{"room": "x"}] * sum(
+        1 for m in everything if m["wing"] == "rare" and m["room"] == "x"
+    )
+    dated_a = list(col.iter_metadata(["wing"], require_key="filed_at", equals={"wing": "a"}))
+    assert len(dated_a) == sum(
+        1 for m in everything if m["wing"] == "a" and isinstance(m.get("filed_at"), str)
+    )
+    assert list(col.iter_metadata(["wing"], equals={"wing": "no_such_wing"})) == []
 
 
 def test_chroma_backend_accepts_palace_ref_kwarg(tmp_path):
@@ -1106,7 +1161,7 @@ def test_palace_wrapper_embeds_for_chroma(tmp_path, monkeypatch):
 
     calls = []
 
-    def fake_embed(texts):
+    def fake_embed(texts, **_kwargs):
         texts = list(texts)
         calls.append(texts)
         return [[float(len(text)), 1.0, 0.0, 0.0] for text in texts]
@@ -1458,6 +1513,7 @@ def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
     never want to open it again, even read-only.
     """
     from unittest.mock import patch
+
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     # Pre-create the marker so the function should short-circuit.
@@ -2547,6 +2603,28 @@ def test_explain_ef_mismatch_recognizes_chromadb_conflict():
     assert "mempalace --palace /tmp/palace.db repair rebuild-index" in msg
 
 
+def test_explain_ef_mismatch_also_offers_a_separate_palace_rebuild():
+    """Same two re-embed routes as the identity-mismatch hint: in place, or
+    into a separate palace with ``--mode from-sqlite``."""
+    err = ValueError("Embedding function conflict: new: embeddinggemma2 vs persisted: default")
+    msg = ChromaBackend._explain_ef_mismatch(err, "/tmp/palace.db")
+    assert "mempalace --palace /tmp/palace.db repair rebuild-index" in msg
+    assert (
+        "mempalace --palace <new-palace> repair --mode from-sqlite --source /tmp/palace.db" in msg
+    )
+
+
+def test_explain_ef_mismatch_prints_a_windows_path_as_typed():
+    """Eve's GPU recheck on Windows: the message formatted the path with
+    ``!r``, so ``search`` showed it quoted, with every backslash doubled."""
+    err = ValueError("Embedding function conflict: new: embeddinggemma2 vs persisted: default")
+    path = r"C:\Users\igorl\.mempalace\palace"
+    msg = ChromaBackend._explain_ef_mismatch(err, path)
+    first_line = msg.splitlines()[0]
+    assert first_line == rf"Embedding model mismatch reading palace at {path}."
+    assert "\\\\" not in msg
+
+
 def test_explain_ef_mismatch_returns_none_for_unrelated_errors():
     """Don't paper over unrelated ValueErrors with the EF-mismatch message —
     the caller needs to re-raise unmodified so debugging stays sane."""
@@ -2576,13 +2654,18 @@ def test_get_collection_translates_ef_mismatch_to_helpful_error(tmp_path):
             return [[0.0] * _TEST_EMBED_DIM for _ in input]
 
     original_resolver = backend._resolve_embedding_function
-    backend._resolve_embedding_function = lambda: _ConflictingEF()
+    backend._resolve_embedding_function = lambda **_: _ConflictingEF()
     # Drop the cached client so the next call goes through the open path.
     backend.close_palace(palace_path)
 
     try:
-        with pytest.raises(ValueError, match=r"rebuild-index"):
+        with pytest.raises(ValueError, match=r"rebuild-index") as excinfo:
             backend.get_collection(palace_path, "drawers", create=False)
+        # A ValueError subclass, so callers like `mine` can report it cleanly.
+        from mempalace.backends.base import EmbeddingFunctionMismatchError
+
+        assert isinstance(excinfo.value, EmbeddingFunctionMismatchError)
+        assert "unset MEMPALACE_EMBEDDING_MODEL" not in str(excinfo.value)
     finally:
         backend._resolve_embedding_function = original_resolver
         backend.close_palace(palace_path)

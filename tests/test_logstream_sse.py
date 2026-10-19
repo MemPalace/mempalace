@@ -15,6 +15,8 @@ import pytest
 
 from mempalace import mcp_server as mcp
 
+pytestmark = pytest.mark.usefixtures("tokenless_http_hub")
+
 
 @pytest.fixture
 def patched_palace(monkeypatch, config, palace_path):

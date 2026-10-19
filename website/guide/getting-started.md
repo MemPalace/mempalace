@@ -21,7 +21,7 @@ The domain `mempalace.tech` is a **brand-squatting site** not affiliated with th
 
 ### Requirements
 
-- Python 3.9+
+- Python 3.10+
 - `chromadb>=0.5.0` (installed automatically)
 - `pyyaml>=6.0` (installed automatically)
 

@@ -9,47 +9,28 @@ import unicodedata
 from pathlib import Path
 from typing import Callable, Iterator, Optional, TextIO, Union
 
+from .fsio import decode_windows_1252, encode_windows_1252
+
 _BACKUP_FORMAT = "mempalace-encoding-repair"
 _BACKUP_VERSION = 1
-_UNDEFINED_CP1252_BYTES = frozenset(
-    {
-        0x81,
-        0x8D,
-        0x8F,
-        0x90,
-        0x9D,
-    }
-)
 
 
 def _cp1252_character(
     byte_value: int,
 ) -> str:
-    """Map a legacy byte to the character stored in old palaces."""
-    if byte_value in _UNDEFINED_CP1252_BYTES:
-        # Pre-3.1 Windows reads could preserve these five undefined
-        # Windows-1252 byte values as their corresponding invisible
-        # C1 control code points.
-        return chr(byte_value)
+    """Map a legacy byte to the character stored in old palaces.
 
-    return bytes([byte_value]).decode("cp1252")
+    Pre-3.1 Windows reads could preserve the five undefined Windows-1252
+    byte values as the C1 control code points with the same number.
+    """
+    return decode_windows_1252(bytes([byte_value]))
 
 
 def _encode_mojibake_candidate(
     text: str,
 ) -> bytes:
     """Recover original bytes, including undefined CP1252 values."""
-    raw = bytearray()
-
-    for character in text:
-        codepoint = ord(character)
-
-        if codepoint in _UNDEFINED_CP1252_BYTES:
-            raw.append(codepoint)
-        else:
-            raw.extend(character.encode("cp1252"))
-
-    return bytes(raw)
+    return encode_windows_1252(text)
 
 
 _CONTINUATION_CHARS = "".join(
@@ -461,7 +442,7 @@ def repair_collection(
             page = collection.get(
                 limit=page_size,
                 offset=offset,
-                include=["documents"],
+                include=["documents", "metadatas"],
             )
             ids = list(
                 _result_field(
@@ -477,6 +458,8 @@ def repair_collection(
                 )
                 or []
             )
+            metadatas = list(_result_field(page, "metadatas") or [])
+            metadatas += [None] * (len(ids) - len(metadatas))
 
             if len(ids) != len(documents):
                 raise RuntimeError("collection returned misaligned ids and documents")
@@ -486,9 +469,10 @@ def repair_collection(
 
             page_changes = []
 
-            for drawer_id, document in zip(
+            for drawer_id, document, metadata in zip(
                 ids,
                 documents,
+                metadatas,
             ):
                 scanned += 1
 
@@ -496,6 +480,11 @@ def repair_collection(
                     document,
                     str,
                 ):
+                    continue
+
+                # A drawer that names its source encoding was decoded without
+                # loss; "repairing" it would break encode_source's round trip.
+                if isinstance(metadata, dict) and metadata.get("source_encoding"):
                     continue
 
                 repaired = repair_mojibake(document)

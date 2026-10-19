@@ -15,7 +15,6 @@ from mempalace.write_routing import (
     resolve_write_routing_policy,
 )
 
-
 _ROUTING_ENV_KEYS = (
     "MEMPALACE_WRITE_ROUTING",
     "MEMPALACE_HOOK_WRITE_ROUTING",
@@ -283,7 +282,7 @@ def test_global_env_beats_legacy_hook_env_and_config(
 
     cfg = MempalaceConfig(config_dir=tmp_path)
 
-    assert cfg.hook_write_routing is WriteRoutingPolicy.REQUIRE
+    assert cfg.resolve_write_routing("hooks").policy is WriteRoutingPolicy.REQUIRE
 
 
 def test_legacy_hook_env_beats_config(
@@ -342,7 +341,7 @@ def test_global_config_applies_to_both_scopes(tmp_path):
 
     cfg = MempalaceConfig(config_dir=tmp_path)
 
-    assert cfg.hook_write_routing is WriteRoutingPolicy.PREFER
+    assert cfg.resolve_write_routing("hooks").policy is WriteRoutingPolicy.PREFER
     assert cfg.cli_write_routing is WriteRoutingPolicy.PREFER
 
 

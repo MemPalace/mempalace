@@ -16,47 +16,10 @@ outright (``ValueError``) — that behaviour is unchanged and still tested
 here for completeness. The bulk ingest paths (miner, convo_miner, sweeper,
 diary_ingest) build documents without routing through that helper and reach
 ``ChromaCollection`` directly, exactly as #1235 found for surrogates. This
-file covers the chokepoint fix that closes that gap: replace, not reject, so
-a NUL-containing chunk doesn't abort or corrupt an otherwise-good mine.
+file covers the chokepoint that closes that gap: the NUL is stored as a
+reversible escape, so a NUL-containing chunk neither aborts nor corrupts an
+otherwise-good mine, and reads return it unchanged.
 """
-
-from mempalace.config import strip_nul_bytes
-
-
-# ── Unit tests ─────────────────────────────────────────────────────────────
-
-
-class TestStripNulBytes:
-    def test_passthrough_normal(self):
-        assert strip_nul_bytes("hello world") == "hello world"
-        assert strip_nul_bytes("你好世界") == "你好世界"
-
-    def test_empty_string(self):
-        assert strip_nul_bytes("") == ""
-
-    def test_replaces_single_nul(self):
-        assert strip_nul_bytes("hello\x00world") == "hello�world"
-
-    def test_replaces_multiple_nuls(self):
-        assert strip_nul_bytes("\x00\x00\x00") == "���"
-        assert strip_nul_bytes("a\x00b\x00c") == "a�b�c"
-
-    def test_replaces_large_nul_run(self):
-        """The reporter-shaped case: a large contiguous NUL run inside
-        otherwise-ordinary captured tool output."""
-        dirty = "before-nuls " + ("\x00" * 10291) + " after-nuls"
-        clean = strip_nul_bytes(dirty)
-        assert "\x00" not in clean
-        assert clean.startswith("before-nuls ")
-        assert clean.endswith(" after-nuls")
-        assert clean.count("�") == 10291
-
-    def test_preserves_real_content_around_nuls(self):
-        assert (
-            strip_nul_bytes("ordinary log line one\x00\x00\x00ordinary log line two")
-            == "ordinary log line one���ordinary log line two"
-        )
-
 
 # ── Existing sanitizer behavior (unchanged) ─────────────────────────────────
 
@@ -71,9 +34,9 @@ class TestSanitizeContentStillRejectsNuls:
     """
 
     def test_sanitize_content_rejects_nul(self):
-        from mempalace.config import sanitize_content
-
         import pytest
+
+        from mempalace.config import sanitize_content
 
         with pytest.raises(ValueError, match="null bytes"):
             sanitize_content("hello\x00world")
@@ -99,6 +62,16 @@ class _CapturingCollection:
         self.calls.append(("update", kwargs))
 
 
+def _stored_docs(kwargs):
+    """Documents as a reader gets them back from what reached chromadb."""
+    from mempalace.stored_text import restore_rows
+
+    docs = kwargs["documents"]
+    single = isinstance(docs, str)
+    docs, _ = restore_rows([docs] if single else docs, kwargs["metadatas"])
+    return docs[0] if single else docs
+
+
 class TestBackendChokepointStripsNulBytes:
     """The bulk ingest paths (miner, convo_miner, sweeper, diary_ingest) build
     documents without routing through ``sanitize_content`` and reach
@@ -118,19 +91,29 @@ class TestBackendChokepointStripsNulBytes:
         fake, col = self._collection()
         col.add(documents=["clean\x00doc"], ids=["1"])
         _, kwargs = fake.calls[0]
-        assert kwargs["documents"] == ["clean�doc"]
+        stored = kwargs["documents"][0]
+        assert "\x00" not in stored
+        stored.encode("utf-8")
+        assert _stored_docs(kwargs)[0] == "clean\x00doc"
 
     def test_upsert_strips_nul_in_document(self):
         fake, col = self._collection()
         col.upsert(documents=["a\x00b"], ids=["1"], metadatas=[{"wing": "w"}])
         _, kwargs = fake.calls[0]
-        assert kwargs["documents"] == ["a�b"]
+        stored = kwargs["documents"][0]
+        assert "\x00" not in stored
+        assert _stored_docs(kwargs)[0] == "a\x00b"
+        from mempalace.stored_text import FLAG
+
+        assert kwargs["metadatas"][0][FLAG] == 1
 
     def test_update_strips_nul_in_document(self):
         fake, col = self._collection()
         col.update(ids=["1"], documents=["x\x00y"])
         _, kwargs = fake.calls[0]
-        assert kwargs["documents"] == ["x�y"]
+        stored = kwargs["documents"][0]
+        assert "\x00" not in stored
+        assert _stored_docs(kwargs)[0] == "x\x00y"
 
     def test_one_nul_message_does_not_corrupt_the_batch(self):
         """The reporter's shape: a single NUL-heavy row alongside ordinary
@@ -141,16 +124,26 @@ class TestBackendChokepointStripsNulBytes:
             ids=["1", "2", "3"],
         )
         _, kwargs = fake.calls[0]
-        assert kwargs["documents"] == ["ok one", "poison�row", "ok three"]
+        assert _stored_docs(kwargs) == [
+            "ok one",
+            "poison\x00row",
+            "ok three",
+        ]
+        assert all("\x00" not in doc for doc in kwargs["documents"])
         assert len(kwargs["ids"]) == 3
 
     def test_both_surrogates_and_nuls_in_same_document(self):
         """Both sanitizers apply to the same document — order doesn't
         leave either kind of bad character behind."""
         fake, col = self._collection()
-        col.upsert(documents=["a\udc95b\x00c"], ids=["1"])
+        original = "a\udc95b\x00c"
+        col.upsert(documents=[original], ids=["1"])
         _, kwargs = fake.calls[0]
-        assert kwargs["documents"] == ["a�b�c"]
+        stored = kwargs["documents"][0]
+        stored.encode("utf-8")
+        assert "\x00" not in stored
+        assert "\udc95" not in stored
+        assert _stored_docs(kwargs)[0] == original
 
     def test_single_string_document_is_not_split_into_chars(self):
         """chromadb accepts a bare str as one document (OneOrMany[Document]).
@@ -159,5 +152,6 @@ class TestBackendChokepointStripsNulBytes:
         fake, col = self._collection()
         col.upsert(documents="one\x00document", ids=["1"])
         _, kwargs = fake.calls[0]
-        assert kwargs["documents"] == "one�document"
         assert isinstance(kwargs["documents"], str)
+        assert "\x00" not in kwargs["documents"]
+        assert _stored_docs(kwargs) == "one\x00document"

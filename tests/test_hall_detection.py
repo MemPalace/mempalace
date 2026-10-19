@@ -76,8 +76,8 @@ class TestDrawerHasHallMetadata:
     """When a drawer is created, it must have a hall field in metadata."""
 
     def test_add_drawer_includes_hall(self, palace_path):
-        from mempalace.palace import get_collection
         from mempalace.miner import add_drawer
+        from mempalace.palace import get_collection
 
         col = get_collection(palace_path)
         add_drawer(
@@ -99,8 +99,8 @@ class TestConvoMinerWritesHalls:
     """Conversation miner must also tag drawers with hall metadata."""
 
     def test_convo_miner_drawers_have_hall(self, tmp_dir):
-        from mempalace.palace import get_collection
         from mempalace.convo_miner import mine_convos
+        from mempalace.palace import get_collection
 
         palace_dir = os.path.join(tmp_dir, "palace")
         os.makedirs(palace_dir)
@@ -150,8 +150,8 @@ class TestMineProjectWritesHalls:
     """Full mine pipeline must produce drawers with hall metadata."""
 
     def test_mined_drawers_have_hall(self, tmp_dir):
-        from mempalace.palace import get_collection
         from mempalace.miner import mine
+        from mempalace.palace import get_collection
 
         palace_dir = os.path.join(tmp_dir, "palace")
         os.makedirs(palace_dir)

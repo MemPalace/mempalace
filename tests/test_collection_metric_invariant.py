@@ -15,7 +15,6 @@ gets caught at test time rather than silently degrading search quality.
 from mempalace.backends.chroma import ChromaBackend
 from mempalace.palace import get_collection
 
-
 EXPECTED_METRIC = "cosine"
 
 
