@@ -269,6 +269,49 @@ def test_token_file_is_passed_by_path(isolated_home, capture_exec, monkeypatch):
     assert not server_token_path(str(isolated_home / "palace")).exists()
 
 
+def _token_line(out):
+    """The `token    :` line of the startup banner."""
+    lines = [line for line in out.splitlines() if line.startswith("  token    :")]
+    assert len(lines) == 1, out
+    return lines[0]
+
+
+def test_token_file_banner_names_the_file(isolated_home, capture_exec, monkeypatch, capsys):
+    # MEMPALACE_MCP_HTTP_TOKEN is unset when the token comes from a file, so the
+    # banner names that file, not the palace's stored token, which this server
+    # does not use.
+    token_file = isolated_home / "token"
+    token_file.write_text("file-secret-token\n", encoding="utf-8")
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", str(token_file))
+    with pytest.raises(_ExecCalled):
+        cli.cmd_serve(_serve_args(isolated_home, host="0.0.0.0"))
+    out = capsys.readouterr().out
+    assert _token_line(out) == f"  token    : {token_file}  (from MEMPALACE_MCP_HTTP_TOKEN_FILE)"
+    assert str(server_token_path(str(isolated_home / "palace"))) not in out
+    assert "file-secret-token" not in out
+
+
+def test_reused_generated_token_banner_names_the_token_file(isolated_home, capture_exec, capsys):
+    # A token generated on an earlier start is reused, not printed again.
+    palace = str(isolated_home / "palace")
+    token, created = load_or_create_server_token(palace)
+    assert created is True
+    with pytest.raises(_ExecCalled):
+        cli.cmd_serve(_serve_args(isolated_home, host="0.0.0.0"))
+    out = capsys.readouterr().out
+    assert _token_line(out).startswith(f"  token    : {server_token_path(palace)}  (0600;")
+    assert token not in out
+
+
+def test_env_token_banner_names_no_file(isolated_home, capture_exec, monkeypatch, capsys):
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "env-secret-token")
+    with pytest.raises(_ExecCalled):
+        cli.cmd_serve(_serve_args(isolated_home, host="0.0.0.0"))
+    out = capsys.readouterr().out
+    assert "  token    :" not in out
+    assert "env-secret-token" not in out
+
+
 def test_env_token_is_passed_as_value(isolated_home, capture_exec, monkeypatch):
     monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "env-secret-token")
     monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN_FILE", "")
