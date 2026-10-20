@@ -22,6 +22,7 @@ from urllib import error as urlerror, parse as urlparse, request as urlrequest
 import numpy as np
 
 from ..lexical import bm25_scores, tokenize
+from ..secret_env import read_secret_env
 from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
 from ..timeutil import utc_now_iso as _utcnow
 from ..version import __version__
@@ -155,7 +156,7 @@ class _QdrantConfig:
         )
         api_key = (
             options.get("api_key")
-            or os.environ.get("MEMPALACE_QDRANT_API_KEY")
+            or read_secret_env("MEMPALACE_QDRANT_API_KEY")
             or getattr(cfg, "qdrant_api_key", None)
         )
         namespace = (

@@ -1250,13 +1250,18 @@ def _http_resolve_token(host: str) -> str:
     from the same place, unless ``MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN``
     (``mempalace serve --allow-insecure``) says a trusted proxy guards it.
     """
-    token = env_str("MEMPALACE_MCP_HTTP_TOKEN", "")
+    from ..secret_env import read_secret_env
+
+    # MEMPALACE_MCP_HTTP_TOKEN_FILE (a Compose secret, a systemd credential)
+    # keeps the token out of the environment; a bad one raises before bind.
+    token = (read_secret_env("MEMPALACE_MCP_HTTP_TOKEN") or "").strip()
     if token or _http_local_only(host) or env_bool(_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV, False):
         return token
     if not _config.palace_path:
         raise ValueError(
-            "MCP HTTP needs a bearer token: set MEMPALACE_MCP_HTTP_TOKEN or a palace "
-            f"path, or set {_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV}=1 to serve without one."
+            "MCP HTTP needs a bearer token: set MEMPALACE_MCP_HTTP_TOKEN (or "
+            "MEMPALACE_MCP_HTTP_TOKEN_FILE) or a palace path, or set "
+            f"{_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV}=1 to serve without one."
         )
     from .. import server_registry
 

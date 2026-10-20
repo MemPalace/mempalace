@@ -50,7 +50,11 @@ SEARCH_SETTINGS = (
     ),
     ("embedding_device", ("MEMPALACE_EMBEDDING_DEVICE",), ("embedding", "!openai-compat")),
     ("embedding_threads", ("MEMPALACE_EMBEDDING_THREADS",), ("embedding", "!openai-compat")),
-    ("qdrant_api_key", ("MEMPALACE_QDRANT_API_KEY",), ("backend", "qdrant")),
+    (
+        "qdrant_api_key",
+        ("MEMPALACE_QDRANT_API_KEY", "MEMPALACE_QDRANT_API_KEY_FILE"),
+        ("backend", "qdrant"),
+    ),
     ("qdrant_namespace", ("MEMPALACE_QDRANT_NAMESPACE",), ("backend", "qdrant")),
     ("qdrant_timeout", ("MEMPALACE_QDRANT_TIMEOUT",), ("backend", "qdrant")),
     ("qdrant_url", ("MEMPALACE_QDRANT_URL",), ("backend", "qdrant")),

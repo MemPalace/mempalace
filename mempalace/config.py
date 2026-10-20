@@ -20,6 +20,7 @@ from pathlib import Path
 from . import fsio, paths
 from ._env import env_flag, env_float, env_int, env_str, parse_bool, parse_number
 from ._once import first_time
+from .secret_env import read_secret_env
 from .write_routing import (
     ResolvedWriteRoutingPolicy,
     RoutingPolicyCandidate,
@@ -786,8 +787,12 @@ class MempalaceConfig:
 
     @property
     def qdrant_api_key(self):
-        """API key for the opt-in ``qdrant`` backend, if configured."""
-        env_val = os.environ.get("MEMPALACE_QDRANT_API_KEY")
+        """API key for the opt-in ``qdrant`` backend, if configured.
+
+        ``MEMPALACE_QDRANT_API_KEY_FILE`` names a file holding the key, as an
+        alternative to the env var (see :mod:`mempalace.secret_env`).
+        """
+        env_val = read_secret_env("MEMPALACE_QDRANT_API_KEY")
         if env_val:
             return env_val
         value = self._file_config.get("qdrant_api_key")
