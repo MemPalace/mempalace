@@ -724,6 +724,14 @@ requires Python 3.10.
 - [#2859](https://github.com/MemPalace/mempalace/pull/2859) chore(release): 3.12.0
 - [#2861](https://github.com/MemPalace/mempalace/pull/2861) fix(mine): keep --palace and media options on daemon-routed adapter mines
 
+### Added
+
+- **`kg_timeline` and `KnowledgeGraph.query_relationship` return each fact's `confidence`,
+  `source_closet` and `source_file`.** `query_entity` already returned the first two, but
+  the timeline and relationship reads dropped all three, so a fact's provenance depended
+  on which read path surfaced it. The three keys now carry the stored values on every
+  fact those reads return, and no existing key changes. (#2749)
+
 ---
 
 ## [3.11.0] — 2026-10-12
