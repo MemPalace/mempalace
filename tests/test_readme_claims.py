@@ -77,9 +77,9 @@ SCHEMAS_PATH = MEMPALACE_PKG / "mcp_server" / "schemas.py"
 LIGHT_SERVER_PATH = MEMPALACE_PKG / "mcp_light_server.py"
 
 # Matches a number that states a tool count, in every wording the docs use:
-#   "45 tools", "45 MCP tools", "(45 MCP tools)", "All 45 MemPalace MCP tools",
-#   "**45 separate tools", "the 45-tool server", "Full MCP surface: 47 tools",
-#   and "three PQL tools ... instead of 45" (the DSH patch comment).
+# 45 tools, 45 MCP tools, (45 MCP tools), All 45 MemPalace MCP tools,
+# **45 separate tools, the 45-tool server, Full MCP surface: 47 tools,
+# and "three PQL tools ... instead of 45" (the DSH patch comment).
 # The lookbehind keeps a version suffix like "v3.45 tools" from reading as 45.
 TOOL_COUNT_CLAIM_RE = re.compile(
     r"(?<![\w.])(\d+)(?:-|\s+)(?:(?:MemPalace|MCP|separate)\s+)*tools?\b"
@@ -574,7 +574,7 @@ class TestTunnelFunctions:
 
     def test_tunnel_functions_importable(self):
         """find_tunnels, traverse, graph_stats should be importable."""
-        from mempalace.palace_graph import find_tunnels, traverse, graph_stats
+        from mempalace.palace_graph import find_tunnels, graph_stats, traverse
 
         assert callable(find_tunnels)
         assert callable(traverse)
@@ -807,22 +807,6 @@ class TestHallMetadata:
             "Halls are a schema ghost — defined in config, read by palace_graph, "
             "but never written by any pipeline."
         )
-
-    def test_readme_hall_types_match_config(self):
-        """If README lists specific hall names, they should appear in config."""
-        # README mentions these 5 halls
-        readme_halls = [
-            "hall_facts",
-            "hall_events",
-            "hall_discoveries",
-            "hall_preferences",
-            "hall_advice",
-        ]
-        for hall in readme_halls:
-            # These should either be in config or README should not list them
-            # The hall_ prefix is a README convention; config uses keyword groups
-            # like "emotions", "consciousness" etc. Check if they're consistent.
-            pass  # This is a documentation check; the real test is #18b above
 
 
 # ---------------------------------------------------------------------------

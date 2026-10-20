@@ -20,10 +20,10 @@ from mempalace import embedding  # noqa: E402
 from mempalace.onnx_graph import (  # noqa: E402
     _GRAPH_NODE,
     _MODEL_GRAPH,
-    _Node,
     _encode_varint,
     _fields,
     _len_field,
+    _Node,
     _string_field,
     gather_before_dequantize,
 )

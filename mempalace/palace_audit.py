@@ -35,14 +35,14 @@ import time
 from collections import Counter, defaultdict
 from typing import Optional
 
+from . import paths
 from .backends._inproc_sqlite import open_reader as open_palace_reader
 from .config import MempalaceConfig, normalize_wing_name
 from .hallways import (
-    entity_spelling_key,
+    association_groups,
     is_generic_entity,
     is_self_link,
     list_hallways,
-    association_groups,
 )
 from .palace_graph import _load_tunnels
 from .tunnels_tool import connection_index, tunnel_endpoints
@@ -106,11 +106,6 @@ def _wing_prefix_pairs(wings: list[str]) -> list[tuple[str, str]]:
     return pairs
 
 
-def hallway_entity_key(entity: str) -> str:
-    """Kept as the audit's name for :func:`mempalace.hallways.entity_spelling_key`."""
-    return entity_spelling_key(entity)
-
-
 # ── readers ──────────────────────────────────────────────────────────────────
 
 
@@ -167,7 +162,7 @@ def _wing_source_counts_reader(config: MempalaceConfig):
     except Exception:
         return None
     if backend == "chroma":
-        from .backends.chroma import sqlite_wing_source_counts
+        from .backends.chroma_sqlite import sqlite_wing_source_counts
 
         return sqlite_wing_source_counts
     if backend in {"sqlite_exact", "rust_exact"}:
@@ -217,30 +212,6 @@ def _read_wing_project_mix(config: MempalaceConfig) -> Optional[dict[str, dict]]
         }
         for wing, targets in per_wing.items()
     }
-
-
-def resolve_kg_path(palace_path: str, explicit: bool = False) -> str:
-    """The knowledge graph that belongs to ``palace_path``.
-
-    A palace-local ``knowledge_graph.sqlite3`` always wins. The legacy
-    ``~/.mempalace/knowledge_graph.sqlite3`` belongs to the legacy default
-    palace (``~/.mempalace/palace``) alone, so it is used only for that
-    palace — whether it was reached by default, ``--palace``,
-    ``MEMPALACE_PALACE_PATH`` or ``config.json``. Any other palace keeps its
-    graph inside itself, so ``audit`` cannot report and ``kg normalize
-    --yes`` cannot rewrite an unrelated graph. ``explicit`` (``--palace``
-    given) forces the palace-local path, as the MCP server does for its
-    flag. Neither file is created here.
-    """
-    from .config import DEFAULT_PALACE_PATH
-    from .knowledge_graph import DEFAULT_KG_PATH
-
-    local = os.path.join(palace_path, "knowledge_graph.sqlite3")
-    if explicit or os.path.isfile(local):
-        return local
-    if os.path.realpath(palace_path) == os.path.realpath(DEFAULT_PALACE_PATH):
-        return DEFAULT_KG_PATH
-    return local
 
 
 def _read_kg(kg_path: str) -> Optional[dict]:
@@ -701,7 +672,8 @@ def audit_palace(
     """Run every read-only check and return the report as a dict.
 
     ``explicit_palace`` says the caller passed ``--palace``; see
-    :func:`resolve_kg_path` for which knowledge graph belongs to a palace.
+    :func:`mempalace.paths.knowledge_graph_path` for which knowledge graph
+    belongs to a palace.
 
     ``progress(step, detail)`` is called before and after each reader — the
     hallway sidecar alone can be tens of megabytes, and a caller on a terminal
@@ -726,8 +698,6 @@ def audit_palace(
     palace_path = config.palace_path
     if not os.path.isdir(palace_path):
         raise FileNotFoundError(f"palace not found at {palace_path}")
-    explicit = bool(explicit_palace)
-
     source = "sqlite"
 
     def read_counts():
@@ -749,7 +719,7 @@ def audit_palace(
     hallway_records = step("hallways", lambda: list_hallways(config=config), lambda h: str(len(h)))
     kg = step(
         "knowledge graph",
-        lambda: _read_kg(resolve_kg_path(palace_path, explicit=explicit)),
+        lambda: _read_kg(paths.knowledge_graph_path(palace_path, explicit=bool(explicit_palace))),
         lambda k: f"{k['triples']} facts" if k else "no file",
     )
 

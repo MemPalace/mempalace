@@ -15,20 +15,26 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Optional
-from urllib import error as urlerror
-from urllib import parse as urlparse
-from urllib import request as urlrequest
+from urllib import error as urlerror, parse as urlparse, request as urlrequest
 
 import numpy as np
 
+from ..lexical import bm25_scores, tokenize
+from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
+from ..timeutil import utc_now_iso as _utcnow
 from ..version import __version__
+from ._filters import matches_where, matches_where_document, validate_where
+from ._remote_common import (
+    RemoteMarkerMixin,
+    as_vector_array,
+    jsonable_metadata,
+    normalize_vectors,
+)
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
-    BackendMismatchError,
     BackendError,
     BaseBackend,
     BaseCollection,
@@ -42,8 +48,8 @@ from .base import (
     PalaceRef,
     QueryResult,
     UnsupportedCapabilityError,
-    UnsupportedFilterError,
     _IncludeSpec,
+    validate_write_batch,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,9 +60,8 @@ _PAYLOAD_ID = "mempalace_id"
 _PAYLOAD_DOCUMENT = "document"
 _PAYLOAD_METADATA = "metadata"
 _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
-_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # Page size for Qdrant's /points/scroll cursor. 4096 (up from the original
-# 256) cuts REST round-trips ~16x for any full-collection walk (#1796).
+# 256) cuts REST round-trips ~16x for any full-collection walk.
 # Qdrant's own docs suggest larger scroll batches are safe, and this is well
 # below typical REST payload-size limits for metadata-only (with_vector=False)
 # scrolls such as get_all_metadata().
@@ -66,199 +71,8 @@ _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # for the $or/$contains local-filter query fallback. At 4096 rows per page,
 # high-dimensional embeddings make those particular responses tens of MB --
 # Qdrant handles it and round-trips still drop overall, but this is a real
-# trade-off, not a metadata-only optimization. (Noted in maintainer review
-# on #1832.)
+# trade-off, not a metadata-only optimization.
 _SCROLL_PAGE_SIZE = 4096
-_SUPPORTED_OPERATORS = frozenset(
-    {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
-)
-
-
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _tokenize(text: str) -> list[str]:
-    if not text:
-        return []
-    return _TOKEN_RE.findall(text.lower())
-
-
-def _bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
-    query_terms = set(_tokenize(query))
-    n_docs = len(documents)
-    if not query_terms or n_docs == 0:
-        return [0.0] * n_docs
-
-    tokenized = [_tokenize(d) for d in documents]
-    doc_lens = [len(toks) for toks in tokenized]
-    if not any(doc_lens):
-        return [0.0] * n_docs
-    avgdl = sum(doc_lens) / n_docs or 1.0
-
-    df = {term: 0 for term in query_terms}
-    for toks in tokenized:
-        for term in set(toks) & query_terms:
-            df[term] += 1
-
-    idf = {term: np.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1.0) for term in query_terms}
-    scores = []
-    for toks, dl in zip(tokenized, doc_lens):
-        if dl == 0:
-            scores.append(0.0)
-            continue
-        tf: dict[str, int] = {}
-        for token in toks:
-            if token in query_terms:
-                tf[token] = tf.get(token, 0) + 1
-        score = 0.0
-        for term, freq in tf.items():
-            num = freq * (k1 + 1)
-            den = freq + k1 * (1 - b + b * dl / avgdl)
-            score += float(idf[term]) * num / den
-        scores.append(score)
-    return scores
-
-
-def _validate_where(where: Optional[dict]) -> None:
-    if not where:
-        return
-    stack = [where]
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, dict):
-            continue
-        for key, value in node.items():
-            if key.startswith("$") and key not in _SUPPORTED_OPERATORS:
-                raise UnsupportedFilterError(f"operator {key!r} not supported by qdrant")
-            if isinstance(value, dict):
-                stack.append(value)
-            elif isinstance(value, list):
-                stack.extend(item for item in value if isinstance(item, dict))
-
-
-def _coerce_comparable(value: Any):
-    if isinstance(value, bool):
-        return int(value)
-    return value
-
-
-def _compare(actual: Any, op: str, expected: Any) -> bool:
-    actual = _coerce_comparable(actual)
-    expected = _coerce_comparable(expected)
-    if op == "$eq":
-        return actual == expected
-    if op == "$ne":
-        return actual != expected
-    if op == "$in":
-        return actual in (expected or [])
-    if op == "$nin":
-        return actual not in (expected or [])
-    if op == "$contains":
-        return str(expected) in str(actual or "")
-    try:
-        if op == "$gt":
-            return actual > expected
-        if op == "$gte":
-            return actual >= expected
-        if op == "$lt":
-            return actual < expected
-        if op == "$lte":
-            return actual <= expected
-    except TypeError:
-        return False
-    raise UnsupportedFilterError(f"operator {op!r} not supported by qdrant")
-
-
-def _matches_where(meta: dict, where: Optional[dict]) -> bool:
-    if not where:
-        return True
-    if not isinstance(where, dict):
-        return False
-    for key, expected in where.items():
-        if key == "$and":
-            if not all(_matches_where(meta, clause) for clause in expected or []):
-                return False
-            continue
-        if key == "$or":
-            if not any(_matches_where(meta, clause) for clause in expected or []):
-                return False
-            continue
-        if key.startswith("$"):
-            raise UnsupportedFilterError(f"operator {key!r} not supported by qdrant")
-        actual = meta.get(key)
-        if isinstance(expected, dict):
-            for op, operand in expected.items():
-                if not _compare(actual, op, operand):
-                    return False
-        elif actual != expected:
-            return False
-    return True
-
-
-def _matches_where_document(document: str, where_document: Optional[dict]) -> bool:
-    if not where_document:
-        return True
-    if not isinstance(where_document, dict):
-        return False
-    for key, value in where_document.items():
-        if key == "$contains":
-            if str(value) not in document:
-                return False
-            continue
-        if key == "$and":
-            if not all(_matches_where_document(document, clause) for clause in value or []):
-                return False
-            continue
-        if key == "$or":
-            if not any(_matches_where_document(document, clause) for clause in value or []):
-                return False
-            continue
-        raise UnsupportedFilterError(f"where_document operator {key!r} not supported")
-    return True
-
-
-def _validate_write_batch(
-    *,
-    documents: list[str],
-    ids: list[str],
-    metadatas: Optional[list[dict]],
-    embeddings: Optional[list[list[float]]],
-) -> None:
-    n = len(ids)
-    if len(documents) != n:
-        raise ValueError(f"documents length {len(documents)} does not match ids length {n}")
-    if metadatas is not None and len(metadatas) != n:
-        raise ValueError(f"metadatas length {len(metadatas)} does not match ids length {n}")
-    if embeddings is not None and len(embeddings) != n:
-        raise ValueError(f"embeddings length {len(embeddings)} does not match ids length {n}")
-
-
-def _as_vector_array(vector: list[float]) -> np.ndarray:
-    arr = np.asarray(vector, dtype=np.float32)
-    if arr.ndim != 1 or arr.size == 0:
-        raise ValueError("embedding must be a non-empty 1D vector")
-    return arr
-
-
-def _normalize_vectors(embeddings: list[list[float]]) -> tuple[list[list[float]], int]:
-    vectors = []
-    dims = set()
-    for embedding in embeddings:
-        arr = _as_vector_array(embedding)
-        vectors.append(arr.astype(float).tolist())
-        dims.add(int(arr.size))
-    if len(dims) > 1:
-        raise DimensionMismatchError(f"qdrant batch cannot mix embedding dimensions {sorted(dims)}")
-    return vectors, dims.pop() if dims else 0
-
-
-def _jsonable_metadata(meta: dict | None) -> dict:
-    try:
-        value = json.loads(json.dumps(meta or {}, ensure_ascii=False))
-    except (TypeError, ValueError):
-        value = {}
-    return value if isinstance(value, dict) else {}
 
 
 def _point_id(doc_id: str) -> str:
@@ -282,9 +96,10 @@ def _payload_row(point: dict) -> dict:
     vector = point.get("vector")
     if isinstance(vector, dict):
         vector = vector.get("") or vector.get("default") or next(iter(vector.values()), None)
+    document, meta = decode_record(str(payload.get(_PAYLOAD_DOCUMENT) or ""), meta)
     return {
         "id": str(payload.get(_PAYLOAD_ID) or point.get("id") or ""),
-        "document": str(payload.get(_PAYLOAD_DOCUMENT) or ""),
+        "document": document,
         "metadata": meta,
         "embedding": vector if isinstance(vector, list) else None,
         "score": point.get("score"),
@@ -294,7 +109,7 @@ def _payload_row(point: dict) -> dict:
 def _vector_distance(query: np.ndarray, vector: list[float] | None) -> Optional[float]:
     if vector is None:
         return None
-    vec = _as_vector_array(vector)
+    vec = as_vector_array(vector)
     if vec.size != query.size:
         return None
     denom = float(np.linalg.norm(query)) * float(np.linalg.norm(vec))
@@ -575,7 +390,7 @@ class _QdrantRESTClient:
         hits = result.get("hits") or []
 
         return {
-            str(hit["value"]): int(hit.get("count") or 0)
+            str(decode_value(hit["value"])): int(hit.get("count") or 0)
             for hit in hits
             if hit.get("value") is not None
         }
@@ -639,7 +454,7 @@ def _requires_local_filter(where: Optional[dict], where_document: Optional[dict]
 def _qdrant_filter(where: Optional[dict]) -> Optional[dict]:
     if not where:
         return None
-    _validate_where(where)
+    validate_where(where)
     must = []
     must_not = []
     for key, expected in where.items():
@@ -653,7 +468,7 @@ def _qdrant_filter(where: Optional[dict]) -> Optional[dict]:
             return None
         if key.startswith("$"):
             return None
-        condition, not_conditions = _condition(key, expected)
+        condition, not_conditions = _condition(key, encode_filter(expected))
         if condition is None:
             return None
         must.append(condition)
@@ -676,7 +491,7 @@ def _combine_filters(*filters: Optional[dict]) -> Optional[dict]:
 
 
 def _text_any_filter(query: str) -> Optional[dict]:
-    tokens = _tokenize(query)
+    tokens = tokenize(query)
     if not tokens:
         return None
     return {"must": [{"key": _PAYLOAD_DOCUMENT, "match": {"text_any": " ".join(tokens)}}]}
@@ -806,8 +621,8 @@ class QdrantCollection(BaseCollection):
         with_vector: bool = False,
         max_rows: Optional[int] = None,
     ) -> list[dict]:
-        _validate_where(where)
-        _validate_where(where_document)
+        validate_where(where)
+        validate_where(where_document)
         local_filter_required = _requires_local_filter(where, where_document)
         q_filter = None if local_filter_required else _qdrant_filter(where)
         if ids is not None:
@@ -819,43 +634,39 @@ class QdrantCollection(BaseCollection):
         rows = self._scroll_all(
             qdrant_filter=q_filter, with_vector=with_vector, max_rows=bounded_rows
         )
-        rows = [
+        id_set = None if ids is None else set(ids)
+        return [
             row
             for row in rows
-            if (ids is None or row["id"] in set(ids))
-            and _matches_where(row["metadata"], where)
-            and _matches_where_document(row["document"], where_document)
+            if (id_set is None or row["id"] in id_set)
+            and matches_where(row["metadata"], where)
+            and matches_where_document(row["document"], where_document)
         ]
-        return rows
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
-        _validate_write_batch(
+        validate_write_batch(
+            ids,
+            unique_ids=True,
             documents=documents,
-            ids=ids,
             metadatas=metadatas,
             embeddings=embeddings,
         )
         if embeddings is None:
             raise ValueError("qdrant requires explicit embeddings")
-        if len(set(ids)) != len(ids):
-            raise ValueError("add ids must be unique")
         existing = self.get(ids=list(ids), include=[])
         if existing.ids:
             raise ValueError(f"ids already exist in qdrant collection: {existing.ids}")
         self.upsert(documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
-        _validate_write_batch(
-            documents=documents,
-            ids=ids,
-            metadatas=metadatas,
-            embeddings=embeddings,
-        )
+        validate_write_batch(ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
         if embeddings is None:
             raise ValueError("qdrant requires explicit embeddings")
-        vectors, dimension = _normalize_vectors(embeddings)
+        vectors, dimension = normalize_vectors(embeddings, "qdrant")
         self._ensure_remote_collection(dimension)
-        metadatas = metadatas or [{} for _ in ids]
+        documents, ids, metadatas = prepare_stored_write(
+            documents, ids, metadatas or [{} for _ in ids]
+        )
         points = []
         for doc_id, doc, meta, vector in zip(ids, documents, metadatas, vectors):
             points.append(
@@ -865,53 +676,13 @@ class QdrantCollection(BaseCollection):
                     "payload": {
                         _PAYLOAD_ID: str(doc_id),
                         _PAYLOAD_DOCUMENT: str(doc),
-                        _PAYLOAD_METADATA: _jsonable_metadata(meta),
+                        _PAYLOAD_METADATA: jsonable_metadata(meta),
                         "updated_at": _utcnow(),
                     },
                 }
             )
         self._client.upsert_points(self._remote_collection, points)
         self._backend._write_marker(self._palace, self._config)
-
-    def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
-        if documents is None and metadatas is None and embeddings is None:
-            raise ValueError("update requires at least one of documents, metadatas, embeddings")
-        n = len(ids)
-        for label, value in (
-            ("documents", documents),
-            ("metadatas", metadatas),
-            ("embeddings", embeddings),
-        ):
-            if value is not None and len(value) != n:
-                raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
-        existing = self.get(ids=ids, include=["documents", "metadatas", "embeddings"])
-        by_id = {
-            rid: (existing.documents[i], existing.metadatas[i], existing.embeddings[i])
-            for i, rid in enumerate(existing.ids)
-            if existing.embeddings is not None
-        }
-        out_ids = []
-        out_docs = []
-        out_metas = []
-        out_embeddings = []
-        for idx, doc_id in enumerate(ids):
-            if doc_id not in by_id:
-                continue
-            prev_doc, prev_meta, prev_embedding = by_id[doc_id]
-            out_ids.append(doc_id)
-            out_docs.append(documents[idx] if documents is not None else prev_doc)
-            meta = dict(prev_meta or {})
-            if metadatas is not None:
-                meta.update(metadatas[idx] or {})
-            out_metas.append(meta)
-            out_embeddings.append(embeddings[idx] if embeddings is not None else prev_embedding)
-        if out_ids:
-            self.upsert(
-                documents=out_docs,
-                ids=out_ids,
-                metadatas=out_metas,
-                embeddings=out_embeddings,
-            )
 
     def _query_local_exact(
         self,
@@ -928,8 +699,8 @@ class QdrantCollection(BaseCollection):
         rows = [
             row
             for row in rows
-            if _matches_where(row["metadata"], where)
-            and _matches_where_document(row["document"], where_document)
+            if matches_where(row["metadata"], where)
+            and matches_where_document(row["document"], where_document)
         ]
         outer_ids: list[list[str]] = []
         outer_docs: list[list[str]] = []
@@ -937,7 +708,7 @@ class QdrantCollection(BaseCollection):
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
         for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
+            q = as_vector_array(query_vector)
             scored = []
             for row in rows:
                 distance = _vector_distance(q, row["embedding"])
@@ -975,8 +746,8 @@ class QdrantCollection(BaseCollection):
             raise ValueError("query requires query_embeddings")
         if not query_embeddings:
             raise ValueError("query input must be a non-empty list")
-        _validate_where(where)
-        _validate_where(where_document)
+        validate_where(where)
+        validate_where(where_document)
         if _requires_local_filter(where, where_document):
             return self._query_local_exact(
                 query_embeddings=query_embeddings,
@@ -1001,7 +772,7 @@ class QdrantCollection(BaseCollection):
         outer_dists: list[list[float]] = []
         outer_embeds: list[list[list[float]]] = []
         for query_vector in query_embeddings:
-            q = _as_vector_array(query_vector)
+            q = as_vector_array(query_vector)
             if self._known_dimension is None:
                 self._known_dimension = self._remote_dimension()
             if self._known_dimension is not None and int(q.size) != self._known_dimension:
@@ -1067,7 +838,7 @@ class QdrantCollection(BaseCollection):
         )
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
-        """Return every matching record's metadata in one cursor pass (#1796).
+        """Return every matching record's metadata in one cursor pass.
 
         Overrides the default offset-paginated implementation, which would
         call self.get(limit=, offset=) in a loop -- and since self.get() is
@@ -1078,10 +849,10 @@ class QdrantCollection(BaseCollection):
         Delegates to self._rows(), the same single-scroll-plus-local-filter
         helper that backs get()/delete(). With ids=None and
         where_document=None, _rows() reduces to exactly one _scroll_all()
-        pass followed by an unconditional _matches_where() re-check on every
+        pass followed by an unconditional matches_where() re-check on every
         row -- the same filter logic get(), delete(), and lexical_search()
         already use, so this can't independently drift from those call
-        sites. (Maintainer review on #1832: avoid duplicating the filter
+        sites. (Avoid duplicating the filter
         dance inline.)
         """
         rows = self._rows(where=where)
@@ -1092,10 +863,10 @@ class QdrantCollection(BaseCollection):
     ) -> GetResult:
         """Every matching row's id plus the requested fields in one cursor pass.
 
-        Same reasoning as :meth:`get_all_metadata` (#1796): the default
+        Same reasoning as :meth:`get_all_metadata`: the default
         implementation would call ``get(limit=, offset=)`` in a loop, and each
-        of those calls re-walks the collection from the start (#2452 measured
-        275 s for ``list_drawers`` on 126k drawers). ``_rows()`` already has
+        of those calls re-walks the collection from the start (measured
+        at 275 s for ``list_drawers`` on 126k drawers). ``_rows()`` already has
         every id in hand, so hand them back instead of discarding them.
         """
         spec = _IncludeSpec.resolve(
@@ -1119,8 +890,8 @@ class QdrantCollection(BaseCollection):
         # Validate the filter before the existence short-circuit so an
         # unsupported local-only filter raises regardless of whether the
         # collection has been materialized yet — matching the order used by
-        # get()/lexical_search() above (#1835 review).
-        _validate_where(where)
+        # get()/lexical_search() above.
+        validate_where(where)
         if _requires_local_filter(where):
             raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
         if not self._remote_exists():
@@ -1138,7 +909,7 @@ class QdrantCollection(BaseCollection):
         )
 
     def delete(self, *, ids=None, where=None):
-        _validate_where(where)
+        validate_where(where)
         if not self._remote_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
@@ -1169,7 +940,7 @@ class QdrantCollection(BaseCollection):
         return self._client.count_points(self._remote_collection)
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
-        _validate_where(where)
+        validate_where(where)
         q_filter = None if _requires_local_filter(where) else _qdrant_filter(where)
         rows = []
         text_filter = _text_any_filter(query)
@@ -1188,8 +959,8 @@ class QdrantCollection(BaseCollection):
                 rows = []
         if not text_filter_success:
             rows = self._scroll_all(qdrant_filter=q_filter, with_vector=False)
-        rows = [row for row in rows if _matches_where(row["metadata"], where)]
-        scores = _bm25_scores(query, [row["document"] for row in rows])
+        rows = [row for row in rows if matches_where(row["metadata"], where)]
+        scores = bm25_scores(query, [row["document"] for row in rows])
         hits = [
             LexicalHit(
                 id=row["id"],
@@ -1217,8 +988,10 @@ class QdrantCollection(BaseCollection):
         return HealthStatus.healthy()
 
 
-class QdrantBackend(BaseBackend):
+class QdrantBackend(RemoteMarkerMixin, BaseBackend):
     name = "qdrant"
+    marker_filename = _MARKER_FILENAME
+    marker_hint = "keep MEMPALACE_QDRANT_URL and namespace consistent"
     capabilities = frozenset(
         {
             "requires_explicit_embeddings",
@@ -1240,10 +1013,6 @@ class QdrantBackend(BaseBackend):
         self._closed = False
 
     @staticmethod
-    def _marker_path(palace_path: str) -> str:
-        return os.path.join(palace_path, _MARKER_FILENAME)
-
-    @staticmethod
     def _palace_hash(palace: PalaceRef) -> str:
         return sha256(palace.id.encode("utf-8", errors="surrogatepass")).hexdigest()[:16]
 
@@ -1261,66 +1030,6 @@ class QdrantBackend(BaseBackend):
             "palace_hash": self._palace_hash(palace),
             "remote_prefix": self._remote_collection_prefix(palace=palace, config=config),
         }
-
-    def _marker_exists(self, palace: PalaceRef) -> bool:
-        return bool(palace.local_path and os.path.isfile(self._marker_path(palace.local_path)))
-
-    def _read_marker(self, palace: PalaceRef) -> Optional[dict]:
-        if not palace.local_path:
-            return None
-        marker_path = self._marker_path(palace.local_path)
-        if not os.path.isfile(marker_path):
-            return None
-        try:
-            with open(marker_path, encoding="utf-8") as f:
-                marker = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise BackendMismatchError(f"qdrant marker is unreadable: {marker_path}") from exc
-        return marker if isinstance(marker, dict) else {}
-
-    def _validate_marker_target(self, palace: PalaceRef, config: _QdrantConfig) -> None:
-        marker = self._read_marker(palace)
-        if marker is None:
-            return
-        if marker.get("backend") != self.name:
-            raise BackendMismatchError("qdrant marker does not identify the qdrant backend")
-        expected = self._marker_target(palace, config)
-        actual = marker.get("qdrant")
-        if not isinstance(actual, dict):
-            raise BackendMismatchError("qdrant marker is missing remote target metadata")
-        mismatched = [
-            key for key, expected_value in expected.items() if actual.get(key) != expected_value
-        ]
-        if mismatched:
-            details = ", ".join(mismatched)
-            raise BackendMismatchError(
-                "qdrant marker remote target does not match current configuration "
-                f"({details}); keep MEMPALACE_QDRANT_URL and namespace consistent "
-                "or use a fresh palace directory"
-            )
-
-    def _write_marker(self, palace: PalaceRef, config: _QdrantConfig) -> None:
-        if not palace.local_path:
-            return
-        os.makedirs(palace.local_path, exist_ok=True)
-        try:
-            os.chmod(palace.local_path, 0o700)
-        except (OSError, NotImplementedError):
-            pass
-        marker = {
-            "backend": self.name,
-            "schema_version": 1,
-            "created_at": _utcnow(),
-            "palace_id": palace.id,
-            "qdrant": self._marker_target(palace, config),
-        }
-        marker_path = self._marker_path(palace.local_path)
-        with open(marker_path, "w", encoding="utf-8") as f:
-            json.dump(marker, f, indent=2, ensure_ascii=False)
-        try:
-            os.chmod(marker_path, 0o600)
-        except (OSError, NotImplementedError):
-            pass
 
     # Embedder identity lives in a sidecar, NOT the backend marker: the marker's
     # presence signals "palace initialized" (reads raise CollectionNotInitialized

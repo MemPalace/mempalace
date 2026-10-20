@@ -35,10 +35,6 @@ class CliWriteRouting:
     def use_daemon(self) -> bool:
         return self.decision.use_daemon
 
-    @property
-    def use_direct(self) -> bool:
-        return not self.decision.use_daemon and not self.decision.blocked
-
 
 def add_cli_write_routing_flags(
     parser: argparse.ArgumentParser,

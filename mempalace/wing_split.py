@@ -28,10 +28,11 @@ import json
 import os
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name, sanitize_name
+from .fsio import atomic_write_json, atomic_write_text
+from .timeutil import utc_now_iso
 
 SPLIT_SCHEMA_VERSION = 1
 _PAGE_SIZE = 2000
@@ -189,7 +190,7 @@ def plan_split(col, wing: str, existing_wings: Iterable[str]) -> dict:
     return {
         "schema_version": SPLIT_SCHEMA_VERSION,
         "wing": wing,
-        "planned_at": datetime.now(timezone.utc).isoformat(),
+        "planned_at": utc_now_iso(),
         "projects": projects,
         "unresolved": unresolved,
     }
@@ -202,10 +203,7 @@ def split_plan_path(config: MempalaceConfig, wing: str) -> str:
 def save_split_plan(config: MempalaceConfig, plan: dict) -> str:
     path = split_plan_path(config, plan["wing"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic_write_json(path, plan, private=False, follow_symlinks=False)
     return path
 
 
@@ -301,14 +299,11 @@ def write_split_pending(config: MempalaceConfig, wing: str, plan: dict) -> str:
     path = split_pending_path(config, wing)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": utc_now_iso(),
         "plan_sha256": split_plan_fingerprint(plan),
     }
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    atomic_write_text(path, text, private=False, follow_symlinks=False)
     return path
 
 
@@ -363,7 +358,7 @@ def apply_split(
     """
     wing = plan["wing"]
     targets = {key: entry["target"] for key, entry in plan["projects"].items()}
-    stamp = datetime.now(timezone.utc).isoformat()
+    stamp = utc_now_iso()
     moved, per_target, skipped = _rekey_collection(col, wing, targets, stamp, progress)
     closets_moved = 0
     if closets_col is not None:

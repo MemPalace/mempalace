@@ -1,7 +1,8 @@
 """Malformed recovery journals must never mutate Palace state."""
 
 import json
-from test_rooms_pending_snapshot_contract import _seed, _resume
+
+from test_rooms_pending_snapshot_contract import _resume, _seed
 
 
 def test_duplicate_journal_members_rejected_before_mutation(tmp_path):

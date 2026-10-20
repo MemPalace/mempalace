@@ -4,10 +4,9 @@ MemPalace MCP Server — read/write palace access for Claude Code
 ================================================================
 Install: claude mcp add mempalace -- mempalace-mcp [--palace /path/to/palace]
 
-The public import path remains ``mempalace.mcp_server``. Implementation is
-split across this package so PRs can target a domain file instead of one
-8 000-line module. Fragment files are executed into this package's globals
-(the same namespace as the historical module), which preserves:
+The public import path is ``mempalace.mcp_server``. Implementation is split
+by domain across this package. Fragment files are executed into this
+package's globals (one shared namespace), which preserves:
 
 * ``from mempalace.mcp_server import tool_status, TOOLS, handle_request, main``
 * test monkeypatches on ``mempalace.mcp_server._config`` / ``_get_kg`` / ...
@@ -35,7 +34,7 @@ Tools (maintenance):
 import os
 import sys
 
-# --- MCP stdio protection (issue #225) -----------------------------------
+# --- MCP stdio protection ---------------------------------------------------
 # The MCP protocol multiplexes JSON-RPC over stdio: stdout MUST carry only
 # valid JSON-RPC messages, stderr is for human-readable logs. Some
 # transitive dependencies (chromadb → onnxruntime, posthog telemetry) print
@@ -44,7 +43,7 @@ import sys
 # both the Python and file-descriptor level before heavy imports, then
 # restore the real stdout in main() before entering the protocol loop.
 #
-# Preserved across importlib.reload (#2485): once redirected, sys.stdout points
+# Preserved across importlib.reload: once redirected, sys.stdout points
 # to sys.stderr. If a reload executes unconditionally, it captures sys.stderr
 # into _REAL_STDOUT and duplicates the already-redirected fd 1, permanently
 # breaking stdout and leaking file descriptors.
@@ -65,11 +64,11 @@ sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
 import contextlib  # noqa: E402
+import hashlib  # noqa: E402
+import hmac  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
-import hashlib  # noqa: E402
-import hmac  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -78,22 +77,25 @@ from pathlib import Path  # noqa: E402
 from typing import Optional  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
-from ..config import (  # noqa: E402
-    MempalaceConfig,
-    sanitize_kg_value,
-    sanitize_name,
-    sanitize_content,
-    sanitize_iso_temporal,
-    sqlite_read_uri,
-    strip_lone_surrogates,
-)
-from ..version import __version__  # noqa: E402
 from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 
+from .. import (  # noqa: E402
+    paths,
+    tool_capabilities as _tool_capabilities,
+)
+from .._env import env_bool, env_float, env_int, env_list, env_str  # noqa: E402
+from .._once import first_time  # noqa: E402
+from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
+from ..backends.base import (  # noqa: E402
+    DimensionMismatchError,
+    EmbedderIdentityMismatchError,
+    EmbedderIdentityRecordError,
+    EmbeddingFunctionMismatchError,
+)
 from ..backends.chroma import (  # noqa: E402
+    _HNSW_WRITE_DEFAULTS,
     ChromaBackend,
     ChromaCollection,
-    _HNSW_WRITE_DEFAULTS,
     _clear_chroma_system_cache,
     _is_own_db_stamp,
     _note_own_db_stamp,
@@ -103,48 +105,63 @@ from ..backends.chroma import (  # noqa: E402
     register_before_system_cache_reset,
     reset_hnsw_capacity_cache,
 )
-from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
-from ..backends.base import (  # noqa: E402
-    DimensionMismatchError,
-    EmbedderIdentityMismatchError,
-    EmbedderIdentityRecordError,
-    EmbeddingFunctionMismatchError,
+from ..collision_scan import assert_no_collisions  # noqa: E402
+from ..config import (  # noqa: E402
+    MempalaceConfig,
+    normalize_wing_name,
+    sanitize_content,
+    sanitize_iso_temporal,
+    sanitize_kg_value,
+    sanitize_name,
+    sqlite_read_uri,
+    strip_lone_surrogates,
+    wing_aliases,
 )
+from ..date_window import filed_at_in_window, parse_date_bound  # noqa: E402
 from ..embedding import (  # noqa: E402
     MODEL_ERROR_CLASS_NAMES,
     EmbeddingFunctionUnavailableError,
     UnknownEmbeddingModelError,
     model_error_result,
 )
-from ..date_window import filed_at_in_window, parse_date_bound  # noqa: E402
-from ..query_sanitizer import sanitize_query  # noqa: E402
-from ..source_identity import identity_metadata  # noqa: E402
+from ..hallways import (  # noqa: E402
+    delete_hallway,
+    list_hallways,
+)
+from ..ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from ..knowledge_graph import KnowledgeGraph, knowledge_graph_notice  # noqa: E402
+from ..logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
+from ..metadata_types import BOOKKEEPING_WHERE, is_bookkeeping  # noqa: E402
+from ..palace_graph import (  # noqa: E402
+    GraphUnavailable,
+    _load_tunnels as _load_graph_tunnels,
+    create_tunnel,
+    delete_tunnel,
+    find_tunnels,
+    follow_tunnels,
+    graph_stats,
+    list_tunnels,
+    traverse,
+)
+from ..query_sanitizer import sanitize_query, sanitizer_report  # noqa: E402
+from ..search_util import chroma_known_wings, known_wings  # noqa: E402
 from ..searcher import (  # noqa: E402
     SearchError,
     _distance_to_similarity,
     _metric_for_collection,
+    build_where_filter,
     search as cli_search,
     search_memories,
 )
-from ..palace_graph import (  # noqa: E402
-    traverse,
-    find_tunnels,
-    graph_stats,
-    create_tunnel,
-    list_tunnels,
-    delete_tunnel,
-    follow_tunnels,
-    _load_tunnels as _load_graph_tunnels,
+from ..source_identity import identity_metadata  # noqa: E402
+from ..stored_text import (  # noqa: E402
+    EXACT_WIRE_HEADER,
+    decode_value,
+    dumps_client,
+    dumps_internal,
 )
-from ..hallways import (  # noqa: E402
-    list_hallways,
-    delete_hallway,
-)
-
-from ..knowledge_graph import KnowledgeGraph, DEFAULT_KG_PATH  # noqa: E402
-from ..logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
-from ..collision_scan import assert_no_collisions  # noqa: E402
-from ..ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
+from ..timeutil import recency_key, utc_now_iso, utc_now_z  # noqa: E402
+from ..version import __version__  # noqa: E402
 
 # ==================== WRITE-AHEAD LOG ====================
 # Every write operation is logged to a JSONL file before execution.

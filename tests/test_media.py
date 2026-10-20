@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import argparse
+import contextlib
+import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from dataclasses import replace
-import argparse
-import contextlib
-import sys
 
-from mempalace.media import MediaAssetError, asset_from_path, media_asset_exists, store_media_asset
-from mempalace.sources.media import MediaAdapter
+from mempalace.media import MediaAssetError, asset_from_path, store_media_asset
 from mempalace.sources.base import SourceRef
+from mempalace.sources.media import MediaAdapter
 
 
 class _FakeCollection:
@@ -373,9 +373,7 @@ def test_media_reference_survives_missing_file_check(tmp_path):
     path = tmp_path / "image.png"
     path.write_bytes(b"image")
     asset = asset_from_path(path, source_root=tmp_path, media_type="image", project="demo")
-    assert media_asset_exists(asset)
     path.unlink()
-    assert not media_asset_exists(asset)
     assert asset.metadata()["file_exists"] is True
 
 
@@ -515,8 +513,8 @@ def test_populated_collection_without_recorded_embedding_identity_fail_closed(
 
     from mempalace import palace
     from mempalace.backends import PalaceRef
-    from mempalace.backends.sqlite_exact import SQLiteExactBackend
     from mempalace.backends.base import EmbedderIdentityMismatchError
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
 
     monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma2")

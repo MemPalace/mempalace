@@ -6,7 +6,6 @@ import sys
 
 import pytest
 
-
 # Lines json.loads rejects with something other than JSONDecodeError.
 _UNLOADABLE_JSON_KINDS = ["nesting-too-deep-to-parse", "number-past-the-digit-limit"]
 

@@ -28,18 +28,20 @@ except (OSError, AttributeError):
     pass
 sys.stdout = sys.stderr
 
-from .version import __version__  # noqa: E402
+import inspect  # noqa: E402
+
+from . import mcp_server  # noqa: E402
 from .query_parser import (  # noqa: E402
     QueryParseError,
     parse_coordinate_input,
     parse_exec_input,
     parse_query_input,
 )
-from . import mcp_server  # noqa: E402
+from .search_util import _cosine_scale_distance  # noqa: E402
+from .timeutil import recency_key  # noqa: E402
+from .version import __version__  # noqa: E402
 
-import inspect  # noqa: E402
-
-logger = logging.getLogger("mempalace_mcp_light")
+logger = logging.getLogger(__name__)
 
 _PQL_KEYWORDS = {
     "FIND",
@@ -116,11 +118,13 @@ def _unwrap_wrapper_input(arguments: Any) -> Any:
     return arguments
 
 
-def _call_handler_safe(handler, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Invoke handler safely by filtering extra kwargs that the handler doesn't accept."""
-    if not callable(handler):
-        return {"success": False, "error": f"Handler {handler} is not callable"}
-    mapped = _alias_args_for_handler(handler, params)
+def _call_handler_safe(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Run tool ``name`` with the kwargs its handler accepts, checked like any tools/call."""
+    handler = mcp_server.TOOLS[name]["handler"]
+    try:
+        mapped = mcp_server.validate_tool_arguments(name, _alias_args_for_handler(handler, params))
+    except mcp_server.ToolArgumentError as e:
+        return {"success": False, "error": f"Invalid params for tool {name}: {e}"}
     return handler(**mapped)
 
 
@@ -176,7 +180,13 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
         res["summary"] = "No matching memories found in the palace for this query."
         return res
 
-    distances = [d for d in (_search_distance(item) for item in results_list) if d is not None]
+    # The bands are on the cosine scale; the raw distance may be l2 or ip.
+    metric = res.get("distance_metric") or "cosine"
+    distances = [
+        _cosine_scale_distance(d, metric)
+        for d in (_search_distance(item) for item in results_list)
+        if d is not None
+    ]
     if distances:
         min_dist = min(distances)
         if min_dist > 0.52:
@@ -188,7 +198,7 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
 
     by_recency = sorted(
         range(len(results_list)),
-        key=lambda i: _search_timestamp(results_list[i]),
+        key=lambda i: recency_key(_search_timestamp(results_list[i])),
         reverse=True,
     )
     for recency_rank, orig_i in enumerate(by_recency, 1):
@@ -237,62 +247,18 @@ def tool_palace_query(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     except QueryParseError as e:
         return {"success": False, "error": f"PQL query parse error: {e}"}
 
-    # Resolve fuzzy wing names
-    if "wing" in params and isinstance(params["wing"], str):
-        params["wing"] = _resolve_fuzzy_wing(params["wing"])
-
-    # Dispatch to underlying handlers in mcp_server
-    if target in ("search", "find"):
-        raw_res = _call_handler_safe(mcp_server.tool_search, params)
-        return _enrich_search_results(raw_res)
-    elif target in ("taxonomy", "get_taxonomy"):
-        res = mcp_server.tool_get_taxonomy()
-        wing = params.get("wing")
-        if wing and isinstance(res, dict) and "taxonomy" in res:
-            tax = res["taxonomy"]
-            return {"taxonomy": {wing: tax.get(wing, {})}} if wing in tax else {"taxonomy": {}}
-        return res
-    elif target in ("wings", "list_wings"):
-        return mcp_server.tool_list_wings()
-    elif target in ("rooms", "list_rooms"):
-        return _call_handler_safe(mcp_server.tool_list_rooms, params)
-    elif target in ("drawer", "get_drawer"):
-        return _call_handler_safe(mcp_server.tool_get_drawer, params)
-    elif target in ("drawers", "list_drawers"):
-        return _call_handler_safe(mcp_server.tool_list_drawers, params)
-    elif target in ("check_duplicate", "duplicate", "check"):
-        return _call_handler_safe(mcp_server.tool_check_duplicate, params)
-    elif target in ("aaak_spec", "aaak", "get_aaak_spec"):
-        return mcp_server.tool_get_aaak_spec()
-    elif target in ("kg_query", "kg"):
-        return _call_handler_safe(mcp_server.tool_kg_query, params)
-    elif target in ("kg_timeline", "timeline"):
-        return _call_handler_safe(mcp_server.tool_kg_timeline, params)
-    elif target in ("kg_stats", "kg_statistics"):
-        return mcp_server.tool_kg_stats()
-    elif target in ("traverse", "traverse_graph"):
-        return _call_handler_safe(mcp_server.tool_traverse_graph, params)
-    elif target in ("find_tunnels",):
-        return _call_handler_safe(mcp_server.tool_find_tunnels, params)
-    elif target in ("list_tunnels", "tunnels"):
-        return _call_handler_safe(mcp_server.tool_list_tunnels, params)
-    elif target in ("follow_tunnels", "follow"):
-        return _call_handler_safe(mcp_server.tool_follow_tunnels, params)
-    elif target in ("list_hallways", "hallways"):
-        return _call_handler_safe(mcp_server.tool_list_hallways, params)
-    elif target in ("graph_stats", "stats"):
-        return mcp_server.tool_graph_stats()
-    elif target in ("diary_read", "diary"):
-        return _call_handler_safe(mcp_server.tool_diary_read, params)
-    elif target in ("status",):
-        res = mcp_server.tool_status()
-        return mcp_server._decorate_mcp_tool_result("mempalace_status", res)
-    elif target in ("filed", "memories_filed_away"):
-        return mcp_server.tool_memories_filed_away()
-    elif target in ("settings", "hook_settings"):
-        return mcp_server.tool_hook_settings()
-    else:
+    _resolve_wing_params(params)
+    name = _allowlisted_tool(_QUERY_TARGET_TO_TOOL, target)
+    if name is None:
         return {"success": False, "error": f"Unknown palace_query target: '{target}'"}
+    res = _call_handler_safe(name, _query_arguments(name, params))
+    if name == "mempalace_search":
+        return _enrich_search_results(res)
+    if name == "mempalace_get_taxonomy" and params.get("wing") and isinstance(res, dict):
+        return _filter_taxonomy_payload(res, params["wing"]) if "taxonomy" in res else res
+    if name == "mempalace_status":
+        return mcp_server._decorate_mcp_tool_result(name, res)
+    return res
 
 
 def tool_palace_exec(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
@@ -304,51 +270,11 @@ def tool_palace_exec(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     except QueryParseError as e:
         return {"success": False, "error": f"PQL exec parse error: {e}"}
 
-    # Dispatch to underlying handlers
-    if action == "add_drawer":
-        if "wing" in params:
-            params["wing"] = _resolve_fuzzy_wing(params["wing"])
-        return _call_handler_safe(mcp_server.tool_add_drawer, params)
-    elif action == "update_drawer":
-        if "wing" in params:
-            params["wing"] = _resolve_fuzzy_wing(params["wing"])
-        return _call_handler_safe(mcp_server.tool_update_drawer, params)
-    elif action == "delete_drawer":
-        return _call_handler_safe(mcp_server.tool_delete_drawer, params)
-    elif action == "delete_by_source":
-        return _call_handler_safe(mcp_server.tool_delete_by_source, params)
-    elif action == "checkpoint":
-        return _call_handler_safe(mcp_server.tool_checkpoint, params)
-    elif action == "mine":
-        return _call_handler_safe(mcp_server.tool_mine, params)
-    elif action == "sync":
-        return _call_handler_safe(mcp_server.tool_sync, params)
-    elif action == "kg_add":
-        return _call_handler_safe(mcp_server.tool_kg_add, params)
-    elif action == "kg_invalidate":
-        return _call_handler_safe(mcp_server.tool_kg_invalidate, params)
-    elif action == "kg_supersede":
-        return _call_handler_safe(mcp_server.tool_kg_supersede, params)
-    elif action == "create_tunnel":
-        if "source_wing" in params:
-            params["source_wing"] = _resolve_fuzzy_wing(params["source_wing"])
-        if "target_wing" in params:
-            params["target_wing"] = _resolve_fuzzy_wing(params["target_wing"])
-        return _call_handler_safe(mcp_server.tool_create_tunnel, params)
-    elif action == "delete_tunnel":
-        return _call_handler_safe(mcp_server.tool_delete_tunnel, params)
-    elif action == "delete_hallway":
-        return _call_handler_safe(mcp_server.tool_delete_hallway, params)
-    elif action == "diary_write":
-        if "wing" in params:
-            params["wing"] = _resolve_fuzzy_wing(params["wing"])
-        return _call_handler_safe(mcp_server.tool_diary_write, params)
-    elif action == "reconnect":
-        return mcp_server.tool_reconnect()
-    elif action == "hook_settings":
-        return _call_handler_safe(mcp_server.tool_hook_settings, params)
-    else:
+    _resolve_wing_params(params)
+    name = _allowlisted_tool(_EXEC_ACTION_TO_TOOL, action)
+    if name is None:
         return {"success": False, "error": f"Unknown palace_exec action: '{action}'"}
+    return _call_handler_safe(name, params)
 
 
 def tool_palace_coordinate(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
@@ -360,26 +286,10 @@ def tool_palace_coordinate(arguments: Dict[str, Any] | str) -> Dict[str, Any]:
     except QueryParseError as e:
         return {"success": False, "error": f"PQL coordinate parse error: {e}"}
 
-    if action == "task_create":
-        return _call_handler_safe(mcp_server.tool_task_create, params)
-    elif action == "event_append":
-        return _call_handler_safe(mcp_server.tool_event_append, params)
-    elif action == "event_list":
-        return _call_handler_safe(mcp_server.tool_event_list, params)
-    elif action == "event_wait":
-        return _call_handler_safe(mcp_server.tool_event_wait, params)
-    elif action == "event_ack":
-        return _call_handler_safe(mcp_server.tool_event_ack, params)
-    elif action == "artifact_put":
-        return _call_handler_safe(mcp_server.tool_artifact_put, params)
-    elif action == "artifact_get":
-        return _call_handler_safe(mcp_server.tool_artifact_get, params)
-    elif action == "patch_submit":
-        return _call_handler_safe(mcp_server.tool_patch_submit, params)
-    elif action in ("mesh_peers", "peers"):
-        return mcp_server.tool_mesh_peers()
-    else:
+    name = _allowlisted_tool(_COORD_ACTION_TO_TOOL, action)
+    if name is None:
         return {"success": False, "error": f"Unknown palace_coordinate action: '{action}'"}
+    return _call_handler_safe(name, params)
 
 
 # ==================== LIGHTWEIGHT MCP TOOL DEFINITIONS ====================
@@ -686,6 +596,7 @@ _QUERY_TARGET_TO_TOOL = {
     "kg_timeline": "mempalace_kg_timeline",
     "timeline": "mempalace_kg_timeline",
     "kg_stats": "mempalace_kg_stats",
+    "kg_statistics": "mempalace_kg_stats",
     "rooms": "mempalace_list_rooms",
     "list_rooms": "mempalace_list_rooms",
     "wings": "mempalace_list_wings",
@@ -722,32 +633,101 @@ _QUERY_TARGET_TO_TOOL = {
     "stats": "mempalace_graph_stats",
 }
 
+# palace_exec / palace_coordinate actions the production rewrite may dispatch.
+# Anything absent is an unknown target (-32602), never ``mempalace_<action>``.
+_EXEC_ACTION_TO_TOOL = {
+    "add_drawer": "mempalace_add_drawer",
+    "update_drawer": "mempalace_update_drawer",
+    "delete_drawer": "mempalace_delete_drawer",
+    "delete_by_source": "mempalace_delete_by_source",
+    "checkpoint": "mempalace_checkpoint",
+    "mine": "mempalace_mine",
+    "sync": "mempalace_sync",
+    "kg_add": "mempalace_kg_add",
+    "kg_invalidate": "mempalace_kg_invalidate",
+    "kg_supersede": "mempalace_kg_supersede",
+    "create_tunnel": "mempalace_create_tunnel",
+    "delete_tunnel": "mempalace_delete_tunnel",
+    "delete_hallway": "mempalace_delete_hallway",
+    "diary_write": "mempalace_diary_write",
+    "reconnect": "mempalace_reconnect",
+    "hook_settings": "mempalace_hook_settings",
+}
 
-def _classify_underlying_tool(tool_name: str, arguments: Any) -> str:
-    """Map a consolidated lightweight tool call to its underlying legacy tool name for preflight gates."""
+_COORD_ACTION_TO_TOOL = {
+    "task_create": "mempalace_task_create",
+    "event_append": "mempalace_event_append",
+    "event_list": "mempalace_event_list",
+    "event_wait": "mempalace_event_wait",
+    "event_ack": "mempalace_event_ack",
+    "artifact_put": "mempalace_artifact_put",
+    "artifact_get": "mempalace_artifact_get",
+    "patch_submit": "mempalace_patch_submit",
+    "mesh_peers": "mempalace_mesh_peers",
+    # Structured ``{"action": "peers"}`` is not rewritten by the PQL parser.
+    "peers": "mempalace_mesh_peers",
+}
+
+
+def _allowlisted_tool(mapping: Dict[str, str], key: str) -> Optional[str]:
+    """Return the mempalace_* name for an allowlisted key, else None."""
+    name = mapping.get(key)
+    if isinstance(name, str) and name in mcp_server.TOOLS:
+        return name
+    return None
+
+
+def _query_arguments(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """palace_query reads settings; the arguments that would change them are dropped."""
+    return {} if name == "mempalace_hook_settings" else params
+
+
+def _resolve_wing_params(params: Dict[str, Any]) -> None:
+    for key in ("wing", "source_wing", "target_wing"):
+        if isinstance(params.get(key), str):
+            params[key] = _resolve_fuzzy_wing(params[key])
+
+
+def _classify_underlying_tool(tool_name: str, arguments: Any) -> Optional[str]:
+    """Map a palace_* call to an allowlisted mempalace_* tool.
+
+    Unknown targets are None. They are not invented as ``mempalace_<target>``.
+    A parse failure still names a real mutating tool so preflight keeps
+    treating an unreadable exec or coordinate call as a write.
+    """
     unwrapped = _unwrap_wrapper_input(arguments)
     if tool_name == "palace_exec":
         try:
             action, _ = parse_exec_input(unwrapped)
-            return f"mempalace_{action}"
         except Exception:
             return "mempalace_add_drawer"
+        return _allowlisted_tool(_EXEC_ACTION_TO_TOOL, action)
 
     if tool_name == "palace_coordinate":
         try:
             action, _ = parse_coordinate_input(unwrapped)
-            return f"mempalace_{action}"
         except Exception:
             return "mempalace_event_append"
+        return _allowlisted_tool(_COORD_ACTION_TO_TOOL, action)
 
     if tool_name == "palace_query":
         try:
             target, _ = parse_query_input(unwrapped)
-            return _QUERY_TARGET_TO_TOOL.get(target, f"mempalace_{target}")
         except Exception:
             return "mempalace_search"
+        return _allowlisted_tool(_QUERY_TARGET_TO_TOOL, target)
 
-    return tool_name
+    if isinstance(tool_name, str) and tool_name in mcp_server.TOOLS:
+        return tool_name
+    return None
+
+
+def _unknown_target_error(req_id) -> Dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": req_id,
+        "error": {"code": -32602, "message": "unknown target"},
+    }
 
 
 def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -780,11 +760,11 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "serverInfo": {"name": "mempalace-light", "version": __version__},
             },
         }
-    elif method == "ping":
+    if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    elif method.startswith("notifications/"):
+    if method.startswith("notifications/"):
         return None
-    elif method == "tools/list":
+    if method == "tools/list":
         # In read-only mode, only palace_query is exposed
         tools_list = []
         for name, tool_def in LIGHT_TOOLS.items():
@@ -802,7 +782,7 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "id": req_id,
             "result": {"tools": tools_list},
         }
-    elif method == "tools/call":
+    if method == "tools/call":
         if not isinstance(params, dict) or "name" not in params:
             return {
                 "jsonrpc": "2.0",
@@ -820,8 +800,12 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         arguments = params.get("arguments") or {}
 
-        # Classify underlying tool for preflight gates (read-only, peer-writer, stale-library, diverged-index)
+        # Same allowlist the production rewrite uses. An unknown palace_*
+        # target is -32602 here too, so this path cannot dispatch a write
+        # the rewrite would refuse.
         underlying_name = _classify_underlying_tool(tool_name, arguments)
+        if not underlying_name:
+            return _unknown_target_error(req_id)
         refusal = mcp_server._mcp_tool_preflight_refusal(req_id, underlying_name)
         if refusal is not None:
             return refusal
@@ -845,7 +829,9 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 },
             }
         except Exception as e:
-            return mcp_server._internal_tool_error(req_id, tool_name, e)
+            return mcp_server._internal_tool_error(
+                req_id, tool_name, e, include_message=isinstance(e, ValueError)
+            )
 
     if req_id is None:
         return None
@@ -913,13 +899,15 @@ def _rewrite_tools_call_for_hub(request: Dict[str, Any]):
 
     taxonomy_wing = None
     if tool_name in ("palace_query", "palace_exec"):
-        for key in ("wing", "source_wing", "target_wing"):
-            if isinstance(parsed.get(key), str):
-                parsed[key] = _resolve_fuzzy_wing(parsed[key])
+        _resolve_wing_params(parsed)
         if tool_name == "palace_query" and query_target in ("taxonomy", "get_taxonomy"):
             taxonomy_wing = parsed.get("wing")
 
     underlying = _classify_underlying_tool(tool_name, arguments)
+    if not underlying:
+        return {"_unknown_target": True}
+    if tool_name == "palace_query":
+        parsed = _query_arguments(underlying, parsed)
     tool_def = mcp_server.TOOLS.get(underlying) or {}
     handler = tool_def.get("handler")
     if handler is not None:
@@ -975,6 +963,8 @@ def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, 
     method = request.get("method") if isinstance(request, dict) else None
     if method == "tools/call":
         rewritten = _rewrite_tools_call_for_hub(request)
+        if isinstance(rewritten, dict) and rewritten.get("_unknown_target"):
+            return _unknown_target_error(request.get("id"))
         if isinstance(rewritten, dict) and rewritten.get("_parse_error"):
             req_id = request.get("id")
             payload = {"success": False, "error": f"PQL parse error: {rewritten['message']}"}
@@ -1004,7 +994,9 @@ def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, 
             try:
                 resp = mcp_server._dispatch_stdio_request(forwarded)
             except Exception as exc:
-                return mcp_server._internal_tool_error(request.get("id"), underlying, exc)
+                return mcp_server._internal_tool_error(
+                    request.get("id"), underlying, exc, include_message=isinstance(exc, ValueError)
+                )
             return _postprocess_light_response(rewritten, resp)
     return handle_light_request(request)
 
@@ -1053,25 +1045,14 @@ def main():
         line = line.strip()
         if not line:
             continue
-        try:
-            req = json.loads(line)
-        except Exception as exc:
-            # A line json.loads rejects is skipped, as invalid JSON always was. An
-            # integer past the digit limit or nesting too deep to parse raises
-            # something else, and used to end the server.
-            logger.error("Skipped a line json.loads rejected: %s: %s", type(exc).__name__, exc)
+        payload = mcp_server._stdio_reply(line, dispatch_light_stdio_request)
+        if payload is None:
             continue
         try:
-            resp = dispatch_light_stdio_request(req)
-        except Exception as exc:
-            logger.error("Server error: %s", exc)
-            continue
-        if resp is not None:
-            try:
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-            except (BrokenPipeError, OSError):
-                break
+            sys.stdout.write(payload + "\n")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            break
 
 
 if __name__ == "__main__":

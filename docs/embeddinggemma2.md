@@ -94,7 +94,7 @@ Normal tests mock model inference and require no downloaded weights:
 
 ```bash
 python -m pytest tests/ -q --ignore=tests/benchmarks \
-  --cov=mempalace --cov-report=term --cov-fail-under=80
+  --cov=mempalace --cov-report=term
 ruff check .
 ruff format --check .
 ```

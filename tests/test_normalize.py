@@ -2,6 +2,8 @@ import json
 import stat
 from unittest.mock import patch
 
+import pytest
+
 from mempalace.normalize import (
     _SLACK_PROVENANCE_FOOTER,
     _extract_content,
@@ -13,9 +15,9 @@ from mempalace.normalize import (
     _try_claude_ai_json,
     _try_claude_code_jsonl,
     _try_codex_jsonl,
+    _try_continue_json,
     _try_gemini_json,
     _try_gemini_jsonl,
-    _try_continue_json,
     _try_normalize_json,
     _try_normalize_json_split,
     _try_pi_jsonl,
@@ -24,7 +26,6 @@ from mempalace.normalize import (
     normalize_conversations,
     strip_noise,
 )
-
 
 # ── normalize() top-level ──────────────────────────────────────────────
 
@@ -53,11 +54,8 @@ def test_empty(tmp_path):
 
 def test_normalize_io_error():
     """normalize raises IOError for unreadable file."""
-    try:
+    with pytest.raises(IOError, match="Could not read"):
         normalize("/nonexistent/path/file.txt")
-        assert False, "Should have raised"
-    except IOError as e:
-        assert "Could not read" in str(e)
 
 
 def test_normalize_already_has_markers(tmp_path):
@@ -696,7 +694,7 @@ class TestGeminiJson:
         assert "Why did the chicken cross the road?" in result
 
     def test_multi_part_text_joined(self):
-        """Multiple text parts within a single message are joined with spaces."""
+        """Text parts within one message concatenate as written, as Gemini reads them."""
         data = {
             "contents": [
                 {
@@ -711,7 +709,7 @@ class TestGeminiJson:
         }
         result = _try_gemini_json(data)
         assert result is not None
-        assert "Part one. Part two." in result
+        assert "Part one.Part two." in result
 
     def test_non_text_parts_skipped(self):
         """``inline_data`` / ``function_call`` parts are skipped; only ``text`` is extracted."""
@@ -1672,16 +1670,32 @@ def test_try_normalize_json_valid_but_unknown_schema():
 
 def test_messages_to_transcript_basic():
     msgs = [("user", "Q"), ("assistant", "A")]
-    with patch("mempalace.normalize.spellcheck_user_text", side_effect=lambda x: x, create=True):
-        result = _messages_to_transcript(msgs, spellcheck=False)
+    result = _messages_to_transcript(msgs)
     assert "> Q" in result
     assert "A" in result
+
+
+def test_messages_to_transcript_keeps_user_text_even_with_a_speller():
+    """User turns are never spell-corrected on the way to a transcript, even
+    when autocorrect is installed: correction is an opt-in miner step."""
+
+    class _Speller:
+        def __call__(self, word):
+            return {"knoe": "know", "befor": "before"}.get(word, word)
+
+    msgs = [("user", "i knoe the question befor"), ("assistant", "ok")]
+    with (
+        patch("mempalace.spellcheck._get_speller", return_value=_Speller()),
+        patch("mempalace.spellcheck._get_system_words", return_value=set()),
+    ):
+        result = _messages_to_transcript(msgs)
+    assert "> i knoe the question befor" in result
 
 
 def test_messages_to_transcript_consecutive_users():
     """Two user messages in a row (no assistant between)."""
     msgs = [("user", "Q1"), ("user", "Q2"), ("assistant", "A")]
-    result = _messages_to_transcript(msgs, spellcheck=False)
+    result = _messages_to_transcript(msgs)
     assert "> Q1" in result
     assert "> Q2" in result
 
@@ -1689,7 +1703,7 @@ def test_messages_to_transcript_consecutive_users():
 def test_messages_to_transcript_assistant_first():
     """Leading assistant message (no user before it)."""
     msgs = [("assistant", "preamble"), ("user", "Q"), ("assistant", "A")]
-    result = _messages_to_transcript(msgs, spellcheck=False)
+    result = _messages_to_transcript(msgs)
     assert "preamble" in result
     assert "> Q" in result
 
@@ -1908,11 +1922,8 @@ def test_normalize_rejects_large_file(tmp_path):
         st_size = 600 * 1024 * 1024
 
     with patch("mempalace.normalize.os.fstat", return_value=_HugeStat()):
-        try:
+        with pytest.raises(IOError, match="(?i)too large"):
             normalize(str(big))
-            assert False, "Should have raised IOError"
-        except IOError as e:
-            assert "too large" in str(e).lower()
 
 
 # ── strip_noise() — verbatim-safety boundary tests ─────────────────────
@@ -2047,12 +2058,15 @@ class TestStripNoiseRemovesSystemChrome:
             assert tag not in out, f"{tag} leaked into output"
             assert "Real." in out
 
-    def test_collapses_excessive_blank_lines(self):
+    def test_keeps_blank_lines_when_nothing_is_stripped(self):
         text = "line one\n\n\n\n\n\nline two"
+        assert strip_noise(text) == text
+
+    def test_collapses_the_blank_lines_a_removal_leaves(self):
+        text = "line one\n\n<system-reminder>\nnote\n</system-reminder>\n\n\n\nline two"
         out = strip_noise(text)
         assert "line one" in out
         assert "line two" in out
-        # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
 
 
@@ -2166,3 +2180,80 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── ChatGPT active branch / Slack null user (W1-09) ──────────────────
+
+
+def _chatgpt_node(node_id, parent, children, role=None, text=None):
+    message = None
+    if role is not None:
+        message = {"author": {"role": role}, "content": {"parts": [text]}}
+    return node_id, {"id": node_id, "parent": parent, "children": children, "message": message}
+
+
+def test_chatgpt_follows_the_branch_current_node_ends_on():
+    """A regenerated answer forks the tree; the export keeps both branches.
+    Only the branch ``current_node`` points at is the conversation the user
+    kept, so the abandoned first draft must not be filed."""
+    nodes = dict(
+        [
+            _chatgpt_node("root", None, ["u1"]),
+            _chatgpt_node("u1", "root", ["a_old", "a_new"], "user", "what is a palace"),
+            _chatgpt_node("a_old", "u1", ["u_old"], "assistant", "abandoned draft"),
+            _chatgpt_node("u_old", "a_old", [], "user", "abandoned follow-up"),
+            _chatgpt_node("a_new", "u1", ["u2"], "assistant", "kept answer"),
+            _chatgpt_node("u2", "a_new", ["a2"], "user", "and a drawer"),
+            _chatgpt_node("a2", "u2", [], "assistant", "kept second answer"),
+        ]
+    )
+    result = _try_chatgpt_json({"mapping": nodes, "current_node": "a2"})
+    assert result is not None
+    assert "kept answer" in result
+    assert "kept second answer" in result
+    assert "abandoned" not in result
+
+
+def test_chatgpt_without_current_node_still_walks_from_the_root():
+    nodes = dict(
+        [
+            _chatgpt_node("root", None, ["u1"]),
+            _chatgpt_node("u1", "root", ["a1"], "user", "hello"),
+            _chatgpt_node("a1", "u1", [], "assistant", "hi there"),
+        ]
+    )
+    result = _try_chatgpt_json({"mapping": nodes})
+    assert "> hello" in result
+    assert "hi there" in result
+
+
+@pytest.mark.parametrize("current_node", ["root", "missing", "u1"])
+def test_chatgpt_falls_back_to_the_root_walk_when_current_node_is_too_short(current_node):
+    """A current_node that is the root, unknown, or too early to hold an
+    exchange must not lose the conversation: the root walk still files it."""
+    nodes = dict(
+        [
+            _chatgpt_node("root", None, ["u1"]),
+            _chatgpt_node("u1", "root", ["a1"], "user", "hello"),
+            _chatgpt_node("a1", "u1", [], "assistant", "hi there"),
+        ]
+    )
+    result = _try_chatgpt_json({"mapping": nodes, "current_node": current_node})
+    assert result is not None
+    assert "> hello" in result
+    assert "hi there" in result
+
+
+def test_slack_null_user_is_filed_as_unknown():
+    """Slack exports carry ``"user": null`` for bots and deleted accounts.
+    Those turns are kept under "unknown" instead of aborting the parse."""
+    data = [
+        {"type": "message", "user": "U1", "text": "first"},
+        {"type": "message", "user": None, "text": "from a deleted account"},
+        {"type": "message", "user": "U1", "text": None},
+        {"type": "message", "user": "U2", "text": "reply"},
+    ]
+    result = _try_slack_json(data)
+    assert result is not None
+    assert "[unknown] from a deleted account" in result
+    assert "[U2] reply" in result

@@ -451,7 +451,7 @@ class TestHyphenatedWingNormalization:
     def test_find_tunnels_warns_on_empty_result(self, tmp_path, monkeypatch, caplog):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
         # No data in collection, so build_graph returns empty nodes
-        with caplog.at_level("WARNING", logger="mempalace_graph"):
+        with caplog.at_level("WARNING", logger="mempalace"):
             result = palace_graph.find_tunnels("nonexistent-wing")
         assert result == []
         assert "No tunnels found" in caplog.text
@@ -566,7 +566,7 @@ class TestTunnelFileFollowsConfig:
         monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(configured))
         monkeypatch.setattr(palace_graph, "_legacy_tunnel_file", lambda: str(legacy))
 
-        with caplog.at_level(logging.WARNING, logger="mempalace_graph"):
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
             result = palace_graph._load_tunnels()
 
         assert result == [], "must not auto-migrate from legacy file"
@@ -581,7 +581,7 @@ class TestTunnelFileFollowsConfig:
         monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(same))
         monkeypatch.setattr(palace_graph, "_legacy_tunnel_file", lambda: str(same))
 
-        with caplog.at_level(logging.WARNING, logger="mempalace_graph"):
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
             assert palace_graph._load_tunnels() == []
 
         assert "Legacy tunnels file" not in caplog.text
@@ -669,9 +669,9 @@ class TestCreateTunnelEndpointValidation:
         t = palace_graph.create_tunnel("wing_code", "any", "wing_people", "any", label="cold-start")
         assert t["label"] == "cold-start"
 
-    def test_create_tunnel_tolerates_collection_query_exception(self, tmp_path, monkeypatch):
-        """Permission errors / temporary chroma faults during the
-        validation query must not block legitimate writes."""
+    def test_create_tunnel_refuses_when_the_room_check_cannot_read(self, tmp_path, monkeypatch):
+        """A failed validation query is not "the room exists": the explicit
+        tunnel is refused with GraphUnavailable and nothing is written."""
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
 
         class _AngryCollection:
@@ -680,9 +680,9 @@ class TestCreateTunnelEndpointValidation:
 
         monkeypatch.setattr(palace_graph, "_get_collection", lambda config=None: _AngryCollection())
 
-        # Should not raise — fall back to "allow" rather than fail-closed.
-        t = palace_graph.create_tunnel("wing_code", "x", "wing_people", "y", label="best-effort")
-        assert t["label"] == "best-effort"
+        with pytest.raises(palace_graph.GraphUnavailable):
+            palace_graph.create_tunnel("wing_code", "x", "wing_people", "y", label="unverified")
+        assert palace_graph.list_tunnels() == []
 
     def test_compute_topic_tunnels_skips_endpoint_validation(self, tmp_path, monkeypatch):
         """Topic tunnels use synthetic ``topic:<name>`` room identifiers

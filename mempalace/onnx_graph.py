@@ -6,7 +6,7 @@ pulling in the ``onnx`` package. Every field it does not rewrite is copied
 through byte for byte, so the result differs from the input only where it
 means to.
 
-The rewrite (#2681): a q8 model that stores its token table quantized looks
+The rewrite: a q8 model that stores its token table quantized looks
 tokens up as ``Gather(DequantizeLinear(table_q, scale, zero_point), ids)``.
 ONNX Runtime evaluates that literally, so every ``run()``, even for a
 two-word query, first dequantizes the whole table into a float32 copy

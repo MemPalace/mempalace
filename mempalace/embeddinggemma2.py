@@ -15,6 +15,8 @@ import warnings
 from pathlib import Path, PurePath
 from typing import Any, Optional
 
+from .embedding import as_text_batch
+
 logger = logging.getLogger(__name__)
 
 MODEL_ID = "google/embeddinggemma-2"
@@ -74,10 +76,7 @@ def _config_kwargs(modalities: str) -> dict[str, Any]:
 
 
 def _as_texts(value: str | list[str]) -> list[str]:
-    if isinstance(value, str):
-        texts = [value]
-    else:
-        texts = list(value)
+    texts = as_text_batch(value)
     if any(not isinstance(text, str) for text in texts):
         raise TypeError("EmbeddingGemma 2 accepts text strings only")
     return texts

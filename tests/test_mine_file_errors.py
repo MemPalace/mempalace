@@ -1,10 +1,11 @@
 """A file the mine could not file is an error, not a skip.
 
-The stale-drawer purge that precedes every (re-)mine of a file aborts that
-file when it raises (#23 / #105). The mine used to count those files as
-"skipped (already filed or other)" and finish as a success, so a mine that
-filed nothing past its first file after a backend failure reported the same
-as a clean one: the MCP tool answered ``success: true`` and the CLI exited 0.
+The stale-drawer purge that follows every (re-)mine of a file fails that file
+when it raises (#23 / #105): its new drawers stay marked unfinished. The mine
+used to count those files as "skipped (already filed or other)" and finish as
+a success, so a mine that filed nothing past its first file after a backend
+failure reported the same as a clean one: the MCP tool answered
+``success: true`` and the CLI exited 0.
 """
 
 import os
@@ -24,34 +25,27 @@ def _project(tmp_path):
     return src
 
 
-def _fail_purge_for(monkeypatch, module, names):
-    """Wrap the real collection the miner opens; purge raises for ``names``."""
-    real_get_collection = module.get_collection
+def _fail_purge_for(monkeypatch, names):
+    """The stale-drawer purge raises for sources named in ``names``."""
+    from mempalace import palace
 
-    class PurgeFailsFor:
-        def __init__(self, inner):
-            self._inner = inner
+    real = palace._source_file_delete_ids
 
-        def __getattr__(self, attr):
-            return getattr(self._inner, attr)
+    def delete_ids(collection, source_file, extract_mode):
+        if os.path.basename(source_file) in names:
+            raise RuntimeError("simulated closed backend handle")
+        return real(collection, source_file, extract_mode)
 
-        def delete(self, *args, **kwargs):
-            source = (kwargs.get("where") or {}).get("source_file", "")
-            if os.path.basename(source) in names:
-                raise RuntimeError("simulated closed backend handle")
-            return self._inner.delete(*args, **kwargs)
-
-    def get_collection(*args, **kwargs):
-        return PurgeFailsFor(real_get_collection(*args, **kwargs))
-
-    monkeypatch.setattr(module, "get_collection", get_collection)
+    monkeypatch.setattr(palace, "_source_file_delete_ids", delete_ids)
 
 
 def _filed(palace_path):
-    from mempalace.palace import get_collection
+    """Sources whose drawers are all there: a failed purge leaves them unfinished."""
+    from mempalace.palace import file_already_mined, get_collection
 
-    metas = get_collection(palace_path, create=False).get(include=["metadatas"])["metadatas"]
-    return {os.path.basename(m["source_file"]) for m in metas}
+    col = get_collection(palace_path, create=False)
+    sources = {m["source_file"] for m in col.get(include=["metadatas"])["metadatas"]}
+    return {os.path.basename(s) for s in sources if file_already_mined(col, s)}
 
 
 def test_project_mine_counts_purge_failures_as_errors_and_fails(
@@ -60,7 +54,7 @@ def test_project_mine_counts_purge_failures_as_errors_and_fails(
     from mempalace import miner
 
     src = _project(tmp_path)
-    _fail_purge_for(monkeypatch, miner, BAD)
+    _fail_purge_for(monkeypatch, BAD)
 
     with pytest.raises(Exception) as excinfo:
         miner.mine(str(src), palace_path, wing_override="w")
@@ -77,11 +71,11 @@ def test_project_mine_counts_purge_failures_as_errors_and_fails(
 
 
 def test_mcp_mine_reports_success_false_with_the_failure_count(monkeypatch, config, tmp_path):
-    from mempalace import mcp_server, miner
+    from mempalace import mcp_server
 
     monkeypatch.setattr(mcp_server, "_config", config)
     src = _project(tmp_path)
-    _fail_purge_for(monkeypatch, miner, BAD)
+    _fail_purge_for(monkeypatch, BAD)
 
     result = mcp_server.tool_mine(source=str(src), mode="projects", wing="w")
 
@@ -112,10 +106,9 @@ def test_mcp_mine_without_failures_still_succeeds(monkeypatch, config, tmp_path)
 
 def test_cli_mine_exits_nonzero_when_files_failed(monkeypatch, palace_path, tmp_path, capsys):
     import mempalace.cli as cli
-    from mempalace import miner
 
     src = _project(tmp_path)
-    _fail_purge_for(monkeypatch, miner, BAD)
+    _fail_purge_for(monkeypatch, BAD)
     monkeypatch.setenv("MEMPALACE_HUB_FORWARD", "0")
     monkeypatch.setattr(
         sys,
@@ -154,14 +147,7 @@ def test_convo_mine_counts_purge_failures_as_errors_and_fails(
             f"> Why {name}?\nBecause {name} must be filed as at least one drawer.\n",
             encoding="utf-8",
         )
-    real = convo_miner._source_file_delete_ids
-
-    def delete_ids(collection, source_file, extract_mode):
-        if os.path.basename(source_file) == "b.txt":
-            raise RuntimeError("simulated closed backend handle")
-        return real(collection, source_file, extract_mode)
-
-    monkeypatch.setattr(convo_miner, "_source_file_delete_ids", delete_ids)
+    _fail_purge_for(monkeypatch, ("b.txt",))
 
     with pytest.raises(Exception) as excinfo:
         convo_miner.mine_convos(str(src), palace_path, wing="w")
@@ -175,10 +161,10 @@ def test_convo_mine_counts_purge_failures_as_errors_and_fails(
 
 
 def test_daemon_mine_job_reports_the_failure(monkeypatch, palace_path, tmp_path):
-    from mempalace import miner, service
+    from mempalace import service
 
     src = _project(tmp_path)
-    _fail_purge_for(monkeypatch, miner, BAD)
+    _fail_purge_for(monkeypatch, BAD)
 
     result = service.run_mine(
         {"source": str(src), "palace_path": palace_path, "mode": "projects", "wing": "w"}

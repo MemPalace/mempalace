@@ -8,18 +8,17 @@ from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
-from hypothesis import given
-from hypothesis import strategies as st
+from hypothesis import given, strategies as st
 
 import mempalace.hooks_cli as hooks_cli_mod
 from mempalace.config import sanitize_name
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
+    _claim_mine_slot,
     _count_human_messages,
     _diary_agent_for_harness,
     _extract_recent_messages,
     _get_mine_targets,
-    _hooks_daemon_enabled,
     _is_harness_boilerplate,
     _log,
     _maybe_auto_ingest,
@@ -27,18 +26,17 @@ from mempalace.hooks_cli import (
     _mine_already_running,
     _mine_sync,
     _parse_harness_input,
-    _safe_wing_slug,
+    _pid_file_for_cmd,
     _sanitize_session_id,
     _save_diary_direct,
     _validate_transcript_path,
     _wing_from_transcript_path,
-    hook_stop,
-    hook_session_start,
-    hook_session_end,
+    _wing_slug,
     hook_precompact,
+    hook_session_end,
+    hook_session_start,
+    hook_stop,
     run_hook,
-    _claim_mine_slot,
-    _pid_file_for_cmd,
 )
 
 
@@ -515,9 +513,14 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
     # Saves silently — systemMessage notification with themes, no block
     assert result["systemMessage"].startswith("\u2726 1 checkpoint saved")
     assert "hooks" in result["systemMessage"]
-    # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "wing_sessions"
+    # tmp_path has no "-Projects-" segment, so _wing_from_transcript_path falls back to "sessions"
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_sessions", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="sessions",
+        toast=False,
+        agent_name="claude",
+        exchange_count=SAVE_INTERVAL,
     )
 
 
@@ -538,8 +541,38 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
             state_dir=tmp_path,
         )
     mock_save.assert_called_once_with(
-        str(transcript), "test", wing="wing_myproject", toast=False, agent_name="claude"
+        str(transcript),
+        "test",
+        wing="myproject",
+        toast=False,
+        agent_name="claude",
+        exchange_count=SAVE_INTERVAL,
     )
+
+
+def test_stop_hook_diary_files_into_the_same_wing_as_the_transcript(tmp_path, monkeypatch):
+    """D-17: a session's diary and its ingested transcript share one wing,
+    including a home-directory session's workstation wing."""
+    import mempalace.hooks_cli as hooks_cli
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(hooks_cli.Path, "home", classmethod(lambda cls: home))
+    transcript = tmp_path / "session.jsonl"
+    lines = [
+        {"cwd": str(home), "message": {"role": "user", "content": f"msg {i}"}}
+        for i in range(SAVE_INTERVAL)
+    ]
+    _write_transcript(transcript, lines)
+    save_result = {"drawers_filed": 1, "messages_folded": 15, "themes": []}
+    with patch("mempalace.hooks_cli._save_diary_direct", return_value=save_result) as mock_save:
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    diary_wing = mock_save.call_args.kwargs["wing"]
+    assert diary_wing == hooks_cli._project_wing(str(transcript)) == hooks_cli._workstation_wing()
 
 
 def test_stop_hook_tracks_save_point(tmp_path):
@@ -654,9 +687,38 @@ def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_
         [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(5)],
     )
 
+    spawned = {}
+
+    def _fake_popen(cmd, **kwargs):
+        spawned["cmd"] = list(cmd)
+
+        class _Proc:
+            pid = os.getpid()
+
+        return _Proc()
+
     agent = _diary_agent_for_harness("claude-code")
-    res = _save_diary_direct(str(transcript), "sess1", wing="wing_.claude", agent_name=agent)
-    assert res["drawers_filed"] > 0
+    with patch("mempalace.hooks_cli.subprocess.Popen", _fake_popen):
+        res = _save_diary_direct(str(transcript), "sess1", wing="wing_.claude", agent_name=agent)
+    assert res.get("checkpoint_queued") is True
+    assert res["drawers_filed"] == 0
+    argv = " ".join(spawned["cmd"])
+    assert "run_detached_diary_checkpoint" in argv
+    assert "CHECKPOINT" not in argv
+
+    # The child starts the transcript mine only after the diary entry is filed.
+    filed_before_ingest = []
+
+    def _ingest(path):
+        filed_before_ingest.append(tool_diary_read(agent_name="claude").get("total", 0) >= 1)
+
+    with (
+        patch("mempalace.hooks_cli._ingest_transcript", side_effect=_ingest) as ingest,
+        patch("mempalace.hooks_cli._maybe_auto_ingest"),
+    ):
+        hooks_cli_mod.run_detached_diary_checkpoint(spawned["cmd"][-1])
+    ingest.assert_called_once_with(str(transcript))
+    assert filed_before_ingest == [True]
 
     visible = tool_diary_read(agent_name="claude")
     assert visible.get("total", 0) >= 1
@@ -665,6 +727,140 @@ def test_stop_hook_checkpoint_visible_to_diary_read(monkeypatch, config, palace_
     # The legacy identity no longer captures hook checkpoints.
     legacy = tool_diary_read(agent_name="session-hook")
     assert legacy.get("entries") == []
+
+
+def test_stop_foreground_does_not_import_mcp_server(tmp_path):
+    """The default Stop path must stay inside the 500ms budget.
+
+    Importing mempalace.mcp_server alone is about half a second. The
+    foreground queues a detached child and must not import it.
+    """
+    import time
+
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    removed = {
+        key: sys.modules.pop(key)
+        for key in list(sys.modules)
+        if key == "mempalace.mcp_server" or key.startswith("mempalace.mcp_server.")
+    }
+    try:
+        started = time.perf_counter()
+        result = _capture_hook_output(
+            hook_stop,
+            {
+                "session_id": "budget",
+                "stop_hook_active": False,
+                "transcript_path": str(transcript),
+            },
+            state_dir=tmp_path,
+        )
+        elapsed = time.perf_counter() - started
+        assert "mempalace.mcp_server" not in sys.modules
+        assert "checkpoint queued" in result["systemMessage"]
+        assert elapsed < 0.5, f"foreground stop took {elapsed:.3f}s"
+    finally:
+        sys.modules.update(removed)
+
+
+def test_stop_leaves_the_mines_to_a_queued_checkpoint(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(SAVE_INTERVAL)],
+    )
+    queued = {"drawers_filed": 0, "messages_folded": 3, "checkpoint_queued": True}
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=queued),
+        patch("mempalace.hooks_cli._ingest_transcript") as ingest,
+        patch("mempalace.hooks_cli._maybe_auto_ingest") as auto_ingest,
+    ):
+        _capture_hook_output(
+            hook_stop,
+            {"session_id": "q", "stop_hook_active": False, "transcript_path": str(transcript)},
+            state_dir=tmp_path,
+        )
+    ingest.assert_not_called()
+    auto_ingest.assert_not_called()
+    # The child advances the marker once it has filed, not the foreground.
+    assert not (tmp_path / "q_last_save").exists()
+
+
+def test_queue_reports_nothing_when_no_child_started(tmp_path):
+    with (
+        patch.object(hooks_cli_mod, "STATE_DIR", tmp_path),
+        patch.object(hooks_cli_mod, "_MINE_PID_DIR", tmp_path / "mine_pids"),
+        patch("mempalace.hooks_cli._claim_mine_slot", return_value=None),
+        patch("mempalace.hooks_cli.subprocess.Popen") as popen,
+    ):
+        assert hooks_cli_mod._queue_diary_checkpoint({"session_id": "s", "entry": "x"}) is False
+    popen.assert_not_called()
+
+
+def test_checkpoint_child_waits_out_a_held_palace_lock(tmp_path):
+    from mempalace.daemon import LOCK_REFUSAL_ERROR_CLASS
+
+    refused = {"success": False, "error": "busy", "error_class": LOCK_REFUSAL_ERROR_CLASS}
+    filed = {"success": True, "entry_id": "e1"}
+    with (
+        patch.object(hooks_cli_mod, "STATE_DIR", tmp_path),
+        patch("mempalace.mcp_server.tool_diary_write", side_effect=[refused, refused, filed]) as w,
+        patch("mempalace.hooks_cli.time.sleep") as sleep,
+    ):
+        ok = hooks_cli_mod._apply_diary_checkpoint(
+            {"entry": "CHECKPOINT:x", "session_id": "s", "exchange_count": 15}
+        )
+    assert ok is True
+    assert w.call_count == 3
+    assert sleep.call_count == 2
+    assert (tmp_path / "s_last_save").read_text(encoding="utf-8") == "15"
+
+
+def test_daemon_available_probe_stays_under_hook_budget(tmp_path, monkeypatch):
+    import socket
+    import threading
+    import time
+
+    from mempalace import daemon
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "daemon-state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def _hang():
+        try:
+            conn, _addr = server.accept()
+            time.sleep(2)
+            conn.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=_hang, daemon=True).start()
+    try:
+        daemon.ensure_token(str(palace))
+        endpoint = daemon.state_dir(str(palace)) / "endpoint.json"
+        endpoint.write_text(
+            json.dumps({"host": "127.0.0.1", "port": port, "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+        started = time.perf_counter()
+        available = hooks_cli_mod._daemon_available()
+        elapsed = time.perf_counter() - started
+    finally:
+        server.close()
+
+    assert available is False
+    assert daemon.HOOK_PROBE_TIMEOUT <= 0.15
+    assert elapsed < 0.5, f"hook probe took {elapsed:.3f}s"
+    assert elapsed < daemon.HOOK_PROBE_TIMEOUT + 0.2
 
 
 def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
@@ -748,13 +944,6 @@ def test_save_diary_daemon_lock_deferral_does_not_stall_the_hook(tmp_path):
     assert "Daemon diary checkpoint failed" not in logged, "a parked job is not a failure"
 
 
-def test_hooks_daemon_enabled_requires_explicit_true():
-    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
-        assert _hooks_daemon_enabled() is False
-        mock_cfg_cls.return_value.hook_use_daemon = True
-        assert _hooks_daemon_enabled() is True
-
-
 # --- hook_session_start ---
 
 
@@ -784,21 +973,21 @@ def test_precompact_allows(tmp_path):
 
 def test_wing_from_transcript_path_extracts_project():
     path = "/home/jp/.claude/projects/-home-jp-Projects-memorypalace/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_memorypalace"
+    assert _wing_from_transcript_path(path) == "memorypalace"
 
 
 def test_wing_from_transcript_path_fallback():
-    assert _wing_from_transcript_path("/some/random/path.jsonl") == "wing_sessions"
+    assert _wing_from_transcript_path("/some/random/path.jsonl") == "sessions"
 
 
 def test_wing_from_transcript_path_windows_backslashes():
     path = "C:\\Users\\jp\\.claude\\projects\\-home-jp-Projects-myapp\\session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myapp"
+    assert _wing_from_transcript_path(path) == "myapp"
 
 
 def test_wing_from_transcript_path_lowercases():
     path = "/home/jp/.claude/projects/-home-jp-Projects-MyProject/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myproject"
+    assert _wing_from_transcript_path(path) == "myproject"
 
 
 def test_wing_from_transcript_path_non_projects_layout():
@@ -809,14 +998,14 @@ def test_wing_from_transcript_path_non_projects_layout():
     # truncating to the last token (which would drop ``MemPalace`` here and collide
     # with any other ``-mempalace`` leaf elsewhere on the system).
     path = "/home/igor/.claude/projects/-home-igor-dev-MemPalace-mempalace/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_mempalace_mempalace"
+    assert _wing_from_transcript_path(path) == "mempalace_mempalace"
 
 
 def test_wing_from_transcript_path_macos_users_layout():
     # macOS ~/ layout without a Projects/ segment — single-token project name
     # so the heuristic produces the same result as the leaf-only approach.
     path = "/Users/alice/.claude/projects/-Users-alice-code-MyApp/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_myapp"
+    assert _wing_from_transcript_path(path) == "myapp"
 
 
 def test_wing_from_transcript_path_nested_deep():
@@ -827,7 +1016,7 @@ def test_wing_from_transcript_path_nested_deep():
     # path as the wing — collision-safe even if multiple clients have a
     # ``frontend/`` subdir.
     path = "/home/bob/.claude/projects/-home-bob-work-clients-acme-frontend/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_clients_acme_frontend"
+    assert _wing_from_transcript_path(path) == "clients_acme_frontend"
 
 
 # --- _wing_from_transcript_path: hyphenated project names (issue #1410) ---
@@ -836,13 +1025,13 @@ def test_wing_from_transcript_path_nested_deep():
 def test_wing_from_transcript_path_hyphenated_claude_code():
     """Regression: ``claude-code`` was truncated to ``wing_code`` (#1410)."""
     path = "/Users/me/.claude/projects/-Users-me-claude-code/abc.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_claude_code"
+    assert _wing_from_transcript_path(path) == "claude_code"
 
 
 def test_wing_from_transcript_path_hyphenated_react_native():
     """Regression: ``react-native`` was truncated to ``wing_native`` (#1410)."""
     path = "/Users/me/.claude/projects/-Users-me-react-native/abc.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_react_native"
+    assert _wing_from_transcript_path(path) == "react_native"
 
 
 def test_wing_from_transcript_path_no_collision_between_hyphenated_siblings():
@@ -855,8 +1044,8 @@ def test_wing_from_transcript_path_no_collision_between_hyphenated_siblings():
     admin = _wing_from_transcript_path(
         "/Users/me/.claude/projects/-Users-me-admin-portal/abc.jsonl"
     )
-    assert customer == "wing_customer_portal"
-    assert admin == "wing_admin_portal"
+    assert customer == "customer_portal"
+    assert admin == "admin_portal"
     assert customer != admin
 
 
@@ -864,7 +1053,7 @@ def test_wing_from_transcript_path_strips_parent_dir_with_hyphenated_project():
     """Reporter's example: ``-home-alice-projects-react-native`` should keep
     the full project name after stripping the ``projects-`` parent (#1410)."""
     path = "/home/alice/.claude/projects/-home-alice-projects-react-native/abc.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_react_native"
+    assert _wing_from_transcript_path(path) == "react_native"
 
 
 def test_wing_from_transcript_path_fallback_collapses_worktree():
@@ -877,8 +1066,8 @@ def test_wing_from_transcript_path_fallback_collapses_worktree():
         "-Users-u-projects-gsd-core--claude-worktrees-hardcore-wilbur-48691a/x.jsonl"
     )
     non_worktree_path = "/Users/u/.claude/projects/-Users-u-projects-gsd-core/x.jsonl"
-    assert _wing_from_transcript_path(worktree_path) == "wing_gsd_core"
-    assert _wing_from_transcript_path(non_worktree_path) == "wing_gsd_core"
+    assert _wing_from_transcript_path(worktree_path) == "gsd_core"
+    assert _wing_from_transcript_path(non_worktree_path) == "gsd_core"
 
 
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
@@ -898,7 +1087,7 @@ def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):
         '{"type":"user","cwd":"/home/igor/dev/MemPalace/mempalace","content":"hi"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_mempalace"
+    assert _wing_from_transcript_path(str(transcript)) == "mempalace"
 
 
 def test_wing_from_transcript_path_cwd_with_hyphenated_project(tmp_path):
@@ -911,7 +1100,7 @@ def test_wing_from_transcript_path_cwd_with_hyphenated_project(tmp_path):
         '{"type":"user","cwd":"/Users/me/git/claude-code","content":"hi"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_claude_code"
+    assert _wing_from_transcript_path(str(transcript)) == "claude_code"
 
 
 def test_wing_from_transcript_path_cwd_skips_lines_without_cwd(tmp_path):
@@ -929,7 +1118,7 @@ def test_wing_from_transcript_path_cwd_skips_lines_without_cwd(tmp_path):
     ]
     transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
     # First cwd record wins (line 4, real-project).
-    assert _wing_from_transcript_path(str(transcript)) == "wing_real_project"
+    assert _wing_from_transcript_path(str(transcript)) == "real_project"
 
 
 def test_wing_from_transcript_path_cwd_falls_back_when_no_cwd_in_jsonl(tmp_path):
@@ -946,7 +1135,7 @@ def test_wing_from_transcript_path_cwd_falls_back_when_no_cwd_in_jsonl(tmp_path)
     # won't match and we hit the wing_sessions default. The point of this
     # test: the cwd reader doesn't crash and returns None cleanly.
     result = _wing_from_transcript_path(str(transcript))
-    assert result == "wing_sessions"
+    assert result == "sessions"
 
 
 def test_wing_from_transcript_path_cwd_handles_malformed_jsonl(tmp_path):
@@ -960,13 +1149,13 @@ def test_wing_from_transcript_path_cwd_handles_malformed_jsonl(tmp_path):
         '{"type":"valid","cwd":"/Users/me/git/clean-name","content":"ok"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_clean_name"
+    assert _wing_from_transcript_path(str(transcript)) == "clean_name"
 
 
 def test_wing_from_transcript_path_cwd_handles_missing_file():
     """Nonexistent transcript path falls back cleanly to the encoded heuristic."""
     path = "/Users/me/.claude/projects/-Users-me-claude-code/does-not-exist.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_claude_code"
+    assert _wing_from_transcript_path(path) == "claude_code"
 
 
 def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
@@ -980,58 +1169,58 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
         '{"type":"x","cwd":"/Users/me/git/proper-name"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_proper_name"
+    assert _wing_from_transcript_path(str(transcript)) == "proper_name"
 
 
-# --- _safe_wing_slug: special-character project dirs (e.g. +project) ---
+# --- _wing_slug: special-character project dirs (e.g. +project) ---
 
 
-def test_safe_wing_slug_strips_leading_plus():
+def test_wing_slug_strips_leading_plus():
     """Regression: a ``+``-prefixed folder (e.g. ``+project``) leaked ``+`` into the
     slug, producing ``wing_+project`` which ``sanitize_name`` rejects — silently
     breaking diary auto-save for that project."""
-    assert _safe_wing_slug("+project") == "project"
+    assert _wing_slug("+project") == "project"
 
 
-def test_safe_wing_slug_replaces_inner_special_chars():
-    assert _safe_wing_slug("foo+bar") == "foo_bar"
+def test_wing_slug_replaces_inner_special_chars():
+    assert _wing_slug("foo+bar") == "foo_bar"
 
 
-def test_safe_wing_slug_preserves_space_and_hyphen_behavior():
+def test_wing_slug_preserves_space_and_hyphen_behavior():
     # spaces and hyphens still collapse to underscores (no regression)
-    assert _safe_wing_slug("React Native") == "react_native"
-    assert _safe_wing_slug("claude-code") == "claude_code"
+    assert _wing_slug("React Native") == "react_native"
+    assert _wing_slug("claude-code") == "claude_code"
 
 
-def test_safe_wing_slug_preserves_existing_valid_names():
+def test_wing_slug_preserves_existing_valid_names():
     """Backward compatibility: a name that already produced a valid wing keeps the
     same slug, so previously-filed diary entries aren't orphaned (AGENTS.md: never
     destroy existing data). ``.`` and ``'`` are both accepted by sanitize_name and
     must survive."""
-    assert _safe_wing_slug("myapp") == "myapp"
-    assert _safe_wing_slug("my.app") == "my.app"
-    assert _safe_wing_slug("v1.2.3") == "v1.2.3"
-    assert _safe_wing_slug("o'brien") == "o'brien"
+    assert _wing_slug("myapp") == "myapp"
+    assert _wing_slug("my.app") == "my.app"
+    assert _wing_slug("v1.2.3") == "v1.2.3"
+    assert _wing_slug("o'brien") == "o'brien"
 
 
-def test_safe_wing_slug_collapses_double_dots():
+def test_wing_slug_collapses_double_dots():
     """``..`` must collapse — sanitize_name rejects it as path traversal."""
-    assert _safe_wing_slug("my..app") == "my.app"
-    assert _safe_wing_slug("..hidden..") == "hidden"
+    assert _wing_slug("my..app") == "my.app"
+    assert _wing_slug("..hidden..") == "hidden"
 
 
-def test_safe_wing_slug_caps_length_for_sanitize_name():
+def test_wing_slug_caps_length_for_sanitize_name():
     """sanitize_name rejects names over 128 chars; the slug stays short enough that
     wing_<slug> never trips that limit, even for very long directory names."""
-    slug = _safe_wing_slug("a" * 500)
+    slug = _wing_slug("a" * 500)
     assert len(slug) <= 120
     sanitize_name(f"wing_{slug}")  # must not raise
 
 
-def test_safe_wing_slug_falls_back_to_sessions_when_empty():
+def test_wing_slug_falls_back_to_sessions_when_empty():
     # names made entirely of disallowed characters reduce to nothing
-    assert _safe_wing_slug("+") == "sessions"
-    assert _safe_wing_slug("@#$") == "sessions"
+    assert _wing_slug("+") == "sessions"
+    assert _wing_slug("@#$") == "sessions"
 
 
 def test_wing_from_transcript_path_cwd_plus_prefixed_dir(tmp_path):
@@ -1044,20 +1233,20 @@ def test_wing_from_transcript_path_cwd_plus_prefixed_dir(tmp_path):
         '{"type":"user","cwd":"/Users/me/code/+project","content":"hi"}\n',
         encoding="utf-8",
     )
-    assert _wing_from_transcript_path(str(transcript)) == "wing_project"
+    assert _wing_from_transcript_path(str(transcript)) == "project"
 
 
 def test_wing_from_transcript_path_legacy_plus_prefixed_project():
     """Legacy ``-Projects-<name>`` path with a ``+``-prefixed project folder."""
     path = "/Users/me/foo/-Projects-+app/session.jsonl"
-    assert _wing_from_transcript_path(path) == "wing_app"
+    assert _wing_from_transcript_path(path) == "app"
 
 
 @given(st.text(min_size=1, max_size=300))
-def test_safe_wing_slug_always_yields_sanitizable_wing(name):
+def test_wing_slug_always_yields_sanitizable_wing(name):
     """Property: for ANY non-empty input, ``wing_<slug>`` must pass sanitize_name —
     the entire contract of the helper (a rejected wing silently breaks auto-save)."""
-    wing = f"wing_{_safe_wing_slug(name)}"
+    wing = f"wing_{_wing_slug(name)}"
     assert sanitize_name(wing) == wing
 
 
@@ -2310,7 +2499,7 @@ def test_session_end_uses_detached_paths_not_sync_mine(tmp_path):
     mock_auto.assert_called_once()
     mock_sync.assert_not_called()
     mock_save.assert_called_once_with(
-        expected_path, "sess", wing="wing_sessions", toast=False, agent_name="claude"
+        expected_path, "sess", wing="sessions", toast=False, agent_name="claude"
     )
     # The session is over; its per-session save marker is cleared.
     assert not last_save_file.exists()
@@ -2526,15 +2715,39 @@ def test_session_end_checkpoint_visible_to_diary_read(
     with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
         mock_cfg_cls.return_value.hooks_auto_save = True
         mock_cfg_cls.return_value.hook_desktop_toast = False
-        # Mock only the detached subprocess mines; run the REAL diary write.
+        spawned = {}
+
+        def _fake_popen(cmd, **kwargs):
+            spawned.setdefault("cmds", []).append(list(cmd))
+
+            class _Proc:
+                pid = os.getpid()
+
+            return _Proc()
+
+        # Mines stay detached. The diary child is recorded, then filed here
+        # so the test does not wait on a second interpreter.
         with (
             patch("mempalace.hooks_cli._ingest_transcript"),
             patch("mempalace.hooks_cli._maybe_auto_ingest"),
+            patch("mempalace.hooks_cli.subprocess.Popen", _fake_popen),
         ):
             hook_session_end(
                 {"session_id": "sessX", "transcript_path": str(transcript)},
                 "claude-code",
             )
+    diary_cmds = [
+        cmd for cmd in spawned.get("cmds", []) if "run_detached_diary_checkpoint" in " ".join(cmd)
+    ]
+    assert diary_cmds
+    # The foreground left the mines to the child.
+    assert len(spawned["cmds"]) == 1
+    with (
+        patch("mempalace.hooks_cli._ingest_transcript") as ingest,
+        patch("mempalace.hooks_cli._maybe_auto_ingest"),
+    ):
+        hooks_cli_mod.run_detached_diary_checkpoint(diary_cmds[0][-1])
+    ingest.assert_called_once_with(str(transcript))
 
     visible = tool_diary_read(agent_name="claude")
     assert visible.get("total", 0) >= 1
@@ -2641,7 +2854,7 @@ def test_regular_file_at_palace_root_treated_as_absent(tmp_path, monkeypatch):
     assert fake_root.read_text() == "oops, this is a file not a directory"
 
 
-# --- _ingest_wing: hook-ingested transcripts file under the project wing ---
+# --- _project_wing: hook-ingested transcripts file under the project wing ---
 
 
 def _write_transcript_with_cwd(tmp_path, cwd, name="s.jsonl"):
@@ -2655,41 +2868,41 @@ def _write_transcript_with_cwd(tmp_path, cwd, name="s.jsonl"):
     return str(path)
 
 
-def test_ingest_wing_uses_the_project_from_cwd(tmp_path):
-    from mempalace.hooks_cli import _ingest_wing
+def test_project_wing_uses_the_project_from_cwd(tmp_path):
+    from mempalace.hooks_cli import _project_wing
 
     path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/mempalace")
-    assert _ingest_wing(path) == "mempalace"
+    assert _project_wing(path) == "mempalace"
 
 
-def test_ingest_wing_collapses_worktrees_and_hyphens(tmp_path):
-    from mempalace.hooks_cli import _ingest_wing
+def test_project_wing_collapses_worktrees_and_hyphens(tmp_path):
+    from mempalace.hooks_cli import _project_wing
 
     path = _write_transcript_with_cwd(tmp_path, "/Users/me/dev/acme-app/.claude/worktrees/x")
-    assert _ingest_wing(path) == "acme_app"
+    assert _project_wing(path) == "acme_app"
 
 
-def test_ingest_wing_home_directory_sessions_go_to_the_workstation(tmp_path, monkeypatch):
+def test_project_wing_home_directory_sessions_go_to_the_workstation(tmp_path, monkeypatch):
     from mempalace import hooks_cli
 
     monkeypatch.setattr(hooks_cli.Path, "home", classmethod(lambda cls: Path("/Users/me")))
     path = _write_transcript_with_cwd(tmp_path, "/Users/me/")
     monkeypatch.setattr(hooks_cli.sys, "platform", "darwin")
-    assert hooks_cli._ingest_wing(path) == "mac_workstation"
+    assert hooks_cli._project_wing(path) == "mac_workstation"
     monkeypatch.setattr(hooks_cli.sys, "platform", "win32")
-    assert hooks_cli._ingest_wing(path) == "windows_workstation"
+    assert hooks_cli._project_wing(path) == "windows_workstation"
     monkeypatch.setattr(hooks_cli.sys, "platform", "linux")
-    assert hooks_cli._ingest_wing(path) == "linux_workstation"
+    assert hooks_cli._project_wing(path) == "linux_workstation"
 
 
-def test_ingest_wing_falls_back_to_the_encoded_folder_then_sessions(tmp_path):
-    from mempalace.hooks_cli import _ingest_wing
+def test_project_wing_falls_back_to_the_encoded_folder_then_sessions(tmp_path):
+    from mempalace.hooks_cli import _project_wing
 
     path = tmp_path / ".claude" / "projects" / "-Users-me-dev-thing" / "no-cwd.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"type": "queue-operation"}) + "\n", encoding="utf-8")
-    assert _ingest_wing(str(path)) == "thing"
-    assert _ingest_wing("/some/random/path.jsonl") == "sessions"
+    assert _project_wing(str(path)) == "thing"
+    assert _project_wing("/some/random/path.jsonl") == "sessions"
 
 
 def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch):

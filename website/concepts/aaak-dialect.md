@@ -84,6 +84,10 @@ mempalace compress --wing myapp --dry-run
 mempalace compress --wing myapp
 ```
 
+The summaries are stored in their own `mempalace_aaak` collection, one row per
+drawer with `kind="aaak"`. They don't affect search, and the drawers keep their
+verbatim text.
+
 ### With entity config
 
 ```bash

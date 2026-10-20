@@ -31,7 +31,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # A synthetic but realistic Claude Code transcript fixture. Three persona
 # names appear repeatedly in dialogue patterns that the v3.3.3
 # entity_detector treats as person-evidence (dialogue markers, action verbs,
@@ -1691,9 +1690,9 @@ def test_merge_tier_fields_no_llm_provider_returns_heuristic_only():
     path), behavior is identical to today — heuristic-only result, no
     merge logic fires. This pins the v3.3.4 contract.
     """
-    from mempalace.cli import _run_pass_zero
-
     import tempfile
+
+    from mempalace.cli import _run_pass_zero
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         project_dir = Path(tmp_dir) / "project"

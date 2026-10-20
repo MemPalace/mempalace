@@ -3,14 +3,20 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
-def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> dict:
+def _internal_tool_error(
+    req_id, tool_name: str, exc: BaseException = None, include_message: bool = False
+) -> dict:
+    """A -32000 reply naming the exception class; its text only when asked.
+
+    ``str(exc)`` can carry paths and internals, so a client sees it only for an
+    input refusal (ValueError) or on an internal path such as the daemon.
+    """
     logger.exception(f"Tool error in {tool_name}")
     error: dict = {"code": -32000, "message": "Internal tool error"}
     if exc is not None:
-        error["data"] = {
-            "error_class": type(exc).__name__,
-            "message": str(exc),
-        }
+        error["data"] = {"error_class": type(exc).__name__}
+        if include_message:
+            error["data"]["message"] = str(exc)
     return {
         "jsonrpc": "2.0",
         "id": req_id,
@@ -19,7 +25,7 @@ def _internal_tool_error(req_id, tool_name: str, exc: BaseException = None) -> d
 
 
 def _mcp_read_only_refusal(req_id, tool_name: str):
-    """Refuse state-changing tools when the server runs in read-only mode (#1877).
+    """Refuse state-changing tools when the server runs in read-only mode.
 
     Read-only is an operator-set server mode (``--read-only`` /
     ``MEMPALACE_MCP_READ_ONLY``), distinct from the dynamic peer-writer lock:
@@ -48,7 +54,7 @@ def _mcp_read_only_refusal(req_id, tool_name: str):
 def _mcp_diverged_index_refusal(req_id, tool_name: str):
     """Refuse vector writes while the HNSW segment is known to be diverged.
 
-    The capacity probe (#1222) already routes *reads* around a diverged index:
+    The capacity probe already routes *reads* around a diverged index:
     ``search`` and ``check_duplicate`` fall back to BM25-only sqlite. Writes had
     no such gate — they went straight to chromadb, where an upsert into that same
     index can never come back. Observed on a 3.7.0 palace whose flushed segment
@@ -549,13 +555,13 @@ def _stale_library_payload() -> dict:
             )
     if inactive:
         payload["unreadable"] = inactive
-    if drift and _truthy_env(_MCP_ALLOW_STALE_LIBRARY_ENV):
+    if drift and env_bool(_MCP_ALLOW_STALE_LIBRARY_ENV, False):
         payload["gate_disabled_by"] = _MCP_ALLOW_STALE_LIBRARY_ENV
     return payload
 
 
 def _mcp_stale_library_refusal(req_id, tool_name: str):
-    """Refuse mutating tools once the served code is no longer what is installed (#899).
+    """Refuse mutating tools once the served code is no longer what is installed.
 
     Reads stay available on purpose: the palace itself is intact at this point,
     and a user who has just been told to restart still needs ``status`` and
@@ -569,7 +575,7 @@ def _mcp_stale_library_refusal(req_id, tool_name: str):
     if tool_name not in _MUTATING_TOOLS:
         return None
 
-    if _truthy_env(_MCP_ALLOW_STALE_LIBRARY_ENV):
+    if env_bool(_MCP_ALLOW_STALE_LIBRARY_ENV, False):
         return None
 
     drift, _unreadable = _stale_library_report()
@@ -731,9 +737,280 @@ def _tool_catalog_entry(name: str, tool: dict) -> dict:
         "description": tool["description"],
         "inputSchema": tool["input_schema"],
     }
-    if tool.get("read_only"):
+    if _tool_capabilities.classify_tool(name) == "read":
         entry["annotations"] = {"readOnlyHint": True}
     return entry
+
+
+class ToolArgumentError(ValueError):
+    """An argument does not fit the tool's input schema."""
+
+
+_BOOL_WORDS = {"true": True, "yes": True, "on": True, "1": True}
+_BOOL_WORDS.update({"false": False, "no": False, "off": False, "0": False})
+_INT_TEXT = re.compile(r"[+-]?[0-9]+")
+# Array/object arguments sent as JSON text are parsed only up to this size.
+_JSON_TEXT_LIMIT = 1_000_000
+
+
+def _as_integer(value, schema, where):
+    try:
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        elif isinstance(value, str) and _INT_TEXT.fullmatch(value.strip()):
+            value = int(value.strip())
+    except (ValueError, OverflowError):
+        # Past Python's integer-string digit limit.
+        raise ToolArgumentError(f"'{where}' is too large") from None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ToolArgumentError(f"'{where}' must be an integer")
+    return value
+
+
+def _as_number(value, schema, where):
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            raise ToolArgumentError(f"'{where}' must be a number") from None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ToolArgumentError(f"'{where}' must be a number")
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ToolArgumentError(f"'{where}' must be a finite number")
+    return value
+
+
+def _as_boolean(value, schema, where):
+    # A truthy "false" must never reach a handler as True.
+    if isinstance(value, str) and value.strip().lower() in _BOOL_WORDS:
+        value = _BOOL_WORDS[value.strip().lower()]
+    elif type(value) is int and value in (0, 1):
+        value = bool(value)
+    if not isinstance(value, bool):
+        raise ToolArgumentError(f"'{where}' must be true or false")
+    return value
+
+
+def _as_string(value, schema, where):
+    if type(value) is int:
+        value = str(value)
+    if not isinstance(value, str):
+        raise ToolArgumentError(f"'{where}' must be a string")
+    return value
+
+
+def _as_container(value, schema, where):
+    expected = schema["type"]
+    container = list if expected == "array" else dict
+    if isinstance(value, str):
+        if len(value) > _JSON_TEXT_LIMIT:
+            raise ToolArgumentError(f"'{where}' is too large to read as an {expected}")
+        try:
+            parsed = json.loads(value)
+        except (ValueError, RecursionError):
+            parsed = None
+        if isinstance(parsed, container):
+            value = parsed
+    if not isinstance(value, container):
+        raise ToolArgumentError(f"'{where}' must be an {expected}")
+    items = schema.get("items")
+    if expected == "array" and isinstance(items, dict) and items.get("type"):
+        value = [_coerce_argument(v, items, f"{where}[{i}]") for i, v in enumerate(value)]
+    return value
+
+
+_COERCERS = {
+    "integer": _as_integer,
+    "number": _as_number,
+    "boolean": _as_boolean,
+    "string": _as_string,
+    "array": _as_container,
+    "object": _as_container,
+}
+
+
+# A property marked strict is never converted: "true", 1 or null is refused,
+# not read as true or as absent. For switches that widen what is mined or
+# searched, a sloppy value must not opt in.
+STRICT_SCHEMA_KEY = "x-mempalace-strict"
+_STRICT_TYPES = {
+    "boolean": bool,
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "array": list,
+    "object": dict,
+}
+
+
+def _check_strict(value, schema, where):
+    expected = schema.get("type")
+    wanted = _STRICT_TYPES.get(expected)
+    if wanted is None:
+        return value
+    if not isinstance(value, wanted) or (isinstance(value, bool) and expected != "boolean"):
+        raise ToolArgumentError(f"'{where}' must be a JSON {expected}")
+    items = schema.get("items")
+    if expected == "array" and isinstance(items, dict) and items.get("type"):
+        value = [
+            _coerce_argument(v, items, f"{where}[{i}]", strict=True) for i, v in enumerate(value)
+        ]
+    return value
+
+
+def _coerce_argument(value, schema: dict, where: str, strict: bool = False):
+    """Return ``value`` as the type ``schema`` declares, or raise ToolArgumentError.
+
+    JSON clients send integers as floats or strings and booleans as "false";
+    those are converted unless the property is strict.
+    """
+    coerce = _COERCERS.get(schema.get("type"))
+    if strict or schema.get(STRICT_SCHEMA_KEY):
+        value = _check_strict(value, schema, where)
+    elif coerce is not None:
+        value = coerce(value, schema, where)
+    if "enum" in schema and value not in schema["enum"]:
+        allowed = ", ".join(repr(v) for v in schema["enum"])
+        raise ToolArgumentError(f"'{where}' must be one of {allowed}")
+    if coerce in (_as_integer, _as_number):
+        if "minimum" in schema and value < schema["minimum"]:
+            raise ToolArgumentError(f"'{where}' must be at least {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            raise ToolArgumentError(f"'{where}' must be at most {schema['maximum']}")
+    if coerce is _as_string and len(value) > schema.get("maxLength", len(value)):
+        raise ToolArgumentError(f"'{where}' must be at most {schema['maxLength']} characters")
+    return value
+
+
+def validate_tool_arguments(tool_name: str, arguments: dict) -> dict:
+    """Coerce and check ``arguments`` against the tool's input schema.
+
+    Shared by every entry point that runs a tool handler (stdio, HTTP, the
+    daemon and the light server), so a value is judged the same way whichever
+    door it came through. A JSON null means "not supplied", so the handler's
+    default applies, except on a strict property, where it is refused. Keys
+    the schema does not declare pass through untouched; filtering them is the
+    caller's job.
+    """
+    props = TOOLS[tool_name]["input_schema"].get("properties", {})
+    checked = {}
+    for key, value in arguments.items():
+        schema = props.get(key)
+        if value is None and not (schema or {}).get(STRICT_SCHEMA_KEY):
+            continue
+        checked[key] = value if schema is None else _coerce_argument(value, schema, key)
+    return checked
+
+
+def call_tool(req_id, params: dict, internal: bool = False):
+    """Validate, gate, and run one tools/call.
+
+    Returns ``(error_response, None)`` when the call is refused or fails, and
+    ``(None, result)`` with the handler's raw result otherwise. The stdio and
+    HTTP transports wrap the result as MCP text content; the daemon keeps the
+    dict as its job result.
+
+    A handler exception reaches a client as its class only, never ``str(exc)``,
+    except a ValueError, which tools raise to refuse an input. ``internal``
+    callers (the daemon's job record) keep every message.
+    """
+    if not isinstance(params, dict) or "name" not in params:
+        return _json_rpc_error(
+            req_id, -32602, "Invalid params: 'name' is required for tools/call"
+        ), None
+    if _tool_call_members_invalid(params):
+        return _json_rpc_error(
+            req_id,
+            -32602,
+            "Invalid params: 'name' must be a string and 'arguments' an object",
+        ), None
+    tool_name = params.get("name")
+    tool_args = params.get("arguments") or {}
+    if tool_name not in TOOLS:
+        return _json_rpc_error(req_id, -32601, f"Unknown tool: {tool_name}"), None
+    # Whitelist arguments to declared schema properties only.
+    # Prevents callers from spoofing internal params like added_by/source_file.
+    # Skip filtering if handler explicitly accepts **kwargs (pass-through).
+    # Default to filtering on inspect failure (safe fallback).
+    import inspect
+
+    schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
+    try:
+        handler = TOOLS[tool_name]["handler"]
+        sig = inspect.signature(handler)
+        accepts_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except (ValueError, TypeError):
+        accepts_var_keyword = False
+    if not accepts_var_keyword:
+        # An unknown kwarg here is almost always a wrong parameter *name*
+        # (e.g. text= instead of content=). Silently dropping it makes the
+        # cause surface only indirectly as a later "Missing required 'X'",
+        # so name it explicitly — symmetric with the missing-required path
+        # below. wait_for_previous is an internal transport kwarg in no
+        # tool schema; it is popped before dispatch further down, so it
+        # must not be reported as unknown here.
+        unknown = [k for k in tool_args if k not in schema_props and k != "wait_for_previous"]
+        if unknown:
+            quoted = ", ".join(f"'{k}'" for k in unknown)
+            word = "parameter" if len(unknown) == 1 else "parameters"
+            logger.debug("Tool %s: unknown %s %s", tool_name, word, quoted)
+            return _json_rpc_error(
+                req_id, -32602, f"Unknown {word} {quoted} for tool {tool_name}"
+            ), None
+        tool_args = {k: v for k, v in tool_args.items() if k in schema_props}
+    try:
+        tool_args = validate_tool_arguments(tool_name, tool_args)
+    except ToolArgumentError as e:
+        return _json_rpc_error(req_id, -32602, f"Invalid params for tool {tool_name}: {e}"), None
+    tool_args.pop("wait_for_previous", None)
+    preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
+    if preflight_error is not None:
+        return preflight_error, None
+
+    # 'content' is an accepted alias for diary_write's 'entry' (callers often
+    # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
+    # content-only call still satisfies the required 'entry' param while the
+    # signature-based missing-parameter diagnostic (-32602) keeps working.
+    # 'entry' wins if both are supplied.
+    if tool_name == "mempalace_diary_write" and "content" in tool_args:
+        content_val = tool_args.pop("content")
+        # Only fill from the alias when the caller did not supply 'entry' at
+        # all (or passed it as null). An explicit entry — even "" — wins.
+        if "entry" not in tool_args or tool_args["entry"] is None:
+            tool_args["entry"] = content_val
+    try:
+        with _write_stall_watch(tool_name):
+            return None, _decorate_mcp_tool_result(
+                tool_name, TOOLS[tool_name]["handler"](**tool_args)
+            )
+    except TypeError as e:
+        # Qualname match prevents leaking internal helper/param names raised
+        # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
+        msg = str(e)
+        handler = TOOLS[tool_name]["handler"]
+        handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
+        # Qualname can include "<locals>" for nested defs and "<lambda>"
+        # for lambdas — accept Python's TypeError emit verbatim.
+        m_missing = re.match(
+            r"^([\w\.<>]+)\(\) missing \d+ required "
+            r"(?:positional |keyword-only )?arguments?: (.+)$",
+            msg,
+        )
+        if m_missing and m_missing.group(1) == handler_qn:
+            names = re.findall(r"'(\w+)'", m_missing.group(2))
+            if names:
+                quoted = ", ".join(f"'{n}'" for n in names)
+                word = "parameter" if len(names) == 1 else "parameters"
+                logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
+                return _json_rpc_error(
+                    req_id, -32602, f"Missing required {word} {quoted} for tool {tool_name}"
+                ), None
+        return _internal_tool_error(req_id, tool_name, e, include_message=internal), None
+    except Exception as exc:
+        expose = internal or isinstance(exc, ValueError)
+        return _internal_tool_error(req_id, tool_name, exc, include_message=expose), None
 
 
 def handle_request(request):
@@ -764,14 +1041,14 @@ def handle_request(request):
                 "serverInfo": {"name": "mempalace", "version": __version__},
             },
         }
-    elif method == "ping":
+    if method == "ping":
         return {"jsonrpc": "2.0", "id": req_id, "result": {}}
-    elif method.startswith("notifications/"):
+    if method.startswith("notifications/"):
         # Notifications (no id) never get a response per JSON-RPC spec
         return None
-    elif method == "tools/list":
+    if method == "tools/list":
         # In read-only mode, hide the refused tools so clients don't advertise
-        # write capabilities they can't use (dispatch also refuses them, #1877).
+        # write capabilities they can't use (dispatch also refuses them).
         # Same set on both sides, or a tool would be listed and then rejected.
         return {
             "jsonrpc": "2.0",
@@ -784,137 +1061,9 @@ def handle_request(request):
                 ]
             },
         }
-    elif method == "tools/call":
-        if not isinstance(params, dict) or "name" not in params:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid params: 'name' is required for tools/call",
-                },
-            }
-        if _tool_call_members_invalid(params):
-            return _json_rpc_error(
-                req_id,
-                -32602,
-                "Invalid params: 'name' must be a string and 'arguments' an object",
-            )
-        tool_name = params.get("name")
-        tool_args = params.get("arguments") or {}
-        if tool_name not in TOOLS:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
-            }
-        # Whitelist arguments to declared schema properties only.
-        # Prevents callers from spoofing internal params like added_by/source_file.
-        # Skip filtering if handler explicitly accepts **kwargs (pass-through).
-        # Default to filtering on inspect failure (safe fallback).
-        import inspect
-
-        schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
-        try:
-            handler = TOOLS[tool_name]["handler"]
-            sig = inspect.signature(handler)
-            accepts_var_keyword = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-        except (ValueError, TypeError):
-            accepts_var_keyword = False
-        if not accepts_var_keyword:
-            # An unknown kwarg here is almost always a wrong parameter *name*
-            # (e.g. text= instead of content=). Silently dropping it makes the
-            # cause surface only indirectly as a later "Missing required 'X'",
-            # so name it explicitly — symmetric with the missing-required path
-            # below. wait_for_previous is an internal transport kwarg in no
-            # tool schema; it is popped before dispatch further down, so it
-            # must not be reported as unknown here.
-            unknown = [k for k in tool_args if k not in schema_props and k != "wait_for_previous"]
-            if unknown:
-                quoted = ", ".join(f"'{k}'" for k in unknown)
-                word = "parameter" if len(unknown) == 1 else "parameters"
-                logger.debug("Tool %s: unknown %s %s", tool_name, word, quoted)
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32602,
-                        "message": f"Unknown {word} {quoted} for tool {tool_name}",
-                    },
-                }
-            tool_args = {k: v for k, v in tool_args.items() if k in schema_props}
-        # Coerce argument types based on input_schema.
-        # MCP JSON transport may deliver integers as floats or strings;
-        # ChromaDB and Python slicing require native int.
-        for key, value in list(tool_args.items()):
-            prop_schema = schema_props.get(key, {})
-            declared_type = prop_schema.get("type")
-            try:
-                if declared_type == "integer" and not isinstance(value, int):
-                    tool_args[key] = int(value)
-                elif declared_type == "number" and not isinstance(value, (int, float)):
-                    tool_args[key] = float(value)
-            except (ValueError, TypeError):
-                return {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
-                }
-        tool_args.pop("wait_for_previous", None)
-        preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
-        if preflight_error is not None:
-            return preflight_error
-
-        # 'content' is an accepted alias for diary_write's 'entry' (callers often
-        # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
-        # content-only call still satisfies the required 'entry' param while the
-        # signature-based missing-parameter diagnostic (-32602) keeps working.
-        # 'entry' wins if both are supplied.
-        if tool_name == "mempalace_diary_write" and "content" in tool_args:
-            content_val = tool_args.pop("content")
-            # Only fill from the alias when the caller did not supply 'entry' at
-            # all (or passed it as null). An explicit entry — even "" — wins.
-            if "entry" not in tool_args or tool_args["entry"] is None:
-                tool_args["entry"] = content_val
-        try:
-            with _write_stall_watch(tool_name):
-                result = _decorate_mcp_tool_result(
-                    tool_name, TOOLS[tool_name]["handler"](**tool_args)
-                )
-
-            return _tool_call_response(req_id, result)
-        except TypeError as e:
-            # Qualname match prevents leaking internal helper/param names raised
-            # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
-            msg = str(e)
-            handler = TOOLS[tool_name]["handler"]
-            handler_qn = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", "")
-            # Qualname can include "<locals>" for nested defs and "<lambda>"
-            # for lambdas — accept Python's TypeError emit verbatim.
-            m_missing = re.match(
-                r"^([\w\.<>]+)\(\) missing \d+ required "
-                r"(?:positional |keyword-only )?arguments?: (.+)$",
-                msg,
-            )
-            if m_missing and m_missing.group(1) == handler_qn:
-                names = re.findall(r"'(\w+)'", m_missing.group(2))
-                if names:
-                    quoted = ", ".join(f"'{n}'" for n in names)
-                    word = "parameter" if len(names) == 1 else "parameters"
-                    logger.debug("Tool %s: missing required %s %s", tool_name, word, quoted)
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "error": {
-                            "code": -32602,
-                            "message": f"Missing required {word} {quoted} for tool {tool_name}",
-                        },
-                    }
-            return _internal_tool_error(req_id, tool_name, e)
-        except Exception as exc:
-            return _internal_tool_error(req_id, tool_name, exc)
+    if method == "tools/call":
+        refusal, result = call_tool(req_id, params)
+        return refusal if refusal is not None else _tool_call_response(req_id, result)
 
     # Notifications (missing id) must never get a response
     if req_id is None:
@@ -923,7 +1072,7 @@ def handle_request(request):
 
 
 def _restore_stdout():
-    """Restore real stdout for MCP JSON-RPC output (see issue #225)."""
+    """Restore real stdout for MCP JSON-RPC output."""
     global _REAL_STDOUT, _REAL_STDOUT_FD
     if _REAL_STDOUT_FD is not None:
         try:
@@ -935,8 +1084,6 @@ def _restore_stdout():
     sys.stdout = _REAL_STDOUT
 
 
-_WARMUP_TRUTHY = {"1", "true", "yes", "on"}
-_WARMUP_FALSY = {"", "0", "false", "no", "off"}
 # Sentinel text for the warmup query. Distinctive so it cannot semantically
 # match real drawer content (e.g. a palace containing notes about "warmup"
 # routines) and is greppable in chromadb debug logs if the team ever adds
@@ -968,7 +1115,7 @@ def _maybe_eager_warmup_embedder() -> None:
     ``add_drawer``, ``search``) otherwise pays two compounding cold-load
     costs that together can exceed the MCP client timeout and surface as
     ``-32000`` "Internal tool error" with no recoverable trace on the
-    agent side (#1495):
+    agent side:
 
     1. ONNX/CoreML embedder init in :func:`mempalace.embedding.get_embedding_function`
        (5–30s on first inference; ChromaDB's ``ONNXMiniLM_L6_V2.__call__``
@@ -977,9 +1124,9 @@ def _maybe_eager_warmup_embedder() -> None:
        first collection operation; seconds on palaces of 50k+ drawers).
 
     Warming via :func:`_get_collection`'s collection-then-query path
-    covers BOTH in a single startup-phase call — mirroring the reporter's
-    proposal in #1495 — so users with large existing palaces see the
-    same benefit as users on the embedder-only cost path.
+    covers BOTH in a single startup-phase call, so users with large
+    existing palaces see the same benefit as users on the embedder-only
+    cost path.
 
     Truthy parsing accepts ``1/true/yes/on`` (case-insensitive); falsy
     set ``0/false/no/off`` and empty/whitespace are silently off; any
@@ -1021,16 +1168,9 @@ def _maybe_eager_warmup_embedder() -> None:
     has zero cold-load cost; nothing was skipped that the first real tool
     call would have paid.
     """
-    raw = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
-    if raw in _WARMUP_FALSY:
+    if not env_bool("MEMPALACE_EAGER_WARMUP", False):
         return
-    if raw not in _WARMUP_TRUTHY:
-        logger.warning(
-            "MEMPALACE_EAGER_WARMUP=%r is not recognized (use one of %s); warmup disabled",
-            raw,
-            sorted(_WARMUP_TRUTHY | (_WARMUP_FALSY - {""})),
-        )
-        return
+    raw = env_str("MEMPALACE_EAGER_WARMUP")
     palace_path = _config.palace_path
     try:
         backend_name = _selected_backend_name()
@@ -1105,19 +1245,13 @@ _WRITE_STALL_EXIT_DEFAULT = 0.0
 _WRITE_STALL_EXIT_CODE = 75
 
 _write_stall_lock = threading.Lock()
-# Optional[dict]: {"tool": str, "since": float(monotonic), "warned": bool}
+# None, or the write in flight: its tool name, its monotonic start time
+# ("since") and whether a stall warning was already logged ("warned").
 _write_stall_inflight: Optional[dict] = None
 
 
 def _write_stall_secs(env_name: str, default: float) -> float:
-    raw = os.environ.get(env_name, "")
-    if not raw.strip():
-        return default
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        logger.warning("%s=%r is not a number; using %.0fs", env_name, raw, default)
-        return default
+    return max(0.0, env_float(env_name, default))
 
 
 def _write_stall_action(elapsed: float, warn_secs: float, exit_secs: float, warned: bool):
@@ -1223,17 +1357,17 @@ def _start_write_stall_watchdog() -> None:
 def _exit_running_registered_cleanup() -> None:
     """Exit the process from a daemon thread, WITH the `atexit` handlers.
 
-    `os._exit` alone skipped them, so the idle watchdog left
-    `serverinfo.json` advertising a dead PID -- measured in #2500 at 2 days
-    8 hours of a stale record. Two handlers are registered by the time this
+    `os._exit` alone skips them, so the idle watchdog would leave
+    `serverinfo.json` advertising a dead PID for days. Two handlers are
+    registered by the time this
     can fire: `server_registry.clear_serverinfo` (http.py) and
     `_release_mcp_writer_lock` (_guards.py).
 
-    NOT `sys.exit(0)`, which #2500 suggests. This runs in a DAEMON THREAD,
+    NOT `sys.exit(0)`. This runs in a DAEMON THREAD,
     where `SystemExit` unwinds that thread and nothing else -- measured: the
     process stays alive and the watchdog, having returned out of its own
     loop, never fires again. That trades a stale `serverinfo.json` for the
-    file-handle accumulation the watchdog exists to prevent (#1552).
+    file-handle accumulation the watchdog exists to prevent.
 
     `atexit._run_exitfuncs` is private, and deliberate: the public surface
     has no "run the handlers now" and the alternative -- calling the two
@@ -1257,7 +1391,7 @@ def _start_idle_exit_watchdog() -> None:
     When no request has been handled for ``MEMPALACE_MCP_IDLE_HOURS``
     (default 8 h), the thread terminates the process so that stale MCP
     servers from ended Claude Code sessions do not accumulate ChromaDB /
-    HNSW file handles on Windows (#1552).
+    HNSW file handles on Windows.
 
     Set ``MEMPALACE_MCP_IDLE_HOURS=0`` to disable the watchdog.
     """

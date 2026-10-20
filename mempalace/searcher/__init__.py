@@ -20,7 +20,7 @@ import math
 import os
 import re
 import sqlite3
-from datetime import timedelta
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -32,30 +32,46 @@ from ..backends import (
     UnsupportedCapabilityError,
 )
 from ..backends._inproc_sqlite import open_reader as open_palace_reader
-from ..backends.chroma import _filtered_candidate_rows, _fts_candidate_rows
-from ..config import MempalaceConfig
+from ..backends.chroma_sqlite import (
+    _decoded_rows,
+    _filtered_candidate_rows,
+    _fts_candidate_rows,
+    _match_sql,
+    _newest_row_ids,
+)
+from ..config import MempalaceConfig, wing_aliases
 from ..date_window import filed_at_in_window, parse_window
 from ..embedding import UnknownEmbeddingModelError, _model_error_class, model_error_result
 from ..i18n import _canonical_lang, get_stopwords
+from ..lexical import bm25_scores, tokenize
+from ..metadata_types import is_bookkeeping
 from ..palace import (
     _open_collection_or_explain,
     get_closets_collection,
     get_collection,
+    is_aaak_row,
     resolve_backend_name,
 )
+from ..search_util import (
+    _boosted_cosine_distance,
+    _cosine_scale_distance,
+    _distance_to_similarity,
+    _first_or_empty,
+    _metric_for_collection,
+    _metric_scale_distance,
+    build_where_filter,
+    chroma_known_wings,
+    palace_wing_aliases,
+)
+from ..stored_text import decode_record, encode_filter
+from ..timeutil import localize
 
-# Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
-# Multiple lines may join with newlines inside one closet document.
-_CLOSET_DRAWER_REF_RE = re.compile(r"→([\w,]+)")
-
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 
 class SearchError(Exception):
     """Raised when search cannot proceed (e.g. no palace found)."""
 
-
-_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 
 _FRAGMENT_DIR = Path(__file__).resolve().parent
 # Load order is a dependency sequence, not a catalog: later files use names

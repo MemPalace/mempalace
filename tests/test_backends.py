@@ -16,13 +16,14 @@ from mempalace.backends import (
     QueryResult,
     UnsupportedFilterError,
     available_backends,
+    chroma as chroma_module,
+    chroma_sqlite,
     get_backend,
 )
-from mempalace.backends import chroma as chroma_module
 from mempalace.backends.chroma import (
+    _HNSW_MISSING_METADATA_DATA_FLOOR,
     ChromaBackend,
     ChromaCollection,
-    _HNSW_MISSING_METADATA_DATA_FLOOR,
     _fix_blob_seq_ids,
     _fix_missing_collection_type,
     _pin_hnsw_threads,
@@ -951,13 +952,16 @@ def test_chroma_get_recent_matches_exact_order_from_sqlite(tmp_path, monkeypatch
     from mempalace.backends.base import BaseCollection
 
     col = _recent_palace(tmp_path)
-    monkeypatch.setattr(chroma_module, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
+    monkeypatch.setattr(chroma_sqlite, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
     wheres = [
         None,
         {"wing": "a"},
         {"wing": "rare"},
         {"$and": [{"room": "x"}, {"wing": {"$eq": "b"}}]},
         {"wing": "missing"},
+        # A wing with its old spellings (wing_aliases).
+        {"wing": {"$in": ["rare", "missing", "b"]}},
+        {"$and": [{"wing": {"$in": ["a", "rare"]}}, {"room": "y"}]},
     ]
     exact = {
         repr(where): BaseCollection.get_recent(col, limit=10_000, where=where) for where in wheres
@@ -981,7 +985,7 @@ def test_chroma_get_recent_falls_back_for_filters_sqlite_does_not_evaluate(tmp_p
 
     col = _recent_palace(tmp_path)
     where = {"n": {"$gte": 150}}
-    assert chroma_module._string_equalities(where) is None
+    assert chroma_sqlite._string_equalities(where) is None
     got = col.get_recent(limit=5, where=where)
     assert got.ids == BaseCollection.get_recent(col, limit=5, where=where).ids
     assert all(meta["n"] >= 150 for meta in got.metadatas)
@@ -1042,7 +1046,7 @@ def test_chroma_sqlite_readers_skip_vector_segment_rows(tmp_path, monkeypatch, f
         backend.close()
     _insert_vector_segment_ghost(palace)
 
-    monkeypatch.setattr(chroma_module, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
+    monkeypatch.setattr(chroma_sqlite, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
     backend = ChromaBackend()
     try:
         col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=False)
@@ -1509,6 +1513,7 @@ def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
     never want to open it again, even read-only.
     """
     from unittest.mock import patch
+
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     # Pre-create the marker so the function should short-circuit.

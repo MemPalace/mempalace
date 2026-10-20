@@ -8,15 +8,23 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Project config filenames, in resolution order (#2676). The first regular
-# file wins; ``mempal.*`` is the legacy name. ``miner.SKIP_FILENAMES`` lists the
-# same four so none of them is ever mined as content.
+# Project config filenames, in resolution order. The first regular
+# file wins; ``mempal.*`` is the legacy name. ``mempalace init`` writes the
+# first one when none exists.
 PROJECT_CONFIG_FILENAMES = (
     "mempalace.yaml",
     "mempalace.yml",
     "mempal.yaml",
     "mempal.yml",
 )
+
+# The confirmed-entities record ``mempalace init`` writes beside the config.
+ENTITIES_FILENAME = "entities.json"
+
+# Every file MemPalace itself writes into a project. The miner never files
+# them, entity and corpus-origin detection never sample them, and
+# ``mempalace init`` keeps them out of git.
+MEMPALACE_PROJECT_FILES = PROJECT_CONFIG_FILENAMES + (ENTITIES_FILENAME,)
 
 
 def find_project_config(project_dir) -> Optional[Path]:

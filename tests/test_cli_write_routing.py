@@ -23,7 +23,6 @@ from mempalace.write_routing import (
     choose_write_route,
 )
 
-
 _SERVICE_ENV_KEYS = (
     "MEMPALACE_PALACE_PATH",
     "MEMPAL_PALACE_PATH",
@@ -143,8 +142,8 @@ def test_cli_direct_policy_selects_direct():
             operation="mine",
         )
 
-    assert routing.use_direct is True
     assert routing.use_daemon is False
+    assert routing.decision.blocked is False
 
 
 def test_explicit_direct_overrides_require_policy():
@@ -157,7 +156,8 @@ def test_explicit_direct_overrides_require_policy():
         )
 
     config.assert_not_called()
-    assert routing.use_direct is True
+    assert routing.use_daemon is False
+    assert routing.decision.blocked is False
     assert routing.source == "--direct"
     assert routing.explicit is True
 
@@ -266,6 +266,33 @@ def test_cmd_mine_prefer_submits_daemon_job(tmp_path):
         "background": False,
         "auto_start": True,
     }
+
+
+@pytest.mark.parametrize("palace", [None, "given"])
+def test_cmd_mine_daemon_payload_says_whether_palace_was_given(tmp_path, palace):
+    """The daemon job must know --palace was passed, as the direct path does."""
+    args = _mine_args(
+        tmp_path,
+        palace=str(tmp_path / "palace") if palace else None,
+        source="media",
+        wing="photos",
+        related_drawer_id="drawer_x",
+    )
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch("mempalace.cli._submit_daemon_cli_job") as submit,
+    ):
+        cli.cmd_mine(args)
+
+    payload = submit.call_args.args[1]
+    assert payload["explicit_palace"] is bool(palace)
+    assert payload["source_adapter"] == "media"
+    assert payload["wing"] == "photos"
+    assert payload["related_drawer_id"] == "drawer_x"
 
 
 def test_cmd_mine_direct_preserves_direct_path(tmp_path):

@@ -80,9 +80,7 @@ mempalace/
 ├── entity_detector.py   # Auto-detect people/projects from content
 ├── entity_registry.py   # Entity storage and disambiguation
 ├── layers.py            # L0-L3 memory wake-up stack
-├── onboarding.py        # Interactive first-run setup
 ├── repair.py            # Palace repair and consistency checks
-├── dedup.py             # Deduplication
 ├── migrate.py           # ChromaDB version migration
 ├── spellcheck.py        # Auto-correct user messages
 ├── exporter.py          # Palace data export
@@ -103,7 +101,7 @@ hooks/                   # Claude Code hook scripts
 - **Formatter**: ruff format, double quotes
 - **Commits**: conventional commits (`fix:`, `feat:`, `test:`, `docs:`, `ci:`)
 - **Tests**: `tests/test_*.py`, fixtures in `tests/conftest.py`
-- **Coverage**: 85% threshold (80% on Windows due to ChromaDB file lock cleanup)
+- **Coverage**: pytest reads the gate from `pyproject.toml` (`[tool.coverage.report] fail_under`; on Windows, `[tool.mempalace.coverage] fail_under_windows`, because ChromaDB file-lock cleanup leaves lines unexecuted).
 
 ## Architecture
 

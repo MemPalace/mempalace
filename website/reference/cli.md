@@ -33,6 +33,7 @@ mempalace init .                     # initialize from the current directory
 |---------|------------------------------------------------------------------------------|
 | `<dir>` | **Required.** Project directory to scan. Pass `.` for the current directory. |
 | `--yes` | Auto-accept all detected entities                                            |
+| `--embedding-model` | Record the embedding model in `config.json`: `embeddinggemma` (multilingual, ~300 MB download), `minilm` (English-only, ~30 MB), `embeddinggemma2` or `openai-compat` |
 
 What it does:
 
@@ -120,7 +121,9 @@ mempalace wake-up --wing driftwood
 
 ## `mempalace compress`
 
-Compress drawers using AAAK Dialect.
+Compress drawers using AAAK Dialect. Summaries go to the `mempalace_aaak`
+collection, keyed by drawer id, and never into the closets that search reads.
+Drawers are not changed.
 
 ```bash
 mempalace compress --wing myapp
@@ -141,6 +144,22 @@ Show what's been filed — drawer count, wing/room breakdown.
 ```bash
 mempalace status
 ```
+
+## `mempalace export`
+
+Write the palace out as a folder of markdown files: an `index.md` table of
+contents, then one folder per wing and one file per room, with each drawer's
+text as a section. Drawers are streamed in batches, so memory stays bounded on
+large palaces.
+
+```bash
+mempalace export ~/palace-export
+mempalace --palace ~/other-palace export ./out
+```
+
+| Option | Description |
+|--------|-------------|
+| `<output_dir>` | **Required.** Directory to write the markdown tree into |
 
 ## `mempalace repair`
 
