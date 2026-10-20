@@ -13,9 +13,9 @@ import contextlib
 import os
 import sqlite3
 from collections import defaultdict
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
-from ..lexical import tokenize
+from ..lexical import fts_terms, is_cjk, tokenize
 from ..stored_text import FLAG, decode_record, decode_value, encode_filter, encode_where
 from ..timeutil import recency_floor, recency_key
 from ._filters import matches_where
@@ -239,11 +239,11 @@ _FTS_FILTER_DRIVEN_MAX = 20_000
 
 
 def _fts_tokens(query: str, stop_words: frozenset = frozenset()) -> list[str]:
-    """Query terms the trigram index can match: three or more characters.
+    """Query terms the trigram index can match: see :func:`mempalace.lexical.fts_terms`.
 
     Stop words are dropped unless the query holds nothing else.
     """
-    terms = [t for t in tokenize(query) if len(t) >= 3]
+    terms = fts_terms(query)
     return [t for t in terms if t not in stop_words] or terms
 
 
@@ -258,6 +258,27 @@ class CandidateRows(list):
     truncated = False
 
 
+def _whole_word_matcher(query_tokens: Iterable[str]) -> Callable[[Optional[str]], bool]:
+    """Predicate: does a drawer's text hold one of ``query_tokens`` as a whole word?
+
+    CJK is written without spaces, so a CJK term has no word boundary to
+    respect and counts wherever it appears; any other term must be a whole
+    ``\\w{2,}`` token of the text.
+    """
+    tokens = list(query_tokens)
+    cjk = [t for t in tokens if is_cjk(t)]
+    words = {t for t in tokens if not is_cjk(t)}
+
+    def matches(text: Optional[str]) -> bool:
+        if cjk and text:
+            lowered = text.lower()
+            if any(t in lowered for t in cjk):
+                return True
+        return bool(words) and not words.isdisjoint(tokenize(text, cjk_bigrams=False))
+
+    return matches
+
+
 def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) -> list[int]:
     """Row ids from ``(row_id, text)`` pairs, whole-word matches first.
 
@@ -266,11 +287,11 @@ def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) 
     only contain a query term inside another word keep the places left over:
     they still carry near misses such as ``vectors`` for ``vector``.
     """
-    words = set(query_tokens)
+    is_whole = _whole_word_matcher(query_tokens)
     whole: list[int] = []
     partial: list[int] = []
     for row_id, text in rows:
-        if words.intersection(tokenize(text)):
+        if is_whole(text):
             whole.append(int(row_id))
             if limit is not None and len(whole) >= limit:
                 break
@@ -317,7 +338,7 @@ def _fts_candidate_rows(
         {filter_sql}
     """
     params = (" OR ".join(tokens), collection_name, *filter_params)
-    words = set(tokens)
+    is_whole = _whole_word_matcher(tokens)
     ranked = conn.execute(
         match_sql + " ORDER BY embedding_fulltext_search.rank LIMIT ?",
         (*params, _FTS_SCAN_CAP),
@@ -326,7 +347,7 @@ def _fts_candidate_rows(
     if len(ranked) < _FTS_SCAN_CAP:
         return result
     text_by_id = {int(row_id): text or "" for row_id, text in ranked}
-    whole = [row_id for row_id in result if words.intersection(tokenize(text_by_id[row_id]))]
+    whole = [row_id for row_id in result if is_whole(text_by_id[row_id])]
     if limit is not None and len(whole) >= limit:
         return result
     # The ranked window is full and short of whole-word matches: a name can
@@ -340,7 +361,7 @@ def _fts_candidate_rows(
         (*params, _FTS_CONTINUATION_BUDGET),
     ):
         read += 1
-        if int(row_id) in seen or not words.intersection(tokenize(text)):
+        if int(row_id) in seen or not is_whole(text):
             continue
         extra.append(int(row_id))
         if limit is not None and len(whole) + len(extra) >= limit:
@@ -461,7 +482,7 @@ def sqlite_lexical_rows(
     full-text query fails; a clean miss stays empty. ``[]`` when the database
     is missing or unreadable.
     """
-    tokens = [t for t in tokenize(query) if len(t) >= 3]
+    tokens = fts_terms(query)
 
     def read(conn):
         row_ids: list[int] = []

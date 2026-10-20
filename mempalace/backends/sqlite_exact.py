@@ -1452,7 +1452,9 @@ class SQLiteExactCollection(BaseCollection):
     def _lexical_search_fts(self, cur, *, query: str, n_results: int, where: Optional[dict]):
         if not self._fts_available(cur):
             return None
-        tokens = [t for t in tokenize(query) if len(t) >= 2]
+        # The fts5 table uses the default unicode61 tokenizer, which keeps a CJK
+        # run whole, so the query is split the same way.
+        tokens = [t for t in tokenize(query, cjk_bigrams=False) if len(t) >= 2]
         if not tokens:
             return None
         fts_query = " OR ".join(tokens)

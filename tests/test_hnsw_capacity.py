@@ -1344,6 +1344,39 @@ def test_whole_word_candidate_pick_ignores_stop_words_when_terms_present():
     assert _whole_words_first(rows, tokens, limit=1) == [2]
 
 
+def test_whole_word_candidate_pick_counts_a_cjk_term_anywhere():
+    """CJK has no word boundaries: a drawer holding a query trigram inside a
+    sentence is a whole-word match, not a near miss."""
+    tokens = _fts_tokens("整合性を確認")
+    rows = [(1, "今日は天気が良い"), (2, "FTSを修復して整合性を確認しました")]
+    assert _whole_words_first(rows, tokens, limit=1) == [2]
+
+
+def test_bm25_fallback_finds_a_japanese_phrase_inside_a_sentence(tmp_path):
+    """A Japanese query used to be one sentence-long token that no drawer
+    repeated. Trigrams find the drawer and bigrams give it a BM25 score."""
+    seg = "seg-bm25-japanese"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [
+            ("今日は天気が良いので散歩しました", {"wing": "w", "room": "r"}, "j-1"),
+            ("FTS インデックスを修復して整合性を確認しました", {"wing": "w", "room": "r"}, "j-2"),
+        ],
+    )
+    out = _bm25_only_via_sqlite("インデックスの整合性", str(tmp_path), n_results=5)
+    assert out["results"][0]["text"] == "FTS インデックスを修復して整合性を確認しました"
+    assert out["results"][0]["bm25_score"] > 0
+
+
+def test_fts_candidates_match_a_two_character_word_next_to_latin_letters():
+    from mempalace.backends.chroma_sqlite import _fts_candidate_rows
+
+    conn = _fts_conn([(1, "MCP が FTS修復 のあと復帰した"), (2, "修理の予定")])
+    assert list(_fts_candidate_rows(conn, "drawers", "FTS修復", limit=5)) == [1]
+
+
 def _fts_conn(rows):
     """In-memory chroma-shaped FTS store: ``rows`` is [(rowid, text), ...]."""
     conn = sqlite3.connect(":memory:")

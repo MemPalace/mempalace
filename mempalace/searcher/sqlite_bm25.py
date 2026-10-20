@@ -182,9 +182,9 @@ def _bm25_only_via_sqlite(
 
     window_active = since_dt is not None or before_dt is not None
     try:
-        # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
-        # shorter than 3 chars (trigram tokenizer can't match them).
-        tokens = [t for t in tokenize(query) if len(t) >= 3]
+        # FTS5 MATCH expects whitespace-separated terms the trigram tokenizer
+        # can match: three characters or more (see lexical.fts_terms).
+        tokens = fts_terms(query)
         candidate_ids: list[int] = []
         candidates_truncated = False
         use_recency_fallback = not tokens
