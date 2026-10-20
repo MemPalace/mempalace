@@ -1377,6 +1377,65 @@ def test_fts_candidates_match_a_two_character_word_next_to_latin_letters():
     assert list(_fts_candidate_rows(conn, "drawers", "FTS修復", limit=5)) == [1]
 
 
+@pytest.mark.parametrize(
+    "query, rows, expected",
+    [
+        ("設計", [(1, "UI の設計を見直した"), (2, "設定を変えた"), (3, "基本設計書")], [3, 1]),
+        ("会议", [(1, "明天的会议改到下午"), (2, "会员费用"), (3, "會議記錄")], [1]),
+        ("會議", [(1, "明天的会议改到下午"), (3, "會議記錄")], [3]),
+        (
+            "회의",
+            [(1, "내일 회의는 오후로 변경"), (2, "회사 일정"), (3, "회의록을 작성했다")],
+            [3, 1],
+        ),
+    ],
+)
+def test_fts_candidates_find_two_character_cjk_words(query, rows, expected):
+    """A trigram index cannot match a two-character word, the most common
+    word length in Chinese and Korean and common in Japanese; it is read as a
+    substring instead, newest first."""
+    from mempalace.backends.chroma_sqlite import _fts_candidate_rows
+
+    assert list(_fts_candidate_rows(_fts_conn(rows), "drawers", query, limit=5)) == expected
+
+
+def test_fts_candidates_put_drawers_matching_both_kinds_of_term_first():
+    from mempalace.backends.chroma_sqlite import _fts_candidate_rows
+
+    rows = [
+        (1, "設計の話だけ"),
+        (2, "レビューの話だけ"),
+        (3, "設計レビューを実施した"),
+    ]
+    picked = list(_fts_candidate_rows(_fts_conn(rows), "drawers", "設計 レビュー", limit=5))
+    assert picked[0] == 3
+    assert sorted(picked) == [1, 2, 3]
+
+
+def test_fts_candidates_drop_two_character_stop_words():
+    from mempalace.backends.chroma_sqlite import _fts_candidate_rows
+
+    conn = _fts_conn([(1, "確認しました"), (2, "設計しました")])
+    assert list(
+        _fts_candidate_rows(conn, "drawers", "設計 した", limit=5, stop_words=frozenset({"した"}))
+    ) == [2]
+
+
+def test_bm25_fallback_finds_a_two_character_japanese_word(tmp_path):
+    """A query holding only a two-character word used to have no full-text
+    term and fell back to the newest drawers."""
+    seg = "seg-bm25-two-chars"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    filler = [(f"天気の記録 {i}", {"wing": "w", "room": "r"}, f"f-{i}") for i in range(20)]
+    target = [("画面の設計を見直した", {"wing": "w", "room": "r"}, "t-1")]
+    _seed_drawers(str(tmp_path), seg, target + filler)
+    out = _bm25_only_via_sqlite("設計", str(tmp_path), n_results=3)
+    assert [r["text"] for r in out["results"]] == ["画面の設計を見直した"]
+    assert out["results"][0]["bm25_score"] > 0
+    scoped = _bm25_only_via_sqlite("設計", str(tmp_path), wing="w", n_results=3)
+    assert [r["text"] for r in scoped["results"]] == ["画面の設計を見直した"]
+
+
 def _fts_conn(rows):
     """In-memory chroma-shaped FTS store: ``rows`` is [(rowid, text), ...]."""
     conn = sqlite3.connect(":memory:")

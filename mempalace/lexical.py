@@ -17,14 +17,19 @@ _CJK_CHARS = (
     "\u3005-\u3007"  # 々 〆 〇
     "\u3040-\u309f"  # Hiragana
     "\u30a0-\u30ff"  # Katakana, including the prolonged sound mark ー
+    "\u3100-\u312f"  # Bopomofo
     "\u3130-\u318f"  # Hangul Compatibility Jamo
+    "\u31a0-\u31bf"  # Bopomofo Extended
     "\u31f0-\u31ff"  # Katakana Phonetic Extensions
     "\u3400-\u4dbf"  # CJK Unified Ideographs Extension A
     "\u4e00-\u9fff"  # CJK Unified Ideographs
+    "\ua960-\ua97f"  # Hangul Jamo Extended-A
     "\uac00-\ud7af"  # Hangul Syllables
+    "\ud7b0-\ud7ff"  # Hangul Jamo Extended-B
     "\uf900-\ufaff"  # CJK Compatibility Ideographs
     "\uff66-\uff9f"  # Halfwidth Katakana
-    "\U00020000-\U0003134f"  # CJK Unified Ideographs Extensions B-G
+    "\uffa0-\uffdc"  # Halfwidth Hangul
+    "\U00020000-\U000323af"  # Ideograph Extensions B-H and Compatibility Supplement
 )
 _CJK_RUN_RE = re.compile(f"[{_CJK_CHARS}]+")
 
@@ -87,11 +92,11 @@ def fts_terms(query) -> list:
     """Query terms for a trigram full-text index, in query order.
 
     Words of three or more characters are kept whole, exactly as before CJK
-    support. A CJK run becomes its overlapping trigrams: the index has no word
-    boundaries to match a bigram against, and a run of two characters cannot
-    be matched at all. Where a CJK run touches other letters inside one word
-    (``fts修復``), the trigrams spanning the boundary are added too, so the
-    two-character ``修復`` can still match when the text writes it that way.
+    support. A CJK run becomes its overlapping trigrams, since the index has
+    no word boundaries to match a bigram against. Where a CJK run touches
+    other letters inside one word (``fts修復``), the trigrams spanning the
+    boundary are added too. A two-character run has no trigram of its own:
+    :func:`fts_short_terms` returns it for a substring scan instead.
     """
     terms: list = []
     for token in TOKEN_RE.findall((query or "").lower()):
@@ -107,6 +112,21 @@ def fts_terms(query) -> list:
                 for g in _ngrams(token, FTS_MIN_TERM_LEN)
                 if is_cjk(g) and not _CJK_RUN_RE.fullmatch(g)
             )
+    return terms
+
+
+def fts_short_terms(query) -> list:
+    """Two-character CJK runs of ``query``, which a trigram index cannot match.
+
+    ``設計``, ``会议`` and ``회의`` are whole words, so callers look them up as
+    substrings (``LIKE``) next to the trigram ``MATCH``. A single character is
+    left out: it would match nearly every drawer.
+    """
+    terms: list = []
+    for token in TOKEN_RE.findall((query or "").lower()):
+        for part, cjk in _split_cjk(token):
+            if cjk and len(part) == FTS_MIN_TERM_LEN - 1 and part not in terms:
+                terms.append(part)
     return terms
 
 

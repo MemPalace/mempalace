@@ -13,7 +13,14 @@ tokenizes exactly as before (``test_text_without_cjk_tokenizes_as_before``).
 
 import pytest
 
-from mempalace.lexical import TOKEN_RE, bm25_scores, fts_terms, is_cjk, tokenize
+from mempalace.lexical import (
+    TOKEN_RE,
+    bm25_scores,
+    fts_short_terms,
+    fts_terms,
+    is_cjk,
+    tokenize,
+)
 
 CORPUS = [
     "Kubernetes rollout notes: we rolled back the deploy on Friday.",
@@ -161,3 +168,48 @@ def test_fts_terms_keep_non_cjk_words_as_before():
 )
 def test_fts_terms_split_cjk_into_trigrams(query, terms):
     assert fts_terms(query) == terms
+
+
+@pytest.mark.parametrize(
+    "text, tokens",
+    [
+        # Simplified and Traditional Chinese
+        ("向量数据库的索引", ["向量", "量数", "数据", "据库", "库的", "的索", "索引"]),
+        ("會議記錄，明天開會", ["會議", "議記", "記錄", "明天", "天開", "開會"]),
+        # Korean writes particles onto the word; bigrams still share 회의 and 의록
+        ("회의록을 작성했습니다", ["회의", "의록", "록을", "작성", "성했", "했습", "습니", "니다"]),
+        # Bopomofo and halfwidth Hangul
+        ("ㄅㄆㄇ", ["ㄅㄆ", "ㄆㄇ"]),
+        ("\uffa1\uffa4\uffa7", ["\uffa1\uffa4", "\uffa4\uffa7"]),
+    ],
+)
+def test_chinese_and_korean_runs_become_bigrams(text, tokens):
+    assert tokenize(text) == tokens
+
+
+def test_bm25_ranks_chinese_and_korean_by_shared_words():
+    zh = ["今天天气很好", "向量数据库需要重建索引", "数据很重要"]
+    zh_scores = bm25_scores("重建索引", zh)
+    assert zh_scores.index(max(zh_scores)) == 1 and zh_scores[0] == 0
+    ko = ["오늘 날씨가 좋다", "회의록을 작성했습니다", "회사 일정 공유"]
+    ko_scores = bm25_scores("회의록", ko)
+    assert ko_scores.index(max(ko_scores)) == 1 and ko_scores[0] == 0
+
+
+@pytest.mark.parametrize(
+    "query, terms",
+    [
+        ("設計", ["設計"]),
+        ("設計 レビュー", ["設計"]),
+        ("会议 记录", ["会议", "记录"]),
+        ("회의 일정", ["회의", "일정"]),
+        ("FTS修復", ["修復"]),
+        # Runs of three or more go to the trigram query; one character is too broad.
+        ("整合性 の", []),
+        ("設計 設計", ["設計"]),
+        ("deploy", []),
+        (None, []),
+    ],
+)
+def test_fts_short_terms_are_two_character_cjk_runs(query, terms):
+    assert fts_short_terms(query) == terms

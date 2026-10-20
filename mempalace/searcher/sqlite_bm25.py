@@ -182,9 +182,9 @@ def _bm25_only_via_sqlite(
 
     window_active = since_dt is not None or before_dt is not None
     try:
-        # FTS5 MATCH expects whitespace-separated terms the trigram tokenizer
-        # can match: three characters or more (see lexical.fts_terms).
-        tokens = fts_terms(query)
+        # Trigram terms (lexical.fts_terms) and the two-character CJK words the
+        # trigram index cannot match (lexical.fts_short_terms, read as LIKE).
+        tokens = fts_terms(query) + fts_short_terms(query)
         candidate_ids: list[int] = []
         candidates_truncated = False
         use_recency_fallback = not tokens
