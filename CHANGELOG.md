@@ -8,6 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **A writer with a different `HOME` no longer bypasses the palace's writer
+  lock.** The lock that keeps one writer per palace lived only under
+  `~/.mempalace/locks`, so a process started with another `HOME` on the same
+  palace (a service account, a container, a profile manager) took its own lock
+  and wrote beside the holder. Writers now also lock
+  `.<palace-name>.mempalace.lock` next to the palace directory, which every
+  process that can write the palace contends for, and a different-`HOME`
+  writer is refused like any other second writer. The `~` lock is still taken
+  too, so an older and a newer version that share a `HOME` keep excluding each
+  other. When the palace's parent directory cannot hold the file, the file
+  there cannot be opened, or the name there is a link or anything but a
+  regular file, a warning is logged and only the `~` lock is used, as before.
+  (#2741)
+
 ---
 
 ## [3.12.0] — 2026-10-18
