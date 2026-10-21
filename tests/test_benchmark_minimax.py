@@ -126,7 +126,7 @@ def test_longmemeval_rerank_reads_final_text_after_thinking(monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     result = _longmem.llm_rerank(
-        "question", [0, 1], ["first", "second"], "key", model="MiniMax-M3.1-Flash"
+        "question", [0, 1], ["first", "second"], ["id-1", "id-2"], "key", model="MiniMax-M3.1-Flash"
     )
     assert result == [1, 0]
     assert captured["url"] == "https://api.minimax.io/anthropic/v1/messages"

@@ -573,7 +573,9 @@ def _load_api_key(key_arg, model="", backend="anthropic"):
     """Use an explicit key or the selected provider's environment variable."""
     if key_arg:
         return key_arg
-    if backend == "anthropic" and model.startswith("MiniMax"):
+    if backend != "anthropic":
+        return ""
+    if model.startswith("MiniMax"):
         return os.environ.get("MINIMAX_API_KEY", "")
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if env_key:
