@@ -8,6 +8,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Conversation mining compares transcript timestamps by instant rather than
+  text order, so mixed UTC offsets and fractional seconds select the correct
+  authored time. Invalid timestamps are ignored.
+- Hybrid search breaks authored-time ties by instant across UTC offsets.
+
+### Upgrade notes
+
+- Existing conversation drawers keep their metadata when an unchanged source is
+  skipped. For Chroma palaces with retained JSONL transcripts, run the
+  [authored-time backfill](docs/authored-at.md#backfilling-existing-memory) from
+  this checkout to correct previously selected timestamps without re-embedding.
+  Preview with the default dry run before adding `--apply`.
+
 ---
 
 ## [3.12.0] — 2026-10-18
