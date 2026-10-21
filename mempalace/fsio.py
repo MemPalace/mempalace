@@ -305,6 +305,43 @@ def atomic_publish(
     fsync_directory(path.parent)
 
 
+def remove_abandoned_publish_temps(
+    path: PathLike, *, older_than: float, legacy: Optional["re.Pattern[str]"] = None
+) -> int:
+    """Delete the temporary files of publishes into ``path`` that never finished.
+
+    ``atomic_publish`` removes its temporary file when the write or the rename
+    fails, but a writer killed in between (SIGKILL, the OOM killer) leaves it,
+    and no later publish reuses the name: each picks a fresh random one. This
+    removes regular files next to ``path`` that carry a name ``atomic_publish``
+    gives its temporaries, or one ``legacy`` matches, once nothing has
+    modified them for ``older_than`` seconds: a writer still filling one
+    modifies it as it goes. Returns how many it removed. A file it cannot
+    stat or remove stays.
+    """
+    path = write_target(path)
+    name = re.escape(path.name)
+    own = re.compile(rf"{name}\.tmp-\d+|\.{name}\.[0-9a-f]{{12}}\.tmp")
+    cutoff = time.time() - older_than
+    try:
+        entries = list(os.scandir(path.parent))
+    except OSError:
+        return 0
+    removed = 0
+    for entry in entries:
+        if not (own.fullmatch(entry.name) or (legacy and legacy.fullmatch(entry.name))):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_mtime > cutoff:
+                continue
+            os.unlink(entry.path)
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
+
 def atomic_write_json(
     path: PathLike, payload: Any, *, private: bool = True, follow_symlinks: bool = True
 ) -> None:
