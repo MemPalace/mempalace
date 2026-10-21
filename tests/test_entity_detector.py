@@ -42,6 +42,14 @@ def test_extract_candidates_ignores_stopwords():
     assert "The" not in result
 
 
+def test_extract_candidates_ignores_pt_br_pronouns():
+    # #2811: init registered these as people in a pt-br palace
+    text = "Ele disse. Os dados. Se for. " * 3 + "Joana disse. " * 3
+    result = extract_candidates(text, languages=("pt-br",))
+    assert not {"Ele", "Os", "Se"} & set(result)
+    assert "Joana" in result
+
+
 def test_extract_candidates_requires_min_frequency():
     text = "Riley said hi. Devon waved."
     result = extract_candidates(text)
