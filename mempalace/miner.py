@@ -1085,6 +1085,7 @@ def _is_cjk_entity_char(char: str) -> bool:
             "HIRAGANA ",
             "KATAKANA ",
             "KATAKANA-HIRAGANA ",
+            "COMBINING KATAKANA-HIRAGANA ",
             "HANGUL ",
             "HALFWIDTH KATAKANA",
             "HALFWIDTH HANGUL ",

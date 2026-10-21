@@ -857,6 +857,8 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
         ("佐々", "佐々さん", True),
         ("ｻｸﾗ", "ｻｸﾗさん", True),
         ("ｺﾝﾋﾟｭｰﾀｰ", "ｺﾝﾋﾟｭｰﾀｰを使う", True),
+        ("セカ\u3099", "セカ\u3099を使う", True),
+        ("ハ\u309a", "ハ\u309aを使う", True),
         ("Aya", "AYA", True),
         ("Aya", "Ayala", False),
         ("Мир", "Мирный", False),
