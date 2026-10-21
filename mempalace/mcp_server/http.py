@@ -811,10 +811,13 @@ def _node_profile() -> dict:
         logger.debug("node profile: logstream authorship unavailable", exc_info=True)
     accelerator = None
     try:
-        from ..embedding import _resolve_providers, current_model_name
+        from ..embedding import current_model_name, describe_device
 
         device = getattr(_config, "embedding_device", None) or "auto"
-        _providers, effective = _resolve_providers(device)
+        model = getattr(_config, "embedding_model", None)
+        # A mesh profile advertises compute capabilities, not endpoint URLs
+        # that may contain credentials or private hostnames.
+        effective = "openai-compat" if model == "openai-compat" else describe_device(device, model)
         accelerator = {
             "provider": _ACCELERATOR_NAMES.get(effective, effective),
             "embedder": current_model_name(),
