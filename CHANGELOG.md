@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Registered Chinese, Japanese, and Korean entities are tagged when adjacent to
+  other words or particles. Mixed-script names retain word boundaries on their
+  non-CJK edges.
+
 ---
 
 ## [3.12.0] — 2026-10-18
