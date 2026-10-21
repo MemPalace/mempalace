@@ -784,7 +784,7 @@ def tool_search(
 
 
 def _can_potentiate_on_search() -> bool:
-    if not _truthy_env(_SALIENCE_POTENTIATE_ENV):
+    if not env_bool(_SALIENCE_POTENTIATE_ENV, False):
         return False
     if _READ_ONLY or _vector_disabled:
         return False
