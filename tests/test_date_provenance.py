@@ -37,7 +37,8 @@ def date_search(request, monkeypatch, tmp_path):
                     CREATE VIRTUAL TABLE embedding_fulltext_search
                         USING fts5(string_value, tokenize='trigram');
                     CREATE TABLE embedding_metadata
-                        (id INTEGER, key TEXT, string_value TEXT, int_value INTEGER);
+                        (id INTEGER, key TEXT, string_value TEXT, int_value INTEGER,
+                         float_value REAL);
                     CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
                     CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
                     CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT,
@@ -49,7 +50,7 @@ def date_search(request, monkeypatch, tmp_path):
                 )
                 conn.execute("INSERT INTO embedding_fulltext_search VALUES (?)", (TEXT,))
                 conn.executemany(
-                    "INSERT INTO embedding_metadata VALUES (1, ?, ?, NULL)",
+                    "INSERT INTO embedding_metadata VALUES (1, ?, ?, NULL, NULL)",
                     [("chroma:document", TEXT), *meta.items()],
                 )
             return searcher.search_memories(

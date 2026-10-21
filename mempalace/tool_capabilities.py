@@ -61,6 +61,7 @@ TOOL_CAPABILITIES = {
     "mempalace_get_drawer": ("read", ""),
     "mempalace_get_drawers": ("read", ""),
     "mempalace_list_drawers": ("read", ""),
+    "mempalace_drawer_salience": ("read", ""),
     "mempalace_update_drawer": ("write", "mutating vector_write"),
     "mempalace_diary_write": ("write", "mutating vector_write embedding_release"),
     "mempalace_diary_read": ("read", ""),
