@@ -1085,6 +1085,7 @@ def _is_cjk_entity_char(char: str) -> bool:
         for start, end in (
             (0x1100, 0x11FF),
             (0x2E80, 0x2EFF),
+            (0x302E, 0x302F),
             (0x3040, 0x30FF),
             (0x3130, 0x318F),
             (0x31C0, 0x31FF),
@@ -1093,7 +1094,7 @@ def _is_cjk_entity_char(char: str) -> bool:
             (0xA960, 0xA97F),
             (0xAC00, 0xD7FF),
             (0xF900, 0xFAFF),
-            (0xFF66, 0xFF9F),
+            (0xFF65, 0xFF9F),
             (0xFFA0, 0xFFDC),
             (0x1AFF0, 0x1AFFF),
             (0x1B000, 0x1B16F),
