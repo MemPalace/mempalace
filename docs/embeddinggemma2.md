@@ -19,6 +19,13 @@ export MEMPALACE_EMBEDDINGGEMMA2_MODALITIES=all
 
 Use `.[embeddinggemma2]` for text/image inference, or `.[multimodal]` for audio/video decoding too. TorchCodec needs compatible FFmpeg libraries. Install FFmpeg using your platform's package manager before using audio/video file inputs.
 
+On macOS, the required `torch>=2.14.0` has official wheels for Apple Silicon,
+not Intel Macs. PyTorch [ended official Intel Mac support after 2.2.x](https://pytorch.org/blog/pytorch2-2/).
+Choosing `embedding_device=cpu` cannot bypass this installation limit. Intel
+Macs can use the ONNX backends with compatible dependencies or an
+`openai-compat` endpoint. On Apple Silicon, the installed packages must support
+the macOS/Python versions; `auto` uses MPS only when PyTorch reports it available.
+
 The extras pull `torch` from PyPI. On Windows that wheel is CPU-only. To run on an NVIDIA GPU (Windows or Linux), install torch from the PyTorch CUDA index first, choosing the CUDA build for your driver at [pytorch.org](https://pytorch.org/get-started/locally/). For a smaller CPU-only install on Linux, use the CPU index:
 
 ```bash

@@ -730,7 +730,8 @@ def test_describe_device_reports_the_model_aware_resolution(monkeypatch):
 
 @pytest.mark.parametrize("device", ["auto", "coreml", "mps"])
 @pytest.mark.parametrize("threads", [0, 2])
-def test_minilm_device_label_matches_the_built_session(monkeypatch, device, threads):
+@pytest.mark.parametrize("has_coreml", [False, True], ids=["cpu-only", "coreml-available"])
+def test_minilm_device_label_matches_the_built_session(monkeypatch, device, threads, has_coreml):
     """Exercise both Chroma's session builder and the thread-capped override."""
     import onnxruntime as ort
 
@@ -741,9 +742,8 @@ def test_minilm_device_label_matches_the_built_session(monkeypatch, device, thre
         return SimpleNamespace(get_providers=lambda: list(providers))
 
     monkeypatch.setattr(ort, "InferenceSession", session)
-    monkeypatch.setattr(
-        ort, "get_available_providers", lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"]
-    )
+    available = (["CoreMLExecutionProvider"] if has_coreml else []) + ["CPUExecutionProvider"]
+    monkeypatch.setattr(ort, "get_available_providers", lambda: available)
     monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: threads)
     ef = embedding.get_embedding_function(device, "minilm")
 
