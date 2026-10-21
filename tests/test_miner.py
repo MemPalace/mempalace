@@ -1644,6 +1644,90 @@ def test_process_file_purges_closets_even_when_all_chunks_filtered_out(tmp_path,
     )
 
 
+def test_shrunk_source_below_min_chunk_size_purges_stale_drawers_and_closets(tmp_path, monkeypatch):
+    """A KNOWN source that shrinks below ``min_chunk_size`` must be purged,
+    not skipped (#2608).
+
+    Before the fix, ``process_file()`` returned early for any content
+    shorter than ``min_chunk_size`` *before* the per-source lock and the
+    stale-drawer / closet purge path. So a file that had been mined and is
+    now shorter than the threshold kept its old drawers + closets
+    searchable — its obsolete content never left the palace and ``sync
+    --apply`` couldn't reach it (it classifies the shortened file as
+    ``kept``).
+
+    After the fix the file takes the normal lock/purge path: ``chunk_text()``
+    honours ``min_chunk_size`` and returns no chunks (so zero new drawers are
+    written), ``collection.delete()`` and ``purge_file_closets()`` remove the
+    obsolete entries, and the caller's ``files_skipped`` counter still counts
+    the zero-drawer outcome.
+
+    Distinct from #24 (``test_process_file_purges_closets_even_when_all_chunks_
+    filtered_out``): there the file-level min-length gate is *passed* and only
+    the per-chunk filter empties the list. Here the file-level gate itself used
+    to reject the content, which short-circuited the purge entirely."""
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.deleted = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, **kwargs):
+            self.deleted.append(kwargs.get("where"))
+
+        def upsert(self, documents, ids, metadatas):
+            raise AssertionError(
+                "no chunks should be upserted when content is below min_chunk_size"
+            )
+
+    purged: list = []
+    source = tmp_path / "shrunk.txt"
+    # Content shorter than the min_chunk_size gate (default 50 chars). This is
+    # the shape a file takes after it shrinks: it was once long enough to be
+    # mined, it is now below the threshold.
+    source.write_text("short", encoding="utf-8")
+
+    col = FakeCol()
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "general")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(
+        miner,
+        "purge_file_closets",
+        lambda closets_col, source_file: purged.append(source_file),
+    )
+    monkeypatch.setattr(
+        miner,
+        "upsert_closet_lines",
+        lambda *a, **kw: pytest.fail("should not rebuild closets for a shrunk source"),
+    )
+
+    drawers, room, skip_reason = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+        closets_col=object(),
+        min_chunk_size=50,
+    )
+
+    assert drawers == 0
+    assert skip_reason is None
+    assert col.deleted == [{"source_file": str(source)}], (
+        "old drawers for the shrunk source were left behind — collection.delete() "
+        "must run even when the new content produces zero chunks"
+    )
+    assert purged == [str(source)], (
+        "old closets for the shrunk source were left dangling — they point at "
+        "drawer IDs that collection.delete() already removed"
+    )
+
+
 def test_file_already_mined_detects_incomplete_multi_batch_remine():
     """A crash between upsert batches must not be mistaken for 'fully
     mined' (#21). process_file stamps every chunk's metadata with

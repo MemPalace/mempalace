@@ -1600,8 +1600,6 @@ def process_file(
     mine. A file it proves already filed is skipped without querying the
     palace; any other file goes through ``file_already_mined()``.
     """
-    effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
-
     # Skip if already filed
     source_file = str(filepath)
     if not dry_run and (
@@ -1615,9 +1613,16 @@ def process_file(
         return 0, "general", None
     content, read_mtime, source_encoding = read_result
 
+    # NOTE: no early return for content shorter than min_chunk_size (#2608).
+    # It must take the normal lock/purge path so that a KNOWN source that
+    # has shrunk below the threshold gets its stale drawers + closets
+    # purged. chunk_text() honors min_chunk_size and returns [] for such
+    # content, so zero new drawers are written and the caller's
+    # files_skipped counter (driven by `drawers == 0`) still lands under
+    # the residual "read error or too short" bucket. A freshly-encountered
+    # short file still creates no drawers: file_already_mined() is False,
+    # collection.delete() matches nothing, and no rows are upserted.
     content = content.strip()
-    if len(content) < effective_min:
-        return 0, "general", None
 
     room = detect_room(filepath, content, rooms, project_path)
     chunks = chunk_text(
