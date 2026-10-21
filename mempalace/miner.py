@@ -15,7 +15,6 @@ import re
 import shlex
 import stat
 import sys
-import unicodedata
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -1079,18 +1078,35 @@ def detect_hall(content: str) -> str:
 
 
 def _is_cjk_entity_char(char: str) -> bool:
-    return char in "々〆〇〻" or unicodedata.name(char, "").startswith(
-        (
-            "CJK ",
-            "HIRAGANA ",
-            "KATAKANA ",
-            "KATAKANA-HIRAGANA ",
-            "COMBINING KATAKANA-HIRAGANA ",
-            "HANGUL ",
-            "HALFWIDTH KATAKANA",
-            "HALFWIDTH HANGUL ",
+    # Unicode 17 blocks keep newer Han characters recognized on older Python runtimes.
+    codepoint = ord(char)
+    return char in "々〆〇〻" or any(
+        start <= codepoint <= end
+        for start, end in (
+            (0x1100, 0x11FF),
+            (0x2E80, 0x2EFF),
+            (0x3040, 0x30FF),
+            (0x3130, 0x318F),
+            (0x31C0, 0x31FF),
+            (0x3400, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xA960, 0xA97F),
+            (0xAC00, 0xD7FF),
+            (0xF900, 0xFAFF),
+            (0xFF66, 0xFF9F),
+            (0xFFA0, 0xFFDC),
+            (0x1AFF0, 0x1AFFF),
+            (0x1B000, 0x1B16F),
+            (0x20000, 0x2A6DF),
+            (0x2A700, 0x2EE5F),
+            (0x2F800, 0x2FA1F),
+            (0x30000, 0x3347F),
         )
     )
+
+
+def _is_variation_selector(char: str) -> bool:
+    return 0xFE00 <= ord(char) <= 0xFE0F or 0xE0100 <= ord(char) <= 0xE01EF
 
 
 def _extract_entities_for_metadata(content: str) -> str:
@@ -1120,7 +1136,10 @@ def _extract_entities_for_metadata(content: str) -> str:
         # CJK text can join names directly to adjacent words or particles.
         # Keep the guard on each non-CJK edge of a mixed-script name.
         left = "" if _is_cjk_entity_char(name[0]) else r"(?<!\w)"
-        right = "" if _is_cjk_entity_char(name[-1]) else r"(?!\w)"
+        end = len(name) - 1
+        while end > 0 and _is_variation_selector(name[end]):
+            end -= 1
+        right = "" if _is_cjk_entity_char(name[end]) else r"(?!\w)"
         if re.search(left + re.escape(name) + right, content, re.IGNORECASE):
             matched.add(name)
 
