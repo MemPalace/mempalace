@@ -6,9 +6,12 @@ requests without making real API calls.
 """
 
 import importlib.util
+import inspect
 import json
 import urllib.request
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).parent.parent
 
@@ -64,9 +67,13 @@ class TestLoadApiKey:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
         assert _locomo._load_api_key("", model="claude-sonnet-4-6") == "anthropic-secret"
 
-    def test_ollama_does_not_read_provider_key(self, monkeypatch):
+    def test_ollama_preserves_existing_key_selection(self, monkeypatch):
         monkeypatch.setenv("MINIMAX_API_KEY", "minimax-secret")
-        assert _locomo._load_api_key("", model="MiniMax-M3.1-Flash", backend="ollama") == ""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "existing-key")
+        assert (
+            _locomo._load_api_key("", model="MiniMax-M3.1-Flash", backend="ollama")
+            == "existing-key"
+        )
 
     def test_no_env_returns_empty(self, monkeypatch):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
@@ -131,3 +138,122 @@ def test_longmemeval_rerank_reads_final_text_after_thinking(monkeypatch):
     assert result == [1, 0]
     assert captured["url"] == "https://api.minimax.io/anthropic/v1/messages"
     assert captured["payload"]["thinking"] == {"type": "adaptive"}
+
+
+@pytest.mark.parametrize("module", [_locomo, _longmem])
+@pytest.mark.parametrize(
+    "model", ["MiniMax-M3.1-Flash", "MiniMax-M3", "MiniMax-M2.7", "MiniMax-custom", "custom"]
+)
+@pytest.mark.parametrize(
+    "endpoint", [None, "https://api.minimaxi.com/anthropic/", "https://custom.invalid/anthropic/"]
+)
+def test_serialized_rerank_routes_preserve_models(monkeypatch, module, model, endpoint):
+    if endpoint:
+        monkeypatch.setenv("MINIMAX_BASE_URL", endpoint)
+    else:
+        monkeypatch.delenv("MINIMAX_BASE_URL", raising=False)
+    captured = []
+
+    def fake_urlopen(request, timeout):
+        captured.append(request)
+        return _Response({"content": [{"type": "text", "text": "2"}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    if module is _locomo:
+        assert module.llm_rerank_locomo("q", [0, 1], ["a", "b"], "key", model=model) == [1, 0]
+    else:
+        assert module.llm_rerank("q", [0, 1], ["a", "b"], ["a", "b"], "key", model=model) == [1, 0]
+    request = captured[0]
+    base = (endpoint or "https://api.minimax.io/anthropic").rstrip("/")
+    if not model.startswith("MiniMax"):
+        base = "https://api.anthropic.com"
+    assert request.full_url == base + "/v1/messages"
+    assert request.get_header("X-api-key") == "key"
+    payload = json.loads(request.data)
+    assert payload["model"] == model
+    assert payload["messages"][0]["role"] == "user"
+    assert "service_tier" not in payload
+    if model == "MiniMax-M3.1-Flash":
+        assert payload["thinking"] == {"type": "adaptive"}
+        assert payload["max_tokens"] == 16384
+    else:
+        assert payload["max_tokens"] == 8
+        assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("module", [_locomo, _longmem])
+def test_ollama_request_is_unchanged(monkeypatch, module):
+    captured = []
+
+    def fake_urlopen(request, timeout):
+        captured.append(request)
+        return _Response({"choices": [{"message": {"content": "2"}}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    kwargs = {
+        "model": "minimax-m2.7:cloud",
+        "backend": "ollama",
+        "base_url": "http://localhost:11434",
+    }
+    if module is _locomo:
+        assert module.llm_rerank_locomo("q", [0, 1], ["a", "b"], "key", **kwargs) == [1, 0]
+    else:
+        assert module.llm_rerank("q", [0, 1], ["a", "b"], ["a", "b"], "key", **kwargs) == [1, 0]
+    payload = json.loads(captured[0].data)
+    assert captured[0].full_url == "http://localhost:11434/v1/chat/completions"
+    assert payload["model"] == "minimax-m2.7:cloud"
+    assert payload["max_tokens"] == 1024
+    assert payload["temperature"] == 0.0
+    assert "thinking" not in payload
+
+
+def test_existing_defaults_and_multimodal_prompt_are_preserved(monkeypatch):
+    assert (
+        inspect.signature(_locomo.run_benchmark).parameters["llm_model"].default
+        == "claude-sonnet-4-6"
+    )
+    assert (
+        inspect.signature(_longmem.run_benchmark).parameters["llm_model"].default
+        == "claude-haiku-4-5-20251001"
+    )
+    prompt = [
+        {"type": "text", "text": "describe"},
+        {"type": "image", "source": {"type": "url", "url": "https://example.invalid/image.png"}},
+    ]
+    captured = []
+
+    def fake_urlopen(request, timeout):
+        captured.append(json.loads(request.data))
+        return _Response({"content": [{"type": "text", "text": "ok"}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert _locomo._llm_call(prompt, "key") == "ok"
+    assert captured[0]["model"] == "claude-haiku-4-5-20251001"
+    assert captured[0]["messages"][0]["content"] == prompt
+    assert captured[0]["max_tokens"] == 32
+
+
+def test_diary_flash_response(monkeypatch):
+    captured = []
+    expected = {"topics": ["test"], "summary": "test"}
+
+    def fake_urlopen(request, timeout):
+        captured.append(json.loads(request.data))
+        return _Response(
+            {
+                "content": [
+                    {"type": "thinking", "thinking": "private"},
+                    {"type": "text", "text": json.dumps(expected)},
+                ]
+            }
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    assert (
+        _longmem.diary_ingest_session(
+            [{"role": "user", "content": "test"}], "id", "key", model="MiniMax-M3.1-Flash"
+        )
+        == expected
+    )
+    assert captured[0]["model"] == "MiniMax-M3.1-Flash"
+    assert captured[0]["thinking"] == {"type": "adaptive"}

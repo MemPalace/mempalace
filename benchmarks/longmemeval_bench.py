@@ -2914,9 +2914,7 @@ def _load_api_key(key_arg, model="", backend="anthropic"):
     """Use an explicit key or the selected provider's environment variable."""
     if key_arg:
         return key_arg
-    if backend != "anthropic":
-        return ""
-    if model.startswith("MiniMax"):
+    if backend == "anthropic" and model.startswith("MiniMax"):
         return os.environ.get("MINIMAX_API_KEY", "")
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if env_key:
@@ -2968,7 +2966,7 @@ def run_benchmark(
     hybrid_weight=0.30,
     llm_rerank_enabled=False,
     llm_key="",
-    llm_model="MiniMax-M3.1-Flash",
+    llm_model="claude-haiku-4-5-20251001",
     diary_cache_file=None,
     skip_precompute=False,
     split_file=None,
@@ -3159,7 +3157,7 @@ def run_benchmark(
                 rankings,
                 corpus,
                 corpus_ids,
-                api_key,
+                _load_api_key(llm_key, llm_model, llm_backend),
                 top_k=rerank_pool,
                 model=llm_model,
                 backend=llm_backend,
@@ -3337,10 +3335,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--llm-model",
-        default="MiniMax-M3.1-Flash",
+        default="claude-haiku-4-5-20251001",
         help="Model for LLM re-ranking and diary ingest "
-        "(default: MiniMax-M3.1-Flash). Custom model IDs are passed through. "
-        "With --llm-backend ollama, use an Ollama model tag like 'minimax-m2.7:cloud'.",
+        "(default: claude-haiku-4-5-20251001). "
+        "MiniMax models: MiniMax-M3.1-Flash (recommended), MiniMax-M3. "
+        "Set MINIMAX_API_KEY; MINIMAX_BASE_URL overrides the endpoint. "
+        "Explicit legacy/custom model IDs are passed through. "
+        "With --llm-backend ollama, use an installed Ollama model tag.",
     )
     parser.add_argument(
         "--llm-backend",

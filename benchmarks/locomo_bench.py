@@ -573,9 +573,7 @@ def _load_api_key(key_arg, model="", backend="anthropic"):
     """Use an explicit key or the selected provider's environment variable."""
     if key_arg:
         return key_arg
-    if backend != "anthropic":
-        return ""
-    if model.startswith("MiniMax"):
+    if backend == "anthropic" and model.startswith("MiniMax"):
         return os.environ.get("MINIMAX_API_KEY", "")
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if env_key:
@@ -597,7 +595,7 @@ def run_benchmark(
     out_file=None,
     llm_rerank_enabled=False,
     llm_key="",
-    llm_model="MiniMax-M3.1-Flash",
+    llm_model="claude-sonnet-4-6",
     hybrid_weight=0.30,
     palace_cache_file=None,
     palace_model="claude-haiku-4-5-20251001",
@@ -1018,9 +1016,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--llm-model",
-        default="MiniMax-M3.1-Flash",
-        help="Model for LLM rerank (default: MiniMax-M3.1-Flash). "
-        "MiniMax models use MINIMAX_API_KEY and MINIMAX_BASE_URL; custom IDs are passed through.",
+        default="claude-sonnet-4-6",
+        help="Model for LLM rerank (default: claude-sonnet-4-6). "
+        "MiniMax models: MiniMax-M3.1-Flash (recommended), MiniMax-M3. "
+        "Set MINIMAX_API_KEY; MINIMAX_BASE_URL overrides the endpoint. "
+        "Explicit legacy/custom model IDs are passed through.",
     )
     parser.add_argument(
         "--llm-key",
