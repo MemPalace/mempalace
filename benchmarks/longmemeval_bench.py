@@ -2380,7 +2380,6 @@ def _llm_options(model, max_tokens):
         return {
             "max_tokens": max(max_tokens, 16384),
             "thinking": {"type": "adaptive"},
-            "output_config": {"effort": "low"},
         }
     return {"max_tokens": max_tokens}
 
@@ -3338,8 +3337,7 @@ if __name__ == "__main__":
         "--llm-model",
         default="MiniMax-M3.1-Flash",
         help="Model for LLM re-ranking and diary ingest "
-        "(default: claude-haiku-4-5-20251001). "
-        "Use 'claude-sonnet-4-6' for Sonnet comparison. "
+        "(default: MiniMax-M3.1-Flash). Custom model IDs are passed through. "
         "With --llm-backend ollama, use an Ollama model tag like 'minimax-m2.7:cloud'.",
     )
     parser.add_argument(

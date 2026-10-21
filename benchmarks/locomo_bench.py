@@ -378,7 +378,6 @@ def _llm_options(model, max_tokens):
         return {
             "max_tokens": max(max_tokens, 16384),
             "thinking": {"type": "adaptive"},
-            "output_config": {"effort": "low"},
         }
     return {"max_tokens": max_tokens}
 
