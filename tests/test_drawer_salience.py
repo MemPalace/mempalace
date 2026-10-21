@@ -19,7 +19,6 @@ from mempalace.dynamics import (
     STABILITY_INCREMENT,
 )
 
-
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 

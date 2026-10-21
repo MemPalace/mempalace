@@ -132,7 +132,7 @@ def initialize_drawer_dynamics_fields(
     """
 
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = utc_now()
     missing_created_at = "created_at" not in drawer_metadata
     if missing_created_at and drawer_metadata.get("filed_at"):
         drawer_metadata["created_at"] = drawer_metadata["filed_at"]
@@ -166,10 +166,10 @@ def initialize_drawer_dynamics_fields(
         normalized_fields.append("access_count")
     drawer_metadata["access_count"] = count
 
-    if _parse_iso(drawer_metadata["last_activated"]) is None:
+    if parse_timestamp(drawer_metadata["last_activated"]) is None:
         fallback = (
-            _parse_iso(drawer_metadata.get("created_at"))
-            or _parse_iso(drawer_metadata.get("filed_at"))
+            parse_timestamp(drawer_metadata.get("created_at"))
+            or parse_timestamp(drawer_metadata.get("filed_at"))
             or now
         )
         drawer_metadata["last_activated"] = fallback.isoformat()
@@ -190,7 +190,7 @@ def drawer_salience(drawer_metadata: dict, *, now: Optional[datetime] = None) ->
     """Return lazy-decayed salience for drawer metadata without mutating input."""
 
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = utc_now()
     record = dict(drawer_metadata or {})
     initialize_drawer_dynamics_fields(record, now=now)
     return {
