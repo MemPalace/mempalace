@@ -42,6 +42,28 @@ def test_extract_candidates_ignores_stopwords():
     assert "The" not in result
 
 
+def test_extract_candidates_ignores_technical_terms():
+    """Generic code/architecture terms are not entities (#476)."""
+    terms = [
+        "Handler",
+        "Node",
+        "Manager",
+        "Plugin",
+        "Module",
+        "Interface",
+        "Builder",
+        "Factory",
+        "Config",
+    ]
+    text = " ".join(f"The {t} runs. Later the {t} stops. Then {t} restarts." for t in terms)
+    text += " Riley said hi. Riley laughed. Riley smiled."
+    result = extract_candidates(text)
+    for term in terms:
+        assert term not in result, f"{term!r} should be a stopword; got: {list(result)!r}"
+        assert term.lower() in STOPWORDS
+    assert "Riley" in result
+
+
 def test_extract_candidates_requires_min_frequency():
     text = "Riley said hi. Devon waved."
     result = extract_candidates(text)
