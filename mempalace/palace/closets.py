@@ -98,6 +98,26 @@ def _candidate_entity_words(text: str) -> list:
     return words
 
 
+_LOCALE_STOPWORDS_CACHE = None
+
+
+def _locale_entity_stopwords() -> frozenset:
+    """Return the lowercased entity stopwords of the configured languages.
+
+    ``_ENTITY_STOPLIST`` and the COCA filter are English-only. These come
+    from the same locale files as the candidate patterns, so a pt-br palace
+    drops "Ele" or "Não" the way an English one drops "The".
+    """
+    global _LOCALE_STOPWORDS_CACHE
+    if _LOCALE_STOPWORDS_CACHE is None:
+        from ..config import MempalaceConfig
+        from ..i18n import get_entity_patterns
+
+        patterns = get_entity_patterns(MempalaceConfig().entity_languages)
+        _LOCALE_STOPWORDS_CACHE = frozenset(patterns["stopwords"])
+    return _LOCALE_STOPWORDS_CACHE
+
+
 def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_metas=None):
     """Build compact closet pointer lines from drawer content.
 
@@ -132,10 +152,11 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_meta
     working_window, compound_counts = _apply_known_systems_prepass(window)
 
     coca_filter = _get_coca_filter()
+    locale_stopwords = _locale_entity_stopwords()
     words = _candidate_entity_words(working_window)
     word_freq: dict = dict(compound_counts)
     for w in words:
-        if w in _ENTITY_STOPLIST:
+        if w in _ENTITY_STOPLIST or w.lower() in locale_stopwords:
             continue
         # Tier 2 linguistics cleanup — drop common English content words
         # ("Code", "Line", "Note", "Phase", …) so they don't appear in
