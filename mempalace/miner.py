@@ -402,6 +402,49 @@ def load_gitignore_matcher(dir_path: Path, cache: dict):
     return cache[dir_path]
 
 
+def _repo_common_dir(project_path: Path) -> Optional[Path]:
+    """Resolve the Git directory holding a checkout's shared exclude file."""
+    git_dir = project_path / ".git"
+    if git_dir.is_file():
+        marker = git_dir.read_text(encoding="utf-8", errors="surrogateescape").strip()
+        if not marker.startswith("gitdir:") or not marker[7:].strip():
+            return None
+        git_dir = project_path / marker[7:].strip()
+    elif not git_dir.is_dir():
+        return None
+    try:
+        common = (
+            (git_dir / "commondir").read_text(encoding="utf-8", errors="surrogateescape").strip()
+        )
+    except FileNotFoundError:
+        return git_dir
+    return git_dir / common if common else None
+
+
+def load_repo_exclude_matcher(project_path: Path, cache: dict):
+    """Cache common Git excludes, anchored at the checkout's project root.
+
+    Linked worktrees point to their administration directory through a
+    ``.git`` file, then to the shared Git directory through ``commondir``.
+    Its exclude patterns have lower precedence than per-directory gitignores.
+    The tuple cache key keeps these rules separate from directory matchers.
+    """
+    cache_key = (project_path, "git_info_exclude")
+    if cache_key not in cache:
+        try:
+            common = _repo_common_dir(project_path)
+            lines = (
+                (common / "info" / "exclude").read_text(encoding="utf-8", errors="surrogateescape")
+                if common is not None
+                else ""
+            )
+        except OSError:
+            cache[cache_key] = None
+        else:
+            cache[cache_key] = GitignoreMatcher.from_patterns(project_path, lines.splitlines())
+    return cache[cache_key]
+
+
 def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
     """Apply active .gitignore matchers in ancestor order; last match wins."""
     ignored = False
@@ -412,9 +455,25 @@ def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
     return ignored
 
 
-def should_skip_dir(dirname: str) -> bool:
-    """Skip known generated/cache directories before gitignore matching."""
-    return dirname in SKIP_DIRS or dirname.endswith(".egg-info")
+def should_skip_dir(dir_path: Path) -> bool:
+    """Skip known generated/cache directories before gitignore matching.
+
+    Takes the full directory path so layout-dependent cases can be detected:
+
+    - Any directory whose basename is in ``SKIP_DIRS`` (e.g. ``.worktrees``),
+      or ends in ``.egg-info``, is skipped outright.
+    - A ``worktrees`` directory is skipped ONLY when it sits directly under a
+      ``.claude`` directory (``<project>/.claude/worktrees/``). That is the
+      Claude Code worktree layout containing duplicate checkouts. A
+      genuine ``src/worktrees`` Python package is NOT under ``.claude`` and
+      still mines.
+    """
+    dirname = dir_path.name
+    if dirname in SKIP_DIRS or dirname.endswith(".egg-info"):
+        return True
+    if dirname == "worktrees" and dir_path.parent.name == ".claude":
+        return True
+    return False
 
 
 def normalize_include_paths(include_ignored: list) -> set:
@@ -1768,6 +1827,16 @@ def scan_project(
     Skips symlinks and oversized files. Each skipped symlink is logged to
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why a directory looks empty after walking.
+
+    When ``respect_gitignore`` is set, both per-directory ``.gitignore``
+    files AND the repository-level ``<project>/.git/info/exclude`` are
+    honoured (see :func:`load_repo_exclude_matcher`). The repo-level file is
+    anchored at the project root so its patterns prune the entire tree —
+    this is what keeps a git-worktree that a user excluded locally from being
+    double-mined as a duplicate wing (MemPalace/mempalace#2599).
+    In addition to gitignore, known build/cache directories and Claude Code
+    worktree locations (``.worktrees/``, ``.claude/worktrees/``) are always
+    pruned via :func:`should_skip_dir`, independent of ``respect_gitignore``.
     """
     project_path = Path(project_dir).expanduser().resolve()
     files = []
@@ -1775,6 +1844,16 @@ def scan_project(
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
     exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns or [])
+
+    # Honour the repo-level ``.git/info/exclude`` across the whole tree. It is
+    # anchored at the project root, so it survives the per-directory pruning
+    # of per-directory matchers below (those are dropped as we descend past
+    # their directory, but the root matcher stays because the root is always
+    # an ancestor). Only applies under gitignore, matching ``.gitignore``.
+    if respect_gitignore:
+        repo_exclude_matcher = load_repo_exclude_matcher(project_path, matcher_cache)
+        if repo_exclude_matcher is not None:
+            active_matchers.append(repo_exclude_matcher)
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -1793,7 +1872,7 @@ def scan_project(
             d
             for d in dirs
             if is_force_included(root_path / d, project_path, include_paths)
-            or not should_skip_dir(d)
+            or not should_skip_dir(root_path / d)
         ]
         if respect_gitignore and active_matchers:
             dirs[:] = [
