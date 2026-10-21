@@ -9,7 +9,6 @@ import pytest
 from mempalace import searcher
 from mempalace.dynamics import drawer_salience
 
-
 T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 NOW = T0 + timedelta(hours=60)
 DOCUMENT = "Verbatim heliotrope research notes.\nKeep this second line intact."
