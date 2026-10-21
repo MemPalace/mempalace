@@ -5,7 +5,7 @@ The recommended way to use MemPalace with Claude Code — native marketplace ins
 ## Installation
 
 ```bash
-claude plugin marketplace add milla-jovovich/mempalace
+claude plugin marketplace add MemPalace/mempalace
 claude plugin install --scope user mempalace
 ```
 
@@ -15,7 +15,7 @@ Restart Claude Code, then type `/skills` to verify "mempalace" appears.
 
 With the plugin installed, Claude Code automatically:
 - Starts the MemPalace MCP server on launch
-- Has access to all 19 tools
+- Has access to all 47 tools
 - Learns the AAAK dialect and memory protocol from the `mempalace_status` response
 - Searches the palace before answering questions about past work
 

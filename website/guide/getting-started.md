@@ -2,19 +2,26 @@
 
 ## Installation
 
-Install MemPalace from PyPI:
+We recommend [`uv`](https://docs.astral.sh/uv/) — `uv tool install` puts
+the `mempalace` CLI in an isolated environment on your PATH:
 
 ```bash
-pip install mempalace
+uv tool install mempalace
 ```
 
+If you prefer pip, `pip install mempalace` still works.
+
+Android / Termux uses Android's Python wheel platform rather than Linux's.
+Follow the [Termux guide](/guide/termux) to run MemPalace in a Debian PRoot
+container instead of attempting a native install.
+
 ::: danger Security Warning
-The domain `mempalace.tech` is a **brand-squatting site** not affiliated with this project. It is known to run ad-redirects and potential malware. The official MemPalace distribution is only available via this [GitHub repository](https://github.com/milla-jovovich/mempalace) and [PyPI](https://pypi.org/project/mempalace/). Never install binaries or scripts from unofficial domains.
+The domain `mempalace.tech` is a **brand-squatting site** not affiliated with this project. It is known to run ad-redirects and potential malware. The official MemPalace distribution is only available via this [GitHub repository](https://github.com/MemPalace/mempalace) and [PyPI](https://pypi.org/project/mempalace/). Never install binaries or scripts from unofficial domains.
 :::
 
 ### Requirements
 
-- Python 3.9+
+- Python 3.10+
 - `chromadb>=0.5.0` (installed automatically)
 - `pyyaml>=6.0` (installed automatically)
 
@@ -23,9 +30,9 @@ No API key required for the core local workflow. After installation, the main st
 ### From Source
 
 ```bash
-git clone https://github.com/milla-jovovich/mempalace.git
+git clone https://github.com/MemPalace/mempalace.git
 cd mempalace
-pip install -e ".[dev]"
+uv sync --extra dev   # or: pip install -e ".[dev]"
 ```
 
 ## Quick Start
@@ -34,14 +41,20 @@ Three steps: **init**, **mine**, **search**.
 
 ### 1. Initialize Your Palace
 
+`mempalace init` requires a project directory to scan. Pass a path,
+or `.` to use the current directory.
+
 ```bash
 mempalace init ~/projects/myapp
+# or, from inside the project:
+mempalace init .
 ```
 
 This scans your project directory and:
+
 - Detects people and projects from file content
 - Creates rooms from your folder structure
-- Sets up `~/.mempalace/` config directory
+- Ensures the `~/.mempalace/` config directory exists
 
 ### 2. Mine Your Data
 
@@ -71,7 +84,7 @@ That gives you a working local memory index.
 
 ## What Happens Next
 
-After the one-time setup, you don't run MemPalace commands manually. Your AI uses it for you through [MCP integration](/guide/mcp-integration) or a [Claude Code plugin](/guide/claude-code).
+After the one-time setup, you don't run MemPalace commands manually. Your AI uses it for you through [MCP integration](/guide/mcp-integration), the bundled Codex plugin, or a [Claude Code plugin](/guide/claude-code).
 
 Ask your AI anything:
 
@@ -82,5 +95,5 @@ It calls `mempalace_search` automatically, gets verbatim results, and answers yo
 ## Next Steps
 
 - [Mining Your Data](/guide/mining) — deep dive into mining modes
-- [MCP Integration](/guide/mcp-integration) — connect to Claude, ChatGPT, Cursor, Gemini
+- [MCP Integration](/guide/mcp-integration) — connect to Claude, Codex, ChatGPT, Cursor, Gemini
 - [The Palace](/concepts/the-palace) — understand wings, rooms, halls, and tunnels

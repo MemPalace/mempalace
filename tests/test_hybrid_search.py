@@ -1,0 +1,316 @@
+"""Tests for the hybrid closet+drawer retrieval in search_memories.
+
+The hybrid path queries drawers directly (the floor) AND closets, applying a
+rank-based boost to drawers whose source_file appears in top closet hits.
+This avoids the "weak-closets regression" where low-signal closets (from
+regex extraction on narrative content) could hide drawers that direct
+search would have found.
+"""
+
+import mempalace.searcher as searcher_mod
+from mempalace.palace import (
+    get_backend_for_palace,
+    get_closets_collection,
+    get_collection,
+    upsert_closet_lines,
+)
+from mempalace.searcher import (
+    _hybrid_rank,
+    _resolve_hybrid_rank_weights,
+    search_memories,
+)
+
+
+def _close_palace(palace_path: str) -> None:
+    """Release chromadb client handles so the next open rebuilds from disk.
+
+    Windows CI intermittently returns zero hybrid hits right after a fast
+    seed write (same class of flake as "Nothing found on disk" on tiny
+    closet collections). Closing the cached client forces the next
+    ``search_memories`` open to re-read segments that have been flushed.
+    """
+    try:
+        get_backend_for_palace(palace_path).close_palace(palace_path)
+    except Exception:
+        pass
+
+
+def _search(query: str, palace: str, **kwargs):
+    """Search, retrying once after a client reopen if results are empty."""
+    result = search_memories(query, palace, **kwargs)
+    if result.get("results"):
+        return result
+    _close_palace(palace)
+    return search_memories(query, palace, **kwargs)
+
+
+def _seed_drawers(palace_path):
+    """Insert 4 short drawers with deterministic content."""
+    col = get_collection(palace_path, create=True)
+    col.upsert(
+        ids=["D1", "D2", "D3", "D4"],
+        documents=[
+            "We switched the auth service to use JWT tokens with a 24h expiry.",
+            "Database migration to PostgreSQL 15 completed last Tuesday.",
+            "The frontend team is debating whether to adopt TanStack Query.",
+            "Kafka consumer rebalance timeout set to 45 seconds after incident.",
+        ],
+        metadatas=[
+            {"wing": "backend", "room": "auth", "source_file": "fixture_D1.md"},
+            {"wing": "backend", "room": "db", "source_file": "fixture_D2.md"},
+            {"wing": "frontend", "room": "state", "source_file": "fixture_D3.md"},
+            {"wing": "backend", "room": "queue", "source_file": "fixture_D4.md"},
+        ],
+    )
+    _close_palace(palace_path)
+
+
+def _seed_strong_closet_for(palace_path, drawer_id, source_file, topics):
+    """Insert a closet whose content strongly overlaps the query keywords."""
+    col = get_closets_collection(palace_path)
+    lines = [f"{t}||→{drawer_id}" for t in topics]
+    upsert_closet_lines(
+        col,
+        closet_id_base=f"closet_{drawer_id}",
+        lines=lines,
+        metadata={
+            "wing": "backend",
+            "room": "auth",
+            "source_file": source_file,
+            "generated_by": "test",
+        },
+    )
+    # Keep this fixture above Chroma's batch_size=2 persistence floor. A
+    # single-row closet collection can intermittently query as "Nothing found on
+    # disk" on Windows when the deterministic test embedder makes writes fast.
+    col.upsert(
+        ids=[f"closet_{drawer_id}_sentinel"],
+        documents=["test sentinel unrelated stabilization topic"],
+        metadatas=[
+            {
+                "wing": "backend",
+                "room": "auth",
+                "source_file": f"{source_file}#sentinel",
+                "generated_by": "test",
+            }
+        ],
+    )
+    _close_palace(palace_path)
+
+
+# ── core invariant: closets can only HELP, never HIDE ─────────────────────
+
+
+class TestHybridInvariant:
+    def test_no_closets_degrades_to_direct_drawer_search(self, tmp_path):
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        # No closets created.
+        result = _search("Kafka rebalance timeout", palace, n_results=3)
+        ids = [h["source_file"] for h in result["results"]]
+        assert ids, "should return results"
+        assert "fixture_D4.md" in ids, "direct drawer search alone should surface the Kafka drawer"
+
+    def test_weak_closets_do_not_hide_direct_drawer_hits(self, tmp_path):
+        """A closet that points at a wrong drawer must NOT suppress the
+        drawer that direct search would have ranked first."""
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        # Seed a misleading closet: it matches a generic phrase but points at D3.
+        _seed_strong_closet_for(
+            palace,
+            drawer_id="D3",
+            source_file="fixture_D3.md",
+            topics=["Kafka queue tuning", "consumer rebalance config"],
+        )
+        result = _search("Kafka consumer rebalance timeout", palace, n_results=5)
+        ids = [h["source_file"] for h in result["results"]]
+        assert "fixture_D4.md" in ids, (
+            "D4 must appear — direct drawer search alone would rank it first. "
+            "Closet pointing to D3 should only boost D3, never hide D4."
+        )
+
+    def test_closet_boost_lifts_matching_drawer(self, tmp_path):
+        """When a closet agrees with direct search, the matching drawer
+        should be boosted to rank 1."""
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        _seed_strong_closet_for(
+            palace,
+            drawer_id="D1",
+            source_file="fixture_D1.md",
+            topics=["JWT auth tokens", "session expiry", "authentication service"],
+        )
+        result = _search("JWT auth tokens expiry", palace, n_results=3)
+        ids = [h["source_file"] for h in result["results"]]
+        assert ids, f"expected hybrid hits after seeding drawers+closets; got {result!r}"
+        assert ids[0] == "fixture_D1.md"
+        top = result["results"][0]
+        assert top["matched_via"] == "drawer+closet"
+        assert top["closet_boost"] > 0
+
+
+# ── closet_boost metadata ────────────────────────────────────────────────
+
+
+class TestClosetMetadata:
+    def test_closet_preview_exposed_when_boosted(self, tmp_path):
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        _seed_strong_closet_for(
+            palace,
+            drawer_id="D1",
+            source_file="fixture_D1.md",
+            topics=["JWT auth tokens", "session expiry", "authentication service"],
+        )
+        result = _search("JWT auth tokens expiry", palace, n_results=2)
+        top = result["results"][0]
+        assert top["source_file"] == "fixture_D1.md"
+        assert top["matched_via"] == "drawer+closet"
+        assert top["closet_boost"] > 0
+        assert "closet_preview" in top
+
+    def test_drawer_only_hits_have_no_closet_preview(self, tmp_path):
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        # No closets
+        result = _search("TanStack Query", palace, n_results=2)
+        assert result["results"]
+        for h in result["results"]:
+            assert h["matched_via"] == "drawer"
+            assert "closet_preview" not in h
+            assert h["closet_boost"] == 0.0
+
+
+# ── source_file filter scopes both drawer and closet queries (#1815) ──────
+
+
+class TestSourceFileFilter:
+    def test_source_file_filter_excludes_other_sources(self, tmp_path):
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        result = _search(
+            "Kafka consumer rebalance timeout",
+            palace,
+            n_results=5,
+            source_file="fixture_D4.md",
+        )
+        ids = [h["source_file"] for h in result["results"]]
+        assert ids, "the matching source_file drawer should be returned"
+        assert set(ids) == {"fixture_D4.md"}
+
+    def test_source_file_filter_overrides_closet_boost_for_other_source(self, tmp_path):
+        # A strong closet pointing at D1 must NOT leak D1 in when the search
+        # is scoped to a different source_file — the where clause is applied
+        # to the closet query too, not just the drawer query.
+        palace = str(tmp_path / "palace")
+        _seed_drawers(palace)
+        _seed_strong_closet_for(
+            palace,
+            drawer_id="D1",
+            source_file="fixture_D1.md",
+            topics=["Kafka queue tuning", "consumer rebalance config"],
+        )
+        result = _search(
+            "Kafka consumer rebalance",
+            palace,
+            n_results=5,
+            source_file="fixture_D4.md",
+        )
+        ids = [h["source_file"] for h in result["results"]]
+        assert "fixture_D1.md" not in ids
+        assert set(ids) <= {"fixture_D4.md"}
+
+
+def test_hybrid_rank_breaks_score_ties_by_authored_at():
+    """Identical-content hits get identical vector + BM25 scores; the tie must break
+    toward the more recently authored drawer, not arbitrary backend order."""
+    older = {
+        "text": "alpha beta gamma",
+        "distance": 0.2,
+        "metadata": {"authored_at": "2026-06-21T10:00:00.000Z"},
+    }
+    newer = {
+        "text": "alpha beta gamma",
+        "distance": 0.2,
+        "metadata": {"authored_at": "2026-06-27T10:00:00.000Z"},
+    }
+    # Input order puts the older drawer first; the tiebreak should reorder it.
+    results = [older, newer]
+    _hybrid_rank(results, "alpha beta gamma")
+    assert results[0]["metadata"]["authored_at"] == "2026-06-27T10:00:00.000Z"
+    assert results[1]["metadata"]["authored_at"] == "2026-06-21T10:00:00.000Z"
+
+
+def test_hybrid_rank_tiebreak_handles_top_level_authored_at():
+    """The search_memories path puts authored_at at the top level (no `metadata`
+    nesting); the tie-break must read it there too."""
+    older = {"text": "alpha beta gamma", "distance": 0.2, "authored_at": "2026-06-21T10:00:00.000Z"}
+    newer = {"text": "alpha beta gamma", "distance": 0.2, "authored_at": "2026-06-27T10:00:00.000Z"}
+    results = [older, newer]
+    _hybrid_rank(results, "alpha beta gamma")
+    assert results[0]["authored_at"] == "2026-06-27T10:00:00.000Z"
+    assert results[1]["authored_at"] == "2026-06-21T10:00:00.000Z"
+
+
+# ── configurable vector/BM25 blend weights (#2298) ───────────────────────
+# The re-rank blend (vector vs BM25) used to be hardcoded 0.6/0.4. It now
+# resolves MempalaceConfig().hybrid_rank_*_weight (env > config.json >
+# default) through _resolve_hybrid_rank_weights, and _hybrid_rank accepts the
+# weights as explicit params. These tests prove the whole chain is live and
+# that a bad config value can never take a search down.
+
+
+def test_resolve_hybrid_rank_weights_defaults_when_config_unset(monkeypatch):
+    monkeypatch.delenv("MEMPALACE_HYBRID_VECTOR_WEIGHT", raising=False)
+    monkeypatch.delenv("MEMPALACE_HYBRID_BM25_WEIGHT", raising=False)
+    vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
+    assert (vector_weight, bm25_weight) == (0.6, 0.4)
+
+
+def test_resolve_hybrid_rank_weights_honors_env(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_HYBRID_VECTOR_WEIGHT", "0.9")
+    monkeypatch.setenv("MEMPALACE_HYBRID_BM25_WEIGHT", "0.1")
+    vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
+    assert (vector_weight, bm25_weight) == (0.9, 0.1)
+
+
+def test_resolve_hybrid_rank_weights_falls_back_when_config_raises(monkeypatch):
+    """A config that blows up must not take a search down — resolver returns defaults."""
+
+    class _Boom:
+        def __init__(self):
+            raise RuntimeError("config dir unreadable")
+
+    monkeypatch.setattr(searcher_mod, "MempalaceConfig", _Boom)
+    vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
+    assert (vector_weight, bm25_weight) == (0.6, 0.4)
+
+
+def test_hybrid_rank_weights_change_the_blend_and_therefore_order():
+    """The weight params must actually reach the blend, not just be accepted.
+
+    A (distance 0.0 -> vector sim 1.0, no lexical overlap -> BM25 norm 0) vs B
+    (distance 1.0 -> vector sim 0.0, matches the query -> BM25 norm 1.0).
+    The vector-favoured default 0.6/0.4 gives A = 0.6, B = 0.4, so A wins; a
+    BM25-favoured 0.1/0.9 gives A = 0.1, B = 0.9, so B wins. Same two
+    candidates, same query, opposite winners - proof the configurable weights
+    flow into _hybrid_rank's scored sort key rather than being accepted and
+    ignored.
+    """
+    query = "quantum entanglement"
+    # distance 0.0 keeps A inside the cosine [0, 2] range; distance 1.0 is
+    # orthogonal (sim max(0, 1-1)=0), leaving B's whole score to BM25.
+    a = {"text": "zebra quark", "distance": 0.0}
+    b = {"text": "quantum entanglement", "distance": 1.0}
+
+    default_order = [r["text"] for r in _hybrid_rank([dict(a), dict(b)], query)]
+    assert default_order[0] == "zebra quark", "default 0.6/0.4 should favour the vector hit"
+
+    custom_order = [
+        r["text"]
+        for r in _hybrid_rank([dict(a), dict(b)], query, vector_weight=0.1, bm25_weight=0.9)
+    ]
+    assert custom_order[0] == "quantum entanglement", (
+        "a BM25-heavy blend must favour the lexical hit"
+    )

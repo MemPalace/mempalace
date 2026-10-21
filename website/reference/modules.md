@@ -8,16 +8,16 @@ Complete source file reference for the MemPalace codebase.
 mempalace/
 ├── README.md                  ← project documentation
 ├── mempalace/                 ← core package
-│   ├── cli.py                 ← CLI entry point
-│   ├── mcp_server.py          ← MCP server (19 tools)
+│   ├── cli/                   ← CLI package (commands, parser)
+│   ├── mcp_server/            ← MCP server package (tools, protocol, HTTP)
 │   ├── knowledge_graph.py     ← temporal entity graph
 │   ├── palace_graph.py        ← room navigation graph
 │   ├── dialect.py             ← AAAK compression
 │   ├── miner.py               ← project file ingest
 │   ├── convo_miner.py         ← conversation ingest
-│   ├── searcher.py            ← semantic search
+│   ├── searcher/              ← hybrid BM25 + vector search package
+│   ├── palace/                ← collection access, closets, mine locks
 │   ├── layers.py              ← 4-layer memory stack
-│   ├── onboarding.py          ← guided setup
 │   ├── config.py              ← configuration loading
 │   ├── normalize.py           ← chat format converter
 │   ├── entity_detector.py     ← auto-detect people/projects
@@ -50,15 +50,15 @@ mempalace/
 
 ## Core Modules
 
-### `cli.py` — CLI Entry Point
+### `cli/` — CLI Entry Point
 
 Argparse-based CLI with subcommands: `init`, `mine`, `split`, `search`, `compress`, `wake-up`, `repair`, `status`, `hook`, `instructions`. Dispatches to the corresponding module.
 
-### `mcp_server.py` — MCP Server
+### `mcp_server/` — MCP Server
 
-JSON-RPC over stdin/stdout. Implements the MCP protocol with 19 tools covering palace read/write, knowledge graph, navigation, and agent diary operations. Includes the Memory Protocol and AAAK Spec in status responses.
+JSON-RPC over stdin/stdout. Implements the MCP protocol with 47 tools covering palace read/write, drawer CRUD, knowledge graph, navigation, tunnels, agent diary, and system operations. Includes the Memory Protocol and AAAK Spec in status responses.
 
-### `searcher.py` — Semantic Search
+### `searcher/` — Semantic Search
 
 Two functions: `search()` for CLI output and `search_memories()` for programmatic use. Both query ChromaDB with optional wing/room filters and return verbatim drawer content with similarity scores.
 
@@ -90,7 +90,7 @@ Imports conversation exports (Claude, ChatGPT, Slack, Markdown, plaintext). Chun
 
 ### `normalize.py` — Format Converter
 
-Converts 5 chat formats to a standard transcript format before mining.
+Converts 5 chat formats to a standard transcript format before mining. The conversation miner records which lossy steps a file's parse applied (tool output truncated or omitted, tool calls summarized, UI chrome stripped, non-text blocks dropped, Slack roles assigned) and stamps them, sorted and comma-joined, in the `transforms` metadata of every drawer from that file, using the RFC 002 transformation names.
 
 ### `general_extractor.py` — Memory Type Extraction
 
@@ -120,10 +120,6 @@ Loads settings from `~/.mempalace/config.json` and environment variables.
 
 Splits concatenated transcripts into per-session files based on session boundary detection.
 
-### `onboarding.py` — Guided Setup
-
-Interactive setup wizard for `mempalace init`. Generates AAAK bootstrap and wing config.
-
 ### `spellcheck.py` — Spell Checking
 
-Optional spell checking utility (requires `autocorrect` package).
+Optional spell checking utility (requires `autocorrect` package). The conversation miner uses it only when `convo.spellcheck` (or `MEMPALACE_CONVO_SPELLCHECK`) is on, corrects user messages only, and adds `spellcheck_user` to the `transforms` stamp of every drawer from a file whose text the speller changed.

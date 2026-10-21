@@ -1,0 +1,656 @@
+"""
+test_mcp_mine.py — Tests for the ``mempalace_mine`` MCP tool (#1662).
+
+Mining was previously CLI-only (``mempalace mine``); non-Claude-Code MCP clients
+(Desktop Commander, LM Studio, Aionui) had no MCP-callable mine. ``tool_mine``
+wraps the same in-process miners the CLI uses — projects / convos / extract —
+synchronously, mirroring the ``tool_sync`` contract.
+
+The miners print progress + a summary to stdout, which in the MCP server is the
+JSON-RPC channel. ``tool_mine`` therefore redirects stdout at the file-descriptor
+level around the miner and returns the text as an opaque ``output`` field rather
+than letting it corrupt the protocol. These tests assert the dispatch/return
+contract, that convos mining actually files drawers (the #1662 gap), and that the
+stdout isolation holds.
+"""
+
+import os
+import sys
+from types import SimpleNamespace
+
+import chromadb
+import pytest
+
+
+def _patch(monkeypatch, config):
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+
+
+def _write(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+# ── Registration ─────────────────────────────────────────────────────────
+
+
+def test_registered_in_tools():
+    from mempalace import mcp_server
+
+    assert "mempalace_mine" in mcp_server.TOOLS
+    entry = mcp_server.TOOLS["mempalace_mine"]
+    assert entry["handler"] is mcp_server.tool_mine
+    assert entry["input_schema"]["required"] == ["source"]
+    include_ignored = entry["input_schema"]["properties"]["include_ignored"]
+    assert include_ignored["type"] == "array"
+    assert include_ignored["items"]["type"] == "string"
+    assert entry["input_schema"]["properties"]["include_subagents"]["type"] == "boolean"
+
+
+# ── Guard rails ──────────────────────────────────────────────────────────
+
+
+def test_no_palace_returns_structured_error(monkeypatch):
+    from mempalace import mcp_server
+
+    class _EmptyConfig:
+        palace_path = ""
+        collection_name = "mempalace_drawers"
+
+    monkeypatch.setattr(mcp_server, "_config", _EmptyConfig())
+    result = mcp_server.tool_mine(source="/tmp")
+    assert result["success"] is False
+    assert "error" in result
+
+
+def test_invalid_mode_returns_structured_error(monkeypatch, config, tmp_dir):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "src")
+    os.makedirs(src)
+    result = mcp_server.tool_mine(source=src, mode="bogus")
+    assert result["success"] is False
+    assert "invalid mode" in result["error"].lower()
+
+
+def test_missing_source_dir_returns_structured_error(monkeypatch, config):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    result = mcp_server.tool_mine(source="/nonexistent/path/xyz")
+    assert result["success"] is False
+    assert "source" in result["error"].lower()
+
+
+@pytest.mark.parametrize("include_ignored", ["notes.md", 1, {}, [1], [None], [""], ["  "]])
+def test_invalid_include_ignored_is_rejected_before_ingestion(
+    monkeypatch, config, tmp_path, include_ignored
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+
+    def _unexpected_mine(*args, **kwargs):
+        pytest.fail("invalid include_ignored reached the miner")
+
+    monkeypatch.setattr("mempalace.miner.mine", _unexpected_mine)
+    result = mcp_server.tool_mine(source=str(tmp_path), include_ignored=include_ignored)
+    assert result["success"] is False
+    assert result["error_class"] == "ValueError"
+    assert "include_ignored" in result["error"]
+
+
+@pytest.mark.parametrize("mode", ["convos", "extract"])
+def test_include_ignored_is_rejected_for_non_project_modes(monkeypatch, config, tmp_path, mode):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+
+    def _unexpected_capture(_run):
+        pytest.fail("unsupported include_ignored reached ingestion")
+
+    monkeypatch.setattr(mcp_server, "_capture_fd_stdout", _unexpected_capture)
+    result = mcp_server.tool_mine(source=str(tmp_path), mode=mode, include_ignored=["notes.md"])
+    assert result["success"] is False
+    assert result["error_class"] == "ValueError"
+    assert "projects" in result["error"]
+
+
+@pytest.mark.parametrize("include_subagents", ["false", "true", 1, 0, None, []])
+def test_non_boolean_include_subagents_is_rejected_before_ingestion(
+    monkeypatch, config, tmp_path, include_subagents
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+
+    def _unexpected_capture(_run):
+        pytest.fail("invalid include_subagents reached ingestion")
+
+    monkeypatch.setattr(mcp_server, "_capture_fd_stdout", _unexpected_capture)
+    arguments = {"source": str(tmp_path), "mode": "convos", "include_subagents": include_subagents}
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_mine", "arguments": arguments},
+        }
+    )
+    assert response["error"]["code"] == -32602
+    assert "include_subagents" in response["error"]["message"]
+
+
+# ── Dispatch + return contract ───────────────────────────────────────────
+
+
+def test_projects_include_ignored_reaches_miner_with_existing_options(
+    monkeypatch, config, tmp_path
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    observed = {}
+
+    def _mine(**kwargs):
+        observed.update(kwargs)
+
+    monkeypatch.setattr("mempalace.miner.mine", _mine)
+    paths = [".agents/handoffs/notes.md", "docs/other note.md"]
+    result = mcp_server.tool_mine(
+        source=str(tmp_path),
+        wing="notes",
+        agent="codex",
+        limit=1,
+        dry_run=True,
+        include_ignored=paths,
+    )
+    assert result["success"] is True
+    assert observed == {
+        "project_dir": str(tmp_path),
+        "palace_path": config.palace_path,
+        "wing_override": "notes",
+        "agent": "codex",
+        "limit": 1,
+        "dry_run": True,
+        "include_ignored": paths,
+    }
+
+
+@pytest.mark.parametrize("include_subagents", [True, False])
+def test_convos_include_subagents_reaches_convo_miner(
+    monkeypatch, config, tmp_path, include_subagents
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    observed = {}
+
+    def _mine_convos(**kwargs):
+        observed.update(kwargs)
+
+    monkeypatch.setattr("mempalace.convo_miner.mine_convos", _mine_convos)
+    result = mcp_server.tool_mine(
+        source=str(tmp_path), mode="convos", dry_run=True, include_subagents=include_subagents
+    )
+    assert result["success"] is True
+    assert observed["include_subagents"] is include_subagents
+
+
+def test_convos_mine_skips_subagents_unless_asked(monkeypatch, config, tmp_path):
+    """Default stays the CLI's: subagent folders are opt-in."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    session = tmp_path / "session"
+    (session / "subagents").mkdir(parents=True)
+    _write(session / "parent.txt", "> What is memory?\nMemory is persistence.\n")
+    _write(session / "subagents" / "agent.txt", "> Explore?\nExplored the tree.\n")
+
+    default = mcp_server.tool_mine(source=str(tmp_path), mode="convos", dry_run=True)
+    included = mcp_server.tool_mine(
+        source=str(tmp_path), mode="convos", dry_run=True, include_subagents=True
+    )
+    assert default["success"] is True and included["success"] is True
+    assert "agent.txt" not in default["output"]
+    assert "agent.txt" in included["output"]
+
+
+@pytest.mark.parametrize("mode", ["projects", "extract"])
+def test_include_subagents_is_ignored_by_non_convos_modes(monkeypatch, config, tmp_path, mode):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    calls = []
+
+    def _mine(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("mempalace.miner.mine", _mine)
+    monkeypatch.setattr("mempalace.format_miner.mine_formats", _mine)
+    result = mcp_server.tool_mine(
+        source=str(tmp_path), mode=mode, dry_run=True, include_subagents=True
+    )
+    assert result["success"] is True
+    assert len(calls) == 1
+    assert "include_subagents" not in calls[0]
+
+
+def test_include_subagents_passes_the_protocol_argument_whitelist(monkeypatch, config, tmp_path):
+    """The hub dispatches through handle_request, which rejects any argument
+    the schema does not declare -- the forwarded flag must survive it."""
+    import json
+
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    observed = {}
+    monkeypatch.setattr(
+        "mempalace.convo_miner.mine_convos", lambda **kwargs: observed.update(kwargs)
+    )
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_mine",
+                "arguments": {
+                    "source": str(tmp_path),
+                    "mode": "convos",
+                    "dry_run": True,
+                    "include_subagents": True,
+                },
+            },
+        }
+    )
+    assert "error" not in response, response
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["success"] is True, payload
+    assert observed["include_subagents"] is True
+
+
+@pytest.mark.parametrize("mode", ["projects", "convos", "extract"])
+@pytest.mark.parametrize("options", [{}, {"include_ignored": None}, {"include_ignored": []}])
+def test_empty_include_ignored_preserves_default_dispatch(
+    monkeypatch, config, tmp_path, mode, options
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    calls = []
+
+    def _mine(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("mempalace.miner.mine", _mine)
+    monkeypatch.setattr("mempalace.convo_miner.mine_convos", _mine)
+    monkeypatch.setattr("mempalace.format_miner.mine_formats", _mine)
+    result = mcp_server.tool_mine(source=str(tmp_path), mode=mode, dry_run=True, **options)
+    assert result["success"] is True
+    assert len(calls) == 1
+    assert "include_ignored" not in calls[0]
+
+
+@pytest.mark.parametrize("include_ignored", [None, [], [".agents/handoffs/keep.md"]])
+def test_projects_include_ignored_preserves_gitignore_selection(
+    monkeypatch, config, tmp_path, include_ignored
+):
+    from mempalace import mcp_server, miner
+
+    _patch(monkeypatch, config)
+    (tmp_path / ".gitignore").write_text(".agents/\n", encoding="utf-8")
+    notes = tmp_path / ".agents" / "handoffs"
+    notes.mkdir(parents=True)
+    for path in (tmp_path / "visible.md", notes / "keep.md", notes / "ignored.md"):
+        path.write_text("# Notes\n\n" + "Verbatim project notes. " * 40, encoding="utf-8")
+
+    scan = miner.scan_project
+    selected = []
+
+    def _scan(*args, **kwargs):
+        files = scan(*args, **kwargs)
+        selected.extend(path.relative_to(tmp_path).as_posix() for path in files)
+        return files
+
+    monkeypatch.setattr(miner, "scan_project", _scan)
+    result = mcp_server.tool_mine(
+        source=str(tmp_path), dry_run=True, include_ignored=include_ignored
+    )
+    assert result["success"] is True, result
+    expected = ["visible.md"]
+    if include_ignored:
+        expected.append(".agents/handoffs/keep.md")
+    assert sorted(selected) == sorted(expected)
+
+
+def test_dry_run_projects_returns_success_and_output(monkeypatch, config, tmp_dir):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "proj")
+    os.makedirs(src)
+    _write(os.path.join(src, "notes.md"), "# Title\n\n" + ("Some real content. " * 40))
+
+    result = mcp_server.tool_mine(source=src, mode="projects", dry_run=True)
+    assert result["success"] is True
+    assert result["mode"] == "projects"
+    assert result["dry_run"] is True
+    assert isinstance(result["output"], str) and result["output"]
+
+
+def test_convos_mode_files_drawers(monkeypatch, config, tmp_dir):
+    """The #1662 core ask: mine conversation transcripts via MCP.
+
+    Proves the tool eliminates the gap rather than masking it — after a real
+    convos mine the palace collection actually holds the drawers.
+    """
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "convos")
+    os.makedirs(src)
+    _write(
+        os.path.join(src, "chat.txt"),
+        "> What is memory?\nMemory is persistence.\n\n"
+        "> Why does it matter?\nIt enables continuity across sessions.\n\n"
+        "> How do we build it?\nWith structured verbatim storage.\n",
+    )
+
+    result = mcp_server.tool_mine(source=src, mode="convos", wing="test_convos")
+    assert result["success"] is True
+    assert result["mode"] == "convos"
+    assert result["dry_run"] is False
+
+    client = chromadb.PersistentClient(path=config.palace_path)
+    try:
+        col = client.get_collection("mempalace_drawers")
+        assert col.count() >= 2
+    finally:
+        del client
+
+
+def test_convos_mode_accepts_a_single_file(monkeypatch, config, tmp_dir):
+    """A lone conversation file is a valid convos source (#2281).
+
+    ``cli.py`` documents the positional as "Directory to mine, or one
+    conversation file with --mode convos", and ``hooks_cli._ingest_transcript``
+    submits exactly one ``.jsonl``. ``cmd_mine`` forwards to the hub whenever one
+    is live, so a directory-only precondition here makes the documented
+    single-file form unreachable in the configuration most users run, and every
+    hook transcript ingest fails.
+    """
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "one-session.txt")
+    _write(
+        src,
+        "> What is memory?\nMemory is persistence.\n\n"
+        "> Why does it matter?\nIt enables continuity across sessions.\n\n"
+        "> How do we build it?\nWith structured verbatim storage.\n",
+    )
+
+    result = mcp_server.tool_mine(source=src, mode="convos", wing="test_one_file")
+    assert result["success"] is True, result.get("error")
+    assert result["mode"] == "convos"
+
+    client = chromadb.PersistentClient(path=config.palace_path)
+    try:
+        col = client.get_collection("mempalace_drawers")
+        assert col.count() >= 2
+    finally:
+        del client
+
+
+def test_projects_mode_still_rejects_a_file(monkeypatch, config, tmp_dir):
+    """Only convos gained the single-file form; projects still needs a tree.
+
+    Guards the relaxation from widening into "any mode, any path" — without
+    this, the fix for #2281 would pass just as well if the precondition were
+    dropped entirely.
+    """
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "notes.md")
+    _write(src, "# Title\n\n" + ("Some real content. " * 40))
+
+    result = mcp_server.tool_mine(source=src, mode="projects")
+    assert result["success"] is False
+    assert "source" in result["error"].lower()
+
+
+def test_stdout_captured_not_leaked_to_fd(monkeypatch, config, tmp_dir, capfd):
+    """Miner stdout must land in ``output``, never on the real fd-1 JSON-RPC
+    channel. ``tool_mine`` redirects fd 1 around the in-process miner."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "convos")
+    os.makedirs(src)
+    _write(
+        os.path.join(src, "chat.txt"),
+        "> Q one?\nAnswer one is reasonably long so it forms a chunk here.\n\n"
+        "> Q two?\nAnswer two is also long enough to be filed as a drawer here.\n",
+    )
+
+    result = mcp_server.tool_mine(source=src, mode="convos", wing="cap", dry_run=True)
+    captured = capfd.readouterr()
+    assert "Done." in result["output"]
+    assert "Done." not in captured.out
+
+
+def test_fd_redirect_unavailable_falls_back_to_python_capture(monkeypatch):
+    """A host that rejects fd-level redirection still gets one safe callback.
+
+    Windows MCP hosts can expose a valid protocol stdout that ``os.dup`` can
+    copy while rejecting a later ``os.dup2`` to a temporary-file descriptor.
+    The documented Python-only fallback must cover that setup failure too.
+    """
+    from mempalace import mcp_server
+
+    calls = []
+
+    def _reject_redirect(_source_fd, _target_fd):
+        raise OSError(22, "Invalid argument")
+
+    def _callback():
+        calls.append("called")
+        print("python fallback output")
+        return "result"
+
+    fake_os = SimpleNamespace(dup=os.dup, dup2=_reject_redirect, close=os.close)
+    monkeypatch.setattr(mcp_server, "os", fake_os)
+
+    result, output = mcp_server._capture_fd_stdout(_callback)
+
+    assert result == "result"
+    assert calls == ["called"]
+    assert output == "python fallback output\n"
+
+
+def test_fd_restore_failure_remains_fail_closed(monkeypatch):
+    """Once fd 1 was redirected, a failed restore becomes a fatal transport error."""
+    from mempalace import mcp_server
+
+    calls = 0
+
+    def _fail_restore(_source_fd, _target_fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(22, "Invalid argument")
+
+    fake_os = SimpleNamespace(dup=os.dup, dup2=_fail_restore, close=os.close)
+    monkeypatch.setattr(mcp_server, "os", fake_os)
+
+    with pytest.raises(mcp_server._ProtocolStdoutRestoreFailure, match="restore"):
+        mcp_server._capture_fd_stdout(lambda: print("captured"))
+
+    assert calls == 2
+
+
+def test_callback_flush_failure_still_restores_fd(monkeypatch):
+    """A failed post-callback flush cannot skip protocol-fd restoration."""
+    from mempalace import mcp_server
+
+    flushes = 0
+    dup2_calls = []
+
+    class _Stdout:
+        def flush(self):
+            nonlocal flushes
+            flushes += 1
+            if flushes == 2:
+                raise OSError(22, "flush failed")
+
+    fake_sys = SimpleNamespace(stdout=_Stdout(), stderr=sys.stderr)
+    fake_os = SimpleNamespace(
+        dup=os.dup,
+        dup2=lambda source_fd, target_fd: dup2_calls.append((source_fd, target_fd)),
+        close=os.close,
+    )
+    monkeypatch.setattr(mcp_server, "sys", fake_sys)
+    monkeypatch.setattr(mcp_server, "os", fake_os)
+
+    with pytest.raises(OSError, match="flush failed"):
+        mcp_server._capture_fd_stdout(lambda: print("captured"))
+
+    assert flushes == 2
+    assert len(dup2_calls) == 2
+
+
+def test_tool_mine_does_not_swallow_fatal_stdout_restore_failure(monkeypatch, config, tmp_dir):
+    """The normal tool error contract cannot continue after protocol-fd loss."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "proj")
+    os.makedirs(src)
+
+    def _fatal(_fn):
+        raise mcp_server._ProtocolStdoutRestoreFailure("cannot restore protocol stdout")
+
+    monkeypatch.setattr(mcp_server, "_capture_fd_stdout", _fatal)
+
+    with pytest.raises(mcp_server._ProtocolStdoutRestoreFailure, match="restore"):
+        mcp_server.tool_mine(source=src, mode="projects", dry_run=True)
+
+
+def test_mine_already_running_surfaces_structured_error(monkeypatch, config, tmp_dir):
+    """A held palace lock (MineAlreadyRunning) surfaces as a structured
+    already-running error, mirroring tool_sync."""
+    from mempalace import mcp_server
+    from mempalace.palace import MineAlreadyRunning
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "proj")
+    os.makedirs(src)
+    _write(os.path.join(src, "a.md"), "content " * 50)
+
+    def _boom(*args, **kwargs):
+        raise MineAlreadyRunning("held by pid 999")
+
+    monkeypatch.setattr("mempalace.miner.mine", _boom)
+    result = mcp_server.tool_mine(source=src, mode="projects")
+    assert result["success"] is False
+    assert result.get("error_class") == "LockHeldByOtherProcess"
+
+
+def test_large_output_is_tail_truncated(monkeypatch, config, tmp_dir):
+    """A very large miner summary is tail-trimmed (and flagged, never silently)
+    so the MCP response stays bounded."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "proj")
+    os.makedirs(src)
+
+    def _chatty(*args, **kwargs):
+        print("X" * 5000)
+        return None
+
+    monkeypatch.setattr("mempalace.miner.mine", _chatty)
+    result = mcp_server.tool_mine(source=src, mode="projects")
+    assert result["success"] is True
+    assert result["output_truncated"] is True
+    assert len(result["output"]) == 4000
+
+
+def test_import_error_outside_extract_is_not_mislabeled(monkeypatch, config, tmp_dir):
+    """An ImportError outside extract mode is a real bug, not a missing extra —
+    it must not be labelled MissingDependency."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "proj")
+    os.makedirs(src)
+
+    def _broken(*args, **kwargs):
+        raise ImportError("no module named 'totally_internal'")
+
+    monkeypatch.setattr("mempalace.miner.mine", _broken)
+    result = mcp_server.tool_mine(source=src, mode="projects")
+    assert result["success"] is False
+    assert result.get("error_class") == "ImportError"
+    assert "mine failed" in result["error"]
+
+
+def test_extract_missing_dependency_is_named(monkeypatch, config, tmp_dir):
+    """extract mode surfaces a MissingDependency error pointing at the extra."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "docs")
+    os.makedirs(src)
+
+    def _no_extra(*args, **kwargs):
+        raise ImportError("No module named 'markitdown'")
+
+    monkeypatch.setattr("mempalace.format_miner.mine_formats", _no_extra)
+    result = mcp_server.tool_mine(source=src, mode="extract")
+    assert result["success"] is False
+    assert result.get("error_class") == "MissingDependency"
+    assert "mempalace[extract]" in result["error"]
+
+
+def test_system_exit_from_miner_does_not_kill_server(monkeypatch, config, tmp_dir):
+    """miner.mine turns Ctrl-C into sys.exit(130); in-process that SystemExit
+    would escape the protocol loop (which only catches Exception) and kill the
+    server. tool_mine converts it to a structured error instead."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "proj")
+    os.makedirs(src)
+
+    def _exit(*args, **kwargs):
+        raise SystemExit(130)
+
+    monkeypatch.setattr("mempalace.miner.mine", _exit)
+    result = mcp_server.tool_mine(source=src, mode="projects")
+    assert result["success"] is False
+    assert result.get("error_class") == "Interrupted"
+
+
+def test_generic_exception_carries_error_class(monkeypatch, config, tmp_dir):
+    """An unexpected miner failure is surfaced with its exception type so the
+    caller can distinguish error kinds."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "proj")
+    os.makedirs(src)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr("mempalace.miner.mine", _boom)
+    result = mcp_server.tool_mine(source=src, mode="projects")
+    assert result["success"] is False
+    assert "mine failed" in result["error"]
+    assert result.get("error_class") == "RuntimeError"

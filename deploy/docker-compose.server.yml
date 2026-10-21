@@ -1,0 +1,71 @@
+# MemPalace remote team server — MCP over HTTP, backed by a central Qdrant.
+#
+# One command stands up a shared memory service a whole team's AI clients
+# connect to. Embeddings are still produced locally inside the mempalace
+# container; only your own Qdrant ever receives the vectors and text.
+#
+#   1. cp deploy/server.env.example deploy/.env  &&  edit deploy/.env
+#      (at minimum set MEMPALACE_MCP_HTTP_TOKEN to a long random secret)
+#   2. docker compose -f deploy/docker-compose.server.yml --env-file deploy/.env up -d
+#   3. connect a client (see the Remote / Team Server guide):
+#      claude mcp add --transport http mempalace http://YOUR_HOST:8765/mcp \
+#        --header "Authorization: Bearer $MEMPALACE_MCP_HTTP_TOKEN"
+#
+# SECURITY: this exposes plaintext HTTP on :8765. For anything beyond a trusted
+# private network, put a TLS-terminating reverse proxy in front (nginx/Caddy/
+# Traefik) and only expose the proxy. The bearer token is mandatory for the
+# network-exposed (0.0.0.0) bind.
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    volumes:
+      - qdrant-storage:/qdrant/storage
+    # Not published to the host: only the mempalace service reaches it over the
+    # internal compose network. Uncomment to inspect Qdrant directly.
+    # ports:
+    #   - "6333:6333"
+
+  mempalace:
+    image: ghcr.io/mempalace/mempalace:latest
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    command:
+      - serve
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8765"
+      - --backend
+      - qdrant
+      # Uncomment to expose recall without write access to most clients:
+      # - --read-only
+    environment:
+      # Required for the network-exposed bind. Set in deploy/.env.
+      MEMPALACE_MCP_HTTP_TOKEN: ${MEMPALACE_MCP_HTTP_TOKEN:?set MEMPALACE_MCP_HTTP_TOKEN in deploy/.env}
+      MEMPALACE_QDRANT_URL: http://qdrant:6333
+      MEMPALACE_QDRANT_API_KEY: ${MEMPALACE_QDRANT_API_KEY:-}
+      # Set to cuda/dml/coreml on an accelerated host (see Dockerfile.gpu).
+      MEMPALACE_EMBEDDING_DEVICE: ${MEMPALACE_EMBEDDING_DEVICE:-auto}
+    ports:
+      - "8765:8765"
+    volumes:
+      - mempalace-data:/data
+    healthcheck:
+      # The image has no curl; use Python (always present). /healthz needs no auth.
+      # If you enable TLS on the server itself, switch this to https + ssl context.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://127.0.0.1:8765/healthz').read().strip()==b'ok' else sys.exit(1)"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+volumes:
+  qdrant-storage:
+  mempalace-data:

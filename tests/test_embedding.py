@@ -1,0 +1,870 @@
+import logging
+import re
+
+import pytest
+
+import mempalace.embedding as embedding
+
+
+@pytest.fixture(autouse=True)
+def isolate_embedding_state(monkeypatch):
+    monkeypatch.setattr(embedding, "_EF_CACHE", {})
+
+
+def test_embeddinggemma2_factory_is_lazy_cached_and_identity_tracks_settings(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma2")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION", "768")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_MODALITIES", "text")
+    first = embedding.get_embedding_function()
+    assert first is embedding.get_embedding_function()
+    assert first._model is None
+    assert embedding.probe_dimension() == 768
+    identity = embedding.get_embedder_identity()
+    assert identity.model_name == first.identity
+    assert "google/embeddinggemma-2@" in identity.model_name
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION", "256")
+    second = embedding.get_embedding_function()
+    assert second is not first
+    assert embedding.get_embedder_identity().dimension == 256
+    assert embedding.current_model_name() != identity.model_name
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_MODALITIES", "all")
+    assert embedding.get_embedding_function().identity != second.identity
+
+
+class _FakeMiniLM:
+    """Stands in for the MiniLM ONNX class so no model is loaded."""
+
+    built = []
+
+    def __init__(self, preferred_providers=None, intra_op_num_threads=0):
+        self.preferred_providers = preferred_providers
+        _FakeMiniLM.built.append(self)
+
+
+def _fake_minilm(monkeypatch):
+    _FakeMiniLM.built = []
+    monkeypatch.setattr(embedding, "_build_ef_class", lambda: _FakeMiniLM)
+
+
+def _fallback_warnings(caplog):
+    return [r for r in caplog.records if "Unknown embedding_model" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["all-minilm-l6-v2", "minilm-l6", "", "none", "open", "gemma", "gemma2"],
+    ids=["non-canonical", "other-name", "empty", "null", "open", "gemma", "gemma2"],
+)
+def test_unknown_embedding_model_falls_back_to_minilm_with_one_warning(monkeypatch, caplog, model):
+    """An unrecognized model keeps the historical MiniLM fallback, and every
+    call resolves to the same cached function that ``"minilm"`` gets."""
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        first = embedding.get_embedding_function(device="cpu", model=model)
+        second = embedding.get_embedding_function(device="cpu", model=model)
+        minilm = embedding.get_embedding_function(device="cpu", model="minilm")
+
+    assert isinstance(first, _FakeMiniLM)
+    assert first is second is minilm
+    assert len(_FakeMiniLM.built) == 1
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    assert repr(model) in warnings[0].getMessage()
+    assert "falling back to 'minilm'" in warnings[0].getMessage()
+    assert "`mempalace repair rebuild-index`" in warnings[0].getMessage()
+    assert "did you mean" not in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "embeddinggemm2",
+        "embeddinggema",
+        "embedinggemma",
+        "embeddingemma2",
+        "EmbeddingGema2",
+        "embeddinggemma-300m",
+        "embeddinggemma3",
+    ],
+)
+def test_embeddinggemma_near_miss_raises_instead_of_falling_back(monkeypatch, caplog, model):
+    """A misspelled EmbeddingGemma name would file MiniLM vectors that only a
+    full re-embed can replace, so it stops with a hint instead."""
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        with pytest.raises(embedding.UnknownEmbeddingModelError) as excinfo:
+            embedding.get_embedding_function(device="cpu", model=model)
+    message = str(excinfo.value)
+    assert repr(model.strip().lower()) in message
+    assert "did you mean 'embeddinggemma' or 'embeddinggemma2'?" in message
+    assert "Valid values: embeddinggemma, embeddinggemma2, minilm, openai-compat" in message
+    assert isinstance(excinfo.value, ValueError)
+    assert not _FakeMiniLM.built
+    assert not _fallback_warnings(caplog)
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["openai", "openai_compat", "openaicompat", "OpenAI", "opnai-compat", "openai-compatible"],
+)
+def test_openai_compat_near_miss_raises_instead_of_falling_back(monkeypatch, caplog, model):
+    """Someone who meant remote embeddings would get local MiniLM vectors that
+    only a full re-embed can replace, so a near miss of ``openai-compat`` stops
+    with a hint instead, like an EmbeddingGemma typo does."""
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        with pytest.raises(embedding.UnknownEmbeddingModelError) as excinfo:
+            embedding.get_embedding_function(device="cpu", model=model)
+    message = str(excinfo.value)
+    assert repr(model.strip().lower()) in message
+    assert "did you mean 'openai-compat'?" in message
+    assert "embeddinggemma' or" not in message
+    assert "Valid values: embeddinggemma, embeddinggemma2, minilm, openai-compat" in message
+    assert "Not falling back to 'minilm'" in message
+    assert not _FakeMiniLM.built
+    assert not _fallback_warnings(caplog)
+
+
+@pytest.mark.parametrize(
+    "model, expected",
+    [
+        ("OpenAI-Compat", "openai-compat"),
+        (" openai-compat ", "openai-compat"),
+        ("EmbeddingGemma2", "embeddinggemma2"),
+        (" EmbeddingGemma ", "embeddinggemma"),
+        ("embeddinggemma", "embeddinggemma"),
+        ("embeddinggemma2", "embeddinggemma2"),
+        ("MiniLM", "minilm"),
+    ],
+)
+def test_known_models_resolve_case_insensitively(model, expected):
+    """Names are compared stripped and lowercased, as config.embedding_model
+    already normalizes them, so a capitalized known name is that model."""
+    assert embedding._resolve_embedding_model(model) == expected
+
+
+@pytest.mark.parametrize(
+    "a, b, distance",
+    [
+        ("", "", 0),
+        ("embeddinggemma", "embeddinggemma", 0),
+        ("embeddinggemm2", "embeddinggemma2", 1),
+        ("embeddinggema", "embeddinggemma", 1),
+        ("kitten", "sitting", 3),
+        ("", "abc", 3),
+    ],
+)
+def test_edit_distance(a, b, distance):
+    assert embedding._edit_distance(a, b) == distance
+    assert embedding._edit_distance(b, a) == distance
+
+
+def test_configured_embeddinggemma_typo_raises_through_the_chroma_backend(monkeypatch, tmp_path):
+    """The Chroma backend used to swallow factory errors and open with
+    chromadb's default function; the typo error must get through it."""
+    import json
+
+    from mempalace.backends.chroma import ChromaBackend
+
+    (tmp_path / "config.json").write_text(json.dumps({"embedding_model": "embeddinggemm2"}))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    _fake_minilm(monkeypatch)
+
+    with pytest.raises(embedding.UnknownEmbeddingModelError):
+        embedding.get_embedding_function()
+    with pytest.raises(embedding.UnknownEmbeddingModelError):
+        ChromaBackend._resolve_embedding_function()
+    with pytest.raises(embedding.UnknownEmbeddingModelError):
+        embedding.describe_device()
+
+
+@pytest.mark.parametrize(
+    "configured, raw",
+    [
+        ("notamodel", "'notamodel'"),
+        ("all-minilm-l6-v2", "'all-minilm-l6-v2'"),
+        ("", "'' (empty)"),
+        (None, "null"),
+    ],
+    ids=["unknown", "non-canonical", "empty", "null"],
+)
+def test_configured_unknown_model_falls_back_and_records_minilm(
+    monkeypatch, tmp_path, caplog, configured, raw
+):
+    """The same fallback through ``config.json``, the path mine, search and
+    the MCP server take. The config resolves the name, so the identity a
+    fresh palace records and checks is the model that embeds it, ``minilm``,
+    and correcting the config to ``minilm`` later is not a model swap."""
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    (tmp_path / "config.json").write_text(json.dumps({"embedding_model": configured}))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
+    _fake_minilm(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        assert MempalaceConfig().embedding_model == "minilm"
+        ef = embedding.get_embedding_function()
+        assert embedding.get_embedding_function() is ef
+        assert embedding.describe_device() == "cpu"
+        assert embedding.current_model_name() == "minilm"
+        assert MempalaceConfig().embedding_model == "minilm"
+    assert ef is embedding.get_embedding_function(device="cpu", model="minilm")
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    # How the configured value appears: quoted strings, an empty string
+    # flagged as such, and a JSON null as null rather than the string 'none'.
+    assert f"Unknown embedding_model {raw}" in warnings[0].getMessage()
+    assert "'none'" not in warnings[0].getMessage()
+
+
+def test_unknown_model_from_the_environment_falls_back(monkeypatch, caplog):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
+    _fake_minilm(monkeypatch)
+    from mempalace.config import MempalaceConfig
+
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        ef = embedding.get_embedding_function()
+        assert MempalaceConfig().embedding_model == "minilm"
+        assert embedding.current_model_name() == "minilm"
+    assert ef is embedding.get_embedding_function(device="cpu", model="minilm")
+    warnings = _fallback_warnings(caplog)
+    assert len(warnings) == 1
+    assert "'all-minilm-l6-v2'" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("source", ["env", "config.json"])
+@pytest.mark.parametrize(
+    "configured, hint",
+    [
+        ("embeddinggemm2", "did you mean 'embeddinggemma' or 'embeddinggemma2'?"),
+        ("openai", "did you mean 'openai-compat'?"),
+    ],
+)
+def test_config_refuses_near_misses(monkeypatch, tmp_path, caplog, source, configured, hint):
+    """A near miss raises from the config itself, before anything reads the
+    model to stamp an identity or open a palace."""
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    if source == "env":
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", configured)
+    else:
+        monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+        (tmp_path / "config.json").write_text(json.dumps({"embedding_model": configured}))
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        with pytest.raises(embedding.UnknownEmbeddingModelError, match=re.escape(hint)):
+            MempalaceConfig().embedding_model
+        with pytest.raises(embedding.UnknownEmbeddingModelError, match=re.escape(hint)):
+            embedding.current_model_name()
+    assert not _fallback_warnings(caplog)
+
+
+@pytest.mark.parametrize(
+    "configured, expected",
+    [
+        ("minilm", "minilm"),
+        ("EmbeddingGemma", "embeddinggemma"),
+        (" embeddinggemma2 ", "embeddinggemma2"),
+        ("OpenAI-Compat", "openai-compat"),
+    ],
+)
+def test_config_keeps_supported_names(monkeypatch, tmp_path, caplog, configured, expected):
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    (tmp_path / "config.json").write_text(json.dumps({"embedding_model": configured}))
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        assert MempalaceConfig().embedding_model == expected
+    assert not _fallback_warnings(caplog)
+
+
+def test_search_config_fingerprint_stays_total_for_a_near_miss(monkeypatch, tmp_path):
+    """The Hub fingerprint must never raise; a typo gets its own digest and the
+    direct path reports the actionable error."""
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
+    digests = {}
+    for name in ("embeddinggemm2", "minilm", "notamodel"):
+        (tmp_path / "config.json").write_text(
+            json.dumps({"palace_path": str(tmp_path / "palace"), "embedding_model": name})
+        )
+        digests[name] = MempalaceConfig().search_config_fingerprint
+    assert digests["notamodel"] == digests["minilm"]
+    assert digests["embeddinggemm2"] != digests["minilm"]
+
+
+def test_known_models_do_not_warn(monkeypatch, caplog):
+    _fake_minilm(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger=embedding.logger.name):
+        embedding.get_embedding_function(device="cpu", model=" MiniLM ")
+    assert not _fallback_warnings(caplog)
+
+
+def test_invalid_embeddinggemma2_dimension_still_raises(monkeypatch):
+    """The fallback covers unknown model names only; a known model with an
+    invalid setting still fails closed."""
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma2")
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION", "300")
+    with pytest.raises(ValueError, match="embeddinggemma2_dimension"):
+        embedding.get_embedding_function(device="cpu")
+
+
+def test_embedding_wrapper_selects_query_and_metadata_document_methods(monkeypatch):
+    from mempalace.backends import embedding_wrapper as ew
+
+    class Provider:
+        calls = []
+
+        def __call__(self, input):
+            raise AssertionError("asymmetric provider should use explicit methods")
+
+        def embed_query(self, input):
+            self.calls.append(("query", input))
+            return [[1.0, 0.0]]
+
+        def embed_documents(self, input, metadatas=None):
+            self.calls.append(("documents", input, metadatas))
+            return [[0.0, 1.0]]
+
+    provider = Provider()
+    monkeypatch.setattr(embedding, "get_embedding_function", lambda: provider)
+    assert ew._embed_texts(["where is authentication?"], query=True) == [[1.0, 0.0]]
+    assert ew._embed_texts(["def auth(): pass"], metadatas=[{"source_file": "auth.py"}]) == [
+        [0.0, 1.0]
+    ]
+    assert provider.calls == [
+        ("query", ["where is authentication?"]),
+        ("documents", ["def auth(): pass"], [{"source_file": "auth.py"}]),
+    ]
+
+
+def test_auto_picks_cuda(monkeypatch):
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("auto") == (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "cuda",
+    )
+
+
+def test_auto_falls_to_cpu(monkeypatch):
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+
+    assert embedding._resolve_providers("auto") == (["CPUExecutionProvider"], "cpu")
+
+
+def test_auto_skips_coreml_for_embeddinggemma(monkeypatch):
+    """auto must not hand EmbeddingGemma to CoreML.
+
+    CoreML supports only a fraction of that model's quantized graph and
+    returns an all-NaN hidden state without erroring, so a Mac user with no
+    explicit embedding_device would silently embed (and, under `repair
+    rebuild-index`, persist) degenerate vectors.
+    """
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("auto", "embeddinggemma") == (
+        ["CPUExecutionProvider"],
+        "cpu",
+    )
+
+
+def test_auto_still_picks_coreml_for_other_models(monkeypatch):
+    """The denylist is per-model — it must not disable CoreML globally."""
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("auto", "minilm") == (
+        ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+        "coreml",
+    )
+
+
+def test_auto_still_picks_cuda_for_embeddinggemma(monkeypatch):
+    """Only CoreML is implicated; CUDA stays the preferred accelerator."""
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CUDAExecutionProvider", "CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("auto", "embeddinggemma") == (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "cuda",
+    )
+
+
+def test_explicit_coreml_is_still_honored_for_embeddinggemma(monkeypatch):
+    """An explicit embedding_device=coreml is a deliberate choice, so the
+    denylist (which only guards *automatic* selection) leaves it alone. The
+    witness probe in EmbeddinggemmaONNX._lazy_load is what keeps it safe."""
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding._resolve_providers("coreml", "embeddinggemma") == (
+        ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+        "coreml",
+    )
+
+
+def test_cuda_missing_warns_with_gpu_extra(monkeypatch, caplog):
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+
+    assert embedding._resolve_providers("cuda") == (["CPUExecutionProvider"], "cpu")
+    assert "mempalace[gpu]" in caplog.text
+
+
+def test_coreml_missing_warns_with_coreml_extra(monkeypatch, caplog):
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+
+    assert embedding._resolve_providers("coreml") == (["CPUExecutionProvider"], "cpu")
+    assert "mempalace[coreml]" in caplog.text
+
+
+def test_dml_missing_warns_with_dml_extra(monkeypatch, caplog):
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+
+    assert embedding._resolve_providers("dml") == (["CPUExecutionProvider"], "cpu")
+    assert "mempalace[dml]" in caplog.text
+
+
+def test_unknown_device_warns_once(monkeypatch, caplog):
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+
+    assert embedding._resolve_providers("bogus") == (["CPUExecutionProvider"], "cpu")
+    assert embedding._resolve_providers("bogus") == (["CPUExecutionProvider"], "cpu")
+    assert caplog.text.count("Unknown embedding_device") == 1
+
+
+def test_onnxruntime_import_error_falls_back_to_cpu(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise ImportError("missing")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    assert embedding._resolve_providers("cuda") == (["CPUExecutionProvider"], "cpu")
+
+
+def test_get_embedding_function_caches_by_resolved_provider_tuple(monkeypatch):
+    class DummyEF:
+        def __init__(self, preferred_providers, intra_op_num_threads=0):
+            self.preferred_providers = preferred_providers
+
+    monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyEF)
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
+    )
+
+    first = embedding.get_embedding_function("cpu", "minilm")
+    second = embedding.get_embedding_function("auto", "minilm")
+
+    assert first is second
+    assert first.preferred_providers == ["CPUExecutionProvider"]
+
+
+def test_intra_op_session_options_caps_threads():
+    so = embedding._intra_op_session_options(3)
+    assert so is not None
+    assert so.intra_op_num_threads == 3
+
+
+def test_intra_op_session_options_uncapped_returns_none():
+    assert embedding._intra_op_session_options(0) is None
+    assert embedding._intra_op_session_options(-1) is None
+
+
+def test_get_embedding_function_threads_cap_passed_to_minilm_ef(monkeypatch):
+    captured = {}
+
+    class DummyEF:
+        def __init__(self, preferred_providers, intra_op_num_threads=0):
+            captured["threads"] = intra_op_num_threads
+
+    monkeypatch.setattr(embedding, "_build_ef_class", lambda: DummyEF)
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
+    )
+    monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 2)
+
+    embedding.get_embedding_function("cpu", "minilm")
+
+    assert captured["threads"] == 2
+
+
+def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch):
+    captured = {}
+
+    class DummyGemma:
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0, batch_size=32):
+            captured["threads"] = intra_op_num_threads
+
+    monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
+    )
+    monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: 4)
+
+    embedding.get_embedding_function("cpu", "embeddinggemma")
+
+    assert captured["threads"] == 4
+
+
+def test_get_embedding_function_batch_size_passed_to_embeddinggemma(monkeypatch):
+    """#2330: the configured sub-batch size must reach EmbeddinggemmaONNX, not
+    just its constructor's default, or an override is silently inert."""
+    captured = {}
+
+    class DummyGemma:
+        def __init__(self, preferred_providers=None, intra_op_num_threads=0, batch_size=32):
+            captured["batch_size"] = batch_size
+
+    monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CPUExecutionProvider"], "cpu"),
+    )
+    monkeypatch.setattr(embedding, "_resolve_embeddinggemma_batch_size", lambda: 8)
+
+    embedding.get_embedding_function("cpu", "embeddinggemma")
+
+    assert captured["batch_size"] == 8
+
+
+def test_resolve_embeddinggemma_batch_size_reads_config(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE", "6")
+    assert embedding._resolve_embeddinggemma_batch_size() == 6
+
+
+def test_resolve_embeddinggemma_batch_size_falls_back_on_config_error(monkeypatch):
+    class ExplodingConfig:
+        def __init__(self, *a, **kw):
+            raise RuntimeError("config load failed")
+
+    monkeypatch.setattr("mempalace.config.MempalaceConfig", ExplodingConfig)
+
+    assert embedding._resolve_embeddinggemma_batch_size() == embedding._EMBEDDINGGEMMA_BATCH_SIZE
+
+
+def test_minilm_ef_model_override_applies_thread_cap(monkeypatch):
+    """The ``_MempalaceONNX.model`` override must construct the ORT session
+    with the configured ``intra_op_num_threads`` (#1068). We stub
+    ``InferenceSession`` to capture the ``SessionOptions`` it receives, so the
+    test never downloads or loads the real model."""
+    import onnxruntime as ort
+
+    captured = {}
+
+    def fake_session(model_path, providers=None, sess_options=None):
+        captured["sess_options"] = sess_options
+        captured["providers"] = providers
+        return object()
+
+    monkeypatch.setattr(ort, "InferenceSession", fake_session)
+
+    ef_cls = embedding._build_ef_class()
+    ef = ef_cls(preferred_providers=["CPUExecutionProvider"], intra_op_num_threads=2)
+    _ = ef.model  # triggers the cached_property build
+
+    assert captured["sess_options"] is not None
+    assert captured["sess_options"].intra_op_num_threads == 2
+    assert "CoreMLExecutionProvider" not in captured["providers"]
+
+
+def test_minilm_ef_model_override_falls_back_when_uncapped(monkeypatch):
+    """With no cap (0), the override must defer to the parent build via
+    ``super().model`` — not reach into ``cached_property`` internals (#1068
+    review). Proves super() resolves the parent descriptor without error."""
+    import onnxruntime as ort
+
+    captured = {}
+
+    def fake_session(model_path, providers=None, sess_options=None):
+        captured["sess_options"] = sess_options
+        return object()
+
+    monkeypatch.setattr(ort, "InferenceSession", fake_session)
+
+    ef_cls = embedding._build_ef_class()
+    ef = ef_cls(preferred_providers=["CPUExecutionProvider"], intra_op_num_threads=0)
+    session = ef.model  # cap <= 0 → super().model (upstream builder)
+
+    assert session is not None
+    # Upstream leaves intra_op at ORT's default (0 = unset), confirming we
+    # deferred to it rather than applying our cap.
+    assert captured["sess_options"].intra_op_num_threads == 0
+
+
+def _max_concurrent_forwards(monkeypatch, providers, n_threads):
+    """Run ``_forward`` from ``n_threads`` threads and return peak overlap.
+
+    The upstream ``_forward`` is replaced by a stub that only counts how many
+    calls are inside it at once, so no model is downloaded or loaded.
+    """
+    import threading
+    import time
+
+    from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+    state = {"in_flight": 0, "max": 0}
+    lock = threading.Lock()
+
+    def counting_forward(self, documents, batch_size=32):
+        with lock:
+            state["in_flight"] += 1
+            state["max"] = max(state["max"], state["in_flight"])
+        time.sleep(0.05)
+        with lock:
+            state["in_flight"] -= 1
+        return [[0.0]] * len(documents)
+
+    monkeypatch.setattr(ONNXMiniLM_L6_V2, "_forward", counting_forward)
+    ef = embedding._build_ef_class()(preferred_providers=providers)
+    start = threading.Barrier(n_threads)
+
+    def worker():
+        start.wait(timeout=5)
+        ef._forward(["doc"])
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    return state["max"]
+
+
+def test_minilm_ef_serializes_runs_on_dml(monkeypatch):
+    """ONNX Runtime does not support concurrent Run() on a DirectML session;
+    overlapping calls fault with an access violation and kill the MCP HTTP
+    server, whose request threads share one cached EF instance."""
+    providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    assert _max_concurrent_forwards(monkeypatch, providers, 4) == 1
+
+
+def test_minilm_ef_does_not_serialize_cpu_runs(monkeypatch):
+    """The DirectML guard must leave concurrent-safe providers parallel."""
+    assert _max_concurrent_forwards(monkeypatch, ["CPUExecutionProvider"], 4) > 1
+
+
+def test_describe_device_uses_resolved_effective_device(monkeypatch):
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CUDAExecutionProvider", "CPUExecutionProvider"], "cuda"),
+    )
+
+    assert embedding.describe_device("auto") == "cuda"
+
+
+def test_describe_device_reports_the_model_aware_resolution(monkeypatch):
+    """The status header must show the device that will actually be used —
+    which now depends on the model, since CoreML is off the table for
+    embeddinggemma."""
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    assert embedding.describe_device("auto", "minilm") == "coreml"
+    assert embedding.describe_device("auto", "embeddinggemma") == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# embedding -> backend handoff
+#
+# These live in this module on purpose: conftest's autouse
+# ``_stable_embedding_function_for_tests`` replaces
+# ``embedding_wrapper._embed_texts`` outright for every other test module, so a
+# defect in the real function is invisible there. ``test_embedding`` is in
+# ``_REAL_EMBEDDING_TEST_MODULES`` and runs unstubbed.
+# ---------------------------------------------------------------------------
+
+
+class _NumpyEmbeddingFunction:
+    """Mimics the real EF contract: a list of float32 ``np.ndarray`` rows.
+
+    Both shipped embedders (ChromaDB's ONNX MiniLM and EmbeddingGemma) return
+    numpy arrays, not Python lists — that difference is the whole point here.
+    """
+
+    def __init__(self, dim: int = 8):
+        self.dim = dim
+
+    def __call__(self, input):
+        import numpy as np
+
+        return [np.full(self.dim, 0.1, dtype=np.float32) for _ in list(input or [])]
+
+
+def test_embed_texts_returns_plain_python_floats(monkeypatch):
+    """``list(ndarray)`` yields ``np.float32`` scalars, which ChromaDB rejects.
+
+    Regression for the default (chroma) backend failing every write with
+    "Expected embeddings to be a list of floats or ints, a list of lists, a
+    numpy array, or a list of numpy arrays" once chroma began declaring
+    ``requires_explicit_embeddings`` and routing through EmbeddingCollection.
+    """
+    from mempalace.backends import embedding_wrapper as ew
+
+    monkeypatch.setattr(
+        embedding, "get_embedding_function", lambda *_, **__: _NumpyEmbeddingFunction()
+    )
+
+    vectors = ew._embed_texts(["hello", "world"])
+
+    assert len(vectors) == 2
+    for row in vectors:
+        assert isinstance(row, list)
+        assert all(type(x) is float for x in row), f"got {type(row[0])}, not builtin float"
+
+
+def test_embedding_collection_upsert_accepts_numpy_backed_vectors(tmp_path, monkeypatch):
+    """End-to-end: a real Chroma collection must accept what the wrapper emits.
+
+    Asserting on float types alone would not catch a future ChromaDB tightening
+    its accepted shapes, so drive an actual upsert + read-back.
+    """
+    from mempalace.backends.base import PalaceRef
+    from mempalace.backends.chroma import ChromaBackend
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+
+    monkeypatch.setattr(
+        embedding, "get_embedding_function", lambda *_, **__: _NumpyEmbeddingFunction()
+    )
+
+    backend = ChromaBackend()
+    palace = tmp_path / "palace"
+    ref = PalaceRef(id=str(palace), local_path=str(palace))
+    try:
+        inner = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+        col = EmbeddingCollection(inner)
+
+        col.upsert(documents=["verbatim drawer text"], ids=["drawer-1"], metadatas=[{"wing": "w"}])
+
+        assert col.get(ids=["drawer-1"]).documents == ["verbatim drawer text"]
+    finally:
+        backend.close()
+
+
+def test_embed_texts_handles_plain_sequence_embedders(monkeypatch):
+    """The ``float(x)`` fallback must convert plain sequences, not just ndarrays.
+
+    ``_embed_texts`` branches on ``hasattr(v, "tolist")``. The numpy side is
+    covered above, but the fallback exists for embedders that hand back plain
+    sequences (custom/BYO EFs, and rows that arrive as tuples), and nothing
+    exercised it — so a regression there would surface only in the field, on a
+    non-default embedder, as the same ChromaDB ``ValueError``.
+
+    Yields ``Decimal`` rather than ``float`` so the assertion proves a real
+    conversion happened rather than passing values through unchanged.
+    """
+    from decimal import Decimal
+
+    from mempalace.backends import embedding_wrapper as ew
+
+    class _PlainSequenceEmbeddingFunction:
+        def __call__(self, input):
+            return [(Decimal("0.5"), Decimal("0.25")) for _ in list(input or [])]
+
+    monkeypatch.setattr(
+        embedding, "get_embedding_function", lambda *_, **__: _PlainSequenceEmbeddingFunction()
+    )
+
+    vectors = ew._embed_texts(["a", "b"])
+
+    assert vectors == [[0.5, 0.25], [0.5, 0.25]]
+    for row in vectors:
+        assert isinstance(row, list)
+        assert all(type(x) is float for x in row), f"got {type(row[0])}, not builtin float"
+
+
+def test_collection_add_embeds_before_the_inner_write(monkeypatch):
+    """The request lock may drop during inference. That window has to close
+    before the backend write, which holds the palace lock."""
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.embedding import set_embedding_section_hook
+
+    events = []
+
+    class _Hook:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+            return False
+
+    set_embedding_section_hook(lambda: _Hook())
+    try:
+        monkeypatch.setattr(
+            embedding,
+            "get_embedding_function",
+            lambda device=None, model=None: lambda input: [[0.5, 0.5]],
+        )
+
+        class _Inner:
+            def add(self, *, documents, ids, metadatas=None, embeddings=None):
+                events.append("write")
+                assert embeddings == [[0.5, 0.5]]
+
+        EmbeddingCollection(_Inner()).add(documents=["hello"], ids=["1"])
+    finally:
+        set_embedding_section_hook(None)
+
+    assert events == ["enter", "exit", "write"]
+
+
+def test_embed_texts_short_circuits_on_empty_input(monkeypatch):
+    """Empty input must return ``[]`` without constructing an embedding function.
+
+    Callers pass empty batches (a drawer set fully filtered by dedup), and
+    loading the EF is the expensive part — on the ONNX default it spins up a
+    native session. Guards the early return so it cannot be refactored away.
+    """
+    from mempalace.backends import embedding_wrapper as ew
+
+    def _explode(*_, **__):
+        raise AssertionError("get_embedding_function must not be called for an empty batch")
+
+    monkeypatch.setattr(embedding, "get_embedding_function", _explode)
+
+    assert ew._embed_texts([]) == []

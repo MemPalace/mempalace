@@ -25,7 +25,7 @@
     "status_palace": "궁전: {path}",
     "status_wings": "날개 {count}개",
     "status_closets": "벽장 {count}개",
-    "status_drawers": "서랍 {drawers}개",
+    "status_drawers": "서랍 {count}개",
     "init_complete": "{path}에 궁전 초기화 완료",
     "init_exists": "{path}에 궁전이 이미 존재합니다",
     "repair_complete": "수리 완료. {fixed}개 문제 해결.",

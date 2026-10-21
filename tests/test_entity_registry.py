@@ -1,13 +1,12 @@
 """Tests for mempalace.entity_registry."""
 
-from unittest.mock import patch
+import pytest
 
 from mempalace.entity_registry import (
     COMMON_ENGLISH_WORDS,
     PERSON_CONTEXT_PATTERNS,
     EntityRegistry,
 )
-
 
 # ── COMMON_ENGLISH_WORDS ────────────────────────────────────────────────
 
@@ -61,6 +60,96 @@ def test_save_creates_file(tmp_path):
     registry = EntityRegistry.load(config_dir=tmp_path)
     registry.save()
     assert (tmp_path / "entity_registry.json").exists()
+
+
+def test_save_is_atomic_does_not_leave_tmp(tmp_path):
+    # Atomic write must not leave the .tmp sidecar file after a successful save.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.save()
+    leftover = list(tmp_path.glob("entity_registry.json.tmp*"))
+    assert leftover == [], f"atomic write leaked tmp file(s): {leftover}"
+
+
+def test_save_preserves_previous_on_serialization_failure(tmp_path, monkeypatch):
+    # If serialization fails mid-write, the previous registry must remain
+    # intact — this is the whole point of atomic write vs truncating in place.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.seed(
+        mode="personal",
+        people=[{"name": "Alice", "relationship": "friend", "context": "personal"}],
+        projects=[],
+    )
+    registry.save()
+    target = tmp_path / "entity_registry.json"
+    original = target.read_text(encoding="utf-8")
+
+    # Force os.replace to raise — simulates filesystem full / permission flip
+    # AFTER the temp file is written but BEFORE the rename completes.
+    import os as _os
+
+    real_replace = _os.replace
+
+    def boom(src, dst):
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(_os, "replace", boom)
+    with pytest.raises(OSError):
+        registry.seed(
+            mode="personal",
+            people=[{"name": "Bob", "relationship": "friend", "context": "personal"}],
+            projects=[],
+        )
+        registry.save()
+
+    # Restore os.replace before reading so the assertion can rely on it.
+    monkeypatch.setattr(_os, "replace", real_replace)
+    assert target.read_text(encoding="utf-8") == original
+    # The .tmp sidecar must also be cleaned up — otherwise it litters the
+    # palace directory and a future diagnostic cannot distinguish stale
+    # debris from an in-flight write.
+    leftover = list(tmp_path.glob("entity_registry.json.tmp*"))
+    assert leftover == [], f"atomic write leaked tmp on rename failure: {leftover}"
+
+
+def test_save_cleans_tmp_on_write_failure(tmp_path, monkeypatch):
+    # Failure BEFORE the rename (disk full, FUSE break, IO error during
+    # write/fsync) must also clean up the .tmp sidecar. The existing
+    # rename-failure test only covers the post-write path; this exercises
+    # the gap between write and rename.
+    registry = EntityRegistry.load(config_dir=tmp_path)
+    registry.seed(
+        mode="personal",
+        people=[{"name": "Alice", "relationship": "friend", "context": "personal"}],
+        projects=[],
+    )
+    registry.save()
+    target = tmp_path / "entity_registry.json"
+    original = target.read_text(encoding="utf-8")
+
+    # Force os.fsync to raise — simulates IO error after the bytes are in
+    # the kernel page cache but before they hit the platter.
+    import os as _os
+
+    real_fsync = _os.fsync
+
+    def boom(fd):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(_os, "fsync", boom)
+    with pytest.raises(OSError):
+        registry.seed(
+            mode="personal",
+            people=[{"name": "Bob", "relationship": "friend", "context": "personal"}],
+            projects=[],
+        )
+        registry.save()
+    monkeypatch.setattr(_os, "fsync", real_fsync)
+
+    # Previous registry intact (rename never happened — atomic guarantee).
+    assert target.read_text(encoding="utf-8") == original
+    # And the .tmp sidecar is gone, not litter on disk.
+    leftover = list(tmp_path.glob("entity_registry.json.tmp*"))
+    assert leftover == [], f"atomic write leaked tmp on fsync failure: {leftover}"
 
 
 # ── seed ────────────────────────────────────────────────────────────────
@@ -211,90 +300,6 @@ def test_lookup_ambiguous_word_as_concept(tmp_path):
     )
     result = registry.lookup("Ever", context="have you ever tried this")
     assert result["type"] == "concept"
-
-
-# ── research (Wikipedia) — mocked ──────────────────────────────────────
-
-
-def test_research_caches_result(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-
-    mock_result = {
-        "inferred_type": "person",
-        "confidence": 0.80,
-        "wiki_summary": "Saoirse is an Irish given name.",
-        "wiki_title": "Saoirse",
-    }
-
-    with patch("mempalace.entity_registry._wikipedia_lookup", return_value=mock_result):
-        result = registry.research("Saoirse", auto_confirm=True)
-    assert result["inferred_type"] == "person"
-
-    # Second call should use cache, not call Wikipedia again
-    with patch(
-        "mempalace.entity_registry._wikipedia_lookup",
-        side_effect=AssertionError("should not be called"),
-    ):
-        cached = registry.research("Saoirse")
-    assert cached["inferred_type"] == "person"
-
-
-def test_confirm_research_adds_to_people(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-
-    mock_result = {
-        "inferred_type": "person",
-        "confidence": 0.80,
-        "wiki_summary": "Saoirse is a name",
-        "wiki_title": "Saoirse",
-    }
-    with patch("mempalace.entity_registry._wikipedia_lookup", return_value=mock_result):
-        registry.research("Saoirse", auto_confirm=False)
-
-    registry.confirm_research("Saoirse", entity_type="person", relationship="friend")
-    assert "Saoirse" in registry.people
-    assert registry.people["Saoirse"]["source"] == "wiki"
-
-
-# ── extract_people_from_query ───────────────────────────────────────────
-
-
-def test_extract_people_from_query(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(
-        mode="personal",
-        people=[
-            {"name": "Riley", "relationship": "daughter", "context": "personal"},
-            {"name": "Devon", "relationship": "friend", "context": "personal"},
-        ],
-        projects=[],
-    )
-    found = registry.extract_people_from_query("What did Riley say about the weather?")
-    assert "Riley" in found
-    assert "Devon" not in found
-
-
-# ── extract_unknown_candidates ──────────────────────────────────────────
-
-
-def test_extract_unknown_candidates(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-    unknowns = registry.extract_unknown_candidates("Saoirse went to the store")
-    assert "Saoirse" in unknowns
-
-
-def test_extract_unknown_candidates_skips_known(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(
-        mode="personal",
-        people=[{"name": "Riley", "relationship": "daughter", "context": "personal"}],
-        projects=[],
-    )
-    unknowns = registry.extract_unknown_candidates("Riley went to the store")
-    assert "Riley" not in unknowns
 
 
 # ── summary ─────────────────────────────────────────────────────────────

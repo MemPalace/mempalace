@@ -11,6 +11,7 @@ Subject → Predicate → Object [valid_from → valid_to]
 ```
 
 Facts have time windows. When something stops being true, you invalidate it — and historical queries still find it.
+When a single-valued fact changes, supersede it so the old and new values meet at one precise boundary.
 
 ## Usage
 
@@ -49,6 +50,28 @@ kg.invalidate("Kai", "works_on", "Orion", ended="2026-03-01")
 
 Now queries for Kai's current work won't return Orion. Historical queries still will.
 
+### Superseding Facts
+
+When a single-valued fact changes, use `supersede()` instead of hand-rolling `invalidate()` plus `add_triple()`:
+
+```python
+kg.add_triple("Kai", "uses_model", "gpt-4.1", valid_from="2026-01-01")
+
+kg.supersede(
+    "Kai",
+    "uses_model",
+    old_obj="gpt-4.1",
+    new_obj="gpt-5.6",
+    at="2026-07-20",
+)
+```
+
+`supersede()` closes the old fact and opens the new one in a single transaction with the same precise boundary.
+A query at the handoff returns only the successor, not both values.
+
+Use it for relationships that should have one current value, such as `uses_model`, `works_at`, or `lives_at`.
+Keep `invalidate()` for facts that simply ended, and use `add_triple()` for facts that can coexist.
+
 ### MCP Tools
 
 Through the MCP server, the knowledge graph is available as tools:
@@ -58,6 +81,7 @@ Through the MCP server, the knowledge graph is available as tools:
 | `mempalace_kg_query` | Query entity relationships with time filtering |
 | `mempalace_kg_add` | Add facts |
 | `mempalace_kg_invalidate` | Mark facts as ended |
+| `mempalace_kg_supersede` | Atomically replace one current fact with another |
 | `mempalace_kg_timeline` | Chronological entity story |
 | `mempalace_kg_stats` | Graph overview |
 
@@ -78,14 +102,18 @@ The knowledge graph uses SQLite with two tables:
 - `confidence` — 0.0 to 1.0
 - `source_closet` — link back to the verbatim memory
 
-Database location: `~/.mempalace/knowledge_graph.sqlite3`
+Database location: `knowledge_graph.sqlite3` inside the palace directory, once it
+holds facts. Until then a palace keeps using `~/.mempalace/knowledge_graph.sqlite3`
+if that holds facts and the palace is the default `~/.mempalace/palace` or was
+selected through `MEMPALACE_PALACE_PATH` or `config.json` (not `--palace`). Graphs
+are never merged; `mempalace kg import-legacy` copies a legacy graph's facts in on
+request.
 
-## Comparison
+## Related Work
 
-| Feature | MemPalace | Zep (Graphiti) |
-|---------|-----------|----------------|
-| Storage | SQLite (local) | Neo4j (cloud) |
-| Cost | Free | $25/mo+ |
-| Temporal validity | Yes | Yes |
-| Self-hosted | Always | Enterprise only |
-| Privacy | Everything local | SOC 2, HIPAA |
+Temporal entity-relationship graphs are a familiar pattern — Zep's
+Graphiti, for example, also exposes a bi-temporal model. MemPalace's
+knowledge graph is local-first (SQLite, everything on disk) and free;
+Zep is a managed service backed by Neo4j with its own pricing, SLAs,
+and compliance surface. See Zep's own [documentation](https://www.getzep.com/)
+for authoritative details on their deployment model.

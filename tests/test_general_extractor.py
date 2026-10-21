@@ -13,7 +13,6 @@ from mempalace.general_extractor import (
     extract_memories,
 )
 
-
 # ── extract_memories — empty / no markers ───────────────────────────────
 
 
@@ -23,14 +22,42 @@ def test_extract_memories_empty_text():
 
 
 def test_extract_memories_no_markers():
-    result = extract_memories("The quick brown fox jumped over the lazy dog.")
-    assert result == []
+    text = "The quick brown fox jumped over the lazy dog."
+    result = extract_memories(text)
+    assert result == [
+        {"content": text, "memory_type": "general", "chunk_index": 0},
+    ]
 
 
-def test_extract_memories_short_text_skipped():
-    # Paragraphs shorter than 20 chars are skipped
+def test_extract_memories_short_text_kept():
     result = extract_memories("ok sure")
-    assert result == []
+    assert result == [
+        {"content": "ok sure", "memory_type": "general", "chunk_index": 0},
+    ]
+
+
+def test_unmatched_paragraphs_stay_verbatim_beside_a_classified_one():
+    recipe = "Mix two cups of flour with warm water until the dough holds together."
+    meeting = "Standup is at nine in the east conference room on Thursday."
+    decision = "We decided to ship Friday because the tests passed cleanly."
+    memories = extract_memories(f"{recipe}\n\n{meeting}\n\n{decision}")
+    by_text = {item["content"]: item["memory_type"] for item in memories}
+    assert by_text[recipe] == "general"
+    assert by_text[meeting] == "general"
+    assert by_text[decision] == "decision"
+
+
+def test_oversized_text_slices_on_whitespace_without_changing_words():
+    paragraph = " ".join(["quinoa"] * 40)
+    memories = extract_memories(paragraph, chunk_size=25)
+    assert memories
+    assert all(item["memory_type"] == "general" for item in memories)
+    assert "".join(item["content"] for item in memories) == paragraph
+    assert all(len(item["content"]) <= 25 for item in memories)
+    for item in memories:
+        tokens = [token for token in item["content"].split(" ") if token]
+        assert tokens
+        assert set(tokens) == {"quinoa"}
 
 
 # ── extract_memories — decision markers ─────────────────────────────────
@@ -246,3 +273,93 @@ def test_positive_words():
 def test_negative_words():
     assert "bug" in NEGATIVE_WORDS
     assert "crash" in NEGATIVE_WORDS
+
+
+# ── extract_memories — oversized segment chunking (#1539) ──────────────
+
+
+def test_extract_memories_oversized_segment_slices_with_label_preserved():
+    """Regression for #1539: a segment longer than chunk_size must be
+    split into multiple memories with the same memory_type. Joined
+    slices must equal the original (verbatim store per CLAUDE.md)."""
+    decision_phrase = "We decided to migrate to PostgreSQL because performance matters. "
+    long_segment = decision_phrase * 50  # ~3,200 chars, well above default 800
+    memories = extract_memories(long_segment)
+    assert len(memories) > 1, (
+        f"oversized segment must split into multiple slices; got {len(memories)}"
+    )
+    assert all(len(m["content"]) <= 800 for m in memories), (
+        f"all slices must be <= chunk_size=800; got max={max(len(m['content']) for m in memories)}"
+    )
+    types = {m["memory_type"] for m in memories}
+    assert len(types) == 1, f"all slices must share one memory_type; got {types}"
+    assert "decision" in types
+    joined = "".join(m["content"] for m in memories)
+    assert joined == long_segment.strip(), (
+        "joined slices must equal original (after strip) verbatim"
+    )
+
+
+def test_extract_memories_oversized_segment_with_custom_chunk_size():
+    """Regression for #1539: caller-supplied chunk_size must govern the
+    paragraph slicer in extract_memories."""
+    decision_phrase = "We decided on Redis because we measured the latency profile. "
+    long_segment = decision_phrase * 40  # ~2,500 chars
+    memories = extract_memories(long_segment, chunk_size=400)
+    assert len(memories) > 1
+    assert all(len(m["content"]) <= 400 for m in memories), (
+        f"all slices must be <= 400; got max={max(len(m['content']) for m in memories)}"
+    )
+
+
+def test_extract_memories_normal_segment_unchanged():
+    """Regression catch: a segment under chunk_size must produce
+    exactly one memory (existing pre-#1539 behaviour for sub-cap)."""
+    text = (
+        "We decided to use React because it fits our team workflow and "
+        "the migration path from our existing stack is clear."
+    )
+    memories = extract_memories(text)
+    assert len(memories) == 1
+    assert memories[0]["content"] == text
+    assert memories[0]["memory_type"] == "decision"
+
+
+def test_extract_memories_chunk_index_contiguous_across_segments():
+    """Regression for #1539: chunk_index must be sequential 0,1,2,...
+    across mixed normal + oversized segments without gaps."""
+    decision_phrase = "We decided to choose Postgres because the index plan works. "
+    long_segment = decision_phrase * 30  # ~1,800 chars → multiple slices at 800
+    second_short = "I prefer always writing tests first because it shapes the API better."
+    text = long_segment + "\n\n" + second_short
+    memories = extract_memories(text)
+    indices = [m["chunk_index"] for m in memories]
+    assert indices == list(range(len(memories))), (
+        f"chunk_index must be 0..N-1 sequential; got {indices}"
+    )
+
+
+def test_markdown_emphasis_does_not_score_as_emotional():
+    """Markdown formatting syntax must not count as emotional content."""
+    text = (
+        "**Key reasons:** transactional guarantees and mature tooling. "
+        "The rollout plan is documented under **Migration notes**."
+    )
+
+    score, _ = _score_markers(text, ALL_MARKERS["emotional"])
+
+    assert score == 0.0
+
+
+def test_markdown_bold_does_not_override_decision_classification():
+    """Markdown-heavy technical prose must not outrank a real decision marker."""
+    text = (
+        "We decided to use PostgreSQL for the new service. "
+        "**Key reasons:** transactional guarantees and mature tooling. "
+        "The rollout details are documented under **Migration notes**."
+    )
+
+    memories = extract_memories(text)
+
+    assert len(memories) == 1
+    assert memories[0]["memory_type"] == "decision"

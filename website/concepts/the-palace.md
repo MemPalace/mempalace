@@ -92,16 +92,9 @@ The original stored text chunks. This is the primary retrieval layer used by the
 
 ## Why Structure Matters
 
-Tested on 22,000+ real conversation memories:
+Wing and room identifiers become metadata filters at query time. Narrowing a search to a specific wing (or wing + room) means the vector store only scores candidates inside that scope, which is useful when you have many unrelated projects or people filed in the same palace.
 
-| Search scope | R@10 | Improvement |
-|-------------|------|-------------|
-| All closets | 60.9% | baseline |
-| Within wing | 73.1% | +12% |
-| Wing + hall | 84.8% | +24% |
-| Wing + room | 94.8% | +34% |
-
-The practical point is that structure improves retrieval. In the project benchmarks, narrowing the search scope by wing and room outperformed searching the entire corpus at once.
+This is standard metadata filtering in the underlying vector store, not a novel retrieval mechanism. The useful property here is operational — clear scoping rules that a human or an agent can apply predictably — not a magic retrieval boost.
 
 ## Navigation
 

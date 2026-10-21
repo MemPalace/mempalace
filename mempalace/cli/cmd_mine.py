@@ -1,0 +1,495 @@
+# Loaded into mempalace.cli via exec (see __init__.py). Not a standalone module.
+if __name__ != "mempalace.cli":
+    raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
+
+from typing import Optional
+
+
+def cmd_mine(args):
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    mode = getattr(args, "mode", None) or "projects"
+    source_adapter = getattr(args, "source", None)
+    include_ignored = []
+    for raw in args.include_ignored or []:
+        include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
+
+    payload = {
+        "source": os.path.abspath(os.path.expanduser(args.dir)),
+        "mode": mode,
+        "wing": args.wing,
+        "agent": args.agent,
+        "limit": args.limit,
+        "dry_run": args.dry_run,
+        "extract": args.extract,
+        "no_gitignore": args.no_gitignore,
+        "include_ignored": include_ignored,
+        "max_chunks_per_file": getattr(
+            args,
+            "max_chunks_per_file",
+            None,
+        ),
+        "redetect_origin": getattr(
+            args,
+            "redetect_origin",
+            False,
+        ),
+        "include_subagents": bool(getattr(args, "include_subagents", False)),
+        "related_drawer_id": getattr(args, "related_drawer_id", None),
+        # The daemon names the palace in every job, so it cannot tell on its
+        # own whether --palace was given; the graph path depends on that.
+        "explicit_palace": bool(args.palace),
+    }
+    if source_adapter:
+        payload["source_adapter"] = source_adapter
+
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "mine",
+    )
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "mine",
+            payload,
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
+        return
+
+    from ..backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
+        EmbeddingFunctionMismatchError,
+    )
+    from ..embedding import (
+        EmbeddingAPIError,
+        EmbeddingFunctionUnavailableError,
+        UnknownEmbeddingModelError,
+    )
+    from ..media import MediaAssetError, MediaAssetSetupError
+    from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
+
+    model_errors = (
+        UnknownEmbeddingModelError,
+        EmbeddingFunctionUnavailableError,
+        EmbedderIdentityRecordError,
+        EmbedderIdentityMismatchError,
+        DimensionMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
+
+    # Before any mining path (a source adapter such as `--source media`,
+    # --redetect-origin, the miner's banner): a misspelled model stops here
+    # with nothing printed or created.
+    _exit_on_misspelled_embedding_model()
+
+    if source_adapter:
+        try:
+            drawers_written = mine_source_adapter(
+                source_name=source_adapter,
+                source_path=args.dir,
+                palace_path=palace_path,
+                dry_run=args.dry_run,
+                project=payload["wing"],
+                related_drawer_id=payload["related_drawer_id"],
+                explicit_palace=payload["explicit_palace"],
+            )
+        except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except MediaAssetSetupError as exc:
+            print(f"mempalace: media indexing is unavailable: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except MediaAssetError as exc:
+            print(f"mempalace: media indexing failed: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except MineAlreadyRunning as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except (*model_errors, EmbeddingAPIError) as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
+        suffix = " would be written" if args.dry_run else " written"
+        item_name = "media asset(s)" if source_adapter == "media" else "drawer(s)"
+        print(f"  Source adapter {source_adapter!r}: {drawers_written} {item_name}{suffix}.")
+        return
+
+    # A live HTTP hub for this palace holds the MCP writer lease, so a
+    # direct mine here would be refused. Hand the job to the hub instead —
+    # this is how the save hooks keep capturing transcripts on a machine
+    # that runs `mempalace serve`.
+    if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(
+        args, palace_path, include_ignored=include_ignored
+    ):
+        return
+
+    # --redetect-origin re-runs corpus_origin on the current corpus state
+    # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
+    # Heuristic-only by design — full LLM detection lives on `mempalace init`.
+    if getattr(args, "redetect_origin", False):
+        _run_pass_zero(
+            project_dir=args.dir,
+            palace_dir=palace_path,
+            llm_provider=None,
+        )
+
+    try:
+        if mode == "convos":
+            from ..convo_miner import mine_convos
+
+            mine_convos(
+                convo_dir=args.dir,
+                palace_path=palace_path,
+                wing=args.wing,
+                agent=args.agent,
+                limit=args.limit,
+                dry_run=args.dry_run,
+                extract_mode=args.extract,
+                include_subagents=getattr(args, "include_subagents", False),
+            )
+        elif mode == "extract":
+            from ..format_miner import mine_formats
+
+            mine_formats(
+                format_dir=args.dir,
+                palace_path=palace_path,
+                wing=args.wing,
+                agent=args.agent,
+                limit=args.limit,
+                dry_run=args.dry_run,
+            )
+        else:
+            from ..miner import mine
+
+            mine(
+                project_dir=args.dir,
+                palace_path=palace_path,
+                wing_override=args.wing,
+                agent=args.agent,
+                limit=args.limit,
+                dry_run=args.dry_run,
+                respect_gitignore=not args.no_gitignore,
+                include_ignored=include_ignored,
+                max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
+            )
+    except MineAlreadyRunning as exc:
+        # A live MCP server or another mine is already writing to this
+        # palace. Surface the holder identity so the operator knows what
+        # to wait for (or stop), and exit non-zero so wrappers like
+        # nohup / scripts can detect the contention.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except MineFileErrors as exc:
+        # The summary above already counted them; exit non-zero so scripts
+        # and hooks do not treat a partial mine as done.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except model_errors as exc:
+        # A misspelled model, or a model that differs from the one the palace
+        # was built with: nothing was written. Print the fix, as search does,
+        # instead of a traceback.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except EmbeddingAPIError as exc:
+        # The openai-compat endpoint refused the connection, failed, or sent
+        # something other than embeddings. The miner has already printed its
+        # "Mine aborted" summary (drawers filed so far are kept, and a re-run
+        # resumes); the cause needs one line, not a traceback.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except MineValidationError as exc:
+        # PRAGMA quick_check on chroma.sqlite3 returned errors at end of mine.
+        # The corruption may pre-date the mine; we surface it here so automation
+        # cannot proceed against a half-broken palace. Reuse cmd_repair's
+        # recovery banner so the operator sees one consistent message regardless
+        # of which command surfaces it.
+        from ..repair import print_sqlite_integrity_abort
+
+        print_sqlite_integrity_abort(exc.palace_path, exc.errors)
+        print(
+            "\n  PRAGMA quick_check after this mine reported errors (the corruption\n"
+            "  may pre-date the mine itself). Drawers may still be intact for direct\n"
+            "  lookup; wing-filtered or full-text search will fail until the FTS5\n"
+            "  index is rebuilt. `mempalace repair --yes` rebuilds the FTS5 virtual\n"
+            "  table automatically (step 6 of the recovery above).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+class UnknownSourceAdapterError(ValueError):
+    """Raised when an explicit ``--source`` name is absent from the registry."""
+
+
+class UnsupportedSourceAdapterProtocolError(ValueError):
+    """Raised when an adapter requires runner semantics not implemented yet."""
+
+
+class _DryRunCollectionProxy:
+    """Empty collection facade that records, but never persists, writes.
+
+    Source adapters are deliberately allowed to access ``drawer_collection``
+    directly.  A dry run must not open the real backend: even read-only-looking
+    opens can create or repair backend artifacts (for example SQLite WAL files).
+    """
+
+    def __init__(self):
+        self.operations = []
+
+    def add(self, **kwargs):
+        self.operations.append(("add", kwargs))
+
+    def upsert(self, **kwargs):
+        self.operations.append(("upsert", kwargs))
+
+    def delete(self, **kwargs):
+        self.operations.append(("delete", kwargs))
+
+    def update(self, **kwargs):
+        self.operations.append(("update", kwargs))
+
+    def query(self, **kwargs):
+        from ..backends import QueryResult
+
+        query_input = kwargs.get("query_texts", kwargs.get("query_embeddings"))
+        num_queries = len(query_input) if isinstance(query_input, (list, tuple)) else 1
+        include = kwargs.get("include") or []
+        return QueryResult.empty(
+            num_queries=num_queries,
+            embeddings_requested="embeddings" in include,
+        )
+
+    def get(self, **kwargs):
+        from ..backends import GetResult
+
+        return GetResult.empty()
+
+    def count(self):
+        return 0
+
+
+class _DryRunKnowledgeGraphProxy:
+    """Recording no-op facade for the KG mutation surface published to adapters."""
+
+    def __init__(self):
+        self.operations = []
+
+    def add_entity(self, *args, **kwargs):
+        self.operations.append(("add_entity", args, kwargs))
+
+    def add_triple(self, *args, **kwargs):
+        self.operations.append(("add_triple", args, kwargs))
+
+    def invalidate(self, *args, **kwargs):
+        self.operations.append(("invalidate", args, kwargs))
+
+    def supersede(self, *args, **kwargs):
+        self.operations.append(("supersede", args, kwargs))
+
+
+def mine_source_adapter(
+    *,
+    source_name: str,
+    source_path: str,
+    palace_path: str,
+    dry_run: bool = False,
+    project: Optional[str] = None,
+    related_drawer_id: Optional[str] = None,
+    explicit_palace: bool = False,
+) -> int:
+    """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
+
+    This deliberately sits alongside, rather than inside, the legacy mode
+    miners.  Until those miners are migrated to first-party adapters, no-flag
+    and ``--mode`` calls must retain their established dispatch paths.
+    """
+    import logging
+
+    from ..knowledge_graph import KnowledgeGraph
+    from ..media import MediaAsset, MediaAssetError, MediaAssetSetupError, store_media_asset
+    from ..palace import get_collection, mine_palace_lock
+    from ..sources import (
+        DrawerRecord,
+        PalaceContext,
+        SourceItemMetadata,
+        SourceRef,
+        get_adapter,
+        resolve_adapter_for_source,
+    )
+
+    logger = logging.getLogger(__name__)
+
+    adapter_name = resolve_adapter_for_source(explicit=source_name)
+    try:
+        adapter = get_adapter(adapter_name)
+    except KeyError as exc:
+        raise UnknownSourceAdapterError(
+            f"unknown source adapter {adapter_name!r}; install its adapter package or "
+            "check the adapter name with `mempalace mine --help`"
+        ) from exc
+
+    if "supports_incremental" in adapter.capabilities:
+        raise UnsupportedSourceAdapterProtocolError(
+            f"source adapter {adapter_name!r} requires incremental ingestion, which "
+            "mempalace mine does not support yet"
+        )
+
+    # A dry run must never open a collection: backend opens can create or
+    # repair storage even when requested as read-only.  Non-dry runs hold one
+    # writer lease from handle creation through adapter iteration, including
+    # direct KG mutations by adapters.
+    lock = mine_palace_lock(palace_path) if not dry_run else contextlib.nullcontext()
+    with lock:
+        knowledge_graph = None
+        try:
+            if dry_run:
+                drawer_collection = _DryRunCollectionProxy()
+                knowledge_graph = _DryRunKnowledgeGraphProxy()
+            else:
+                drawer_collection = get_collection(palace_path)
+                knowledge_graph = KnowledgeGraph(
+                    db_path=paths.knowledge_graph_path(palace_path, explicit=explicit_palace)
+                )
+            context = PalaceContext(
+                drawer_collection=drawer_collection,
+                knowledge_graph=knowledge_graph,
+                palace_path=palace_path,
+                config=MempalaceConfig(palace_path=palace_path),
+                adapter_name=adapter.name,
+                adapter_version=adapter.adapter_version,
+            )
+            drawers_written = 0
+            media_failures = 0
+            media_seen = 0
+            source_options = {}
+            if source_name == "media":
+                if project:
+                    source_options["project"] = project
+                if related_drawer_id:
+                    source_options["related_drawer_id"] = related_drawer_id
+            for result in adapter.ingest(
+                source=SourceRef(local_path=source_path, options=source_options),
+                palace=context,
+            ):
+                if isinstance(result, SourceItemMetadata):
+                    # Non-incremental adapters may report a cursor or version
+                    # while still doing a complete re-extract.  Incremental
+                    # adapters are rejected before ingest above, so accepting
+                    # this avoids a late partial-ingest failure.
+                    warnings.warn(
+                        f"Source adapter {adapter_name!r} yielded non-incremental item "
+                        "metadata; ignoring it during complete ingest",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    continue
+                if isinstance(result, DrawerRecord):
+                    drawers_written += 1
+                    context.upsert_drawer(result)
+                    continue
+                if isinstance(result, MediaAsset):
+                    media_seen += 1
+                    if dry_run:
+                        drawers_written += 1
+                        continue
+                    try:
+                        drawers_written += store_media_asset(
+                            result,
+                            palace_path,
+                            drawer_collection=drawer_collection,
+                        )
+                    except MediaAssetSetupError:
+                        raise
+                    except Exception as exc:
+                        media_failures += 1
+                        logger.warning(
+                            "skipping media asset %s: %s",
+                            result.source_file,
+                            exc,
+                        )
+                    continue
+                raise TypeError(
+                    f"source adapter {adapter_name!r} yielded unsupported result type "
+                    f"{type(result).__name__}"
+                )
+            if media_failures:
+                logger.warning(
+                    "media indexing finished: %d indexed, %d failed",
+                    drawers_written,
+                    media_failures,
+                )
+                if not dry_run and media_seen == media_failures:
+                    raise MediaAssetError(
+                        f"all {media_failures} discovered media assets failed; none were indexed"
+                    )
+            return drawers_written
+        finally:
+            if knowledge_graph is not None and hasattr(knowledge_graph, "close"):
+                knowledge_graph.close()
+
+
+def cmd_sweep(args):
+    """Sweep a transcript file or directory.
+
+    The sweeper deduplicates against its own prior writes via
+    deterministic drawer IDs + a timestamp cursor. It does NOT currently
+    coordinate with the file-level miners (miner.py / convo_miner.py) —
+    those produce char-chunked drawers without compatible message
+    metadata, so running both miners may store overlapping content under
+    different IDs.
+    """
+    from ..sweeper import sweep, sweep_directory
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    # Resolved here, the way the direct route reads it: the daemon keeps the
+    # cwd it was started in. A file keeps its own name, which becomes its
+    # drawers' source_file as `sweep <dir>` would file it, so only the
+    # directories above it are resolved. A blank target is passed on as typed,
+    # as before: resolving "" (or spaces, on Windows) would give the cwd.
+    target = os.path.expanduser(args.target)
+    if target.strip():
+        head, tail = os.path.split(target)
+        if tail in ("", os.curdir, os.pardir):
+            target = os.path.realpath(target)
+        else:
+            target = os.path.join(os.path.realpath(head or os.curdir), tail)
+
+    routing = _resolve_cli_write_routing_or_exit(
+        args,
+        "sweep",
+    )
+    if routing.use_daemon:
+        _submit_daemon_cli_job(
+            "sweep",
+            {"target": target},
+            args,
+            background=bool(getattr(args, "background", False)),
+            auto_start=routing.decision.auto_start_daemon,
+        )
+        return
+    if os.path.isfile(target):
+        result = sweep(target, palace_path)
+        print(
+            f"  Swept {target}: +{result['drawers_added']} new, "
+            f"{result['drawers_already_present']} already present, "
+            f"{result['drawers_skipped']} skipped (< cursor)."
+        )
+    elif os.path.isdir(target):
+        result = sweep_directory(target, palace_path)
+        print(
+            f"  Swept {result['files_succeeded']}/{result['files_attempted']} "
+            f"files from {target}: +{result['drawers_added']} new, "
+            f"{result['drawers_already_present']} already present, "
+            f"{result['drawers_skipped']} skipped (< cursor)."
+        )
+        failures = result.get("failures") or []
+        if failures:
+            print(
+                f"  WARNING: {len(failures)} file(s) failed to sweep - see stderr / logs for details.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+    else:
+        print(f"  ERROR: Not a file or directory: {target}", file=sys.stderr)
+        sys.exit(1)

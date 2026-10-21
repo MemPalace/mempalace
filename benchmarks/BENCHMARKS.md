@@ -41,23 +41,57 @@ Both are real. Both are reproducible. Neither is the whole picture alone.
 
 ## Comparison vs Published Systems (LongMemEval)
 
-| # | System | R@5 | LLM Required | Which LLM | Notes |
+> **Important caveat — read before quoting this table.**
+> MemPal's `R@5` in this table is **retrieval recall**: is the labelled
+> session for this question inside the top-5 retrieved candidates?
+>
+> Several of the other systems below publish **end-to-end QA accuracy** —
+> a different metric that scores whether the system's generated answer
+> is correct. Retrieval recall and QA accuracy are not comparable; a
+> system can have 100% retrieval recall and 40% QA accuracy, and vice
+> versa.
+>
+> - **Mastra's 94.87%** is binary QA accuracy with GPT-5-mini, per
+>   [mastra.ai/research/observational-memory](https://mastra.ai/research/observational-memory).
+> - **Supermemory ASMR's ~99%** is QA accuracy with an 8-/12-agent
+>   ensemble, and the authors explicitly frame it as an experimental
+>   proof-of-concept, not production, per
+>   [their ASMR post](https://supermemory.ai/blog/we-broke-the-frontier-in-agent-memory-introducing-99-sota-memory-system/).
+> - **Mem0** does not publish a LongMemEval number; their published
+>   metric is LoCoMo QA accuracy (~66.9%), per
+>   [mem0.ai/research](https://mem0.ai/research).
+>
+> The table is kept here as a historical record of how the comparison
+> was originally framed. Public-facing pages (`README.md`,
+> `mempalaceofficial.com`) no longer present this table, per issue
+> [#875](https://github.com/MemPalace/mempalace/issues/875). For a fair
+> head-to-head, run the same metric on the same split.
+
+| # | System | R@5 (retrieval recall, unless noted) | LLM Required | Which LLM | Notes |
 |---|---|---|---|---|---|
-| 1 | **MemPal (hybrid v4 + rerank)** | **100%** | Optional | Haiku | Reproducible, 500/500 |
-| 2 | Supermemory ASMR | ~99% | Yes | Undisclosed | Research only, not in production |
+| 1 | **MemPal (hybrid v4 + Haiku rerank)** | **100%** | Optional | Haiku | 500/500 — but the 99.4%→100% step tuned on 3 specific wrong answers (see "Benchmark Integrity" below). Held-out 450q is 98.4%. |
+| 2 | Supermemory ASMR | ~99% *(QA accuracy, not R@5)* | Yes | Ensemble of Gemini 2.0 Flash / GPT-4o-mini | Experimental, not production, per authors |
 | 3 | MemPal (hybrid v3 + rerank) | 99.4% | Optional | Haiku | Reproducible |
 | 3 | MemPal (palace + rerank) | 99.4% | Optional | Haiku | Independent architecture |
-| 4 | Mastra | 94.87% | Yes | GPT-5-mini | — |
-| 5 | **MemPal (raw, no LLM)** | **96.6%** | **None** | **None** | **Highest zero-API score published** |
-| 6 | Hindsight | 91.4% | Yes | Gemini-3 | — |
-| 7 | Supermemory (production) | ~85% | Yes | Undisclosed | — |
-| 8 | Stella (dense retriever) | ~85% | None | None | Academic baseline |
-| 9 | Contriever | ~78% | None | None | Academic baseline |
+| 4 | Mastra | 94.87% *(QA accuracy, not R@5)* | Yes | GPT-5-mini | Different metric — not directly comparable to R@5 |
+| 5 | **MemPal (raw, no LLM)** | **96.6%** | **None** | **None** | **Reproducible, 500/500** |
+| 6 | MemPal hybrid v4 held-out 450 | 98.4% | None | None | Honest generalisable hybrid-pipeline figure |
+| 7 | Hindsight | 91.4% *(per their release, metric unverified)* | Yes | Gemini-3 | Check their published methodology |
+| 8 | Stella (dense retriever) | ~85% | None | None | Academic retrieval baseline |
+| 9 | Contriever | ~78% | None | None | Academic retrieval baseline |
 | 10 | BM25 (sparse) | ~70% | None | None | Keyword baseline |
 
-**MemPal raw (96.6%) is the highest published LongMemEval score that requires no API key, no cloud, and no LLM at any stage.**
+The MemPal raw 96.6% is the headline we ship on public surfaces: it's
+retrieval recall, it requires no API key, and it reproduces.
 
-**MemPal hybrid v4 + Haiku rerank (100%) is the first perfect score on LongMemEval — 500/500 questions, all 6 question types at 100%.**
+The MemPal hybrid v4 + Haiku rerank 100% remains an internal
+result — reproducible with `--mode hybrid_v4 --llm-rerank` — but we
+don't quote it on public pages because the final 0.6% was reached by
+inspecting three specific wrong answers (see "Benchmark Integrity"
+below), which is teaching to the test. The honest generalisable figure
+when an LLM is in the loop is the held-out 98.4% R@5 on 450 unseen
+questions, or the model-agnostic 99.2% R@5 / 100% R@10 we reproduced
+with minimax-m2.7 on the full 500.
 
 ---
 
@@ -72,7 +106,7 @@ Both are real. Both are reproducible. Neither is the whole picture alone.
 | Block extraction | 57–71% | LLM-processed blocks |
 | Mem0 (RAG) | 30–45% | LLM-extracted memories |
 
-MemPal is more than 2× Mem0 on this benchmark. With Sonnet rerank, MemPal reaches **100% on LoCoMo** across all 5 question types including temporal-inference (was 46% at baseline).
+MemPal is more than 2× Mem0 on this benchmark. A historical LoCoMo run reported **100% Avg Recall** across all 5 question types at top-50, where every session fits in the retrieved set. This does not measure a benefit from Sonnet reranking or answer accuracy.
 
 **Why MemPal beats Mem0 by 2×:** Mem0 uses an LLM to extract memories — it decides what to remember and discards the rest. When it extracts the wrong thing, the memory is gone. MemPal stores verbatim text. Nothing is discarded. The simpler approach wins because it doesn't lose information.
 
@@ -88,10 +122,18 @@ MemPal is more than 2× Mem0 on this benchmark. With Sonnet rerank, MemPal reach
 
 ### LoCoMo (1,986 multi-hop QA pairs)
 
+**Reranking limitation:** The current LoCoMo runner cuts retrieval to `top_k`
+before `--llm-rerank` reorders those same IDs. `Avg Recall` checks evidence
+membership and ignores order, so this flag cannot change recall for the same
+retrieved set. It adds LLM latency and any provider cost when executed. Omit it
+for recall-only comparisons, keeping mode, top-k, granularity and embedding
+model fixed. LLM names below identify historical configurations, not measured
+reranking gains; scores at top-50 or top-15 are not R@5 or R@10 measurements.
+
 | Mode | R@5 | R@10 | LLM | Notes |
 |---|---|---|---|---|
-| **Hybrid v5 + Sonnet rerank (top-50)** | **100%** | **100%** | Sonnet | Structurally guaranteed (top-k > sessions) |
-| **bge-large + Haiku rerank (top-15)** | — | **96.3%** | Haiku | Single-hop 86.6%, temporal-inf 87.0% |
+| **Hybrid v5 + Sonnet rerank (top-50)** | — | — | Sonnet | **100% Avg Recall at top-50**; all sessions fit in the set |
+| **bge-large + Haiku rerank (top-15)** | — | — | Haiku | **96.3% Avg Recall at top-15**; single-hop 86.6%, temporal-inf 87.0% |
 | **bge-large hybrid (top-10)** | — | **92.4%** | None | +3.5pp over all-MiniLM, single-hop +10.6pp |
 | **Hybrid v5 (top-10)** | 83.7% | **88.9%** | None | Beats Memori 81.95% — honest score |
 | **Wings v3 speaker-owned closets (top-10)** | — | **85.7%** | None | Adversarial 92.8% — speaker ownership solves speaker confusion |
@@ -126,9 +168,9 @@ Wings v3 design: one closet per speaker per session. Owner's turns verbatim; oth
 
 Root cause of wings v1 failure: (1) speaker WHERE filter discarded evidence about Caroline when evidence lived in a John-tagged closet (John spoke more words but conversation was about Caroline); (2) top_k=10 from ~184 closets = 5.4% coverage vs 37% in session mode. Fix: retrieve all closets, use speaker match as 15% distance boost instead of filter.
 
-**With Sonnet rerank, MemPal achieves 100% on every LoCoMo question type — including temporal-inference, which was the hardest category at baseline.**
+**The historical top-50 run reported 100% Avg Recall on every LoCoMo question type — including temporal-inference, which was the hardest category at the smaller baseline cutoff. All sessions fit under top-50; reranking does not change this membership score.**
 
-**Per-category breakdown (hybrid + Sonnet rerank):**
+**Per-category Avg Recall (historical hybrid + Sonnet rerank, top-50):**
 
 | Category | Recall | Baseline | Delta |
 |---|---|---|---|
@@ -138,7 +180,7 @@ Root cause of wings v1 failure: (1) speaker WHERE filter discarded evidence abou
 | Open-domain | 1.000 | 58.1% | +41.9pp |
 | Adversarial | 1.000 | 61.9% | +38.1pp |
 
-**Temporal-inference was the hardest category** — questions requiring connections across multiple sessions. Hybrid scoring (person name boost, quoted phrase boost) combined with Sonnet's reading comprehension closes this gap entirely. From 46% to 100%.
+**Temporal-inference was the hardest category** — questions requiring evidence from multiple sessions. The historical 46% to 100% comparison uses different retrieval configurations and cutoffs. At top-50 every session is included, so these deltas do not establish a reranking improvement or measure reading comprehension.
 
 ---
 
@@ -308,9 +350,9 @@ The palace classifies each question into one of 5 halls. Pass 1 searches only wi
 ### Setup
 
 ```bash
-git clone -b ben/benchmarking https://github.com/aya-thekeeper/mempal.git
-cd mempal
-pip install chromadb pyyaml
+git clone https://github.com/MemPalace/mempalace.git
+cd mempalace
+uv sync --extra dev   # or: pip install -e ".[dev]"
 mkdir -p /tmp/longmemeval-data
 curl -fsSL -o /tmp/longmemeval-data/longmemeval_s_cleaned.json \
   https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json
@@ -397,10 +439,15 @@ python benchmarks/convomem_bench.py --category all --limit 50
 
 ```bash
 git clone https://github.com/snap-research/locomo.git /tmp/locomo
-python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --granularity session
+python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json --granularity session \
+  --top-k 10
 ```
 
-### LoCoMo — hybrid + Sonnet rerank (100%)
+### LoCoMo — historical hybrid + Sonnet rerank (100% Avg Recall at top-50)
+
+This reproduces the historical configuration. The session pool is saturated at
+top-50; the reranker changes ordering only. For a recall-only run, omit
+`--llm-rerank`, `--llm-model` and `--llm-key`.
 
 ```bash
 python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json \
@@ -409,7 +456,7 @@ python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json \
   --top-k 50 \
   --llm-rerank \
   --llm-model claude-sonnet-4-6 \
-  --api-key $ANTHROPIC_API_KEY
+  --llm-key "$ANTHROPIC_API_KEY"
 ```
 
 ---
@@ -420,7 +467,7 @@ Every major AI memory system and where it stands:
 
 | System | Approach | LongMemEval | Requires | Notes |
 |---|---|---|---|---|
-| **MemPal** | Raw verbatim text + ChromaDB | 96.6% / 100% | Python + ChromaDB | Open source — 100% LME + 100% LoCoMo w/ rerank |
+| **MemPal** | Raw verbatim text + ChromaDB | 96.6% / 100% | Python + ChromaDB | Open source — 100% LME; historical 100% LoCoMo Avg Recall at saturated top-50 |
 | Supermemory | Agentic LLM search (ASMR) | ~99% (exp) / ~85% (prod) | LLM API | Production + experimental tracks |
 | Mastra | LLM observation extraction | 94.87% | GPT-5-mini | Highest validated production score |
 | Hindsight | Time-aware vector retrieval | 91.4% | LLM API | Validated by Virginia Tech |
@@ -495,9 +542,9 @@ python benchmarks/longmemeval_bench.py data/... --mode hybrid_v4 --held-out --sp
 
 ### LoCoMo 100% — a separate caveat
 
-The LoCoMo 100% result with top-k=50 has a structural issue: each of the 10 conversations has 19–32 sessions, but top-k=50 exceeds that count. This means the ground-truth session is always in the candidate pool regardless of the embedding model's ranking. The Sonnet rerank is essentially doing reading comprehension over all sessions — the embedding retrieval step is bypassed entirely.
+The LoCoMo 100% result with top-k=50 has a structural issue: each of the 10 conversations has 19–32 sessions, but top-k=50 exceeds that count. Every session, including the labelled evidence, fits in the retrieved set regardless of ranking. The current reranker moves a selected candidate to the front without changing that set. The reported metric measures evidence membership, not reading comprehension or generated-answer accuracy.
 
-**The honest LoCoMo score is the top-10 result: 60.3% without rerank.** A re-run at top-k=10 with the hybrid mode and rerank is the next step for a publishable LoCoMo result.
+**The raw LoCoMo baseline at top-10 is 60.3% without rerank.** The later hybrid top-10 result is 88.9% (see below). Compare retrieval modes at the same top-k, granularity and embedding model without `--llm-rerank`: reordering the already-cut set cannot improve Avg Recall, even at top-10. Selecting a different set before the cut would be a separate behavior change requiring evaluation; no gain is established by the current flag.
 
 ---
 
@@ -529,7 +576,7 @@ All raw results are committed:
 | `results_rooms_full500.jsonl` | rooms | 89.4% | Session rooms |
 | `results_mempal_hybrid_v4_llmrerank_session_20260325_0930.jsonl` | hybrid_v4+rerank | 100% | Haiku, 500/500 |
 | `results_mempal_hybrid_v4_llmrerank_session_20260325_1054.jsonl` | hybrid_v4+rerank | 100% | Sonnet, LME 500/500 |
-| `results_locomo_hybrid_llmrerank_session_top50_20260325_1056.json` | locomo hybrid+rerank | 100% | Sonnet, 1986/1986 |
+| `results_locomo_hybrid_llmrerank_session_top50_20260325_1056.json` | locomo hybrid+rerank, top-50 | 100% Avg Recall | Sonnet, 1986/1986; saturated session pool, ordering-only rerank |
 | `results_lme_hybrid_v4_held_out_450_20260326_0010.json` | hybrid_v4 held-out | 98.4% R@5 | Clean — 450 unseen questions |
 | `results_locomo_hybrid_session_top10_*.json` | locomo hybrid_v5 | 88.9% R@10 | Honest — top-10, no rerank |
 | `results_locomo_palace_session_top5_20260326_0031.json` | locomo palace v2 | 75.6% R@5 | Summary-based routing, 3 rooms |
@@ -690,8 +737,8 @@ python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_clean
 The question: how much of the 96.6% → 99.4% improvement is the heuristics, and how much would come from just using a better embedding model?
 
 ```bash
-pip install fastembed
-python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_cleaned.json \
+uv pip install fastembed   # or: pip install fastembed
+uv run python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_cleaned.json \
   --mode raw --embed-model bge-large
 ```
 
@@ -699,16 +746,15 @@ python benchmarks/longmemeval_bench.py /tmp/longmemeval-data/longmemeval_s_clean
 
 ### 3. Honest LoCoMo — hybrid at top-10
 
-The 100% result used top-k=50 which exceeds the session count, making retrieval trivial. The honest number is top-k=10.
+The historical 100% Avg Recall result used top-k=50, which includes every session. Use top-10 for a bounded retrieval comparison and omit the ordering-only reranker.
 
 ```bash
 python benchmarks/locomo_bench.py /tmp/locomo/data/locomo10.json \
   --mode hybrid --granularity session \
-  --top-k 10 \
-  --llm-rerank --llm-model claude-haiku-4-5-20251001
+  --top-k 10
 ```
 
-**Expected:** higher than the 60.3% raw top-10 baseline, lower than 100%.
+**Historical reference:** hybrid top-10 reported 88.9%, compared with the 60.3% raw top-10 baseline. These are retrieval-mode results; enabling `--llm-rerank` does not change the reported recall for a fixed retrieved set.
 
 ### 4. bge-large on LoCoMo top-10
 

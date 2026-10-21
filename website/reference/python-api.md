@@ -36,7 +36,7 @@ from mempalace.layers import MemoryStack
 stack = MemoryStack()  # uses default paths from MempalaceConfig
 
 # Wake-up: L0 (identity) + L1 (essential story)
-context = stack.wake_up(wing="myapp")  # ~170-900 tokens
+context = stack.wake_up(wing="myapp")  # ~600-900 tokens
 
 # On-demand: L2 retrieval
 recall = stack.recall(wing="myapp", room="auth", n_results=10)
@@ -61,6 +61,14 @@ kg = KnowledgeGraph()  # uses default path: ~/.mempalace/knowledge_graph.sqlite3
 kg.add_entity("Kai", entity_type="person")
 kg.add_triple("Kai", "works_on", "Orion", valid_from="2025-06-01")
 kg.invalidate("Kai", "works_on", "Orion", ended="2026-03-01")
+kg.add_triple("Kai", "uses_model", "gpt-4.1", valid_from="2026-01-01")
+kg.supersede(
+    "Kai",
+    "uses_model",
+    old_obj="gpt-4.1",
+    new_obj="gpt-5.6",
+    at="2026-07-20",
+)
 
 # Read
 facts = kg.query_entity("Kai", as_of="2026-01-15", direction="both")
@@ -68,6 +76,9 @@ relationships = kg.query_relationship("works_on")
 timeline = kg.timeline("Orion")
 stats = kg.stats()
 ```
+
+Use `supersede()` when a single-valued fact changes.
+It writes the old fact's `valid_to` and the new fact's `valid_from` at the same boundary, avoiding overlapping values at the handoff.
 
 ## Palace Graph
 

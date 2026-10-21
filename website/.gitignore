@@ -5,6 +5,7 @@ node_modules
 out
 dist
 .vitepress/dist
+.vitepress/cache
 .vitepress/.temp
 *.tgz
 
