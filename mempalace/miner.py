@@ -15,6 +15,7 @@ import re
 import shlex
 import stat
 import sys
+import unicodedata
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -1077,6 +1078,10 @@ def detect_hall(content: str) -> str:
     return "general"
 
 
+def _is_cjk_entity_char(char: str) -> bool:
+    return unicodedata.name(char, "").startswith(("CJK ", "HIRAGANA ", "KATAKANA ", "HANGUL "))
+
+
 def _extract_entities_for_metadata(content: str) -> str:
     """Extract entity names from content for metadata tagging.
 
@@ -1101,7 +1106,11 @@ def _extract_entities_for_metadata(content: str) -> str:
         # behavior so a known entity like "Aya" tags drawers that mention
         # "aya" / "AYA" / "Aya". Without re.IGNORECASE, lowercase mentions
         # in chat transcripts and voice-typed content get silently untagged.
-        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content, re.IGNORECASE):
+        # CJK text can join names directly to adjacent words or particles.
+        # Keep the guard on each non-CJK edge of a mixed-script name.
+        left = "" if _is_cjk_entity_char(name[0]) else r"(?<!\w)"
+        right = "" if _is_cjk_entity_char(name[-1]) else r"(?!\w)"
+        if re.search(left + re.escape(name) + right, content, re.IGNORECASE):
             matched.add(name)
 
     coca_filter = _get_coca_filter()

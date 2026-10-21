@@ -844,6 +844,59 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     assert "Lumi" in matched_mixed
 
 
+@pytest.mark.parametrize(
+    ("name", "content", "expected"),
+    [
+        ("资源", "提升资源效率", True),
+        ("会議", "今日会議があります", True),
+        ("회의", "회의에서 결정", True),
+        ("さくら", "さくらさん", True),
+        ("サクラ", "サクラさん", True),
+        ("𠮷", "𠮷さん", True),
+        ("Aya", "AYA", True),
+        ("Aya", "Ayala", False),
+        ("Мир", "Мирный", False),
+        ("ABC研究所", "ABC研究所で", True),
+        ("ABC研究所", "XABC研究所で", False),
+        ("研究所ABC", "新研究所ABC", True),
+        ("研究所ABC", "新研究所ABCx", False),
+        ("ABC研究所XYZ", "xABC研究所XYZ", False),
+        ("A+B研究所", "A+B研究所で", True),
+        ("A+B研究所", "AAAB研究所で", False),
+    ],
+)
+def test_known_entity_script_boundaries(monkeypatch, name, content, expected):
+    from mempalace import miner
+
+    monkeypatch.setattr(miner, "_load_known_entities", lambda: frozenset({name}))
+
+    entities = miner._extract_entities_for_metadata(content).split(";")
+
+    assert (name in entities) is expected
+
+
+def test_mine_stores_registered_cjk_entities(tmp_path, monkeypatch):
+    from mempalace import miner, palace
+
+    monkeypatch.setattr(miner, "_load_known_entities", lambda: frozenset({"资源", "회의"}))
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "notes.txt"
+    source.write_text(
+        "提升资源效率，控制风险。회의에서 결정한 내용을 보존합니다。\n" * 5, encoding="utf-8"
+    )
+    palace_path = str(tmp_path / "palace")
+
+    (project / "mempalace.yaml").write_text("wing: test\nrooms: []\n", encoding="utf-8")
+    mine(str(project), palace_path)
+
+    rows = palace.get_collection(palace_path).get(
+        where={"source_file": str(source.resolve())}, include=["metadatas"]
+    )
+    assert rows["ids"]
+    assert all({"资源", "회의"} <= set(meta["entities"].split(";")) for meta in rows["metadatas"])
+
+
 def test_scan_project_skips_oversized_files(tmp_path, capsys, monkeypatch):
     import re
 
