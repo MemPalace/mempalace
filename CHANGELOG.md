@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Conversation mining compares transcript timestamps by instant rather than
+  text order, so mixed UTC offsets and fractional seconds select the correct
+  authored time. Invalid timestamps are ignored.
+
 ---
 
 ## [3.12.0] — 2026-10-18
