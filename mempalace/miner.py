@@ -1079,7 +1079,17 @@ def detect_hall(content: str) -> str:
 
 
 def _is_cjk_entity_char(char: str) -> bool:
-    return unicodedata.name(char, "").startswith(("CJK ", "HIRAGANA ", "KATAKANA ", "HANGUL "))
+    return char in "々〆〇〻" or unicodedata.name(char, "").startswith(
+        (
+            "CJK ",
+            "HIRAGANA ",
+            "KATAKANA ",
+            "KATAKANA-HIRAGANA ",
+            "HANGUL ",
+            "HALFWIDTH KATAKANA",
+            "HALFWIDTH HANGUL ",
+        )
+    )
 
 
 def _extract_entities_for_metadata(content: str) -> str:
