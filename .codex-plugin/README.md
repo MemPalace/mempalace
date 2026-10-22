@@ -1,10 +1,10 @@
 # MemPalace - Codex CLI Plugin
 
-Give your AI a persistent memory -- mine projects and conversations into a searchable palace backed by ChromaDB, with 44 MCP tools, auto-save hooks, and guided skills.
+Give your AI a persistent memory -- mine projects and conversations into a searchable palace backed by ChromaDB, with 47 MCP tools, auto-save hooks, and guided skills.
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - Codex CLI installed and configured
 - `uv tool install mempalace` (recommended) or `pip install mempalace`
 
@@ -39,7 +39,7 @@ codex
 
 ### Skill Commands
 
-The main `$mempalace:mempalace` skill can be invoked with five different subcommands. `$mempalace <command>` can be used as a short form invocation. 
+The main `$mempalace:mempalace` skill can be invoked with six different subcommands. `$mempalace <command>` can be used as a short form invocation.
 
 | Command | Description |
 |---------| ------------|

@@ -2,6 +2,7 @@
 name = "mempalace-py"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
@@ -15,5 +16,5 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 mempalace-core = { path = "../mempalace-core" }
-pyo3 = { version = "0.22", features = ["abi3-py39"] }
+pyo3 = { version = "0.22", features = ["abi3-py310"] }
 

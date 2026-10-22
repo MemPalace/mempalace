@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from mempalace import cli, mcp_proxy, server_registry
+from mempalace import cli, hub_client, server_registry
 from mempalace.config import MempalaceConfig
 
 
@@ -53,6 +53,7 @@ def _mine_args(source_dir, **overrides):
         extract="exchange",
         max_chunks_per_file=None,
         kg_extract=False,
+        include_subagents=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -104,7 +105,8 @@ class TestServerRegistry:
     def test_shares_directory_with_server_token(self, isolated_home):
         palace = str(isolated_home / "palace")
         assert (
-            server_registry.serverinfo_path(palace).parent == cli._server_token_path(palace).parent
+            server_registry.serverinfo_path(palace).parent
+            == server_registry.server_token_path(palace).parent
         )
 
     def test_dead_pid_record_is_ignored(self, isolated_home):
@@ -157,13 +159,13 @@ class TestServerRegistry:
         token_path.write_text("palace-b-token\n")
         monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "palace-a-token")
 
-        assert server_registry.load_server_token(palace) == "palace-b-token"
+        assert server_registry.load_server_tokens(palace)[0] == "palace-b-token"
 
     def test_process_environment_is_fallback_without_palace_token(self, isolated_home, monkeypatch):
         palace = str(isolated_home / "palace")
         monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "explicit-token")
 
-        assert server_registry.load_server_token(palace) == "explicit-token"
+        assert server_registry.load_server_tokens(palace) == ("explicit-token",)
 
 
 # ── mine forwarding ──────────────────────────────────────────────────
@@ -747,7 +749,9 @@ class TestForwardSearchToHub:
         ],
     )
     def test_per_invocation_search_override_is_not_forwardable(self, monkeypatch, env_name):
-        for name in cli._SEARCH_OVERRIDE_ENV_VARS:
+        from mempalace.hub_client import SEARCH_OVERRIDE_ENV_VARS
+
+        for name in SEARCH_OVERRIDE_ENV_VARS:
             monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv(env_name, "en")
         assert cli._search_args_forwardable(_search_args()) is False
@@ -761,6 +765,14 @@ class TestForwardSearchToHub:
 class TestForwardability:
     def test_plain_convo_mine_is_forwardable(self, tmp_path):
         assert cli._mine_args_forwardable(_mine_args(tmp_path), []) is True
+
+    def test_project_include_ignored_is_forwardable(self, tmp_path):
+        args = _mine_args(tmp_path, mode="projects")
+        assert cli._mine_args_forwardable(args, [".agents/handoffs/note.md"]) is True
+
+    def test_convo_include_subagents_is_forwardable(self, tmp_path):
+        args = _mine_args(tmp_path, include_subagents=True)
+        assert cli._mine_args_forwardable(args, []) is True
 
     @pytest.mark.parametrize(
         "overrides,include_ignored",
@@ -854,7 +866,7 @@ class TestStdioProxy:
             hub.stop()
 
     def test_dynamic_proxy_status_adds_local_client_update_state(self, proxied_palace, monkeypatch):
-        from mempalace import mcp_server, mcp_proxy
+        from mempalace import mcp_proxy, mcp_server
 
         hub = _FakeHub(mine_result={"updates": {"server": {"enabled": True, "installed": "3.9.0"}}})
         try:
@@ -971,7 +983,7 @@ class TestStdioProxy:
         def broken_off(*a):
             raise error
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", broken_off)
+        monkeypatch.setattr(hub_client.HubClient, "post", broken_off)
         write = {
             "jsonrpc": "2.0",
             "id": 9,
@@ -1030,12 +1042,8 @@ class TestThinStdioProxyTokenRetry:
             monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
             request = {"jsonrpc": "2.0", "id": 7, "method": "tools/list"}
 
-            response = mcp_proxy._forward(
-                f"http://127.0.0.1:{hub.port}",
-                {"Content-Type": "application/json"},
-                request,
-                palace,
-            )
+            client = hub_client.HubClient(palace, {"host": "127.0.0.1", "port": hub.port})
+            response = client.post(request)
 
             assert response["id"] == 7
             assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
@@ -1071,11 +1079,191 @@ class TestServeHttpRegistersServerinfo:
         assert observed["during"] is not None, "hub must be discoverable while serving"
         assert observed["during"]["port"] == 12345
         assert observed["during"]["read_only"] is mcp_server._READ_ONLY
+        assert "mine_include_ignored" in observed["during"]["capabilities"]
+        assert "mine_include_subagents" in observed["during"]["capabilities"]
         # After shutdown the record is gone — no stale forwarding target.
         assert server_registry.read_live_serverinfo(palace) is None
 
 
 class TestCmdMineIntegration:
+    def test_include_ignored_routes_normalized_paths_through_hub(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch
+    ):
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, capabilities=["mine_include_ignored"])
+        monkeypatch.setattr(miner, "mine", lambda **kw: pytest.fail("must not open a local writer"))
+        args = _mine_args(
+            tmp_path / "project",
+            palace=palace,
+            mode="projects",
+            include_ignored=[" .agents/handoffs/note.md, docs/private.md ", "reports"],
+            limit=1,
+            agent="test-agent",
+        )
+        cli.cmd_mine(args)
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"] == {
+            "source": str(tmp_path / "project"),
+            "mode": "projects",
+            "agent": "test-agent",
+            "limit": 1,
+            "dry_run": False,
+            "extract": "exchange",
+            "include_ignored": [".agents/handoffs/note.md", "docs/private.md", "reports"],
+        }
+
+    def test_include_ignored_old_hub_refused_without_local_fallback(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(
+            miner, "mine", lambda **kw: pytest.fail("must not fall back to a local writer")
+        )
+        args = _mine_args(
+            tmp_path / "project", palace=palace, mode="projects", include_ignored=["notes"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_mine(args)
+        assert exc.value.code == 1
+        assert fake_hub.requests == []
+        error = capsys.readouterr().err
+        assert "--include-ignored" in error
+        assert "upgrade" in error.lower() and "restart" in error.lower()
+
+    def test_include_ignored_without_hub_preserves_local_options(
+        self, isolated_home, tmp_path, monkeypatch
+    ):
+        from mempalace import miner
+
+        calls = []
+        monkeypatch.setattr(miner, "mine", lambda **kw: calls.append(kw))
+        args = _mine_args(
+            tmp_path / "project",
+            palace=str(isolated_home / "palace"),
+            mode="projects",
+            include_ignored=["notes, reports"],
+        )
+        cli.cmd_mine(args)
+        assert calls[0]["include_ignored"] == ["notes", "reports"]
+        assert calls[0]["respect_gitignore"] is True
+
+    def test_include_ignored_uncertain_hub_write_is_not_replayed(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, capabilities=["mine_include_ignored"])
+        monkeypatch.setattr(
+            miner, "mine", lambda **kw: pytest.fail("must not replay an uncertain write")
+        )
+
+        def uncertain(*args, **kwargs):
+            raise TimeoutError("response lost after submission")
+
+        monkeypatch.setattr(hub_client.HubClient, "post", uncertain)
+        args = _mine_args(
+            tmp_path / "project", palace=palace, mode="projects", include_ignored=["notes"]
+        )
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_mine(args)
+        assert exc.value.code == 1
+        assert "not retrying directly" in capsys.readouterr().err
+
+    def test_include_subagents_routes_through_hub(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch
+    ):
+        from mempalace import convo_miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, capabilities=["mine_include_subagents"])
+        monkeypatch.setattr(
+            convo_miner, "mine_convos", lambda **kw: pytest.fail("must not open a local writer")
+        )
+        args = _mine_args(
+            tmp_path / "convos", palace=palace, include_subagents=True, agent="test-agent"
+        )
+        cli.cmd_mine(args)
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"] == {
+            "source": str(tmp_path / "convos"),
+            "mode": "convos",
+            "agent": "test-agent",
+            "limit": 0,
+            "dry_run": False,
+            "extract": "exchange",
+            "include_subagents": True,
+        }
+
+    def test_include_subagents_old_hub_refused_without_local_fallback(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        from mempalace import convo_miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(
+            convo_miner,
+            "mine_convos",
+            lambda **kw: pytest.fail("must not fall back to a local writer"),
+        )
+        args = _mine_args(tmp_path / "convos", palace=palace, include_subagents=True)
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_mine(args)
+        assert exc.value.code == 1
+        assert fake_hub.requests == []
+        error = capsys.readouterr().err
+        assert "--include-subagents" in error
+        assert "upgrade" in error.lower() and "restart" in error.lower()
+
+    def test_convo_mine_without_include_subagents_still_reaches_old_hub(
+        self, isolated_home, tmp_path, fake_hub
+    ):
+        # The argument is sent only when set, so hubs that predate it keep
+        # taking the save hooks' plain convos mines.
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        cli.cmd_mine(_mine_args(tmp_path / "convos", palace=palace))
+        (request,) = fake_hub.requests
+        assert "include_subagents" not in request["params"]["arguments"]
+
+    def test_include_subagents_outside_convos_mode_is_not_forwarded(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch
+    ):
+        # The direct path ignores the flag outside convos mode; the hub path
+        # must not turn it into an old-hub refusal or a tool argument.
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(miner, "mine", lambda **kw: pytest.fail("must not open a local writer"))
+        args = _mine_args(
+            tmp_path / "project", palace=palace, mode="projects", include_subagents=True
+        )
+        cli.cmd_mine(args)
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"]["mode"] == "projects"
+        assert "include_subagents" not in request["params"]["arguments"]
+
+    def test_mine_without_mode_forwards_projects_mode(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch
+    ):
+        # `mempalace mine <dir>` leaves --mode unset (None); the hub's tool
+        # refuses a null mode, so the forwarder must send the CLI's default.
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(miner, "mine", lambda **kw: pytest.fail("must not open a local writer"))
+        cli.cmd_mine(_mine_args(tmp_path / "project", palace=palace, mode=None))
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"]["mode"] == "projects"
+
     def test_cmd_mine_routes_through_hub(self, isolated_home, tmp_path, fake_hub, monkeypatch):
         palace = str(isolated_home / "palace")
         _register_hub(palace, fake_hub)

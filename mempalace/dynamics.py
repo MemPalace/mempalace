@@ -37,9 +37,10 @@ Research grounding:
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
+from .timeutil import localize, parse_timestamp, utc_now
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tunable constants. Hardcoded for v1; future PRs may expose via
@@ -95,7 +96,7 @@ def initialize_dynamics_fields(connection: dict, *, now: Optional[datetime] = No
     current UTC time. Same pattern as the rest of this module.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = utc_now()
     now_iso = now.isoformat() if isinstance(now, datetime) else now
 
     # ``created_at`` exists on every connection per existing schema; use it as
@@ -133,7 +134,7 @@ def potentiate(
     mutation — no I/O.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = utc_now()
 
     # Backfill any missing fields so callers can pass partial records.
     initialize_dynamics_fields(connection, now=now)
@@ -141,7 +142,7 @@ def potentiate(
     # Compute the gap since the last activation to decide if this counts
     # as spaced reinforcement.
     last_activated_str = connection.get("last_activated") or connection.get("created_at")
-    last_dt = _parse_iso(last_activated_str)
+    last_dt = parse_timestamp(last_activated_str)
     if last_dt is not None:
         hours_since = (now - last_dt).total_seconds() / 3600.0
     else:
@@ -182,17 +183,16 @@ def effective_strength(connection: dict, *, now: Optional[datetime] = None) -> f
     See ``apply_decay``'s note for what happens otherwise.
 
     ``now`` is dependency injection for tests. A naive datetime is read as
-    UTC rather than raising: ``_parse_iso`` already forces awareness on the
-    stored timestamp, so without the same treatment here a caller passing
-    ``datetime.now()`` gets a TypeError from the subtraction below.
+    local time, the same rule as a naive stored timestamp, so a caller
+    passing ``datetime.now()`` gets the right answer instead of a TypeError.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
-    elif now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
+        now = utc_now()
+    else:
+        now = localize(now)
 
     last_activated_str = connection.get("last_activated") or connection.get("created_at")
-    last_dt = _parse_iso(last_activated_str)
+    last_dt = parse_timestamp(last_activated_str)
     if last_dt is None:
         return float(connection.get("strength", DEFAULT_STRENGTH))
 
@@ -243,13 +243,13 @@ def apply_decay(connection: dict, *, now: Optional[datetime] = None) -> dict:
     ``now`` is dependency injection for tests.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = utc_now()
 
     # Backfill missing fields so callers can pass partial records.
     initialize_dynamics_fields(connection, now=now)
 
     last_activated_str = connection.get("last_activated") or connection.get("created_at")
-    last_dt = _parse_iso(last_activated_str)
+    last_dt = parse_timestamp(last_activated_str)
     if last_dt is None:
         # If we can't parse the timestamp, leave the strength as-is rather
         # than corrupting it. A malformed timestamp is a data-integrity
@@ -276,36 +276,6 @@ def apply_decay(connection: dict, *, now: Optional[datetime] = None) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def _parse_iso(value) -> Optional[datetime]:
-    """Parse an ISO-8601 string into a timezone-aware datetime.
-
-    Returns None on any parse failure rather than raising — callers should
-    handle the None case as "unknown timestamp." Old records may have
-    timestamps in slightly different formats; be liberal in what we accept.
-    """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        # fromisoformat handles most ISO-8601 variants including those
-        # written by datetime.isoformat(). Z-suffix not always accepted
-        # by older Python versions; convert to +00:00 explicitly.
-        v = value.strip()
-        if v.endswith("Z"):
-            v = v[:-1] + "+00:00"
-        dt = datetime.fromisoformat(v)
-        # Force timezone awareness so subtraction with timezone-aware
-        # ``now`` doesn't raise TypeError.
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except (ValueError, TypeError):
-        return None
 
 
 __all__ = [

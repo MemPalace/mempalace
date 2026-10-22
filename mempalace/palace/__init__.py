@@ -22,8 +22,10 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from .. import paths
 from ..backends import (
     BackendClosedError,
+    BackendError,
     BackendMismatchError,
     CollectionNotInitializedError,
     PalaceNotFoundError,
@@ -35,13 +37,15 @@ from ..backends import (
     resolve_backend_for_palace,
 )
 from ..backends.embedding_wrapper import EmbeddingCollection
+from ..collision_scan import CollisionError, assert_no_collisions
 from ..entity_detector import (
     _apply_known_systems_prepass,
     _collapse_long_ascii_runs,
     _get_coca_filter,
 )
+from ..metadata_types import coerce_metadata_types
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 SKIP_DIRS = {
     ".git",
@@ -54,7 +58,7 @@ SKIP_DIRS = {
     "build",
     ".next",
     "coverage",
-    ".mempalace",
+    paths.DIRNAME,
     ".ruff_cache",
     ".mypy_cache",
     ".pytest_cache",
@@ -80,7 +84,13 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 #
 # v2 (2026-04): introduced strip_noise() for Claude Code JSONL; previous
 #               drawers stored system tags / hook chrome verbatim.
-NORMALIZE_VERSION = 2
+# v3 (2026-10): user turns are no longer spell-corrected by default, ChatGPT
+#               exports follow the active branch, lossy parsing steps are
+#               stamped in ``transforms``, a conversation is filed under every
+#               file that holds it, and non-UTF-8 sources decode losslessly.
+#               Text that comes out the same keeps its stored embedding, so
+#               the re-mine embeds only what changed.
+NORMALIZE_VERSION = 3
 
 # Revision of the conversation exchange chunker (``convo_miner.chunk_exchanges``),
 # stamped on exchange-mode convo rows as ``convo_chunker_version``. The
@@ -93,6 +103,19 @@ NORMALIZE_VERSION = 2
 #               at or below the min chunk size) and splits oversized units at
 #               whitespace instead of mid-word.
 CONVO_CHUNKER_VERSION = 2
+
+# Revision of ``general_extractor.extract_memories``, stamped on general-mode
+# convo rows as ``general_extractor_version`` under the same rule.
+#
+# v2 (2026-10): paragraphs that match no marker, or are under 20 characters,
+#               are kept as ``general`` instead of dropped.
+GENERAL_EXTRACTOR_VERSION = 2
+
+# Per-mode chunker stamp: extract_mode -> (metadata key, current revision).
+CHUNKER_VERSIONS = {
+    "exchange": ("convo_chunker_version", CONVO_CHUNKER_VERSION),
+    "general": ("general_extractor_version", GENERAL_EXTRACTOR_VERSION),
+}
 
 
 # (palace_id, collection_name, model_name) tuples already validated this
@@ -111,6 +134,7 @@ _FRAGMENTS = (
     "mine_lock.py",
     "palace_lock.py",
     "mined.py",
+    "writes.py",
 )
 
 

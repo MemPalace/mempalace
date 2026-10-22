@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from . import paths
+
 try:
     import tomllib  # Python 3.11+
 except ImportError:  # pragma: no cover
@@ -49,7 +51,7 @@ SKIP_DIRS = {
     ".terraform",
     "vendor",
     "target",
-    ".mempalace",
+    paths.DIRNAME,
     ".cache",
     ".pytest_cache",
     ".mypy_cache",

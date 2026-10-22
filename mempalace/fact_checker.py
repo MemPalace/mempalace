@@ -30,13 +30,13 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime, timezone
 
 # Share miner's mtime-cached registry loader so we don't double-read
 # ~/.mempalace/known_entities.json on every check_text call.
 from .miner import _load_known_entities_raw
+from .timeutil import utc_now
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 
 # Narrow detection patterns — parse "X is Y's Z" and "X's Z is Y".
@@ -59,6 +59,7 @@ def check_text(text: str, palace_path: str = None, config=None) -> list:
     evidence of absence. The detector is deliberately conservative:
     every issue is anchored to a specific KG fact or registry entry.
     """
+    explicit = palace_path is not None
     if config is None:
         from .config import MempalaceConfig
 
@@ -73,7 +74,7 @@ def check_text(text: str, palace_path: str = None, config=None) -> list:
     entity_names_raw = _load_known_entities_raw()
 
     issues.extend(_check_entity_confusion(text, entity_names_raw))
-    issues.extend(_check_kg_contradictions(text, palace_path))
+    issues.extend(_check_kg_contradictions(text, palace_path, explicit=explicit))
 
     return issues
 
@@ -179,7 +180,7 @@ def _extract_claims(text: str) -> list:
     return claims
 
 
-def _check_kg_contradictions(text: str, palace_path: str) -> list:
+def _check_kg_contradictions(text: str, palace_path: str, explicit: bool = False) -> list:
     """Compare each claim in ``text`` against the KG.
 
     For every claim ``(subject, predicate, object)`` parsed from the
@@ -196,19 +197,26 @@ def _check_kg_contradictions(text: str, palace_path: str) -> list:
     if not claims:
         return []
 
+    from . import paths
+
+    kg_path = paths.knowledge_graph_path(palace_path, explicit=explicit)
+    if not os.path.isfile(kg_path):
+        # No graph yet; a check only reads, so it never creates one.
+        return []
     try:
         from .knowledge_graph import KnowledgeGraph
 
-        # KG lives alongside the palace collection; mcp_server uses the
-        # same convention (see _kg init). Pass ``db_path`` — the previous
-        # code passed a nonexistent ``palace_path`` kwarg which raised
-        # TypeError, silently swallowed by the outer except and rendered
-        # the entire KG-check path dead.
-        kg = KnowledgeGraph(db_path=os.path.join(palace_path, "knowledge_graph.sqlite3"))
+        kg = KnowledgeGraph(db_path=kg_path)
     except Exception:
-        # KG unavailable (brand-new palace, corrupted DB, etc.) — skip.
+        # KG unavailable (corrupted DB, etc.) — skip.
         return []
+    try:
+        return _kg_issues(kg, claims)
+    finally:
+        kg.close()
 
+
+def _kg_issues(kg, claims: list) -> list:
     issues: list = []
     for claim in claims:
         subject = claim["subject"]
@@ -251,7 +259,7 @@ def _check_kg_contradictions(text: str, palace_path: str) -> list:
 
         # Stale fact: exact match on (subject, predicate, object) but KG
         # closed the window in the past.
-        now_iso = datetime.now(timezone.utc).date().isoformat()
+        now_iso = utc_now().date().isoformat()
         for fact in facts:
             if fact.get("current"):
                 continue
@@ -345,10 +353,13 @@ if __name__ == "__main__":
         epilog="Exits 0 when no issues found, 1 when one or more issues detected.",
     )
     parser.add_argument("text", nargs="?", help="Text to check (or use --stdin).")
+    # No default: a palace typed here is explicit (it keeps its knowledge
+    # graph inside itself); without it the configured palace is used as
+    # every other tool uses it.
     parser.add_argument(
         "--palace",
-        default=_default_palace_path(),
-        help="Path to the palace directory.",
+        default=None,
+        help=f"Path to the palace directory (default: {_default_palace_path()}).",
     )
     parser.add_argument("--stdin", action="store_true", help="Read text from stdin.")
     args = parser.parse_args()

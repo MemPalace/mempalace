@@ -11,7 +11,6 @@ from pathlib import Path
 
 import chromadb
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 
@@ -411,6 +410,33 @@ class TestSyncPalace:
         finally:
             del client
 
+    def test_aaak_summaries_of_pruned_drawers_go_with_them(self, synced_world):
+        """A summary quotes its drawer, so a prune must not leave it behind."""
+        from mempalace.sync import sync_palace
+
+        client = chromadb.PersistentClient(path=synced_world["palace_path"])
+        aaak = client.get_or_create_collection("mempalace_aaak", metadata={"hnsw:space": "cosine"})
+        aaak.add(
+            ids=["drawer_gitignored_dir", "drawer_keep"],
+            documents=["IGNORED|★", "KEEP|★"],
+            embeddings=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            metadatas=[{"kind": "aaak", "wing": "demo"}, {"kind": "aaak", "wing": "demo"}],
+        )
+        del client
+
+        sync_palace(
+            palace_path=synced_world["palace_path"],
+            project_dirs=[synced_world["repo_path"]],
+            dry_run=False,
+        )
+
+        client = chromadb.PersistentClient(path=synced_world["palace_path"])
+        try:
+            aaak = client.get_collection("mempalace_aaak")
+            assert aaak.get(include=[])["ids"] == ["drawer_keep"]
+        finally:
+            del client
+
     def test_handles_empty_palace(self, palace_path):
         from mempalace.sync import sync_palace
 
@@ -624,11 +650,12 @@ class TestSyncPalace:
         cannot fake-pass — the assertion below verifies the patched explode
         actually ran before the cache was cleared.
         """
+        import json
+
         from mempalace import mcp_server
 
         # Reconfigure to point at synced_world.
         from mempalace.config import MempalaceConfig
-        import json
 
         cfg_dir = Path(synced_world["palace_path"]).parent / "cfg_for_cache_test"
         cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -1212,11 +1239,12 @@ class TestSyncMcpTool:
         assert report.get("dry_run") is True
 
     def test_apply_true_is_destructive(self, monkeypatch, config, synced_world, kg):
+        import json
+
         from mempalace import mcp_server
 
         # Rebuild config to point at synced_world's palace.
         from mempalace.config import MempalaceConfig
-        import json
 
         cfg_dir = Path(synced_world["palace_path"]).parent / "cfg_for_mcp_test"
         cfg_dir.mkdir(parents=True, exist_ok=True)
@@ -1270,10 +1298,10 @@ class TestSyncMcpTool:
         a structured `{success: False, error: ...}` instead of raising."""
         import fcntl
         import hashlib
+        import json
 
         from mempalace import mcp_server
         from mempalace.config import MempalaceConfig
-        import json
 
         # Wire MCP config at synced_world.
         cfg_dir = Path(synced_world["palace_path"]).parent / "cfg_for_lock_test"
@@ -2787,8 +2815,7 @@ class TestMinedFilesystemIdentity(_IdentityRows):
         that arrives or leaves while the witnesses are being stat'ed makes the
         two readings describe different directories, and a verdict built from
         them is a verdict about neither."""
-        from mempalace import source_identity as si
-        from mempalace import sync as sync_mod
+        from mempalace import source_identity as si, sync as sync_mod
 
         repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
         recorded = si.directory_identity(repo)
@@ -2836,8 +2863,7 @@ class TestMinedFilesystemIdentity(_IdentityRows):
         read where the verdict is formed, next to the other two readings, or
         a reading taken while the right volume was there condemns drawers
         settled after it was gone."""
-        from mempalace import source_identity as si
-        from mempalace import sync as sync_mod
+        from mempalace import source_identity as si, sync as sync_mod
 
         repo, neighbour, gone = self._repo_with_a_neighbour(tmp_dir)
         here = si.directory_identity(repo)
@@ -2941,6 +2967,46 @@ class TestMinedFilesystemIdentity(_IdentityRows):
         # A drawer of the file's own content.
         assert _is_bookkeeping_row({"room": "documents", "chunk_index": 0}, "d_1") is False
         assert _is_bookkeeping_row({}, "") is False
+        # A real drawer in a room a project named "_registry".
+        assert _is_bookkeeping_row({"room": "_registry", "chunk_index": 0}, "drawer_p_r") is False
+
+    def test_a_drawer_in_a_real_registry_room_is_pruned_with_its_source(self, tmp_dir, palace_path):
+        """A project can name a room "_registry". Its drawers are content, so
+        when the source goes away they go too, like any other drawer."""
+        from mempalace.sync import sync_palace
+
+        repo = Path(tmp_dir) / "repo"
+        repo.mkdir(parents=True)
+        (repo / ".gitignore").write_text("*.py\n")
+        source = repo / "registry.py"
+        source.write_text("REGISTRY = {}\n")
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        col.add(
+            ids=["drawer_demo__registry_0"],
+            documents=["REGISTRY = {}"],
+            embeddings=[[1.0, 0.0, 0.0]],
+            metadatas=[
+                {
+                    "wing": "demo",
+                    "room": "_registry",
+                    "source_file": str(source),
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-08-23T00:00:00",
+                }
+            ],
+        )
+        del client
+
+        report = sync_palace(
+            palace_path=palace_path, project_dirs=[str(repo)], wing="demo", dry_run=False
+        )
+
+        assert report["removed_drawers"] == 1, report
 
     def test_a_registry_sentinel_is_not_a_drawer_that_survived(self, tmp_dir, palace_path):
         """A convo sentinel names the same source as the drawers it tracks and
@@ -3829,8 +3895,7 @@ class TestGitignoredRouteIdentity(_IdentityRows):
         """The directory that answered before the rule was read is the one the
         drawer was mined from; the one answering after it is not. The rule was
         read from one of them, and nothing says which, so the drawer is kept."""
-        from mempalace import source_identity as si
-        from mempalace import sync as sync_mod
+        from mempalace import source_identity as si, sync as sync_mod
 
         repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
         here = si.directory_identity(repo)
@@ -3863,8 +3928,7 @@ class TestGitignoredRouteIdentity(_IdentityRows):
         """The mirror image: another directory answered before the rule was
         read, and the mined one answers after it. A reading taken only after
         the rule would match the drawer and remove it."""
-        from mempalace import source_identity as si
-        from mempalace import sync as sync_mod
+        from mempalace import source_identity as si, sync as sync_mod
 
         repo, ignored = self._repo_with_an_ignored_file(tmp_dir)
         here = si.directory_identity(repo)
@@ -3909,8 +3973,7 @@ class TestGitignoredRouteIdentity(_IdentityRows):
         With ``below_the_rule`` the sources sit in a subdirectory and the
         rule stays at the root, so the entry read across the change is an
         ancestor's."""
-        from mempalace import source_identity as si
-        from mempalace import sync as sync_mod
+        from mempalace import source_identity as si, sync as sync_mod
 
         repo = Path(tmp_dir) / "repo"
         home = repo / "sub" if below_the_rule else repo

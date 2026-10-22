@@ -7,6 +7,41 @@ class MineAlreadyRunning(RuntimeError):
     """Raised when another `mempalace mine` already holds the per-palace lock."""
 
 
+class MineFileErrors(RuntimeError):
+    """Raised at the end of a mine when one or more files could not be filed.
+
+    The mine finished its loop and printed its summary. Each failed file kept
+    whatever drawers it had and is retried by the next mine, but the run is
+    not a success, and no caller may report it as one.
+    """
+
+    def __init__(self, failed_files: list[str], total_files: int) -> None:
+        if not failed_files:
+            raise ValueError("MineFileErrors requires at least one failed file")
+        super().__init__(
+            f"{len(failed_files)} of {total_files} file(s) failed to mine; "
+            "per-file errors went to stderr (the server's stderr over MCP, the "
+            "terminal on the CLI), and the next mine retries them"
+        )
+        self.failed_files: tuple[str, ...] = tuple(failed_files)
+        self.total_files = total_files
+
+
+def print_files_failed(failed_files: list) -> None:
+    """Add the failed-file count to a mine summary; nothing when none failed."""
+    if failed_files:
+        print(
+            f"  Files failed: {len(failed_files)} (not mined; per-file errors went to "
+            "stderr, retried on the next mine)"
+        )
+
+
+def raise_if_files_failed(failed_files: list, total_files: int) -> None:
+    """End a mine that could not file every file with :class:`MineFileErrors`."""
+    if failed_files:
+        raise MineFileErrors(failed_files, total_files)
+
+
 class MineValidationError(RuntimeError):
     """Raised at end of mine when PRAGMA quick_check on the palace reports errors."""
 
@@ -15,8 +50,7 @@ class MineValidationError(RuntimeError):
             raise ValueError("MineValidationError requires at least one error string")
         if not palace_path:
             raise ValueError("MineValidationError requires a non-empty palace_path")
-        # Name the SQLite that produced the verdict. #2240 points at this
-        # post-mine check by name: a build that cannot detect a given FTS5
+        # Name the SQLite that produced the verdict: a build that cannot detect a given FTS5
         # fault reports the same "clean" as one that can. The CLI handler
         # renders the abort banner, which carries the version; the MCP `mine`
         # tool and the daemon's job runner render this message instead, so it
@@ -30,15 +64,23 @@ class MineValidationError(RuntimeError):
         self.errors: tuple[str, ...] = tuple(errors)
 
 
-def _validate_palace_fts5_after_mine(palace_path: str) -> None:
+def _validate_palace_fts5_after_mine(
+    palace_path: str, *, writes_since: Optional[int] = None
+) -> None:
     """Raise MineValidationError if PRAGMA quick_check reports any error after a mine.
+
+    ``writes_since`` is :func:`palace_write_serial` read before the mine's
+    first write. When nothing was written since, the check is skipped: a mine
+    that filed, purged and registered nothing left the database as it found
+    it, and on a 1M-drawer palace the full quick_check costs ~40 s warm, most
+    of a no-op mine. ``None`` always checks.
 
     Reuses the same primitive that `cmd_repair` already runs as preflight so the
     operator sees the same recovery banner regardless of which command surfaces
     the bug.
 
     An isolated FTS5 inverted-index corruption (the common case after a
-    killed-mid-write mine, #1596) is auto-healed in place first via the same
+    killed-mid-write mine) is auto-healed in place first via the same
     `maybe_autoheal_fts5_index` rebuild `cmd_repair` already runs as its own
     preflight step — so a normal `mine` self-heals the recoverable case
     instead of forcing the operator to run `mempalace repair` by hand for a
@@ -46,6 +88,8 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
     last word here: it checks the content table against `embedding_metadata`
     before rebuilding from it, and declines when it cannot.
     """
+    if writes_since is not None and palace_write_serial() == writes_since:
+        return
     if resolve_backend_name(palace_path) != "chroma":
         return
 
@@ -66,7 +110,7 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
         # transport -- a stray print() here would corrupt the protocol stream
         # and crash the connection.
         #
-        # warning, not info: this module logs through the `mempalace_mcp`
+        # warning, not info: this module logs through the `mempalace.palace`
         # logger, which sets no level of its own, and nothing configures logging
         # on the `mempalace mine` path -- so root keeps its default and info
         # records are dropped. Every message this call can emit describes a palace whose
@@ -76,6 +120,17 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
         errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.warning)
     if errors:
         raise MineValidationError(palace_path, errors)
+
+
+def palace_write_serial() -> int:
+    """A counter that moves whenever this process writes to a Chroma palace.
+
+    A miner reads it before its first write and hands it to
+    :func:`_validate_palace_fts5_after_mine` as ``writes_since``.
+    """
+    from ..backends.chroma import chroma_write_serial
+
+    return chroma_write_serial()
 
 
 # Process-wide record of palaces this PROCESS already holds the lock for. Used
@@ -237,11 +292,10 @@ def mine_palace_lock(palace_path: str):
     lets the threaded MCP HTTP transport write from a worker thread while the
     long-lived writer-lease is held on another thread of the same process.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    lock_dir = paths.lock_dir()
     os.makedirs(lock_dir, exist_ok=True)
     resolved = os.path.realpath(os.path.expanduser(palace_path))
-    lock_key_source = os.path.normcase(resolved)
-    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
+    palace_key = paths.palace_key(palace_path, length=16)
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
     if _held_by_this_process(palace_key):
@@ -255,7 +309,7 @@ def mine_palace_lock(palace_path: str):
     # which on Windows breaks ``msvcrt.locking`` (it locks 1 byte at the
     # *current* position, so two contenders end up locking different bytes
     # and silently both acquire — observed as Windows-CI lock test
-    # failures during #1264 development).
+    # failures).
     if not os.path.exists(lock_path):
         # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
         # contender just created it, which is fine — we proceed to open.

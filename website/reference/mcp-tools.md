@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 45 MCP tools.
+Detailed parameter schemas for all 47 MCP tools.
 
 ## Palace — Read Tools
 
@@ -70,9 +70,16 @@ Semantic search. Returns verbatim drawer content with similarity scores.
 | `room` | string | No | Filter by room |
 | `since` | string | No | Include drawers filed on or after this ISO date/datetime |
 | `before` | string | No | Include drawers filed strictly before this ISO date/datetime |
+| `max_distance` | number | No | Distance cutoff on the cosine scale (0 = identical, 2 = opposite), applied the same way whatever metric the palace uses. Default: no cutoff |
 | `expand_wings` | boolean | No | Opt-in (default false). When true and no wing/room/source_file filter is set, a thin baseline triggers additive cross-wing expansion — structurally related wings are queried separately and their deduped hits append after the baseline, filling only slots the baseline left empty. |
 
 **Returns:** `{ query, filters, results: [{ text, wing, room, source_file, similarity }] }`
+
+When `max_distance` drops results, the response says how many in
+`filtered_by_max_distance`. With `candidate_strategy: "union"`, a lexical-only
+hit whose vector distance can't be computed is kept with `distance: null` and
+`fallback_reason: "distance_unavailable"`, and a failed lexical fetch sets
+`candidate_strategy_fallback: "lexical_search_failed"`.
 
 When expansion fires, the response includes `wing_expansion`:
 `{ applied, wings, added }` — the wings queried and how many hits were
@@ -156,25 +163,25 @@ Save a whole session in one call. Semantic-dedups each item, files the non-dupli
 
 ### `mempalace_delete_drawer`
 
-Delete a drawer by ID. Irreversible.
+Delete a drawer by ID. Irreversible. The drawer's earlier revisions in `drawer_revisions.jsonl` are removed with it.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to delete |
 
-**Returns:** `{ success, drawer_id }`
+**Returns:** `{ success, drawer_id, deleted_ids, chunks_deleted, closets_deleted, revisions_deleted, revisions_error? }`. When the drawer was deleted but its revisions could not be removed, `revisions_deleted` is `null` and `revisions_error` says so.
 
 ---
 
 ### `mempalace_delete_drawers`
 
-Delete many drawers by ID in one call. Irreversible. Each ID is removed the same way as `mempalace_delete_drawer`: a logical drawer id removes the whole group, including its chunk rows, and a physical chunk id removes that one row. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still runs. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and deletes nothing.
+Delete many drawers by ID in one call. Irreversible. Each ID is removed the same way as `mempalace_delete_drawer`: a logical drawer id removes the whole group, including its chunk rows, and a physical chunk id removes that one row. A missing ID is an item in `results` and is counted in `errors`; the rest of the batch still runs. An accepted call is 1 to 500 IDs and always returns `results`, including a one-ID call. An empty list or more than 500 IDs is rejected and deletes nothing. The earlier revisions of every deleted drawer are removed once the batch finishes.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `drawer_ids` | array of strings | **Yes** | Drawer IDs to delete (1 to 500) |
 
-**Returns:** `{ results, count, deleted, errors }` for an accepted call. Each result is `{ drawer_id, deleted_ids, chunks_deleted, closets_deleted }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
+**Returns:** `{ results, count, deleted, errors, revisions_deleted, revisions_error? }` for an accepted call. Each result is `{ drawer_id, deleted_ids, chunks_deleted, closets_deleted }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
 
 ---
 
@@ -191,14 +198,25 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |
 | `extract` | string | No | Convos extraction strategy: `exchange` (default) or `general`; ignored by other modes |
+| `include_ignored` | array of strings | No | Project-relative paths to scan even if ignored, like CLI `--include-ignored`; `projects` mode only (default `[]`) |
+| `include_subagents` | boolean | No | Also mine Claude Code subagent transcripts (`subagents/` dirs), like CLI `--include-subagents`; `convos` mode only, ignored by other modes (default false) |
 
 **Returns:** `{ success, mode, dry_run, output }` on success (`output` is the miner's human-readable summary; `output_truncated: true` is added when a very large summary is tail-trimmed), or `{ success: false, error, error_class? }` on failure.
+
+**Files that fail to mine** (`projects` and `convos` modes): when a file's stale-drawer purge raises, that file is not mined. Its existing drawers are left untouched, the next mine retries it, and the summary in `output` adds a `Files failed: N` line. The mine finishes the remaining files, but it is not reported as a success:
+
+```text
+{ success: false, mode, dry_run, output[, output_truncated],
+  error, error_class: "MineFileErrors", files_failed, failed_files }
+```
+
+`files_failed` is the number of files that failed. `failed_files` lists their paths, capped at the first 20. `error` reads `"N of M file(s) failed to mine; per-file errors went to stderr (the server's stderr over MCP, the terminal on the CLI), and the next mine retries them"`. Only stdout is captured into `output`, so the per-file `! [error] ... stale-drawer purge failed` lines go to the server's stderr (its log), not into `output`. The CLI behaves the same way: `mempalace mine` prints the summary, reports the failed files on stderr, and exits `1`.
 
 ---
 
 ### `mempalace_delete_by_source`
 
-Bulk-delete every drawer mined from one `source_file` (exact match). Use this to clean up benchmark or test data that was accidentally mined into a user wing — for example ShareGPT dumps or `results_mempal_*.jsonl` eval files drowning out real memories in semantic search. Matching is pushed down to the storage backend via a `where` filter, so it is not subject to the SQLite variable limit no matter how many drawers share the source. Returns a dry-run match count and a small sample by default; pass `dry_run=false` to commit. Irreversible.
+Bulk-delete every drawer mined from one `source_file` (exact match). Use this to clean up benchmark or test data that was accidentally mined into a user wing — for example ShareGPT dumps or `results_mempal_*.jsonl` eval files drowning out real memories in semantic search. Matching is pushed down to the storage backend via a `where` filter, so it is not subject to the SQLite variable limit no matter how many drawers share the source. Returns a dry-run match count and a small sample by default; pass `dry_run=false` to commit. Irreversible. A commit also removes the earlier revisions recorded for drawers from that source.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -206,7 +224,7 @@ Bulk-delete every drawer mined from one `source_file` (exact match). Use this to
 | `dry_run` | boolean | No | Preview the match count without deleting; default `true`. Pass `false` to actually delete |
 
 **Returns (dry run):** `{ success, dry_run, source_file, match_count, sample, hint }`
-**Returns (commit):** `{ success, dry_run, source_file, deleted }`
+**Returns (commit):** `{ success, dry_run, source_file, deleted, closets_deleted, revisions_deleted, revisions_error? }`
 
 ---
 
@@ -237,8 +255,11 @@ Fetch a single drawer by ID — returns full content and metadata.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
+| `include_source_bytes` | boolean | No | Also return `source_bytes_base64` for a drawer whose metadata names a `source_encoding` |
 
 **Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
+
+A drawer mined from a file with bytes that are not valid UTF-8 carries `metadata.source_encoding`. Responses show such a byte as U+FFFD, because some clients' JSON parsers reject the escape that would carry it; the palace keeps the byte. With `include_source_bytes: true` the response adds `source_bytes_base64`, the drawer text's exact source bytes.
 
 ---
 
@@ -273,6 +294,8 @@ List drawers with pagination. Optional wing/room filter. Returns IDs, wings, roo
 
 Update an existing drawer's content and/or metadata (wing, room). Fetches the existing drawer first; returns an error if not found.
 
+Before the overwrite, the replaced text and metadata are appended verbatim to `drawer_revisions.jsonl` in the palace directory. If that append fails, the update is refused. Revisions are kept across updates and are not capped. Deleting the drawer (`mempalace_delete_drawer`, `mempalace_delete_drawers` or `mempalace_delete_by_source`) removes them.
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to update |
@@ -280,7 +303,7 @@ Update an existing drawer's content and/or metadata (wing, room). Fetches the ex
 | `wing` | string | No | New wing (omit to keep existing) |
 | `room` | string | No | New room (omit to keep existing) |
 
-**Returns:** `{ success, drawer_id, updated_fields }`
+**Returns:** `{ success, drawer_id, wing, room, closets_deleted, revision_id? }` (plus `chunks` and `chunk_ids` for a chunked drawer)
 
 ---
 
@@ -548,6 +571,16 @@ Force a reconnect to the palace database. Use this after external scripts or CLI
 
 **Returns:** `{ success, message, drawers, vector_disabled[, vector_disabled_reason] }` (on no-palace: `{ success: false, message, drawers, vector_disabled }`; on exception: `{ success: false, error }`)
 
+**While a mine runs on a hub:** over the HTTP hub transport, reconnect waits up to 10 seconds for a running `mempalace_mine` on that hub to finish. Reconnect closes the backend handles the mine is writing through, so it never runs inside a mine. If the mine is still running after 10 seconds, reconnect is refused without touching the backend:
+
+```text
+{ success: false, error_class: "MineInProgress",
+  error: "a mine is running on this hub; reconnect closes the backend handles that mine is writing through, so it was not run (waited 10s)",
+  hint: "Retry mempalace_reconnect after the mine finishes." }
+```
+
+Retry once the mine has finished. A stdio server (no hub) is unaffected.
+
 ---
 
 ## Agent Coordination Tools (Logstream)
@@ -602,7 +635,7 @@ Append an immutable agent-coordination event to the logstream (RFC 003).
 
 ### `mempalace_event_list`
 
-List events with structured filters.
+List events with structured filters. `writer` filters by who wrote an event. `from_agent` is the caller identity and does not narrow the result.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -611,7 +644,8 @@ List events with structured filters.
 | `topic` | string | No | Filter by topic |
 | `type` | string | No | Filter by event type |
 | `to_agent` | string | No | Filter by target; also matches `*` broadcasts |
-| `from_agent` | string | No | Filter by writer |
+| `from_agent` | string | No | Caller identity. Not a filter: it never narrows the result. To filter by who wrote an event use `writer` |
+| `writer` | string | No | Filter by the agent that wrote the event |
 | `correlation_id` | string | No | Filter by correlation id |
 | `status` | string | No | Filter by status |
 | `since_event_id` | string | No | Only events strictly after this id in append order (precise forward cursor) |
@@ -626,7 +660,7 @@ List events with structured filters.
 
 ### `mempalace_event_wait`
 
-Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `from_agent`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`, plus:
+Block until a matching event exists or the timeout expires (long-poll; max 5 minutes). Accepts the forward filters `stream`, `room`, `topic`, `type`, `to_agent`, `writer`, `correlation_id`, `status`, `since_event_id`, and `since_created_at`. `from_agent` is the caller identity and does not filter. Also:
 
 For live-tail clients that can keep an HTTP connection open, use
 `GET /logstream/stream` SSE instead; `event_wait` is the polling MCP surface.

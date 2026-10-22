@@ -6,11 +6,10 @@ plus mock-based tests for error paths.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import BackendMismatchError
@@ -23,7 +22,6 @@ from mempalace.searcher import (
     search_memories,
 )
 
-
 # ── build_where_filter (unit) ──────────────────────────────────────────
 
 
@@ -31,20 +29,23 @@ class TestBuildWhereFilter:
     """build_where_filter composes a ChromaDB where clause from optional
     wing / room / source_file constraints (#1815). ChromaDB needs a ``$and``
     only when ≥2 clauses are present; a single clause is returned bare and
-    zero clauses yield an empty filter."""
+    zero clauses yield an empty filter. A wing matches every spelling its
+    project was filed under."""
+
+    WING = {"wing": {"$in": ["backend", "wing_backend"]}}
 
     def test_no_filters_returns_empty(self):
         assert build_where_filter() == {}
 
     def test_wing_only(self):
-        assert build_where_filter(wing="backend") == {"wing": "backend"}
+        assert build_where_filter(wing="backend") == self.WING
 
     def test_room_only(self):
         assert build_where_filter(room="auth") == {"room": "auth"}
 
     def test_wing_and_room(self):
         assert build_where_filter(wing="backend", room="auth") == {
-            "$and": [{"wing": "backend"}, {"room": "auth"}]
+            "$and": [self.WING, {"room": "auth"}]
         }
 
     def test_source_file_only(self):
@@ -52,7 +53,7 @@ class TestBuildWhereFilter:
 
     def test_wing_and_source_file(self):
         assert build_where_filter(wing="backend", source_file="auth.py") == {
-            "$and": [{"wing": "backend"}, {"source_file": "auth.py"}]
+            "$and": [self.WING, {"source_file": "auth.py"}]
         }
 
     def test_room_and_source_file(self):
@@ -62,7 +63,7 @@ class TestBuildWhereFilter:
 
     def test_wing_room_and_source_file(self):
         assert build_where_filter(wing="backend", room="auth", source_file="auth.py") == {
-            "$and": [{"wing": "backend"}, {"room": "auth"}, {"source_file": "auth.py"}]
+            "$and": [self.WING, {"room": "auth"}, {"source_file": "auth.py"}]
         }
 
 
@@ -320,7 +321,7 @@ class TestSearchMemories:
         assert hits[0]["closet_boost"] == pytest.approx(0.4)
         assert hits[0]["similarity"] == pytest.approx(0.92)
 
-    def test_closet_boosted_hits_deduped_by_source_before_hydration(self):
+    def test_closet_boosted_hits_keep_each_drawer_and_fetch_source_once(self):
         jsonl = "C:/convo/big.jsonl"
         other = "notes.md"
         extra = "extra.md"
@@ -388,13 +389,12 @@ class TestSearchMemories:
         ):
             result = search_memories("query term", "/fake/path", n_results=3)
 
-        sources = [hit["source_path"] for hit in result["results"]]
-        assert sources.count(jsonl) == 1, sources
-        assert other in sources
-        assert extra in sources
+        hits = result["results"]
+        assert [hit["source_path"] for hit in hits] == [jsonl, jsonl, jsonl]
+        assert [hit["drawer_id"] for hit in hits] == ["d0", "d1", "d2"]
+        assert [hit["text"] for hit in hits] == ["j0", "j1", "j2"]
         assert get_sources.count(jsonl) == 1, get_sources
-        jsonl_hit = next(hit for hit in result["results"] if hit["source_path"] == jsonl)
-        assert jsonl_hit["similarity"] == pytest.approx(0.6)
+        assert hits[0]["similarity"] == pytest.approx(0.6)
 
 
 # ── BM25 internals: None / empty document safety ─────────────────────
@@ -413,21 +413,21 @@ class TestBM25NoneSafety:
     """
 
     def test_tokenize_handles_none(self):
-        from mempalace.searcher import _tokenize
+        from mempalace.lexical import tokenize
 
-        assert _tokenize(None) == []
+        assert tokenize(None) == []
 
     def test_tokenize_handles_empty_string(self):
-        from mempalace.searcher import _tokenize
+        from mempalace.lexical import tokenize
 
-        assert _tokenize("") == []
+        assert tokenize("") == []
 
     def test_bm25_scores_does_not_crash_on_none_documents(self):
         """A ``None`` mixed into the corpus must yield score 0.0 for that doc
         and finite scores for the rest, not raise AttributeError."""
-        from mempalace.searcher import _bm25_scores
+        from mempalace.lexical import bm25_scores
 
-        scores = _bm25_scores(
+        scores = bm25_scores(
             "postgres migration", ["postgres migration done", None, "kafka rebalance"]
         )
         assert len(scores) == 3
@@ -748,8 +748,8 @@ class TestSearchCLI:
         ):
             search("anything", fake_palace_path, since="2026-01-01", before="2026-02-01")
 
-        assert seen["since_dt"] == datetime(2026, 1, 1)
-        assert seen["before_dt"] == datetime(2026, 2, 1)
+        assert seen["since_dt"] == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert seen["before_dt"] == datetime(2026, 2, 1, tzinfo=timezone.utc)
 
     def test_search_rejects_inverted_window_before_probing_a_diverged_index(self, fake_palace_path):
         """An inverted window is a caller error, so it must raise the same way
@@ -811,16 +811,16 @@ class TestSearchCLI:
 
 def test_tokenize_default_keeps_all_tokens():
     """Without stop_words, behaviour matches the pre-i18n tokenizer."""
-    from mempalace.searcher import _tokenize
+    from mempalace.lexical import tokenize
 
-    assert _tokenize("The cat sat on the mat") == ["the", "cat", "sat", "on", "the", "mat"]
+    assert tokenize("The cat sat on the mat") == ["the", "cat", "sat", "on", "the", "mat"]
 
 
 def test_tokenize_filters_stop_words():
     """When stop_words is given, matching tokens are dropped."""
-    from mempalace.searcher import _tokenize
+    from mempalace.lexical import tokenize
 
-    tokens = _tokenize("The cat sat on the mat", stop_words=frozenset({"the", "on"}))
+    tokens = tokenize("The cat sat on the mat", stop_words=frozenset({"the", "on"}))
     assert "the" not in tokens
     assert "on" not in tokens
     assert tokens == ["cat", "sat", "mat"]
@@ -828,21 +828,21 @@ def test_tokenize_filters_stop_words():
 
 def test_tokenize_stop_words_empty_is_no_op():
     """Empty frozenset is the same as default — full backwards compat."""
-    from mempalace.searcher import _tokenize
+    from mempalace.lexical import tokenize
 
-    assert _tokenize("hello world", stop_words=frozenset()) == _tokenize("hello world")
+    assert tokenize("hello world", stop_words=frozenset()) == tokenize("hello world")
 
 
 def test_bm25_scores_filters_stop_words_from_query_and_docs():
     """BM25 with a stop-words set uses the filtered vocabulary on both sides."""
-    from mempalace.searcher import _bm25_scores
+    from mempalace.lexical import bm25_scores
 
     query = "the quick fox"
     docs = ["the quick fox", "the lazy dog"]
     stop_words = frozenset({"the"})
 
-    filtered = _bm25_scores(query, docs, stop_words=stop_words)
-    unfiltered = _bm25_scores(query, docs)
+    filtered = bm25_scores(query, docs, stop_words=stop_words)
+    unfiltered = bm25_scores(query, docs)
 
     # Both should rank the first doc higher than the second (fox + quick match).
     assert filtered[0] > filtered[1]
@@ -853,9 +853,9 @@ def test_bm25_scores_filters_stop_words_from_query_and_docs():
 
 def test_bm25_scores_all_stopwords_query_returns_zeros():
     """If every query term is a stop word, BM25 short-circuits to all-zero."""
-    from mempalace.searcher import _bm25_scores
+    from mempalace.lexical import bm25_scores
 
-    scores = _bm25_scores(
+    scores = bm25_scores(
         "the and of", ["a doc", "another"], stop_words=frozenset({"the", "and", "of"})
     )
     assert scores == [0.0, 0.0]
@@ -863,9 +863,9 @@ def test_bm25_scores_all_stopwords_query_returns_zeros():
 
 def test_bm25_scores_all_stopword_docs_returns_zero_vector():
     """Every doc emptied by stop-word filter yields zero scores without divide errors."""
-    from mempalace.searcher import _bm25_scores
+    from mempalace.lexical import bm25_scores
 
-    scores = _bm25_scores("fox", ["the the the", "the the"], stop_words=frozenset({"the", "fox"}))
+    scores = bm25_scores("fox", ["the the the", "the the"], stop_words=frozenset({"the", "fox"}))
     assert scores == [0.0, 0.0]
 
 
@@ -1003,7 +1003,7 @@ def test_resolve_stop_words_none_reflects_config_change_between_calls(monkeypatc
 
 
 def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tmp_path):
-    """`_bm25_only_via_sqlite` must pass `stop_words` into `_bm25_scores`.
+    """`_bm25_only_via_sqlite` must pass `stop_words` into `bm25_scores`.
 
     Without this, vector-disabled (#1222) palaces silently lose stop-word
     filtering on the BM25 fallback path.
@@ -1011,13 +1011,13 @@ def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tm
     from mempalace import searcher
 
     captured = {}
-    real_bm25 = searcher._bm25_scores
+    real_bm25 = searcher.bm25_scores
 
     def _spy(query, docs, **kwargs):
         captured["stop_words"] = kwargs.get("stop_words")
         return real_bm25(query, docs, **kwargs)
 
-    monkeypatch.setattr(searcher, "_bm25_scores", _spy)
+    monkeypatch.setattr(searcher, "bm25_scores", _spy)
 
     # Build a minimal chroma.sqlite3 with one matching drawer so the scoring
     # path is reached. Schema mirrors what `_bm25_only_via_sqlite` reads:
@@ -1240,8 +1240,8 @@ class TestSearchMemoriesDateFilter:
         result = search_memories(self.BROAD, palace_path, n_results=10)
         assert "undated.md" in [r["source_file"] for r in result["results"]]
 
-    def test_aware_filed_at_matches_wall_clock(self, palace_path, seeded_collection):
-        # diary_ingest stamps aware UTC; the window compares wall-clock fields.
+    def test_aware_filed_at_compared_as_instant(self, palace_path, seeded_collection):
+        # Writers stamp aware UTC; the window compares instants.
         seeded_collection.upsert(
             ids=["aware1"],
             documents=["Aware planning entry about database sprint authentication."],

@@ -28,11 +28,12 @@ question-driven, not reflexive.
 
 ## The protocol
 
-1. **On wake-up** (if a session-start hook injected context, honour its wing scoping / `additional_context`): scope recall to the wing inferred from the workspace, then continue.
+1. **On wake-up** (if a session-start hook injected context, honour its wing scoping / `additional_context`): use the workspace's known wing for relevant recall; omit uncertain filters.
 2. **Before responding** about people, projects, past events, or prior
-   decisions: call `palace_query FIND` (or `mempalace_search`) first. For relational or temporal
-   facts ("who reported to whom in March", "what was true then"), call
-   `palace_query KG` (or `mempalace_kg_query`) instead or as well.
+   decisions: choose the recall tool that fits the question using
+   [the query guide below](#retrieve-only-the-context-you-need). Start with
+   KG for a known entity's relationships or time-bound facts, FIND for
+   source text, or DIARY for recent agent continuity.
 3. **If unsure** about a fact (name, age, relationship, preference): say
    "let me check the palace" and query. Wrong is worse than slow.
 4. **Return verbatim.** Quote the drawer's exact stored words. Never
@@ -63,11 +64,50 @@ question-driven, not reflexive.
 question — not a system prompt or pasted conversation) plus optional
 `wing` / `room` filters and `limit` (default 5).
 
+## Retrieve only the context you need
+
+Start with the tool that fits the question and **stop when the result
+answers it**. Progressive disclosure means retrieving more context only
+when needed, rather than calling KG, search, and diary on every question.
+
+1. **Known relationships or time-bound facts:** start with
+   `palace_query KG <entity>` / `mempalace_kg_query(entity=...)`.
+   For example, "Who owned myapp in March?" needs a known entity and an
+   `as_of` date. Without `as_of`, the full MCP response includes active,
+   historical, and future facts; use `active_facts` for a current-state
+   question. If the relevant fact answers the question, stop. If the KG
+   is empty or insufficient, search the stored text: not every memory
+   has a corresponding KG fact.
+2. **Decisions, explanations, or exact source words:** use
+   `palace_query FIND <terms>` / `mempalace_search` with a short query
+   and a small `limit`, such as 3. Start here directly for "Why did we
+   switch databases?" Use `wing` / `room` only when their names are known
+   and relevant. If a scoped search misses, check the taxonomy or relax
+   those filters before concluding the information is absent. Search
+   already returns stored text; retrieve a specific drawer when you need
+   its complete content, including a logical drawer split into chunks.
+3. **Recent agent continuity:** use `palace_query DIARY <agent>` /
+   `mempalace_diary_read(agent_name=..., last_n=3)` for "Where did this
+   agent leave off?" or a recent handover. A diary read can be the first
+   call for this question; a fact lookup does not require one. The full
+   MCP tool reads recent diary rows newest first, across the agent's
+   wings unless `wing` is supplied. A row may be one chunk of a longer
+   entry, so a small `last_n` does not promise complete sessions. Search
+   for older or topic-specific context rather than assuming recent diary
+   rows cover it.
+
+Use source context when a structured fact needs explanation or
+verification, and keep quoted text verbatim. Response sizes depend on
+the number of facts and the length of stored text; a small result limit
+does not impose a fixed token budget.
+
 ## Unhappy paths
 
-- **Empty results.** Say the palace has nothing on this; do not invent an
-  answer to fill the gap. Offer to widen the search (drop the wing
-  filter) or to file the new information.
+- **Empty results.** An empty KG query or filtered search does not prove
+  the palace has nothing on this. Try the appropriate text search or
+  check and widen the scope. If recall still finds nothing, state what
+  was checked; do not invent an answer to fill the gap. Offer to file
+  the new information.
 - **MCP unavailable / tool error.** Surface the error plainly and suggest
   the user verify the server (`mempalace status`, or re-run install).
   Do not silently fall back to guessing from model memory.

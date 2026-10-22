@@ -13,12 +13,11 @@ The Python package that powers MemPalace. All modules, all logic.
 | `convo_miner.py` | Conversation ingest — chunks by exchange pair (Q+A), detects rooms from content |
 | `searcher/` | Hybrid BM25 + vector search; public import is still `mempalace.searcher` |
 | `layers.py` | 4-layer memory stack: L0 (identity), L1 (critical facts), L2 (room recall), L3 (deep search) |
-| `dialect.py` | AAAK compression — entity codes, emotion markers, 30x lossless ratio |
+| `dialect.py` | AAAK — experimental lossy abbreviation layer (entity codes, emotion markers); not the storage default |
 | `knowledge_graph.py` | Temporal entity-relationship graph — SQLite, time-filtered queries, fact invalidation |
 | `palace/` | Collection access, closets, mine locks; public import is still `mempalace.palace` |
 | `palace_graph.py` | Room-based navigation graph — BFS traversal, tunnel detection across wings |
 | `mcp_server/` | MCP server package — tools, schemas, protocol, HTTP; public import is still `mempalace.mcp_server` |
-| `onboarding.py` | Guided first-run setup — asks about people/projects, generates AAAK bootstrap + wing config |
 | `entity_registry.py` | Entity code registry — maps names to AAAK codes, handles ambiguous names |
 | `entity_detector.py` | Auto-detect people and projects from file content |
 | `general_extractor.py` | Classifies text into 5 memory types (decision, preference, milestone, problem, emotional) |

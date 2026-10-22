@@ -48,7 +48,7 @@ def mock_claude_jsonl(tmp_path):
             "uuid": "a-1",
             "message": {"role": "assistant", "content": [{"type": "text", "text": "Paris."}]},
         },
-        # Noise: file-history-snapshot
+        # Noise record, a file history snapshot.
         {"type": "file-history-snapshot", "messageId": "abc-snap"},
         # Second user/assistant exchange
         {
@@ -297,8 +297,8 @@ class TestSweeperDrawerMetadata:
     depends on: session_id, timestamp, uuid, role."""
 
     def test_drawer_has_session_id_and_timestamp_metadata(self, mock_claude_jsonl, tmp_path):
-        from mempalace.sweeper import sweep
         from mempalace.palace import get_collection
+        from mempalace.sweeper import sweep
 
         palace_path = str(tmp_path / "palace")
         sweep(str(mock_claude_jsonl), palace_path)

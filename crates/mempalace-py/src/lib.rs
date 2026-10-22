@@ -1,3 +1,7 @@
+// pyo3 0.22's #[pymethods] wrappers convert each PyResult into itself;
+// the lint fires on that generated code, not on anything written here.
+#![allow(clippy::useless_conversion)]
+
 use mempalace_core::{MemPalaceError, VectorIndex};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
@@ -23,6 +27,9 @@ fn to_py_err(err: MemPalaceError) -> PyErr {
 pub struct PyNativeVectorIndex {
     inner: VectorIndex,
 }
+
+/// One query hit as Python sees it: (id, distance, similarity, wing, room).
+type QueryHit = (String, f32, f32, Option<String>, Option<String>);
 
 #[pymethods]
 impl PyNativeVectorIndex {
@@ -58,7 +65,7 @@ impl PyNativeVectorIndex {
         query_embedding: Vec<f32>,
         k: usize,
         filter_wing: Option<&str>,
-    ) -> PyResult<Vec<(String, f32, f32, Option<String>, Option<String>)>> {
+    ) -> PyResult<Vec<QueryHit>> {
         let hits = py
             .allow_threads(|| self.inner.query(&query_embedding, k, filter_wing))
             .map_err(to_py_err)?;
@@ -75,7 +82,7 @@ impl PyNativeVectorIndex {
         query_embedding: Vec<f32>,
         k: usize,
         filter_wing: Option<&str>,
-    ) -> PyResult<Vec<(String, f32, f32, Option<String>, Option<String>)>> {
+    ) -> PyResult<Vec<QueryHit>> {
         let hits = py
             .allow_threads(|| self.inner.query_parallel(&query_embedding, k, filter_wing))
             .map_err(to_py_err)?;

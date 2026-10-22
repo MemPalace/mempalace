@@ -12,7 +12,6 @@ from mempalace.convo_scanner import (
     scan_claude_projects,
 )
 
-
 # ── is_claude_projects_root ─────────────────────────────────────────────
 
 

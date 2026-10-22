@@ -118,6 +118,83 @@ def test_native_mutations_invalidate_all_wrappers(native_backend):
     assert col._native_index is not None
 
 
+def test_native_wings_takes_one_wing_or_a_wing_set():
+    from mempalace.backends.rust_exact import _native_wings
+
+    assert _native_wings(None) == ()
+    assert _native_wings({"wing": "a"}) == ("a",)
+    assert _native_wings({"wing": {"$in": ["a", "wing_a", "a"]}}) == ("a", "wing_a")
+    assert _native_wings({"wing": {"$in": []}}) is None
+    assert _native_wings({"wing": "a", "room": "r"}) is None
+    assert _native_wings({"room": "r"}) is None
+
+
+def test_native_wing_set_merges_each_wings_hits(tmp_path, monkeypatch):
+    import mempalace.backends.rust_exact as rust_module
+
+    hits_by_wing = {"my_app": [("a", 0.0)], "wing_my_app": [("c", 0.02)], "my-app": [("d", 1.0)]}
+    calls = []
+
+    class FakeIndex:
+        @staticmethod
+        def load_from_sqlite(*_args):
+            return FakeIndex()
+
+        def is_empty(self):
+            return False
+
+        def query_parallel(self, _vector, n, wing):
+            calls.append(wing)
+            return hits_by_wing.get(wing, [])[:n]
+
+    monkeypatch.setattr(rust_module, "_NativeVectorIndex", FakeIndex)
+    backend = RustExactBackend()
+    try:
+        palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+        col = backend.get_collection(palace=palace, collection_name="test", create=True)
+        col.add(
+            ids=["a", "c", "d"],
+            documents=["a", "c", "d"],
+            metadatas=[{"wing": "my_app"}, {"wing": "wing_my_app"}, {"wing": "my-app"}],
+            embeddings=[[1.0, 0.0], [0.8, 0.2], [0.0, 1.0]],
+        )
+        where = {"wing": {"$in": ["my-app", "my_app", "wing_my_app"]}}
+        result = col.query(query_embeddings=[[1.0, 0.0]], n_results=2, where=where)
+        assert result.ids == [["a", "c"]]
+        assert result.documents == [["a", "c"]]
+        assert calls == ["my-app", "my_app", "wing_my_app"]
+    finally:
+        backend.close()
+
+
+def test_native_query_over_a_wing_set_is_the_top_n_of_the_union(native_backend, monkeypatch):
+    import mempalace.backends.rust_exact as rust_module
+
+    backend, palace = native_backend
+    col = backend.get_collection(palace=palace, collection_name="test", create=True)
+    col.add(
+        ids=["a", "b", "c", "d"],
+        documents=["a", "b", "c", "d"],
+        metadatas=[
+            {"wing": "my_app"},
+            {"wing": "other"},
+            {"wing": "wing_my_app"},
+            {"wing": "my-app"},
+        ],
+        embeddings=[[1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.0, 1.0]],
+    )
+
+    def _no_python_scan(*_args, **_kwargs):
+        raise AssertionError("a wing set left the native index")
+
+    monkeypatch.setattr(rust_module.SQLiteExactCollection, "_query_once", _no_python_scan)
+    where = {"wing": {"$in": ["my_app", "wing_my_app", "my-app"]}}
+    assert col.query(query_embeddings=[[1.0, 0.0]], n_results=2, where=where).ids == [["a", "c"]]
+    assert col.query(query_embeddings=[[1.0, 0.0]], n_results=5, where=where).ids == [
+        ["a", "c", "d"]
+    ]
+
+
 def test_native_external_commit_refresh(native_backend):
     backend, palace = native_backend
     col = backend.get_collection(palace=palace, collection_name="test", create=True)
@@ -166,6 +243,7 @@ def test_native_format_detection_is_sqlite_only(tmp_path, monkeypatch):
 @pytest.mark.parametrize("count", [31, 10001])
 def test_native_matches_python_ranking_and_filters(native_backend, count):
     import numpy as np
+
     from mempalace.backends.sqlite_exact import SQLiteExactBackend
 
     backend, palace = native_backend

@@ -2,6 +2,8 @@
 if __name__ != "mempalace.cli":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.cli")
 
+from typing import Optional
+
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -31,6 +33,11 @@ def cmd_mine(args):
             "redetect_origin",
             False,
         ),
+        "include_subagents": bool(getattr(args, "include_subagents", False)),
+        "related_drawer_id": getattr(args, "related_drawer_id", None),
+        # The daemon names the palace in every job, so it cannot tell on its
+        # own whether --palace was given; the graph path depends on that.
+        "explicit_palace": bool(args.palace),
     }
     if source_adapter:
         payload["source_adapter"] = source_adapter
@@ -49,7 +56,33 @@ def cmd_mine(args):
         )
         return
 
-    from ..palace import MineAlreadyRunning, MineValidationError
+    from ..backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbedderIdentityRecordError,
+        EmbeddingFunctionMismatchError,
+    )
+    from ..embedding import (
+        EmbeddingAPIError,
+        EmbeddingFunctionUnavailableError,
+        UnknownEmbeddingModelError,
+    )
+    from ..media import MediaAssetError, MediaAssetSetupError
+    from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
+
+    model_errors = (
+        UnknownEmbeddingModelError,
+        EmbeddingFunctionUnavailableError,
+        EmbedderIdentityRecordError,
+        EmbedderIdentityMismatchError,
+        DimensionMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
+
+    # Before any mining path (a source adapter such as `--source media`,
+    # --redetect-origin, the miner's banner): a misspelled model stops here
+    # with nothing printed or created.
+    _exit_on_misspelled_embedding_model()
 
     if source_adapter:
         try:
@@ -58,22 +91,37 @@ def cmd_mine(args):
                 source_path=args.dir,
                 palace_path=palace_path,
                 dry_run=args.dry_run,
+                project=payload["wing"],
+                related_drawer_id=payload["related_drawer_id"],
+                explicit_palace=payload["explicit_palace"],
             )
         except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(2)
+        except MediaAssetSetupError as exc:
+            print(f"mempalace: media indexing is unavailable: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except MediaAssetError as exc:
+            print(f"mempalace: media indexing failed: {exc}", file=sys.stderr)
+            sys.exit(2)
         except MineAlreadyRunning as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
             sys.exit(1)
+        except (*model_errors, EmbeddingAPIError) as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
         suffix = " would be written" if args.dry_run else " written"
-        print(f"  Source adapter {source_adapter!r}: {drawers_written} drawer(s){suffix}.")
+        item_name = "media asset(s)" if source_adapter == "media" else "drawer(s)"
+        print(f"  Source adapter {source_adapter!r}: {drawers_written} {item_name}{suffix}.")
         return
 
     # A live HTTP hub for this palace holds the MCP writer lease, so a
     # direct mine here would be refused. Hand the job to the hub instead —
     # this is how the save hooks keep capturing transcripts on a machine
     # that runs `mempalace serve`.
-    if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(args, palace_path):
+    if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(
+        args, palace_path, include_ignored=include_ignored
+    ):
         return
 
     # --redetect-origin re-runs corpus_origin on the current corpus state
@@ -130,6 +178,24 @@ def cmd_mine(args):
         # palace. Surface the holder identity so the operator knows what
         # to wait for (or stop), and exit non-zero so wrappers like
         # nohup / scripts can detect the contention.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except MineFileErrors as exc:
+        # The summary above already counted them; exit non-zero so scripts
+        # and hooks do not treat a partial mine as done.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except model_errors as exc:
+        # A misspelled model, or a model that differs from the one the palace
+        # was built with: nothing was written. Print the fix, as search does,
+        # instead of a traceback.
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except EmbeddingAPIError as exc:
+        # The openai-compat endpoint refused the connection, failed, or sent
+        # something other than embeddings. The miner has already printed its
+        # "Mine aborted" summary (drawers filed so far are kept, and a re-run
+        # resumes); the cause needs one line, not a traceback.
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:
@@ -228,6 +294,9 @@ def mine_source_adapter(
     source_path: str,
     palace_path: str,
     dry_run: bool = False,
+    project: Optional[str] = None,
+    related_drawer_id: Optional[str] = None,
+    explicit_palace: bool = False,
 ) -> int:
     """Run an explicitly selected RFC 002 source adapter through ``PalaceContext``.
 
@@ -235,16 +304,21 @@ def mine_source_adapter(
     miners.  Until those miners are migrated to first-party adapters, no-flag
     and ``--mode`` calls must retain their established dispatch paths.
     """
+    import logging
+
     from ..knowledge_graph import KnowledgeGraph
+    from ..media import MediaAsset, MediaAssetError, MediaAssetSetupError, store_media_asset
     from ..palace import get_collection, mine_palace_lock
     from ..sources import (
         DrawerRecord,
         PalaceContext,
-        SourceRef,
         SourceItemMetadata,
+        SourceRef,
         get_adapter,
         resolve_adapter_for_source,
     )
+
+    logger = logging.getLogger(__name__)
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
     try:
@@ -275,7 +349,7 @@ def mine_source_adapter(
             else:
                 drawer_collection = get_collection(palace_path)
                 knowledge_graph = KnowledgeGraph(
-                    db_path=os.path.join(palace_path, "knowledge_graph.sqlite3")
+                    db_path=paths.knowledge_graph_path(palace_path, explicit=explicit_palace)
                 )
             context = PalaceContext(
                 drawer_collection=drawer_collection,
@@ -286,8 +360,16 @@ def mine_source_adapter(
                 adapter_version=adapter.adapter_version,
             )
             drawers_written = 0
+            media_failures = 0
+            media_seen = 0
+            source_options = {}
+            if source_name == "media":
+                if project:
+                    source_options["project"] = project
+                if related_drawer_id:
+                    source_options["related_drawer_id"] = related_drawer_id
             for result in adapter.ingest(
-                source=SourceRef(local_path=source_path),
+                source=SourceRef(local_path=source_path, options=source_options),
                 palace=context,
             ):
                 if isinstance(result, SourceItemMetadata):
@@ -306,10 +388,41 @@ def mine_source_adapter(
                     drawers_written += 1
                     context.upsert_drawer(result)
                     continue
+                if isinstance(result, MediaAsset):
+                    media_seen += 1
+                    if dry_run:
+                        drawers_written += 1
+                        continue
+                    try:
+                        drawers_written += store_media_asset(
+                            result,
+                            palace_path,
+                            drawer_collection=drawer_collection,
+                        )
+                    except MediaAssetSetupError:
+                        raise
+                    except Exception as exc:
+                        media_failures += 1
+                        logger.warning(
+                            "skipping media asset %s: %s",
+                            result.source_file,
+                            exc,
+                        )
+                    continue
                 raise TypeError(
                     f"source adapter {adapter_name!r} yielded unsupported result type "
                     f"{type(result).__name__}"
                 )
+            if media_failures:
+                logger.warning(
+                    "media indexing finished: %d indexed, %d failed",
+                    drawers_written,
+                    media_failures,
+                )
+                if not dry_run and media_seen == media_failures:
+                    raise MediaAssetError(
+                        f"all {media_failures} discovered media assets failed; none were indexed"
+                    )
             return drawers_written
         finally:
             if knowledge_graph is not None and hasattr(knowledge_graph, "close"):

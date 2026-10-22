@@ -15,7 +15,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     what it worked on, what it noticed, what it thinks matters.
 
     Note: ``agent_name`` is normalized to lowercase before storage so
-    that diary reads are case-insensitive (see #1243). "Claude",
+    that diary reads are case-insensitive. "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
     """
     from ..daemon import LOCK_REFUSAL_ERROR_CLASS
@@ -31,13 +31,14 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     if wing:
         wing = sanitize_name(wing)
     else:
-        wing = f"wing_{agent_name.replace(' ', '_')}"
+        wing = f"wing_{normalize_wing_name(agent_name) or agent_name}"
     room = "diary"
     col = _get_collection(create=True)
     if not col:
         return _collection_error_or_no_palace()
 
     now = datetime.now()
+    filed_at = utc_now_iso()
     entry_id = (
         f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
         f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
@@ -65,7 +66,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "topic": topic,
             "type": "diary_entry",
             "agent": agent_name,
-            "filed_at": now.isoformat(),
+            "filed_at": filed_at,
             "date": now.strftime("%Y-%m-%d"),
         }
         chunk_size = _config.chunk_size
@@ -81,17 +82,16 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 "entry_id": entry_id,
                 "agent": agent_name,
                 "topic": topic,
-                "timestamp": now.isoformat(),
+                "timestamp": filed_at,
                 "chunks": 1,
             }
 
         # Oversized entry: split into bounded per-chunk drawers so the
         # embedding model never sees a document above ``chunk_size``.
         # Every chunk carries ``chunk_index`` for ordered reconstruction
-        # and the group id under BOTH ``parent_entry_id`` (the original
-        # #1539 key, kept so existing readers and palaces are unaffected)
-        # and ``parent_drawer_id`` (the key the logical-id read paths were
-        # built around in #1782) -- see ``_PARENT_ID_KEYS`` (#2185).
+        # and the group id under BOTH ``parent_entry_id`` (the diary key
+        # existing readers and palaces use) and ``parent_drawer_id`` (the
+        # key the logical-id read paths use) -- see ``_PARENT_ID_KEYS``.
         # Note on ``entry_id`` in the return value: for the chunked path
         # the returned ``entry_id`` is the LOGICAL group handle -- no
         # drawer is stored under that exact id, but it resolves through
@@ -129,7 +129,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "entry_id": entry_id,
             "agent": agent_name,
             "topic": topic,
-            "timestamp": now.isoformat(),
+            "timestamp": filed_at,
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
         }
@@ -138,18 +138,68 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         # mirroring tool_mine / tool_sync. The lock wraps ``col.add`` itself, so
         # a peer holding it means no entry was filed -- a refusal, not a write
         # failure -- and the daemon defers such a job rather than dead-lettering
-        # it (#2014). Swallowed into the generic branch the refusal loses
+        # it. Swallowed into the generic branch the refusal loses
         # ``error_class``, becomes indistinguishable from a genuine write error,
         # and the queued diary entry is dropped. The daemon's constant, not a
         # literal: the two sides are a wire contract, and drift on either end
-        # silently un-fixes #2014.
+        # silently drops refused entries again.
         return {
             "success": False,
             "error": f"another mine is in progress: {e}",
             "error_class": LOCK_REFUSAL_ERROR_CLASS,
         }
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _embed_failure(e, success=False)
+
+
+def _diary_read_response(agent_name: str, entries: list, total: int) -> dict:
+    if total == 0:
+        return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
+    return {
+        "agent": agent_name,
+        "entries": entries,
+        "total": total,
+        "showing": len(entries),
+    }
+
+
+def _sqlite_diary_read(agent_name: str, last_n: int, wing: str):
+    """Read the requested diary page without cold-loading Chroma's HNSW index.
+
+    ``None`` preserves the collection path for other backends, unavailable
+    databases, unsupported schemas, and records SQLite cannot safely order.
+    This does not cache content or change diary chunk/total semantics.
+    """
+    if not _is_chroma_backend():
+        return None
+    try:
+        from ..backends.chroma_sqlite import sqlite_diary_rows
+
+        result = sqlite_diary_rows(
+            _config.palace_path,
+            _config.collection_name,
+            agent_name=agent_name,
+            wing=_palace_wing_aliases(wing) if wing else "",
+            limit=last_n,
+        )
+        if result is None:
+            return None
+        total, rows = result
+        entries = []
+        for _drawer_id, doc, meta in rows:
+            meta = _safe_meta(meta)
+            entries.append(
+                {
+                    "date": meta.get("date", ""),
+                    "timestamp": meta.get("filed_at", ""),
+                    "topic": meta.get("topic", ""),
+                    "content": doc,
+                }
+            )
+        return _diary_read_response(agent_name, entries, total)
+    except Exception:
+        logger.debug("sqlite diary read failed; falling back", exc_info=True)
+        return None
 
 
 def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
@@ -159,12 +209,14 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
 
     When ``wing`` is provided, reads only from that wing. When ``wing``
     is empty or omitted, returns entries from every wing this agent has
-    written to. Diary writes from hooks land in project-derived wings
-    (``wing_<project>``), so requiring a specific wing on read would
-    silo those entries from agent-initiated reads.
+    written to. Diary writes from hooks land in the project's wing, so
+    requiring a specific wing on read would silo those entries from
+    agent-initiated reads. A wing matches every spelling its project was
+    filed under (``wing_aliases``), so entries written under an older slug
+    are still read.
 
     Note: ``agent_name`` is normalized to lowercase before filtering so
-    that reads are case-insensitive (see #1243). Entries written under
+    that reads are case-insensitive. Entries written under
     pre-fix mixed-case agent names will not match the lowercase filter;
     use ``mempalace repair`` to migrate legacy data if needed.
     """
@@ -175,16 +227,19 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
+    result = _sqlite_diary_read(agent_name, last_n, wing)
+    if result is not None:
+        return result
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
 
     # Build filter: always scope by agent + room=diary. Wing is optional —
-    # when empty, return entries across all wings for this agent (matches
-    # the #1097 empty-string-as-no-filter convention for LLM ergonomics).
+    # when empty, return entries across all wings for this agent (the
+    # empty-string-as-no-filter convention, for LLM ergonomics).
     conditions = [{"room": "diary"}, {"agent": agent_name}]
     if wing:
-        conditions.insert(0, {"wing": wing})
+        conditions.insert(0, {"wing": {"$in": _palace_wing_aliases(wing)}})
 
     try:
         where = {"$and": conditions}
@@ -221,22 +276,14 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
 
             # Keep memory bounded while scanning: only candidates for the
             # final newest-N result need to survive into the next page.
-            entries.sort(key=lambda x: x["timestamp"], reverse=True)
+            entries.sort(key=lambda x: recency_key(x["timestamp"]), reverse=True)
             del entries[last_n:]
 
             offset += len(batch_ids)
             if len(batch_ids) < _DIARY_READ_PAGE_SIZE:
                 break
 
-        if total == 0:
-            return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
-
-        return {
-            "agent": agent_name,
-            "entries": entries,
-            "total": total,
-            "showing": len(entries),
-        }
+        return _diary_read_response(agent_name, entries, total)
     except Exception:
         logger.exception("diary_read failed")
         return {"error": "Failed to read diary entries"}
@@ -288,7 +335,7 @@ def tool_hook_settings(silent_save: bool = None, desktop_toast: bool = None):
 
 def tool_memories_filed_away():
     """Acknowledge the latest silent checkpoint. Returns a short summary."""
-    state_dir = Path.home() / ".mempalace" / "hook_state"
+    state_dir = paths.state_path("hook_state")
     ack_file = state_dir / "last_checkpoint"
     if not ack_file.is_file():
         return {
@@ -324,7 +371,7 @@ def _attach_stale_library_warning(result: dict) -> dict:
     """Stamp the stale-library write-guard state onto a reconnect result.
 
     Reconnect reopens the database but cannot reload Python modules, so it
-    never clears the stale-library gate (#899). Without this, a reconnect
+    never clears the stale-library gate. Without this, a reconnect
     after an upgrade answers "success: Reconnected to palace" while every
     write keeps failing — the caller has no way to tell the two states
     apart from the reconnect result alone.
@@ -352,6 +399,15 @@ def tool_reconnect():
     or replace ``knowledge_graph.sqlite3`` directly, which can leave the
     in-memory HNSW index stale or pin a closed-on-disk SQLite connection.
     """
+    # Serialize against HTTP embedding windows that temporarily drop the
+    # request lock. HTTP dispatch already holds this lock, taken before the
+    # request lease; the nested enter is a no-op on that thread.
+    with _http_embedding_lifecycle():
+        return _tool_reconnect_locked()
+
+
+def _tool_reconnect_locked():
+    """Reconnect body; caller holds the embedding lifecycle lock."""
     global \
         _client_cache, \
         _collection_cache, \
@@ -410,8 +466,8 @@ def tool_reconnect():
     ChromaBackend._quarantined_paths.discard(_config.palace_path)
     # Force probe re-run on next _get_client by clearing the flag now;
     # _refresh_vector_disabled_flag will re-set it if the divergence
-    # still applies after the reconnect. The probe keeps its own cache
-    # (#1471), so drop that too — otherwise the "re-run" would be served
+    # still applies after the reconnect. The probe keeps its own cache,
+    # so drop that too — otherwise the "re-run" would be served
     # from the verdict this reconnect is meant to discard.
     reset_hnsw_capacity_cache()
     _vector_disabled = False
