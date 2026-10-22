@@ -479,6 +479,25 @@ class TestScanConvos:
         assert "session.jsonl" in names
         assert "bipc8jdx0.txt" not in names
 
+    def test_scan_skips_chunks_dirs(self, tmp_path):
+        session_dir = tmp_path / "session_logs"
+        chunks = session_dir / "chunks" / "transcript"
+        chunks.mkdir(parents=True)
+        (chunks / "00000000.jsonl").write_text('{"type": "USER_INPUT"}', encoding="utf-8")
+        (session_dir / "transcript.jsonl").write_text('{"type": "USER_INPUT"}', encoding="utf-8")
+        files = scan_convos(str(session_dir))
+        names = [f.name for f in files]
+        assert "transcript.jsonl" in names
+        assert "00000000.jsonl" not in names
+
+    def test_scan_skips_duplicate_transcript_full_when_transcript_present(self, tmp_path):
+        (tmp_path / "transcript.jsonl").write_text('{"type": "USER_INPUT"}', encoding="utf-8")
+        (tmp_path / "transcript_full.jsonl").write_text('{"type": "USER_INPUT"}', encoding="utf-8")
+        files = scan_convos(str(tmp_path))
+        names = [f.name for f in files]
+        assert "transcript.jsonl" in names
+        assert "transcript_full.jsonl" not in names
+
     def test_scan_keeps_regular_nested_dirs(self, tmp_path):
         # The tool-results skip must not turn into a blanket nested-dir skip.
         nested = tmp_path / "archive"

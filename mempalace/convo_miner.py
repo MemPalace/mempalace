@@ -174,7 +174,11 @@ CONVO_EXTENSIONS = {
 # 12.8k drawers from tool-results files on one palace; a single file
 # produced 3.6k). Extends the generic SKIP_DIRS set for the convo scanner
 # only — project mining semantics are unchanged.
-CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
+#
+# ``chunks``: Google Antigravity / Gemini IDE pages sliced conversation chunks
+# to ``.system_generated/logs/chunks/**/*.jsonl``. The main session is in
+# ``transcript.jsonl``; mining the chunk slices duplicates the session.
+CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results", "chunks"}
 
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
@@ -538,8 +542,11 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
             for d in dirs
             if d not in CONVO_SKIP_DIRS and (include_subagents or d.lower() != "subagents")
         ]
+        has_transcript = "transcript.jsonl" in filenames
         for filename in filenames:
             if filename.endswith(".meta.json"):
+                continue
+            if filename == "transcript_full.jsonl" and has_transcript:
                 continue
             filepath = Path(root) / filename
             if filepath.suffix.lower() in CONVO_EXTENSIONS:
