@@ -13,7 +13,6 @@ import json
 import os
 from unittest.mock import MagicMock, patch
 
-
 import mempalace.searcher as searcher
 from mempalace.palace import get_collection
 from mempalace.searcher import search_memories
@@ -134,7 +133,7 @@ def _seed_expansion_palace(palace_path, wing_names=("alpha", "beta"), collection
     """Seed a palace where scored wings differ from the best-hit wing."""
     col = get_collection(palace_path, collection_name=collection_name, create=True)
     ids, docs, metas = [], [], []
-    for i, wing in enumerate(wing_names):
+    for _i, wing in enumerate(wing_names):
         for j in range(4):
             ids.append(f"{wing}_{j}")
             docs.append(

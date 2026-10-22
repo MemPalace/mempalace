@@ -33,7 +33,7 @@ import logging
 import re
 
 from .hallways import list_hallways
-from .palace_graph import find_tunnels, build_graph
+from .palace_graph import build_graph, find_tunnels
 
 logger = logging.getLogger("mempalace_mcp")
 
