@@ -1025,6 +1025,15 @@ class TestExtractAuthoredAt:
         f.write_text('{"timestamp": 1}\n{"timestamp": false}\n')
         assert _extract_authored_at(f) is None
 
+    def test_extracts_created_at_from_antigravity_jsonl(self, tmp_path):
+        f = tmp_path / "session.jsonl"
+        f.write_text(
+            '{"type": "USER_INPUT", "created_at": "2026-06-20T10:00:00.000Z"}\n'
+            '{"type": "PLANNER_RESPONSE", "created_at": "2026-06-23T14:30:00.000Z"}\n'
+            '{"type": "USER_INPUT", "created_at": "2026-06-21T09:00:00.000Z"}\n'
+        )
+        assert _extract_authored_at(f) == "2026-06-23T14:30:00.000Z"
+
 
 def test_scan_convos_accepts_one_file_without_scanning_siblings(
     tmp_path,
