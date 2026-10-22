@@ -1,17 +1,17 @@
 """Preserve tunnel spelling context through proposal selection and application."""
 
 import pytest
+from test_tunnels_tool_aliases import halls, row
 
-from mempalace import palace_graph as pg, palace_audit as audit
+from mempalace import palace_audit as audit, palace_graph as pg
 from mempalace.config import MempalaceConfig
 from mempalace.tunnels_tool import (
     apply_proposal,
+    load_proposal,
     propose_tunnels,
     prune_tunnels,
     save_proposal,
-    load_proposal,
 )
-from test_tunnels_tool_aliases import halls, row
 
 
 @pytest.mark.parametrize("reason", ["cap", "filtered_wings"])

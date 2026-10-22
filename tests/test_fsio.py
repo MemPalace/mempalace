@@ -270,3 +270,193 @@ def test_an_fsync_io_error_is_not_swallowed(tmp_path, monkeypatch):
 
     assert dest.read_bytes() == original
     assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+
+
+def test_move_aside_retries_a_rename_a_reader_blocks(tmp_path, monkeypatch):
+    """Windows refuses to rename a file another process has open; the reader
+    lets go, so moving the file aside is retried rather than raised."""
+    path = tmp_path / "registry.json"
+    path.write_bytes(b"{not json")
+    real_replace = os.replace
+    refusals = []
+
+    def held_twice(src, dst):
+        if len(refusals) < 2:
+            refusals.append(dst)
+            raise _SharingViolation(errno.EACCES, "being used by another process")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", held_twice)
+    monkeypatch.setattr(fsio.time, "sleep", lambda s: None)
+
+    kept = fsio.move_aside(path, label="corrupt")
+
+    assert len(refusals) == 2
+    assert not path.exists()
+    assert (tmp_path / os.path.basename(kept)).read_bytes() == b"{not json"
+
+
+def test_atomic_write_bytes_keeps_the_bytes_exactly(tmp_path):
+    dest = tmp_path / "log.jsonl"
+    dest.write_bytes(b"old\n")
+
+    fsio.atomic_write_bytes(dest, b"a\nb\r\nc\n")
+
+    assert dest.read_bytes() == b"a\nb\r\nc\n"
+    assert [p.name for p in tmp_path.iterdir()] == ["log.jsonl"]
+
+
+def _symlink_or_skip(link, target):
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"symlinks unavailable here: {exc}")
+
+
+def test_a_followed_link_writes_its_target(tmp_path):
+    target = tmp_path / "real.txt"
+    target.write_text("old", encoding="utf-8")
+    link = tmp_path / "link.txt"
+    _symlink_or_skip(link, target)
+
+    fsio.atomic_write_text(link, "new")
+
+    assert os.path.islink(link)
+    assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_an_unfollowed_link_is_replaced_and_its_target_left_alone(tmp_path):
+    target = tmp_path / "victim.txt"
+    target.write_text("untouched", encoding="utf-8")
+    link = tmp_path / "corrupt_ids.txt"
+    _symlink_or_skip(link, target)
+
+    fsio.atomic_write_text(link, "drawer_bad\n", follow_symlinks=False)
+
+    assert not os.path.islink(link)
+    assert link.read_text(encoding="utf-8") == "drawer_bad\n"
+    assert target.read_text(encoding="utf-8") == "untouched"
+
+
+def test_an_unfollowed_link_is_not_written_in_place_when_the_rename_fails(tmp_path, monkeypatch):
+    """Writing in place would follow the link, so the refusal is raised."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    link = tmp_path / "corrupt_ids.txt"
+    _symlink_or_skip(link, victim)
+    real_replace = os.replace
+
+    def refused(src, dst, *args, **kwargs):
+        if os.path.basename(str(dst)) == link.name:
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", refused)
+
+    with pytest.raises(PermissionError):
+        fsio.atomic_write_text(link, "drawer_bad\n", follow_symlinks=False)
+
+    assert os.path.islink(link)
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [link.name, victim.name]
+
+
+def test_an_unfollowed_link_is_not_written_in_place_without_a_temp_file(tmp_path, monkeypatch):
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    link = tmp_path / "corrupt_ids.txt"
+    _symlink_or_skip(link, victim)
+
+    def refused(*args, **kwargs):
+        raise PermissionError(errno.EACCES, "Access is denied")
+
+    monkeypatch.setattr(fsio, "open_new_temp_file", refused)
+
+    with pytest.raises(PermissionError):
+        fsio.atomic_write_text(link, "drawer_bad\n", follow_symlinks=False)
+
+    assert victim.read_text(encoding="utf-8") == "untouched"
+
+
+def test_a_file_at_the_old_pid_temp_name_is_left_alone(tmp_path):
+    dest = tmp_path / "state.json"
+    stale = tmp_path / f"state.json.tmp-{os.getpid()}"
+    stale.write_text("someone else's", encoding="utf-8")
+
+    fsio.atomic_write_text(dest, "new")
+
+    assert dest.read_text(encoding="utf-8") == "new"
+    assert stale.read_text(encoding="utf-8") == "someone else's"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [dest.name, stale.name]
+
+
+def test_a_link_at_the_next_temp_name_is_skipped_not_written_through(tmp_path, monkeypatch):
+    """Temporary files are created ``O_EXCL``: a link planted at the name the
+    publisher picks costs one attempt, never a write through it."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    dest = tmp_path / "state.json"
+    names = iter([b"\x00" * 6, b"\x01" * 6])
+    monkeypatch.setattr(os, "urandom", lambda n: next(names))
+    planted = tmp_path / ".state.json.000000000000.tmp"
+    _symlink_or_skip(planted, victim)
+
+    fsio.atomic_write_text(dest, "new")
+
+    assert dest.read_text(encoding="utf-8") == "new"
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert os.path.islink(planted)
+
+
+def test_a_read_racing_a_publish_is_retried_on_windows(tmp_path, monkeypatch):
+    """Opening a file while os.replace renames over it gives EACCES on Windows."""
+    dest = tmp_path / "updates-cache.json"
+    dest.write_bytes(b'{"latest": "3.9.0"}')
+    real_read = fsio.Path.read_bytes
+    failures = []
+
+    def read_bytes(self):
+        if len(failures) < 2:
+            failures.append(self)
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_read(self)
+
+    monkeypatch.setattr(fsio, "_WINDOWS", True)
+    monkeypatch.setattr(fsio, "_REPLACE_BACKOFF", (0, 0, 0))
+    monkeypatch.setattr(fsio.Path, "read_bytes", read_bytes)
+
+    assert fsio.read_published_bytes(dest) == b'{"latest": "3.9.0"}'
+    assert len(failures) == 2
+
+
+def test_a_denied_read_is_not_retried_off_windows(tmp_path, monkeypatch):
+    dest = tmp_path / "state.json"
+    dest.write_bytes(b"{}")
+    calls = []
+
+    def read_bytes(self):
+        calls.append(self)
+        raise PermissionError(errno.EACCES, "Permission denied", str(self))
+
+    monkeypatch.setattr(fsio, "_WINDOWS", False)
+    monkeypatch.setattr(fsio.Path, "read_bytes", read_bytes)
+
+    with pytest.raises(PermissionError):
+        fsio.read_published_bytes(dest)
+    assert len(calls) == 1
+
+
+def test_a_link_planted_at_the_old_pid_temp_name_is_never_followed(tmp_path):
+    """The temporary file used to be ``<name>.tmp-<pid>`` opened without
+    ``O_EXCL``; on Windows, which has no ``O_NOFOLLOW``, a link planted there
+    sent the write to its target and the rename left a link in place."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    dest = tmp_path / "corrupt_ids.txt"
+    _symlink_or_skip(tmp_path / f"corrupt_ids.txt.tmp-{os.getpid()}", victim)
+
+    fsio.atomic_write_text(dest, "drawer_bad\n", follow_symlinks=False)
+
+    assert not os.path.islink(dest)
+    assert dest.read_text(encoding="utf-8") == "drawer_bad\n"
+    assert victim.read_text(encoding="utf-8") == "untouched"

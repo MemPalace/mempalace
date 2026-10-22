@@ -9,19 +9,14 @@ caller's terminal.
 from __future__ import annotations
 
 import contextlib
-import io
 import functools
+import io
 import os
 import sys
 from typing import Any
 
 from .config import MempalaceConfig
-from .tool_capabilities import (  # noqa: F401  (re-exported for callers and tests)
-    MAINTENANCE_TOOLS,
-    READ_TOOLS,
-    WRITE_TOOLS,
-    classify_tool,
-)
+from .tool_capabilities import classify_tool
 
 _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 _PALACE_PATH_ENV = "MEMPALACE_PALACE_PATH"
@@ -224,6 +219,9 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 source_path=source,
                 palace_path=palace_path,
                 dry_run=dry_run,
+                project=wing,
+                related_drawer_id=payload.get("related_drawer_id"),
+                explicit_palace=bool(payload.get("explicit_palace")),
             )
         elif mode == "convos":
             from .convo_miner import mine_convos
@@ -597,7 +595,7 @@ def run_mcp_tool(payload: dict[str, Any]) -> dict[str, Any]:
     if name not in mcp_server.TOOLS:
         return {"success": False, "error": f"unknown MCP tool: {name}", "exit_code": 2}
     refusal, result = mcp_server.call_tool(
-        "daemon-mcp-tool", {"name": name, "arguments": arguments}
+        "daemon-mcp-tool", {"name": name, "arguments": arguments}, internal=True
     )
     if refusal is not None:
         return _daemon_result_from_mcp_refusal(refusal["error"])

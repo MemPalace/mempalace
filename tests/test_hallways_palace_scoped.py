@@ -22,7 +22,7 @@ with patch.dict("sys.modules", {"chromadb": MagicMock()}):
 
 
 # =============================================================================
-# Resolver: MempalaceConfig.hallway_file + _get_hallway_file
+# Resolving the hallway file through MempalaceConfig and _get_hallway_file
 # =============================================================================
 
 
@@ -82,7 +82,7 @@ class TestLegacyHallwayFileDetection:
         monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(configured))
         monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(legacy))
 
-        with caplog.at_level(logging.WARNING, logger="mempalace_hallways"):
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
             result = hallways_mod._load_hallways()
 
         assert result == [], "must not auto-migrate from legacy file"
@@ -97,7 +97,7 @@ class TestLegacyHallwayFileDetection:
         monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(same))
         monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(same))
 
-        with caplog.at_level(logging.WARNING, logger="mempalace_hallways"):
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
             assert hallways_mod._load_hallways() == []
 
         assert "Legacy hallways file" not in caplog.text

@@ -73,7 +73,7 @@ def _parse_args(argv=None):
 # Defaults only. Programs other than this server import this package too (the
 # light server, the daemon, the hook runner, integrations), so parsing a command
 # line is left to the entry points, which apply their flags with
-# _apply_server_flags() before serving (#2528). A reload keeps what they applied,
+# _apply_server_flags() before serving. A reload keeps what they applied,
 # here and in _READ_ONLY and _palace_flag_given below.
 _args = globals().get("_args") or _parse_args([])
 
@@ -116,11 +116,8 @@ _config = MempalaceConfig()
 # below) are hidden from tools/list and refused at dispatch (-32003). That is a
 # wider set than the _MUTATING_TOOLS the peer-writer guard uses. Resolved at
 # startup: from MEMPALACE_MCP_READ_ONLY here, and from --read-only by
-# _apply_server_flags(). Computed inline (not via _truthy_env, defined below) so it
-# is available to the request path regardless of import order.
-_READ_ONLY = globals().get("_READ_ONLY", False) or os.environ.get(
-    "MEMPALACE_MCP_READ_ONLY", ""
-).strip().lower() in {"1", "true", "yes", "on"}
+# _apply_server_flags().
+_READ_ONLY = globals().get("_READ_ONLY", False) or env_bool("MEMPALACE_MCP_READ_ONLY", False)
 
 _kg_by_path: dict[str, KnowledgeGraph] = {}
 _kg_cache_lock = threading.Lock()
@@ -131,10 +128,11 @@ _logstream_cache_lock = threading.Lock()
 # Keep that entire scope single-threaded even when tool_search is invoked
 # outside the HTTP dispatch lock (tests, embedded hosts, future transports).
 _cli_search_capture_lock = threading.Lock()
-# Raised by _apply_server_flags() for --palace; _resolve_kg_path() reads it.
+# Raised by _apply_server_flags() for --palace: a palace named that way keeps
+# its knowledge graph inside itself (see paths.historical_knowledge_graph_path).
 _palace_flag_given: bool = globals().get("_palace_flag_given", False)
 
-# MCP server idle auto-exit (#1552).  Stale MCP servers from ended Claude
+# MCP server idle auto-exit.  Stale MCP servers from ended Claude
 # Code sessions do not self-terminate, accumulating ChromaDB/HNSW file
 # handles on Windows.  When MEMPALACE_MCP_IDLE_HOURS is set (or defaults
 # to 8 h), a background daemon thread exits the process once no request
@@ -143,7 +141,7 @@ _MCP_IDLE_HOURS_ENV = "MEMPALACE_MCP_IDLE_HOURS"
 _MCP_IDLE_HOURS_DEFAULT = 8.0
 _last_request_time: float = time.monotonic()
 
-# MCP startup/open SQLite integrity gate (#1818).
+# MCP startup/open SQLite integrity gate.
 #
 # The peer-writer guard prevents new concurrent writers, but an MCP server can
 # still start against a palace that was already left corrupt by a prior writer
@@ -156,8 +154,8 @@ _sqlite_integrity_check_error = ""
 # ambiguous on its own: quick_check found nothing wrong, or it never ran. Four
 # exits in the refresh leave the list empty and only one of them means the
 # database came back clean. This names the others — the palace with no
-# chroma.sqlite3 (#2290), and the palace whose database is over the startup
-# probe's size limit (#2240) — so the status payload can report an absence
+# chroma.sqlite3, and the palace whose database is over the startup
+# probe's size limit — so the status payload can report an absence
 # rather than a clean bill of health.
 _sqlite_integrity_no_verdict_reason = ""
 # The four fields above as one value, published by each refresh once it has
@@ -187,7 +185,7 @@ _STARTUP_INTEGRITY_MAX_MB_ENV = "MEMPALACE_STARTUP_INTEGRITY_MAX_MB"
 _STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 
 
-# MCP peer-writer guard (#1818).
+# MCP peer-writer guard.
 #
 # The existing per-operation palace lock serializes individual writes, but it
 # cannot make another long-lived Chroma PersistentClient forget stale in-memory
@@ -209,7 +207,7 @@ _DIVERGED_INDEX_ERROR_CODE = -32004
 _READ_ONLY_REFUSED_TOOLS = _tool_capabilities.READ_ONLY_REFUSED_TOOLS
 
 
-# Stale-library write gate (#899).
+# Stale-library write gate.
 #
 # A long-lived MCP server imports mempalace and its storage backend once and
 # then serves from those in-memory modules for the whole life of the process.
@@ -219,15 +217,15 @@ _READ_ONLY_REFUSED_TOOLS = _tool_capabilities.READ_ONLY_REFUSED_TOOLS
 # writes, produced by code the user no longer has installed, and reports
 # success for every one of them.
 #
-# #457 is the same condition with the volume turned up: upgrading mempalace
-# tightened its ChromaDB pin and moved the installed ChromaDB across a
+# The loud variant: an upgrade can tighten mempalace's ChromaDB pin and move
+# the installed ChromaDB across a
 # storage-format boundary (downwards, 1.5.6 to 0.6.3), the running server kept
 # serving the modules it had already loaded, and every tool call then failed
-# with `no such column: collections.schema_str` until the host was restarted. That one
-# announced itself. #899 reports the quiet variant, where the writes succeed in
+# with `no such column: collections.schema_str` until the host was restarted. In the
+# quiet variant the writes succeed in
 # a format the newly-installed library may not read back and nothing surfaces
 # until a fresh process opens the palace. Either way nothing told the running
-# server to stop first; `mempalace migrate` (#502) only recovers such a palace
+# server to stop first; `mempalace migrate` only recovers such a palace
 # after the fact.
 #
 # Watched distributions are the ones whose code writes the palace on this
@@ -308,10 +306,6 @@ _stale_library_cache: dict = {"signature": None, "versions": {}, "errors": {}}
 _stale_library_log_lock = threading.Lock()
 _stale_library_reported_errors: dict = {}
 _stale_library_reported_drift: list = []
-
-
-def _truthy_env(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _discard_mcp_storage_handles() -> None:
@@ -442,7 +436,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
         )
 
         backend_name = resolve_backend_name(_config.palace_path)
-        if _truthy_env(_MCP_ALLOW_PEER_WRITER_ENV):
+        if env_bool(_MCP_ALLOW_PEER_WRITER_ENV, False):
             if not backend_requires_single_writer(backend_name):
                 return True, ""
             logger.warning(
@@ -474,8 +468,8 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     # The flock is held from __enter__ onward. Anything that fails while we
     # finish promotion must release it in this try/finally — otherwise the
     # open lock-file handle pins mine_palace_*.lock until process death
-    # (Windows: "being used by another process"), which is the kg_add leak
-    # shape in #2618 when a tool took the lease and then wedged mid-setup.
+    # (Windows: "being used by another process") when a tool takes the lease
+    # and then wedges mid-setup.
     try:
         _MCP_WRITER_LOCK_CM = lock_cm
         import atexit
@@ -546,24 +540,10 @@ def _startup_integrity_size_limit_bytes() -> int:
     """Byte size above which the startup SQLite quick_check is skipped.
 
     Returns 0 when the gate is disabled (``MEMPALACE_STARTUP_INTEGRITY_MAX_MB``
-    set to 0, a non-positive number, or an unparseable value), meaning the
-    startup probe always runs.
+    set to 0 or a negative number), meaning the startup probe always runs. An
+    unparseable value means the default.
     """
-
-    raw = os.environ.get(_STARTUP_INTEGRITY_MAX_MB_ENV, "").strip()
-    if not raw:
-        mb = _STARTUP_INTEGRITY_MAX_MB_DEFAULT
-    else:
-        try:
-            mb = float(raw)
-        except ValueError:
-            logger.warning(
-                "Invalid %s=%r; using default %.0f MB",
-                _STARTUP_INTEGRITY_MAX_MB_ENV,
-                raw,
-                _STARTUP_INTEGRITY_MAX_MB_DEFAULT,
-            )
-            mb = _STARTUP_INTEGRITY_MAX_MB_DEFAULT
+    mb = env_float(_STARTUP_INTEGRITY_MAX_MB_ENV, _STARTUP_INTEGRITY_MAX_MB_DEFAULT)
     if mb <= 0:
         return 0
     return int(mb * 1024 * 1024)
@@ -601,7 +581,7 @@ def _refresh_sqlite_integrity_status() -> None:
     quick_check backing repair preflight and adds whether a verdict exists at
     all. A failure here is treated as an integrity failure so the server does
     not proceed silently after a malformed FTS5 index or other SQLite-layer
-    corruption (#1818).
+    corruption.
     """
 
     with _sqlite_integrity_refresh_lock:
@@ -765,7 +745,7 @@ def _sqlite_integrity_payload() -> dict:
     # _refresh_sqlite_integrity_status short-circuits for non-chroma backends,
     # so on a non-chroma backend no quick_check runs. Reporting checked/ok true
     # would imply a verification that never happened and reference a
-    # chroma.sqlite3 the active backend does not use (#1931). Recorded errors
+    # chroma.sqlite3 the active backend does not use. Recorded errors
     # only ever come from the chroma path, so surface them regardless of the
     # backend lookup (which may itself fail); only the clean case is
     # reclassified as not-applicable. ``errors`` is the generation captured
@@ -794,9 +774,8 @@ def _sqlite_integrity_payload() -> dict:
             }
 
         # Same rule, and the refresh records a reason for each way of reaching
-        # it: the startup probe skipped above a size limit, where the palace in
-        # #2240 is roughly four times the default, and a chroma palace with no
-        # database to open (#2290). Reporting checked/ok true for either says a
+        # it: the startup probe skipped above a size limit, and a chroma palace
+        # with no database to open. Reporting checked/ok true for either says a
         # build examined the database and found it clean when none ever opened
         # it. A palace whose file is unreachable rather than absent does not
         # arrive here at all: its probe recorded an error, so it falls through
@@ -824,7 +803,7 @@ def _sqlite_integrity_payload() -> dict:
         "ok": not errors,
         # Which SQLite produced this verdict. An "ok" from a build that cannot
         # detect a given FTS5 fault is not the same claim as an "ok" from one
-        # that can, and the two are otherwise indistinguishable here (#2240).
+        # that can, and the two are otherwise indistinguishable here.
         "sqlite_version": sqlite3.sqlite_version,
         "palace": _config.palace_path,
         "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3")
@@ -886,21 +865,31 @@ def _mcp_sqlite_integrity_refusal(req_id, tool_name: str):
 
 
 def _mcp_idle_timeout_secs() -> float:
-    """Return the configured MCP idle timeout in seconds (0 = disabled)."""
-    raw = os.environ.get(_MCP_IDLE_HOURS_ENV, "")
-    if raw:
-        try:
-            hours = float(raw)
-            return max(0.0, hours) * 3600
-        except ValueError:
-            return 0.0
-    return _MCP_IDLE_HOURS_DEFAULT * 3600
+    """Return the configured MCP idle timeout in seconds (0 = disabled).
+
+    An unparseable value disables the timeout rather than meaning the default.
+    """
+    if env_str(_MCP_IDLE_HOURS_ENV) is None:
+        return _MCP_IDLE_HOURS_DEFAULT * 3600
+    return max(0.0, env_float(_MCP_IDLE_HOURS_ENV, 0.0)) * 3600
 
 
 def _resolve_kg_path() -> str:
-    if _palace_flag_given:
-        return os.path.join(_config.palace_path, "knowledge_graph.sqlite3")
-    return DEFAULT_KG_PATH
+    return paths.knowledge_graph_path(_config.palace_path, explicit=_palace_flag_given)
+
+
+def _with_kg_notice(payload):
+    """Add the palace's knowledge-graph notice, if any, to a KG tool response.
+
+    The notice is also logged, once per process.
+    """
+    notice = knowledge_graph_notice(_config.palace_path, explicit=_palace_flag_given)
+    if notice:
+        if first_time("kg-notice", notice):
+            logger.warning(notice)
+        if isinstance(payload, dict):
+            payload["notice"] = notice
+    return payload
 
 
 def _canonicalize_kg_path(path: str) -> str:
@@ -916,7 +905,7 @@ def _canonicalize_kg_path(path: str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
-def _get_kg(canonical_path=None) -> KnowledgeGraph:
+def _get_kg(canonical_path=None, read=False) -> KnowledgeGraph:
     """Return the cached ``KnowledgeGraph`` for the resolved palace.
 
     When ``canonical_path`` is ``None`` (default), the path is resolved
@@ -928,6 +917,9 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     a symlink remap, or a mount remap between the captured value and
     this call drift the insert and evict keys apart, stranding a closed
     handle under one key while the lookup probes another.
+
+    With ``read``, a palace with no graph file gets an empty, uncached
+    in-memory graph: a read never creates the file.
     """
     path = (
         canonical_path if canonical_path is not None else _canonicalize_kg_path(_resolve_kg_path())
@@ -935,6 +927,8 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     kg = _kg_by_path.get(path)
     if kg is not None:
         return kg
+    if read and not os.path.isfile(path):
+        return KnowledgeGraph.empty()
     with _kg_cache_lock:
         kg = _kg_by_path.get(path)
         if kg is None:
@@ -943,7 +937,7 @@ def _get_kg(canonical_path=None) -> KnowledgeGraph:
     return kg
 
 
-def _call_kg(op):
+def _call_kg(op, read=False):
     """Run ``op(kg)`` against the cached KG with one-shot retry on close.
 
     Race we're guarding against: a handler grabs ``kg = _get_kg()`` and is
@@ -970,10 +964,13 @@ def _call_kg(op):
     insert key to the evict key even if FS or env state mutates between
     attempts, preventing a closed handle from leaking under a stale
     key the lookup no longer matches.
+
+    ``read`` ops on a palace with no graph file run against an empty graph
+    (see :func:`_get_kg`).
     """
     path = _canonicalize_kg_path(_resolve_kg_path())
     for attempt in range(2):
-        kg = _get_kg(path)
+        kg = _get_kg(path, read=True) if read else _get_kg(path)
         try:
             return op(kg)
         except sqlite3.ProgrammingError:
@@ -1056,7 +1053,7 @@ def _is_transient_index_error(result) -> bool:
     # Chroma can return "Internal error: Error finding id" during the
     # HNSW flush window after a bulk CLI mine — SQLite rows are
     # committed but the binary segment metadata isn't flushed yet.
-    # Self-heals once the flush completes (~30-60s). See issue #1315.
+    # Self-heals once the flush completes (~30-60s).
     if not isinstance(result, dict):
         return False
     err = result.get("error", "")
@@ -1096,7 +1093,7 @@ def _force_chroma_cache_reset() -> None:
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
     _invalidate_overview_caches()
-    # This runs on the #1315 retry path, which drops caches precisely to
+    # This runs on the transient-index-error retry path, which drops caches to
     # re-observe the palace after a transient index error. The capacity verdict
     # is another cached view of that same palace, so it must be dropped too, or
     # the retry could be answered from the pre-error verdict (its 10 s ceiling
@@ -1124,7 +1121,7 @@ def _force_chroma_cache_reset() -> None:
         logger.debug("Failed to clear Chroma shared system cache during cache reset")
 
 
-# ── Vector-search disabled flag (#1222) ──────────────────────────────────
+# ── Vector-search disabled flag ──────────────────────────────────
 # Set when ``hnsw_capacity_status`` reports a divergence between sqlite
 # and the HNSW segment large enough that chromadb would segfault on
 # segment load. While this is set, vector-shaped tools (``search``,

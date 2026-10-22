@@ -1,7 +1,7 @@
 """Tests for mempalace.rooms — closed room sets: propose (LLM) and apply (embedding decider)."""
 
-import os
 import json
+import os
 from argparse import Namespace
 
 import pytest
@@ -524,9 +524,16 @@ def test_main_dispatches_rooms(monkeypatch):
     )
 
 
-def test_rekey_closets_follows_the_drawers_and_reports_splits():
-    from mempalace.rooms import rekey_closets
+def _rekey_closets(closets, plan):
+    """The closet phase `rooms apply` runs: plan the moves, then move by id."""
+    from mempalace.rooms import closet_targets, plan_closet_moves, rekey_closets_by_ids
 
+    targets, ambiguous = closet_targets(plan)
+    moves = plan_closet_moves(closets, plan.wing, targets)
+    return {"moved": rekey_closets_by_ids(closets, plan.wing, moves), "ambiguous": ambiguous}
+
+
+def test_rekey_closets_follows_the_drawers_and_reports_splits():
     rows = [
         {
             "id": "a",
@@ -565,7 +572,7 @@ def test_rekey_closets_follows_the_drawers_and_reports_splits():
             {"id": "k4", "meta": {"wing": "other", "room": "technical", "source_file": "s1"}},
         ]
     )
-    report = rekey_closets(closets, plan)
+    report = _rekey_closets(closets, plan)
     # s1 split across two rooms, so its closet cannot represent both and stays
     # put; s2 moved wholly, so its closet follows.
     assert closets.rows["k1"]["meta"]["room"] == "technical"
@@ -573,13 +580,10 @@ def test_rekey_closets_follows_the_drawers_and_reports_splits():
     assert closets.rows["k3"]["meta"]["room"] == "decisions"  # other room: untouched
     assert closets.rows["k4"]["meta"]["room"] == "technical"  # other wing: untouched
     assert report == {"moved": 1, "ambiguous": 3}
-    assert rekey_closets(None, plan) == {"moved": 0, "ambiguous": 0}
 
 
 def test_rekey_closets_leaves_a_source_whose_drawers_only_partly_moved():
     """A closet indexes the whole source: moving it would strand the stayers."""
-    from mempalace.rooms import rekey_closets
-
     rows = [
         {
             "id": "a",
@@ -601,7 +605,7 @@ def test_rekey_closets_leaves_a_source_whose_drawers_only_partly_moved():
     closets = FakeCollection(
         [{"id": "k", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
     )
-    assert rekey_closets(closets, plan) == {"moved": 0, "ambiguous": 1}
+    assert _rekey_closets(closets, plan) == {"moved": 0, "ambiguous": 1}
     assert closets.rows["k"]["meta"]["room"] == "technical"
 
 

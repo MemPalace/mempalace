@@ -5,7 +5,6 @@ import subprocess
 import sys
 
 import pytest
-
 from _mcp_server_helpers import (
     _needs_symlinks,
     _posix_only_getcwd_patch,

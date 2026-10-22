@@ -23,17 +23,21 @@ normalizes that away from the caller.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-logger = logging.getLogger("mempalace_llm")
+from ._env import env_bool
+
+logger = logging.getLogger(__name__)
 
 
 # ── External-service heuristic (issue #24 — privacy warning support) ─────
@@ -149,7 +153,15 @@ def resolve_openai_url(endpoint: str, leaf: str) -> str:
 
 
 class LLMError(RuntimeError):
-    """Raised for any provider failure — transport, parse, auth, missing model."""
+    """Raised for any provider failure — transport, parse, auth, missing model.
+
+    ``status`` is the HTTP status when the endpoint answered with an error.
+    The message is masked: an endpoint URL or reply may carry a key.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(redact_secrets(message))
+        self.status = status
 
 
 @dataclass
@@ -234,8 +246,7 @@ class LLMProvider:
 
 
 def external_use_accepted_by_env() -> bool:
-    flag = os.environ.get("MEMPALACE_ACCEPT_EXTERNAL_LLM", "")
-    return flag.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return env_bool("MEMPALACE_ACCEPT_EXTERNAL_LLM", False)
 
 
 def require_external_consent(
@@ -268,27 +279,138 @@ def require_external_consent(
     return False
 
 
-def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
-    """POST JSON and return the parsed response. Raises LLMError on any failure."""
-    req = Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", **headers},
-    )
+def json_request_body(body: dict) -> bytes:
+    """UTF-8 JSON for an LLM API request.
+
+    A stray source byte is held in drawer text as a lone surrogate, which
+    strict APIs reject; it is sent as U+FFFD, the stored text keeps it.
+    """
+    from .config import strip_lone_surrogates
+
+    return strip_lone_surrogates(json.dumps(body, ensure_ascii=False)).encode("utf-8")
+
+
+def post_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
+    """POST JSON to an LLM or embedding endpoint and return the parsed reply.
+
+    Every model request leaves through here. Raises LLMError on any failure;
+    ``status`` carries the HTTP status when the server answered with one.
+    """
     try:
+        req = Request(
+            url,
+            data=json_request_body(body),
+            headers={"Content-Type": "application/json", **headers},
+        )
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except HTTPError as e:
         detail = ""
-        try:
-            detail = e.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            pass
-        raise LLMError(f"HTTP {e.code} from {url}: {detail or e.reason}") from e
-    except (URLError, OSError) as e:
+        if e.code not in (401, 403):  # auth errors often echo the key back
+            try:
+                detail = e.read().decode("utf-8", errors="replace")[:ECHO_LIMIT]
+            except Exception:
+                pass
+        raise LLMError(f"HTTP {e.code} from {url}: {detail or e.reason}", status=e.code) from e
+    except (URLError, OSError, http.client.HTTPException) as e:
         raise LLMError(f"Cannot reach {url}: {e}") from e
     except json.JSONDecodeError as e:
         raise LLMError(f"Malformed response from {url}: {e}") from e
+    except ValueError as e:  # an invalid or missing URL scheme
+        raise LLMError(f"Cannot reach {url}: {e}") from e
+
+
+_SECRETS = (
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}"), "sk-***"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+"), "Bearer ***"),
+    # user:password@ in a URL's authority
+    (re.compile(r"(//)[^/@\s]*@"), r"\1***@"),
+    (
+        re.compile(
+            r"(?i)([?&](?:(?:api[_-]?)?key|(?:access[_-]?)?token|secret|password|auth)=)[^&\s]+"
+        ),
+        r"\1***",
+    ),
+    (re.compile(r"(?i)(api[_-]?key[\"'\s]*[:=]\s*[\"']?)[A-Za-z0-9._\-]{8,}"), r"\1***"),
+)
+
+# How much of an endpoint's own reply an error message repeats.
+ECHO_LIMIT = 500
+
+
+def redact_secrets(text: str) -> str:
+    """Mask API keys an endpoint, URL or echoed reply may carry into a message."""
+    for pattern, replacement in _SECRETS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+_FENCED = re.compile(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```")
+
+
+def _json_candidates(text: str):
+    """The whole reply, then fenced blocks, then each top-level ``{...}``/``[...]``.
+
+    A span inside an earlier span is never offered: when an outer object
+    fails to parse, an object quoted inside it must not stand in for it. A
+    span left open (a reply cut at the token limit) ends the scan.
+    """
+    text = text.strip()
+    if not text:
+        return
+    yield text
+    for match in _FENCED.finditer(text):
+        yield match.group(1).strip()
+    covered = 0
+    for start, opener in ((i, ch) for i, ch in enumerate(text) if ch in "{["):
+        if start < covered:
+            continue
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_string = escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    covered = i + 1
+                    yield text[start:covered]
+                    break
+        else:
+            return
+
+
+def parse_json_reply(text: str, expect=(dict, list)):
+    """The JSON value an LLM reply carries, preferring types in ``expect`` order.
+
+    Models wrap JSON in code fences or prose; candidates are the reply as-is,
+    then fenced blocks, then each top-level object or array. The first
+    candidate of the first type in ``expect`` wins, so a stray ``[1]`` in prose
+    never beats the object after it. Raises ValueError when there is none.
+    """
+    kinds = expect if isinstance(expect, tuple) else (expect,)
+    values = []
+    for candidate in _json_candidates(text or ""):
+        try:
+            values.append(json.loads(candidate))
+        except json.JSONDecodeError:
+            continue
+    for kind in kinds:
+        for value in values:
+            if isinstance(value, kind):
+                return value
+    raise ValueError("LLM response held no JSON object")
 
 
 # ==================== OLLAMA ====================
@@ -318,7 +440,7 @@ class OllamaProvider(LLMProvider):
             with urlopen(f"{self.endpoint}/api/tags", timeout=5) as resp:
                 data = json.loads(resp.read())
         except (URLError, HTTPError, OSError, json.JSONDecodeError) as e:
-            return False, f"Cannot reach Ollama at {self.endpoint}: {e}"
+            return False, redact_secrets(f"Cannot reach Ollama at {self.endpoint}: {e}")
         names = {m.get("name", "") for m in data.get("models", []) or []}
         # Ollama tags may or may not include ':latest' — accept either form
         wanted = {self.model, f"{self.model}:latest"}
@@ -357,7 +479,7 @@ class OllamaProvider(LLMProvider):
             # only when the caller explicitly opts in/out so the wire format
             # stays minimal for the common case.
             body["think"] = think
-        data = _http_post_json(f"{self.endpoint}/api/chat", body, headers={}, timeout=self.timeout)
+        data = post_json(f"{self.endpoint}/api/chat", body, headers={}, timeout=self.timeout)
         text = (data.get("message") or {}).get("content", "")
         if not text:
             raise LLMError(f"Empty response from Ollama (model={self.model})")
@@ -436,10 +558,10 @@ class OpenAICompatProvider(LLMProvider):
         try:
             models = self.served_models()
         except (URLError, HTTPError, OSError, ValueError) as e:
-            return False, f"Cannot reach {self.endpoint}: {e}"
+            return False, redact_secrets(f"Cannot reach {self.endpoint}: {e}")
         if self.model == "auto":
             if not models:
-                return False, f"{self.endpoint} lists no models to pick from"
+                return False, redact_secrets(f"{self.endpoint} lists no models to pick from")
             self.model = models[0]
         elif models and self.model not in models:
             # A gateway may list only part of what it routes, or spell a model
@@ -449,7 +571,7 @@ class OpenAICompatProvider(LLMProvider):
                 "model %r is not in the list served at %s (%s); continuing. "
                 "Use --llm-model auto to follow the server.",
                 self.model,
-                self.endpoint,
+                redact_secrets(self.endpoint),
                 ", ".join(models[:8]),
             )
         return True, "ok"
@@ -489,12 +611,12 @@ class OpenAICompatProvider(LLMProvider):
             headers["Authorization"] = f"Bearer {self.api_key}"
         url = self._resolve_url()
         try:
-            data = _http_post_json(url, body, headers=headers, timeout=self.timeout)
+            data = post_json(url, body, headers=headers, timeout=self.timeout)
         except LLMError as e:
             if "reasoning_effort" not in body or "HTTP 400" not in str(e):
                 raise
             body.pop("reasoning_effort")
-            data = _http_post_json(url, body, headers=headers, timeout=self.timeout)
+            data = post_json(url, body, headers=headers, timeout=self.timeout)
         try:
             choice = data["choices"][0]
             text = choice["message"]["content"]
@@ -574,7 +696,7 @@ class AnthropicProvider(LLMProvider):
             "X-API-Key": self.api_key,
             "anthropic-version": self.API_VERSION,
         }
-        data = _http_post_json(
+        data = post_json(
             f"{self.endpoint}/v1/messages", body, headers=headers, timeout=self.timeout
         )
         try:

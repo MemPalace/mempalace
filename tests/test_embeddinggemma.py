@@ -24,7 +24,6 @@ import mempalace.embedding as embedding  # noqa: E402  (after importorskip)
 @pytest.fixture(autouse=True)
 def isolate_embedding_state(monkeypatch):
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
-    monkeypatch.setattr(embedding, "_WARNED", set())
 
 
 def _make_fake_session(out_dim=768):

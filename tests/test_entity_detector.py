@@ -9,13 +9,12 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-from hypothesis import given
-from hypothesis import strategies as st
+from hypothesis import given, strategies as st
 
 from mempalace.entity_detector import (
+    _MAX_CANDIDATE_TOKEN_LEN,
     PROSE_EXTENSIONS,
     STOPWORDS,
-    _MAX_CANDIDATE_TOKEN_LEN,
     _collapse_long_ascii_runs,
     _print_entity_list,
     classify_entity,
@@ -25,7 +24,6 @@ from mempalace.entity_detector import (
     scan_for_detection,
     score_entity,
 )
-
 
 # ── extract_candidates ──────────────────────────────────────────────────
 
@@ -142,6 +140,7 @@ def test_coca_wordlist_file_loads_with_expected_shape():
     """The data file ships with a stable schema."""
     import json
     from pathlib import Path
+
     import mempalace
 
     pkg_dir = Path(mempalace.__file__).parent
@@ -164,6 +163,7 @@ def test_coca_wordlist_contains_all_known_aya_false_positives():
     false positive from Aya's real palace, lowercased."""
     import json
     from pathlib import Path
+
     import mempalace
 
     pkg_dir = Path(mempalace.__file__).parent
@@ -261,6 +261,7 @@ def test_known_systems_file_loads_with_expected_shape():
     """The data file ships with a stable schema."""
     import json
     from pathlib import Path
+
     import mempalace
 
     pkg_dir = Path(mempalace.__file__).parent
@@ -287,6 +288,7 @@ def test_known_systems_file_contains_expected_high_value_entries():
     users mention in real palaces."""
     import json
     from pathlib import Path
+
     import mempalace
 
     pkg_dir = Path(mempalace.__file__).parent
@@ -682,6 +684,16 @@ def test_scan_for_detection_fallback_to_all_readable(tmp_path):
     assert ".py" in extensions or ".js" in extensions
 
 
+def test_scan_for_detection_never_samples_mempalace_project_files(tmp_path):
+    """The rooms and entities a previous ``mempalace init`` wrote are not
+    source prose; sampling them made a second init detect different names."""
+    (tmp_path / "notes.md").write_text("Alice met Bob.")
+    for name in ("mempalace.yaml", "mempalace.yml", "mempal.yaml", "entities.json"):
+        (tmp_path / name).write_text("people: [Carol]")
+    names = {f.name for f in scan_for_detection(str(tmp_path))}
+    assert names == {"notes.md"}
+
+
 def test_scan_for_detection_max_files(tmp_path):
     """Caps to max_files."""
     for i in range(20):
@@ -705,8 +717,7 @@ def _temp_locale(locale_code: str, entity_section: dict):
     on the next run (the fixture lacks the required terms/cli/aaak sections).
     Recover with `rm mempalace/i18n/zz-test-*.json`.
     """
-    from mempalace import i18n
-    from mempalace import entity_detector
+    from mempalace import entity_detector, i18n
 
     locale_path = Path(i18n.__file__).parent / f"{locale_code}.json"
     if locale_path.exists():
@@ -1143,7 +1154,7 @@ def test_entity_extraction_no_redos_on_adversarial_ascii_run():
     except subprocess.TimeoutExpired:
         raise AssertionError(
             "entity extraction hung on an adversarial ASCII run — ReDoS regression (#2063)"
-        )
+        ) from None
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
 

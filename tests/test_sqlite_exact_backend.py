@@ -7,7 +7,6 @@ import sys
 import threading
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite, make_minimal_sqlite_exact_sqlite
 
 import mempalace.backends.sqlite_exact as sqlite_exact_module
@@ -930,7 +929,7 @@ def test_search_union_uses_sqlite_exact_lexical_search(tmp_path, monkeypatch):
 def test_search_closets_use_lexical_not_vector_on_sqlite_exact(tmp_path, monkeypatch):
     import mempalace.backends.embedding_wrapper as embedding_wrapper
     from mempalace.backends.sqlite_exact import SQLiteExactCollection
-    from mempalace.palace import get_collection, get_closets_collection
+    from mempalace.palace import get_closets_collection, get_collection
     from mempalace.searcher import search_memories
 
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "sqlite_exact")
@@ -1376,6 +1375,7 @@ def test_sqlite_exact_equality_where_uses_locus_column(tmp_path):
 
 def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     import numpy as np
+
     from mempalace.backends.sqlite_exact import (
         _LOCUS_FIELDS,
         _LOCUS_INDEX,
@@ -1497,8 +1497,8 @@ def test_top_k_preserves_stable_cutoff_ties(tmp_path, k):
 def test_search_open_works_while_other_process_holds_writer_lease(
     tmp_path, monkeypatch, backend_name
 ):
-    from mempalace.searcher import _open_search_collection
     from mempalace.palace import _open_collection_or_explain
+    from mempalace.searcher import _open_search_collection
 
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", backend_name)
     backend, col = _collection(tmp_path)
@@ -1576,8 +1576,9 @@ b.close()
 def test_legacy_schema_search_is_read_only(tmp_path, monkeypatch, backend_name, dimension_column):
     import json
     import struct
-    from mempalace.searcher import _open_search_collection
+
     from mempalace.palace import get_backend
+    from mempalace.searcher import _open_search_collection
 
     db_path = tmp_path / "sqlite_exact.sqlite3"
     with sqlite3.connect(db_path) as conn:
@@ -1633,9 +1634,9 @@ with mine_palace_lock(sys.argv[1]):
 
 @pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
 def test_hybrid_search_keeps_closet_boost_under_writer_lease(tmp_path, monkeypatch, backend_name):
+    import mempalace.backends.embedding_wrapper as embedding_wrapper
     from mempalace.backends import get_backend
     from mempalace.searcher import search_memories
-    import mempalace.backends.embedding_wrapper as embedding_wrapper
 
     backend, drawers = _collection(tmp_path)
     closets = backend.get_collection(str(tmp_path), "mempalace_closets", create=True)
@@ -1999,3 +2000,202 @@ def test_sqlite_exact_legacy_fts_rowid_migration(tmp_path):
         assert [h.id for h in col2.lexical_search(query="modernized", n_results=5).hits] == ["a"]
     finally:
         backend2.close()
+
+
+def test_sqlite_exact_pushes_eq_and_in_filters(tmp_path):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["nul", "surrogate", "plain", "bare"],
+        documents=["nul", "surrogate", "plain", "bare"],
+        metadatas=[{"wing": "a\x00b"}, {"wing": "x\udcffy"}, {"wing": "plain"}, {}],
+        embeddings=[[1.0, 0.0]] * 4,
+    )
+    result, selects = _doc_select_sql(
+        col, lambda: col.get(where={"wing": {"$in": ["a\x00b", "x\udcffy"]}})
+    )
+    assert result.ids == ["nul", "surrogate"]
+    assert selects and "wing IN (" in selects[0]
+    result, selects = _doc_select_sql(col, lambda: col.get(where={"wing": {"$eq": "x\udcffy"}}))
+    assert result.ids == ["surrogate"]
+    assert selects and "wing = " in selects[0]
+    assert col.get(where={"wing": {"$in": []}}).ids == []
+    # ``None`` also matches a missing key, which only the Python path knows.
+    assert col.get(where={"wing": {"$in": ["plain", None]}}).ids == ["plain", "bare"]
+
+
+def _brute_force_recent(col, where, limit):
+    from mempalace.timeutil import recency_key
+
+    everything = col.get(where=where, include=["metadatas"])
+    pairs = list(zip(everything.ids, everything.metadatas))
+    dated = sorted((p for p in pairs if p[1].get("filed_at")), key=lambda p: p[0])
+    dated.sort(key=lambda p: recency_key(p[1]["filed_at"]), reverse=True)
+    undated = [p for p in pairs if not p[1].get("filed_at")]  # storage order
+    return [drawer_id for drawer_id, _ in (dated + undated)[:limit]]
+
+
+def _mixed_form_palace(col, zone, n=240):
+    """Drawers in two spellings of one wing plus another wing, filed over a
+    few days as naive local time in ``zone``, UTC ``+00:00`` and UTC ``Z``,
+    inserted in shuffled order; a few carry no ``filed_at``."""
+    import random
+    from datetime import datetime, timedelta, timezone
+
+    rng = random.Random(2851)
+    base = datetime(2026, 10, 2, 12, tzinfo=timezone.utc)
+    ids, metas = [], []
+    for i in range(n):
+        instant = base - timedelta(minutes=rng.randrange(4 * 24 * 60))
+        form = i % 3
+        if form == 0:
+            stamp = instant.astimezone(zone).replace(tzinfo=None).isoformat()
+        elif form == 1:
+            stamp = instant.isoformat(timespec="microseconds")
+        else:
+            stamp = instant.strftime("%Y-%m-%dT%H:%M:%SZ")
+        meta = {"wing": ("proj_a", "wing_proj_a", "other")[i % 5 % 3], "filed_at": stamp}
+        if i % 37 == 0:
+            del meta["filed_at"]
+        ids.append(f"d{i:03d}")
+        metas.append(meta)
+    order = list(range(n))
+    rng.shuffle(order)
+    col.add(
+        ids=[ids[i] for i in order],
+        documents=[f"drawer {ids[i]}" for i in order],
+        metadatas=[metas[i] for i in order],
+        embeddings=[[1.0, 0.0]] * n,
+    )
+
+
+@pytest.mark.parametrize("hours", [9, -11], ids=["utc+9", "utc-11"])
+def test_sqlite_exact_wing_alias_recency_is_exact(monkeypatch, tmp_path, hours):
+    from datetime import timedelta, timezone
+
+    from mempalace import timeutil
+    from mempalace.backends.base import BaseCollection
+    from mempalace.layers import fetch_recent_window
+
+    zone = timezone(timedelta(hours=hours))
+    monkeypatch.setattr(timeutil, "_LOCAL_TZ", zone)
+    backend, col = _collection(tmp_path)
+    try:
+        _mixed_form_palace(col, zone)
+
+        def approximate(*args, **kwargs):
+            raise AssertionError("fell back to the windowed base get_recent")
+
+        monkeypatch.setattr(BaseCollection, "get_recent", approximate)
+        aliases = {"wing": {"$in": ["proj_a", "wing_proj_a"]}}
+        for where in (None, aliases, {"wing": "other"}):
+            for limit in (1, 25, 150, 400):
+                expected = _brute_force_recent(col, where, limit)
+                assert col.get_recent(limit=limit, where=where).ids == expected
+        _docs, metas = fetch_recent_window(col, wing="proj_a", max_scan=25, budget=None)
+        expected = _brute_force_recent(col, aliases, 25)
+        assert metas == col.get(ids=expected, include=["metadatas"]).metadatas
+    finally:
+        backend.close_palace(str(tmp_path))
+
+
+class _RecordingCursor:
+    def __init__(self, cur, log):
+        self._cur, self._log = cur, log
+
+    def execute(self, sql, params=()):
+        self._log.append((sql, tuple(params)))
+        return self._cur.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+def _recency_plans(col, where):
+    """Query plans of the ordering reads ``get_recent`` runs for ``where``."""
+    import contextlib
+
+    log = []
+    original = col._cursor
+
+    @contextlib.contextmanager
+    def recording(**kwargs):
+        with original(**kwargs) as cur:
+            yield _RecordingCursor(cur, log)
+
+    col._cursor = recording
+    try:
+        col.get_recent(limit=10, where=where)
+    finally:
+        del col._cursor
+    reads = [(sql, p) for sql, p in log if "ORDER BY" in sql and "FROM documents" in sql]
+    assert reads
+    conn = col._handle.conn
+    return [
+        " ".join(str(row[-1]) for row in conn.execute("EXPLAIN QUERY PLAN " + sql, p))
+        for sql, p in reads
+    ]
+
+
+def test_sqlite_exact_recency_reads_use_filed_at_indexes(tmp_path):
+    from datetime import timezone
+
+    from mempalace.backends.sqlite_exact import _FILED_AT_INDEX, _WING_FILED_AT_INDEX
+
+    backend, col = _collection(tmp_path)
+    try:
+        _mixed_form_palace(col, timezone.utc)
+        for plan in _recency_plans(col, None):
+            assert f"INDEX {_FILED_AT_INDEX}" in plan, plan
+        aliases = {"wing": {"$in": ["proj_a", "wing_proj_a"]}}
+        room_scoped = {"$and": [aliases, {"room": "notes"}]}
+        for plan in _recency_plans(col, aliases) + _recency_plans(col, room_scoped):
+            assert f"INDEX {_WING_FILED_AT_INDEX}" in plan, plan
+    finally:
+        backend.close_palace(str(tmp_path))
+
+
+def test_sqlite_exact_recency_indexes_are_additive_and_skipped_read_only(tmp_path):
+    from datetime import timezone
+
+    from mempalace.backends.sqlite_exact import _FILED_AT_INDEX, _WING_FILED_AT_INDEX
+
+    recency = {_FILED_AT_INDEX, _WING_FILED_AT_INDEX}
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    backend, col = _collection(tmp_path)
+    _mixed_form_palace(col, timezone.utc)
+    aliases = {"wing": {"$in": ["proj_a", "wing_proj_a"]}}
+    expected = {
+        key: _brute_force_recent(col, w, 25) for key, w in (("all", None), ("wing", aliases))
+    }
+    backend.close_palace(palace)
+
+    # A palace from before the indexes existed.
+    conn = sqlite3.connect(str(tmp_path / "sqlite_exact.sqlite3"))
+    for name in recency:
+        conn.execute(f"DROP INDEX {name}")
+    conn.commit()
+    conn.close()
+
+    def indexes(col):
+        rows = col._handle.conn.execute("PRAGMA index_list(documents)").fetchall()
+        return {row[1] for row in rows}
+
+    reader_backend = SQLiteExactBackend()
+    reader = reader_backend.get_collection(
+        palace=palace, collection_name="mempalace_drawers", options={"read_only": True}
+    )
+    try:
+        assert not recency & indexes(reader)
+        assert reader.get_recent(limit=25).ids == expected["all"]
+        assert reader.get_recent(limit=25, where=aliases).ids == expected["wing"]
+    finally:
+        reader_backend.close_palace(palace)
+
+    for _ in range(2):  # idempotent across reopenings
+        backend, col = _collection(tmp_path, create=False)
+        try:
+            assert recency <= indexes(col)
+            assert col.count() == 240
+            assert col.get_recent(limit=25, where=aliases).ids == expected["wing"]
+        finally:
+            backend.close_palace(palace)

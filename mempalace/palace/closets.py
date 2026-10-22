@@ -89,7 +89,7 @@ def _candidate_entity_words(text: str) -> list:
             except re.error:
                 continue
         _CANDIDATE_RX_CACHE = rxs
-    # Defuse ReDoS on long ASCII blobs before matching (#2063); see
+    # Defuse ReDoS on long ASCII blobs before matching; see
     # entity_detector._collapse_long_ascii_runs.
     stripped = _collapse_long_ascii_runs(text)
     words = []
@@ -238,6 +238,154 @@ def purge_file_closets(closets_col, source_file: str) -> None:
         closets_col.delete(where={"source_file": source_file})
     except Exception:
         logger.debug("Closet purge failed for %s", source_file, exc_info=True)
+
+
+def open_aaak_collection(palace_path: str):
+    """The AAAK collection, or None when ``compress`` never created it."""
+    try:
+        return get_aaak_collection(palace_path, create=False)
+    except (CollectionNotInitializedError, PalaceNotFoundError):
+        return None
+
+
+def purge_source_closets(palace_path: str, source_file: str, *, commit: bool = True) -> int:
+    """Count, and with ``commit`` delete, the closets of ``source_file``.
+
+    Closets are keyed by source, not by drawer, so they go whenever a drawer
+    of that source does. Never raises: the drawer change has already committed.
+    """
+    try:
+        closets_col = get_closets_collection(palace_path, create=False)
+    except Exception as exc:
+        logger.warning("Closet purge skipped (collection unavailable): %s", exc)
+        return 0
+    if closets_col is None:
+        return 0
+    try:
+        ids = closets_col.get(where={"source_file": source_file}, include=[]).get("ids") or []
+        if commit and ids:
+            closets_col.delete(where={"source_file": source_file})
+        return len(ids)
+    except Exception as exc:
+        logger.warning("Closet purge failed for %s: %s", source_file, exc)
+        return 0
+
+
+def drawers_removed(
+    palace_path,
+    *,
+    aaak_ids=(),
+    aaak_source=None,
+    closet_sources=(),
+    revision_ids=None,
+    revision_source=None,
+    aaak_col=None,
+    reraise=(),
+) -> dict:
+    """Purge what was derived from drawers just deleted or rewritten.
+
+    Call it after the drawer change commits. AAAK summaries go by drawer id
+    (``aaak_ids``) or for a whole file (``aaak_source``), closets per source in
+    ``closet_sources``, and saved revisions by ``revision_ids`` or
+    ``revision_source`` when either is given. A failure is logged and reported,
+    never raised, so it cannot undo the drawer change; only errors in
+    ``reraise`` propagate. Returns ``closets_deleted`` when closets were asked
+    for, and ``revisions_deleted`` (None plus ``revisions_error`` on failure)
+    when revisions were.
+    """
+    result = {}
+    if closet_sources:
+        result["closets_deleted"] = sum(
+            purge_source_closets(palace_path, source) for source in dict.fromkeys(closet_sources)
+        )
+    if aaak_ids or aaak_source:
+        try:
+            if aaak_col is None and palace_path:
+                aaak_col = open_aaak_collection(palace_path)
+            if aaak_col is not None:
+                _delete_aaak_rows(aaak_col, aaak_ids, aaak_source)
+        except reraise:
+            raise
+        except Exception:
+            logger.warning("AAAK purge failed for %s", aaak_source or "drawers", exc_info=True)
+    if revision_ids is None and revision_source is None:
+        return result
+    if not revision_ids and revision_source is None:
+        return {**result, "revisions_deleted": 0}
+    from ..revisions import purge_drawer_revisions
+
+    try:
+        result["revisions_deleted"] = purge_drawer_revisions(
+            palace_path, drawer_ids=revision_ids or (), source_file=revision_source
+        )
+    except Exception as exc:
+        logger.exception("Revision purge failed after a drawer delete")
+        result["revisions_deleted"] = None
+        result["revisions_error"] = f"revision purge failed: {type(exc).__name__}"
+    return result
+
+
+def _delete_aaak_rows(aaak_col, drawer_ids, source_file, batch_size: int = 500) -> None:
+    # A summary quotes its drawer, so it goes by the drawer's id or its whole file.
+    ids = set()
+    drawer_ids = list(dict.fromkeys(drawer_ids))
+    for start in range(0, len(drawer_ids), batch_size):
+        ids.update(aaak_col.get(ids=drawer_ids[start : start + batch_size], include=[])["ids"])
+    if source_file:
+        ids.update(aaak_col.get(where={"source_file": source_file}, include=[])["ids"])
+    ordered = sorted(ids)
+    for start in range(0, len(ordered), batch_size):
+        aaak_col.delete(ids=ordered[start : start + batch_size])
+
+
+def is_aaak_row(metadata) -> bool:
+    """Whether a row is an AAAK summary rather than a closet pointer.
+
+    ``mempalace compress`` used to write its summaries into the closets
+    collection. Those rows carry ``compression_ratio``, which no closet writer
+    sets; rows in the AAAK collection carry ``kind="aaak"``.
+    """
+    meta = metadata or {}
+    return meta.get("kind") == "aaak" or "compression_ratio" in meta
+
+
+def move_aaak_out_of_closets(palace_path: str, batch_size: int = 500) -> int:
+    """Move AAAK summaries left in the closets collection to the AAAK collection.
+
+    Every row is stored in the AAAK collection before any is deleted from the
+    closets, so an interrupted move leaves a copy in both and the next call
+    finishes it. Returns the number of rows moved.
+    """
+    try:
+        closets_col = get_closets_collection(palace_path, create=False)
+    except CollectionNotInitializedError:
+        return 0
+    found = []
+    offset = 0
+    while True:
+        page = closets_col.get(include=["documents", "metadatas"], limit=batch_size, offset=offset)
+        ids = page.get("ids") or []
+        if not ids:
+            break
+        for row_id, doc, meta in zip(ids, page.get("documents") or [], page.get("metadatas") or []):
+            if is_aaak_row(meta):
+                found.append((row_id, doc, {**(meta or {}), "kind": "aaak"}))
+        offset += len(ids)
+        if len(ids) < batch_size:
+            break
+    if not found:
+        return 0
+    aaak_col = get_aaak_collection(palace_path, create=True)
+    for start in range(0, len(found), batch_size):
+        batch = found[start : start + batch_size]
+        aaak_col.upsert(
+            ids=[row[0] for row in batch],
+            documents=[row[1] for row in batch],
+            metadatas=[row[2] for row in batch],
+        )
+    for start in range(0, len(found), batch_size):
+        closets_col.delete(ids=[row[0] for row in found[start : start + batch_size]])
+    return len(found)
 
 
 def upsert_closet_lines(closets_col, closet_id_base, lines, metadata):

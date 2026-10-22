@@ -11,16 +11,16 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import sys
 import threading
 import time
-import sys
 
 import pytest
 
 import mempalace.palace as palace_mod
 from mempalace.palace import (
-    _write_lock_holder,
     MineAlreadyRunning,
+    _write_lock_holder,
     mine_global_lock,
     mine_lock,
     mine_palace_lock,

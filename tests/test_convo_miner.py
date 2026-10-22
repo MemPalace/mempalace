@@ -1,20 +1,20 @@
 import json
 import os
-import tempfile
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
 import chromadb
 import pytest
 
+from mempalace import palace
 from mempalace.convo_miner import (
     _is_ai_tool_path,
     _register_file,
     _resolve_wing,
     mine_convos,
 )
-from mempalace import palace
 from mempalace.palace import (
     CONVO_CHUNKER_VERSION,
     GENERAL_EXTRACTOR_VERSION,
@@ -640,40 +640,41 @@ def test_mine_convos_grown_file_purges_stale_drawers_not_additive(capsys):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_mine_convos_skips_same_content_under_new_filename(capsys):
-    """Re-exporting the same conversation from Claude/ChatGPT under a new
-    filename (fresh export bundle, regenerated slug, etc.) must not create
-    a duplicate set of drawers -- only the exact-new content should file."""
+def _drawer_sources(palace_path, marker):
+    """source_file of every real (non-sentinel) drawer whose text holds marker."""
+    col = chromadb.PersistentClient(path=palace_path).get_collection("mempalace_drawers")
+    rows = col.get(include=["documents", "metadatas"])
+    return sorted(
+        Path(m["source_file"]).name
+        for d, m in zip(rows["documents"], rows["metadatas"])
+        if marker in d and m.get("ingest_mode") != "registry"
+    )
+
+
+def test_mine_convos_files_the_same_conversation_under_each_filename():
+    """The same conversation exported twice under two filenames is filed under
+    both (D-09): dropping the second copy hid it from anything scoped to that
+    source. Re-mining files nothing new."""
     tmpdir = tempfile.mkdtemp()
     try:
         transcript = (
             "> What is the plan?\nStart with the schema, then the API.\n\n"
             "> Any risks?\nMigration ordering is the main one.\n"
         )
-        (Path(tmpdir) / "export_2026-01-01.txt").write_text(transcript)
+        convo_dir = Path(tmpdir) / "convos"
+        convo_dir.mkdir()
+        (convo_dir / "export_2026-01-01.txt").write_text(transcript)
+        (convo_dir / "export_2026-02-01.txt").write_text(transcript)
         palace_path = os.path.join(tmpdir, "palace")
-        mine_convos(tmpdir, palace_path, wing="test")
+        mine_convos(str(convo_dir), palace_path, wing="test")
 
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
-        count_after_first = col.count()
-        assert count_after_first >= 2
+        sources = _drawer_sources(palace_path, "Migration ordering is the main one")
+        assert sources == ["export_2026-01-01.txt", "export_2026-02-01.txt"]
 
-        # Simulate a later export: the same conversation lands under a new
-        # filename, alongside one genuinely new conversation.
-        (Path(tmpdir) / "export_2026-02-01.txt").write_text(transcript)
-        (Path(tmpdir) / "export_2026-02-01_new.txt").write_text(
-            "> What's next?\nUNIQUE_SECOND_EXPORT_MARKER covers the new work.\n"
-        )
-        mine_convos(tmpdir, palace_path, wing="test")
-        out = capsys.readouterr().out
-        assert "duplicate of export_2026-01-01.txt" in out
-
-        col = client.get_collection("mempalace_drawers")
-        docs = col.get(include=["documents"])["documents"]
-        dup_hits = sum(1 for d in docs if "Migration ordering is the main one" in d)
-        assert dup_hits == 1, f"duplicate transcript re-filed: {dup_hits} copies"
-        assert any("UNIQUE_SECOND_EXPORT_MARKER" in d for d in docs)
+        col = chromadb.PersistentClient(path=palace_path).get_collection("mempalace_drawers")
+        count = col.count()
+        mine_convos(str(convo_dir), palace_path, wing="test")
+        assert col.count() == count
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -694,56 +695,61 @@ def _privacy_export_bundle(conversations):
     ]
 
 
-def test_mine_convos_skips_same_conversation_within_re_exported_bundle(capsys):
-    """A Claude.ai privacy export bundles every conversation into one JSON
-    file. Re-exporting that bundle under a new filename with one additional
-    conversation must not re-file the conversations that didn't change --
-    hashing the whole bundle would change the file-level hash the moment
-    any conversation is added, hiding the ones that are still duplicates.
-    """
+def test_re_exported_bundle_files_every_conversation_under_its_own_source():
+    """A re-exported privacy bundle keeps all of its conversations, including
+    the ones an earlier export already filed, under the new file's name."""
     tmpdir = tempfile.mkdtemp()
     try:
         convo_a = ["What is the plan?", "CONVO_A_MARKER: start with the schema."]
         convo_b = ["Any risks?", "CONVO_B_MARKER: migration ordering is the main one."]
         convo_c = ["What's next?", "CONVO_C_MARKER: covers the new work."]
-
-        bundle1 = _privacy_export_bundle([convo_a, convo_b])
-        (Path(tmpdir) / "export_2026-01-01.json").write_text(json.dumps(bundle1))
-
+        old, new = "export_2026-01-01.json", "export_2026-02-01.json"
+        (Path(tmpdir) / old).write_text(json.dumps(_privacy_export_bundle([convo_a, convo_b])))
         palace_path = os.path.join(tmpdir, "palace")
         mine_convos(tmpdir, palace_path, wing="test")
 
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
-        docs_after_first = col.get(include=["documents"])["documents"]
-        assert any("CONVO_A_MARKER" in d for d in docs_after_first)
-        assert any("CONVO_B_MARKER" in d for d in docs_after_first)
-
-        # Re-export: same two conversations plus one genuinely new one, all
-        # under a fresh filename (as a real re-export from Claude would do).
         bundle2 = _privacy_export_bundle([convo_a, convo_b, convo_c])
-        (Path(tmpdir) / "export_2026-02-01.json").write_text(json.dumps(bundle2))
-
+        (Path(tmpdir) / new).write_text(json.dumps(bundle2))
         mine_convos(tmpdir, palace_path, wing="test")
 
-        col = client.get_collection("mempalace_drawers")
-        docs = col.get(include=["documents"])["documents"]
-        a_hits = sum(1 for d in docs if "CONVO_A_MARKER" in d)
-        b_hits = sum(1 for d in docs if "CONVO_B_MARKER" in d)
-        c_hits = sum(1 for d in docs if "CONVO_C_MARKER" in d)
-        assert a_hits == 1, f"conversation A re-filed from the updated bundle: {a_hits} copies"
-        assert b_hits == 1, f"conversation B re-filed from the updated bundle: {b_hits} copies"
-        assert c_hits >= 1, "new conversation C was not filed at all"
+        assert _drawer_sources(palace_path, "CONVO_A_MARKER") == [old, new]
+        assert _drawer_sources(palace_path, "CONVO_B_MARKER") == [old, new]
+        assert _drawer_sources(palace_path, "CONVO_C_MARKER") == [new]
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_content_dedup_is_scoped_per_wing():
-    """Mining the same transcript content into a second wing must file real
-    drawers there, not just the registry sentinel -- the content-hash map
-    is a dedup signal within a wing, not a cross-wing "already have this
-    content anywhere" gate.
-    """
+def test_a_copy_registered_as_a_duplicate_by_an_older_palace_is_mined():
+    """Older palaces registered a copy of an already-filed conversation as a
+    bare sentinel. A sentinel from an older NORMALIZE_VERSION reads as not
+    mined, so the copy gets its own drawers on the next mine."""
+    from mempalace.convo_miner import _register_file
+    from mempalace.palace import NORMALIZE_VERSION, get_collection
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        transcript = "> What is the plan?\nCOPY_MARKER start with the schema.\n"
+        first, copy = Path(tmpdir) / "first.txt", Path(tmpdir) / "copy.txt"
+        first.write_text(transcript)
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        copy.write_text(transcript)
+        col = get_collection(palace_path)
+        _register_file(col, str(copy.resolve()), "test", "mempalace", "exchange")
+        sentinel = col.get(where={"source_file": str(copy.resolve())}, include=["metadatas"])
+        meta = dict(sentinel["metadatas"][0], normalize_version=NORMALIZE_VERSION - 1)
+        col.update(ids=sentinel["ids"], metadatas=[meta])
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        assert _drawer_sources(palace_path, "COPY_MARKER") == ["copy.txt", "first.txt"]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_same_content_mined_into_a_second_wing_files_real_drawers():
+    """Mining the same transcript content into a second wing files real
+    drawers there, not just the registry sentinel."""
     tmpdir = tempfile.mkdtemp()
     try:
         transcript = (
@@ -769,9 +775,7 @@ def test_content_dedup_is_scoped_per_wing():
             for d, m in zip(wing_b_docs["documents"], wing_b_docs["metadatas"])
             if m.get("room") != "_registry"
         ]
-        assert real_drawers, (
-            "wing_b holds only the registry sentinel -- content dedup leaked across wings"
-        )
+        assert real_drawers, "wing_b holds only the registry sentinel"
         assert any("Migration ordering is the main one" in d for d in real_drawers)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1072,9 +1076,7 @@ def test_prefetch_mined_set_scoped_with_no_candidates_returns_empty_without_erro
 
 def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
     """The convo miner must actually pass the candidate file list through to
-    prefetch_mined_set, not just leave the new parameter unused. It must
-    NOT pass source_files to prefetch_content_hashes (the cross-path
-    dedup test coverage), which stays a full unconditional scan."""
+    prefetch_mined_set, not just leave the new parameter unused."""
     import mempalace.convo_miner as convo_miner_module
 
     tmpdir = tempfile.mkdtemp()
@@ -1088,7 +1090,6 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
 
         seen = {}
         real_prefetch_mined_set = convo_miner_module.prefetch_mined_set
-        real_prefetch_content_hashes = convo_miner_module.prefetch_content_hashes
 
         def _spy_mined_set(collection, extract_mode=None, source_files=None):
             seen["mined_set_source_files"] = source_files
@@ -1096,18 +1097,12 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
                 collection, extract_mode=extract_mode, source_files=source_files
             )
 
-        def _spy_content_hashes(collection, extract_mode=None):
-            seen["content_hashes_called"] = True
-            return real_prefetch_content_hashes(collection, extract_mode=extract_mode)
-
         monkeypatch.setattr(convo_miner_module, "prefetch_mined_set", _spy_mined_set)
-        monkeypatch.setattr(convo_miner_module, "prefetch_content_hashes", _spy_content_hashes)
 
         mine_convos(tmpdir, palace_path, wing="test")
 
         resolved = str(convo_path.resolve())
         assert seen["mined_set_source_files"] == [resolved]
-        assert seen["content_hashes_called"] is True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 

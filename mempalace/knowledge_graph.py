@@ -36,20 +36,161 @@ Usage:
 """
 
 import json
-import os
 import re
 import sqlite3
 import threading
 import unicodedata
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 from typing import Optional
+
+from . import paths
 from .config import sanitize_iso_temporal
 from .ids import make_triple_id
+from .timeutil import utc_now_iso, utc_now_z
 
-
-DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+DEFAULT_KG_PATH = paths.legacy_knowledge_graph_path()
 _MIN_ENTITY_CANDIDATE_LEN = 3
+
+
+def knowledge_graph_notice(
+    palace_path: str, legacy: Optional[str] = None, explicit: bool = False
+) -> Optional[str]:
+    """Say so when a graph that belongs to ``palace_path`` holds facts it does not read.
+
+    That happens when the palace's own graph and the one it used before both
+    hold facts: the palace reads its own, and this names the other file and the
+    explicit command that copies its facts in. Graphs are never merged
+    automatically.
+    """
+    used = paths.knowledge_graph_path(palace_path, legacy=legacy, explicit=explicit)
+    other = paths.historical_knowledge_graph_path(palace_path, legacy=legacy, explicit=explicit)
+    if other is None or paths.same_path(other, used) or not paths.knowledge_graph_has_rows(other):
+        return None
+    return (
+        f"The knowledge graph at {other} holds facts this palace does not read; it reads "
+        f"{used}. Graphs are never merged automatically; review and copy them in with "
+        f"`mempalace kg import-legacy --from {other}`."
+    )
+
+
+def open_graph(path: str, read: bool = False) -> "KnowledgeGraph":
+    """The graph at ``path``; for a read, an empty in-memory one when there is no file.
+
+    A read never creates the graph file: an empty file would then be taken
+    for the palace's graph.
+    """
+    if read and not Path(path).is_file():
+        return KnowledgeGraph.empty()
+    return KnowledgeGraph(db_path=path)
+
+
+def _read_only(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def import_graph_rows(source_path: str, target_path: str, apply: bool = False) -> dict:
+    """Copy one graph file's entities and triples into another, keeping what is there.
+
+    The source is only read. An entity the target already has (same id) is left
+    as it is; so is a fact it already records with the same subject, predicate,
+    object and validity window, whenever it was recorded. A current fact whose
+    subject and predicate already hold a different current object in the target
+    is not copied but listed under ``conflicts``, so the two never both read as
+    current. A reused fact id with different content or validity is kept in
+    the target and listed under ``id_conflicts``. With ``apply`` false the
+    import runs against an in-memory snapshot: no stored facts change and a
+    missing target is not created. The counts say what would be copied.
+    """
+    if paths.same_path(source_path, target_path):
+        raise ValueError("the source and the target are the same knowledge graph")
+    source = _read_only(source_path)
+    target = None
+    kg = None
+
+    def found(sql, args):
+        return target.execute(sql, args).fetchone() is not None
+
+    counts = {}
+    try:
+        if apply:
+            kg = KnowledgeGraph(db_path=target_path)
+        else:
+            kg = KnowledgeGraph.empty()
+            if Path(target_path).is_file():
+                existing = _read_only(target_path)
+                try:
+                    existing.backup(kg._conn())
+                finally:
+                    existing.close()
+                # Applying opens KnowledgeGraph and migrates legacy schemas.
+                # Preview those same changes only in the in-memory copy.
+                kg._init_db()
+        target = kg._conn()
+        for table, columns in KnowledgeGraph._REPLICATION_TABLES.items():
+            available = {r["name"] for r in source.execute(f"PRAGMA table_info({table})")}
+            cols = [c for c in columns if c in available]
+            numbers = {"added": 0, "present": 0}
+            if table == "triples":
+                numbers["conflicts"] = []
+                numbers["id_conflicts"] = []
+            counts[table] = numbers
+            if "id" not in cols:
+                continue
+            insert = (
+                f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+            )
+            for row in source.execute(f"SELECT {', '.join(cols)} FROM {table}"):
+                if table == "triples":
+                    fact = (row["subject"], row["predicate"], row["object"])
+                    window = (row["valid_from"], row["valid_to"])
+                    if found(
+                        "SELECT 1 FROM triples WHERE subject = ? AND predicate = ? "
+                        "AND object = ? AND valid_from IS ? AND valid_to IS ?",
+                        fact + window,
+                    ):
+                        numbers["present"] += 1
+                        continue
+                    if found("SELECT 1 FROM triples WHERE id = ?", (row["id"],)):
+                        numbers["id_conflicts"].append(row["id"])
+                        continue
+                    clash = (
+                        target.execute(
+                            "SELECT object FROM triples WHERE subject = ? AND predicate = ? "
+                            "AND object != ? AND valid_to IS NULL",
+                            fact,
+                        ).fetchone()
+                        if row["valid_to"] is None
+                        else None
+                    )
+                    if clash is not None:
+                        numbers["conflicts"].append(
+                            {
+                                "subject": row["subject"],
+                                "predicate": row["predicate"],
+                                "object": row["object"],
+                                "current_object": clash[0],
+                            }
+                        )
+                        continue
+                elif found(f"SELECT 1 FROM {table} WHERE id = ?", (row["id"],)):
+                    numbers["present"] += 1
+                    continue
+                inserted = target.execute(insert, tuple(row)).rowcount
+                if inserted != 1:
+                    raise sqlite3.IntegrityError(
+                        f"knowledge graph import did not insert {table} row {row['id']!r}"
+                    )
+                numbers["added"] += inserted
+        if apply:
+            target.commit()
+    finally:
+        source.close()
+        if kg is not None:
+            kg.close()
+    return counts
 
 
 def _escape_like(value: str) -> str:
@@ -185,6 +326,16 @@ class KnowledgeGraph:
         self._connection = None
         self._lock = threading.Lock()
         self._init_db()
+
+    @classmethod
+    def empty(cls) -> "KnowledgeGraph":
+        """An in-memory graph with no facts, for reading a palace that has none yet."""
+        kg = cls.__new__(cls)
+        kg.db_path = ":memory:"
+        kg._connection = None
+        kg._lock = threading.Lock()
+        kg._init_db()
+        return kg
 
     def _init_db(self):
         conn = self._conn()
@@ -378,9 +529,7 @@ class KnowledgeGraph:
                 if existing:
                     return existing["id"]  # Already exists and still valid
 
-                triple_id = make_triple_id(
-                    sub_id, pred, obj_id, valid_from, datetime.now().isoformat()
-                )
+                triple_id = make_triple_id(sub_id, pred, obj_id, valid_from, utc_now_iso())
                 conn.execute(
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
@@ -471,7 +620,7 @@ class KnowledgeGraph:
         successor is still opened, so ``supersede`` degrades to ``add_triple``.
         """
         if at is None:
-            boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            boundary = utc_now_z()
         elif _is_date_only_temporal(at):
             boundary = f"{at}T00:00:00Z"
         else:
@@ -529,9 +678,7 @@ class KnowledgeGraph:
                 if existing:
                     return existing["id"]
 
-                triple_id = make_triple_id(
-                    sub_id, pred, new_id, boundary, datetime.now().isoformat()
-                )
+                triple_id = make_triple_id(sub_id, pred, new_id, boundary, utc_now_iso())
                 conn.execute(
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
@@ -583,7 +730,7 @@ class KnowledgeGraph:
         ``source_file`` here is only a fallback for an original carrying none.
         """
         if at is None:
-            boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            boundary = utc_now_z()
         elif _is_date_only_temporal(at):
             boundary = f"{at}T00:00:00Z"
         else:
@@ -639,7 +786,7 @@ class KnowledgeGraph:
                 ).fetchone()
                 if existing:
                     return existing["id"]
-                new_id = make_triple_id(sub_id, pred, obj_id, boundary, datetime.now().isoformat())
+                new_id = make_triple_id(sub_id, pred, obj_id, boundary, utc_now_iso())
                 conn.execute(
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,

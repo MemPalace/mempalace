@@ -4,7 +4,7 @@ if __name__ != "mempalace.cli":
 
 
 def cmd_sync(args):
-    """Prune drawers whose source files are gitignored, deleted, or moved (#1252)."""
+    """Prune drawers whose source files are gitignored, deleted, or moved."""
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
     routing = _resolve_cli_write_routing_or_exit(
@@ -28,11 +28,10 @@ def cmd_sync(args):
             auto_start=routing.decision.auto_start_daemon,
         )
         return
-    from ..palace import MineAlreadyRunning
-    from ..wal import _wal_log
     from ..backends import detect_backend_for_path
-    from ..palace import _backend_artifact_label, resolve_backend_name
+    from ..palace import MineAlreadyRunning, _backend_artifact_label, resolve_backend_name
     from ..sync import sync_palace
+    from ..wal import _wal_log
 
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")
@@ -148,7 +147,7 @@ def _submit_daemon_cli_job(
             backend=backend,
             wait=not background,
             auto_start=auto_start,
-            # A job refused the palace lock is deferred, not failed (#2014), so
+            # A job refused the palace lock is deferred, not failed, so
             # it never becomes terminal while the holder lives. Waiting it out
             # would strand this terminal behind a peer that can outlive the
             # default hour; report the parked job instead. A job that is really

@@ -1,6 +1,6 @@
 """Extra spellcheck tests covering _load_known_names and speller edge cases."""
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 from mempalace.spellcheck import (
     _load_known_names,

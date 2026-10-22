@@ -1,10 +1,11 @@
 """Metadata-aware vectors must reflect the metadata the backend retains."""
 
 import pytest
+from test_embedding_wrapper import _FakeInner, _use_metadata_aware_embedder
+
 from mempalace import embedding
 from mempalace.backends import embedding_wrapper as ew
 from mempalace.backends.chroma import ChromaCollection
-from test_embedding_wrapper import _FakeInner, _use_metadata_aware_embedder
 
 
 @pytest.mark.parametrize("metadata", [None, [{"room": "new"}]])

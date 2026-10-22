@@ -1,7 +1,7 @@
 """Lock-safe SQLite header probes for the file-backed backends.
 
 ``detect()`` on the file-backed backends verifies the SQLite header before
-claiming a palace directory (#1893). It runs on essentially every MCP tool
+claiming a palace directory. It runs on essentially every MCP tool
 call (``resolve_backend_name`` -> ``detect_backends_for_path``) and used to do
 a plain ``open()`` on the very database file the backend already holds a
 long-lived WAL connection to. ``SQLiteExactBackend._database_signature``
@@ -18,7 +18,7 @@ clean ``close()`` from checkpointing and unlinking the ``-wal`` / ``-shm``
 sidecars underneath it. After one plain open+close the server was
 lock-naked: any external ``sqlite3.connect()`` + ``close()`` orphaned the
 sidecars while the server kept writing (successfully, as far as it could
-tell) into the unlinked inodes. See #2302 for the same kernel mechanism.
+tell) into the unlinked inodes.
 
 The fix is the one SQLite documents: every read of the database file goes
 through SQLite itself. A throwaway ``mode=ro&immutable=1`` connection takes
@@ -43,7 +43,7 @@ so the cheap checks around the probe are lock-safe everywhere.
 file is known to be a SQLite database it stays one until it is replaced
 (new inode). Negative results are never cached, because a 0-byte file left
 behind by a bare ``sqlite3.connect()`` becomes a real database as soon as the
-header is written (#1893).
+header is written.
 """
 
 from __future__ import annotations
@@ -102,7 +102,7 @@ def read_header_fields(db_path: str, *, extra: Optional[tuple] = None) -> Option
     st = os.stat(db_path)
     if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
         # A 0-byte file is a valid *empty* database to SQLite, but for palace
-        # detection it is the bare-connect artifact of #1893, not a palace.
+        # detection it is a bare-connect artifact, not a palace.
         return None
     uri = sqlite_read_uri(db_path) + "&immutable=1"
     try:

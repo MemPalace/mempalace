@@ -142,7 +142,7 @@ class TestDiaryTools:
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
         del _client
-        from mempalace.mcp_server import tool_diary_write, tool_diary_read
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
 
         w = tool_diary_write(
             agent_name="TestAgent",

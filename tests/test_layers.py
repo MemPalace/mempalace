@@ -3,8 +3,17 @@
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from mempalace.backends.base import BaseCollection, GetResult
+from mempalace.config import wing_aliases
 from mempalace.layers import Layer0, Layer1, Layer2, Layer3, MemoryStack
+
+
+@pytest.fixture(autouse=True)
+def _no_reader_left_in_flight(monkeypatch):
+    """A reader abandoned by one test must not make the next fetch fail fast."""
+    monkeypatch.setattr("mempalace.layers._inflight_reader", None)
 
 
 # ── Layer0 — with identity file ─────────────────────────────────────────
@@ -157,7 +166,7 @@ def test_layer1_with_wing_filter():
     assert "ESSENTIAL STORY" in result
     # Verify wing filter was passed
     call_kwargs = mock_col.get.call_args_list[0][1]
-    assert call_kwargs.get("where") == {"wing": "project_x"}
+    assert call_kwargs.get("where") == {"wing": {"$in": wing_aliases("project_x")}}
 
 
 def test_layer1_truncates_long_snippets():
@@ -236,11 +245,14 @@ def test_layer1_breaks_importance_ties_by_filed_at_recency():
     assert result.index("middle memory") < result.index("oldest memory")
 
 
-def test_layer1_batch_exception_breaks():
-    """If col.get raises on a batch, loop breaks gracefully."""
+def test_layer1_scan_cut_short_reports_the_read_error(monkeypatch):
+    """A page that keeps failing is reported, not passed off as the whole window."""
+    monkeypatch.setattr("mempalace.layers._READ_RETRY_DELAY", 0)
     mock_col = _mock_legacy_collection()
     mock_col.get.side_effect = [
-        {"documents": ["doc1"], "metadatas": [{"room": "r"}]},
+        {"documents": ["doc1"] * 500, "metadatas": [{"room": "r"}] * 500},
+        RuntimeError("batch error"),
+        RuntimeError("batch error"),
         RuntimeError("batch error"),
     ]
     with (
@@ -248,10 +260,58 @@ def test_layer1_batch_exception_breaks():
         patch("mempalace.layers._get_collection", return_value=mock_col),
     ):
         mock_cfg.return_value.palace_path = "/fake"
-        layer = Layer1(palace_path="/fake")
-        result = layer.generate()
+        result = Layer1(palace_path="/fake").generate()
 
-    assert "ESSENTIAL STORY" in result
+    assert "could not be read right now (RuntimeError)" in result
+    assert "ESSENTIAL STORY" not in result
+
+
+def test_layer1_unreadable_palace_is_not_reported_empty(monkeypatch):
+    """A palace a writer is holding is not 'No memories yet'."""
+    import sqlite3
+
+    monkeypatch.setattr("mempalace.layers._READ_RETRY_DELAY", 0)
+    mock_col = MagicMock()
+    mock_col.get_recent.side_effect = sqlite3.OperationalError("database is locked")
+    mock_col.get.side_effect = sqlite3.OperationalError("database is locked")
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        result = Layer1(palace_path="/fake").generate()
+
+    assert "No memories" not in result
+    assert "could not be read right now (OperationalError)" in result
+    assert mock_col.get_recent.call_count == 3
+    # The same palace error is reported, not re-run as a scan.
+    mock_col.get.assert_not_called()
+
+
+def test_layer1_retries_a_read_the_palace_was_not_ready_for(monkeypatch):
+    """A read that fails once while the palace is busy succeeds on the retry."""
+    import sqlite3
+
+    monkeypatch.setattr("mempalace.layers._READ_RETRY_DELAY", 0)
+    mock_col = MagicMock()
+    mock_col.get_recent.side_effect = [
+        sqlite3.OperationalError("database is locked"),
+        GetResult(
+            ids=["a"],
+            documents=["The memory filed while the reader waited."],
+            metadatas=[{"room": "r"}],
+        ),
+    ]
+    mock_col.get.side_effect = sqlite3.OperationalError("database is locked")
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        result = Layer1(palace_path="/fake").generate()
+
+    assert "The memory filed while the reader waited." in result
+    mock_col.get.assert_not_called()
 
 
 # ── Layer1 — recency fetch (capable backend vs scan fallback) ───────────
@@ -315,7 +375,7 @@ def test_layer1_recency_capability_receives_wing_filter():
         mock_cfg.return_value.palace_path = "/fake"
         Layer1(palace_path="/fake", wing="my_project").generate()
 
-    assert captured["where"] == {"wing": "my_project"}
+    assert captured["where"] == {"wing": {"$in": wing_aliases("my_project")}}
 
 
 def test_layer1_falls_back_to_scan_when_capability_missing():
@@ -339,10 +399,183 @@ def test_layer1_falls_back_to_scan_when_capability_missing():
     assert mock_col.get.called
 
 
-def test_layer1_falls_back_to_scan_when_capability_raises():
-    """A backend error inside get_recent degrades to the scan, not to an empty L1."""
+def _release_stuck_reader(release):
+    import mempalace.layers as layers_mod
+
+    release.set()
+    reader = layers_mod._inflight_reader
+    if reader is not None:
+        reader.join(5)
+
+
+def test_layer1_read_that_blocks_past_the_budget_is_cut_off():
+    """A read stuck in SQLite's busy timeout does not hold wake-up past its budget."""
+    import threading
+    import time as _time
+
+    release = threading.Event()
+    mock_col = MagicMock()
+
+    def blocked(**kwargs):
+        release.wait(5)
+        raise AssertionError("the abandoned read's result must not be used")
+
+    mock_col.get_recent.side_effect = blocked
+    try:
+        with (
+            patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+            patch("mempalace.layers._get_collection", return_value=mock_col),
+        ):
+            mock_cfg.return_value.palace_path = "/fake"
+            started = _time.monotonic()
+            result = Layer1(palace_path="/fake").generate()
+            elapsed = _time.monotonic() - started
+    finally:
+        _release_stuck_reader(release)
+
+    assert "could not be read right now (TimeoutError)" in result
+    # The read blocks for 5 s; the bound only needs to prove the 300 ms budget cut it off.
+    assert elapsed < 1.5
+    mock_col.get.assert_not_called()
+
+
+def test_stuck_reads_leave_one_reader_thread_and_later_fetches_fail_fast():
+    """While an abandoned read is still running, new fetches do not start another."""
+    import threading
+    import time as _time
+
+    from mempalace.layers import fetch_recent_window
+
+    release = threading.Event()
+    calls = []
+
+    def stuck(**kwargs):
+        calls.append(1)
+        release.wait(5)
+        return GetResult(ids=[], documents=[], metadatas=[])
+
+    col = MagicMock()
+    col.get_recent.side_effect = stuck
+    try:
+        with pytest.raises(TimeoutError):
+            fetch_recent_window(col)
+        timings = []
+        for _ in range(20):
+            started = _time.monotonic()
+            with pytest.raises(TimeoutError, match="still running"):
+                fetch_recent_window(col)
+            timings.append(_time.monotonic() - started)
+        readers = [t for t in threading.enumerate() if t.name == "mempalace-recent-read"]
+    finally:
+        _release_stuck_reader(release)
+
+    assert len(calls) == 1
+    assert len(readers) == 1
+    assert max(timings) < 0.05
+
+    col.get_recent.side_effect = None
+    col.get_recent.return_value = GetResult(
+        ids=["a"], documents=["Readable again."], metadatas=[{"room": "r"}]
+    )
+    assert fetch_recent_window(col)[0] == ["Readable again."]
+
+
+def test_layer1_palace_that_does_not_exist_yet_has_no_memories():
+    """A missing palace or collection is not a read failure (develop's wording)."""
+    from mempalace.backends.base import CollectionNotInitializedError, PalaceNotFoundError
+
+    for exc in (PalaceNotFoundError("no palace"), CollectionNotInitializedError("no table")):
+        mock_col = MagicMock()
+        mock_col.get_recent.side_effect = exc
+        with (
+            patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+            patch("mempalace.layers._get_collection", return_value=mock_col),
+        ):
+            mock_cfg.return_value.palace_path = "/fake"
+            result = Layer1(palace_path="/fake").generate()
+
+        assert result == "## L1 — No memories yet."
+        assert mock_col.get_recent.call_count == 1  # not retried
+        mock_col.get.assert_not_called()
+
+
+def test_layer1_scan_of_a_palace_that_does_not_exist_yet_has_no_memories():
+    from mempalace.backends.base import CollectionNotInitializedError
+
+    mock_col = _mock_legacy_collection()
+    mock_col.get.side_effect = CollectionNotInitializedError("no table")
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        result = Layer1(palace_path="/fake").generate()
+
+    assert result == "## L1 — No memories yet."
+
+
+def test_wake_up_fails_when_mempalace_cannot_run(tmp_path):
+    """A broken install (missing dependency) still exits wake-up with an error,
+    so hooks inject nothing, instead of a 'could not be read' wake-up.
+
+    The ImportError surfaces while opening the palace, on the caller's thread
+    and outside the read budget, so the outcome does not depend on timing: the
+    open here is slower than the whole budget before it fails.
+    """
+    import time as _time
+
+    def slow_broken_open(*args, **kwargs):
+        _time.sleep(0.5)  # longer than the 300 ms read budget
+        raise ModuleNotFoundError("No module named 'chromadb'")
+
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", side_effect=slow_broken_open),
+    ):
+        mock_cfg.return_value.palace_path = str(tmp_path / "palace")
+        stack = MemoryStack(
+            palace_path=str(tmp_path / "palace"), identity_path=str(tmp_path / "id")
+        )
+        with pytest.raises(ModuleNotFoundError):
+            stack.wake_up()
+        with pytest.raises(ModuleNotFoundError):
+            Layer1(palace_path="/fake").generate()
+
+
+def test_wake_up_keeps_identity_when_l1_fails(tmp_path):
+    """L0 is returned even if generating L1 blows up."""
+    identity = tmp_path / "identity.txt"
+    identity.write_text("I am Atlas.", encoding="utf-8")
+    stack = MemoryStack(palace_path=str(tmp_path / "palace"), identity_path=str(identity))
+    with patch.object(stack.l1, "generate", side_effect=RuntimeError("boom")):
+        text = stack.wake_up()
+
+    assert "I am Atlas." in text
+    assert "could not be read right now (RuntimeError)" in text
+
+
+def test_layer1_reports_a_get_recent_backend_error(monkeypatch):
+    """A backend error inside get_recent is reported, not re-run as a scan."""
+    monkeypatch.setattr("mempalace.layers._READ_RETRY_DELAY", 0)
     mock_col = MagicMock()
     mock_col.get_recent.side_effect = RuntimeError("server said no")
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        result = Layer1(palace_path="/fake").generate()
+
+    assert "could not be read right now (RuntimeError)" in result
+    mock_col.get.assert_not_called()
+
+
+def test_layer1_falls_back_to_scan_when_capability_unsupported():
+    """A backend that has get_recent but cannot serve it wakes up via the scan."""
+    from mempalace.backends.base import UnsupportedCapabilityError
+
+    mock_col = MagicMock()
+    mock_col.get_recent.side_effect = UnsupportedCapabilityError("no recency order")
     mock_col.get.side_effect = [
         {
             "documents": ["Scanned memory recovered after the backend errored."],
@@ -649,7 +882,7 @@ def test_layer3_search_with_wing_filter():
         layer.search("q", wing="proj")
 
     call_kwargs = mock_col.query.call_args[1]
-    assert call_kwargs["where"] == {"wing": "proj"}
+    assert call_kwargs["where"] == {"wing": {"$in": wing_aliases("proj")}}
 
 
 def test_layer3_search_with_room_filter():

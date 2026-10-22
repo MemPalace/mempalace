@@ -9,7 +9,6 @@ import mempalace.embedding as embedding
 @pytest.fixture(autouse=True)
 def isolate_embedding_state(monkeypatch):
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
-    monkeypatch.setattr(embedding, "_WARNED", set())
 
 
 def test_embeddinggemma2_factory_is_lazy_cached_and_identity_tracks_settings(monkeypatch):
@@ -763,8 +762,8 @@ def test_embedding_collection_upsert_accepts_numpy_backed_vectors(tmp_path, monk
     Asserting on float types alone would not catch a future ChromaDB tightening
     its accepted shapes, so drive an actual upsert + read-back.
     """
-    from mempalace.backends.chroma import ChromaBackend
     from mempalace.backends.base import PalaceRef
+    from mempalace.backends.chroma import ChromaBackend
     from mempalace.backends.embedding_wrapper import EmbeddingCollection
 
     monkeypatch.setattr(

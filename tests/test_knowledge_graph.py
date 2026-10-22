@@ -6,9 +6,10 @@ timeline, stats, and edge cases (duplicate triples, ID collisions).
 """
 
 import json
+import sqlite3
 
 import pytest
-import sqlite3
+
 from mempalace.knowledge_graph import KnowledgeGraph
 
 

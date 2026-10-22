@@ -41,15 +41,17 @@ added to pyproject — uses stdlib urllib.
 import contextlib
 import json
 import os
-import re
 import time
 import urllib.parse
-import urllib.request
-import urllib.error
-from datetime import datetime
 from typing import Optional
 
-from .llm_client import endpoint_is_local, external_use_accepted_by_env
+from . import paths
+from .llm_client import (
+    endpoint_is_local,
+    external_use_accepted_by_env,
+    parse_json_reply,
+    post_json,
+)
 from .palace import (
     NORMALIZE_VERSION,
     get_closets_collection,
@@ -59,6 +61,8 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+from .search_util import palace_wing_aliases
+from .timeutil import utc_now_iso
 
 MAX_CONTENT_CHARS = 30000
 MAX_OUTPUT_TOKENS = 1500
@@ -164,45 +168,31 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
     if lang_instruction and "english" not in lang_instruction.lower():
         prompt += f"\n\nLanguage instruction: {lang_instruction}"
 
-    body = json.dumps(
-        {
-            "model": cfg.model,
-            "max_tokens": MAX_OUTPUT_TOKENS,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-    ).encode("utf-8")
-
-    headers = {"Content-Type": "application/json"}
-    if cfg.key:
-        headers["Authorization"] = f"Bearer {cfg.key}"
-
+    body = {
+        "model": cfg.model,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    headers = {"Authorization": f"Bearer {cfg.key}"} if cfg.key else {}
     url = f"{cfg.endpoint}/chat/completions"
 
     for attempt in range(3):
         try:
-            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
-                raw = resp.read().decode("utf-8")
-            payload = json.loads(raw)
-
-            text = payload["choices"][0]["message"]["content"].strip()
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-            parsed = json.loads(text)
+            payload = post_json(url, body, headers, timeout=HTTP_TIMEOUT_S)
+            parsed = parse_json_reply(payload["choices"][0]["message"]["content"], expect=dict)
+            if not isinstance(parsed.get("topics"), list):
+                # The wrong object would purge the regex closets for nothing.
+                raise ValueError("LLM reply is not a closet object")
             return parsed, payload.get("usage")
-        except json.JSONDecodeError:
-            if attempt < 2:
-                time.sleep(2**attempt)
-                continue
-            return None, None
-        except urllib.error.HTTPError as e:
-            # 429 / 503 = retry with backoff
-            if e.code in (429, 503) and attempt < 2:
-                time.sleep(2**attempt)
-                continue
-            return None, None
         except Exception as e:
-            if "rate" in str(e).lower() and attempt < 2:
+            # Retry a reply with no usable closet JSON, a malformed response,
+            # or a 429/503; give up on everything else.
+            retry = (
+                isinstance(e, ValueError)
+                or isinstance(e.__cause__, json.JSONDecodeError)
+                or getattr(e, "status", None) in (429, 503)
+            )
+            if retry and attempt < 2:
                 time.sleep(2**attempt)
                 continue
             return None, None
@@ -293,8 +283,10 @@ def _regenerate_closets_owned(
 
     # Paginate the fetch — a single get(limit=total, ...) blows through
     # SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) on large palaces and
-    # crashes inside chromadb (see #802, #850, #1073).
+    # crashes inside chromadb.
     by_source: dict = {}
+    # A wing reads every spelling its project was filed under.
+    wings = set(palace_wing_aliases(wing, drawers_col)) if wing else None
     batch_size = 5000
     offset = 0
     while offset < total:
@@ -306,7 +298,7 @@ def _regenerate_closets_owned(
             meta = meta or {}
             source = meta.get("source_file", "unknown")
             w = meta.get("wing", "")
-            if wing and w != wing:
+            if wings is not None and w not in wings:
                 continue
             if source not in by_source:
                 by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
@@ -372,7 +364,7 @@ def _regenerate_closets_owned(
                     "room": r,
                     "source_file": source,
                     "generated_by": f"llm:{cfg.model}",
-                    "filed_at": datetime.now().isoformat(),
+                    "filed_at": utc_now_iso(),
                     "entities": entities,
                     # Stamp so the miner's stale-drawer gate doesn't treat
                     # LLM closets as leftovers and rebuild over them next run.
@@ -404,7 +396,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--palace",
-        default=os.path.expanduser("~/.mempalace/palace"),
+        default=paths.default_palace_path(),
         help="Path to the palace",
     )
     parser.add_argument("--wing", default=None, help="Limit to one wing")

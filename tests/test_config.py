@@ -4,12 +4,12 @@ import sqlite3
 import tempfile
 
 import pytest
+
 from mempalace.config import (
     MempalaceConfig,
     _default_config_dir,
     connect_sqlite_read,
     normalize_wing_name,
-    sanitize_iso_date,
     sanitize_iso_temporal,
     sanitize_kg_value,
     sanitize_name,
@@ -624,70 +624,70 @@ def test_kg_value_rejects_over_length():
         sanitize_kg_value("a" * 129)
 
 
-# --- sanitize_iso_date ---
+# --- sanitize_iso_temporal (date-only inputs) ---
 
 
 def test_iso_date_rejects_year_only():
     # Partial dates re-introduce silent empty result sets via lexicographic
     # TEXT comparison in KG queries (e.g. "2026-01-01" <= "2026" is False).
     with pytest.raises(ValueError):
-        sanitize_iso_date("2026")
+        sanitize_iso_temporal("2026")
 
 
 def test_iso_date_rejects_year_month():
     with pytest.raises(ValueError):
-        sanitize_iso_date("2026-03")
+        sanitize_iso_temporal("2026-03")
 
 
 def test_iso_date_accepts_full_date():
-    assert sanitize_iso_date("2026-03-15") == "2026-03-15"
+    assert sanitize_iso_temporal("2026-03-15") == "2026-03-15"
 
 
 def test_iso_date_passes_through_none():
-    assert sanitize_iso_date(None) is None
+    assert sanitize_iso_temporal(None) is None
 
 
 def test_iso_date_passes_through_empty_string():
-    assert sanitize_iso_date("") == ""
+    assert sanitize_iso_temporal("") == ""
 
 
 def test_iso_date_strips_whitespace():
-    assert sanitize_iso_date("  2026-03-15  ") == "2026-03-15"
+    assert sanitize_iso_temporal("  2026-03-15  ") == "2026-03-15"
 
 
 def test_iso_date_rejects_natural_language():
     with pytest.raises(ValueError):
-        sanitize_iso_date("March 2026")
+        sanitize_iso_temporal("March 2026")
 
 
 def test_iso_date_rejects_abbreviated_month():
     with pytest.raises(ValueError):
-        sanitize_iso_date("Jan 2025")
+        sanitize_iso_temporal("Jan 2025")
 
 
 def test_iso_date_rejects_us_format():
     with pytest.raises(ValueError):
-        sanitize_iso_date("03/15/2026")
+        sanitize_iso_temporal("03/15/2026")
 
 
 def test_iso_date_rejects_invalid_month():
     with pytest.raises(ValueError):
-        sanitize_iso_date("2026-13")
+        sanitize_iso_temporal("2026-13")
 
 
 def test_iso_date_rejects_invalid_day():
     with pytest.raises(ValueError):
-        sanitize_iso_date("2026-02-32")
+        sanitize_iso_temporal("2026-02-32")
 
 
 def test_iso_date_rejects_non_string():
     with pytest.raises(ValueError):
-        sanitize_iso_date(20260315)
+        sanitize_iso_temporal(20260315)
 
 
 def test_iso_date_error_names_field():
     with pytest.raises(ValueError, match="valid_from"):
-        sanitize_iso_date("yesterday", "valid_from")
+        sanitize_iso_temporal("yesterday", "valid_from")
 
 
 def test_iso_temporal_accepts_full_date():
@@ -703,7 +703,7 @@ def test_iso_temporal_strips_datetime_whitespace():
 
 
 def test_iso_date_backward_compatible_wrapper_accepts_datetime():
-    assert sanitize_iso_date("2026-05-06T14:23:00Z") == "2026-05-06T14:23:00Z"
+    assert sanitize_iso_temporal("2026-05-06T14:23:00Z") == "2026-05-06T14:23:00Z"
 
 
 def test_iso_temporal_rejects_datetime_without_seconds():
@@ -1014,12 +1014,12 @@ def test_miner_constants_alias_config_defaults():
     canonical ``DEFAULT_CHUNK_*`` constants in ``mempalace.config``.
     Pinned by this test so a future drift would surface as a unit failure.
     """
-    from mempalace.miner import CHUNK_SIZE, CHUNK_OVERLAP, MIN_CHUNK_SIZE
     from mempalace.config import (
-        DEFAULT_CHUNK_SIZE,
         DEFAULT_CHUNK_OVERLAP,
+        DEFAULT_CHUNK_SIZE,
         DEFAULT_MIN_CHUNK_SIZE,
     )
+    from mempalace.miner import CHUNK_OVERLAP, CHUNK_SIZE, MIN_CHUNK_SIZE
 
     assert CHUNK_SIZE == DEFAULT_CHUNK_SIZE == 800
     assert CHUNK_OVERLAP == DEFAULT_CHUNK_OVERLAP == 100
@@ -1489,9 +1489,41 @@ def test_relative_xdg_config_home_is_ignored(monkeypatch, tmp_path):
     assert _default_config_dir() == fake_home / ".config" / "mempalace"
 
 
-def test_init_writes_xdg_aware_palace_path(tmp_path):
+def test_init_leaves_the_default_palace_path_implicit(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     cfg.init()
     with open(tmp_path / "config.json") as f:
         written = json.load(f)
-    assert written["palace_path"] == str(tmp_path / "palace")
+    assert written == {}
+    assert MempalaceConfig(config_dir=str(tmp_path)).palace_path == str(tmp_path / "palace")
+
+
+def test_init_leaves_defaults_out_so_later_defaults_apply(tmp_path, monkeypatch):
+    MempalaceConfig(config_dir=str(tmp_path)).init()
+    import mempalace.config as config_module
+
+    monkeypatch.setattr(config_module, "DEFAULT_HALL_KEYWORDS", {"only_this_hall": ["x"]})
+    assert MempalaceConfig(config_dir=str(tmp_path)).hall_keywords == {"only_this_hall": ["x"]}
+
+
+def test_init_records_an_explicit_palace_path(tmp_path):
+    palace = tmp_path / "chosen-palace"
+    MempalaceConfig(config_dir=str(tmp_path)).init(palace_path=str(palace))
+    with open(tmp_path / "config.json") as f:
+        assert json.load(f) == {"palace_path": str(palace)}
+
+
+def test_init_never_rewrites_an_existing_config(tmp_path):
+    (tmp_path / "config.json").write_text('{"collection_name": "mine"}', encoding="utf-8")
+    MempalaceConfig(config_dir=str(tmp_path)).init(palace_path=str(tmp_path / "p"))
+    with open(tmp_path / "config.json") as f:
+        assert json.load(f) == {"collection_name": "mine"}
+
+
+def test_a_setter_after_init_keeps_what_init_recorded(tmp_path):
+    palace = tmp_path / "chosen-palace"
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+    cfg.init(palace_path=str(palace))
+    cfg.set_entity_languages(["en", "pt"])
+    with open(tmp_path / "config.json") as f:
+        assert json.load(f) == {"palace_path": str(palace), "entity_languages": ["en", "pt"]}

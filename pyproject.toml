@@ -1,9 +1,9 @@
 [project]
 name = "mempalace"
-version = "3.11.0"
+version = "3.12.0"
 description = "Give your AI a memory — mine projects and conversations into a searchable palace. No API key required."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 authors = [
     {name = "milla-jovovich"},
@@ -17,7 +17,6 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -30,13 +29,10 @@ dependencies = [
     "chromadb>=1.5.4,<2",
     "pyyaml>=6.0,<7",
     "tomli>=2.0.0; python_version < '3.11'",
-    # Multilingual embedding model deps. Onboarding now offers the
-    # embeddinggemma-300m ONNX model as the default for new installs, so
-    # these are required core deps (not optional extras). The 300 MB ONNX
-    # model itself is lazy-downloaded on first use, not at install time.
-    # Users who pick minilm during onboarding still get these installed
-    # but unused — small wheel-size cost in exchange for one fewer pip
-    # command in the multilingual setup path.
+    # Multilingual embedding model deps (embeddinggemma-300m ONNX), kept as
+    # core deps rather than optional extras so choosing the multilingual model
+    # needs no extra pip command. The 300 MB ONNX model itself is
+    # lazy-downloaded on first use, not at install time.
     "huggingface_hub>=0.20",
     "tokenizers>=0.15",
     "numpy>=1.24",
@@ -111,7 +107,7 @@ spellcheck = ["autocorrect>=2.0"]
 # MEMPALACE_MILVUS_TOKEN to point at Milvus server or Zilliz Cloud.
 milvus = [
     "pymilvus>=3.0.0",
-    "milvus-lite>=3.0; python_version >= '3.10' and sys_platform != 'win32'",
+    "milvus-lite>=3.0; sys_platform != 'win32'",
 ]
 # Opt-in Postgres + pgvector backend. Only the psycopg driver is needed on the
 # client; the server must have the `vector` extension available. Selected via
@@ -130,31 +126,30 @@ coreml = ["onnxruntime>=1.16"]
 # The upstream image extra supplies Pillow and torchvision, which the
 # processor imports even for text-only use.
 embeddinggemma2 = [
-    "sentence-transformers[image]>=6.1.0; python_version >= '3.10'",
-    "transformers>=5.19.0; python_version >= '3.10'",
-    "torch>=2.14.0; python_version >= '3.10'",
+    "sentence-transformers[image]>=6.1.0",
+    "transformers>=5.19.0",
+    "torch>=2.14.0",
     # Pillow < 12.3.0 has heap out-of-bounds writes and other memory-safety
-    # advisories reachable from untrusted images. 12.x needs Python >= 3.10.
-    "pillow>=12.3.0; python_version >= '3.10'",
+    # advisories reachable from untrusted images.
+    "pillow>=12.3.0",
 ]
 multimodal = [
-    "sentence-transformers[image]>=6.1.0; python_version >= '3.10'",
-    "transformers>=5.19.0; python_version >= '3.10'",
-    "torch>=2.14.0; python_version >= '3.10'",
+    "sentence-transformers[image]>=6.1.0",
+    "transformers>=5.19.0",
+    "torch>=2.14.0",
     # Pillow < 12.3.0 has heap out-of-bounds writes and other memory-safety
-    # advisories reachable from untrusted images. 12.x needs Python >= 3.10.
-    "pillow>=12.3.0; python_version >= '3.10'",
-    "soundfile>=0.13.1; python_version >= '3.10'",
-    "scipy>=1.10; python_version >= '3.10'",
-    "torchcodec>=0.17.0; python_version >= '3.10'",
+    # advisories reachable from untrusted images.
+    "pillow>=12.3.0",
+    "soundfile>=0.13.1",
+    "scipy>=1.10",
+    "torchcodec>=0.17.0",
 ]
 # Multilingual extra kept as a no-op alias for back-compat with
 # `pip install mempalace[multilingual]` — these deps now ship in core.
 multilingual = []
 # Binary-format extraction for `mempalace mine --mode extract`. Per-format
 # transformer routing: striprtf for .rtf, MarkItDown for .pdf/.docx/.pptx/
-# .xlsx/.epub. MarkItDown requires Python ≥ 3.10 (env marker ensures it
-# only installs where supported; Python 3.9 users still get RTF coverage).
+# .xlsx/.epub.
 extract = [
     "striprtf>=0.0.27",
     # Per PR #1555 review (Igor): bare ``markitdown`` is enough to import
@@ -164,7 +159,7 @@ extract = [
     # markitdown (EpubConverter uses beautifulsoup4, a base requirement),
     # so no [epub] sub-extra is needed (and none exists in 0.1.5). RTF is
     # covered by striprtf above.
-    "markitdown[docx,pdf,pptx,xlsx]>=0.1.5; python_version >= '3.10'",
+    "markitdown[docx,pdf,pptx,xlsx]>=0.1.5",
 ]
 
 [dependency-groups]
@@ -193,7 +188,7 @@ packages = ["mempalace"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 # "*.md": ruff 0.16 began formatting Python inside markdown fences, which
 # pulls ~96 docs into scope and reflows hand-aligned example code (the
 # column-aligned field comments in docs/rfcs/002 are deliberate). Docs are
@@ -201,8 +196,23 @@ target-version = "py39"
 extend-exclude = ["benchmarks", "*.md"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "C901"]
-ignore = ["E501"]
+select = ["E", "F", "W", "C901", "I", "RUF100", "B", "RET", "ERA"]
+# RET501: an explicit `return None` in a no-op default or a test fake shows
+# the reader it stands in for a call that returns a value.
+# RET503: every hit ends in a call that always raises, a retry loop whose last
+# attempt re-raises, or an endless generator; an added `return` would be dead.
+# B905: fires on every zip() once the target is py310. Choosing strict= per
+# call is its own lint stage, not part of raising the Python floor.
+ignore = ["E501", "RET501", "RET503", "B905"]
+# Codes of rules planned for later lint stages. Their noqa marks are
+# deliberate, so RUF100 must not strip them before those rules are on.
+external = ["A002", "ARG001", "ARG002", "BLE001", "S310"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mempalace"]
+# Keep `x as y` names in the statement they came from, so a noqa on that
+# statement still covers them.
+combine-as-imports = true
 
 [tool.ruff.lint.per-file-ignores]
 # mcp_server fragments exec into the package namespace. Names they use live
@@ -228,6 +238,11 @@ ignore = ["E501"]
 # palace fragments exec into the package namespace.
 "mempalace/palace/__init__.py" = ["F401"]
 "mempalace/palace/*.py" = ["F821"]
+# pytest idioms: `pytest.raises(Exception)` around backends that raise their
+# own driver errors, and bare attribute reads inside `pytest.raises` blocks.
+"tests/**" = ["B017", "B018"]
+# The comment blocks document transcript formats with sample JSON lines.
+"tests/test_normalize.py" = ["ERA001"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 25

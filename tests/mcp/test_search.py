@@ -1,13 +1,12 @@
 """MCP server tests — search tool and date-window filters."""
 
 import json
-from types import SimpleNamespace
 import sys
 import warnings
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
 from _mcp_server_helpers import (
     _patch_mcp_server,
 )
@@ -24,6 +23,18 @@ class TestSearchTool:
         # Top result should be the auth drawer
         top = result["results"][0]
         assert "JWT" in top["text"] or "authentication" in top["text"].lower()
+
+    def test_search_reports_a_truncated_query(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_search
+
+        query = "You are a helpful assistant with tools. " * 20 + "How do JWT tokens work?"
+        result = tool_search(query=query)
+        assert result["query_sanitized"] is True
+        assert result["sanitizer"]["truncated"] is True
+        assert result["sanitizer"]["replaced_lone_surrogates"] is False
 
     def test_search_with_wing_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -135,10 +146,30 @@ class TestSearchTool:
         result = tool_search(query="JWT", min_similarity=1.5)
         assert "results" in result
 
-        # Old name takes precedence when both provided
-        result_strict = tool_search(query="JWT", max_distance=999.0, min_similarity=0.01)
-        result_loose = tool_search(query="JWT", max_distance=0.01, min_similarity=999.0)
-        assert len(result_strict["results"]) <= len(result_loose["results"])
+        # Old name takes precedence when both provided. Similarity 0.01 is
+        # distance 0.99; similarity at or above 1.0 means exact matches only.
+        result_wide = tool_search(query="JWT", max_distance=0.01, min_similarity=0.01)
+        result_exact = tool_search(query="JWT", max_distance=999.0, min_similarity=999.0)
+        assert result_wide["results"]
+        assert result_exact["results"] == []
+
+    def test_search_min_similarity_of_one_is_exact_match_not_no_cutoff(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        seen = {}
+
+        def fake_search(*args, **kwargs):
+            seen["max_distance"] = kwargs.get("max_distance")
+            return {"results": []}
+
+        monkeypatch.setattr(mcp_server, "search_memories", fake_search)
+
+        mcp_server.tool_search(query="needle", min_similarity=1.0)
+
+        assert 0.0 < seen["max_distance"] < 0.001
 
     def test_search_passes_candidate_strategy(self, monkeypatch, config, kg):
         """MCP callers can opt into backend BM25/vector union candidate gathering."""
@@ -158,7 +189,7 @@ class TestSearchTool:
         assert "error" not in result
         assert seen["candidate_strategy"] == "union"
 
-    def test_search_preserves_default_max_distance(self, monkeypatch, config, kg):
+    def test_search_applies_no_default_max_distance(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import mcp_server
 
@@ -173,7 +204,7 @@ class TestSearchTool:
         result = mcp_server.tool_search(query="needle")
 
         assert "error" not in result
-        assert seen["max_distance"] == 1.5
+        assert seen["max_distance"] is None
 
     def test_search_cli_compatible_reuses_hub_collection(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -355,10 +386,20 @@ class TestSearchTool:
 
         monkeypatch.setattr(mcp_server, "search_memories", lambda *a, **kw: pytest.fail())
 
-        result = mcp_server.tool_search(query="rareterm", candidate_strategy="bm25")
+        response = mcp_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "mempalace_search",
+                    "arguments": {"query": "rareterm", "candidate_strategy": "bm25"},
+                },
+            }
+        )
 
-        assert "error" in result
-        assert "candidate_strategy" in result["error"]
+        assert response["error"]["code"] == -32602
+        assert "candidate_strategy" in response["error"]["message"]
 
     def test_list_rooms_rejects_invalid_wing(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)

@@ -14,7 +14,6 @@ from mempalace.room_detector_local import (
     save_config,
 )
 
-
 # ── FOLDER_ROOM_MAP ────────────────────────────────────────────────────
 
 

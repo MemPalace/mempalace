@@ -131,12 +131,17 @@ def test_non_boolean_include_subagents_is_rejected_before_ingestion(
         pytest.fail("invalid include_subagents reached ingestion")
 
     monkeypatch.setattr(mcp_server, "_capture_fd_stdout", _unexpected_capture)
-    result = mcp_server.tool_mine(
-        source=str(tmp_path), mode="convos", include_subagents=include_subagents
+    arguments = {"source": str(tmp_path), "mode": "convos", "include_subagents": include_subagents}
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_mine", "arguments": arguments},
+        }
     )
-    assert result["success"] is False
-    assert result["error_class"] == "ValueError"
-    assert "include_subagents" in result["error"]
+    assert response["error"]["code"] == -32602
+    assert "include_subagents" in response["error"]["message"]
 
 
 # ── Dispatch + return contract ───────────────────────────────────────────

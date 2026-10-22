@@ -9,13 +9,11 @@ This file is RED-first. The corresponding implementation lives in
 ``mempalace/hallways.py`` and is written to make these tests pass.
 """
 
-from unittest.mock import MagicMock, patch
-
 import itertools
 import json
+from unittest.mock import MagicMock, patch
 
 import pytest
-
 
 # Mock chromadb at import time so the hallways module can be loaded even
 # in environments where chromadb isn't installed. Mirrors the pattern in
