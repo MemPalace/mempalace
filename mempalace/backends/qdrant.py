@@ -491,7 +491,8 @@ def _combine_filters(*filters: Optional[dict]) -> Optional[dict]:
 
 
 def _text_any_filter(query: str) -> Optional[dict]:
-    tokens = tokenize(query)
+    # Matched against Qdrant's own word index, which keeps a CJK run whole.
+    tokens = tokenize(query, cjk_bigrams=False)
     if not tokens:
         return None
     return {"must": [{"key": _PAYLOAD_DOCUMENT, "match": {"text_any": " ".join(tokens)}}]}

@@ -8,6 +8,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Keyword search works for Chinese, Japanese and Korean.** `\w{2,}` read a
+  whole CJK clause as one token, so BM25 gave CJK drawers no score and the
+  full-text candidates (union search and the BM25 fallback) found almost
+  nothing. A CJK run is now split into overlapping character bigrams for BM25
+  and into trigrams for the full-text `MATCH`, and two-character words such as
+  `設計`, `会议` and `회의`, which no trigram matches, are looked up as
+  substrings. Text without CJK tokenizes as before, and `sqlite_exact` and
+  Qdrant keep their current behavior. Nothing is re-indexed: the change
+  applies at query time. (#2865)
+
 ---
 
 ## [3.12.0] — 2026-10-18
