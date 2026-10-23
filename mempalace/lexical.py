@@ -15,6 +15,7 @@ TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 _CJK_CHARS = (
     "\u1100-\u11ff"  # Hangul Jamo
     "\u3005-\u3007"  # 々 〆 〇
+    "\u303b"  # 〻, the vertical iteration mark
     "\u3040-\u309f"  # Hiragana
     "\u30a0-\u30ff"  # Katakana, including the prolonged sound mark ー
     "\u3100-\u312f"  # Bopomofo
@@ -29,7 +30,12 @@ _CJK_CHARS = (
     "\uf900-\ufaff"  # CJK Compatibility Ideographs
     "\uff66-\uff9f"  # Halfwidth Katakana
     "\uffa0-\uffdc"  # Halfwidth Hangul
-    "\U00020000-\U000323af"  # Ideograph Extensions B-H and Compatibility Supplement
+    "\U0001aff0-\U0001afff"  # Kana Extended-B
+    "\U0001b000-\U0001b16f"  # Kana Supplement, Kana Extended-A, Small Kana Extension
+    # Ideograph Extensions B-J and Compatibility Supplement. ``TOKEN_RE`` only
+    # keeps characters the runtime's Unicode database knows, so Extension J
+    # (Unicode 17) is split into bigrams only on a runtime that has it.
+    "\U00020000-\U0003347f"
 )
 _CJK_RUN_RE = re.compile(f"[{_CJK_CHARS}]+")
 

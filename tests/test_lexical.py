@@ -187,6 +187,37 @@ def test_chinese_and_korean_runs_become_bigrams(text, tokens):
     assert tokenize(text) == tokens
 
 
+@pytest.mark.parametrize(
+    "text, tokens",
+    [
+        # The vertical iteration mark repeats the character before it
+        ("時\u303b来る", ["時\u303b", "\u303b来", "来る"]),
+        # Hentaigana (Kana Supplement) and small kana (Small Kana Extension)
+        ("\U0001b002\U0001b003\U0001b004", ["\U0001b002\U0001b003", "\U0001b003\U0001b004"]),
+        ("\U0001b150\U0001b151", ["\U0001b150\U0001b151"]),
+    ],
+)
+def test_supplementary_kana_and_iteration_marks_become_bigrams(text, tokens):
+    assert tokenize(text) == tokens
+
+
+@pytest.mark.parametrize(
+    "char",
+    [
+        "\u303b",  # vertical iteration mark
+        "\U0001aff1",  # Kana Extended-B
+        "\U0001b001",  # Kana Supplement
+        "\U0001b132",  # Small Kana Extension
+        "\U0002ebf0",  # CJK Unified Ideographs Extension I
+        "\U000323b0",  # CJK Unified Ideographs Extension J (Unicode 17)
+    ],
+)
+def test_newer_cjk_blocks_count_as_cjk(char):
+    # is_cjk reads the range table directly, so it holds on any Python version
+    # even where the runtime's Unicode database predates the block.
+    assert is_cjk(char)
+
+
 def test_bm25_ranks_chinese_and_korean_by_shared_words():
     zh = ["今天天气很好", "向量数据库需要重建索引", "数据很重要"]
     zh_scores = bm25_scores("重建索引", zh)
