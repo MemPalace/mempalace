@@ -1,4 +1,4 @@
-# MemPalace DeepSeek Harness Plugin
+﻿# MemPalace DeepSeek Harness Plugin
 
 The [MemPalace](https://github.com/MemPalace/mempalace) plugin for the
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH). It is
@@ -14,7 +14,8 @@ Sister plugins for other harnesses live alongside it: `.claude-plugin/`,
 `.codex-plugin/`, `.cursor-plugin/`, `.antigravity-plugin/`.
 
 Built against DSH `0.1.5` (its `dsh-agent`, `dsh-session`, `dsh-system-prompt`
-and `dsh-subprocess` extension points).
+and `dsh-subprocess` extension points). Also works on `0.2.x`, where
+`agent/session-start` was renamed to `agent/created`.
 
 ## Requirements
 
