@@ -173,7 +173,7 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
         "schema_version": _SCHEMA_VERSION,
         "hallways": list(hallways),
     }
-    _atomic_write_json(hallway_file, payload)
+    _atomic_write_json(hallway_file, payload, compact=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

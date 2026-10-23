@@ -460,3 +460,62 @@ def test_a_link_planted_at_the_old_pid_temp_name_is_never_followed(tmp_path):
     assert not os.path.islink(dest)
     assert dest.read_text(encoding="utf-8") == "drawer_bad\n"
     assert victim.read_text(encoding="utf-8") == "untouched"
+
+
+def _orphan(path, payload: bytes = b"x", age_seconds: float = 3600.0) -> str:
+    """Drop a publish-shaped temp file beside ``path`` with an old mtime."""
+    tmp = path.parent / f".{path.name}.{os.urandom(6).hex()}.tmp"
+    tmp.write_bytes(payload)
+    old = tmp.stat().st_mtime - age_seconds
+    os.utime(tmp, (old, old))
+    return str(tmp)
+
+
+def test_sweep_stale_publish_temps_removes_old_orphans(tmp_path):
+    target = tmp_path / "hallways.json"
+    stale = _orphan(target)
+    assert fsio.sweep_stale_publish_temps(target) == 1
+    assert not os.path.exists(stale)
+
+
+def test_sweep_stale_publish_temps_keeps_in_flight_writer(tmp_path):
+    """A temp file younger than the age gate belongs to a live writer."""
+    target = tmp_path / "hallways.json"
+    fresh = _orphan(target, age_seconds=30.0)
+    assert fsio.sweep_stale_publish_temps(target) == 0
+    assert os.path.exists(fresh)
+
+
+def test_sweep_stale_publish_temps_leaves_unrelated_files(tmp_path):
+    target = tmp_path / "hallways.json"
+    target.write_text("{}")
+    neighbor = _orphan(tmp_path / "kg.json")
+    assert fsio.sweep_stale_publish_temps(target) == 0
+    assert os.path.exists(neighbor)
+    assert target.read_text() == "{}"
+
+
+def test_atomic_publish_sweeps_orphans(tmp_path):
+    """The publish path itself reclaims a dead writer's leftover."""
+    target = tmp_path / "state.json"
+    stale = _orphan(target)
+    fsio.atomic_write_json(target, {"a": 1})
+    assert not os.path.exists(stale)
+    assert json.loads(target.read_text()) == {"a": 1}
+
+
+def test_atomic_write_json_compact_roundtrip_and_size(tmp_path):
+    target = tmp_path / "big.json"
+    payload = {"schema_version": 1, "records": [{"a": i, "b": "x" * 20} for i in range(50)]}
+    fsio.atomic_write_json(target, payload, compact=True)
+    assert json.loads(target.read_text()) == payload
+    compacted = target.stat().st_size
+    fsio.atomic_write_json(target, payload)
+    assert compacted < target.stat().st_size
+
+
+def test_atomic_write_json_default_stays_indented(tmp_path):
+    """Existing callers keep the human-readable layout."""
+    target = tmp_path / "state.json"
+    fsio.atomic_write_json(target, {"a": 1})
+    assert b"\n" in target.read_bytes()
