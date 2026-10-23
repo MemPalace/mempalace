@@ -22,7 +22,12 @@ from typing import Optional
 
 from . import paths
 from ._env import env_str, parse_number
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import (
+    _apply_known_systems_prepass,
+    _entity_blocklist,
+    _get_coca_filter,
+    _use_english_filters,
+)
 from .fsio import atomic_write_json, encoding_metadata, move_aside, read_source_text
 
 # Module-level import so tests can patch it as
@@ -1104,7 +1109,11 @@ def _extract_entities_for_metadata(content: str) -> str:
         if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content, re.IGNORECASE):
             matched.add(name)
 
-    coca_filter = _get_coca_filter()
+    from .config import MempalaceConfig
+
+    entity_langs = MempalaceConfig().entity_languages
+    entity_stoplist = {w.lower() for w in _ENTITY_STOPLIST} | _entity_blocklist(entity_langs)
+    coca_filter = _get_coca_filter() if _use_english_filters(entity_langs) else frozenset()
     window = content[:_ENTITY_EXTRACT_WINDOW]
     # Known-systems compound pre-pass. Detects
     # multi-word product names atomically and masks them from the window so
@@ -1115,7 +1124,7 @@ def _extract_entities_for_metadata(content: str) -> str:
     words = _candidate_entity_words(working_window)
     freq: dict = dict(compound_counts)
     for w in words:
-        if w in _ENTITY_STOPLIST:
+        if w.lower() in entity_stoplist:
             continue
         # Drop common English content words
         # ("Code", "Line", "Note", "Phase", …) from per-drawer entity
