@@ -25,6 +25,7 @@ import re
 import stat
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple, Union
 
@@ -120,6 +121,44 @@ def open_new_temp_file(directory: PathLike, prefix: str, suffix: str = "", *, mo
         errno.EEXIST,
         f"no usable temporary file name found in {directory} after {TEMP_NAME_ATTEMPTS} attempts",
     )
+
+
+def sweep_stale_publish_temps(path: PathLike, min_age_seconds: float = 600.0) -> int:
+    """Unlink orphaned publish temporaries beside ``path``; return the count.
+
+    ``atomic_publish`` creates every temporary ``O_EXCL`` under a random
+    name, so a surviving ``.{name}.*.tmp`` belongs to a process that died
+    mid-write (SIGKILL, OOM killer, supervisor timeout) and cannot return.
+    Nothing else ever reclaims it; on large payloads each orphan is
+    hundreds of MB. The ``min_age_seconds`` gate keeps a slow in-flight
+    writer's file safe — two processes publishing the same target get
+    distinct temp names, so only genuinely stale files match.
+    """
+    path = Path(path)
+    prefix = f".{path.name}."
+    try:
+        entries = os.listdir(path.parent)
+    except OSError:
+        return 0
+    cutoff = time.time() - min_age_seconds
+    removed = 0
+    for name in entries:
+        if not (name.startswith(prefix) and name.endswith(".tmp")):
+            continue
+        candidate = path.parent / name
+        try:
+            if candidate.stat().st_mtime >= cutoff:
+                continue
+            candidate.unlink()
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        print(
+            f"  ! swept {removed} stale publish temp(s) beside {path.name}",
+            file=sys.stderr,
+        )
+    return removed
 
 
 def _chmod_quiet(path: PathLike, mode: int) -> None:
@@ -286,6 +325,7 @@ def atomic_publish(
     Every other failure propagates and does not truncate ``path``.
     """
     path = write_target(path) if follow_symlinks else Path(path)
+    sweep_stale_publish_temps(path)
     mode = 0o600 if private else 0o666
     try:
         fd, tmp = _open_publish_temp(path, mode)
@@ -306,12 +346,26 @@ def atomic_publish(
 
 
 def atomic_write_json(
-    path: PathLike, payload: Any, *, private: bool = True, follow_symlinks: bool = True
+    path: PathLike,
+    payload: Any,
+    *,
+    private: bool = True,
+    follow_symlinks: bool = True,
+    compact: bool = False,
 ) -> None:
-    """Serialize ``payload`` (indented, UTF-8, non-ASCII kept) into ``path``."""
+    """Serialize ``payload`` (UTF-8, non-ASCII kept) into ``path``.
+
+    Indented by default; ``compact=True`` drops the indent entirely, which
+    matters on payloads measured in hundreds of MB where ``indent=2`` adds
+    a newline and spaces per record.
+    """
+    if compact:
+        body = partial(json.dump, payload, ensure_ascii=False, separators=(",", ":"))
+    else:
+        body = partial(json.dump, payload, ensure_ascii=False, indent=2)
     atomic_publish(
         path,
-        lambda handle: json.dump(payload, handle, indent=2, ensure_ascii=False),
+        body,
         private=private,
         follow_symlinks=follow_symlinks,
     )
