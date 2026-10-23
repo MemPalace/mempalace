@@ -1325,6 +1325,13 @@ _ENCODED_PARENT_PREFIXES = (
     "Documents-",
 )
 
+# Git worktree parents that belong to the enclosing project, not to the
+# ephemeral worktree: Claude Code's own ``.claude/worktrees/`` plus the common
+# hand-rolled ``<project>/.worktrees/`` layout. Encoded forms are how the same
+# paths look once Claude Code flattens ``/`` and ``.`` to ``-``.
+_WORKTREE_CWD_MARKERS = ("/.claude/worktrees/", "/.worktrees/")
+_WORKTREE_ENCODED_MARKERS = ("-claude-worktrees-", "--worktrees-")
+
 
 def _wing_slug(name: str) -> str:
     """The project wing for a directory name; ``sessions`` when nothing is left."""
@@ -1338,9 +1345,9 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
     types (tool_use, tool_result, user/assistant turns), but not all
     (e.g. queue-operation lines lack it). Scans up to 200 lines. Returns
     the path with forward slashes and no trailing slash, with a git
-    worktree under ``<project>/.claude/worktrees/`` collapsed to
-    ``<project>``, or ``None`` if the file is unreadable, empty, or
-    records no cwd.
+    worktree under ``<project>/.claude/worktrees/`` or
+    ``<project>/.worktrees/`` collapsed to ``<project>``, or ``None`` if
+    the file is unreadable, empty, or records no cwd.
     """
     try:
         path = Path(transcript_path).expanduser()
@@ -1363,24 +1370,44 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
-                # A cwd inside "<project>/.claude/worktrees/<wt>" (a git
-                # worktree) belongs to <project>, not the ephemeral worktree
-                # directory -- otherwise every worktree spawns its own wing.
-                _wt_marker = "/.claude/worktrees/"
-                if _wt_marker in cwd_norm:
-                    cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
+                # A cwd inside "<project>/.claude/worktrees/<wt>" or
+                # "<project>/.worktrees/<wt>" (a git worktree) belongs to
+                # <project>, not the ephemeral worktree directory --
+                # otherwise every worktree spawns its own wing.
+                for _wt_marker in _WORKTREE_CWD_MARKERS:
+                    if _wt_marker in cwd_norm:
+                        cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
+                        break
                 return cwd_norm
     except OSError:
         pass
     return None
 
 
+def _project_wing_override(cwd_norm: str) -> Optional[str]:
+    """Configured project name (``project_wings``) for ``cwd_norm``, or ``None``.
+
+    The longest configured directory containing ``cwd_norm`` wins.
+    """
+    try:
+        overrides = MempalaceConfig().project_wings
+    except Exception:
+        return None
+    best = None
+    for directory, name in overrides.items():
+        if cwd_norm == directory or cwd_norm.startswith(directory + "/"):
+            if best is None or len(directory) > len(best[0]):
+                best = (directory, name)
+    return best[1] if best else None
+
+
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
-    """The project wing from the transcript's cwd leaf, or ``None``."""
+    """The project wing from the transcript's cwd leaf (or its ``project_wings``
+    override), or ``None``."""
     cwd_norm = _cwd_from_jsonl(transcript_path)
     if not cwd_norm:
         return None
-    project = cwd_norm.rsplit("/", 1)[-1]
+    project = _project_wing_override(cwd_norm) or cwd_norm.rsplit("/", 1)[-1]
     if project:
         return _wing_slug(project)
     return None
@@ -1451,11 +1478,13 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     if match:
         encoded = match.group(1)
         # "<project>/.claude/worktrees/<wt>" flattens to "-<project>--claude-worktrees-<wt>"
-        # here; collapse it to <project> like _wing_from_jsonl_cwd already does for cwd,
-        # or every worktree spawns its own wing.
-        _wt_marker = "-claude-worktrees-"
-        if _wt_marker in encoded:
-            encoded = encoded.split(_wt_marker, 1)[0]
+        # and "<project>/.worktrees/<wt>" to "-<project>--worktrees-<wt>" here; collapse
+        # both to <project> like _wing_from_jsonl_cwd already does for cwd, or every
+        # worktree spawns its own wing.
+        for _wt_marker in _WORKTREE_ENCODED_MARKERS:
+            if _wt_marker in encoded:
+                encoded = encoded.split(_wt_marker, 1)[0]
+                break
         # Strip platform user-home prefix so the wing isn't dominated by
         # /Users/<user>/ or /home/<user>/.
         m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)
