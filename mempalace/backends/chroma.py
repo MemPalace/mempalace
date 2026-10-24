@@ -1,6 +1,7 @@
 """ChromaDB-backed MemPalace storage backend (RFC 001 reference implementation)."""
 
 import contextlib
+import datetime as _dt
 import json
 import logging
 import os
@@ -628,6 +629,49 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return _hnsw_metadata_marker_intact(seg_dir)
 
 
+def _segment_last_write_epoch(db_path: str, seg_id: str) -> Optional[float]:
+    """Newest ``embeddings.created_at`` for one segment, as epoch seconds.
+
+    Chroma flushes HNSW segment files asynchronously and only above its sync
+    threshold, so a segment's mtime says when ITS data was last persisted —
+    not when the palace was last written. The shared ``chroma.sqlite3`` mtime
+    moves with *every* collection's writes, which made long-idle collections
+    look perpetually stale against it. The honest baseline for "is this
+    segment lagging its own writes" is the newest ``embeddings`` row
+    attributed to that segment; the query drives the
+    ``UNIQUE(segment_id, embedding_id)`` index by its leading column.
+
+    Reads go through :func:`open_palace_reader` — the one door for palace
+    sqlite access — so a per-call close cannot drop Chroma's file locks.
+    Returns ``None`` on any sqlite error, missing schema, or unparseable
+    value; callers fall back to the shared-sqlite mtime (the previous
+    behavior). ``created_at`` is the schema's naive-UTC ``CURRENT_TIMESTAMP``
+    default; parsed as UTC rather than guessed.
+    """
+    try:
+        con = open_palace_reader(db_path, timeout=5)
+    except (sqlite3.Error, ValueError):
+        return None
+    try:
+        row = con.execute(
+            "SELECT MAX(e.created_at) FROM embeddings e WHERE e.segment_id = ?",
+            (seg_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if not row or row[0] is None:
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(str(row[0]))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.timezone.utc)
+    return parsed.timestamp()
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -687,7 +731,12 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
             binary_header
         )
 
-        if not payload_corrupt and not header_corrupt and sqlite_mtime - hnsw_mtime < stale_seconds:
+        # Baseline staleness against this segment's own last write, not the
+        # shared sqlite mtime — see _segment_last_write_epoch.
+        baseline = _segment_last_write_epoch(db_path, name)
+        if baseline is None:
+            baseline = sqlite_mtime
+        if not payload_corrupt and not header_corrupt and baseline - hnsw_mtime < stale_seconds:
             continue
 
         # Stage 2: integrity gate. Mtime drift alone is not corruption because
@@ -698,7 +747,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
                 "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
                 "metadata and payload size are intact — flush-lag, not "
                 "corruption. Leaving in place.",
-                sqlite_mtime - hnsw_mtime,
+                baseline - hnsw_mtime,
                 seg_dir,
             )
             continue
@@ -719,7 +768,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
             )
         else:
             reason = (
-                f"sqlite {sqlite_mtime - hnsw_mtime:.0f}s newer than HNSW "
+                f"last write {baseline - hnsw_mtime:.0f}s newer than HNSW "
                 "and integrity check failed"
             )
 
