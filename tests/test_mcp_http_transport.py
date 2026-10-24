@@ -397,6 +397,63 @@ class TestEmbeddingDoesNotHoldTheHttpLock:
         assert result["total_drawers"] == 0
         assert elapsed < 0.5, f"status waited on diary embedding: {elapsed:.3f}s"
 
+    def test_status_completes_while_checkpoint_embeds(self, http_server, monkeypatch):
+        """A multi-item checkpoint must yield the lock during each item's embed.
+
+        ``mempalace_checkpoint`` is a composite of ``check_duplicate`` /
+        ``add_drawer`` / ``diary_write``; ``check_duplicate`` and
+        ``diary_write`` already release the request lock around embedding
+        inference (``embedding_release``), while ``add_drawer`` does not —
+        which is why the composite must carry the flag itself rather than
+        inherit it. Held monolithically, an N-item checkpoint blocks every
+        palace request for the whole batch; with the release installed, a
+        concurrent read lands inside the first item's embed window.
+        """
+        port, _ = http_server
+        first_embed_started = threading.Event()
+
+        def slow_checkpoint(**_kwargs):
+            from mempalace.embedding import embedding_section
+
+            for item in range(2):
+                with embedding_section():
+                    if item == 0:
+                        first_embed_started.set()
+                    time.sleep(1.0)
+            return {"added": [], "duplicates": [], "errors": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_checkpoint"], "handler", slow_checkpoint)
+
+        def quick_status(**_kwargs):
+            return {"total_drawers": 0, "wings": {}, "rooms": {}}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_status"], "handler", quick_status)
+
+        errors = []
+
+        def writer():
+            try:
+                self._call(
+                    port,
+                    "mempalace_checkpoint",
+                    {"items": [{"wing": "w", "room": "r", "content": "x"}]},
+                    req_id=71,
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        assert first_embed_started.wait(timeout=3)
+        started_at = time.perf_counter()
+        result = self._call(port, "mempalace_status", {}, req_id=72)
+        elapsed = time.perf_counter() - started_at
+        thread.join(timeout=5)
+
+        assert not errors, errors
+        assert result["total_drawers"] == 0
+        assert elapsed < 0.9, f"status waited on the checkpoint's embedding: {elapsed:.3f}s"
+
     def test_status_completes_while_search_embeds(self, http_server, monkeypatch):
         port, _ = http_server
         embed_started = threading.Event()
