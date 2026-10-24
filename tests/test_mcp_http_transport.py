@@ -21,6 +21,7 @@ import http.client
 import json
 import logging
 import os
+import socket
 import socketserver
 import ssl
 import threading
@@ -83,6 +84,39 @@ def http_server():
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+def test_listen_backlog_admits_connection_burst():
+    """A burst of simultaneous clients must not be dropped while nothing accepts.
+
+    ``socketserver.TCPServer`` defaults to ``request_queue_size = 5``: with the
+    accept loop busy (or before its first accept), the 7th+ pending connection
+    is dropped and the client sees a connect timeout. The MCP HTTP server
+    fronts a palace behind a single RWLock, so a burst of session handshakes
+    arriving while one slow request holds the lock is the normal case, not an
+    anomaly. Bind the production server but never start ``serve_forever`` —
+    nothing accepts, so every connection parks in the listen queue, the
+    deterministic worst case for a busy accept loop.
+    """
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    conns = []
+    established = 0
+    try:
+        for _ in range(20):
+            try:
+                conns.append(socket.create_connection(("127.0.0.1", port), timeout=2.0))
+                established += 1
+            except OSError:
+                pass
+        assert established == 20, (
+            f"listen backlog dropped {20 - established}/20 pending connections "
+            f"(request_queue_size={type(httpd).request_queue_size})"
+        )
+    finally:
+        for s in conns:
+            s.close()
+        httpd.server_close()
 
 
 def test_post_dispatches_to_handle_request(http_server):
