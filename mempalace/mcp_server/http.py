@@ -1273,6 +1273,7 @@ def _build_http_server(host: str, port: int):
     CI. Returns a bound ``ThreadingHTTPServer`` whose request policy (Host
     allowlist, Origin check, optional bearer token) is attached as attributes.
     """
+    import socket
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     auth_token = _http_resolve_token(host)
@@ -1299,6 +1300,14 @@ def _build_http_server(host: str, port: int):
                 # later fails instead of sharing it.
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             super().server_bind()
+
+        # socketserver's default listen backlog is 5. The palace RWLock means
+        # one slow request can hold every handler thread while new sessions
+        # keep arriving; a backlog of 5 drops the 7th+ pending connection and
+        # the client sees a connect timeout. Queue a realistic burst instead:
+        # 128 is a floor, not a tuning claim — take the platform default
+        # where it is larger.
+        request_queue_size = max(socket.SOMAXCONN, 128)
 
         def handle_error(self, request, client_address):
             # A client hanging up mid-response makes the send path raise
