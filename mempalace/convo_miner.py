@@ -260,8 +260,6 @@ def _register_file(
 
 
 # =============================================================================
-# CHUNKING — exchange pairs for conversations
-# =============================================================================
 
 
 def chunk_exchanges(
@@ -668,6 +666,7 @@ def _file_chunks_locked(
         # ingest timestamp. Prefer the mtime captured with the read: a fresh
         # stat here can observe an append that this pass did not ingest.
         filed_at = utc_now_iso()
+        pass_contents = {chunk["content"] for chunk in chunks}
         if source_mtime is None:
             try:
                 source_mtime = os.path.getmtime(source_file)
@@ -713,7 +712,12 @@ def _file_chunks_locked(
             )
             drawers.append((drawer_id, chunk["content"], meta))
         drawers_added = write_file_drawers(
-            collection, source_file, drawers, extract_mode=extract_mode, aaak_col=aaak_col
+            collection,
+            source_file,
+            drawers,
+            extract_mode=extract_mode,
+            pass_contents=pass_contents,
+            aaak_col=aaak_col,
         )
     return drawers_added, room_counts_delta, False
 

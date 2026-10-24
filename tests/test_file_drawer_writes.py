@@ -7,6 +7,7 @@ file with no drawers at all.
 """
 
 import os
+import re
 
 import pytest
 
@@ -200,7 +201,10 @@ def test_project_failed_stale_delete_keeps_text_and_converges(tmp_path, monkeypa
 # -- conversation miner -------------------------------------------------------
 
 
-def test_convo_remine_of_a_shorter_transcript_leaves_only_its_new_drawers(tmp_path):
+def test_convo_shorter_remine_preserves_surviving_turns_and_files_the_new_one(tmp_path):
+    """A shrunk transcript re-mine re-derives the new turn but keeps the
+    turns that are no longer in the file (additive history), so the new
+    exchange is present and no preserved turn is lost."""
     convo = _Convo(tmp_path)
     convo.write(range(6))
     convo.mine()
@@ -211,9 +215,15 @@ def test_convo_remine_of_a_shorter_transcript_leaves_only_its_new_drawers(tmp_pa
     convo.mine()
 
     rows = convo.rows()
-    assert len(rows) == 1
-    assert "question 0" in rows[0][0]
-    assert rows[0][1]["chunk_total"] == 1
+    # One newly derived drawer for the surviving turn ...
+    new_drawers = [r for r in rows if r[0].strip().startswith("> question 0")]
+    assert len(new_drawers) == 1
+    assert new_drawers[0][1]["chunk_index"] == 0
+    assert new_drawers[0][1]["chunk_total"] == 1
+    # ... and the turns dropped from the file survive as additive history.
+    assert len(rows) == 6
+    preserved = {doc for doc, _ in rows if re.search(r"\bquestion [1-5]\b", doc)}
+    assert preserved, "additive turns 1-5 should survive the shrink"
 
 
 def test_convo_remine_of_a_longer_transcript_files_every_exchange(tmp_path):
@@ -244,7 +254,15 @@ def test_convo_remine_leaves_the_other_extract_mode_alone(tmp_path):
     _touch(convo.doc)
     convo.mine()
 
-    assert len(convo.rows()) == 1
+    # The re-derived exchange ...
+    rows = convo.rows()
+    new_drawers = [r for r in rows if r[0].strip().startswith("> question 0")]
+    assert len(new_drawers) == 1
+    # ... plus the turns dropped from the file survive (additive history).
+    assert len(rows) == 3
+    preserved = {doc for doc, _ in rows if re.search(r"\bquestion [12]\b", doc)}
+    assert preserved, "additive turns 1-2 should survive the shrink"
+    # ... and the other extract mode is left entirely alone.
     assert sorted(doc for doc, _ in convo.rows("general")) == general
 
 
@@ -263,26 +281,47 @@ def test_convo_failed_write_keeps_the_previous_drawers(tmp_path, monkeypatch):
     assert sorted(doc for doc, _ in convo.rows()) == before
 
 
-def test_convo_failed_stale_delete_keeps_text_and_converges(tmp_path, monkeypatch):
+def test_convo_failed_stale_purge_keeps_text_and_converges(tmp_path, monkeypatch):
+    """A failed stale-drawer purge fails the file rather than reporting it
+    mined; the new drawers and the preserved additive turns stay put, and a
+    retry with a healthy backend converges to filed."""
     convo = _Convo(tmp_path)
     convo.write(range(4))
     convo.mine()
 
     convo.write([0])
     _touch(convo.doc)
-    real_delete = type(get_collection(convo.palace)).delete
-    _fail_deletes(monkeypatch, convo.palace)
+
+    import mempalace.palace as _palace
+
+    def fail_purge(collection, source_file, extract_mode, pass_contents=None):
+        raise RuntimeError("killed before the stale purge")
+
+    monkeypatch.setattr(_palace, "_source_file_delete_ids", fail_purge)
     with pytest.raises(MineFileErrors):
         convo.mine()
     assert convo.rows(), "the transcript was left with no drawers"
-    col = get_collection(convo.palace)
-    assert not file_already_mined(col, str(convo.doc), check_mtime=True, extract_mode="exchange")
+    assert any("question 0" in doc for doc, _ in convo.rows())
+    # A failed purge must leave the file unfiled, not silently mined.
+    # (A fresh collection per check: a long-lived handle loses its rust
+    # bindings once a later mine opens/closes its own handles.)
+    assert not file_already_mined(
+        get_collection(convo.palace), str(convo.doc), check_mtime=True, extract_mode="exchange"
+    )
 
-    monkeypatch.setattr(type(col), "delete", real_delete)
+    # The file stays unfiled until a retry with a healthy backend succeeds.
+    monkeypatch.undo()
     convo.mine()
+    assert file_already_mined(
+        get_collection(convo.palace), str(convo.doc), check_mtime=True, extract_mode="exchange"
+    )
     rows = convo.rows()
-    assert len(rows) == 1
-    assert "question 0" in rows[0][0]
+    new_drawers = [r for r in rows if r[0].strip().startswith("> question 0")]
+    assert len(new_drawers) == 1
+    assert new_drawers[0][1]["chunk_index"] == 0
+    assert new_drawers[0][1]["chunk_total"] == 1
+    preserved = {doc for doc, _ in rows if re.search(r"\bquestion [1-3]\b", doc)}
+    assert preserved, "additive turns 1-3 should survive the retry"
 
 
 def test_project_remine_drops_metadata_the_new_text_no_longer_earns(tmp_path):

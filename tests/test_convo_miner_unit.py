@@ -1162,3 +1162,315 @@ def test_mine_convos_passes_the_directory_it_read_from(tmp_path, monkeypatch):
     convo_miner.mine_convos(str(transcripts), str(tmp_path / "palace"))
 
     assert seen.get("source_dir_ino") == si.directory_identity(transcripts)
+
+
+# ============================================================================
+# Additive-history / version-identity orphan-delete (issue #1593 / #2793)
+# ============================================================================
+#
+# When a source transcript shrinks (user deletes early turns, or a rewrite
+# re-derives chunks at new boundaries), the re-mine pass must NOT blanket-
+# purge ALL prior drawers for that source file.
+#
+# Normative rules (issue #2793):
+#   1. Preserved: prior drawers at the CURRENT schema version whose verbatim
+#      content is NOT re-derived in this pass (additive history — surviving
+#      turns whose text is no longer at their original chunk_index).
+#   2. Deleted: prior drawers at an OLDER schema version (normalize_version or
+#      chunker revision) — schema bump → fully superseded.
+#   3. Deleted: prior drawers whose verbatim content IS re-derived in this
+#      pass (redundant — the upsert re-creates the same text at its new
+#      chunk_index, and keeping the old copy would duplicate it).
+#   4. Deleted: prior drawers with blank/empty content (genuinely orphan —
+#      no verbatim content to preserve).
+#
+# The two existing develop guard tests (test_mine_convos_rebuilds_stale_
+# drawers_after_schema_bump and test_mine_convos_grown_file_purges_stale_
+# drawers_not_additive) pin rules 2 and 3 respectively.
+
+
+class _StoredCol:
+    """Fake collection modeling a chromadb store with pre-filed drawers.
+
+    Tracks which IDs are deleted and which are upserted so tests can assert
+    the surviving set after a re-mine pass.
+    """
+
+    def __init__(self, pre_stored: dict):
+        # pre_stored: id -> (content, metadata)
+        self.store = dict(pre_stored)
+        self.deleted_ids: list = []
+        self.upserted: list = []  # (id, content, meta) triples
+
+    def get(self, where=None, limit=None, offset=0, include=None, **kw):
+        """Return the paginated slice of pre-filed drawers.
+
+        Mirrors chromadb.get() shape: {"ids": [...], "metadatas": [...]}
+        plus "documents" when requested.
+        """
+        all_ids = list(self.store.keys())
+        off = offset or 0
+        lim = limit if limit else len(all_ids)
+        page = all_ids[off : off + lim]
+        result = {"ids": page, "metadatas": [self.store[i][1] for i in page]}
+        if include and "documents" in include:
+            result["documents"] = [self.store[i][0] for i in page]
+        return result
+
+    def delete(self, *args, **kwargs):
+        ids = kwargs.get("ids")
+        if ids is None and args:
+            ids = args[0]
+        for i in ids or []:
+            if i not in self.deleted_ids:
+                self.deleted_ids.append(i)
+            self.store.pop(i, None)
+
+    def upsert(self, documents, ids, metadatas):
+        for d, i, m in zip(documents, ids, metadatas):
+            self.upserted.append((i, d, m))
+            self.store[i] = (d, m)
+
+    def alive(self) -> set:
+        return set(self.store.keys())
+
+    def alive_contents(self) -> set:
+        return {v[0] for v in self.store.values() if v[0]}
+
+    def update(self, ids, metadatas):
+        """Merge metadata updates into the store (chunk_total finalize)."""
+        for i, m in zip(ids or [], metadatas or []):
+            if i in self.store:
+                content, existing_meta = self.store[i]
+                self.store[i] = (content, {**existing_meta, **(m or {})})
+
+
+class TestAdditiveHistoryOrphanDelete:
+    """Regression tests for the additive-history / version-identity fix
+    (upstream issue #1593, filed as #2793 on MemPalace/mempalace).
+
+    These exercise ``_file_chunks_locked`` end-to-end against a fake
+    collection. They are **RED on the develop baseline** (blanket purge
+    destroys prior drawers) and **GREEN at the branch head** where the
+    ``_additive_history_delete_ids`` classifier preserves surviving turns.
+    """
+
+    CURRENT_SCHEMA = {
+        "source_file": "shrink_me.txt",
+        "extract_mode": "exchange",
+        "normalize_version": 3,  # current NORMALIZE_VERSION
+        "convo_chunker_version": 2,  # current CONVO_CHUNKER_VERSION
+        "ingest_mode": "convos",
+        "wing": "convos",
+        "room": "conversations",
+        "chunk_index": 0,
+        "added_by": "agent-under-test",
+    }
+
+    _COLLECTION = "_file_chunks_locked"
+    # Use this constant in all monkeypatched helper signatures.
+    _CHUNKS_ARG = "chunks"
+
+    # ------------------------------------------------------------------
+    # Rule 1 (preserved): prior drawer at current schema, content NOT
+    # re-derived in this pass → KEPT as additive history.
+    # ------------------------------------------------------------------
+
+    def test_shrink_preserves_surviving_content_not_rederived(self, monkeypatch):
+        """When the source shrinks and a prior drawer's verbatim content is
+        not re-derived in this pass, it must survive the re-mine (additive
+        history) rather than being blanket-deleted."""
+        import mempalace.convo_miner as convo_miner
+
+        prior_content = (
+            "User: explain the authentication flow in detail\n"
+            "AI: The flow starts with OAuth2 token exchange at /oauth/token.\n"
+            "User: what about refresh tokens?\n"
+            "AI: Refresh tokens are rotated on every use for security.\n"
+        )
+        # Prior drawer at chunk_index=0 with this content.
+        prior_meta = dict(self.CURRENT_SCHEMA)
+        prior_meta["chunk_index"] = 0
+        prior_id = "drawer_convos_conversations_pre0"
+        col = _StoredCol({prior_id: (prior_content, prior_meta)})
+
+        # This pass derives only ONE chunk with DIFFERENT content (the file
+        # was rewritten, the old text is no longer at any current chunk_index).
+        new_content = "User: what is the auth flow?\nAI: It uses OAuth2 token exchange.\n"
+        chunks = [{"content": new_content, "chunk_index": 0}]
+
+        self._patch_helpers(monkeypatch, convo_miner)
+
+        drawers, _rooms, skipped = convo_miner._file_chunks_locked(
+            col, "shrink_me.txt", chunks, "convos", "conversations", "agent-under-test", "exchange"
+        )
+
+        assert skipped is False
+        assert drawers == 1
+        # The prior drawer must still be alive in the collection.
+        assert prior_id in col.alive(), (
+            "Prior drawer content was not re-derived in this pass (shrink "
+            "scenario) but was blanket-deleted — additive history lost: "
+            f"deleted={col.deleted_ids}"
+        )
+        # The prior content is still retrievable.
+        assert prior_content in col.alive_contents()
+
+    # ------------------------------------------------------------------
+    # Rule 3 (deleted): prior drawer at current schema, content IS
+    # re-derived in this pass → PURGED (redundant upsert prevents dup).
+    # ------------------------------------------------------------------
+
+    def test_grown_file_redundant_prior_drawer_purged_no_dup(self, monkeypatch):
+        """When the file GROWS and a prior drawer's verbatim content IS
+        re-derived in this pass (at a new chunk_index), the old drawer is
+        purged so the re-upserted copy is the sole occurrence — no
+        duplicates."""
+        import mempalace.convo_miner as convo_miner
+
+        shared_content = (
+            "User: how do I configure the database?\n"
+            "AI: Set DATABASE_URL in your .env file and run migrate.\n"
+        )
+        # Prior drawer at chunk_index=2 with this content (it was re-derived
+        # at a different index in the grown file).
+        prior_meta = dict(self.CURRENT_SCHEMA)
+        prior_meta["chunk_index"] = 2
+        prior_id = "drawer_convos_conversations_pre2"
+        col = _StoredCol({prior_id: (shared_content, prior_meta)})
+
+        # This pass derives a chunk whose content is the same text (now at
+        # a different chunk_index after the file grew).
+        chunks = [
+            {"content": "User: new topic A", "chunk_index": 0},
+            {"content": "User: new topic B", "chunk_index": 1},
+            {"content": shared_content, "chunk_index": 2},
+        ]
+
+        self._patch_helpers(monkeypatch, convo_miner)
+
+        drawers, _rooms, skipped = convo_miner._file_chunks_locked(
+            col, "shrink_me.txt", chunks, "convos", "conversations", "agent-under-test", "exchange"
+        )
+
+        assert skipped is False
+        assert drawers == 3
+        # The old drawer's content is now stored exactly once: by the new
+        # upsert at its (possibly same or different) chunk_index.
+        # The prior_id itself must be gone (or overwritten by upsert at same
+        # id — but since chunk_index=2, the new drawer would be at the same
+        # id, so the store only has one copy).
+        content_count = sum(1 for c in col.alive_contents() if c == shared_content)
+        assert content_count == 1, (
+            f"shared content appears {content_count} times after re-mine; "
+            "expected exactly 1 (old drawer purged, new upsert replaces it)"
+        )
+
+    # ------------------------------------------------------------------
+    # Rule 4 (deleted): prior drawer with blank/empty content → PURGED
+    # (genuinely orphan — no verbatim content to preserve).
+    # ------------------------------------------------------------------
+
+    def test_orphan_blank_content_drawer_purged(self, monkeypatch):
+        """A prior drawer with blank or empty verbatim content is a genuine
+        orphan — no text to preserve — and must be deleted on re-mine."""
+        import mempalace.convo_miner as convo_miner
+
+        prior_meta = dict(self.CURRENT_SCHEMA)
+        prior_meta["chunk_index"] = 5
+        prior_id = "drawer_convos_conversations_orphan5"
+        # Content is blank — genuinely orphan.
+        col = _StoredCol({prior_id: ("", prior_meta)})
+
+        # New pass derives a fresh chunk.
+        chunks = [
+            {"content": "User: fresh topic after orphan cleanup", "chunk_index": 0},
+        ]
+        self._patch_helpers(monkeypatch, convo_miner)
+
+        drawers, _rooms, skipped = convo_miner._file_chunks_locked(
+            col, "shrink_me.txt", chunks, "convos", "conversations", "agent-under-test", "exchange"
+        )
+
+        assert skipped is False
+        assert drawers == 1
+        # The blank-content orphan must be gone.
+        assert prior_id not in col.alive(), (
+            "Blank-content orphan drawer was NOT purged — genuine orphans "
+            "with no verbatim content should be deleted"
+        )
+
+    # ------------------------------------------------------------------
+    # Rule 2 (deleted): prior drawer at OLDER schema (normalize_version <
+    # current) → PURGED (schema bump supersedes, matches existing develop
+    # test test_mine_convos_rebuilds_stale_drawers_after_schema_bump).
+    # ------------------------------------------------------------------
+
+    def test_stale_schema_drawer_purged_not_preserved(self, monkeypatch):
+        """A prior drawer at an older normalize_version (schema bump) must
+        still be purged — the additive-history preservation rule does NOT
+        rescue superseded-schema content."""
+        import mempalace.convo_miner as convo_miner
+
+        stale_content = (
+            "User: the old v1 schema said this text\n"
+            "AI: and it was filed with normalize_version 1\n"
+        )
+        stale_meta = dict(self.CURRENT_SCHEMA)
+        stale_meta["normalize_version"] = 1  # older than current (2)
+        stale_meta["chunk_index"] = 0
+        stale_id = "drawer_convos_conversations_v1"
+        col = _StoredCol({stale_id: (stale_content, stale_meta)})
+
+        # This pass derives a fresh chunk.
+        chunks = [{"content": "User: v2 schema new content", "chunk_index": 0}]
+        self._patch_helpers(monkeypatch, convo_miner)
+
+        drawers, _rooms, skipped = convo_miner._file_chunks_locked(
+            col, "shrink_me.txt", chunks, "convos", "conversations", "agent-under-test", "exchange"
+        )
+
+        assert skipped is False
+        assert drawers == 1
+        # The older-schema drawer must be purged regardless of its content.
+        assert stale_id not in col.alive(), (
+            "Older-schema (v1) drawer survived re-mine — schema-bump purge "
+            "must take precedence over additive-history preservation"
+        )
+
+    # ------------------------------------------------------------------
+    # Shared helper: monkeypatch the collaborators that ``_file_chunks_locked``
+    # calls so we don't need chromadb or real disk I/O.
+    # ------------------------------------------------------------------
+
+    def _patch_helpers(self, monkeypatch, convo_miner):
+        """Patch the minimum helper set required for ``_file_chunks_locked``
+        to run against a fake collection."""
+        import contextlib as _ctx
+
+        # file_already_mined: always False (we're re-mining a shrunk/changed file).
+        monkeypatch.setattr(
+            convo_miner,
+            "file_already_mined",
+            lambda collection, source_file, **kwargs: False,
+        )
+        # mine_lock: no-op context manager.
+        monkeypatch.setattr(
+            convo_miner,
+            "mine_lock",
+            lambda source_file: _ctx.nullcontext(),
+        )
+        # _detect_hall_cached: avoid real hall detection.
+        monkeypatch.setattr(
+            convo_miner,
+            "_detect_hall_cached",
+            lambda content: "conversations",
+        )
+        # assert_no_collisions: no-op (our fake col has no collisions).
+        from mempalace import palace as _palace_ns
+
+        monkeypatch.setattr(
+            _palace_ns,
+            "assert_no_collisions",
+            lambda proposed, collection: None,
+        )
