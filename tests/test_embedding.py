@@ -608,10 +608,8 @@ def test_minilm_ef_model_override_applies_thread_cap(monkeypatch):
     assert "CoreMLExecutionProvider" not in captured["providers"]
 
 
-def test_minilm_ef_model_override_falls_back_when_uncapped(monkeypatch):
-    """With no cap (0), the override must defer to the parent build via
-    ``super().model`` — not reach into ``cached_property`` internals (#1068
-    review). Proves super() resolves the parent descriptor without error."""
+def test_minilm_ef_model_override_leaves_threads_at_default_when_uncapped(monkeypatch):
+    """With no cap (0), the session keeps ORT's default intra-op pool (#1068)."""
     import onnxruntime as ort
 
     captured = {}
@@ -624,11 +622,10 @@ def test_minilm_ef_model_override_falls_back_when_uncapped(monkeypatch):
 
     ef_cls = embedding._build_ef_class()
     ef = ef_cls(preferred_providers=["CPUExecutionProvider"], intra_op_num_threads=0)
-    session = ef.model  # cap <= 0 → super().model (upstream builder)
+    session = ef.model
 
     assert session is not None
-    # Upstream leaves intra_op at ORT's default (0 = unset), confirming we
-    # deferred to it rather than applying our cap.
+    # 0 = unset: ORT picks its own pool size.
     assert captured["sess_options"].intra_op_num_threads == 0
 
 
@@ -682,6 +679,50 @@ def test_minilm_ef_serializes_runs_on_dml(monkeypatch):
 def test_minilm_ef_does_not_serialize_cpu_runs(monkeypatch):
     """The DirectML guard must leave concurrent-safe providers parallel."""
     assert _max_concurrent_forwards(monkeypatch, ["CPUExecutionProvider"], 4) > 1
+
+
+@pytest.mark.parametrize("threads", [0, 2])
+def test_minilm_ef_model_override_disables_cpu_mem_arena(monkeypatch, threads):
+    """#2685: the CPU arena keeps the high-water mark of the largest batch a
+    mine embeds, so a long-lived server never gives that memory back. The
+    session must be built with the arena off, capped or not."""
+    import onnxruntime as ort
+
+    captured = {}
+
+    def fake_session(model_path, providers=None, sess_options=None):
+        captured["sess_options"] = sess_options
+        return object()
+
+    monkeypatch.setattr(ort, "InferenceSession", fake_session)
+
+    ef_cls = embedding._build_ef_class()
+    ef = ef_cls(preferred_providers=["CPUExecutionProvider"], intra_op_num_threads=threads)
+    _ = ef.model
+
+    assert captured["sess_options"].enable_cpu_mem_arena is False
+
+
+def test_minilm_ef_model_override_falls_back_to_upstream_build(monkeypatch):
+    """If our session build raises, embedding still works through the parent
+    build via ``super().model`` (#1068 review)."""
+    import onnxruntime as ort
+
+    calls = []
+
+    def fake_session(model_path, providers=None, sess_options=None):
+        calls.append(sess_options)
+        if len(calls) == 1:
+            raise RuntimeError("upstream internals shifted")
+        return object()
+
+    monkeypatch.setattr(ort, "InferenceSession", fake_session)
+
+    ef_cls = embedding._build_ef_class()
+    ef = ef_cls(preferred_providers=["CPUExecutionProvider"], intra_op_num_threads=0)
+
+    assert ef.model is not None
+    assert len(calls) == 2
 
 
 def test_describe_device_uses_resolved_effective_device(monkeypatch):
