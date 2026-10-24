@@ -63,9 +63,11 @@ existing behavior. Content-date filtering would require a separate explicit API.
 
 ## Backfilling existing memory
 
-New conversation mines populate `authored_at` automatically. Drawers mined before this feature only have
-`filed_at`. Re-mining does **not** fix them — the scanner skips files already mined at the
-current `NORMALIZE_VERSION`. Two options:
+New conversation mines populate `authored_at` automatically. Drawers mined before this
+feature only have `filed_at`. Normal mining reprocesses legacy transcripts without a
+verified source fingerprint once; it skips unchanged, verified transcripts at the
+current normalization and chunker versions. For a metadata-only backfill or an explicit
+rebuild:
 
 1. **In-place backfill (recommended — no re-embedding).** `scripts/backfill_authored_at.py`
    reads each convos drawer's source transcript and updates only the `authored_at` metadata.
