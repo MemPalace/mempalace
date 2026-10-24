@@ -1,3 +1,5 @@
+import datetime
+import logging
 import os
 import pickle
 import shutil
@@ -1771,6 +1773,86 @@ def test_quarantine_stale_hnsw_leaves_healthy_segment_with_drift_alone(tmp_path)
     moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
     assert moved == []
     assert seg.exists()
+
+
+def _add_segment_write_history(palace, seg_name, created_at):
+    """Give the fixture palace a segments+embeddings schema with one write."""
+    con = sqlite3.connect(palace / "chroma.sqlite3")
+    try:
+        con.execute("CREATE TABLE segments (id TEXT, type TEXT, scope TEXT, collection TEXT)")
+        con.execute(
+            "CREATE TABLE embeddings (id TEXT, segment_id TEXT, embedding_id TEXT,"
+            " seq_id INTEGER, created_at TEXT)"
+        )
+        con.execute(
+            "INSERT INTO segments VALUES (?, 'urn:chroma:segment/vector/hnsw-local-persisted',"
+            " 'VECTOR', 'coll-1')",
+            (seg_name,),
+        )
+        con.execute(
+            "INSERT INTO embeddings VALUES ('e1', ?, 'emb-1', 1, ?)",
+            (seg_name, created_at),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def test_quarantine_stale_hnsw_skips_idle_segment_fresh_against_own_writes(tmp_path, caplog):
+    """A long-idle collection must not trip the staleness scan forever.
+
+    The shared chroma.sqlite3 mtime moves with EVERY collection's writes, so
+    a wing that has not been written in months looks perpetually stale
+    against it even though its segment is exactly as fresh as its own last
+    write allows. Baseline the comparison against the segment's own newest
+    embeddings row instead (production case: three wings tripping the
+    flush-lag log on every server start with 20-89 day gaps).
+    """
+    now = 1_700_000_000.0
+    idle_write = datetime.datetime.fromtimestamp(now - 90 * 86400, tz=datetime.timezone.utc)
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 90 * 86400,
+        sqlite_mtime=now,
+        meta_bytes=_HEALTHY_META,
+    )
+    _add_segment_write_history(palace, seg.name, idle_write.isoformat())
+
+    with caplog.at_level(logging.INFO, logger="mempalace.backends.chroma"):
+        moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert moved == []
+    assert seg.exists()
+    assert not any("mtime gap" in r.message for r in caplog.records), (
+        "idle segment tripped the flush-lag scan despite no writes since flush"
+    )
+
+
+def test_quarantine_stale_hnsw_still_trips_segment_lagging_its_own_writes(tmp_path, caplog):
+    """A segment older than its own last write still trips the scan.
+
+    Writes that sit in chroma's embeddings_queue below the sync threshold
+    are exactly the at-risk case (#1963): the segment file predates data
+    the collection has accepted, so the mtime-gap check must keep firing
+    even though the shared sqlite mtime is irrelevant here.
+    """
+    now = 1_700_000_000.0
+    recent_write = datetime.datetime.fromtimestamp(now - 60, tz=datetime.timezone.utc)
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=_HEALTHY_META,
+    )
+    _add_segment_write_history(palace, seg.name, recent_write.isoformat())
+
+    with caplog.at_level(logging.INFO, logger="mempalace.backends.chroma"):
+        moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert moved == []  # healthy metadata -> left in place
+    assert any("mtime gap" in r.message for r in caplog.records), (
+        "segment lagging its own writes did not trip the flush-lag scan"
+    )
 
 
 def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_path):
