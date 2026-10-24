@@ -135,7 +135,7 @@ def test_change_during_read_is_recovered_on_next_stable_mine(tmp_path, monkeypat
 
         def read(self, size=-1):
             nonlocal changed
-            if size != -1 or changed:
+            if changed:
                 return self.stream.read(size)
             prefix = self.stream.read(32)
             assert b"DECISION_OLD" in prefix
@@ -147,7 +147,7 @@ def test_change_during_read_is_recovered_on_next_stable_mine(tmp_path, monkeypat
                 ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 60_000_000_000),
             )
             changed = True
-            return prefix + self.stream.read()
+            return prefix + self.stream.read(-1 if size < 0 else max(0, size - len(prefix)))
 
     def changing_fdopen(fd, *args, **kwargs):
         file_stat = os.fstat(fd)
@@ -563,11 +563,11 @@ def test_io_failure_during_read_preserves_stored_snapshot(tmp_path, monkeypatch,
         def __exit__(self, *args):
             return self.stream.__exit__(*args)
 
-        def read(self):
+        def read(self, size=-1):
             if failure == "read":
                 failed.append(True)
                 raise OSError("injected transcript read failure")
-            return self.stream.read()
+            return self.stream.read(size)
 
         def fileno(self):
             failed.append(True)
@@ -665,7 +665,7 @@ def test_restored_mtime_rewrite_during_read_preserves_prior_drawers(tmp_path, mo
 
         def read(self, size=-1):
             nonlocal changed, changed_stat
-            if size != -1 or changed:
+            if changed:
                 return self.stream.read(size)
             prefix = self.stream.read(32)
             assert b"DECISION_OLD" in prefix
@@ -673,7 +673,7 @@ def test_restored_mtime_rewrite_during_read_preserves_prior_drawers(tmp_path, mo
             os.utime(source, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
             changed_stat = source.stat()
             changed = True
-            return prefix + self.stream.read()
+            return prefix + self.stream.read(-1 if size < 0 else max(0, size - len(prefix)))
 
     def rewriting_fdopen(fd, *args, **kwargs):
         file_stat = os.fstat(fd)

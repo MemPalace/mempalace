@@ -8,6 +8,7 @@ drawer removes its revisions too (``purge_drawer_revisions``).
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 from pathlib import Path
@@ -55,7 +56,12 @@ def append_drawer_revision(
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
         fd = os.open(str(path), flags, 0o600)
         try:
-            os.write(fd, line.encode("utf-8"))
+            remaining = memoryview(line.encode("utf-8"))
+            while remaining:
+                written = os.write(fd, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, "drawer revision write made no progress")
+                remaining = remaining[written:]
             os.fsync(fd)
         finally:
             os.close(fd)

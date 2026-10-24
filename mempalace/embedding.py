@@ -766,14 +766,14 @@ _EF_API_TIMEOUT = 120
 
 def _warn_if_external_embedding(url: str) -> None:
     """Warn once when an embedding URL would send document text off-machine."""
-    from mempalace.llm_client import endpoint_is_local
+    from mempalace.llm_client import endpoint_is_local, redact_secrets
 
     if not url or endpoint_is_local(url) or not first_time("embedding", "external-endpoint"):
         return
     logger.warning(
         "Embedding endpoint %s is outside the local network. "
         "Document text sent there leaves this machine.",
-        url,
+        redact_secrets(url),
     )
 
 
@@ -782,8 +782,14 @@ class EmbeddingAPIError(RuntimeError):
 
     Module-specific subclass mirroring ``llm_client.LLMError`` so callers can
     distinguish embedding-endpoint failures; subclasses ``RuntimeError`` so
-    existing ``except RuntimeError`` paths still catch it.
+    existing ``except RuntimeError`` paths still catch it. Like ``LLMError``,
+    its message is masked: the endpoint URL or its reply may carry a key.
     """
+
+    def __init__(self, message: str):
+        from mempalace.llm_client import redact_secrets
+
+        super().__init__(redact_secrets(message))
 
 
 class OpenAICompatEmbeddingFunction:
@@ -867,14 +873,18 @@ class OpenAICompatEmbeddingFunction:
         """
         import numpy as np
 
+        from mempalace.llm_client import ECHO_LIMIT
+
         if not isinstance(data, dict):
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned a non-object response: {data}"
+                f"Embedding API at {self._url} returned a non-object response: "
+                f"{str(data)[:ECHO_LIMIT]}"
             )
         rows = data.get("data")
         if not isinstance(rows, list):
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned no 'data' array: {data.get('error', data)}"
+                f"Embedding API at {self._url} returned no 'data' array: "
+                f"{str(data.get('error', data))[:ECHO_LIMIT]}"
             )
         if len(rows) != n:
             raise EmbeddingAPIError(

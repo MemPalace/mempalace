@@ -6,7 +6,7 @@ A Cursor IDE plugin that gives your agent a persistent memory system. Auto-regis
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - Cursor 1.7+ (plugin manifest schema requires it)
 
 ## Installation

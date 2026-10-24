@@ -156,10 +156,11 @@ class LLMError(RuntimeError):
     """Raised for any provider failure — transport, parse, auth, missing model.
 
     ``status`` is the HTTP status when the endpoint answered with an error.
+    The message is masked: an endpoint URL or reply may carry a key.
     """
 
     def __init__(self, message: str, status: Optional[int] = None):
-        super().__init__(message)
+        super().__init__(redact_secrets(message))
         self.status = status
 
 
@@ -307,29 +308,38 @@ def post_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
         detail = ""
         if e.code not in (401, 403):  # auth errors often echo the key back
             try:
-                detail = e.read().decode("utf-8", errors="replace")[:500]
+                detail = e.read().decode("utf-8", errors="replace")[:ECHO_LIMIT]
             except Exception:
                 pass
-        message = f"HTTP {e.code} from {url}: {detail or e.reason}"
-        raise LLMError(_redact(message), status=e.code) from e
+        raise LLMError(f"HTTP {e.code} from {url}: {detail or e.reason}", status=e.code) from e
     except (URLError, OSError, http.client.HTTPException) as e:
-        raise LLMError(_redact(f"Cannot reach {url}: {e}")) from e
+        raise LLMError(f"Cannot reach {url}: {e}") from e
     except json.JSONDecodeError as e:
-        raise LLMError(_redact(f"Malformed response from {url}: {e}")) from e
+        raise LLMError(f"Malformed response from {url}: {e}") from e
     except ValueError as e:  # an invalid or missing URL scheme
-        raise LLMError(_redact(f"Cannot reach {url}: {e}")) from e
+        raise LLMError(f"Cannot reach {url}: {e}") from e
 
 
 _SECRETS = (
     (re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}"), "sk-***"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+"), "Bearer ***"),
-    (re.compile(r"(?i)([?&](?:api[_-]?)?key=)[^&\s]+"), r"\1***"),
+    # user:password@ in a URL's authority
+    (re.compile(r"(//)[^/@\s]*@"), r"\1***@"),
+    (
+        re.compile(
+            r"(?i)([?&](?:(?:api[_-]?)?key|(?:access[_-]?)?token|secret|password|auth)=)[^&\s]+"
+        ),
+        r"\1***",
+    ),
     (re.compile(r"(?i)(api[_-]?key[\"'\s]*[:=]\s*[\"']?)[A-Za-z0-9._\-]{8,}"), r"\1***"),
 )
 
+# How much of an endpoint's own reply an error message repeats.
+ECHO_LIMIT = 500
 
-def _redact(text: str) -> str:
-    """Mask API keys an endpoint or URL may carry into an error message."""
+
+def redact_secrets(text: str) -> str:
+    """Mask API keys an endpoint, URL or echoed reply may carry into a message."""
     for pattern, replacement in _SECRETS:
         text = pattern.sub(replacement, text)
     return text
@@ -430,7 +440,7 @@ class OllamaProvider(LLMProvider):
             with urlopen(f"{self.endpoint}/api/tags", timeout=5) as resp:
                 data = json.loads(resp.read())
         except (URLError, HTTPError, OSError, json.JSONDecodeError) as e:
-            return False, f"Cannot reach Ollama at {self.endpoint}: {e}"
+            return False, redact_secrets(f"Cannot reach Ollama at {self.endpoint}: {e}")
         names = {m.get("name", "") for m in data.get("models", []) or []}
         # Ollama tags may or may not include ':latest' — accept either form
         wanted = {self.model, f"{self.model}:latest"}
@@ -548,10 +558,10 @@ class OpenAICompatProvider(LLMProvider):
         try:
             models = self.served_models()
         except (URLError, HTTPError, OSError, ValueError) as e:
-            return False, f"Cannot reach {self.endpoint}: {e}"
+            return False, redact_secrets(f"Cannot reach {self.endpoint}: {e}")
         if self.model == "auto":
             if not models:
-                return False, f"{self.endpoint} lists no models to pick from"
+                return False, redact_secrets(f"{self.endpoint} lists no models to pick from")
             self.model = models[0]
         elif models and self.model not in models:
             # A gateway may list only part of what it routes, or spell a model
@@ -561,7 +571,7 @@ class OpenAICompatProvider(LLMProvider):
                 "model %r is not in the list served at %s (%s); continuing. "
                 "Use --llm-model auto to follow the server.",
                 self.model,
-                self.endpoint,
+                redact_secrets(self.endpoint),
                 ", ".join(models[:8]),
             )
         return True, "ok"

@@ -554,7 +554,11 @@ def read_source_text(
     with os.fdopen(fd, "rb") as handle:
         if st.st_size > max_bytes:
             raise OSError(f"file too large ({st.st_size // (1024 * 1024)} MB)")
-        raw = handle.read()
+        # The file can grow after fstat. Bound the actual read as well, with
+        # one extra byte to distinguish an exact-limit file from overflow.
+        raw = handle.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise OSError(f"file too large (exceeds {max_bytes} bytes)")
         if source_metadata is not None:
             fingerprint = source_fingerprint(st)
             if source_fingerprint(os.fstat(handle.fileno())) != fingerprint:

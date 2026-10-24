@@ -16,5 +16,5 @@ extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 mempalace-core = { path = "../mempalace-core" }
-pyo3 = { version = "0.22", features = ["abi3-py39"] }
+pyo3 = { version = "0.22", features = ["abi3-py310"] }
 

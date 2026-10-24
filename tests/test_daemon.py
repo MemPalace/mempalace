@@ -1207,6 +1207,9 @@ def test_run_mine_source_adapter_dispatches_through_adapter_runner(tmp_path, mon
         "source_path": "/source",
         "palace_path": str(palace.resolve()),
         "dry_run": True,
+        "project": None,
+        "related_drawer_id": None,
+        "explicit_palace": False,
     }
     assert out == {
         "success": True,
@@ -1215,6 +1218,34 @@ def test_run_mine_source_adapter_dispatches_through_adapter_runner(tmp_path, mon
         "dry_run": True,
         "exit_code": 0,
     }
+
+
+def test_run_mine_source_adapter_keeps_the_cli_options(tmp_path, monkeypatch):
+    """A daemon adapter mine passes --palace, --wing and --related-drawer-id on.
+
+    Without the --palace flag the adapter resolves the knowledge graph as if no
+    palace was named, and can write facts into the home graph instead of the
+    named palace's own.
+    """
+    from mempalace import cli, service
+
+    received = {}
+    monkeypatch.setattr(cli, "mine_source_adapter", lambda **kwargs: received.update(kwargs))
+    palace = tmp_path / "palace"
+    service.run_mine(
+        {
+            "palace_path": str(palace),
+            "source": "/source",
+            "source_adapter": "media",
+            "wing": "photos",
+            "related_drawer_id": "drawer_x",
+            "explicit_palace": True,
+        }
+    )
+
+    assert received["explicit_palace"] is True
+    assert received["project"] == "photos"
+    assert received["related_drawer_id"] == "drawer_x"
 
 
 def test_run_mcp_tool_rejects_non_dict_arguments():

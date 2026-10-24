@@ -34,6 +34,10 @@ def cmd_mine(args):
             False,
         ),
         "include_subagents": bool(getattr(args, "include_subagents", False)),
+        "related_drawer_id": getattr(args, "related_drawer_id", None),
+        # The daemon names the palace in every job, so it cannot tell on its
+        # own whether --palace was given; the graph path depends on that.
+        "explicit_palace": bool(args.palace),
     }
     if source_adapter:
         payload["source_adapter"] = source_adapter
@@ -87,15 +91,9 @@ def cmd_mine(args):
                 source_path=args.dir,
                 palace_path=palace_path,
                 dry_run=args.dry_run,
-                explicit_palace=bool(args.palace),
-                **(
-                    {
-                        "project": getattr(args, "wing", None),
-                        "related_drawer_id": getattr(args, "related_drawer_id", None),
-                    }
-                    if source_adapter == "media"
-                    else {}
-                ),
+                project=payload["wing"],
+                related_drawer_id=payload["related_drawer_id"],
+                explicit_palace=payload["explicit_palace"],
             )
         except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
             print(f"mempalace: {exc}", file=sys.stderr)

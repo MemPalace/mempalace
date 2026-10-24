@@ -343,6 +343,78 @@ def test_raises_and_surfaces_server_error_body(monkeypatch):
         ef(["a"])
 
 
+# A configured endpoint can carry its credential in the URL itself.
+SECRET_URL = (
+    "https://user:hunter2pass@emb.example/v1"
+    "?key=SECRETKEY1&api_key=SECRETKEY2&access_token=SECRETKEY3"
+)
+URL_SECRETS = ("hunter2pass", "SECRETKEY1", "SECRETKEY2", "SECRETKEY3")
+
+
+def _assert_masked(text):
+    for secret in URL_SECRETS:
+        assert secret not in text, text
+    assert "emb.example" in text, text
+
+
+def _responding(body):
+    def respond(req, timeout=None):
+        return _FakeResp(json.dumps(body).encode())
+
+    return respond
+
+
+def test_transport_error_masks_endpoint_credentials(monkeypatch):
+    def boom(req, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("mempalace.llm_client.urlopen", boom)
+    ef = embedding.OpenAICompatEmbeddingFunction(SECRET_URL, "m")
+    with pytest.raises(embedding.EmbeddingAPIError) as raised:
+        ef(["a"])
+    _assert_masked(str(raised.value))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        [1, 2, 3],  # non-object response
+        {"error": {"message": "bad"}},  # no "data" array
+        {"data": []},  # wrong count
+    ],
+)
+def test_invalid_response_errors_mask_endpoint_credentials(monkeypatch, body):
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _responding(body))
+    ef = embedding.OpenAICompatEmbeddingFunction(SECRET_URL, "m")
+    with pytest.raises(embedding.EmbeddingAPIError) as raised:
+        ef(["a"])
+    _assert_masked(str(raised.value))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        ["Incorrect API key provided: sk-ECHOEDSECRET123"],  # non-object response
+        {"error": {"message": "Incorrect API key provided: sk-ECHOEDSECRET123"}},
+    ],
+)
+def test_echoed_response_body_is_masked(monkeypatch, body):
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _responding(body))
+    ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
+    with pytest.raises(embedding.EmbeddingAPIError) as raised:
+        ef(["a"])
+    assert "ECHOEDSECRET123" not in str(raised.value)
+    assert "Incorrect API key" in str(raised.value)
+
+
+def test_echoed_response_body_is_truncated(monkeypatch):
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _responding({"error": "x" * 5000}))
+    ef = embedding.OpenAICompatEmbeddingFunction("http://h", "m")
+    with pytest.raises(embedding.EmbeddingAPIError) as raised:
+        ef(["a"])
+    assert len(str(raised.value)) < 1000
+
+
 def test_get_embedding_function_caches_instance(monkeypatch):
     monkeypatch.setattr(
         "mempalace.config.MempalaceConfig", lambda *a, **k: _FakeCfg("http://h:8420", "small", "k")
