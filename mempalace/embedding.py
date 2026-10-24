@@ -317,16 +317,17 @@ def _build_ef_class():
 
         @cached_property
         def model(self):
-            # Upstream builds the InferenceSession with no intra-op thread cap,
-            # so ORT defaults its pool to the physical core count and a
-            # background mine pins every core. Rebuild the session the
-            # same way upstream does (same SessionOptions, same CoreML pruning,
-            # same model path) but with our cap applied. If upstream's
-            # internals shift, fall back to its uncapped build so embedding
-            # still works.
+            # Upstream builds the InferenceSession with ORT's defaults, which
+            # cost a long-lived process twice. There is no intra-op thread cap,
+            # so the pool defaults to the physical core count and a background
+            # mine pins every core. And the CPU memory arena is on: it
+            # grows to the largest batch a mine embeds and never shrinks, so a
+            # server keeps that high-water mark after every mine.
+            # Rebuild the session the same way upstream does (same
+            # SessionOptions, same CoreML pruning, same model path) with the
+            # arena off and our cap applied. If upstream's internals shift,
+            # fall back to its build so embedding still works.
             cap = getattr(self, "_intra_op_num_threads", 0)
-            if not cap or cap <= 0:
-                return super().model
             try:
                 ort = self.ort
                 providers = self._preferred_providers or ort.get_available_providers()
@@ -334,7 +335,9 @@ def _build_ef_class():
                 so = ort.SessionOptions()
                 so.log_severity_level = 3
                 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                so.intra_op_num_threads = cap
+                so.enable_cpu_mem_arena = False
+                if cap and cap > 0:
+                    so.intra_op_num_threads = cap
                 return ort.InferenceSession(
                     os.path.join(self.DOWNLOAD_PATH, self.EXTRACTED_FOLDER_NAME, "model.onnx"),
                     providers=providers,
@@ -342,7 +345,7 @@ def _build_ef_class():
                 )
             except Exception:
                 logger.warning(
-                    "thread-capped ORT session build failed; using ORT defaults",
+                    "custom ORT session build failed; using ORT defaults",
                     exc_info=True,
                 )
                 return super().model
