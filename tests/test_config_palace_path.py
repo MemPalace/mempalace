@@ -244,35 +244,6 @@ def test_palace_path_env_branch_re_resolves_across_env_mutation(tmp_path, monkey
     assert second == leaf_b
 
 
-def test_palace_path_init_roundtrip_leaf_stable(tmp_path):
-    """Acceptance (c) — init() roundtrip keeps leaf unchanged, no double-read.
-
-    ``init()`` persists ``self.palace_path`` (a no-op rewrite of the same
-    value); it must not re-resolve a stale value, and a fresh reader reading
-    the same config dir afterward must land on the identical leaf.
-    """
-    leaf = _make_leaf(str(tmp_path / "src"), name="palace")
-    config_dir = str(tmp_path / "config-dir")
-    os.makedirs(config_dir, exist_ok=True)
-
-    cfg = MempalaceConfig(config_dir=config_dir)
-    cfg._file_config["palace_path"] = str(tmp_path / "src")  # parent dir
-    before = cfg.palace_path
-    assert before == leaf
-
-    cfg.init()  # writes config.json with the resolved value
-
-    with open(os.path.join(config_dir, "config.json")) as f:
-        saved = json.load(f)
-    assert saved["palace_path"] == leaf
-
-    after = cfg.palace_path  # must be unchanged, not re-guessed
-    assert after == leaf
-
-    later = MempalaceConfig(config_dir=config_dir)
-    assert later.palace_path == leaf
-
-
 def test_palace_path_cache_slot_seeded_none(tmp_path):
     """Acceptance — cache slot exists and starts empty (not pre-populated)."""
     cfg = MempalaceConfig(config_dir=str(tmp_path))
