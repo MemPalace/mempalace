@@ -308,7 +308,7 @@ _EMBEDDINGGEMMA2_MAX_BATCH_SIZE = 1024
 _EMBEDDINGGEMMA2_MODALITIES = frozenset({"text", "text+vision", "text+audio", "all"})
 # ChromaDB writes its SQLite store under exactly this filename inside the
 # palace directory. It is the artifact the canonical-leaf normalisation uses
-# for sibling detection; see ``canonical_palace_path`` (#2404).
+# for sibling detection; see ``canonical_palace_path``.
 _CHROMA_SQLITE_NAME = "chroma.sqlite3"
 DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
 _MILVUS_CONSISTENCY_LEVELS = {
@@ -409,7 +409,7 @@ def canonical_palace_path(palace_path: str) -> str:
 
 
 def _resolve_palace_leaf(palace_path: str, _os=None, _pathmod=None) -> str:
-    """Return the canonical *leaf* palace directory for ``palace_path`` (#2404).
+    """Return the canonical *leaf* palace directory for ``palace_path``.
 
     A palace is the single directory that holds the ChromaDB SQLite store
     (``chroma.sqlite3``). When a caller names a *parent* directory whose
@@ -626,7 +626,7 @@ class MempalaceConfig:
         )
         self._file_config = {}
         # Instance cache for the canonicalised ``palace_path`` resolution
-        # (#2418 follow-up). ``None`` = not yet resolved; otherwise the
+        # ``None`` = not yet resolved; otherwise the
         # (source_path, canonical_leaf) pair. Seeded here, cleared by
         # ``_persist_file_config``. See the ``palace_path`` property for the
         # full caching / invalidation contract.
@@ -801,7 +801,7 @@ class MempalaceConfig:
             # A setter just rewrote config.json. If the resolved
             # ``palace_path`` came from the file-config branch it may now
             # disagree with disk, so drop the instance cache and let the next
-            # access re-resolve (#2418). A failed write leaves disk unchanged,
+            # access re-resolve. A failed write leaves disk unchanged,
             # so the cache is intentionally retained on the OSError path.
             self._palace_path_cache = None
         except OSError as exc:
@@ -827,10 +827,9 @@ class MempalaceConfig:
         Every resolution path (constructor override, env var, config file)
         is canonicalised through :func:`canonical_palace_path` so the reader
         always opens the leaf that actually holds the ChromaDB store, even
-        when the caller named a parent directory (#2404). See the helper for
+        when the caller named a parent directory. See the helper for
         the full invariant.
-        - Caching / invalidation contract (#2418, follow-up to AmirF194's
-          strace and re-review on b15cba2):
+        - Caching / invalidation contract:
 
         - The cache is written only when the *resolved* path already
           holds ``chroma.sqlite3``.  That state is definitive for the
@@ -839,7 +838,7 @@ class MempalaceConfig:
           ambiguous parent) is a **transient** observation — it is not
           memoized, so the next access re-probes on disk and picks up a
           leaf that a separate process created between the two reads.  This
-          is the split-brain window #2404 guarded against, and the
+          is the split-brain window guarded against, and the
           re-detection cost is one ``isfile`` on the resolved path per
           uninitialised access (no ``listdir`` once a leaf exists).
         - The cache is cleared independently by ``_persist_file_config``,
@@ -849,7 +848,7 @@ class MempalaceConfig:
           reads, and clearing the cache there would double-read).
         - ``search_config_fingerprint`` is orthogonal (own ``@lru_cache``).
 
-        Invariant preserved (per #2404, per Amir's re-review on b15cba2):
+        Invariant preserved:
         the reader still opens the same leaf the writer wrote to, even when
         that leaf appears for the first time via a separate process while
         the config is cached.
@@ -864,7 +863,7 @@ class MempalaceConfig:
         env_val = None
         if override is None:
             # Precedence: MEMPALACE_PALACE_PATH (documented, primary) >
-            # MEMPALACE_PALACE (short alias accepted per #2366/#2445) > MEMPAL_PALACE_PATH (legacy).
+            # MEMPALACE_PALACE (short alias accepted) > MEMPAL_PALACE_PATH (legacy).
             env_val = (
                 os.environ.get("MEMPALACE_PALACE_PATH")
                 or os.environ.get("MEMPALACE_PALACE")
