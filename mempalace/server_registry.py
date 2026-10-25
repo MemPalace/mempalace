@@ -30,10 +30,10 @@ import os
 from pathlib import Path
 
 from mempalace import paths
-from mempalace._env import env_str
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.fsio import atomic_write_text, read_published_bytes
 
+from .secret_env import SecretEnvError, read_secret_env
 from .timeutil import utc_now_z
 
 logger = logging.getLogger(__name__)
@@ -262,7 +262,13 @@ def load_server_tokens(palace_path: str) -> tuple[str, ...]:
     while an older generated palace credential remains on disk.
     """
     palace_token = _read_server_token_file(palace_path)
-    process_token = env_str(_TOKEN_ENV, "")
+    try:
+        process_token = (read_secret_env(_TOKEN_ENV) or "").strip()
+    except SecretEnvError as exc:
+        # A client-side fallback candidate, not the Hub's own auth: the palace
+        # credential above can still authenticate, so report and drop it.
+        logger.warning("Ignoring the process Hub token: %s", exc)
+        process_token = ""
     candidates = []
     for token in (palace_token, process_token):
         if token and token not in candidates:

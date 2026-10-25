@@ -117,22 +117,47 @@ def cmd_serve(args):
         )
         sys.exit(2)
 
-    # Token resolution. Explicit flag > existing env > the palace's stored token.
-    token = (args.token or env_str("MEMPALACE_MCP_HTTP_TOKEN", "")).strip()
+    # Token resolution. Explicit flag > existing env (the value, or the file
+    # MEMPALACE_MCP_HTTP_TOKEN_FILE names) > the palace's stored token.
+    from ..secret_env import SecretEnvError, read_secret_env, secret_file_env
+
+    token_env = "MEMPALACE_MCP_HTTP_TOKEN"
+    token_file_env = secret_file_env(token_env)
+    token = (args.token or "").strip()
+    # A file holding the token: handed to the server by path, so the value
+    # stays out of the server's environment (/proc/<pid>/environ) as well.
+    token_file = None
+    if not token:
+        try:
+            token = (read_secret_env(token_env) or "").strip()
+        except SecretEnvError as exc:
+            print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        raw_token_file = os.environ.get(token_file_env, "")
+        if token and raw_token_file.strip():
+            # The exact path read_secret_env opened, untrimmed, so the server
+            # reads the same file.
+            token_file = raw_token_file
     token_created = False
     tokenless = local_only or args.allow_insecure
     if not token and not tokenless:
         token, token_created = load_or_create_server_token(palace_path)
+        token_file = str(server_token_path(palace_path))
     token_path = server_token_path(palace_path)
 
     # Build the child environment. Token rides in the env (never argv) so it
-    # stays out of the process table.
+    # stays out of the process table. Exactly one form is passed: the server
+    # refuses to start when both are set.
     env = dict(os.environ)
     env["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:
         env["MEMPALACE_BACKEND"] = str(backend).strip().lower()
-    if token:
-        env["MEMPALACE_MCP_HTTP_TOKEN"] = token
+    env.pop(token_env, None)
+    env.pop(token_file_env, None)
+    if token_file:
+        env[token_file_env] = token_file
+    elif token:
+        env[token_env] = token
     if not token and not local_only and tokenless:
         env["MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN"] = "1"
 
@@ -166,7 +191,9 @@ def cmd_serve(args):
     print(f"  bind     : {host}:{port}  ({'loopback' if loopback else 'network-exposed'})")
     print(f"  tls      : {'on' if tls_cert else 'off (plaintext -- terminate TLS at a proxy)'}")
     print(f"  read-only: {'yes' if args.read_only else 'no'}")
-    if token and not args.token and not os.environ.get("MEMPALACE_MCP_HTTP_TOKEN"):
+    if token and not args.token and os.environ.get(token_file_env, "").strip():
+        print(f"  token    : {token_file}  (from {token_file_env})")
+    elif token and not args.token and not os.environ.get(token_env):
         state = "new, " if token_created else ""
         print(f"  token    : {token_path}  ({state}0600; local mempalace clients read it)")
     elif not token:
