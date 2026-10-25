@@ -47,6 +47,7 @@ from .fsio import (
     atomic_write_json as _atomic_write_json,
     read_json_for_update as _read_json_for_update,
     refuse_unparsed as _refuse_unparsed,
+    remove_abandoned_publish_temps as _remove_abandoned_publish_temps,
 )
 from .metadata_types import is_bookkeeping
 from .timeutil import utc_now_iso
@@ -158,6 +159,13 @@ def _load_hallways(config=None) -> list[dict]:
     return []
 
 
+# The names _save_hallways gave its temporary files while it used
+# tempfile.mkstemp (3.11 and earlier), and how long a temporary file must go
+# unmodified before a save treats it as abandoned.
+_LEGACY_TEMP_NAME = re.compile(r"\.hallways-[a-z0-9_]{8}\.tmp")
+_ABANDONED_TEMP_SECONDS = 600
+
+
 def _save_hallways(hallways: list[dict], config=None) -> None:
     """Atomically persist hallway records to the configured hallway file.
 
@@ -169,6 +177,15 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
     hallway_file = _get_hallway_file(config)
     directory = os.path.dirname(hallway_file)
     os.makedirs(directory, exist_ok=True)
+    # A save killed before its rename leaves a partial copy of the whole file,
+    # hundreds of MB on a large palace, and no later save reuses its name.
+    # Callers hold the hallway-file lock, so no other save of this file is
+    # running; the age check also spares a writer outside that lock.
+    removed = _remove_abandoned_publish_temps(
+        hallway_file, older_than=_ABANDONED_TEMP_SECONDS, legacy=_LEGACY_TEMP_NAME
+    )
+    if removed:
+        logger.info("Removed %d unfinished hallway save(s) next to %s", removed, hallway_file)
     payload = {
         "schema_version": _SCHEMA_VERSION,
         "hallways": list(hallways),

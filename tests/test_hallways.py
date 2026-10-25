@@ -11,6 +11,8 @@ This file is RED-first. The corresponding implementation lives in
 
 import itertools
 import json
+import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -87,6 +89,38 @@ class TestHallwayStorage:
         ]
         hallways_mod._save_hallways(sample)
         assert hallways_mod._load_hallways() == sample
+
+    def test_save_removes_the_temporary_files_of_saves_that_were_killed(
+        self, tmp_path, monkeypatch
+    ):
+        """A save killed before its rename leaves a partial copy of the whole
+        file, and none of these names is ever reused, so they piled up at
+        hundreds of MB each on a large palace (#2756). The next save removes
+        the ones nothing has written to for ten minutes, including the
+        ``tempfile.mkstemp`` names 3.11 and earlier left, and keeps a fresh one,
+        which may be a save still in progress."""
+        _use_tmp_hallway_file(monkeypatch, tmp_path)
+        an_hour_ago = time.time() - 3600
+        abandoned = [
+            tmp_path / "hallways.json.tmp-4242",
+            tmp_path / ".hallways.json.0123456789ab.tmp",
+            tmp_path / ".hallways-k3j_x9q2.tmp",
+        ]
+        for leftover in abandoned:
+            leftover.write_text('{"schema_version": 1, "hallw', encoding="utf-8")
+            os.utime(leftover, (an_hour_ago, an_hour_ago))
+        in_progress = tmp_path / "hallways.json.tmp-4343"
+        in_progress.write_text('{"schema_version": 1, "hallw', encoding="utf-8")
+        tunnels_leftover = tmp_path / "tunnels.json.tmp-4242"
+        tunnels_leftover.write_text("{", encoding="utf-8")
+        os.utime(tunnels_leftover, (an_hour_ago, an_hour_ago))
+
+        hallways_mod._save_hallways([])
+
+        assert [p.name for p in abandoned if p.exists()] == []
+        assert in_progress.exists()
+        assert tunnels_leftover.exists()  # another file's temporaries are not this save's
+        assert hallways_mod._load_hallways() == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

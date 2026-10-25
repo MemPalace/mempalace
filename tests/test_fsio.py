@@ -9,7 +9,11 @@ the temporary file must leave the destination byte-for-byte as it was.
 import errno
 import json
 import os
+import re
 import stat
+import subprocess
+import sys
+import time
 
 import pytest
 
@@ -152,6 +156,90 @@ def test_crash_before_replace_does_not_truncate(tmp_path, monkeypatch):
 
     assert dest.read_bytes() == original
     assert [p.name for p in tmp_path.iterdir()] == ["marker.json"]
+
+
+def test_a_publish_killed_before_the_rename_leaves_a_temp_file_the_sweep_removes(tmp_path):
+    """A writer killed between filling its temporary file and the rename runs no
+    cleanup, so the file stays, and no later publish reuses its randomly chosen
+    name (#2756). Once nothing has modified it for ``older_than`` seconds the sweep
+    removes it; before that it may be a live writer's, so it stays."""
+    dest = tmp_path / "state.json"
+    dest.write_text('{"old": 1}', encoding="utf-8")
+    killed_mid_publish = (
+        "import os, sys\n"
+        "from mempalace import fsio\n"
+        "fsio._replace = lambda tmp, path: os._exit(9)\n"
+        "fsio.atomic_write_json(sys.argv[1], {'new': ['x'] * 1000})\n"
+    )
+    child = subprocess.run([sys.executable, "-c", killed_mid_publish, str(dest)])
+    assert child.returncode == 9
+    (leftover,) = [p for p in tmp_path.iterdir() if p.name != "state.json"]
+    assert leftover.name.startswith(".state.json.") and leftover.name.endswith(".tmp")
+
+    assert fsio.remove_abandoned_publish_temps(dest, older_than=600) == 0
+    assert leftover.exists()
+
+    an_hour_ago = time.time() - 3600
+    os.utime(leftover, (an_hour_ago, an_hour_ago))
+    assert fsio.remove_abandoned_publish_temps(dest, older_than=600) == 1
+    assert not leftover.exists()
+    assert json.loads(dest.read_text(encoding="utf-8")) == {"old": 1}
+
+
+def test_abandoned_temp_sweep_touches_only_this_files_temporaries(tmp_path):
+    dest = tmp_path / "state.json"
+    an_hour_ago = time.time() - 3600
+    removed = [".state.json.0123456789ab.tmp", "state.json.tmp-77", ".state-abc.tmp"]
+    kept = [
+        "state.json.tmp-backup",
+        "state.json.tmp-",
+        "state.json.tmp-77.bak",
+        ".state.json.xyz.tmp",
+        "other.json.tmp-77",
+        "notes.tmp",
+        "state.json",
+    ]
+    for name in removed + kept:
+        (tmp_path / name).write_text("x", encoding="utf-8")
+        os.utime(tmp_path / name, (an_hour_ago, an_hour_ago))
+    target = tmp_path / "kept-target"
+    target.write_text("x", encoding="utf-8")
+    link = tmp_path / "state.json.tmp-78"
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        pass  # no symlink privilege (Windows)
+    else:
+        kept.append(link.name)
+        # Age the link itself where the platform can (not on Windows); a
+        # fresh link is kept by the age check alone.
+        if os.utime in os.supports_follow_symlinks:
+            os.utime(link, (an_hour_ago, an_hour_ago), follow_symlinks=False)
+
+    legacy = re.compile(r"\.state-[a-z]{3}\.tmp")
+    assert fsio.remove_abandoned_publish_temps(dest, older_than=600, legacy=legacy) == 3
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(kept + ["kept-target"])
+
+
+def test_abandoned_temp_sweep_follows_a_symlinked_destination(tmp_path):
+    """``atomic_publish`` writes next to the file a symlink points at, so that is
+    where its temporaries are left and where the sweep must look."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "state.json").write_text("{}", encoding="utf-8")
+    link = tmp_path / "state.json"
+    try:
+        os.symlink(real_dir / "state.json", link)
+    except (OSError, NotImplementedError):
+        pytest.skip("no symlink privilege")
+    leftover = real_dir / "state.json.tmp-77"
+    leftover.write_text("{", encoding="utf-8")
+    an_hour_ago = time.time() - 3600
+    os.utime(leftover, (an_hour_ago, an_hour_ago))
+
+    assert fsio.remove_abandoned_publish_temps(link, older_than=600) == 1
+    assert not leftover.exists()
 
 
 def test_successful_json_replace_is_complete_and_private(tmp_path):
