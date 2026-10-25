@@ -1,0 +1,4 @@
+neo4j
+python-dotenv
+watchdog
+pytest
