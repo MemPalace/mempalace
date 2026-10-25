@@ -16,6 +16,8 @@ def drawer_palace(monkeypatch, config, collection, kg):
     from mempalace import mcp_server
 
     _patch_mcp_server(monkeypatch, config, kg)
+    now = _Clock.at
+    monkeypatch.setattr(mcp_server, "_now", lambda: now)
     monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
     monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
     return mcp_server, collection
@@ -93,6 +95,12 @@ def _payload(drawer_id, content, metadata, *, chunk_ids=None):
         "content": content,
         "wing": metadata.get("wing", ""),
         "room": metadata.get("room", ""),
+        "salience": {
+            "strength": 1.0,
+            "stability": 1.0,
+            "last_activated": metadata["filed_at"],
+            "access_count": 0,
+        },
         "metadata": metadata,
     }
     if chunk_ids is not None:
