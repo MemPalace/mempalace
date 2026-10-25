@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 
 import pytest
+from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.config import (
     MempalaceConfig,
@@ -17,7 +18,6 @@ from mempalace.config import (
     sanitize_name,
     sqlite_read_uri,
 )
-from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 
 def _set_home(monkeypatch, home):

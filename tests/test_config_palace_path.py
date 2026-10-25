@@ -1,14 +1,15 @@
 """Tests for palace_path tilde expansion in MempalaceConfig."""
 
 import json
-import os
 import ntpath
+import os
 import tempfile
 from unittest import mock
+
 from mempalace.config import (
     MempalaceConfig,
-    canonical_palace_path,
     _resolve_palace_leaf,
+    canonical_palace_path,
 )
 
 
