@@ -1070,7 +1070,48 @@ def test_wing_from_transcript_path_fallback_collapses_worktree():
     assert _wing_from_transcript_path(non_worktree_path) == "gsd_core"
 
 
+def test_wing_from_transcript_path_fallback_collapses_dot_worktrees():
+    """``<project>/.worktrees/<wt>`` flattens to ``--worktrees-<wt>``; before the
+    fix the fallback kept the worktree slug, so every branch got its own wing."""
+    worktree_path = "/Users/u/.claude/projects/-Users-u-dev-webui-app--worktrees-737-list-table-drop-unused/x.jsonl"
+    assert _wing_from_transcript_path(worktree_path) == "webui_app"
+
+
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
+
+
+def test_wing_from_transcript_path_cwd_collapses_dot_worktrees(tmp_path):
+    """A cwd inside ``<project>/.worktrees/<wt>`` files under <project>, same as
+    ``.claude/worktrees/``."""
+    project_dir = tmp_path / "-Users-me-dev-webui-app--worktrees-42-fix-login"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/dev/webui-app/.worktrees/42-fix-login","content":"hi"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "webui_app"
+
+
+def test_wing_from_transcript_path_cwd_uses_project_wings_override(tmp_path, monkeypatch):
+    """A ``project_wings`` entry keeps a renamed folder (and its worktrees) in
+    the configured wing instead of one named after the new folder."""
+    cfg_dir = tmp_path / "cfg"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.json").write_text(
+        json.dumps({"project_wings": {"/Users/me/nd/console": "nodeum-console"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(cfg_dir))
+    for cwd in ("/Users/me/nd/console", "/Users/me/nd/console/.worktrees/42-fix-login"):
+        transcript = tmp_path / f"{abs(hash(cwd))}.jsonl"
+        transcript.write_text(json.dumps({"type": "user", "cwd": cwd}) + "\n", encoding="utf-8")
+        assert _wing_from_transcript_path(str(transcript)) == "nodeum_console"
+    other = tmp_path / "other.jsonl"
+    other.write_text(
+        json.dumps({"type": "user", "cwd": "/Users/me/nd/console-old"}) + "\n", encoding="utf-8"
+    )
+    assert _wing_from_transcript_path(str(other)) == "console_old"
 
 
 def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):

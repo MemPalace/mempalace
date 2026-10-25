@@ -1458,6 +1458,21 @@ class MempalaceConfig:
         return max(1, parsed)
 
     @property
+    def project_wings(self):
+        """``{project_dir: name}`` overrides for the project name hooks derive
+        from a session's cwd, so a renamed folder keeps filing into its old
+        wing. Keys may start with ``~``. Reads the ``project_wings`` file key.
+        """
+        raw = self._file_config.get("project_wings")
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            os.path.expanduser(str(directory)).replace("\\", "/").rstrip("/"): str(name)
+            for directory, name in raw.items()
+            if directory and name
+        }
+
+    @property
     def hallway_min_count(self):
         """Minimum co-occurrence count required to materialize a within-wing
         hallway between two entities.
