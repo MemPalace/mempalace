@@ -810,6 +810,24 @@ def test_entity_metadata_finds_cyrillic_names(monkeypatch):
     assert "Михаил" in result, f"Cyrillic name not found in entity metadata: {result!r}"
 
 
+def test_entity_metadata_applies_locale_stopwords(monkeypatch):
+    """Per-drawer extraction must drop the configured locale's stopwords (#2811)."""
+    import mempalace.palace as palace_mod
+    from mempalace.miner import _extract_entities_for_metadata
+
+    monkeypatch.setattr(palace_mod, "_CANDIDATE_RX_CACHE", None)
+    monkeypatch.setattr(palace_mod, "_LOCALE_STOPWORDS_CACHE", None)
+    monkeypatch.setattr(
+        "mempalace.config.MempalaceConfig.entity_languages",
+        property(lambda self: ("pt-br",)),
+    )
+
+    content = "Ele chegou. Não sei. Joana falou. Ele saiu. Não volta. Joana riu."
+    result = set(_extract_entities_for_metadata(content).split(";"))
+    assert "Joana" in result
+    assert not {"Ele", "Não"} & result, result
+
+
 def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     """Per-drawer entity tagging must mirror init-time case-insensitive matching.
 

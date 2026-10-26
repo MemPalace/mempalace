@@ -38,6 +38,7 @@ from .palace import (
     MineValidationError,
     StaleDrawerPurgeFailed,
     _candidate_entity_words,
+    _locale_entity_stopwords,
     _open_collection_or_explain,
     _validate_palace_fts5_after_mine,
     build_closet_lines,
@@ -1105,6 +1106,7 @@ def _extract_entities_for_metadata(content: str) -> str:
             matched.add(name)
 
     coca_filter = _get_coca_filter()
+    locale_stopwords = _locale_entity_stopwords()
     window = content[:_ENTITY_EXTRACT_WINDOW]
     # Known-systems compound pre-pass. Detects
     # multi-word product names atomically and masks them from the window so
@@ -1115,7 +1117,7 @@ def _extract_entities_for_metadata(content: str) -> str:
     words = _candidate_entity_words(working_window)
     freq: dict = dict(compound_counts)
     for w in words:
-        if w in _ENTITY_STOPLIST:
+        if w in _ENTITY_STOPLIST or w.lower() in locale_stopwords:
             continue
         # Drop common English content words
         # ("Code", "Line", "Note", "Phase", …) from per-drawer entity
