@@ -14,7 +14,7 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
     e.g. the sweeper's ``ingest_mode="sweep"`` rows -- must not match: the
     legacy-compat rule otherwise scoops every sweeper drawer for a shared
     transcript into convo_miner's default "exchange" purge/idempotency
-    scope and silently deletes them on the very next re-mine (#104).
+    scope and silently deletes them on the very next re-mine.
     """
     if extract_mode is None:
         return True
@@ -29,15 +29,34 @@ def _metadata_matches_extract_mode(meta: dict, extract_mode: Optional[str]) -> b
 def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
     """True when a drawer was filed by the current pipeline for its scope.
 
-    Pre-v2 drawers have no ``normalize_version`` and count as stale. In the
-    exchange scope a missing ``convo_chunker_version`` is stale too, so a
-    chunker fix re-mines conversation files without touching project files.
+    Pre-v2 drawers have no ``normalize_version`` and count as stale. In a
+    convo scope with a ``CHUNKER_VERSIONS`` entry a missing or older stamp
+    is stale too, so a chunker fix re-mines conversation files without
+    touching project files.
     """
     if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
         return False
-    if extract_mode == "exchange":
-        return meta.get("convo_chunker_version", 1) >= CONVO_CHUNKER_VERSION
+    if extract_mode in CHUNKER_VERSIONS:
+        key, current = CHUNKER_VERSIONS[extract_mode]
+        return meta.get(key, 1) >= current
     return True
+
+
+def _is_plain_number(value) -> bool:
+    # NaN compares unequal to itself and would never prove a match.
+    return isinstance(value, (int, float)) and value == value
+
+
+def _is_comparable(meta: dict, extract_mode: Optional[str] = None) -> bool:
+    """True when every value the mined-set checks compare is a plain number.
+
+    A source with any other value is "unprovable": every check answers "not
+    mined" for it, whatever order its rows come back in.
+    """
+    keys = ["normalize_version", "source_mtime", "chunk_total"]
+    if extract_mode in CHUNKER_VERSIONS:
+        keys.append(CHUNKER_VERSIONS[extract_mode][0])
+    return all(meta.get(key) is None or _is_plain_number(meta[key]) for key in keys)
 
 
 # Every metadata key the mined-set checks below read.
@@ -49,7 +68,7 @@ _MINED_SCAN_KEYS = (
     "ingest_mode",
     "normalize_version",
     "convo_chunker_version",
-    "content_hash",
+    "general_extractor_version",
     "wing",
 )
 
@@ -61,6 +80,11 @@ class MinedSetUnavailable(RuntimeError):
     "not mined yet" and "no duplicate", which cannot be told apart from a
     complete answer, so a mine would re-file sources or write duplicates blind.
     """
+
+
+# A file that fails is recorded and the mine moves on; these mean the palace
+# or the run is unusable, so every miner aborts on them instead.
+MINE_ABORTS = (BackendError, CollisionError, MineAlreadyRunning, MinedSetUnavailable)
 
 
 def _fast_collection_metadata(collection, keys, require_key=None, equals=None):
@@ -81,17 +105,16 @@ def _fast_collection_metadata(collection, keys, require_key=None, equals=None):
     return None
 
 
-def _scan_collection_metadata(collection, keys, absorb, reset, require_key=None) -> None:
+def _scan_collection_metadata(collection, keys, absorb, reset) -> None:
     """Feed every drawer's metadata to ``absorb``: completely, or raise.
 
     The fast sqlite read goes first. If it fails partway, what it gathered is
-    discarded through ``reset`` and the collection is paged instead, where
-    ``require_key`` is only a hint the caller re-checks. If paging fails too,
-    :class:`MinedSetUnavailable` stops the caller.
+    discarded through ``reset`` and the collection is paged instead. If paging
+    fails too, :class:`MinedSetUnavailable` stops the caller.
     """
-    from ..backends.chroma import MetadataRecoveryPending
+    from ..backends.chroma_sqlite import MetadataRecoveryPending
 
-    fast = _fast_collection_metadata(collection, keys, require_key)
+    fast = _fast_collection_metadata(collection, keys)
     if fast is not None:
         try:
             for meta in fast:
@@ -139,8 +162,8 @@ def file_already_mined(
       - no drawers exist for this source_file
       - the stored `normalize_version` is missing or older than the current
         schema (triggers silent rebuild after a normalization upgrade), or,
-        for extract_mode="exchange", the stored `convo_chunker_version` is
-        missing or older than CONVO_CHUNKER_VERSION
+        for a convo extract_mode in CHUNKER_VERSIONS, its chunker stamp is
+        missing or older than the current revision
       - `check_mtime=True` and the file's mtime differs from the stored one
 
     When check_mtime=True (used by the project miner, and by the convo
@@ -160,73 +183,73 @@ def file_already_mined(
     for the same source transcript. Legacy drawers without extract_mode are
     treated as exchange-mode drawers.
 
-    A drawer whose metadata carries ``chunk_total`` (see #21) is only
+    A drawer whose metadata carries ``chunk_total`` is only
     counted toward a match once its stored_mtime group has accumulated at
     least that many drawers -- guarding against a mid-file crash between
     upsert batches, where the surviving drawers share the current mtime
     (the file itself was never touched) but are short of the full set. A
     drawer with no ``chunk_total`` (legacy rows, or a single-shot
     ``add_drawer()`` call with no partial-batch risk) is trusted on its own,
-    exactly as before.
+    exactly as before. A group is complete once it holds the largest
+    ``chunk_total`` any of its drawers names, the rule
+    :func:`prefetch_mined_set` and :func:`prefetch_complete_mtimes` use too.
+
+    Raises :class:`MinedSetUnavailable` when the palace cannot be read: a
+    read error that answered False would re-file the source as unmined.
     """
-    try:
-        # Under the additive-mining model, a single ``source_file`` can have
-        # multiple ``parent_drawer_id`` groups in the palace — one per
-        # mining pass — each with its own stored ``source_mtime`` and
-        # ``normalize_version``. The function must return True if ANY stored
-        # group is current (matching version + matching mtime when checked),
-        # because ChromaDB's ``get(..., limit=1)`` has undefined ordering
-        # across multiple matching rows: a ``limit=1`` shortcut picks
-        # whichever row ChromaDB orders first and only checks that one,
-        # causing spurious re-mines whenever the stale group is returned.
-        # Iterating via the same paginated pattern used in the
-        # extract_mode-is-set branch lets the function short-circuit on the
-        # first matching group regardless of ordering.
-        current_mtime = os.path.getmtime(source_file) if check_mtime else None
-        offset = 0
-        # Tracks, per matching stored_mtime group, how many drawers have
-        # been seen so far toward that group's own chunk_total (#21).
-        group_counts: dict = {}
-        while True:
+    current_mtime = None
+    if check_mtime:
+        try:
+            current_mtime = os.path.getmtime(source_file)
+        except OSError:
+            return False
+    # A source can hold several stored groups, one per mining pass, so every
+    # matching drawer is walked and the answer is decided after the walk:
+    # get() ordering is undefined. Per stored_mtime group: [drawers seen,
+    # largest chunk_total, whether some drawer has no chunk_total].
+    groups: dict = {}
+    unprovable = False
+    offset = 0
+    while True:
+        try:
             results = collection.get(
                 where={"source_file": source_file},
                 limit=1000,
                 offset=offset,
                 include=["metadatas"],
             )
-            ids = results.get("ids") or []
-            metadatas = results.get("metadatas") or []
-            for meta in metadatas:
-                meta = meta or {}
-                # extract_mode scoping (was the existing ``else`` branch):
-                if extract_mode is not None and not _metadata_matches_extract_mode(
-                    meta, extract_mode
-                ):
-                    continue
-                if not _meta_is_current(meta, extract_mode):
-                    continue
-                if not check_mtime:
-                    return True
-                stored_mtime = meta.get("source_mtime")
-                if stored_mtime is None:
-                    continue
-                if abs(float(stored_mtime) - current_mtime) >= 0.001:
-                    continue
-                chunk_total = meta.get("chunk_total")
-                if chunk_total is None:
-                    # No completion marker on this drawer — can't verify
-                    # completeness for its group, trust the match as before.
-                    return True
-                seen = group_counts.get(stored_mtime, 0) + 1
-                group_counts[stored_mtime] = seen
-                if seen >= chunk_total:
-                    return True
-            if not ids:
-                break
-            offset += len(ids)
+        except Exception as exc:
+            raise MinedSetUnavailable(
+                f"could not read whether {source_file} is already mined; stopping "
+                f"rather than filing it again ({exc!r})"
+            ) from exc
+        ids = results.get("ids") or []
+        for meta in results.get("metadatas") or []:
+            meta = coerce_metadata_types(meta or {})
+            if extract_mode is not None and not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            if not _is_comparable(meta, extract_mode):
+                unprovable = True
+                continue
+            if not _meta_is_current(meta, extract_mode):
+                continue
+            stored_mtime = meta.get("source_mtime")
+            if check_mtime and (stored_mtime is None or abs(stored_mtime - current_mtime) >= 0.001):
+                continue
+            chunk_total = meta.get("chunk_total")
+            entry = groups.setdefault(stored_mtime, [0, 0, False])
+            entry[0] += 1
+            if chunk_total is None:
+                # No completion marker (legacy rows, sentinels): trusted.
+                entry[2] = True
+            else:
+                entry[1] = max(entry[1], chunk_total)
+        if not ids:
+            break
+        offset += len(ids)
+    if unprovable:
         return False
-    except Exception:
-        return False
+    return any(untracked or seen >= largest for seen, largest, untracked in groups.values())
 
 
 # Above this many candidate files, one filtered get costs more round trips
@@ -257,8 +280,8 @@ def prefetch_mined_set(
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
 
-    Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule
-    (#2183): a source that only has a mid-file partial (surviving drawers
+    Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule:
+    a source that only has a mid-file partial (surviving drawers
     share the current mtime but are short of ``chunk_total``) is **omitted**
     from the result so the bulk skip path re-mines instead of permanently
     stranding the missing exchanges. Drawers with no ``chunk_total``
@@ -279,32 +302,40 @@ def prefetch_mined_set(
     omitted, the behaviour is unchanged: a bulk sweep still benefits more
     from one full scan than from many filtered queries.
     """
-    # Per source_file: per stored_mtime group → count + optional chunk_total.
-    # A source is only "mined" once some group is complete.
+    # Per source_file: per stored_mtime group -> [count, largest chunk_total,
+    # whether some drawer has no chunk_total]. A source is only "mined" once
+    # some group is complete, and never while any of its rows is unprovable.
     groups: dict[str, dict] = {}
+    unprovable: set = set()
+
+    def _reset():
+        groups.clear()
+        unprovable.clear()
 
     def _absorb(meta):
-        meta = meta or {}
+        meta = coerce_metadata_types(meta or {})
         src = meta.get("source_file")
         if not src:
             return
         if not _metadata_matches_extract_mode(meta, extract_mode):
             return
+        if not _is_comparable(meta, extract_mode):
+            unprovable.add(src)
+            return
         if not _meta_is_current(meta, extract_mode):
             return
         stored_mtime = meta.get("source_mtime")
         mtime_key = float(stored_mtime) if stored_mtime is not None else None
-        entry = groups.setdefault(src, {}).setdefault(mtime_key, {"count": 0, "chunk_total": None})
-        entry["count"] += 1
+        entry = groups.setdefault(src, {}).setdefault(mtime_key, [0, 0, False])
+        entry[0] += 1
         chunk_total = meta.get("chunk_total")
-        if chunk_total is not None:
-            try:
-                entry["chunk_total"] = int(chunk_total)
-            except (TypeError, ValueError):
-                pass
+        if chunk_total is None:
+            entry[2] = True
+        else:
+            entry[1] = max(entry[1], chunk_total)
 
     def _scan_all():
-        _scan_collection_metadata(collection, _MINED_SCAN_KEYS, _absorb, groups.clear)
+        _scan_collection_metadata(collection, _MINED_SCAN_KEYS, _absorb, _reset)
 
     if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
         if source_files:
@@ -325,20 +356,18 @@ def prefetch_mined_set(
                     offset += len(ids)
             except Exception:
                 logger.warning("prefetch_mined_set: scoped fetch failed; scanning")
-                groups.clear()
+                _reset()
                 _scan_all()
     else:
         _scan_all()
 
     mined: dict[str, Optional[float]] = {}
     for src, by_mtime in groups.items():
-        for mtime_key, entry in by_mtime.items():
-            chunk_total = entry["chunk_total"]
-            if chunk_total is None:
-                # Legacy / registry: no completion marker — trust membership.
-                mined[src] = mtime_key
-                break
-            if entry["count"] >= chunk_total:
+        if src in unprovable:
+            continue
+        for mtime_key, (count, largest, untracked) in by_mtime.items():
+            # Legacy / registry rows carry no completion marker: trusted.
+            if untracked or count >= largest:
                 mined[src] = mtime_key
                 break
     return mined
@@ -348,14 +377,9 @@ def prefetch_mined_set(
 _PROJECT_MINED_KEYS = ("source_file", "source_mtime", "chunk_total", "normalize_version")
 
 
-def _is_plain_number(value) -> bool:
-    # NaN compares unequal to itself and would never prove a match.
-    return isinstance(value, (int, float)) and value == value
-
-
 def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tuple]]:
     """``source_file -> stored mtimes of its complete drawer groups``, in one
-    sqlite pass, for the project miner's skip check (#2684).
+    sqlite pass, for the project miner's skip check.
 
     ``file_already_mined(collection, src, check_mtime=True)`` costs one
     ``get(where={"source_file": src})`` per file, ~0.1 s on a 1M-drawer
@@ -382,25 +406,21 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
     # whether some drawer has no chunk_total].
     groups: dict[str, dict] = {}
     unprovable: set = set()
-    from ..backends.chroma import MetadataRecoveryPending
+    from ..backends.chroma_sqlite import MetadataRecoveryPending
 
     try:
         for meta in rows:
-            meta = meta or {}
+            meta = coerce_metadata_types(meta or {})
             src = meta.get("source_file")
             if src not in wanted or src in unprovable:
+                continue
+            if not _is_comparable(meta):
+                unprovable.add(src)
+                groups.pop(src, None)
                 continue
             version = meta.get("normalize_version", 1)
             stored_mtime = meta.get("source_mtime")
             chunk_total = meta.get("chunk_total")
-            if not (
-                _is_plain_number(version)
-                and (stored_mtime is None or _is_plain_number(stored_mtime))
-                and (chunk_total is None or _is_plain_number(chunk_total))
-            ):
-                unprovable.add(src)
-                groups.pop(src, None)
-                continue
             if version < NORMALIZE_VERSION or stored_mtime is None:
                 # file_already_mined() skips this drawer without counting it.
                 continue
@@ -426,72 +446,3 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
         if mtimes:
             complete[src] = mtimes
     return complete
-
-
-def prefetch_content_hashes(
-    collection, extract_mode: Optional[str] = None
-) -> dict[tuple[str, str], str]:
-    """Pre-fetch (wing, content_hash) -> source_file for drawers already
-    filed at the current NORMALIZE_VERSION, in one bulk pass.
-
-    Repeated exports from Claude/ChatGPT land under a new filename each run
-    (timestamped bundle, regenerated slug, etc.) even when the conversation
-    itself hasn't changed. `prefetch_mined_set` only recognizes a file as
-    already-mined by its exact path, so the same conversation re-exported
-    under a new path always looked "new" and got re-mined as a duplicate
-    drawer. This does the same bulk scan but keyed on the SHA-256 of the
-    normalized transcript text, so the convo miner can recognize "this exact
-    conversation is already filed under a different path" and skip it.
-
-    Keyed by (wing, content_hash) rather than content_hash alone — mining
-    the same transcript into a second wing is a deliberate re-file, not a
-    duplicate, and should produce real drawers in that wing rather than
-    just the registry sentinel.
-
-    A drawer's ``content_hash`` metadata may hold several comma-joined
-    SHA-256 hashes: a privacy-export bundle normalizes to one conversation
-    per drawer set, but the hash is computed per conversation so that a
-    re-export with one new conversation added doesn't change the hash of
-    the ones that didn't. Only the first source_file seen for a given
-    (wing, hash) pair is kept — good enough to detect and skip a repeat,
-    the point is not to track every alias.
-
-    Deliberately NOT scoped by candidate source_files the way
-    prefetch_mined_set is: a stored `content_hash` can hold several
-    comma-joined hashes (one privacy-export bundle drawer covers several
-    conversations), so a `where`-filtered query can only match a document
-    whose entire stored value equals one candidate hash and would silently
-    miss any bundle row. An incomplete result here is worse than none,
-    because a caller reading the returned dict has no way to tell "no
-    duplicate" from "the query couldn't see this row". Narrowing this scan
-    correctly needs either a schema change (one hash per metadata field
-    instead of a joined list) or a second index; out of scope for the fix
-    that scoped prefetch_mined_set. See test_mine_convos_skips_same_content_
-    under_new_filename and test_mine_convos_skips_same_conversation_within_
-    re_exported_bundle, which a source_files-scoped or skipped version of
-    this function broke.
-    """
-    hashes: dict[tuple[str, str], str] = {}
-
-    def _absorb(meta):
-        meta = meta or {}
-        content_hash_field = meta.get("content_hash")
-        src = meta.get("source_file")
-        wing = meta.get("wing")
-        if not content_hash_field or not src or not wing:
-            return
-        if not _metadata_matches_extract_mode(meta, extract_mode):
-            return
-        if not _meta_is_current(meta, extract_mode):
-            return
-        for content_hash in content_hash_field.split(","):
-            key = (wing, content_hash)
-            if content_hash and key not in hashes:
-                hashes[key] = src
-
-    # Only drawers carrying a content_hash can match, and on Chroma the
-    # (key, string_value) index finds them without reading the rest.
-    _scan_collection_metadata(
-        collection, _MINED_SCAN_KEYS, _absorb, hashes.clear, require_key="content_hash"
-    )
-    return hashes

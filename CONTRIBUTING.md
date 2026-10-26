@@ -110,8 +110,8 @@ MemPalace workspace-package entries in `Cargo.lock`. Other dependency versions
 are outside this check.
 
 It reports missing, ambiguous or mismatched entries and exits with a nonzero
-status. It reads the release files without modifying them. On Python 3.9 or
-3.10, it uses the `tomli` dependency installed with MemPalace; newer Python
+status. It reads the release files without modifying them. On Python 3.10,
+it uses the `tomli` dependency installed with MemPalace; newer Python
 versions use the standard library TOML parser.
 
 The Version Guard workflow runs this check when guarded files change and on

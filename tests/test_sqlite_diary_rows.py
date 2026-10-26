@@ -1,12 +1,11 @@
 """SQLite diary reads preserve collection semantics without hydrating a palace."""
 
-from contextlib import contextmanager
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
 
-from mempalace.backends import chroma
-
+from mempalace.backends import chroma_sqlite as chroma
 
 _NAME = "mempalace_drawers"
 _MISSING = object()
@@ -181,7 +180,7 @@ class _ObservedReader:
         cursor = self.conn.execute(sql, parameters)
         if sql.startswith("SELECT id, key,"):
             self.hydrated.extend(parameters)
-        if sql.startswith("SELECT e.id, e.embedding_id"):
+        if sql.startswith("SELECT e.id, stamp.string_value"):
             self.plans.extend(self.conn.execute("EXPLAIN QUERY PLAN " + sql, parameters).fetchall())
         if sql.startswith("SELECT COUNT(*), COALESCE") and self.after_count is not None:
             callback, self.after_count = self.after_count, None

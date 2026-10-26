@@ -6,8 +6,8 @@ import sys
 
 import pytest
 
-from mempalace.knowledge_graph import KnowledgeGraph
 from mempalace.kg_normalize import apply_normalize
+from mempalace.knowledge_graph import KnowledgeGraph
 
 
 def _fresh_json(code, *args):

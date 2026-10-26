@@ -21,7 +21,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Fixtures: stub the Hermes ABC, then import the provider module by path.
 # ---------------------------------------------------------------------------
@@ -356,9 +355,8 @@ def test_shutdown_drains_running_worker(provider):
 # ---------------------------------------------------------------------------
 # End-to-end integration: real palace via mempalace's own fixtures.
 #
-# These exercise the ChromaBackend code path that fixes the dim-mismatch bug
-# from prior in-tree Hermes PRs, and run the tool handlers against the
-# `seeded_collection` / `seeded_kg` fixtures from `tests/conftest.py`.
+# These open the palace through palace.get_collection and run the tool
+# handlers against the `seeded_collection` / `seeded_kg` fixtures.
 # ---------------------------------------------------------------------------
 
 
@@ -385,13 +383,11 @@ def _collection_snapshot(provider):
         return col.get(include=["metadatas"]).get("metadatas") or []
 
 
-def test_initialize_opens_chroma_via_backend(initialized_provider):
-    """The dim-mismatch fix: collection access goes through ChromaBackend."""
-    from mempalace.backends.chroma import ChromaBackend
-
+def test_initialize_opens_configured_collection(initialized_provider):
+    """Open the palace through palace.get_collection, not a raw ChromaBackend."""
     assert initialized_provider._initialized is True
     assert initialized_provider._collection is not None
-    assert isinstance(initialized_provider._backend, ChromaBackend)
+    assert not hasattr(initialized_provider, "_backend")
 
 
 def test_get_tool_schemas_returns_full_surface_after_initialize(initialized_provider):
@@ -466,8 +462,7 @@ def provider_on_seeded_palace(seeded_collection, provider, palace_path, tmp_dir)
     """Provider pointed at the same palace_path that ``seeded_collection`` filled.
 
     ``seeded_collection`` writes 4 drawers via raw ``chromadb.PersistentClient``;
-    we then have the provider open the same path via ``ChromaBackend`` — the
-    fact that this round-trips at all is the dim-mismatch regression check.
+    the provider then opens the same path through ``palace.get_collection``.
     """
     (Path(tmp_dir) / "mempalace.json").write_text(json.dumps({"palace_path": palace_path}))
     provider.initialize("s1", hermes_home=str(tmp_dir))
@@ -560,8 +555,8 @@ def test_list_rooms_tool_marks_truncated_without_wing_total(provider_on_seeded_p
 # ----- Knowledge-graph tool handlers --------------------------------------
 
 
-def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_path):
-    """The provider writes to ``<palace_path>/../knowledge_graph.sqlite3``."""
+def test_kg_add_persists_to_palace_local_sqlite(initialized_provider, palace_path):
+    """A new provider writes to ``<palace_path>/knowledge_graph.sqlite3``."""
     from mempalace.knowledge_graph import KnowledgeGraph
 
     result = json.loads(
@@ -572,7 +567,7 @@ def test_kg_add_persists_to_palace_sibling_sqlite(initialized_provider, palace_p
     )
     assert result["status"] == "ok"
 
-    db_path = str(Path(palace_path).parent / "knowledge_graph.sqlite3")
+    db_path = str(Path(palace_path) / "knowledge_graph.sqlite3")
     independent_kg = KnowledgeGraph(db_path=db_path)
     try:
         relations = independent_kg.query_entity("user")
@@ -618,6 +613,147 @@ def test_diary_write_read_roundtrip(initialized_provider):
 def test_diary_read_empty_when_no_writes(initialized_provider):
     result = json.loads(initialized_provider.handle_tool_call("mempalace_diary_read", {}))
     assert result["entries"] == []
+
+
+def test_diary_write_files_a_drawer(initialized_provider):
+    text = "verbatim diary line for the drawer test"
+    write = json.loads(
+        initialized_provider.handle_tool_call("mempalace_diary_write", {"entry": text})
+    )
+    assert write["status"] == "ok"
+    assert write["success"] is True
+
+    read = json.loads(initialized_provider.handle_tool_call("mempalace_diary_read", {"n": 5}))
+    assert any(
+        item.get("entry") == text and item.get("source") == "drawer" for item in read["entries"]
+    )
+
+
+def _write_legacy_diary(provider, entries):
+    legacy = Path(provider._palace_path).parent / "diary.jsonl"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(
+        "".join(
+            json.dumps({"ts": f"2020-01-01T00:00:{i:02d}+00:00", "entry": e}) + "\n"
+            for i, e in enumerate(entries)
+        ),
+        encoding="utf-8",
+    )
+    return legacy
+
+
+def test_diary_read_keeps_the_newest_entries_beside_a_legacy_jsonl(initialized_provider):
+    _write_legacy_diary(initialized_provider, [f"old {i}" for i in range(12)])
+    for i in range(3):
+        initialized_provider.handle_tool_call("mempalace_diary_write", {"entry": f"new {i}"})
+
+    read = json.loads(initialized_provider.handle_tool_call("mempalace_diary_read", {"n": 5}))
+
+    assert [item["entry"] for item in read["entries"]] == [
+        "old 10",
+        "old 11",
+        "new 0",
+        "new 1",
+        "new 2",
+    ]
+    assert [item["source"] for item in read["entries"]][-3:] == ["drawer"] * 3
+
+
+def test_legacy_diary_import_runs_once_and_keeps_the_file(initialized_provider):
+    legacy = _write_legacy_diary(initialized_provider, ["legacy verbatim", "second line"])
+
+    first = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_diary_read", {"n": 10, "import_legacy": True}
+        )
+    )
+    second = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_diary_read", {"n": 10, "import_legacy": True}
+        )
+    )
+
+    assert first["imported"] == 2
+    assert second["imported"] == 0
+    assert not legacy.exists()
+    kept = legacy.with_name("diary.jsonl.imported")
+    assert "legacy verbatim" in kept.read_text(encoding="utf-8")
+    entries = [(item["entry"], item["source"]) for item in second["entries"]]
+    assert entries == [("legacy verbatim", "drawer"), ("second line", "drawer")]
+
+
+def test_legacy_diary_import_resumes_after_a_failed_write(initialized_provider, monkeypatch):
+    legacy = _write_legacy_diary(initialized_provider, ["one", "two", "three"])
+    real_write = initialized_provider._tool_diary_write
+    calls = []
+
+    def flaky(entry):
+        calls.append(entry)
+        if entry == "two" and calls.count("two") == 1:
+            return {"error": "diary write failed"}
+        return real_write(entry)
+
+    monkeypatch.setattr(initialized_provider, "_tool_diary_write", flaky)
+    assert initialized_provider._import_legacy_diary() == 1
+    assert legacy.exists()
+    assert initialized_provider._import_legacy_diary() == 2
+    assert calls == ["one", "two", "two", "three"]
+
+
+def test_file_turn_failure_warning_omits_verbatim(
+    provider, integration_module, monkeypatch, caplog
+):
+    import logging
+
+    secret = "user said the secret phrase"
+
+    def boom(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(integration_module, "file_conversation_exchange", boom)
+    provider._collection = object()
+    with caplog.at_level(logging.DEBUG, logger="mempalace.hermes"):
+        provider._file_turn({"user": secret, "assistant": "noted"})
+    assert provider._write_failures == 1
+    assert secret not in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_file_turn_waits_out_a_held_palace_lock(provider, integration_module, monkeypatch):
+    from mempalace.palace import MineAlreadyRunning
+
+    filed = []
+
+    def busy_then_file(*args, **kwargs):
+        if len(filed) < 2:
+            filed.append("refused")
+            raise MineAlreadyRunning("mine in progress")
+        filed.append(kwargs["text"])
+
+    sleeps = []
+    monkeypatch.setattr(integration_module, "file_conversation_exchange", busy_then_file)
+    monkeypatch.setattr(integration_module.time, "sleep", sleeps.append)
+    provider._collection = object()
+    provider._file_turn({"user": "hello", "assistant": "hi"})
+    assert filed[:2] == ["refused", "refused"]
+    assert len(filed) == 3
+    assert sleeps == [1, 2]
+    assert provider._write_failures == 0
+
+
+def test_status_surfaces_write_failure_counter(provider):
+    class _Col:
+        def count(self):
+            return 1
+
+        def get(self, **kwargs):
+            return {"metadatas": [{"wing": "notes"}]}
+
+    provider._collection = _Col()
+    provider._palace_path = "/tmp/palace"
+    provider._write_failures = 4
+    assert provider._tool_status()["write_failures"] == 4
 
 
 # ----- Config-load path ---------------------------------------------------
@@ -858,9 +994,9 @@ def test_hermes_config_defers_to_mempalace_config_when_unset(
         provider.shutdown()
 
 
-def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path):
-    # All five KG tools must hit the SAME database: the sibling of the
-    # provider's palace dir — never mcp_server's global DEFAULT_KG_PATH.
+def test_kg_tools_all_use_the_provider_palace_kg(initialized_provider, palace_path):
+    # All five KG tools must hit the SAME database: the provider's palace's
+    # own graph, never the global legacy one.
     add = json.loads(
         initialized_provider.handle_tool_call(
             "mempalace_kg_add",
@@ -886,8 +1022,9 @@ def test_kg_tools_all_use_provider_sibling_kg(initialized_provider, palace_path)
     )
     assert inv["success"] is True
 
-    # And the file itself lives next to the palace dir.
-    assert (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
+    # And the file itself lives in the palace dir.
+    assert (Path(palace_path) / "knowledge_graph.sqlite3").exists()
+    assert not (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
 
 
 def test_kg_invalidate_rejects_invalid_input(initialized_provider):
@@ -915,7 +1052,7 @@ def test_on_memory_write_mirrors_both_targets(initialized_provider, palace_path)
     initialized_provider.on_memory_write("add", "memory", "repo uses uv for deps")
     initialized_provider._worker_queue.join()
 
-    kg = KnowledgeGraph(db_path=str(Path(palace_path).parent / "knowledge_graph.sqlite3"))
+    kg = KnowledgeGraph(db_path=str(Path(palace_path) / "knowledge_graph.sqlite3"))
     try:
         user_relations = kg.query_entity("user")
         agent_relations = kg.query_entity("hermes")
@@ -937,3 +1074,82 @@ def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):
     initialized_provider.on_memory_write("replace", "memory", "x")
     initialized_provider.on_memory_write("remove", "user", "x")
     assert initialized_provider._worker_queue.qsize() == pre
+
+
+def test_tool_search_sanitizes_the_query_and_says_so(provider, integration_module, monkeypatch):
+    seen = {}
+
+    def fake_search(query, **kwargs):
+        seen["query"] = query
+        return {"results": [{"text": "hit"}]}
+
+    monkeypatch.setattr(integration_module, "search_memories", fake_search)
+    provider._palace_path = "/fake/palace"
+    contaminated = "You are a helpful assistant. " * 40 + "Where is the config?"
+    result = provider._tool_search(contaminated)
+    assert seen["query"] == "Where is the config"
+    assert result["query_sanitized"] is True
+    assert result["sanitizer"]["truncated"] is True
+    assert result["count"] == 1
+
+
+def test_tool_search_leaves_a_clean_query_alone(provider, integration_module, monkeypatch):
+    monkeypatch.setattr(integration_module, "search_memories", lambda q, **kw: {"results": []})
+    provider._palace_path = "/fake/palace"
+    result = provider._tool_search("where is the config?")
+    assert "sanitizer" not in result
+
+
+def test_l1_story_reports_an_unreadable_collection(integration_module, monkeypatch):
+    """A collection that cannot be read is not "No memories yet"."""
+    import sqlite3
+
+    monkeypatch.setattr("mempalace.layers._READ_RETRY_DELAY", 0)
+
+    class _Locked:
+        def get_recent(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        def get(self, **kwargs):
+            raise AssertionError("the same palace error must not be re-run as a scan")
+
+    story = integration_module._l1_story_from_collection(_Locked())
+    assert "No memories" not in story
+    assert "could not be read right now (OperationalError)" in story
+
+
+def test_l1_story_reads_inline_while_the_caller_holds_the_collection_lock(integration_module):
+    """The read runs on the caller's thread and is never cut off, so the
+    provider's _collection_lock is held for all of it (no abandoned reader
+    racing a writer on the shared Chroma client)."""
+    import time
+
+    lock = threading.Lock()
+    seen = []
+
+    class _Slow:
+        def get(self, **kwargs):
+            time.sleep(0.5)  # longer than the wake-up budget
+            seen.append((threading.current_thread() is caller, lock.locked()))
+            return {"documents": ["A slow but complete read."], "metadatas": [{"room": "r"}]}
+
+    caller = threading.current_thread()
+    with lock:
+        story = integration_module._l1_story_from_collection(_Slow())
+
+    assert seen and seen[0] == (True, True)
+    assert "A slow but complete read." in story
+
+
+def test_l1_story_reads_the_newest_drawers(integration_module):
+    class _Col:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"documents": [], "metadatas": []}
+            return {
+                "documents": ["A memory filed through the provider's own client."],
+                "metadatas": [{"room": "r", "filed_at": "2026-10-01"}],
+            }
+
+    story = integration_module._l1_story_from_collection(_Col(), wing="w")
+    assert "A memory filed through the provider's own client." in story

@@ -7,7 +7,6 @@ import sys
 from unittest.mock import MagicMock
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 from _mcp_server_helpers import (
     _get_collection,
@@ -514,7 +513,7 @@ class TestColdStartDiagnostics:
             "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
             "logging.getLogger('host.app').warning('HOST-ONLY-LINE-xyz')\n"
             "logging.getLogger('mempalace.embedding').info('MEMPALACE-DOTTED-LINE-xyz')\n"
-            "logging.getLogger('mempalace_mcp').info('MEMPALACE-FLAT-LINE-xyz')\n"
+            "logging.getLogger('mempalace.mcp_server').info('MEMPALACE-SERVER-LINE-xyz')\n"
             "logging.shutdown()\n"
             "raise SystemExit(0)\n"
         )
@@ -523,12 +522,12 @@ class TestColdStartDiagnostics:
         assert log_path.exists(), f"log file missing; stderr={result.stderr!r}"
         body = log_path.read_text(encoding="utf-8")
         assert "MEMPALACE-DOTTED-LINE-xyz" in body, body
-        assert "MEMPALACE-FLAT-LINE-xyz" in body, body
+        assert "MEMPALACE-SERVER-LINE-xyz" in body, body
         assert "HOST-ONLY-LINE-xyz" not in body, body
         # Format is "%(message)s" in the embedded path too: the line is the bare
         # message with no "LEVEL:name:" prefix (the file handler sets its own
         # formatter, independent of basicConfig which never runs here).
-        assert any(line == "MEMPALACE-FLAT-LINE-xyz" for line in body.splitlines()), body
+        assert any(line == "MEMPALACE-SERVER-LINE-xyz" for line in body.splitlines()), body
 
     def test_embedded_host_warning_root_gates_mempalace_info(self, tmp_path):
         """Documents the intentional embedded-mode level-gating tradeoff: when
@@ -542,8 +541,8 @@ class TestColdStartDiagnostics:
             "import logging\n"
             "logging.basicConfig(level=logging.WARNING, format='%(message)s')\n"
             "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
-            "logging.getLogger('mempalace_mcp').info('INFO-HEARTBEAT-xyz')\n"
-            "logging.getLogger('mempalace_mcp').warning('WARN-DIAG-xyz')\n"
+            "logging.getLogger('mempalace.mcp_server').info('INFO-HEARTBEAT-xyz')\n"
+            "logging.getLogger('mempalace.mcp_server').warning('WARN-DIAG-xyz')\n"
             "logging.shutdown()\n"
             "raise SystemExit(0)\n"
         )
@@ -651,7 +650,7 @@ class TestHandleRequest:
         assert resp["result"]["protocolVersion"] == SUPPORTED_PROTOCOL_VERSIONS[0]
 
     def test_initialize_missing_version_uses_oldest(self):
-        from mempalace.mcp_server import handle_request, SUPPORTED_PROTOCOL_VERSIONS
+        from mempalace.mcp_server import SUPPORTED_PROTOCOL_VERSIONS, handle_request
 
         resp = handle_request({"method": "initialize", "id": 1, "params": {}})
         assert resp["result"]["protocolVersion"] == SUPPORTED_PROTOCOL_VERSIONS[-1]
@@ -688,24 +687,10 @@ class TestHandleRequest:
         must not advertise the hint (omitted means the MCP default, false).
         The same rule covers every tool --read-only refuses.
         """
-        from mempalace.mcp_server import _READ_ONLY_REFUSED_TOOLS, handle_request
+        from mempalace.mcp_server import _READ_ONLY_REFUSED_TOOLS, TOOLS, handle_request
+        from mempalace.service import classify_tool
 
-        expected = {
-            "mempalace_status",
-            "mempalace_list_wings",
-            "mempalace_list_rooms",
-            "mempalace_get_taxonomy",
-            "mempalace_get_aaak_spec",
-            "mempalace_search",
-            "mempalace_check_duplicate",
-            "mempalace_get_drawer",
-            "mempalace_get_drawers",
-            "mempalace_list_drawers",
-            "mempalace_diary_read",
-            "mempalace_kg_query",
-            "mempalace_kg_timeline",
-            "mempalace_kg_stats",
-        }
+        expected = {name for name in TOOLS if classify_tool(name) == "read"}
         resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
         tools = resp["result"]["tools"]
         hinted = {t["name"] for t in tools if t.get("annotations", {}).get("readOnlyHint") is True}
@@ -907,6 +892,7 @@ class TestCacheInvalidation:
         """When chroma.sqlite3 disappears, a cached collection should be invalidated."""
         _patch_mcp_server(monkeypatch, config, kg)
         import os
+
         from mempalace import mcp_server
 
         _client, _col = _get_collection(palace_path, create=True)
@@ -1447,8 +1433,9 @@ class TestStructuredErrors:
         assert "data" not in err
 
     def test_internal_tool_error_with_exc_includes_structured_data(self):
-        """When exc is supplied, the error body must include data.error_class
-        and data.message so callers can distinguish error types (#1552)."""
+        """When exc is supplied, the error body carries data.error_class so
+        callers can distinguish error types (#1552); the exception text only
+        when the caller asks for it."""
         from mempalace.mcp_server import _internal_tool_error
 
         exc = RuntimeError("chromadb cold init wedge")
@@ -1456,12 +1443,34 @@ class TestStructuredErrors:
             raise exc
         except RuntimeError:
             resp = _internal_tool_error("req-2", "mempalace_add_drawer", exc)
+            internal = _internal_tool_error("req-2", "x", exc, include_message=True)
 
         err = resp["error"]
         assert err["code"] == -32000
-        assert "data" in err
-        assert err["data"]["error_class"] == "RuntimeError"
-        assert "chromadb cold init wedge" in err["data"]["message"]
+        assert err["data"] == {"error_class": "RuntimeError"}
+        assert "chromadb cold init wedge" in internal["error"]["data"]["message"]
+
+    def test_light_server_tool_error_hides_the_exception_text(self, monkeypatch):
+        from mempalace import mcp_light_server
+
+        def boom(arguments):
+            raise OSError("C:/secret/path is locked")
+
+        monkeypatch.setitem(mcp_light_server.LIGHT_TOOLS["palace_query"], "handler", boom)
+        monkeypatch.setattr(
+            mcp_light_server.mcp_server, "_mcp_tool_preflight_refusal", lambda *a, **k: None
+        )
+        resp = mcp_light_server.handle_light_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "palace_query", "arguments": {"target": "status"}},
+            }
+        )
+
+        assert resp["error"]["data"] == {"error_class": "OSError"}
+        assert "secret" not in json.dumps(resp)
 
     def test_internal_tool_error_exception_dispatch_passes_exc(self, monkeypatch):
         """handle_request's Exception branch must pass exc to _internal_tool_error."""
@@ -1484,9 +1493,9 @@ class TestStructuredErrors:
 
         original = mcp_server._internal_tool_error
 
-        def spy_error(req_id, tool_name, exc=None):
+        def spy_error(req_id, tool_name, exc=None, **kwargs):
             captured["exc"] = exc
-            return original(req_id, tool_name, exc)
+            return original(req_id, tool_name, exc, **kwargs)
 
         monkeypatch.setattr(mcp_server, "_internal_tool_error", spy_error)
 
@@ -1501,6 +1510,48 @@ class TestStructuredErrors:
         assert isinstance(captured.get("exc"), OSError)
         assert "data" in resp["error"]
         assert resp["error"]["data"]["error_class"] == "OSError"
+        # The exception text (paths, internals) stays in the log.
+        assert "message" not in resp["error"]["data"]
+        assert "fake disk error" not in json.dumps(resp)
+
+    def test_tool_value_error_message_reaches_the_client(self, monkeypatch):
+        """A ValueError is how a tool refuses an input; its message is the answer."""
+        from mempalace import mcp_server
+
+        def refuses(**kwargs):
+            raise ValueError("valid_from is after valid_to")
+
+        monkeypatch.setattr(
+            mcp_server,
+            "TOOLS",
+            {"mempalace_fake": {"handler": refuses, "input_schema": {"type": "object"}}},
+        )
+        resp = mcp_server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "mempalace_fake"},
+            }
+        )
+        assert resp["error"]["data"] == {
+            "error_class": "ValueError",
+            "message": "valid_from is after valid_to",
+        }
+
+    def test_daemon_calls_keep_the_exception_message(self, monkeypatch):
+        from mempalace import mcp_server
+
+        def fails(**kwargs):
+            raise OSError("fake disk error")
+
+        monkeypatch.setattr(
+            mcp_server,
+            "TOOLS",
+            {"mempalace_fake": {"handler": fails, "input_schema": {"type": "object"}}},
+        )
+        refusal, _ = mcp_server.call_tool("job", {"name": "mempalace_fake"}, internal=True)
+        assert refusal["error"]["data"]["message"] == "fake disk error"
 
     def test_tool_sync_mine_already_running_returns_error_class(self, monkeypatch, tmp_path):
         """tool_sync MineAlreadyRunning path returns error_class: LockHeldByOtherProcess."""
@@ -1560,6 +1611,7 @@ class TestStructuredErrors:
     def test_cache_thread_safe(self, tmp_path, monkeypatch):
         """Concurrent _get_kg() for the same path yields one instance."""
         import concurrent.futures
+
         from mempalace import mcp_server
 
         monkeypatch.setattr(mcp_server, "_kg_by_path", {})
@@ -1796,6 +1848,7 @@ class TestStructuredErrors:
         longer holds it under the stale key.
         """
         import sqlite3 as _sqlite3
+
         from mempalace import mcp_server
 
         class _ClosedKG:

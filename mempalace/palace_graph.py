@@ -28,15 +28,19 @@ import threading
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from datetime import datetime, timezone
 
+from . import paths
+from .backends.base import BaseCollection, PalaceNotFoundError
 from .config import MempalaceConfig, normalize_wing_name
 from .dynamics import initialize_dynamics_fields, potentiate
-from .palace import get_collection as _get_palace_collection
-from .palace import mine_lock
-from .backends.base import BaseCollection
+from .fsio import (
+    atomic_write_json as _atomic_write_json,
+    read_json_for_update as _read_json_for_update,
+)
+from .palace import get_collection as _get_palace_collection, mine_lock
+from .timeutil import utc_now_iso
 
-logger = logging.getLogger("mempalace_graph")
+logger = logging.getLogger(__name__)
 
 
 def _normalize_wing(wing: str | None) -> str | None:
@@ -90,12 +94,11 @@ def sqlite_grouped_counts_reader(config=None):
             config.palace_path, explicit=os.environ.get("MEMPALACE_BACKEND_EXPLICIT")
         )
         if backend == "chroma":
-            from .backends.chroma import sqlite_room_wing_hall_counts
+            from .backends.chroma_sqlite import sqlite_room_wing_hall_counts
 
             db_name = "chroma.sqlite3"
         elif backend in {"sqlite_exact", "rust_exact"}:
-            from .backends.sqlite_exact import _DB_FILENAME as db_name
-            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
+            from .backends.sqlite_exact import _DB_FILENAME as db_name, sqlite_room_wing_hall_counts
         else:
             return None
         if not os.path.isfile(os.path.join(config.palace_path, db_name)):
@@ -182,22 +185,41 @@ def invalidate_graph_cache():
         _graph_cache_time = 0.0
 
 
+class GraphUnavailable(RuntimeError):
+    """The palace exists but its drawers could not be read.
+
+    A palace with no drawers collection yet is not this error: the graph is
+    empty. A lock, a corrupt database or any other failure is, so a caller
+    can say the palace is unavailable instead of reporting no rooms.
+    """
+
+    def __init__(self, palace_path=None):
+        where = f" at {palace_path}" if palace_path else ""
+        super().__init__(f"palace{where} could not be read")
+
+
 def _get_collection(config=None):
+    """The drawers collection opened read-only, or ``None`` when the palace
+    or its drawers collection does not exist yet."""
     config = config or MempalaceConfig()
     try:
         return _get_palace_collection(
             config.palace_path,
             collection_name=config.collection_name,
             create=False,
+            read_only=True,
         )
-    except Exception:
+    except PalaceNotFoundError:
         return None
+    except Exception as exc:
+        logger.warning("Graph read of the palace at %s failed", config.palace_path, exc_info=True)
+        raise GraphUnavailable(config.palace_path) from exc
 
 
 def _iter_all_metadata(col):
-    """Yield every drawer's metadata using the backend's own cursor (#2452).
+    """Yield every drawer's metadata using the backend's own cursor.
 
-    ``get_all_metadata`` (#1796) is a single pass on every backend; the
+    ``get_all_metadata`` is a single pass on every backend; the
     offset loop it replaces is O(n^2) on qdrant, where each page re-walks the
     collection from the start. The loop is kept only for collection objects
     that predate the contract method.
@@ -256,28 +278,29 @@ def build_graph(col=None, config=None):
 
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
 
-    for meta in _iter_all_metadata(col):
-        # ChromaDB can return ``None`` for drawers without metadata
-        # (legacy data, partial writes — upstream #1020 territory).
-        # Skip these silently rather than crash the whole graph
-        # build — a single None drawer shouldn't take down /stats
-        # or any caller of build_graph for the entire palace. Caught
-        # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
-        # against the canonical 151K palace. Closes the same gap as
-        # upstream #999 / fork PR #1094 in a different read path.
-        if meta is None:
-            continue
-        room = meta.get("room", "")
-        wing = meta.get("wing", "")
-        hall = meta.get("hall", "")
-        date = meta.get("date", "")
-        if room and wing:
-            room_data[room]["wings"].add(wing)
-            if hall:
-                room_data[room]["halls"].add(hall)
-            if date:
-                room_data[room]["dates"].add(date)
-            room_data[room]["count"] += 1
+    try:
+        for meta in _iter_all_metadata(col):
+            # ChromaDB can return ``None`` for drawers without metadata
+            # (legacy data, partial writes). Skip them rather than fail the
+            # whole graph build: one bare drawer must not take down every
+            # caller of build_graph.
+            if meta is None:
+                continue
+            room = meta.get("room", "")
+            wing = meta.get("wing", "")
+            hall = meta.get("hall", "")
+            date = meta.get("date", "")
+            if room and wing:
+                room_data[room]["wings"].add(wing)
+                if hall:
+                    room_data[room]["halls"].add(hall)
+                if date:
+                    room_data[room]["dates"].add(date)
+                room_data[room]["count"] += 1
+    except Exception as exc:
+        palace_path = (config or MempalaceConfig()).palace_path
+        logger.warning("Graph read of the palace at %s failed", palace_path, exc_info=True)
+        raise GraphUnavailable(palace_path) from exc
 
     # Build edges from rooms that span multiple wings
     edges = []
@@ -494,14 +517,18 @@ def _get_tunnel_file(config=None) -> str:
 
 def _legacy_tunnel_file() -> str:
     """The pre-3.3.6 hardcoded path. Kept only for one-time orphan detection."""
-    return os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
+    return str(paths.state_path("tunnels.json"))
 
 
-def _load_tunnels(config=None):
+def _load_tunnels(config=None, *, for_write=False):
     """Load explicit tunnels from disk.
 
-    Returns an empty list if the file is missing or corrupt (e.g. truncated
-    by a crash mid-write on a system that lacks atomic-rename semantics).
+    A read (``for_write=False``) returns an empty list if the file is
+    missing or corrupt and leaves the file where it is. A write
+    (``for_write=True``) returns that empty list only when the file is
+    missing. A file that does not parse is moved aside and
+    :class:`CorruptStateError` is raised, so the following save cannot
+    publish a one-entry document over it.
 
     Backwards-compatibility: prior to 3.3.6 the tunnel file was hardcoded at
     ``~/.mempalace/tunnels.json`` regardless of the configured palace_path.
@@ -516,6 +543,8 @@ def _load_tunnels(config=None):
     every helper call within a single create_tunnel cycle.
     """
     current_tunnel_file = _get_tunnel_file(config)
+    if for_write:
+        return list(_read_json_for_update(current_tunnel_file, expect=list) or [])
     if os.path.exists(current_tunnel_file):
         try:
             with open(current_tunnel_file, "r", encoding="utf-8") as f:
@@ -542,15 +571,10 @@ def _load_tunnels(config=None):
 def _save_tunnels(tunnels, config=None):
     """Persist explicit tunnels atomically.
 
-    Writes to ``tunnels.json.tmp`` then ``os.replace``s it into place, so
-    a crash mid-write can never leave a partial/empty tunnels.json that
-    silently wipes every tunnel on next read.
-
-    Also restricts the parent directory to 0o700 and the file to 0o600 —
-    tunnels reveal cross-wing connections (which projects/people/rooms
-    the user has explicitly linked) and should not be world-readable on
-    shared Linux/multi-user systems. Matches the file-permission pattern
-    established by #814 for the other sensitive palace files.
+    The bytes are published by :func:`mempalace.fsio.atomic_write_json`, so
+    a crash mid-write leaves the previous file in place. The parent
+    directory is restricted to 0o700 and the file to 0o600 — tunnels
+    reveal cross-wing connections and should not be world-readable.
 
     ``config`` may be passed in by the caller to avoid re-instantiating
     ``MempalaceConfig`` on every save.
@@ -563,20 +587,7 @@ def _save_tunnels(tunnels, config=None):
     except (OSError, NotImplementedError):
         # Windows / unsupported filesystems — tolerate.
         pass
-    tmp_path = tunnel_file + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(tunnels, f, indent=2)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            # Not all filesystems (or Windows file handles) support fsync — tolerate.
-            pass
-    os.replace(tmp_path, tunnel_file)
-    try:
-        os.chmod(tunnel_file, 0o600)
-    except (OSError, NotImplementedError):
-        pass
+    _atomic_write_json(tunnel_file, tunnels)
 
 
 def _endpoint_key(wing: str, room: str) -> str:
@@ -607,27 +618,20 @@ def _require_name(value: str, field: str) -> str:
 
 
 def _check_room_exists(wing: str, room: str, col) -> bool:
-    """Check if at least one drawer exists for the given wing/room in ChromaDB."""
+    """Check if at least one drawer exists for the given wing/room.
+
+    ``col`` is ``None`` only for a palace with no drawers yet, where there is
+    nothing to check against. A read that fails raises :class:`GraphUnavailable`
+    rather than letting an unverified tunnel through.
+    """
     if col is None:
-        # If collection is unreachable, can't verify, so allow.
-        logger.debug(
-            "ChromaDB collection not reachable, skipping room existence validation for %s/%s",
-            wing,
-            room,
-        )
         return True
     try:
         results = col.get(where={"$and": [{"wing": wing}, {"room": room}]}, limit=1, include=[])
-        return len(results["ids"]) > 0
-    except Exception:
-        # If query fails, assume it's a temporary issue or permissions, and allow.
-        logger.warning(
-            "Error checking room existence in ChromaDB for %s/%s; allowing tunnel creation.",
-            wing,
-            room,
-            exc_info=True,
-        )
-        return True
+    except Exception as exc:
+        logger.warning("Room check for %s/%s failed", wing, room, exc_info=True)
+        raise GraphUnavailable() from exc
+    return len(results["ids"]) > 0
 
 
 # Per-thread map of open tunnel batches, keyed by the normalized tunnel file.
@@ -657,7 +661,7 @@ class _TunnelBatchState:
 
     def load(self):
         if self.tunnels is None:
-            self.tunnels = _load_tunnels(self.config)
+            self.tunnels = _load_tunnels(self.config, for_write=True)
             # setdefault keeps the first record for a duplicated id, matching
             # the per-call path's linear scan.
             self.index = {}
@@ -680,7 +684,7 @@ def tunnel_batch(config=None):
 
     Inside the batch, :func:`create_tunnel` calls for the same tunnel file
     insert or update through an id index instead of loading, scanning and
-    rewriting the whole file per tunnel (#2683). The mine's tunnel passes
+    rewriting the whole file per tunnel. The mine's tunnel passes
     run inside one; outside a batch every call still loads, mutates and
     saves on its own, so MCP tools and explicit user tunnels are unchanged.
 
@@ -724,16 +728,14 @@ def _upsert_tunnel(tunnels: list, existing, tunnel: dict) -> dict:
     if existing is not None:
         # Preserve original creation timestamp on label updates.
         tunnel["created_at"] = existing.get("created_at", tunnel["created_at"])
-        tunnel["updated_at"] = datetime.now(timezone.utc).isoformat()
+        tunnel["updated_at"] = utc_now_iso()
         # Preserve L7 dynamics fields across re-creation events.
         # Without this, a label update (or any re-create) would
         # reset the connection's strength / stability / access_count
         # — defeating the living-connection layer. Backfill any
         # still-missing fields so legacy records also pick up
-        # defaults on next touch. Per PR #1578 review
-        # (gemini-code-assist, medium priority): use dict-update
-        # with a comprehension so the field list lives in one place
-        # and future schema expansion can't drop a field by accident.
+        # defaults on next touch. One dict-update over the field list
+        # keeps that list in one place, so a new field can't be dropped.
         _dyn_fields = ("strength", "stability", "last_activated", "access_count")
         tunnel.update({k: existing[k] for k in _dyn_fields if k in existing})
         initialize_dynamics_fields(tunnel)
@@ -763,7 +765,7 @@ def create_tunnel(
     resolve to the same canonical ID. A second call with the same endpoints
     updates the stored label (and drawer IDs, if provided) rather than
     creating a duplicate. Endpoints are compared **verbatim** — ``"my-wing"``
-    and ``"my_wing"`` are distinct (see Note below and #1504).
+    and ``"my_wing"`` are distinct (see Note below).
 
     The ``source`` / ``target`` fields on the returned dict preserve the
     argument order the caller used, so callers can display it directionally
@@ -798,22 +800,20 @@ def create_tunnel(
         produces two distinct tunnels (canonical IDs differ). Read-path helpers
         (``list_tunnels`` / ``follow_tunnels``) normalize both sides at compare
         time so legacy underscore data and explicit-flag hyphen data both
-        match queries in either form. See #1504.
+        match queries in either form.
     """
     source_wing = _require_name(source_wing, "source_wing")
     source_room = _require_name(source_room, "source_room")
     target_wing = _require_name(target_wing, "target_wing")
     target_room = _require_name(target_room, "target_room")
 
-    # Single MempalaceConfig() per call — reused by _get_tunnel_file /
-    # _load_tunnels / _save_tunnels below. Each MempalaceConfig() re-reads
-    # mempalace.yaml from disk; before this change the helpers each
-    # instantiated their own, triggering several redundant disk reads per
-    # create_tunnel call (flagged by gemini-code-assist on #1469).
+    # One MempalaceConfig() per call, reused by _get_tunnel_file /
+    # _load_tunnels / _save_tunnels below: each instance re-reads its config
+    # from disk.
     config = config or MempalaceConfig()
 
     # Validate room existence for explicit tunnels only. Use the verbatim wing
-    # slugs here so #1504's hyphen-preserving write path remains intact.
+    # slugs here so the hyphen-preserving write path stays intact.
     if kind == "explicit":
         col = _get_collection(config)
         if not _check_room_exists(source_wing, source_room, col):
@@ -829,7 +829,7 @@ def create_tunnel(
         "target": {"wing": target_wing, "room": target_room},
         "label": label,
         "kind": kind,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": utc_now_iso(),
     }
     if source_drawer_id:
         tunnel["source"]["drawer_id"] = source_drawer_id
@@ -853,7 +853,7 @@ def create_tunnel(
     # create_tunnel calls can both read the same snapshot and the later
     # writer silently drops the earlier writer's tunnel.
     with mine_lock(tunnel_file):
-        tunnels = _load_tunnels(config)
+        tunnels = _load_tunnels(config, for_write=True)
         existing = next((t for t in tunnels if t.get("id") == tunnel_id), None)
         stored = _upsert_tunnel(tunnels, existing, tunnel)
         _save_tunnels(tunnels, config)
@@ -871,7 +871,7 @@ def list_tunnels(wing: str = None):
     if norm_wing:
         # Normalize stored wings too: older tunnels.json records hold the
         # underscore form (from the prior write-path normalization), while
-        # post-#1504 records hold whatever the caller passed. Comparing
+        # newer records hold whatever the caller passed. Comparing
         # normalized-on-both-sides matches either.
         # ``t.get(k) or {}`` (not ``t.get(k, {})``) handles ``"source": null``
         # from a hand-edited file — ``.get`` defaults only on missing keys.
@@ -887,7 +887,7 @@ def list_tunnels(wing: str = None):
 def delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
     with mine_lock(_get_tunnel_file()):
-        tunnels = _load_tunnels()
+        tunnels = _load_tunnels(for_write=True)
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
         _save_tunnels(tunnels)
     return {"deleted": tunnel_id}
@@ -907,6 +907,7 @@ def record_tunnel_traversal(tunnel_ids, config=None) -> int:
     touched = 0
     try:
         with mine_lock(_get_tunnel_file(config)):
+            # A read path: a corrupt file reads as empty and is left in place.
             tunnels = _load_tunnels(config)
             for t in tunnels:
                 if isinstance(t, dict) and t.get("id") in wanted:
@@ -926,9 +927,9 @@ def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = T
 
     Given a location (wing/room), finds all tunnels leading from or to it,
     and optionally fetches the connected drawer content. Following a tunnel
-    is a traversal: unless ``record`` is off (a read-only server, a peer
-    that does not hold the writer lock), each tunnel crossed is
-    potentiated so navigation weights and the audit reflect real use.
+    is a traversal: unless ``record`` is off (a read-only server), each
+    tunnel crossed is potentiated so navigation weights and the audit
+    reflect real use.
     """
     # Fall back to raw ``wing`` so an empty/whitespace query string still
     # produces a value to compare with; ``_normalize_wing`` returns ``None``
@@ -1088,7 +1089,7 @@ def compute_topic_tunnels(
 
     wings = sorted(wing_topics.keys())
     created: list[dict] = []
-    # One load and one save for the whole pass, not one per tunnel (#2683).
+    # One load and one save for the whole pass, not one per tunnel.
     with tunnel_batch(config):
         for i, wa in enumerate(wings):
             topics_a = wing_topics[wa]
@@ -1312,7 +1313,7 @@ def entity_tunnels_for_wing(
     links.sort()
 
     created: list = []
-    # One load and one save for the whole pass, not one per tunnel (#2683).
+    # One load and one save for the whole pass, not one per tunnel.
     with tunnel_batch(config):
         for _, entity, other_norm in links[: max(0, max_per_wing)]:
             wings_for_entity = candidates[entity]

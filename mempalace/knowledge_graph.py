@@ -36,22 +36,197 @@ Usage:
 """
 
 import json
-import os
+import re
 import sqlite3
 import threading
-from datetime import date, datetime, timezone
+import unicodedata
+from datetime import date
 from pathlib import Path
 from typing import Optional
+
+from . import paths
 from .config import sanitize_iso_temporal
 from .ids import make_triple_id
+from .timeutil import utc_now_iso, utc_now_z
 
-
-DEFAULT_KG_PATH = os.path.expanduser("~/.mempalace/knowledge_graph.sqlite3")
+DEFAULT_KG_PATH = paths.legacy_knowledge_graph_path()
 _MIN_ENTITY_CANDIDATE_LEN = 3
+
+
+def knowledge_graph_notice(
+    palace_path: str, legacy: Optional[str] = None, explicit: bool = False
+) -> Optional[str]:
+    """Say so when a graph that belongs to ``palace_path`` holds facts it does not read.
+
+    That happens when the palace's own graph and the one it used before both
+    hold facts: the palace reads its own, and this names the other file and the
+    explicit command that copies its facts in. Graphs are never merged
+    automatically.
+    """
+    used = paths.knowledge_graph_path(palace_path, legacy=legacy, explicit=explicit)
+    other = paths.historical_knowledge_graph_path(palace_path, legacy=legacy, explicit=explicit)
+    if other is None or paths.same_path(other, used) or not paths.knowledge_graph_has_rows(other):
+        return None
+    return (
+        f"The knowledge graph at {other} holds facts this palace does not read; it reads "
+        f"{used}. Graphs are never merged automatically; review and copy them in with "
+        f"`mempalace kg import-legacy --from {other}`."
+    )
+
+
+def open_graph(path: str, read: bool = False) -> "KnowledgeGraph":
+    """The graph at ``path``; for a read, an empty in-memory one when there is no file.
+
+    A read never creates the graph file: an empty file would then be taken
+    for the palace's graph.
+    """
+    if read and not Path(path).is_file():
+        return KnowledgeGraph.empty()
+    return KnowledgeGraph(db_path=path)
+
+
+def _read_only(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def import_graph_rows(source_path: str, target_path: str, apply: bool = False) -> dict:
+    """Copy one graph file's entities and triples into another, keeping what is there.
+
+    The source is only read. An entity the target already has (same id) is left
+    as it is; so is a fact it already records with the same subject, predicate,
+    object and validity window, whenever it was recorded. A current fact whose
+    subject and predicate already hold a different current object in the target
+    is not copied but listed under ``conflicts``, so the two never both read as
+    current. A reused fact id with different content or validity is kept in
+    the target and listed under ``id_conflicts``. With ``apply`` false the
+    import runs against an in-memory snapshot: no stored facts change and a
+    missing target is not created. The counts say what would be copied.
+    """
+    if paths.same_path(source_path, target_path):
+        raise ValueError("the source and the target are the same knowledge graph")
+    source = _read_only(source_path)
+    target = None
+    kg = None
+
+    def found(sql, args):
+        return target.execute(sql, args).fetchone() is not None
+
+    counts = {}
+    try:
+        if apply:
+            kg = KnowledgeGraph(db_path=target_path)
+        else:
+            kg = KnowledgeGraph.empty()
+            if Path(target_path).is_file():
+                existing = _read_only(target_path)
+                try:
+                    existing.backup(kg._conn())
+                finally:
+                    existing.close()
+                # Applying opens KnowledgeGraph and migrates legacy schemas.
+                # Preview those same changes only in the in-memory copy.
+                kg._init_db()
+        target = kg._conn()
+        for table, columns in KnowledgeGraph._REPLICATION_TABLES.items():
+            available = {r["name"] for r in source.execute(f"PRAGMA table_info({table})")}
+            cols = [c for c in columns if c in available]
+            numbers = {"added": 0, "present": 0}
+            if table == "triples":
+                numbers["conflicts"] = []
+                numbers["id_conflicts"] = []
+            counts[table] = numbers
+            if "id" not in cols:
+                continue
+            insert = (
+                f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+            )
+            for row in source.execute(f"SELECT {', '.join(cols)} FROM {table}"):
+                if table == "triples":
+                    fact = (row["subject"], row["predicate"], row["object"])
+                    window = (row["valid_from"], row["valid_to"])
+                    if found(
+                        "SELECT 1 FROM triples WHERE subject = ? AND predicate = ? "
+                        "AND object = ? AND valid_from IS ? AND valid_to IS ?",
+                        fact + window,
+                    ):
+                        numbers["present"] += 1
+                        continue
+                    if found("SELECT 1 FROM triples WHERE id = ?", (row["id"],)):
+                        numbers["id_conflicts"].append(row["id"])
+                        continue
+                    clash = (
+                        target.execute(
+                            "SELECT object FROM triples WHERE subject = ? AND predicate = ? "
+                            "AND object != ? AND valid_to IS NULL",
+                            fact,
+                        ).fetchone()
+                        if row["valid_to"] is None
+                        else None
+                    )
+                    if clash is not None:
+                        numbers["conflicts"].append(
+                            {
+                                "subject": row["subject"],
+                                "predicate": row["predicate"],
+                                "object": row["object"],
+                                "current_object": clash[0],
+                            }
+                        )
+                        continue
+                elif found(f"SELECT 1 FROM {table} WHERE id = ?", (row["id"],)):
+                    numbers["present"] += 1
+                    continue
+                inserted = target.execute(insert, tuple(row)).rowcount
+                if inserted != 1:
+                    raise sqlite3.IntegrityError(
+                        f"knowledge graph import did not insert {table} row {row['id']!r}"
+                    )
+                numbers["added"] += inserted
+        if apply:
+            target.commit()
+    finally:
+        source.close()
+        if kg is not None:
+            kg.close()
+    return counts
 
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def canonical_entity_name(name: str) -> str:
+    """NFC, lower-cased name with whitespace runs collapsed.
+
+    ``lower()``, not ``casefold()``: casefold maps "ß" to "ss" and would merge
+    distinct names.
+    """
+    text = unicodedata.normalize("NFC", name or "").lower().strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def entity_id_for_name(name: str) -> str:
+    """Id that keeps punctuation, so distinct names stay distinct.
+
+    Whitespace is an underscore; an underscore that was part of the name is
+    ``%5F`` and a percent sign is ``%25``, so no two canonical names share an id.
+    """
+    text = canonical_entity_name(name).replace("%", "%25").replace("_", "%5F")
+    return text.replace(" ", "_")
+
+
+def legacy_entity_id(name: str) -> str:
+    """Id written before punctuation was kept. It stripped apostrophes and
+    turned spaces into underscores, so distinct names could share one."""
+    return (name or "").lower().replace(" ", "_").replace("'", "")
+
+
+def _drop_none(props: dict) -> dict:
+    return {
+        k: _drop_none(v) if isinstance(v, dict) else v for k, v in props.items() if v is not None
+    }
 
 
 def _is_date_only_temporal(value: str) -> bool:
@@ -152,6 +327,16 @@ class KnowledgeGraph:
         self._lock = threading.Lock()
         self._init_db()
 
+    @classmethod
+    def empty(cls) -> "KnowledgeGraph":
+        """An in-memory graph with no facts, for reading a palace that has none yet."""
+        kg = cls.__new__(cls)
+        kg.db_path = ":memory:"
+        kg._connection = None
+        kg._lock = threading.Lock()
+        kg._init_db()
+        return kg
+
     def _init_db(self):
         conn = self._conn()
         conn.executescript("""
@@ -229,21 +414,50 @@ class KnowledgeGraph:
         self.close()
         return False
 
-    def _entity_id(self, name: str) -> str:
-        return name.lower().replace(" ", "_").replace("'", "")
+    def _resolve_entity_id(self, conn, name: str) -> str:
+        """Id for ``name``: its own id, else a legacy row it used to map to.
+
+        Stored ids are never rewritten. A legacy row is reused only when its
+        stored name no longer owns that id, so a name written after this
+        change (``OBrien``) never absorbs a different one (``O'Brien``).
+        """
+        eid = entity_id_for_name(name)
+        if conn.execute("SELECT 1 FROM entities WHERE id = ?", (eid,)).fetchone():
+            return eid
+        legacy = legacy_entity_id(name)
+        if legacy != eid:
+            row = conn.execute("SELECT name FROM entities WHERE id = ?", (legacy,)).fetchone()
+            if row is not None and entity_id_for_name(row["name"]) != legacy:
+                return legacy
+        return eid
 
     # ── Write operations ──────────────────────────────────────────────────
 
     def add_entity(self, name: str, entity_type: str = "unknown", properties: dict = None):
-        """Add or update an entity node."""
-        eid = self._entity_id(name)
-        props = json.dumps(properties or {})
+        """Add an entity, or merge into the existing node.
+
+        The stored name takes the latest spelling, a type other than
+        ``unknown`` replaces the stored one, and properties merge key by key.
+        A ``None`` value leaves the stored key as it is. A legacy row keeps
+        its stored name: renaming it would change which spellings reach it.
+        """
+        props = json.dumps(_drop_none(properties or {}))
         with self._lock:
             conn = self._conn()
             with conn:
+                eid = self._resolve_entity_id(conn, name)
+                row = conn.execute("SELECT name FROM entities WHERE id = ?", (eid,)).fetchone()
+                rename = row is None or entity_id_for_name(row["name"]) == eid
                 conn.execute(
-                    "INSERT OR REPLACE INTO entities (id, name, type, properties) VALUES (?, ?, ?, ?)",
-                    (eid, name, entity_type, props),
+                    """INSERT INTO entities (id, name, type, properties)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(id) DO UPDATE SET
+                         name = CASE WHEN ? THEN excluded.name ELSE entities.name END,
+                         type = COALESCE(NULLIF(excluded.type, 'unknown'), entities.type),
+                         properties = json_patch(
+                             COALESCE(entities.properties, '{}'), excluded.properties
+                         )""",
+                    (eid, name, entity_type, props, rename),
                 )
         return eid
 
@@ -290,14 +504,14 @@ class KnowledgeGraph:
                 "an inverted interval would be invisible to every KG query"
             )
 
-        sub_id = self._entity_id(subject)
-        obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")
 
         # Auto-create entities if they don't exist
         with self._lock:
             conn = self._conn()
             with conn:
+                sub_id = self._resolve_entity_id(conn, subject)
+                obj_id = self._resolve_entity_id(conn, obj)
                 conn.execute(
                     "INSERT OR IGNORE INTO entities (id, name) VALUES (?, ?)",
                     (sub_id, subject),
@@ -315,9 +529,7 @@ class KnowledgeGraph:
                 if existing:
                     return existing["id"]  # Already exists and still valid
 
-                triple_id = make_triple_id(
-                    sub_id, pred, obj_id, valid_from, datetime.now().isoformat()
-                )
+                triple_id = make_triple_id(sub_id, pred, obj_id, valid_from, utc_now_iso())
                 conn.execute(
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
@@ -342,14 +554,14 @@ class KnowledgeGraph:
 
     def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
         """Mark a relationship as no longer valid (set valid_to date/time)."""
-        sub_id = self._entity_id(subject)
-        obj_id = self._entity_id(obj)
         pred = predicate.lower().replace(" ", "_")
         ended = sanitize_iso_temporal(ended or date.today().isoformat(), "ended")
 
         with self._lock:
             conn = self._conn()
             with conn:
+                sub_id = self._resolve_entity_id(conn, subject)
+                obj_id = self._resolve_entity_id(conn, obj)
                 rows = conn.execute(
                     "SELECT id, valid_from FROM triples "
                     "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
@@ -408,21 +620,21 @@ class KnowledgeGraph:
         successor is still opened, so ``supersede`` degrades to ``add_triple``.
         """
         if at is None:
-            boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            boundary = utc_now_z()
         elif _is_date_only_temporal(at):
             boundary = f"{at}T00:00:00Z"
         else:
             boundary = at
         boundary = sanitize_iso_temporal(boundary, "at")
 
-        sub_id = self._entity_id(subject)
-        old_id = self._entity_id(old_obj)
-        new_id = self._entity_id(new_obj)
         pred = predicate.lower().replace(" ", "_")
 
         with self._lock:
             conn = self._conn()
             with conn:
+                sub_id = self._resolve_entity_id(conn, subject)
+                old_id = self._resolve_entity_id(conn, old_obj)
+                new_id = self._resolve_entity_id(conn, new_obj)
                 # Only create entities we actually open a fact for. old_obj is
                 # matched by id in the UPDATE below whether or not its row
                 # exists, so inserting it would just orphan an entity when no
@@ -466,9 +678,7 @@ class KnowledgeGraph:
                 if existing:
                     return existing["id"]
 
-                triple_id = make_triple_id(
-                    sub_id, pred, new_id, boundary, datetime.now().isoformat()
-                )
+                triple_id = make_triple_id(sub_id, pred, new_id, boundary, utc_now_iso())
                 conn.execute(
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
@@ -520,18 +730,18 @@ class KnowledgeGraph:
         ``source_file`` here is only a fallback for an original carrying none.
         """
         if at is None:
-            boundary = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            boundary = utc_now_z()
         elif _is_date_only_temporal(at):
             boundary = f"{at}T00:00:00Z"
         else:
             boundary = at
         boundary = sanitize_iso_temporal(boundary, "at")
         pred = str(predicate).lower().replace(" ", "_")
-        obj_id = self._entity_id(obj)
 
         with self._lock:
             conn = self._conn()
             with conn:
+                obj_id = self._resolve_entity_id(conn, obj)
                 row = conn.execute(
                     "SELECT subject, valid_from, confidence, source_closet, source_file, "
                     "source_drawer_id, adapter_name FROM triples "
@@ -576,7 +786,7 @@ class KnowledgeGraph:
                 ).fetchone()
                 if existing:
                     return existing["id"]
-                new_id = make_triple_id(sub_id, pred, obj_id, boundary, datetime.now().isoformat())
+                new_id = make_triple_id(sub_id, pred, obj_id, boundary, utc_now_iso())
                 conn.execute(
                     """INSERT INTO triples (
                         id, subject, predicate, object, valid_from, valid_to,
@@ -609,7 +819,6 @@ class KnowledgeGraph:
         as_of: ISO date or canonical UTC datetime — only return facts valid then
         """
         as_of = sanitize_iso_temporal(as_of, "as_of")
-        eid = self._entity_id(name)
         results = []
 
         temporal_sql = ""
@@ -619,6 +828,7 @@ class KnowledgeGraph:
 
         with self._lock:
             conn = self._conn()
+            eid = self._resolve_entity_id(conn, name)
 
             if direction in ("outgoing", "both"):
                 query = (
@@ -691,9 +901,10 @@ class KnowledgeGraph:
         """Return token/prefix entity matches for disambiguation (never substring)."""
         if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
             return []
-        eid = self._entity_id(name)
         with self._lock:
-            return self._lookup_entity_candidates(self._conn(), name, eid)
+            conn = self._conn()
+            eid = self._resolve_entity_id(conn, name)
+            return self._lookup_entity_candidates(conn, name, eid)
 
     def _lookup_entity_candidates(self, conn, name: str, eid: str) -> list:
         if not name or len(name.strip()) < _MIN_ENTITY_CANDIDATE_LEN:
@@ -816,7 +1027,7 @@ class KnowledgeGraph:
         with self._lock:
             conn = self._conn()
             if entity_name:
-                eid = self._entity_id(entity_name)
+                eid = self._resolve_entity_id(conn, entity_name)
                 rows = conn.execute(
                     """
                     SELECT t.*, s.name as sub_name, o.name as obj_name
@@ -859,7 +1070,7 @@ class KnowledgeGraph:
         with self._lock:
             conn = self._conn()
             if entity_name:
-                eid = self._entity_id(entity_name)
+                eid = self._resolve_entity_id(conn, entity_name)
                 row = conn.execute(
                     "SELECT COUNT(*) FROM triples WHERE subject = ? OR object = ?",
                     (eid, eid),
@@ -954,6 +1165,31 @@ class KnowledgeGraph:
         }
 
     # ── Seed from known facts ─────────────────────────────────────────────
+
+    def report_entity_id_collisions(self) -> list:
+        """List rows still keyed by a legacy id their name no longer derives.
+
+        Each was written before entity ids kept punctuation, and may hold facts
+        for more than one spelling. Stored ids stay as they are.
+        """
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute("SELECT id, name FROM entities").fetchall()
+        reports = []
+        for row in rows:
+            current = entity_id_for_name(row["name"])
+            legacy = legacy_entity_id(row["name"])
+            if row["id"] == legacy and row["id"] != current:
+                reports.append(
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "current_id": current,
+                        "legacy_id": legacy,
+                        "detail": "stored id left unchanged",
+                    }
+                )
+        return reports
 
     def seed_from_entity_facts(self, entity_facts: dict):
         """

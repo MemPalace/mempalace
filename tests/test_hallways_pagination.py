@@ -174,9 +174,7 @@ def _records(hallways):
 
 def _compute_both_ways(tmp_path, monkeypatch, col, wing, *, seed=()):
     """compute_hallways_for_wing through the sqlite pass and through paging,
-    each against its own hallway file seeded with ``seed``."""
-    import json
-
+    each against its own hallway store seeded with ``seed``."""
     import mempalace.palace as palace_pkg
 
     results = {}
@@ -188,8 +186,7 @@ def _compute_both_ways(tmp_path, monkeypatch, col, wing, *, seed=()):
             if path == "paged":
                 m.setattr(palace_pkg, "_fast_collection_metadata", lambda *_a, **_k: None)
             created = hallways_mod.compute_hallways_for_wing(wing, col=col, min_count=1)
-        stored = json.loads((tmp_path / path / "hallways.json").read_text(encoding="utf-8"))
-        results[path] = (_records(created), _records(stored["hallways"]))
+        results[path] = (_records(created), _records(hallways_mod._load_hallways()))
     return results
 
 

@@ -15,7 +15,6 @@ from mempalace.backends.base import (
     UnsupportedMaintenanceKindError,
 )
 
-
 # ---------------------------------------------------------------------------
 # Contract surface
 # ---------------------------------------------------------------------------

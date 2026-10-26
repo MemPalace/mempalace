@@ -5,10 +5,10 @@
 def cmd_wings(args):
     from ..wing_split import (
         apply_split,
+        assert_split_pending_matches_plan,
         load_split_plan,
         plan_split,
         plan_targets,
-        assert_split_pending_matches_plan,
         save_split_plan,
         split_pending_path,
         split_plan_path,

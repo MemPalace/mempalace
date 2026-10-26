@@ -89,7 +89,9 @@ def test_shared_cosine_merges_text_and_asset_and_retains_missing_path(indexed_me
     assert first["available"] is True
     assert provider.calls == ["search"]
     image.unlink()
-    missing = search_memories("find the screenshot", palace, include_media=True)["results"][0]
+    again = search_memories("find the screenshot", palace, include_media=True)
+    assert "results" in again, again
+    missing = again["results"][0]
     assert missing["available"] is False
     assert missing["path"] == str(image)
 

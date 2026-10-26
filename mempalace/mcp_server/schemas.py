@@ -330,7 +330,8 @@ TOOLS = {
                     "description": (
                         "Only drawers filed on/after this ISO date or datetime "
                         "(inclusive), e.g. '2026-04-01' or '2026-04-01T09:30:00'. "
-                        "Compares the drawer's created_at (filed_at) wall-clock; "
+                        "A value without an offset is local time. Compares the "
+                        "drawer's created_at (filed_at) as an instant; "
                         "drawers without a filed_at are excluded while set."
                     ),
                 },
@@ -343,7 +344,7 @@ TOOLS = {
                 },
                 "max_distance": {
                     "type": "number",
-                    "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
+                    "description": "Optional distance cutoff on the cosine scale (0=identical, 2=opposite), applied the same way whatever metric the palace uses. Results further than this are dropped and counted in filtered_by_max_distance. Lower = stricter. Default: no cutoff.",
                 },
                 "candidate_strategy": {
                     "type": "string",
@@ -356,10 +357,12 @@ TOOLS = {
                 },
                 "include_media": {
                     "type": "boolean",
+                    "x-mempalace-strict": True,
                     "description": "Opt in to local image/audio/video assets and text in the shared EmbeddingGemma 2 space. Returns media paths and metadata with cosine ranking.",
                 },
                 "query_task": {
                     "type": "string",
+                    "x-mempalace-strict": True,
                     "enum": ["search", "code"],
                     "description": "EmbeddingGemma 2 task prompt: general search (default) or native code retrieval.",
                 },
@@ -459,7 +462,7 @@ TOOLS = {
         "handler": tool_checkpoint,
     },
     "mempalace_delete_drawer": {
-        "description": "Delete a drawer by ID. Irreversible.",
+        "description": "Delete a drawer by ID. Irreversible. Its earlier revisions in drawer_revisions.jsonl are removed too.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -480,7 +483,8 @@ TOOLS = {
             "accepted call (1 to 500 IDs) always returns `results` plus "
             "`deleted`/`errors` totals, including a one-ID call. An empty "
             "list, a non-list, or more than 500 IDs is rejected with `error` "
-            "and deletes nothing."
+            "and deletes nothing. Each deleted drawer's earlier revisions are "
+            "removed too."
         ),
         "input_schema": {
             "type": "object",
@@ -547,6 +551,7 @@ TOOLS = {
                 },
                 "include_ignored": {
                     "type": "array",
+                    "x-mempalace-strict": True,
                     "items": {"type": "string"},
                     "description": (
                         "Project-relative paths to scan even if ignored, matching CLI "
@@ -555,6 +560,7 @@ TOOLS = {
                 },
                 "include_subagents": {
                     "type": "boolean",
+                    "x-mempalace-strict": True,
                     "description": (
                         "Also mine Claude Code subagent transcripts (subagents/ dirs), "
                         "matching CLI --include-subagents. Convos mode only; ignored by "
@@ -567,7 +573,7 @@ TOOLS = {
         "handler": tool_mine,
     },
     "mempalace_delete_by_source": {
-        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing (#1722). Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible.",
+        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing. Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible; a commit also removes those drawers' earlier revisions.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -608,6 +614,14 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "drawer_id": {"type": "string", "description": "ID of the drawer to fetch"},
+                "include_source_bytes": {
+                    "type": "boolean",
+                    "description": (
+                        "Also return `source_bytes_base64`: the drawer's exact source bytes, "
+                        "for a drawer whose metadata names a `source_encoding`. Responses "
+                        "show a byte that is not valid UTF-8 as U+FFFD; these bytes keep it."
+                    ),
+                },
             },
             "required": ["drawer_id"],
         },
@@ -670,7 +684,7 @@ TOOLS = {
         "handler": tool_list_drawers,
     },
     "mempalace_update_drawer": {
-        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found.",
+        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. The replaced text is kept verbatim in the palace's drawer_revisions.jsonl until the drawer is deleted.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1125,29 +1139,15 @@ TOOLS = {
     },
 }
 
-# MCP ToolAnnotations.readOnlyHint for clients that hide mutating tools
-# (plan modes, read-only subagents). Only tools that do not change state
-# belong here. Server --read-only uses the wider _READ_ONLY_REFUSED_TOOLS
-# set: mempalace_memories_filed_away unlinks the checkpoint ack file, so it
-# stays refused there and must not advertise readOnlyHint (MCP default is
-# false when the annotation is omitted).
-for _read_only_name in (
-    "mempalace_status",
-    "mempalace_list_wings",
-    "mempalace_list_rooms",
-    "mempalace_get_taxonomy",
-    "mempalace_get_aaak_spec",
-    "mempalace_search",
-    "mempalace_check_duplicate",
-    "mempalace_get_drawer",
-    "mempalace_get_drawers",
-    "mempalace_list_drawers",
-    "mempalace_diary_read",
-    "mempalace_kg_query",
-    "mempalace_kg_timeline",
-    "mempalace_kg_stats",
-):
-    TOOLS[_read_only_name]["read_only"] = True
+
+# Read/write class and gate flags live in mempalace.tool_capabilities, which the
+# daemon and CLI import without this package. Every tool needs a row there.
+if set(TOOLS) != set(_tool_capabilities.TOOL_CAPABILITIES):
+    raise RuntimeError(
+        "mempalace.tool_capabilities does not match TOOLS: "
+        f"missing={sorted(set(TOOLS) - set(_tool_capabilities.TOOL_CAPABILITIES))} "
+        f"extra={sorted(set(_tool_capabilities.TOOL_CAPABILITIES) - set(TOOLS))}"
+    )
 
 
 SUPPORTED_PROTOCOL_VERSIONS = [

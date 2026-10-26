@@ -39,25 +39,30 @@ def _window_sql_prefilters(since_dt, before_dt) -> list:
     space separator, minute precision, Z/offset suffixes) — a
     full-isoformat bound would sort after some of those on the boundary
     day and drop an in-window row at the SQL layer, where the
-    authoritative Python re-filter (offset drop, unparseable exclusion —
-    mirroring the wing/room double-check) can't recover it. Day
-    granularity costs at most one extra day of candidates per bound;
-    Python decides the exact window.
+    authoritative Python re-filter (instant comparison, unparseable
+    exclusion — mirroring the wing/room double-check) can't recover it.
+    Stored values are UTC or naive local, so a stored date can sit up to a
+    day either side of the bound's UTC date; the narrowing widens by that
+    day. Python decides the exact window.
     """
     prefilters = []
     if since_dt is not None:
-        prefilters.append((">=", since_dt.date().isoformat()))
+        try:
+            lower = (localize(since_dt).astimezone(timezone.utc) - timedelta(days=1)).date()
+            prefilters.append((">=", lower.isoformat()))
+        except OverflowError:
+            # since at the calendar floor: nothing to narrow by.
+            pass
     if before_dt is not None:
         try:
-            upper = (before_dt + timedelta(days=1)).date().isoformat()
+            upper = (localize(before_dt).astimezone(timezone.utc) + timedelta(days=2)).date()
+            prefilters.append(("<", upper.isoformat()))
         except OverflowError:
             # before at the calendar ceiling ("9999-12-31" as an open-ended
             # sentinel): there is no next day to bound by, so skip the SQL
             # narrowing entirely — the Python re-filter stays authoritative
             # and such a window is effectively unbounded above anyway.
-            upper = None
-        if upper is not None:
-            prefilters.append(("<", upper))
+            pass
     return prefilters
 
 
@@ -73,16 +78,16 @@ def _flag_truncations(result: dict, window_pool_truncated: bool, candidates_trun
 
 
 def _pick_fts_candidates(
-    conn, collection_name, query, *, max_candidates, scope, fts_filter, row_filter, stop_words
+    conn, collection_name, query, *, max_candidates, equalities, fts_filter, row_filter, stop_words
 ) -> list[int]:
     """Row ids for the BM25 re-rank, whole-word matches first.
 
     The trigram index matches inside words, and the first matches in storage
     order were the oldest substring hits. A scope filter matching few drawers
     is read directly (``row_filter`` refers to ``e.id``) instead of ranking
-    the palace-wide match set (``fts_filter``).
+    the palace-wide match set (``fts_filter``). ``equalities`` are the
+    stored ``(key, values)`` the scope allows.
     """
-    equalities = [(key, value) for key, value in scope.items() if value]
     candidate_ids = _filtered_candidate_rows(
         conn,
         collection_name,
@@ -122,7 +127,7 @@ def _bm25_only_via_sqlite(
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
-    Used when HNSW is diverged or unloadable (#1222). Bypasses chromadb's
+    Used when HNSW is diverged or unloadable. Bypasses chromadb's
     Python client entirely so a corrupt vector segment can't segfault the
     MCP server. Routes through chromadb's own FTS5 trigram index
     (``embedding_fulltext_search``) for candidate selection, then re-ranks
@@ -146,44 +151,29 @@ def _bm25_only_via_sqlite(
         from ..config import get_configured_collection_name
 
         collection_name = get_configured_collection_name()
+    wing_names = wing_aliases(wing, chroma_known_wings(palace_path)) if wing else []
+    scope = {
+        "wing": wing_names,
+        "room": [room] if room else [],
+        "source_file": [source_file] if source_file else [],
+    }
+
+    equalities = [
+        (key, tuple(encode_filter(value) for value in values))
+        for key, values in scope.items()
+        if values
+    ]
 
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
-        clauses = []
-        params = []
-        for key, value in (("wing", wing), ("room", room), ("source_file", source_file)):
-            if not value:
-                continue
-            clauses.append(
-                f"""
-                AND EXISTS (
-                    SELECT 1
-                    FROM embedding_metadata mf
-                    WHERE mf.id = {row_id_expr}
-                      AND mf.key = ?
-                      AND COALESCE(
-                        mf.string_value,
-                        CAST(mf.int_value AS TEXT),
-                        CAST(mf.float_value AS TEXT),
-                        CAST(mf.bool_value AS TEXT)
-                      ) = ?
-                )
-                """
-            )
-            params.extend([key, value])
+        sql, params = _match_sql(equalities, row_id_expr, "mf")
         for op, sql_bound in _window_sql_prefilters(since_dt, before_dt):
-            clauses.append(
-                f"""
-                AND EXISTS (
-                    SELECT 1
-                    FROM embedding_metadata mf
-                    WHERE mf.id = {row_id_expr}
-                      AND mf.key = 'filed_at'
-                      AND mf.string_value {op} ?
-                )
-                """
+            sql += (
+                " AND EXISTS (SELECT 1 FROM embedding_metadata mf"
+                f" WHERE mf.id = {row_id_expr} AND mf.key = 'filed_at'"
+                f" AND mf.string_value {op} ?)"
             )
             params.append(sql_bound)
-        return "".join(clauses), params
+        return sql, params
 
     try:
         conn = open_palace_reader(db_path)
@@ -194,7 +184,7 @@ def _bm25_only_via_sqlite(
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
         # shorter than 3 chars (trigram tokenizer can't match them).
-        tokens = [t for t in _tokenize(query) if len(t) >= 3]
+        tokens = [t for t in tokenize(query) if len(t) >= 3]
         candidate_ids: list[int] = []
         candidates_truncated = False
         use_recency_fallback = not tokens
@@ -206,7 +196,7 @@ def _bm25_only_via_sqlite(
                     collection_name,
                     query,
                     max_candidates=max_candidates,
-                    scope={"wing": wing, "room": room, "source_file": source_file},
+                    equalities=equalities,
                     fts_filter=(filter_sql, filter_params),
                     row_filter=_metadata_filter_sql("e.id"),
                     stop_words=stop_words,
@@ -224,51 +214,16 @@ def _bm25_only_via_sqlite(
             # something rather than return empty-handed. A clean FTS miss
             # must stay empty, especially after wing/room filtering, because
             # recency fallback would return unrelated scoped drawers.
-            # Wrapped in try/except because the schema may differ on legacy
-            # palaces (older chromadb without ``created_at``, missing
-            # ``segments`` rows after partial restore, etc.); on schema
-            # mismatch we fall back to ordering by primary-key id and finally
-            # to an empty result rather than letting search raise.
+            # On a legacy schema (older chromadb without ``created_at``,
+            # missing ``segments`` rows after partial restore) the window is
+            # ordered by id, and failing that is empty rather than raising.
             try:
-                filter_sql, filter_params = _metadata_filter_sql("e.id")
-                rows = conn.execute(
-                    f"""
-                    SELECT e.id
-                    FROM embeddings e
-                    JOIN segments s ON e.segment_id = s.id
-                    JOIN collections c ON s.collection = c.id
-                    WHERE c.name = ?
-                    {filter_sql}
-                    ORDER BY e.created_at DESC
-                    LIMIT ?
-                    """,
-                    (collection_name, *filter_params, max_candidates),
-                ).fetchall()
-                candidate_ids = [r[0] for r in rows]
-            except sqlite3.Error:
-                logger.debug(
-                    "recency-window query failed; trying id-ordered fallback",
-                    exc_info=True,
+                candidate_ids = _newest_row_ids(
+                    conn, collection_name, max_candidates, *_metadata_filter_sql("e.id")
                 )
-                try:
-                    filter_sql, filter_params = _metadata_filter_sql("e.id")
-                    rows = conn.execute(
-                        f"""
-                        SELECT e.id
-                        FROM embeddings e
-                        JOIN segments s ON e.segment_id = s.id
-                        JOIN collections c ON s.collection = c.id
-                        WHERE c.name = ?
-                        {filter_sql}
-                        ORDER BY e.id DESC
-                        LIMIT ?
-                        """,
-                        (collection_name, *filter_params, max_candidates),
-                    ).fetchall()
-                    candidate_ids = [r[0] for r in rows]
-                except sqlite3.Error:
-                    logger.debug("id-ordered fallback also failed", exc_info=True)
-                    candidate_ids = []
+            except sqlite3.Error:
+                logger.debug("recency-window queries failed", exc_info=True)
+                candidate_ids = []
 
         # A full candidate page means rows beyond it never got a chance to
         # match the window — mirror the vector path's truncation honesty
@@ -284,42 +239,20 @@ def _bm25_only_via_sqlite(
                 "fallback": "bm25_only_via_sqlite",
             }
 
-        placeholders = ",".join(["?"] * len(candidate_ids))
-        meta_rows = conn.execute(
-            f"""
-            SELECT m.id, e.embedding_id, m.key, m.string_value, m.int_value
-            FROM embedding_metadata AS m
-            JOIN embeddings AS e ON e.id = m.id
-            WHERE m.id IN ({placeholders})
-            """,
-            candidate_ids,
-        ).fetchall()
+        # In row order: the BM25 sort below keeps it for ties.
+        rows = _decoded_rows(conn, sorted(candidate_ids))
     finally:
         conn.close()
-
-    # Group metadata rows into per-drawer dicts.
-    drawers: dict[int, dict] = {}
-    for emb_id, stored_drawer_id, key, sval, ival in meta_rows:
-        d = drawers.setdefault(
-            emb_id,
-            {
-                "_id": emb_id,
-                "_stored_drawer_id": stored_drawer_id,
-                "metadata": {},
-                "text": "",
-            },
-        )
-        if key == "chroma:document":
-            d["text"] = sval or ""
-        else:
-            d["metadata"][key] = sval if sval is not None else ival
 
     # Apply wing/room filters in Python (FTS5 candidates may include
     # entries from other wings).
     candidates = []
-    for d in drawers.values():
-        meta = d["metadata"]
-        if wing and meta.get("wing") != wing:
+    wings = set(wing_names)
+    for stored_drawer_id, text, meta in rows:
+        text, meta = text or "", meta or {}
+        if is_bookkeeping(meta, stored_drawer_id):
+            continue
+        if wings and meta.get("wing") not in wings:
             continue
         if room and meta.get("room") != room:
             continue
@@ -330,8 +263,8 @@ def _bm25_only_via_sqlite(
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
-                "drawer_id": _result_drawer_id(meta, d["_stored_drawer_id"]),
-                "text": d["text"],
+                "drawer_id": _result_drawer_id(meta, stored_drawer_id),
+                "text": text,
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
                 "source_file": Path(full_source).name if full_source else "?",
@@ -353,7 +286,7 @@ def _bm25_only_via_sqlite(
 
     # Local BM25 over the candidate set.
     docs = [c["text"] for c in candidates]
-    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
+    bm25_raw = bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     for c, raw in zip(candidates, bm25_raw):
         c["bm25_score"] = round(raw, 3)
@@ -392,6 +325,8 @@ def _merge_bm25_union_candidates(
     stop_words: frozenset = frozenset(),
     since_dt=None,
     before_dt=None,
+    stats: dict = None,
+    known_distances: dict = None,
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -406,13 +341,19 @@ def _merge_bm25_union_candidates(
     contributing chunk M of the same file. Falls back to ``source_file``
     only when full-path/chunk metadata is absent.
 
-    BM25-only additions carry ``distance=None`` unless a strict
-    ``max_distance`` threshold is set. Under a threshold, union mode loads
-    stored embeddings for lexical hits and computes their vector distance
-    before admitting them, preserving the same distance guarantee as the
-    vector-only path.
+    BM25-only additions carry ``distance=None`` unless a ``max_distance``
+    cutoff is set. Under a cutoff, union mode loads stored embeddings for
+    lexical hits and computes their vector distance; a hit past the cutoff is
+    dropped and counted in ``stats["filtered_by_max_distance"]``. A hit whose
+    distance cannot be computed is kept with ``distance=None`` and
+    ``fallback_reason="distance_unavailable"`` rather than lost. A hit the
+    vector path already measured reuses that distance from
+    ``known_distances``; if the vector path dropped it, it stays dropped and
+    is not counted twice.
     """
-    where = build_where_filter(wing, room, source_file)
+    stats = {} if stats is None else stats
+    known_distances = known_distances or {}
+    where = build_where_filter(wing, room, source_file, col=drawers_col)
     try:
         lexical = drawers_col.lexical_search(
             query=query,
@@ -422,19 +363,23 @@ def _merge_bm25_union_candidates(
     except UnsupportedCapabilityError:
         raise
     except Exception:
-        logger.debug("candidate_strategy=union: lexical fetch failed", exc_info=True)
+        logger.warning("candidate_strategy=union: lexical fetch failed", exc_info=True)
+        stats["candidate_strategy_fallback"] = "lexical_search_failed"
         return
 
     metric = _metric_for_collection(drawers_col)
+    unmeasured = [hit for hit in lexical.hits if hit.id not in known_distances]
     lexical_distances = (
-        _lexical_hit_vector_distances(drawers_col, query, lexical.hits, metric)
-        if max_distance > 0.0
+        _lexical_hit_vector_distances(drawers_col, query, unmeasured, metric)
+        if _has_distance_cutoff(max_distance) and unmeasured
         else {}
     )
 
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
+        if is_bookkeeping(meta, hit.id):
+            continue
         # The window applies to every candidate source; a lexically strong
         # drawer outside [since, before) must not enter through this side
         # door (the vector-path candidates are filtered upstream).
@@ -443,34 +388,42 @@ def _merge_bm25_union_candidates(
         ):
             continue
         full_source = meta.get("source_file", "") or ""
-        distance = lexical_distances.get(hit.id)
-        if max_distance > 0.0:
-            if distance is None or distance > max_distance:
+        if hit.id in known_distances:
+            distance = known_distances[hit.id]
+            if _beyond_max_distance(distance, max_distance, metric):
+                continue  # the vector path already dropped and counted it
+        else:
+            distance = lexical_distances.get(hit.id)
+            if distance is not None and _beyond_max_distance(distance, max_distance, metric):
+                stats["filtered_by_max_distance"] = stats.get("filtered_by_max_distance", 0) + 1
                 continue
+        if distance is not None:
             distance = round(distance, 4)
-        bm25_extra.append(
-            {
-                "drawer_id": _result_drawer_id(meta, hit.id),
-                "text": hit.document or "",
-                "wing": meta.get("wing", "unknown"),
-                "room": meta.get("room", "unknown"),
-                "source_file": Path(full_source).name if full_source else "?",
-                "source_path": full_source,
-                **_result_date_fields(meta),
-                "similarity": (
-                    None
-                    if distance is None
-                    else round(_distance_to_similarity(distance, metric), 3)
-                ),
-                "distance": distance,
-                "effective_distance": distance,
-                "closet_boost": 0.0,
-                "matched_via": "bm25_backend",
-                "bm25_score": round(float(hit.score), 3),
-                "_source_file_full": full_source,
-                "_chunk_index": meta.get("chunk_index"),
-            }
-        )
+        entry = {
+            "drawer_id": _result_drawer_id(meta, hit.id),
+            "text": hit.document or "",
+            "wing": meta.get("wing", "unknown"),
+            "room": meta.get("room", "unknown"),
+            "source_file": Path(full_source).name if full_source else "?",
+            "source_path": full_source,
+            **_result_date_fields(meta),
+            "similarity": (
+                None if distance is None else round(_distance_to_similarity(distance, metric), 3)
+            ),
+            "distance": distance,
+            "effective_distance": (
+                None if distance is None else round(_cosine_scale_distance(distance, metric), 4)
+            ),
+            "closet_boost": 0.0,
+            "matched_via": "bm25_backend",
+            "bm25_score": round(float(hit.score), 3),
+            "_source_file_full": full_source,
+            "_chunk_index": meta.get("chunk_index"),
+        }
+        if distance is None and _has_distance_cutoff(max_distance):
+            # The cutoff could not be checked; keep the hit and say why.
+            entry["fallback_reason"] = "distance_unavailable"
+        bm25_extra.append(entry)
 
     def _dedup_key(entry: dict):
         full = entry.get("_source_file_full")

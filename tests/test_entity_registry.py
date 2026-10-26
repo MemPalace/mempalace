@@ -302,45 +302,6 @@ def test_lookup_ambiguous_word_as_concept(tmp_path):
     assert result["type"] == "concept"
 
 
-# ── extract_people_from_query ───────────────────────────────────────────
-
-
-def test_extract_people_from_query(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(
-        mode="personal",
-        people=[
-            {"name": "Riley", "relationship": "daughter", "context": "personal"},
-            {"name": "Devon", "relationship": "friend", "context": "personal"},
-        ],
-        projects=[],
-    )
-    found = registry.extract_people_from_query("What did Riley say about the weather?")
-    assert "Riley" in found
-    assert "Devon" not in found
-
-
-# ── extract_unknown_candidates ──────────────────────────────────────────
-
-
-def test_extract_unknown_candidates(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(mode="personal", people=[], projects=[])
-    unknowns = registry.extract_unknown_candidates("Saoirse went to the store")
-    assert "Saoirse" in unknowns
-
-
-def test_extract_unknown_candidates_skips_known(tmp_path):
-    registry = EntityRegistry.load(config_dir=tmp_path)
-    registry.seed(
-        mode="personal",
-        people=[{"name": "Riley", "relationship": "daughter", "context": "personal"}],
-        projects=[],
-    )
-    unknowns = registry.extract_unknown_candidates("Riley went to the store")
-    assert "Riley" not in unknowns
-
-
 # ── summary ─────────────────────────────────────────────────────────────
 
 

@@ -20,13 +20,11 @@ Public:
 
 from __future__ import annotations
 
-import json
 import re
 import sys
 from dataclasses import dataclass
 
-from mempalace.llm_client import LLMError, LLMProvider
-
+from mempalace.llm_client import LLMError, LLMProvider, parse_json_reply
 
 BATCH_SIZE = 25  # candidates per LLM call; tuned for 4B local models
 CONTEXT_LINES_PER_CANDIDATE = 3
@@ -106,64 +104,15 @@ def _build_user_prompt(candidates_with_contexts: list[tuple[str, str, list[str]]
     return "\n".join(parts)
 
 
-def _extract_json_candidates(text: str) -> list[str]:
-    """Return plausible JSON payloads extracted from an LLM response."""
-    text = text.strip()
-    if not text:
-        return []
-
-    candidates: list[str] = [text]
-
-    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE):
-        candidate = match.group(1).strip()
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-
-    for start, opener in ((i, ch) for i, ch in enumerate(text) if ch in "{["):
-        closer = "}" if opener == "{" else "]"
-        depth = 0
-        in_string = False
-        escaped = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-                continue
-
-            if ch == '"':
-                in_string = True
-            elif ch == opener:
-                depth += 1
-            elif ch == closer:
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1].strip()
-                    if candidate and candidate not in candidates:
-                        candidates.append(candidate)
-                    break
-
-    return candidates
-
-
 def _parse_response(text: str, expected_names: list[str]) -> dict[str, tuple[str, str]]:
     """Parse the LLM's JSON response into {name: (label, reason)}.
 
     Robust to the model occasionally wrapping JSON in text or returning
     slight schema variations. Falls back to matching by candidate name.
     """
-    data = None
-    for candidate in _extract_json_candidates(text):
-        try:
-            data = json.loads(candidate)
-            break
-        except json.JSONDecodeError:
-            continue
-    if data is None:
+    try:
+        data = parse_json_reply(text, expect=(dict, list))
+    except ValueError:
         return {}
 
     entries = data.get("classifications") if isinstance(data, dict) else data
@@ -464,7 +413,7 @@ def collect_corpus_text(
     if not root.is_dir():
         return ""
     candidates: list[tuple[float, Path]] = []
-    for dirpath, dirs, files in _walk_prose(root, SKIP_DIRS):
+    for dirpath, _dirs, files in _walk_prose(root, SKIP_DIRS):
         for fname in files:
             p = dirpath / fname
             if p.suffix.lower() not in PROSE_EXTENSIONS:

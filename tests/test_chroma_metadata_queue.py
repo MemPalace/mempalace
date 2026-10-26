@@ -7,18 +7,19 @@ from uuid import UUID
 import chromadb
 import numpy as np
 import pytest
+from _mcp_server_helpers import _patch_mcp_server
 from chromadb.config import Settings, System
 from chromadb.db.impl.sqlite import SqliteDB
 from chromadb.segment.impl.metadata.sqlite import SqliteMetadataSegment
 from chromadb.types import Operation, ScalarEncoding
-from _mcp_server_helpers import _patch_mcp_server
+
 from mempalace.backends import _inproc_sqlite
 
 
 @pytest.mark.parametrize("operation", ["add", "update", "delete"])
 def test_list_requires_metadata_queue_catchup(monkeypatch, config, palace_path, kg, operation):
     from mempalace import mcp_server as mcp
-    from mempalace.backends.chroma import sqlite_list_id_metadata, sqlite_drawer_rows
+    from mempalace.backends.chroma import sqlite_drawer_rows, sqlite_list_id_metadata
 
     client = chromadb.PersistentClient(
         path=palace_path, settings=Settings(anonymized_telemetry=False)

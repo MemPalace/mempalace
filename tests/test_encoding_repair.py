@@ -12,7 +12,6 @@ from mempalace.encoding_repair import (
     restore_collection,
 )
 
-
 CLEAN_MULTILINGUAL = [
     "La canción «PERÚ» abre el disco.",
     "Buried surface area 1250 Å².",
@@ -334,6 +333,34 @@ class FakeCollection:
             documents,
         ):
             self.documents[positions[drawer_id]] = document
+
+
+def test_drawers_that_name_their_source_encoding_are_left_alone(tmp_path):
+    """A stamped drawer was decoded without loss: text that looks like mojibake
+    is what the source said, and must keep its round trip."""
+    from mempalace.fsio import decode_source, encode_source
+
+    # The source itself holds mojibake, plus one stray byte.
+    raw = "cafÃ© notes".encode("utf-8") + b"\xff"
+    stamped_text, encoding = decode_source(raw)
+    assert encoding == "utf-8+surrogateescape"
+
+    class StampedCollection(FakeCollection):
+        def get(self, *, limit, offset, include):
+            page = super().get(limit=limit, offset=offset, include=include)
+            page["metadatas"] = [
+                {"source_encoding": encoding} if doc == stamped_text else {}
+                for doc in page["documents"]
+            ]
+            return page
+
+    collection = StampedCollection([stamped_text, "cafÃ©"])
+    report = repair_collection(collection, apply=True, backup_path=tmp_path / "backup.jsonl")
+
+    assert report["changed"] == 1
+    assert collection.documents[0] == stamped_text
+    assert encode_source(collection.documents[0], encoding) == raw
+    assert collection.documents[1] == "café"
 
 
 def test_dry_run_flags_only_damaged_documents():

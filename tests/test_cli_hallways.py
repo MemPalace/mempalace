@@ -1,7 +1,8 @@
 """Tests for the `hallways` CLI command."""
 
-import pytest
 from argparse import Namespace
+
+import pytest
 
 import mempalace.hallways as hallways_mod
 from mempalace.cli import cmd_hallways

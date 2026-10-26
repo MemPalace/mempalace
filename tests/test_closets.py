@@ -12,7 +12,6 @@ Coverage map:
   * purge_file_closets — scoped to source_file.
   * Project-miner end-to-end rebuild — re-mining with fewer topics fully
     purges leftover numbered closets from a larger prior run.
-  * _extract_drawer_ids_from_closet — pointer parsing + dedup.
   * search_memories hybrid path — drawer query always the floor,
     closets boost matching source_file, matched_via reflects both signals,
     no whole-file glue, max_distance enforcement.
@@ -34,6 +33,7 @@ import time
 import pytest
 import yaml
 
+from mempalace.lexical import bm25_scores
 from mempalace.miner import (
     _extract_entities_for_metadata,
     _load_known_entities,
@@ -55,13 +55,10 @@ from mempalace.palace_graph import (
     list_tunnels,
 )
 from mempalace.searcher import (
-    _bm25_scores,
-    _expand_with_neighbors,
-    _extract_drawer_ids_from_closet,
+    _enrich_closet_hits,
     _hybrid_rank,
     search_memories,
 )
-
 
 # ── mine_lock ────────────────────────────────────────────────────────────
 
@@ -503,26 +500,6 @@ class TestMinerClosetRebuild:
                     )
 
 
-# ── _extract_drawer_ids_from_closet ───────────────────────────────────
-
-
-class TestExtractDrawerIds:
-    def test_parses_single_pointer(self):
-        assert _extract_drawer_ids_from_closet("topic|;|→drawer_x") == ["drawer_x"]
-
-    def test_parses_multiple_pointers_per_line(self):
-        line = "topic|ent|→drawer_a,drawer_b,drawer_c"
-        assert _extract_drawer_ids_from_closet(line) == ["drawer_a", "drawer_b", "drawer_c"]
-
-    def test_dedupes_across_lines(self):
-        doc = "one|;|→drawer_a,drawer_b\ntwo|;|→drawer_b,drawer_c"
-        assert _extract_drawer_ids_from_closet(doc) == ["drawer_a", "drawer_b", "drawer_c"]
-
-    def test_empty_doc_returns_empty(self):
-        assert _extract_drawer_ids_from_closet("") == []
-        assert _extract_drawer_ids_from_closet("no arrows here") == []
-
-
 # ── search_memories closet-first path ────────────────────────────────
 
 
@@ -701,7 +678,7 @@ class TestEntityMetadata:
 
 class TestBM25:
     def test_scores_positive_for_matching_doc(self):
-        scores = _bm25_scores(
+        scores = bm25_scores(
             "database migration",
             ["We migrated the database to Postgres.", "unrelated cookery tips"],
         )
@@ -709,13 +686,13 @@ class TestBM25:
         assert scores[1] == 0.0
 
     def test_scores_zero_when_no_overlap(self):
-        scores = _bm25_scores("quantum physics", ["We built a web app in React"])
+        scores = bm25_scores("quantum physics", ["We built a web app in React"])
         assert scores == [0.0]
 
     def test_idf_downweights_terms_present_in_every_doc(self):
         # "database" appears in every candidate → low IDF → low contribution.
         # "vacuum" is unique to one → high IDF → that doc dominates.
-        scores = _bm25_scores(
+        scores = bm25_scores(
             "database vacuum",
             [
                 "database backup nightly schedule",
@@ -726,9 +703,9 @@ class TestBM25:
         assert scores[1] == max(scores), "doc with the rare query term should win on IDF"
 
     def test_empty_inputs_return_zeros(self):
-        assert _bm25_scores("", ["hello world"]) == [0.0]
-        assert _bm25_scores("query here", []) == []
-        assert _bm25_scores("query", [""]) == [0.0]
+        assert bm25_scores("", ["hello world"]) == [0.0]
+        assert bm25_scores("query here", []) == []
+        assert bm25_scores("query", [""]) == [0.0]
 
     def test_hybrid_rank_promotes_keyword_match(self):
         results = [
@@ -1059,7 +1036,7 @@ class TestDiaryIngest:
         )
         palace_dir = tmp_path / "palace"
 
-        from mempalace.diary_ingest import _state_file_for, _split_entries, ingest_diaries
+        from mempalace.diary_ingest import _split_entries, _state_file_for, ingest_diaries
 
         ingest_diaries(str(diary_dir), str(palace_dir), force=True)
 
@@ -1353,21 +1330,27 @@ class TestTunnels:
             with pytest.raises(ValueError):
                 create_tunnel(*args)
 
-    def test_corrupt_tunnel_file_does_not_lose_new_writes(self):
-        """A truncated/corrupt tunnels.json (crash mid-write on a system
-        without atomic rename) must not leak into subsequent reads — the
-        file should be treated as empty and a fresh create_tunnel should
-        persist cleanly."""
-        import mempalace.palace_graph as pg
+    def test_corrupt_tunnel_file_is_kept_aside_not_overwritten(self):
+        """A corrupt tunnels.json reads as empty, but the next save refuses
+        to overwrite it: the bytes move to a ``.corrupt-*`` file and the save
+        raises. Saves after that start a fresh file."""
+        import glob
 
-        # Simulate a crash that left a truncated file behind.
-        with open(pg._get_tunnel_file(), "w") as f:
+        import mempalace.palace_graph as pg
+        from mempalace.fsio import CorruptStateError
+
+        tunnel_file = pg._get_tunnel_file()
+        with open(tunnel_file, "w") as f:
             f.write("{not valid json")
 
-        # Load should return [] rather than raising.
         assert list_tunnels() == []
 
-        # A subsequent create must persist (atomic write replaces the corrupt file).
+        with pytest.raises(CorruptStateError):
+            create_tunnel("wing_a", "r1", "wing_b", "r2")
+        (aside,) = glob.glob(tunnel_file + ".corrupt-*")
+        with open(aside) as f:
+            assert f.read() == "{not valid json"
+
         t = create_tunnel("wing_a", "r1", "wing_b", "r2")
         assert list_tunnels() == [t]
 
@@ -1422,6 +1405,25 @@ class TestTunnels:
 # helper level.
 
 
+def _expand_with_neighbors(col, matched_doc, matched_meta, radius=1):
+    """Run one closet hit through the search enrichment step.
+
+    ``text`` stays the matched drawer; the ±1 chunks around it are in
+    ``context``. Returns the hit.
+    """
+    assert radius == 1
+    hit = {
+        "text": matched_doc,
+        "matched_via": "drawer+closet",
+        "_source_file_full": matched_meta.get("source_file") or "",
+        "_chunk_index": matched_meta.get("chunk_index"),
+        "_parent_drawer_id": matched_meta.get("parent_drawer_id"),
+    }
+    [out] = _enrich_closet_hits([hit], col)
+    out["window"] = "\n\n".join(filter(None, [out.get("context"), out["text"]]))
+    return out
+
+
 class TestDrawerGrepExpansion:
     def _seed_source_file(self, palace_path, source: str, n_chunks: int):
         """Helper: put N sequential drawers for a single source file into
@@ -1450,63 +1452,53 @@ class TestDrawerGrepExpansion:
         out = _expand_with_neighbors(col, matched_doc, matched_meta, radius=1)
         assert out["drawer_index"] == 2
         assert out["total_drawers"] == 5
-        # Expect chunks 1, 2, 3 joined in chunk_index order.
-        text = out["text"]
-        assert "chunk_1" in text
-        assert "chunk_2" in text
-        assert "chunk_3" in text
-        # No leakage of non-neighbors.
-        assert "chunk_0" not in text
-        assert "chunk_4" not in text
-        # Ordering preserved — chunk_1 before chunk_2 before chunk_3.
-        assert text.index("chunk_1") < text.index("chunk_2") < text.index("chunk_3")
+        assert out["text"] == matched_doc
+        # Neighbors 1 and 3 in chunk_index order; no leakage of non-neighbors.
+        context = out["context"]
+        assert context.index("chunk_1") < context.index("chunk_3")
+        assert "chunk_0" not in context
+        assert "chunk_2" not in context
+        assert "chunk_4" not in context
 
     def test_expand_at_start_of_file_only_has_next_neighbor(self, palace_path):
         col, _ = self._seed_source_file(palace_path, "/proj/edge_start.md", n_chunks=3)
         out = _expand_with_neighbors(
             col,
-            "chunk_0 content",
+            "chunk_0 content about topic alpha",
             {"source_file": "/proj/edge_start.md", "chunk_index": 0},
         )
         assert out["drawer_index"] == 0
         assert out["total_drawers"] == 3
-        assert "chunk_0" in out["text"]
-        assert "chunk_1" in out["text"]
-        # No chunk_-1 could exist; the expansion must not invent one.
-        assert "chunk_-1" not in out["text"]
+        assert out["context"] == "chunk_1 content about topic alpha"
 
     def test_expand_at_end_of_file_only_has_prev_neighbor(self, palace_path):
         col, _ = self._seed_source_file(palace_path, "/proj/edge_end.md", n_chunks=3)
         out = _expand_with_neighbors(
             col,
-            "chunk_2 content",
+            "chunk_2 content about topic alpha",
             {"source_file": "/proj/edge_end.md", "chunk_index": 2},
         )
         assert out["drawer_index"] == 2
         assert out["total_drawers"] == 3
-        assert "chunk_1" in out["text"]
-        assert "chunk_2" in out["text"]
-        # No chunk_3 exists.
-        assert "chunk_3" not in out["text"]
+        assert out["context"] == "chunk_1 content about topic alpha"
 
     def test_expand_single_drawer_file_returns_just_matched(self, palace_path):
         col, _ = self._seed_source_file(palace_path, "/proj/lone.md", n_chunks=1)
         out = _expand_with_neighbors(
             col,
-            "chunk_0 content",
+            "chunk_0 content about topic alpha",
             {"source_file": "/proj/lone.md", "chunk_index": 0},
         )
-        assert out["drawer_index"] == 0
-        assert out["total_drawers"] == 1
         assert out["text"] == "chunk_0 content about topic alpha"
+        assert "context" not in out
 
     def test_expand_falls_back_when_metadata_missing(self, palace_path):
         col = get_collection(palace_path)
         # No source_file / chunk_index in meta — degrade gracefully.
         out = _expand_with_neighbors(col, "matched doc", {})
         assert out["text"] == "matched doc"
-        assert out["drawer_index"] is None
-        assert out["total_drawers"] is None
+        assert "context" not in out
+        assert "total_drawers" not in out
 
     def test_hybrid_search_enrichment_populates_drawer_index_and_total(self, palace_path):
         """End-to-end: when a closet boosts a source with many drawers, the
@@ -1621,8 +1613,8 @@ class TestDrawerGrepExpansion:
             "parent_drawer_id": "drawer_A",
         }
         out = _expand_with_neighbors(col, matched_doc, matched_meta, radius=1)
-        text = out["text"]
-        # Group A's chunks are returned in chunk_index order.
+        text = out["window"]
+        # Group A's chunks are returned.
         assert "alpha-A-chunk-0" in text
         assert "alpha-A-chunk-1" in text
         # No leakage of group B's chunks through the shared source_file key.
@@ -1652,7 +1644,7 @@ class TestDrawerGrepExpansion:
         # no parent_drawer_id anywhere, so behavior is unchanged.
         assert out["total_drawers"] == 5
         assert out["drawer_index"] == 2
-        text = out["text"]
+        text = out["window"]
         assert "chunk_1" in text
         assert "chunk_2" in text
         assert "chunk_3" in text
@@ -1826,11 +1818,9 @@ class TestDrawerGrepExpansion:
             },
             radius=1,
         )
-        # Singleton group A: text is the matched chunk, total_drawers == 1.
-        assert "solo-A-chunk-0" in out["text"]
-        assert "trio-B-chunk" not in out["text"]
-        assert out["total_drawers"] == 1
-        assert out["drawer_index"] == 0
+        # Singleton group A: only the matched chunk, no neighbor context.
+        assert out["text"] == "solo-A-chunk-0 content"
+        assert "context" not in out
 
     def test_expand_empty_string_parent_drawer_id_treated_as_absent(self, palace_path):
         """Contract pin: an empty-string ``parent_drawer_id`` value
@@ -1853,6 +1843,6 @@ class TestDrawerGrepExpansion:
         # Empty parent_drawer_id is treated as absent; full file-global
         # neighborhood is returned. Mirrors backwards-compat behavior.
         assert out["total_drawers"] == 3
-        assert "chunk_0" in out["text"]
-        assert "chunk_1" in out["text"]
-        assert "chunk_2" in out["text"]
+        assert "chunk_0" in out["window"]
+        assert "chunk_1" in out["window"]
+        assert "chunk_2" in out["window"]

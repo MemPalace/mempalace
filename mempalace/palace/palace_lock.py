@@ -50,8 +50,7 @@ class MineValidationError(RuntimeError):
             raise ValueError("MineValidationError requires at least one error string")
         if not palace_path:
             raise ValueError("MineValidationError requires a non-empty palace_path")
-        # Name the SQLite that produced the verdict. #2240 points at this
-        # post-mine check by name: a build that cannot detect a given FTS5
+        # Name the SQLite that produced the verdict: a build that cannot detect a given FTS5
         # fault reports the same "clean" as one that can. The CLI handler
         # renders the abort banner, which carries the version; the MCP `mine`
         # tool and the daemon's job runner render this message instead, so it
@@ -74,14 +73,14 @@ def _validate_palace_fts5_after_mine(
     first write. When nothing was written since, the check is skipped: a mine
     that filed, purged and registered nothing left the database as it found
     it, and on a 1M-drawer palace the full quick_check costs ~40 s warm, most
-    of a no-op mine (#2684). ``None`` always checks.
+    of a no-op mine. ``None`` always checks.
 
     Reuses the same primitive that `cmd_repair` already runs as preflight so the
     operator sees the same recovery banner regardless of which command surfaces
     the bug.
 
     An isolated FTS5 inverted-index corruption (the common case after a
-    killed-mid-write mine, #1596) is auto-healed in place first via the same
+    killed-mid-write mine) is auto-healed in place first via the same
     `maybe_autoheal_fts5_index` rebuild `cmd_repair` already runs as its own
     preflight step — so a normal `mine` self-heals the recoverable case
     instead of forcing the operator to run `mempalace repair` by hand for a
@@ -111,7 +110,7 @@ def _validate_palace_fts5_after_mine(
         # transport -- a stray print() here would corrupt the protocol stream
         # and crash the connection.
         #
-        # warning, not info: this module logs through the `mempalace_mcp`
+        # warning, not info: this module logs through the `mempalace.palace`
         # logger, which sets no level of its own, and nothing configures logging
         # on the `mempalace mine` path -- so root keeps its default and info
         # records are dropped. Every message this call can emit describes a palace whose
@@ -293,11 +292,10 @@ def mine_palace_lock(palace_path: str):
     lets the threaded MCP HTTP transport write from a worker thread while the
     long-lived writer-lease is held on another thread of the same process.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    lock_dir = paths.lock_dir()
     os.makedirs(lock_dir, exist_ok=True)
     resolved = os.path.realpath(os.path.expanduser(palace_path))
-    lock_key_source = os.path.normcase(resolved)
-    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
+    palace_key = paths.palace_key(palace_path, length=16)
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
     if _held_by_this_process(palace_key):
@@ -311,7 +309,7 @@ def mine_palace_lock(palace_path: str):
     # which on Windows breaks ``msvcrt.locking`` (it locks 1 byte at the
     # *current* position, so two contenders end up locking different bytes
     # and silently both acquire — observed as Windows-CI lock test
-    # failures during #1264 development).
+    # failures).
     if not os.path.exists(lock_path):
         # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
         # contender just created it, which is fine — we proceed to open.
