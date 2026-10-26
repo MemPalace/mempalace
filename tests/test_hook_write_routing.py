@@ -334,7 +334,7 @@ def test_require_unavailable_blocks_every_direct_hook_write_path(
     sync_run.assert_not_called()
     fake_mcp.tool_diary_write.assert_not_called()
 
-    assert result["count"] == 0
+    assert result["drawers_filed"] == 0
     assert result["routing_blocked"] is True
 
 
@@ -558,7 +558,8 @@ def test_stop_uses_one_daemon_probe_for_all_write_helpers(
     def save(*args, **kwargs):
         assert hooks_cli._current_hook_write_routing().use_daemon is True
         return {
-            "count": hooks_cli.SAVE_INTERVAL,
+            "drawers_filed": 1,
+            "messages_folded": hooks_cli.SAVE_INTERVAL,
             "themes": [],
         }
 
@@ -605,4 +606,4 @@ def test_stop_uses_one_daemon_probe_for_all_write_helpers(
         )
 
     probe.assert_called_once_with()
-    assert "memories woven" in output["systemMessage"]
+    assert "checkpoint saved" in output["systemMessage"]

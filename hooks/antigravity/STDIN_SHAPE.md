@@ -144,7 +144,7 @@ contains a `decision` key.
 (Side effects: counter `~/.mempalace/hook_state/antigravity_save_count_<id>` is
 incremented; if the modulo gate fires, a background `mempalace mine`
 subprocess is spawned with the transcript directory and the inferred
-wing `wing_mempalace`.)
+wing `mempalace`.)
 
 ## Worked example: PreInvocation, first invocation
 
@@ -161,13 +161,13 @@ wing `wing_mempalace`.)
 }
 ```
 
-### Output (when the palace has memory for `wing_mempalace`)
+### Output (when the palace has memory for `mempalace`)
 
 ```json
 {
   "injectSteps": [
     {
-      "ephemeralMessage": "<exact verbatim text from `mempalace wake-up --wing wing_mempalace`>"
+      "ephemeralMessage": "<exact verbatim text from `mempalace wake-up --wing mempalace`>"
     }
   ]
 }

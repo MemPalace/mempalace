@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import ClassVar, Optional, Protocol, runtime_checkable
 
+from ..timeutil import recency_key
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -31,7 +32,7 @@ class PalaceNotFoundError(BackendError, FileNotFoundError):
     """Raised when ``get_collection(create=False)`` is called on a missing palace.
 
     Subclass of ``FileNotFoundError`` so legacy callers that catch the latter
-    (pre-#413 seam) keep working unchanged.
+    (the pre-plugin seam) keep working unchanged.
     """
 
 
@@ -81,6 +82,57 @@ class DimensionMismatchError(BackendError):
 
 class EmbedderIdentityMismatchError(BackendError):
     """Raised when the stored embedder model name differs from the current one."""
+
+
+class EmbeddingFunctionMismatchError(BackendError, ValueError):
+    """Raised when a backend's persisted embedding function differs from the current one.
+
+    Chroma stores the embedding function's name on each collection and
+    refuses to open it with another. A ``ValueError`` subclass, as the bare
+    error used to be, so existing ``except ValueError`` callers still see it.
+    """
+
+
+# ``error`` values of tool and search results for the three mismatch errors
+# above. MCP flags results carrying one of them with ``isError``.
+EMBEDDER_IDENTITY_MISMATCH_ERROR = "Embedder identity mismatch"
+EMBEDDING_DIMENSION_MISMATCH_ERROR = "Embedding dimension mismatch"
+EMBEDDING_MODEL_MISMATCH_ERROR = "Embedding model mismatch"
+
+
+class EmbedderIdentityRecordError(BackendError):
+    """The embedder identity could not be recorded for a collection.
+
+    Raised on write paths only (a brand-new collection's first write open,
+    ``palace set-embedder``): writing on without a recorded identity would
+    leave the palace unprotected against a later same-dimension model swap.
+    Reads never record an identity, so they never raise it.
+    """
+
+
+EMBEDDER_IDENTITY_NOT_RECORDED_ERROR = "Embedder identity not recorded"
+
+
+def model_mismatch_error_kind(exc: BaseException) -> Optional[str]:
+    """The result ``error`` value for a model mismatch error, else None."""
+    if isinstance(exc, EmbedderIdentityRecordError):
+        return EMBEDDER_IDENTITY_NOT_RECORDED_ERROR
+    if isinstance(exc, EmbedderIdentityMismatchError):
+        return EMBEDDER_IDENTITY_MISMATCH_ERROR
+    if isinstance(exc, DimensionMismatchError):
+        return EMBEDDING_DIMENSION_MISMATCH_ERROR
+    if isinstance(exc, EmbeddingFunctionMismatchError):
+        return EMBEDDING_MODEL_MISMATCH_ERROR
+    return None
+
+
+# Re-embedding with the current model: in place (archives the original), or
+# into a separate palace from the original's SQLite.
+_RE_EMBED_HINT = (
+    "re-embed with the current model: `mempalace repair rebuild-index` (in place; "
+    "archives the original palace first) or `mempalace --palace <new-palace> repair "
+    "--mode from-sqlite --source <palace>` (into a separate palace)"
+)
 
 
 class EmbedderIdentityUnknownWarning(UserWarning):
@@ -234,14 +286,15 @@ def check_embedder_identity(
             f"collection was built with a {stored.dimension}-dim embedder "
             f"({stored.model_name!r}) but the current embedder is "
             f"{current.dimension}-dim ({current.model_name!r}); the stored "
-            "vectors are incompatible. Re-embed the palace to switch models."
+            "vectors are incompatible. Set embedding_model back to the model "
+            f"the palace was built with, or {_RE_EMBED_HINT}."
         )
     raise EmbedderIdentityMismatchError(
         f"collection was built with embedder {stored.model_name!r} but the "
         f"current embedder is {current.model_name!r}. Searching across a model "
-        "swap silently degrades recall. Re-embed the palace, or run "
-        "`mempalace palace set-embedder --model <name> --force` to record the "
-        "new identity if you know the vectors are compatible."
+        "swap silently degrades recall. Set embedding_model (config.json or "
+        "MEMPALACE_EMBEDDING_MODEL) back to the model the palace was built with, "
+        f"or {_RE_EMBED_HINT}."
     )
 
 
@@ -354,13 +407,78 @@ class LexicalResult:
     hits: list[LexicalHit]
 
 
+def recency_sort_key(meta: Optional[dict], order_field: str = "filed_at") -> tuple:
+    """Sort key for newest-first ordering on an ISO-8601 metadata field.
+
+    Orders by the parsed instant (:func:`timeutil.recency_key`), so naive
+    local values from older writers and UTC values interleave correctly;
+    with ``reverse=True`` records missing the field sort last. Backends that
+    implement :meth:`BaseCollection.get_recent` MUST produce this order. Text
+    order is chronological only within one form, so a SQL top-N read fetches
+    the UTC-suffixed values and the rest separately and merges them by this
+    key.
+    """
+    return recency_key((meta or {}).get(order_field))
+
+
+def _recency_order(metadatas: list[dict], order_field: str) -> list[int]:
+    """Indices into ``metadatas``, newest first, missing timestamps last."""
+    return sorted(
+        range(len(metadatas)),
+        key=lambda i: recency_sort_key(metadatas[i], order_field),
+        reverse=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Collection contract
 # ---------------------------------------------------------------------------
 
 
+def initialize_last_modified_metadata(metadatas):
+    """Initialize last_modified from filed_at without mutating caller data."""
+    if metadatas is None:
+        return None
+
+    items = [metadatas] if isinstance(metadatas, dict) else list(metadatas)
+    result = []
+
+    for metadata in items:
+        if not isinstance(metadata, dict):
+            result.append(metadata)
+            continue
+
+        updated = dict(metadata)
+        filed_at = updated.get("filed_at")
+
+        if filed_at and not updated.get("last_modified"):
+            updated["last_modified"] = filed_at
+
+        result.append(updated)
+
+    return result
+
+
+def validate_write_batch(ids, *, unique_ids: bool = False, **columns) -> None:
+    """Raise ``ValueError`` for a malformed write batch.
+
+    Each column passed (``None`` is skipped) must match ``ids`` in length,
+    checked in the order given; ``unique_ids`` also refuses repeated ids, as
+    ``add`` does on backends that report a duplicate instead of overwriting.
+    """
+    n = len(ids)
+    for label, value in columns.items():
+        if value is not None and len(value) != n:
+            raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
+    if unique_ids and len(set(ids)) != n:
+        raise ValueError("add ids must be unique")
+
+
 class BaseCollection(ABC):
     """Per-collection read/write surface every backend must implement."""
+
+    # Chroma retains omitted metadata fields on upsert; replacing backends do not.
+    upsert_merges_metadata = False
 
     @abstractmethod
     def add(
@@ -472,7 +590,7 @@ class BaseCollection(ABC):
         return None
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
-        """Return every matching record's metadata in one logical pass (#1796).
+        """Return every matching record's metadata in one logical pass.
 
         Default implementation pages through :meth:`get` using
         ``limit``/``offset`` -- correct for backends with a real server-side
@@ -485,7 +603,7 @@ class BaseCollection(ABC):
         cursor exactly once instead. Calling the default implementation on
         such a backend is O(n^2) in collection size: each page re-walks the
         entire collection just to discard everything outside the requested
-        slice. See issue #1796.
+        slice.
         """
         all_meta: list[dict] = []
         offset = 0
@@ -503,6 +621,146 @@ class BaseCollection(ABC):
                 break
             offset += len(batch_meta)
         return all_meta
+
+    def get_all_rows(
+        self, where: Optional[dict] = None, include: Optional[list[str]] = None
+    ) -> GetResult:
+        """Return every matching record -- ids plus the ``include``d fields --
+        in one logical pass.
+
+        The ids-carrying sibling of :meth:`get_all_metadata`, for callers that
+        need to know *which* rows they got (``list_drawers`` collapses chunk
+        rows into logical drawers by id). ``include`` defaults to
+        ``["metadatas"]``; ``documents``/``metadatas`` come back aligned with
+        ``ids`` when requested and empty otherwise. Same contract as
+        ``get_all_metadata``: the default pages through :meth:`get` with
+        ``limit``/``offset``, and backends without a real server-side cursor
+        MUST override it with a single native walk, or every page re-scans
+        the whole collection (O(n^2)).
+        """
+        include = list(include) if include else ["metadatas"]
+        want_docs = "documents" in include
+        want_meta = "metadatas" in include
+        ids: list[str] = []
+        documents: list = []
+        metadatas: list = []
+        offset = 0
+        page_size = 1000
+        while True:
+            kwargs: dict = {"include": include, "limit": page_size, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            batch_ids = batch.ids if hasattr(batch, "ids") else batch.get("ids")
+            if not batch_ids:
+                break
+            ids.extend(batch_ids)
+            if want_docs:
+                batch_docs = (
+                    batch.documents if hasattr(batch, "documents") else batch.get("documents")
+                )
+                documents.extend(batch_docs or [])
+            if want_meta:
+                batch_meta = (
+                    batch.metadatas if hasattr(batch, "metadatas") else batch.get("metadatas")
+                )
+                metadatas.extend(batch_meta or [])
+            if len(batch_ids) < page_size:
+                break
+            offset += len(batch_ids)
+        return GetResult(ids=ids, documents=documents, metadatas=metadatas, embeddings=None)
+
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+    ) -> GetResult:
+        """Return up to ``limit`` records, newest first by ``order_field``.
+
+        ``order_field`` names a metadata key holding an ISO-8601 timestamp
+        string (``filed_at`` for drawers). Ordering is descending on the
+        instant it names; see :func:`recency_sort_key`.
+        Records whose value is missing, empty, or not a string sort last.
+
+        The default implementation pages through :meth:`get` in storage order
+        up to ``limit`` records and sorts that window locally. That is exact
+        when the collection holds no more than ``limit`` records matching
+        ``where``, and *approximate* above that: the window is whatever the
+        backend hands back first, so the genuinely newest records can fall
+        outside it (a known limitation for Layer 1 wake-up).
+        Backends able to push the ordering into storage MUST override this and
+        advertise the ``supports_recency_order`` capability token. What that
+        token promises, exactly:
+
+        * The returned records really are the top ``limit`` under the ordering
+          above, at any collection size, **whenever the backend can also
+          evaluate ``where`` in storage** (including ``where=None``).
+        * The ordering is by instant (:func:`recency_sort_key`), so naive
+          local and UTC timestamps interleave correctly; an override that
+          orders text in storage must read each timestamp form separately.
+        * A filter the backend cannot push into storage has to be evaluated
+          record by record, so a backend MAY bound how far it walks and return
+          fewer than ``limit`` records rather than read the whole collection.
+          A backend that bounds it MUST document the bound on its override.
+          pgvector does; see :meth:`PgVectorCollection._scroll_recent_local`.
+
+        Callers that need the guarantee should check the token rather than
+        assume it, and should read it as covering the filters the backend can
+        push down. The default is always available so no backend breaks.
+
+        ``include`` follows the same contract as :meth:`get`: projections the
+        caller did not ask for come back empty. ``metadatas`` is fetched
+        regardless because the sort reads ``order_field`` from it, but it is
+        only *returned* when requested.
+        """
+        if limit <= 0:
+            return GetResult.empty()
+        include = ["documents", "metadatas"] if include is None else list(include)
+        want_documents = "documents" in include
+        want_metadatas = "metadatas" in include
+        # The local sort needs order_field, so metadatas always come back from
+        # the backend even when the caller projected them out of the result.
+        fetch_include = include if want_metadatas else [*include, "metadatas"]
+
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict] = []
+        offset = 0
+        fetched = 0
+        page_size = min(500, limit)
+        while fetched < limit:
+            kwargs: dict = {"include": fetch_include, "limit": page_size, "offset": offset}
+            if where:
+                kwargs["where"] = where
+            batch = self.get(**kwargs)
+            batch_ids = list(batch.get("ids") or [])
+            batch_docs = list(batch.get("documents") or [])
+            batch_metas = list(batch.get("metadatas") or [])
+            page_len = max(len(batch_ids), len(batch_docs), len(batch_metas))
+            if not page_len:
+                break
+            # Pad the projections the caller did not request so the three
+            # lists stay index-aligned for the sort below.
+            ids.extend(batch_ids or [""] * page_len)
+            documents.extend(batch_docs or [""] * page_len)
+            metadatas.extend(batch_metas or [{}] * page_len)
+            offset += page_len
+            fetched += page_len
+            if page_len < page_size:
+                break
+
+        n = min(len(ids), len(documents), len(metadatas))
+        ids, documents, metadatas = ids[:n], documents[:n], metadatas[:n]
+        order = _recency_order(metadatas, order_field)[:limit]
+        return GetResult(
+            ids=[ids[i] for i in order],
+            documents=[documents[i] for i in order] if want_documents else [],
+            metadatas=[metadatas[i] for i in order] if want_metadatas else [],
+            embeddings=None,
+        )
 
     def facet_counts(
         self,
@@ -555,40 +813,52 @@ class BaseCollection(ABC):
     ) -> None:
         """Default non-atomic update: get + merge + upsert.
 
+        Ids that do not exist are skipped, as on every built-in backend; an
+        update never creates a record. Stored embeddings are kept when the
+        caller passes none and the backend returns one for every row; if any
+        row has none, the whole batch is re-embedded in the same single upsert.
+
         Backends advertising ``supports_update`` MUST override with an atomic
         single-round-trip implementation.
         """
         if documents is None and metadatas is None and embeddings is None:
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
 
-        n = len(ids)
-        for label, value in (
-            ("documents", documents),
-            ("metadatas", metadatas),
-            ("embeddings", embeddings),
-        ):
-            if value is not None and len(value) != n:
-                raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
+        validate_write_batch(ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
 
-        existing = self.get(ids=ids, include=["documents", "metadatas"])
+        existing = self.get(ids=list(ids), include=["documents", "metadatas", "embeddings"])
+        stored_embeddings = existing.embeddings
         by_id = {
-            rid: (existing.documents[i], existing.metadatas[i])
+            rid: (
+                existing.documents[i],
+                existing.metadatas[i],
+                stored_embeddings[i] if stored_embeddings is not None else None,
+            )
             for i, rid in enumerate(existing.ids)
         }
-        merged_docs: list[str] = []
-        merged_metas: list[dict] = []
+        out_ids, out_docs, out_metas, out_embeddings = [], [], [], []
         for i, rid in enumerate(ids):
-            prev_doc, prev_meta = by_id.get(rid, ("", {}))
-            merged_docs.append(documents[i] if documents is not None else prev_doc)
+            if rid not in by_id:
+                continue
+            prev_doc, prev_meta, prev_embedding = by_id[rid]
+            out_ids.append(rid)
+            out_docs.append(documents[i] if documents is not None else prev_doc)
             new_meta = dict(prev_meta or {})
             if metadatas is not None:
                 new_meta.update(metadatas[i] or {})
-            merged_metas.append(new_meta)
+            out_metas.append(new_meta)
+            out_embeddings.append(embeddings[i] if embeddings is not None else prev_embedding)
+        if not out_ids:
+            return
+        # One upsert, so the batch lands whole or not at all. If any row came
+        # back without a stored vector, the backend re-embeds the whole batch.
+        if any(vector is None for vector in out_embeddings):
+            out_embeddings = None
         self.upsert(
-            documents=merged_docs,
-            ids=list(ids),
-            metadatas=merged_metas,
-            embeddings=embeddings,
+            documents=out_docs,
+            ids=out_ids,
+            metadatas=out_metas,
+            embeddings=out_embeddings,
         )
 
 

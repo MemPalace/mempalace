@@ -13,12 +13,11 @@ Covers:
   4. The Qdrant scroll page size constant is 4096, not 256.
 """
 
-import types
 import sys
+import types
 from unittest import mock
 
 import pytest
-
 
 # ── Stub heavy deps so we can import mempalace modules in isolation ─────────
 #
@@ -71,14 +70,13 @@ def _stub_heavy_deps(monkeypatch):
 # during this file's first import below and during every test.
 import numpy  # noqa: E402,F401
 
+from mempalace.backends import qdrant as qdrant_mod  # noqa: E402
 from mempalace.backends.base import (  # noqa: E402
     BaseCollection,
     GetResult,
     PalaceRef,
 )
-from mempalace.backends import qdrant as qdrant_mod  # noqa: E402
 from mempalace.backends.qdrant import QdrantCollection, _QdrantConfig  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # 1. BaseCollection default get_all_metadata()
@@ -304,6 +302,117 @@ class TestQdrantGetAllMetadataSingleScroll:
 
 
 # ---------------------------------------------------------------------------
+# 2a. get_all_rows(): ids-plus-fields sibling of get_all_metadata (issue #2452)
+# ---------------------------------------------------------------------------
+
+
+class _FakeOffsetPagedRowCollection(_FakeOffsetPagedCollection):
+    """Offset-cursor collection whose get() also returns ids and documents."""
+
+    def get(
+        self, *, ids=None, where=None, where_document=None, limit=None, offset=None, include=None
+    ):
+        self.get_call_count += 1
+        self.last_include = include
+        offset = offset or 0
+        limit = limit if limit is not None else len(self._all)
+        page = self._all[offset : offset + limit]
+        start = offset
+        include = include or ["documents", "metadatas"]
+        return GetResult(
+            ids=[f"d{start + i}" for i in range(len(page))],
+            documents=[f"doc{start + i}" for i in range(len(page))]
+            if "documents" in include
+            else [],
+            metadatas=page if "metadatas" in include else [],
+            embeddings=None,
+        )
+
+
+class TestBaseCollectionDefaultGetAllRows:
+    def test_returns_ids_and_metadata_across_pages(self):
+        all_meta = [{"wing": f"w{i}"} for i in range(2500)]
+        col = _FakeOffsetPagedRowCollection(all_meta)
+
+        result = col.get_all_rows()
+
+        assert result.ids == [f"d{i}" for i in range(2500)]
+        assert result.metadatas == all_meta
+        assert result.documents == []
+        assert col.last_include == ["metadatas"]
+        assert 3 <= col.get_call_count <= 4
+
+    def test_includes_documents_when_asked(self):
+        col = _FakeOffsetPagedRowCollection([{"wing": "a"}, {"wing": "b"}])
+
+        result = col.get_all_rows(include=["documents", "metadatas"])
+
+        assert result.ids == ["d0", "d1"]
+        assert result.documents == ["doc0", "doc1"]
+        assert result.metadatas == [{"wing": "a"}, {"wing": "b"}]
+
+    def test_empty_collection(self):
+        assert _FakeOffsetPagedRowCollection([]).get_all_rows().ids == []
+
+    def test_passes_where_through(self):
+        col = _FakeOffsetPagedRowCollection([{"wing": "a"}])
+        captured = {}
+        original_get = col.get
+
+        def spy_get(**kwargs):
+            captured.update(kwargs)
+            return original_get(**kwargs)
+
+        col.get = spy_get
+        col.get_all_rows(where={"wing": "a"})
+        assert captured.get("where") == {"wing": "a"}
+
+
+class TestQdrantGetAllRowsSingleScroll:
+    def test_returns_ids_and_metadata_in_one_pass(self, monkeypatch):
+        page1 = ([_fake_point(f"d{i}", "wing_a") for i in range(3)], "cursor-1")
+        page2 = ([_fake_point(f"d{i}", "wing_b") for i in range(3, 5)], None)
+        col, call_log = _make_qdrant_collection(monkeypatch, [page1, page2])
+
+        result = col.get_all_rows()
+
+        assert result.ids == ["d0", "d1", "d2", "d3", "d4"]
+        assert result.metadatas[0] == {"wing": "wing_a"}
+        assert result.metadatas[-1] == {"wing": "wing_b"}
+        assert result.documents == []  # metadatas only by default
+        assert len(call_log) == 2, (
+            f"expected one cursor pass (2 pages), got {len(call_log)} scroll calls"
+        )
+
+    def test_documents_only_when_included(self, monkeypatch):
+        page1 = ([_fake_point("d0", "wing_a")], None)
+        col, _ = _make_qdrant_collection(monkeypatch, [page1])
+
+        result = col.get_all_rows(include=["documents", "metadatas"])
+
+        assert result.documents == ["content for d0"]
+
+    def test_does_not_call_get_internally(self, monkeypatch):
+        page1 = ([_fake_point("d0", "wing_a")], None)
+        col, _ = _make_qdrant_collection(monkeypatch, [page1])
+        col.get = mock.MagicMock(side_effect=AssertionError("get() should not be called"))
+
+        assert col.get_all_rows().ids == ["d0"]
+        col.get.assert_not_called()
+
+    def test_filters_by_where_locally_when_required(self, monkeypatch):
+        page1 = (
+            [_fake_point("d0", "wing_a"), _fake_point("d1", "wing_b"), _fake_point("d2", "wing_c")],
+            None,
+        )
+        col, _ = _make_qdrant_collection(monkeypatch, [page1])
+
+        result = col.get_all_rows(where={"$or": [{"wing": "wing_a"}, {"wing": "wing_b"}]})
+
+        assert result.ids == ["d0", "d1"]
+
+
+# ---------------------------------------------------------------------------
 # 2b. QdrantCollection.get() bounded scroll (issue #2363)
 # ---------------------------------------------------------------------------
 
@@ -430,28 +539,7 @@ class TestScrollPageSizeBump:
 # this is a deliberate, explicitly-labeled VERBATIM COPY of the real
 # function -- not a live import. If mcp_server._fetch_all_metadata() is
 # ever edited, this copy must be updated to match by hand; there is no
-# automatic link between the two. (Diagnosed during review on #1832 after
-# two successive ImportErrors chasing the stub graph -- see PR discussion.)
-#
-# Real source as of this writing (mempalace/mcp_server.py):
-#
-#     def _fetch_all_metadata(col, where=None):
-#         get_all = getattr(col, "get_all_metadata", None)
-#         if callable(get_all):
-#             return get_all(where=where)
-#         total = col.count()
-#         all_meta = []
-#         offset = 0
-#         while offset < total:
-#             kwargs = {"include": ["metadatas"], "limit": 1000, "offset": offset}
-#             if where:
-#                 kwargs["where"] = where
-#             batch = col.get(**kwargs)
-#             if not batch["metadatas"]:
-#                 break
-#             all_meta.extend(batch["metadatas"])
-#             offset += len(batch["metadatas"])
-#         return all_meta
+# automatic link between the two.
 
 
 def _fetch_all_metadata_under_test(col, where=None):

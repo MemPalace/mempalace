@@ -39,3 +39,11 @@ venv/
 *.sqlite3-journal
 .envrc
 .review-logs
+
+# Rust & Native build artifacts
+target/
+*.pyd
+*.so
+*.dylib
+*.exe
+

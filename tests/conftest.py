@@ -10,9 +10,9 @@ mempalace imports — so that module-level initialisations (e.g.
 instead of the real user profile.
 """
 
-import os
 import hashlib
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -42,6 +42,10 @@ _REAL_EMBEDDING_TEST_MODULES = {
     "test_embedding",
     "test_embedding_api",
     "test_embeddinggemma",
+    "test_embeddinggemma2",
+    "test_embeddinggemma2_device",
+    "test_embeddinggemma2_integration",
+    "test_embedding_model_fallback",
 }
 
 
@@ -95,8 +99,9 @@ class _StableTestEmbeddingFunction:
 # don't re-download the 79 MB model on every run. The HOME redirect above
 # would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
 try:
-    from pathlib import Path  # noqa: E402
-    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (  # noqa: E402
+    from pathlib import Path
+
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (
         ONNXMiniLM_L6_V2,
     )
 
@@ -125,10 +130,11 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
 
     ef = _StableTestEmbeddingFunction()
 
+    from chromadb.api.types import DefaultEmbeddingFunction
+
     import mempalace.backends.chroma as chroma_mod
     import mempalace.backends.embedding_wrapper as embedding_wrapper
     import mempalace.embedding as embedding_mod
-    from chromadb.api.types import DefaultEmbeddingFunction
 
     monkeypatch.setattr(DefaultEmbeddingFunction, "__call__", lambda self, input: ef(input=input))
     monkeypatch.setattr(
@@ -136,20 +142,109 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
     )
     monkeypatch.setattr(embedding_mod, "get_embedding_function", lambda *_, **__: ef)
     monkeypatch.setattr(
-        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda: ef)
+        chroma_mod.ChromaBackend, "_resolve_embedding_function", staticmethod(lambda **_: ef)
     )
-    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts: ef(input=list(texts)))
+    monkeypatch.setattr(embedding_wrapper, "_embed_texts", lambda texts, **_: ef(input=list(texts)))
     yield
 
 
+def _reset_loaded_mcp_writer_state(mcp_server) -> None:
+    """Release process-global MCP writer state between tests.
+
+    The atexit-registration flag is deliberately preserved. Its callback is
+    registered for the lifetime of the Python process, so resetting the flag
+    would allow later writer acquisitions to register duplicate callbacks.
+    """
+    release_writer_lock = getattr(
+        mcp_server,
+        "_release_mcp_writer_lock",
+        None,
+    )
+    try:
+        if callable(release_writer_lock):
+            release_writer_lock()
+    finally:
+        # Normalize status even when the prior test left a failed/read-only
+        # attempt rather than an acquired context manager.
+        for name, value in (
+            ("_MCP_WRITER_LOCK_CM", None),
+            ("_MCP_WRITER_READ_ONLY", False),
+            ("_MCP_WRITER_LOCK_FAILED", False),
+            ("_MCP_WRITER_LOCK_ERROR", ""),
+        ):
+            if hasattr(mcp_server, name):
+                setattr(mcp_server, name, value)
+
+
 @pytest.fixture(autouse=True)
-def _reset_mcp_cache():
+def _release_palace_anchors():
+    """Close anchor connections on ``chroma.sqlite3`` after each test.
+
+    On Linux mempalace keeps one idle connection per database inode for the life
+    of the process; across thousands of temporary palaces that would run the
+    test process out of descriptors. Only acts when the module is loaded.
+    """
+    yield
+    import sys
+
+    inproc = sys.modules.get("mempalace.backends._inproc_sqlite")
+    if inproc is not None:
+        inproc.release_all()
+
+
+def _realign_default_backend(palace_module):
+    """Make ``palace._DEFAULT_BACKEND`` the registry's chroma instance again.
+
+    In production the two are the same object. ``reset_backends()`` (called by
+    several test modules) closes that instance and empties the registry, so the
+    next ``get_backend("chroma")`` builds a second one while ``_DEFAULT_BACKEND``
+    keeps pointing at the closed original. Later tests then patch one object
+    and the code under test uses the other.
+    """
+    from mempalace.backends import registry
+    from mempalace.backends.chroma import ChromaBackend
+
+    current = registry.get_backend("chroma")
+    if isinstance(current, ChromaBackend) and current is not palace_module._DEFAULT_BACKEND:
+        palace_module._DEFAULT_BACKEND = current
+
+
+@pytest.fixture(autouse=True)
+def _fresh_one_shot_warnings():
+    """Let every test see the warnings that fire once per process."""
+    from mempalace import _once
+
+    _once.reset()
+
+
+@pytest.fixture(autouse=True)
+def _utc_local_zone(monkeypatch):
+    """Read naive legacy timestamps as UTC so results don't depend on the host zone.
+
+    Tests that need another zone set ``timeutil._LOCAL_TZ`` themselves.
+    """
+    from datetime import timezone
+
+    from mempalace import timeutil
+
+    monkeypatch.setattr(timeutil, "_LOCAL_TZ", timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _reset_mcp_cache(monkeypatch):
     """Reset cached MCP state between tests without importing mcp_server.
 
-    If mempalace.mcp_server is already imported, close/clear its KG cache and
-    Chroma client cache. If it has not been imported, leave it unloaded so
-    fork/spawn-based tests do not inherit extra Chroma/SQLite state.
+    If mempalace.mcp_server is already imported, release its writer lease,
+    reset writer-status globals, and close/clear its KG and storage caches. If
+    it has not been imported, leave it unloaded so fork/spawn-based tests do
+    not inherit extra Chroma/SQLite state.
+
+    ``monkeypatch`` is an intentional ordering dependency. This fixture must
+    tear down before monkeypatch restores module globals; otherwise a writer
+    context acquired after a test patches ``_MCP_WRITER_LOCK_CM`` can be
+    discarded without its ``__exit__`` method running.
     """
+    del monkeypatch
 
     def _clear_cache():
         try:
@@ -157,6 +252,14 @@ def _reset_mcp_cache():
 
             mcp_server = sys.modules.get("mempalace.mcp_server")
             if mcp_server is not None:
+                stop_sync = getattr(mcp_server, "_stop_peer_sync_thread", None)
+                if callable(stop_sync):
+                    try:
+                        stop_sync()
+                    except Exception:
+                        pass
+
+                _reset_loaded_mcp_writer_state(mcp_server)
                 for kg in list(getattr(mcp_server, "_kg_by_path", {}).values()):
                     close = getattr(kg, "close", None)
                     if close is not None:
@@ -167,6 +270,17 @@ def _reset_mcp_cache():
 
                 if hasattr(mcp_server, "_kg_by_path"):
                     mcp_server._kg_by_path.clear()
+
+                for ls in list(getattr(mcp_server, "_logstream_by_path", {}).values()):
+                    close = getattr(ls, "close", None)
+                    if close is not None:
+                        try:
+                            close()
+                        except Exception:
+                            pass
+
+                if hasattr(mcp_server, "_logstream_by_path"):
+                    mcp_server._logstream_by_path.clear()
 
                 # Close (not just dereference) the cached chromadb client so its
                 # rust-side file handles are released; on Windows a bare deref
@@ -203,6 +317,10 @@ def _reset_mcp_cache():
         except (ImportError, AttributeError):
             pass
 
+        from mempalace import search_util
+
+        search_util._known_wings_cache.clear()
+
         # Release chromadb clients opened through the backend layer. Many tests
         # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
         # which caches one PersistentClient per palace_path on the long-lived
@@ -215,6 +333,7 @@ def _reset_mcp_cache():
         try:
             from mempalace import palace as _palace
 
+            _realign_default_backend(_palace)
             backend = getattr(_palace, "_DEFAULT_BACKEND", None)
             clients = getattr(backend, "_clients", None)
             if clients:
@@ -246,6 +365,17 @@ def _isolate_home():
         else:
             os.environ[var] = orig
     shutil.rmtree(_session_tmp, ignore_errors=True)
+
+
+@pytest.fixture
+def tokenless_http_hub(monkeypatch):
+    """Serve MCP HTTP without a bearer token, as ``mempalace serve --no-token`` does.
+
+    The transport requires a token by default; suites that drive a loopback
+    hub with raw HTTP requests opt out with this rather than carry a token.
+    """
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN", "1")
 
 
 @pytest.fixture
@@ -346,6 +476,13 @@ def seeded_collection(collection):
         ],
     )
     return collection
+
+
+def pytest_configure(config):
+    """On Windows, replace coverage's fail_under with the pyproject Windows gate."""
+    from coverage_gate import apply_platform_threshold
+
+    apply_platform_threshold(config)
 
 
 @pytest.fixture

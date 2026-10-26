@@ -151,9 +151,9 @@ class TestMempalPythonOverride:
         )
 
     def test_falls_back_to_path_when_unset(self, tmp_path):
-        """With MEMPAL_PYTHON unset, the hook uses whatever ``python3``
-        is found on PATH. Prove this by putting a marker-emitting shim
-        first on PATH."""
+        """With MEMPAL_PYTHON unset and no ``mempalace`` on PATH, the hook
+        uses whatever ``python3`` is found on PATH. The PATH is pinned to the
+        shim plus system dirs so a ``mempalace`` from the test venv can't win."""
         marker = tmp_path / "markers.log"
         fake = _write_fake_python(
             tmp_path / "python3",
@@ -163,8 +163,11 @@ class TestMempalPythonOverride:
         result = _run_hook(
             SAVE_HOOK,
             {"session_id": "abc", "stop_hook_active": False, "transcript_path": ""},
-            env_overrides={"MEMPAL_PYTHON": "", "HOME": str(tmp_path)},
-            path_prefix=[fake.parent],
+            env_overrides={
+                "MEMPAL_PYTHON": "",
+                "HOME": str(tmp_path),
+                "PATH": os.pathsep.join([str(fake.parent), "/usr/bin", "/bin"]),
+            },
         )
         assert result.returncode == 0
         invocations = marker.read_text().splitlines() if marker.exists() else []
@@ -237,8 +240,8 @@ class TestSessionEndWrapper:
         shim = tmp_path / "python3"
         shim.write_text(
             f"""#!/bin/bash
-if [ "$1" = "-c" ]; then exit 0; fi
-if [ "$1" = "-m" ] && [ "$2" = "mempalace" ]; then
+case "$1:${{2:-}}" in -c:*run_module*) ;; -c:*) exit 0 ;; esac
+if [ "$1" = "-c" ]; then
   shift 2
   cat >/dev/null
   printf '%s' "$*" > "{args_file}"

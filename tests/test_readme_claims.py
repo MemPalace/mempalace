@@ -23,7 +23,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MEMPALACE_PKG = REPO_ROOT / "mempalace"
 README_PATH = REPO_ROOT / "README.md"
 MCP_TOOLS_DOC_PATH = REPO_ROOT / "website" / "reference" / "mcp-tools.md"
-MODULES_DOC_PATH = REPO_ROOT / "website" / "reference" / "modules.md"
 
 
 def _read(path: Path) -> str:
@@ -34,12 +33,29 @@ def _readme() -> str:
     return _read(README_PATH)
 
 
+def _mcp_server_source() -> str:
+    """Concatenate mcp_server package sources without importing chromadb."""
+    pkg = MEMPALACE_PKG / "mcp_server"
+    return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
+
+
+def _searcher_source() -> str:
+    """Concatenate searcher package sources."""
+    pkg = MEMPALACE_PKG / "searcher"
+    return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
+
+
+def _palace_source() -> str:
+    """Concatenate palace package sources."""
+    pkg = MEMPALACE_PKG / "palace"
+    return "\n".join(_read(path) for path in sorted(pkg.glob("*.py")))
+
+
 def _tools_dict_keys() -> list:
     """Return the list of tool names registered in the TOOLS dict."""
     # Import the module-level TOOLS dict.  We can't just import mcp_server
     # because it calls chromadb on import, so we parse the source instead.
-    src = _read(MEMPALACE_PKG / "mcp_server.py")
-    return re.findall(r'"(mempalace_\w+)":\s*\{', src)
+    return re.findall(r'"(mempalace_\w+)":\s*\{', _mcp_server_source())
 
 
 def _doc_tool_names() -> list:
@@ -54,28 +70,244 @@ def _doc_tool_names() -> list:
 
 
 # ---------------------------------------------------------------------------
-# 1. Tool count — README says 19, verify actual count
+# 1. Tool count — every "N MCP tools" claim must match len(TOOLS)
 # ---------------------------------------------------------------------------
+
+SCHEMAS_PATH = MEMPALACE_PKG / "mcp_server" / "schemas.py"
+LIGHT_SERVER_PATH = MEMPALACE_PKG / "mcp_light_server.py"
+
+# Matches a number that states a tool count, in every wording the docs use:
+# 45 tools, 45 MCP tools, (45 MCP tools), All 45 MemPalace MCP tools,
+# **45 separate tools, the 45-tool server, Full MCP surface: 47 tools,
+# and "three PQL tools ... instead of 45" (the DSH patch comment).
+# The lookbehind keeps a version suffix like "v3.45 tools" from reading as 45.
+TOOL_COUNT_CLAIM_RE = re.compile(
+    r"(?<![\w.])(\d+)(?:-|\s+)(?:(?:MemPalace|MCP|separate)\s+)*tools?\b"
+    r"|\binstead\s+of\s+(\d+)\b",
+    re.IGNORECASE,
+)
+
+# Every living file that states the full MCP server's tool count, with the
+# number of claims it makes. The per-file count is part of the contract: if a
+# rewording stops matching TOOL_COUNT_CLAIM_RE, the file drops below its
+# expected count and the test fails instead of silently losing coverage.
+# CHANGELOG.md is deliberately absent (historical entries keep their counts),
+# as are benchmarks/ (they pin a "legacy 45" fixture on purpose).
+TOOL_COUNT_CLAIM_FILES = {
+    "README.md": 1,
+    ".claude-plugin/README.md": 2,
+    ".claude-plugin/plugin.json": 1,
+    ".claude-plugin/marketplace.json": 1,
+    ".claude-plugin/skills/mempalace/SKILL.md": 1,
+    ".codex-plugin/README.md": 1,
+    ".codex-plugin/plugin.json": 2,
+    ".cursor-plugin/README.md": 2,
+    ".cursor-plugin/plugin.json": 1,
+    ".cursor-plugin/marketplace.json": 1,
+    ".dsh-plugin/README.md": 1,
+    ".dsh-plugin/cordis.patch.yml": 2,
+    "integrations/openclaw/SKILL.md": 1,
+    "skills/mempalace/SKILL.md": 1,
+    "website/guide/claude-code.md": 1,
+    "website/guide/lightweight-mcp.md": 2,
+    "website/guide/mcp-integration.md": 2,
+    "website/guide/openclaw.md": 1,
+    "website/reference/cli.md": 1,
+    "website/reference/mcp-tools.md": 1,
+    "website/reference/modules.md": 1,
+    "mempalace/cli/parser.py": 1,
+    "mempalace/instructions_cli.py": 1,
+    "mempalace/mcp_light_server.py": 1,
+}
+
+
+def _literal_dict_key_count(path: Path, name: str) -> int:
+    """Count the keys of the module-level ``name = {...}`` literal in ``path``.
+
+    Parsed with ``ast`` rather than imported: schemas.py is an exec'd
+    fragment of mempalace.mcp_server and refuses a standalone import.
+    """
+    import ast
+
+    tree = ast.parse(_read(path))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+            if any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+                return len(node.value.keys)
+    raise AssertionError(f"{name} dict literal not found in {path.relative_to(REPO_ROOT)}")
+
+
+def _tools_count() -> int:
+    return _literal_dict_key_count(SCHEMAS_PATH, "TOOLS")
+
+
+def _light_tools_count() -> int:
+    return _literal_dict_key_count(LIGHT_SERVER_PATH, "LIGHT_TOOLS")
+
+
+def _tool_count_claims(text: str) -> list:
+    """Return ``(line_no, count)`` for every full-server tool-count claim.
+
+    Claims equal to the light server's size ("3-tool server", "the 3-tool
+    triad") describe mempalace-light-mcp, not mempalace-mcp, and are skipped.
+    """
+    light = _light_tools_count()
+    claims = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for match in TOOL_COUNT_CLAIM_RE.finditer(line):
+            count = int(match.group(1) or match.group(2))
+            if count != light:
+                claims.append((line_no, count))
+    return claims
 
 
 class TestToolCount:
-    """README claims '19 tools available through MCP' in multiple places."""
+    """Every doc / manifest that states the MCP tool count must match TOOLS."""
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("with 45 MCP tools, auto-save hooks", [45]),
+            ("server (45 MCP tools), ships", [45]),
+            ("All 45 MemPalace MCP tools (`mempalace_search`", [45]),
+            ("cover everything the 45-tool server does", [45]),
+            ("reduces it from **45 separate tools down to 3 high-density tools**", [45]),
+            ("Full MCP surface: 47 tools. Destructive", [47]),
+            ("a local MCP server with 45 tools for storing", [45]),
+            ("palace_coordinate) instead of 45, because DSH", [45]),
+            ("register the 3-tool server as `mempalace-light`", []),
+            ("MemPalace v3.45 tools", []),
+        ],
+    )
+    def test_claim_regex_matches_every_wording(self, text, expected):
+        assert [count for _, count in _tool_count_claims(text)] == expected
 
     def test_readme_tool_count_matches_code(self):
-        """Claim: README says 19 tools. Actual TOOLS dict may differ.
-
-        This test asserts the REAL tool count so the README can be updated.
-        If TOOLS has 25 entries, the README should say 25, not 19.
-        """
-        actual_count = len(_tools_dict_keys())
-        readme = _readme()
-        # Find all "19 tools" claims in README
-        claimed_counts = re.findall(r"(\d+)\s+tools", readme)
-        for claimed in claimed_counts:
-            assert int(claimed) == actual_count, (
-                f"README claims {claimed} tools but TOOLS dict has {actual_count}. "
-                f"Update every occurrence of '{claimed} tools' to '{actual_count} tools'."
+        """README.md's tool count matches len(TOOLS) (kept for history; the
+        file is also covered by test_every_tool_count_claim_matches_code)."""
+        actual_count = _tools_count()
+        claims = _tool_count_claims(_readme())
+        assert claims, "README.md no longer states the MCP tool count"
+        for line_no, claimed in claims:
+            assert claimed == actual_count, (
+                f"README.md:{line_no} claims {claimed} tools but TOOLS has "
+                f"{actual_count}. Update it to {actual_count}."
             )
+
+    def test_tools_count_parse_matches_source_scan(self):
+        """The ast count of TOOLS agrees with the legacy source scan."""
+        assert _tools_count() == len(_tools_dict_keys())
+
+    @pytest.mark.parametrize("rel_path", sorted(TOOL_COUNT_CLAIM_FILES))
+    def test_every_tool_count_claim_matches_code(self, rel_path):
+        actual_count = _tools_count()
+        path = REPO_ROOT / rel_path
+        assert path.is_file(), f"{rel_path} is listed in TOOL_COUNT_CLAIM_FILES but missing"
+        claims = _tool_count_claims(_read(path))
+        stale = [f"{rel_path}:{n} says {c}" for n, c in claims if c != actual_count]
+        assert stale == [], (
+            f"Stale MCP tool counts (TOOLS in mempalace/mcp_server/schemas.py has "
+            f"{actual_count}): {stale}"
+        )
+        expected_claims = TOOL_COUNT_CLAIM_FILES[rel_path]
+        assert len(claims) == expected_claims, (
+            f"{rel_path}: expected {expected_claims} tool-count claim(s), found "
+            f"{len(claims)} at lines {[n for n, _ in claims]}. If the wording changed, "
+            f"widen TOOL_COUNT_CLAIM_RE; if a claim was added or removed, update "
+            f"TOOL_COUNT_CLAIM_FILES."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 1b. Plugin command count — every "N slash commands" claim matches the files
+# ---------------------------------------------------------------------------
+
+_NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+# "5 guided commands", "ships 5 slash commands", "five slash commands",
+# "five different subcommands".
+COMMAND_COUNT_CLAIM_RE = re.compile(
+    r"\b(\d+|" + "|".join(_NUMBER_WORDS) + r")\s+"
+    r"(?:(?:guided|slash|different)\s+)*(?:sub)?commands\b",
+    re.IGNORECASE,
+)
+
+# The same command set ships three ways: Claude Code slash commands, Cursor's
+# global ``/mempalace-*`` commands, and the Codex ``$mempalace <command>`` skills.
+CLAUDE_COMMANDS_DIR = REPO_ROOT / ".claude-plugin" / "commands"
+CURSOR_COMMANDS_DIR = REPO_ROOT / "commands"
+CODEX_COMMAND_SKILLS_DIR = REPO_ROOT / ".codex-plugin" / "skills"
+
+# Every file that states the plugin command count, with its number of claims.
+COMMAND_COUNT_CLAIM_FILES = {
+    ".claude-plugin/README.md": 1,
+    ".cursor-plugin/README.md": 1,
+    ".codex-plugin/README.md": 1,
+    "examples/cursor/README.md": 1,
+}
+
+
+def _plugin_command_names() -> dict:
+    return {
+        "claude": sorted(p.stem for p in CLAUDE_COMMANDS_DIR.glob("*.md")),
+        "cursor": sorted(
+            p.stem.removeprefix("mempalace-") for p in CURSOR_COMMANDS_DIR.glob("mempalace-*.md")
+        ),
+        "codex": sorted(p.parent.name for p in CODEX_COMMAND_SKILLS_DIR.glob("*/SKILL.md")),
+    }
+
+
+def _command_count_claims(text: str) -> list:
+    claims = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        for match in COMMAND_COUNT_CLAIM_RE.finditer(line):
+            raw = match.group(1).lower()
+            claims.append((line_no, int(raw) if raw.isdigit() else _NUMBER_WORDS[raw]))
+    return claims
+
+
+class TestPluginCommandCount:
+    """Plugin READMEs state how many commands ship; that must match the files."""
+
+    def test_every_plugin_ships_the_same_commands(self):
+        names = _plugin_command_names()
+        assert names["claude"], f"no commands found in {CLAUDE_COMMANDS_DIR}"
+        assert names["claude"] == names["cursor"] == names["codex"], names
+
+    @pytest.mark.parametrize(
+        "text, expected",
+        [
+            ("auto-save hooks, and 5 guided commands.", [5]),
+            ("ships 5 slash commands, three model-invocable skills", [5]),
+            ("packages the MCP server, five slash commands, and", [5]),
+            ("can be invoked with five different subcommands.", [5]),
+            ("run the init command to complete setup", []),
+        ],
+    )
+    def test_claim_regex_matches_every_wording(self, text, expected):
+        assert [count for _, count in _command_count_claims(text)] == expected
+
+    @pytest.mark.parametrize("rel_path", sorted(COMMAND_COUNT_CLAIM_FILES))
+    def test_every_command_count_claim_matches_the_files(self, rel_path):
+        actual = len(_plugin_command_names()["claude"])
+        claims = _command_count_claims(_read(REPO_ROOT / rel_path))
+        stale = [f"{rel_path}:{n} says {c}" for n, c in claims if c != actual]
+        assert stale == [], f"Stale plugin command counts (actual {actual}): {stale}"
+        assert len(claims) == COMMAND_COUNT_CLAIM_FILES[rel_path], (
+            f"{rel_path}: expected {COMMAND_COUNT_CLAIM_FILES[rel_path]} command-count "
+            f"claim(s), found {len(claims)} at lines {[n for n, _ in claims]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +375,7 @@ class TestClosetsExist:
     def test_get_closets_collection_exists(self):
         """Claim: closets are a shipped feature.
         palace.py must export get_closets_collection()."""
-        src = _read(MEMPALACE_PKG / "palace.py")
+        src = _palace_source()
         assert "def get_closets_collection(" in src, (
             "palace.py does not define get_closets_collection(). "
             "Closets are described in README but the collection function is missing."
@@ -167,7 +399,7 @@ class TestClosetFirstSearch:
     def test_closet_boost_search_exists(self):
         """Claim: search uses closets as a boost signal.
         searcher.py must have CLOSET_RANK_BOOSTS and query closets_col."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         assert "CLOSET_RANK_BOOSTS" in src, (
             "searcher.py has no closet boost logic. "
             "README describes closet-based search but searcher.py has no closet ranking."
@@ -175,7 +407,7 @@ class TestClosetFirstSearch:
 
     def test_searcher_imports_closets(self):
         """searcher.py must import get_closets_collection to use closets."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         assert "get_closets_collection" in src, (
             "searcher.py does not reference get_closets_collection. "
             "Closet-first search can't work without the closets collection."
@@ -193,7 +425,7 @@ class TestBM25HybridSearch:
     def test_bm25_in_searcher(self):
         """Claim: BM25 hybrid search is shipped.
         searcher.py must have BM25 scoring or hybrid ranking logic."""
-        src = _read(MEMPALACE_PKG / "searcher.py")
+        src = _searcher_source()
         has_bm25 = any(
             term in src.lower()
             for term in [
@@ -223,7 +455,7 @@ class TestEntityMetadataExtraction:
         """Claim: entity extraction is part of the mining pipeline.
         Either miner.py or palace.py must extract entities."""
         miner_src = _read(MEMPALACE_PKG / "miner.py")
-        palace_src = _read(MEMPALACE_PKG / "palace.py")
+        palace_src = _palace_source()
         # Entity extraction can be in either file — palace.py has it for closets
         has_entity_extraction = (
             "entities" in palace_src and "_ENTITY_STOPLIST" in palace_src
@@ -342,7 +574,7 @@ class TestTunnelFunctions:
 
     def test_tunnel_functions_importable(self):
         """find_tunnels, traverse, graph_stats should be importable."""
-        from mempalace.palace_graph import find_tunnels, traverse, graph_stats
+        from mempalace.palace_graph import find_tunnels, graph_stats, traverse
 
         assert callable(find_tunnels)
         assert callable(traverse)
@@ -387,7 +619,7 @@ class TestMineLock:
     def test_mine_lock_exists(self):
         """Claim: multi-agent file locking is shipped.
         palace.py must define mine_lock."""
-        src = _read(MEMPALACE_PKG / "palace.py")
+        src = _palace_source()
         assert "def mine_lock(" in src, (
             "palace.py does not define mine_lock(). "
             "Multi-agent locking is claimed as shipped but function is missing."
@@ -401,7 +633,7 @@ class TestMineLock:
 
     def test_mine_lock_is_context_manager(self):
         """mine_lock should be a context manager (used with `with` statement)."""
-        src = _read(MEMPALACE_PKG / "palace.py")
+        src = _palace_source()
         # It should be decorated with @contextlib.contextmanager or similar
         # Find the mine_lock definition and check for context manager pattern
         assert "@contextlib.contextmanager" in src or "def __enter__" in src, (
@@ -501,24 +733,32 @@ class TestDialectNotLossless:
 # 17. README file reference table for dialect.py does NOT say "lossless"
 # ---------------------------------------------------------------------------
 
+# Every module table that describes dialect.py. mempalace/README.md kept the
+# "30x lossless ratio" wording long after the website table was fixed, because
+# only the website table was checked.
+DIALECT_MODULE_TABLE_FILES = (
+    "website/reference/modules.md",
+    "mempalace/README.md",
+)
+
 
 class TestReadmeDialectNotLossless:
     """The file-reference documentation must not say dialect.py is lossless.
 
     Pre-#875 this lived in a README.md file table; it now lives in
-    website/reference/modules.md. The April 7 correction established that
-    AAAK is a lossy abbreviation system, not lossless compression, and
-    every docs surface that describes dialect.py must respect that.
+    website/reference/modules.md and in the package's own mempalace/README.md.
+    The April 7 correction established that AAAK is a lossy abbreviation
+    system, not lossless compression, and every docs surface that describes
+    dialect.py must respect that.
     """
 
-    def test_readme_dialect_line_not_lossless(self):
-        doc = _read(MODULES_DOC_PATH)
+    @pytest.mark.parametrize("rel_path", DIALECT_MODULE_TABLE_FILES)
+    def test_readme_dialect_line_not_lossless(self, rel_path):
+        doc = _read(REPO_ROOT / rel_path)
         # Any line mentioning dialect.py (narrative or table) must not call it lossless
         dialect_lines = [line for line in doc.splitlines() if "dialect.py" in line]
         assert len(dialect_lines) > 0, (
-            f"Could not find dialect.py in "
-            f"{MODULES_DOC_PATH.relative_to(REPO_ROOT)}. "
-            f"Expected at least one reference."
+            f"Could not find dialect.py in {rel_path}. Expected at least one reference."
         )
 
         for line in dialect_lines:
@@ -567,22 +807,6 @@ class TestHallMetadata:
             "Halls are a schema ghost — defined in config, read by palace_graph, "
             "but never written by any pipeline."
         )
-
-    def test_readme_hall_types_match_config(self):
-        """If README lists specific hall names, they should appear in config."""
-        # README mentions these 5 halls
-        readme_halls = [
-            "hall_facts",
-            "hall_events",
-            "hall_discoveries",
-            "hall_preferences",
-            "hall_advice",
-        ]
-        for hall in readme_halls:
-            # These should either be in config or README should not list them
-            # The hall_ prefix is a README convention; config uses keyword groups
-            # like "emotions", "consciousness" etc. Check if they're consistent.
-            pass  # This is a documentation check; the real test is #18b above
 
 
 # ---------------------------------------------------------------------------
@@ -752,7 +976,7 @@ class TestAAAKSpecToolHandler:
 
     def test_aaak_spec_handler_exists(self):
         """The handler function for get_aaak_spec must be defined."""
-        src = _read(MEMPALACE_PKG / "mcp_server.py")
+        src = _mcp_server_source()
         tools = _tools_dict_keys()
         if "mempalace_get_aaak_spec" in tools:
             assert "def tool_get_aaak_spec(" in src, (

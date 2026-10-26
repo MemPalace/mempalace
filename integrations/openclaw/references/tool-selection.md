@@ -1,63 +1,51 @@
-# MemPalace tool selection
+# Unfamiliar syntax and edge cases
 
-Use this reference when the compact OpenClaw skill does not contain enough detail
-to choose between MemPalace MCP tools.
+Ordinary recall uses the entry point and exposed schemas; this is not a checklist.
+Use host-exposed names/permissions. Missing/read-only tools do not permit policy
+bypass. Schemas own signatures; never invent fields or use Python parameter names.
 
-## Search and browse
+## Light payloads
 
-Start with search for context, then fetch exact drawers when precision matters.
+`palace_query` takes `query`; `palace_exec` takes `command` or structured `action`
+fields. These are tool arguments, not shell commands. For example:
 
-- `mempalace_search` — semantic search. Keep `query` short; put background in
-  `context` if available.
-- `mempalace_check_duplicate` — check before filing standalone drawers.
-- `mempalace_list_wings`, `mempalace_list_rooms`, `mempalace_list_drawers` —
-  browse taxonomy and recent/filtered drawers.
-- `mempalace_get_drawer`, `mempalace_get_taxonomy`, `mempalace_status` — exact
-  drawer/taxonomy/overview lookup.
-- `mempalace_get_aaak_spec` — read the compressed diary/memory dialect.
+- Read: `palace_query` with `{"query":"FIND database decision LIMIT 3"}`.
+- File: `palace_exec` with `{"action":"add_drawer","wing":"myapp","room":"decisions","content":"Exact source text."}`.
 
-## Knowledge graph
+Use real scope/content, never probe writes. Prefer structured fields for arbitrary
+verbatim text to avoid DSL flag/quoting ambiguity.
+Not every full-tool field is a light top-level field. Consult the relevant
+[PQL subsection][pql] only for syntax not covered by exposed schemas.
 
-Use KG tools for durable facts about people, projects, ownership, status,
-relationships, and dates.
+## Interpretation and temporal writes
 
-- `mempalace_kg_query` — current or point-in-time entity facts.
-- `mempalace_kg_add` — add an independent fact.
-- `mempalace_kg_supersede` — atomically replace one single-valued fact.
-- `mempalace_kg_invalidate` — end a fact without replacement.
-- `mempalace_kg_timeline`, `mempalace_kg_stats` — inspect graph history/health.
+- Exact-source search uses the full stored `source_path` as `source_file`, not
+  a basename/glob. Search/list date filters measure filing time, not event time.
+  Recent diary rows may be chunks, not complete sessions.
+- Confirm entity, predicate, evidence, and effective time before changing facts.
+  Backfill already-ended facts with known `valid_from`/`valid_to`, not a fictional
+  present-day change. Keep uncertain conflicts unchanged pending investigation.
+- Atomic supersede's date-only `at` means midnight UTC; standalone invalidate's
+  date-only `ended` retains whole-day validity. Use a known precise instant when
+  needed; separate invalidate/add calls can overlap on the boundary day.
+- Supersede can succeed without an open old fact and does not enforce global
+  single-valued cardinality or repair conflicting history. Success is NOT proof
+  the old fact existed. Inspect relevant facts before and the result/time-scoped
+  query after a change.
 
-## Write and diary
+## Filing and maintenance boundaries
 
-Store durable context verbatim. Do not summarize so far that original meaning is
-lost.
+Use real provenance, never an invented path. Drawer filing deduplicates; checkpoint
+items remain verbatim and accept only schema-supported fields. If per-item source
+provenance is needed but unsupported, use individual drawers. Diary observations
+in AAAK are not user/source text; retain the entry point's hook/save-evidence check.
 
-- `mempalace_add_drawer` — file one drawer in a wing/room.
-- `mempalace_checkpoint` — semantic-dedup several drawers plus one diary entry.
-- `mempalace_update_drawer` — correct or move an existing drawer.
-- `mempalace_diary_write`, `mempalace_diary_read` — continuity index across
-  sessions; use AAAK when the convention calls for it.
+For requested imports/cleanup, confirm exact source/IDs/project/wing. Preview
+supported operations, show count/sample, and obtain approval before applying.
+For irreversible ID deletes without dry-run, inspect and present targets first.
+Read hook settings before changing only approved fields; verify persistence.
+Reconnect refreshes stale state after external writes, not corruption. Follow
+[offline recovery][recovery], never blind re-mining or an in-process rebuild.
 
-## Graph, ingest, and cleanup
-
-Use graph tools when relationships between topics matter. Ingest/cleanup tools
-can alter many memories or host state, so prefer dry runs and explicit user
-intent before destructive actions.
-
-- Graph: `mempalace_traverse`, `mempalace_follow_tunnels`,
-  `mempalace_find_tunnels`, `mempalace_list_tunnels`,
-  `mempalace_create_tunnel`, `mempalace_delete_tunnel`,
-  `mempalace_list_hallways`, `mempalace_delete_hallway`,
-  `mempalace_graph_stats`.
-- `mempalace_mine` — mine a directory, or one conversation file with
-  `mode="convos"`. `source` is the directory or conversation file; optional
-  controls include `mode`, `wing`, `agent`, `limit`, `dry_run`, and the convos
-  `extract` strategy (`exchange` or `general`).
-- `mempalace_sync` — prune drawers for ignored, deleted, or moved source files.
-  Scope with `project_dir` or `wing`; preview first and set `apply` only after
-  confirming the deletion set.
-- `mempalace_delete_by_source` — bulk-delete one exact `source_file` metadata
-  value. Keep its default dry run for the first call.
-- `mempalace_delete_drawer` — irreversibly remove one drawer by ID.
-- System/session: `mempalace_reconnect`, `mempalace_hook_settings`,
-  `mempalace_memories_filed_away`.
+[pql]: https://mempalaceofficial.com/guide/lightweight-mcp.html#palace-query-language-pql-reference
+[recovery]: https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md#recovering-a-corrupt-index

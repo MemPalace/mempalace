@@ -44,9 +44,12 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Optional
 
+from . import paths
 from .config import sanitize_iso_temporal, strip_lone_surrogates
+from .fsio import atomic_publish, read_published_bytes
+from .timeutil import filename_stamp, utc_now_z
 
-logger = logging.getLogger("mempalace_logstream")
+logger = logging.getLogger(__name__)
 
 LOGSTREAM_DB_FILENAME = "logstream.sqlite3"
 
@@ -86,7 +89,7 @@ def _utc_now_iso() -> str:
     compare like against like. Ordering ties within one second are
     resolved by the SQLite rowid (``seq``), not the timestamp.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return utc_now_z()
 
 
 def _new_id(prefix: str) -> str:
@@ -96,7 +99,7 @@ def _new_id(prefix: str) -> str:
     from the rowid, so clock skew between writers cannot reorder or
     collide events.
     """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    stamp = filename_stamp("T", utc=True)
     return f"{prefix}_{stamp}_{secrets.token_hex(6)}"
 
 
@@ -312,6 +315,44 @@ WATCH_STATE_EMPTY = "empty"
 WATCH_STATE_CORRUPT = "corrupt"
 
 
+def sanitize_watch_state_basename(agent: str) -> str:
+    """Turn an agent identity into a state-file basename (no directories).
+
+    RFC 005 identities use colons (``windows:grok:mempalace``), which are
+    illegal in Windows filenames. Slashes would escape ``~/.mempalace/watch``.
+    """
+    agent = (agent or "").strip()
+    if not agent:
+        raise ValueError("agent identity is required to name a watch state file")
+    # Double "_" before mapping ":" so identities that differ only in where
+    # "_" and ":" sit (a:b_c:proj vs a_b:c:proj) never share one cursor file.
+    safe = agent.replace("_", "__").replace(":", "_").replace("/", "_").replace("\\", "_")
+    if safe in {".", ".."} or not safe:
+        raise ValueError("agent identity sanitizes to an empty state-file name")
+    return safe
+
+
+def default_watch_state_file(agent: str, *, home: Optional[str] = None) -> str:
+    """``~/.mempalace/watch/<sanitized-agent>.json`` for ``logstream watch``."""
+    return str(paths.state_path("watch", f"{sanitize_watch_state_basename(agent)}.json", home=home))
+
+
+def resolve_watch_state_file(state_file: Optional[str], agent: Optional[str]) -> Optional[str]:
+    """Choose a watch state-file path.
+
+    ``None`` means "apply the default from ``--agent``". An empty string is
+    an explicit disable (tests, or a caller that does not want a cursor).
+    A non-empty string is used as-is.
+    """
+    if state_file:
+        return state_file
+    if state_file == "":
+        return None
+    if agent:
+        return default_watch_state_file(agent)
+    return None
+
+
 def read_watch_state(path: str) -> tuple:
     """Return ``(cursor, condition)`` for a watch state file.
 
@@ -343,8 +384,7 @@ def read_watch_state(path: str) -> tuple:
     # (permissions, a directory in the way, I/O error) mean corrupt — which
     # replays. It also closes the exists()/open() race.
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        payload = json.loads(read_published_bytes(path).decode("utf-8"))
     except FileNotFoundError:
         return None, WATCH_STATE_ABSENT
     except (OSError, ValueError):
@@ -357,16 +397,6 @@ def read_watch_state(path: str) -> tuple:
     if "cursor" in payload:
         return None, WATCH_STATE_EMPTY
     return None, WATCH_STATE_CORRUPT
-
-
-def read_watch_cursor(path: str) -> Optional[str]:
-    """The cursor from a watch state file, or ``None``.
-
-    Convenience wrapper over :func:`read_watch_state` for callers that do not
-    need to tell a first run from a corrupt file. Watchers should prefer
-    ``read_watch_state``, because those two cases must not behave alike.
-    """
-    return read_watch_state(path)[0]
 
 
 def write_watch_cursor(path: str, cursor: str, agent: str = None, required: bool = False) -> None:
@@ -392,20 +422,18 @@ def write_watch_cursor(path: str, cursor: str, agent: str = None, required: bool
     payload = {"cursor": cursor or None, "updated_at": _utc_now_iso()}
     if agent:
         payload["agent"] = agent
-    tmp = f"{path}.tmp"
     try:
         parent = os.path.dirname(os.path.abspath(path))
         if parent:
             os.makedirs(parent, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        os.replace(tmp, path)
+        atomic_publish(
+            path,
+            lambda handle: json.dump(payload, handle),
+            private=False,
+            follow_symlinks=False,
+        )
     except OSError:
         logger.debug("could not persist watch cursor to %s", path, exc_info=True)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
         if required:
             raise
 
@@ -974,6 +1002,10 @@ class Logstream:
         since_event_id = _sanitize_routing(since_event_id, "since_event_id", required=False)
         before_event_id = _sanitize_routing(before_event_id, "before_event_id", required=False)
         since_created_at = sanitize_iso_temporal(since_created_at, "since_created_at") or None
+        if order is None:
+            order = "asc"
+        elif isinstance(order, str):
+            order = order.lower().strip()
         if order not in ("asc", "desc"):
             raise ValueError(f"order={order!r} must be 'asc' or 'desc'")
         if not isinstance(limit, int) or limit < 1:

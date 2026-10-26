@@ -2,6 +2,7 @@
 
 import argparse
 import errno
+import json
 import os
 import shlex
 import socket
@@ -16,10 +17,11 @@ import pytest
 
 from mempalace.cli import (
     cmd_compress,
+    cmd_daemon,
+    cmd_export,
     cmd_hook,
     cmd_init,
     cmd_instructions,
-    cmd_daemon,
     cmd_mine,
     cmd_repair,
     cmd_search,
@@ -28,7 +30,7 @@ from mempalace.cli import (
     cmd_wakeup,
     main,
 )
-
+from mempalace.palace import MineAlreadyRunning
 
 # ── CLI entry point: PYTHONPATH stripping ────────────────────────────────
 
@@ -117,6 +119,28 @@ def test_cmd_status_custom_palace(mock_config_cls):
         mock_miner.status.assert_called_once_with(palace_path=expected)
 
 
+# ── cmd_export ─────────────────────────────────────────────────────────
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_export_writes_the_configured_palace(mock_config_cls, tmp_path):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(palace=None, output_dir=str(tmp_path / "out"))
+    with patch("mempalace.exporter.export_palace") as mock_export:
+        cmd_export(args)
+    mock_export.assert_called_once_with("/fake/palace", str(tmp_path / "out"))
+
+
+def test_export_is_a_cli_command(tmp_path):
+    with patch("mempalace.exporter.export_palace") as mock_export:
+        with patch(
+            "sys.argv",
+            ["mempalace", "--palace", str(tmp_path / "p"), "export", str(tmp_path / "out")],
+        ):
+            main()
+    mock_export.assert_called_once_with(str(tmp_path / "p"), str(tmp_path / "out"))
+
+
 # ── cmd_search ─────────────────────────────────────────────────────────
 
 
@@ -143,6 +167,24 @@ def test_cmd_search_calls_search(mock_config_cls):
             since="2026-04-01",
             before=None,
         )
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_search_sanitizes_a_contaminated_query_and_says_so(mock_config_cls, capsys):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        palace=None,
+        query="You are a helpful assistant. " * 40 + "Where is the config?",
+        wing=None,
+        room=None,
+        results=5,
+        since=None,
+        before=None,
+    )
+    with patch("mempalace.searcher.search") as mock_search:
+        cmd_search(args)
+    assert mock_search.call_args.kwargs["query"] == "Where is the config"
+    assert "Query sanitized" in capsys.readouterr().err
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -202,6 +244,94 @@ def test_cmd_init_no_entities(mock_config_cls, tmp_path):
         mock_config_cls.return_value.init.assert_called_once()
 
 
+def _init_with_real_config(tmp_path, monkeypatch, *, backend=None):
+    from mempalace.config import MempalaceConfig as RealConfig
+
+    config_dir = tmp_path / "config"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(
+        "mempalace.cli.MempalaceConfig", lambda: RealConfig(config_dir=str(config_dir))
+    )
+    args = argparse.Namespace(dir=str(project), yes=True, backend=backend, global_backend=None)
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._run_pass_zero", return_value=None),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+    ):
+        cmd_init(args)
+    return config_dir
+
+
+def test_cmd_init_records_a_backend_chosen_through_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    config_dir = _init_with_real_config(tmp_path, monkeypatch)
+
+    monkeypatch.delenv("MEMPALACE_BACKEND")
+    from mempalace.config import MempalaceConfig as RealConfig
+
+    assert RealConfig(config_dir=str(config_dir)).backend == "sqlite_exact"
+
+
+def test_cmd_init_keeps_a_backend_config_json_already_names(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "config.json").write_text('{"backend": "chroma"}', encoding="utf-8")
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    _init_with_real_config(tmp_path, monkeypatch)
+
+    saved = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+    assert saved["backend"] == "chroma"
+
+
+def test_cmd_init_records_no_backend_when_none_was_chosen(tmp_path, monkeypatch):
+    monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
+    config_dir = _init_with_real_config(tmp_path, monkeypatch)
+
+    saved = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+    assert "backend" not in saved
+
+
+def test_cmd_init_warns_and_skips_an_unknown_env_backend(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "no-such-backend")
+    config_dir = _init_with_real_config(tmp_path, monkeypatch)
+
+    saved = json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+    assert "backend" not in saved
+    assert "MEMPALACE_BACKEND not recorded" in capsys.readouterr().err
+
+
+def _init_with_embedding_model(tmp_path, monkeypatch, embedding_model):
+    from mempalace.config import MempalaceConfig as RealConfig
+
+    config_dir = tmp_path / "config"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(
+        "mempalace.cli.MempalaceConfig", lambda: RealConfig(config_dir=str(config_dir))
+    )
+    args = argparse.Namespace(dir=str(project), yes=True, embedding_model=embedding_model)
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._run_pass_zero", return_value=None),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+    ):
+        cmd_init(args)
+    return json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+
+
+def test_cmd_init_records_an_explicit_embedding_model(tmp_path, monkeypatch):
+    saved = _init_with_embedding_model(tmp_path, monkeypatch, "embeddinggemma")
+    assert saved["embedding_model"] == "embeddinggemma"
+
+
+def test_cmd_init_records_no_embedding_model_when_none_was_chosen(tmp_path, monkeypatch):
+    saved = _init_with_embedding_model(tmp_path, monkeypatch, None)
+    assert "embedding_model" not in saved
+
+
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_init_with_entities(mock_config_cls, tmp_path):
     fake_files = [tmp_path / "a.txt"]
@@ -259,6 +389,38 @@ def test_cmd_init_normalizes_wing_name_for_topics_registry(mock_config_cls, tmp_
         cmd_init(args)
         mock_register.assert_called_once()
         assert mock_register.call_args.kwargs["wing"] == "my_cool_app"
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_init_does_not_report_a_registry_update_that_did_not_happen(
+    mock_config_cls, tmp_path, capsys
+):
+    """``add_to_known_entities`` answers ``None`` when it left the registry
+    alone and printed why. Printing "Registry updated" over that would tell
+    the user the opposite of what stderr just said."""
+    project = tmp_path / "app"
+    project.mkdir()
+    detected = {
+        "people": [{"name": "Alice"}],
+        "projects": [],
+        "topics": [],
+        "uncertain": [],
+    }
+    confirmed = {"people": ["Alice"], "projects": [], "topics": []}
+    args = argparse.Namespace(dir=str(project), yes=True)
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[project / "a.txt"]),
+        patch("mempalace.entity_detector.detect_entities", return_value=detected),
+        patch("mempalace.entity_detector.confirm_entities", return_value=confirmed),
+        patch("mempalace.miner.add_to_known_entities", return_value=None),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("builtins.open", MagicMock()),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.cli._run_pass_zero", return_value=None),
+    ):
+        cmd_init(args)
+
+    assert "Registry updated" not in capsys.readouterr().out
 
 
 def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
@@ -324,6 +486,82 @@ def test_cmd_init_honors_palace_flag(tmp_path, monkeypatch):
     import os
 
     assert os.environ.get("MEMPALACE_PALACE_PATH") == os.path.abspath(expected)
+
+
+def _run_init_into(tmp_path, monkeypatch, **arg_values):
+    """Run cmd_init with a real config in ``tmp_path/.mempalace``; return its config.json."""
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH")
+    config_dir = tmp_path / ".mempalace"
+    monkeypatch.setattr(
+        "mempalace.cli.MempalaceConfig",
+        lambda *a, **kw: MempalaceConfig(*a, config_dir=str(config_dir), **kw),
+    )
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
+    args = argparse.Namespace(dir=str(project), yes=True, auto_mine=False, no_llm=True)
+    for key, value in arg_values.items():
+        setattr(args, key, value)
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._run_pass_zero", return_value=None),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+    ):
+        cmd_init(args)
+    return json.loads((config_dir / "config.json").read_text(encoding="utf-8"))
+
+
+def test_cmd_init_records_only_explicit_choices(tmp_path, monkeypatch):
+    """--palace and --lang both land in a new config.json; nothing else does.
+    Before, --lang created the file first, so --palace was never recorded,
+    and init wrote every default, freezing them against later releases."""
+    palace = tmp_path / "custom_palace"
+    saved = _run_init_into(tmp_path, monkeypatch, palace=str(palace), lang="en,pt")
+    assert saved == {"palace_path": str(palace), "entity_languages": ["en", "pt"]}
+
+
+def test_cmd_init_does_not_freeze_the_environment_palace(tmp_path, monkeypatch):
+    saved = _run_init_into(tmp_path, monkeypatch)
+    assert saved == {}
+
+
+def test_cmd_init_keeps_an_aaak_entities_json(tmp_path, monkeypatch, capsys):
+    """``entities.json`` is also the AAAK entity-code file ``compress`` reads;
+    init must not overwrite the user's codes with its detection record."""
+    import json
+
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setattr(
+        "mempalace.cli.MempalaceConfig",
+        lambda *a, **kw: MempalaceConfig(*a, config_dir=str(tmp_path / ".mempalace"), **kw),
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    codes = {"entities": {"Alice": "ALC"}, "skip_names": []}
+    (project / "entities.json").write_text(json.dumps(codes), encoding="utf-8")
+    detected = {"people": [{"name": "Alice"}], "projects": [], "uncertain": []}
+    args = argparse.Namespace(dir=str(project), yes=True, auto_mine=False, no_llm=True)
+    with (
+        patch("mempalace.entity_detector.scan_for_detection", return_value=[project / "a.txt"]),
+        patch("mempalace.entity_detector.detect_entities", return_value=detected),
+        patch(
+            "mempalace.entity_detector.confirm_entities",
+            return_value={"people": ["Alice"], "projects": []},
+        ),
+        patch("mempalace.miner.add_to_known_entities", return_value=None),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._run_pass_zero", return_value=None),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+    ):
+        cmd_init(args)
+    assert json.loads((project / "entities.json").read_text(encoding="utf-8")) == codes
+    assert "AAAK entity codes" in capsys.readouterr().err
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -707,7 +945,78 @@ def test_cmd_mine_daemon_background_submits_job(mock_config_cls, capsys):
     assert call_kwargs["wait"] is False
     payload = mock_submit.call_args.args[1]
     assert payload["include_ignored"] == ["a.txt", "b.txt"]
+    assert payload["include_subagents"] is False
     assert "job-1" in capsys.readouterr().out
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_payload_carries_include_subagents(mock_config_cls):
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/chats",
+        palace=None,
+        mode="convos",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        daemon=True,
+        background=True,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+        include_subagents=True,
+    )
+    with patch("mempalace.daemon.submit_job", return_value={"id": "job-1"}) as mock_submit:
+        with patch("mempalace.convo_miner.mine_convos") as mock_mine:
+            cmd_mine(args)
+
+    mock_mine.assert_not_called()
+    payload = mock_submit.call_args.args[1]
+    assert payload["mode"] == "convos"
+    assert payload["include_subagents"] is True
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_daemon_resolves_relative_source_against_caller_cwd(
+    mock_config_cls, tmp_path, monkeypatch
+):
+    """#2441: the daemon outlives this process and keeps its own cwd, so a
+    relative source has to be resolved here, against the caller's cwd, before
+    it enters the payload. _forward_mine_to_hub already does this for the hub
+    path; the daemon path did not."""
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    monkeypatch.chdir(tmp_path)
+    expected_source = os.getcwd()
+    args = argparse.Namespace(
+        dir=".",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        daemon=True,
+        background=True,
+        backend=None,
+        global_backend=None,
+        max_chunks_per_file=None,
+        redetect_origin=False,
+    )
+    with patch("mempalace.daemon.submit_job", return_value={"id": "job-1"}) as mock_submit:
+        with patch("mempalace.miner.mine") as mock_mine:
+            cmd_mine(args)
+
+    mock_mine.assert_not_called()
+    payload = mock_submit.call_args.args[1]
+    assert payload["source"] == expected_source
 
 
 @patch("mempalace.cli.MempalaceConfig")
@@ -820,6 +1129,92 @@ def test_cmd_mine_exits_nonzero_on_lock_holder(mock_config_cls, capsys):
     assert "mcp_server" in captured.err
 
 
+def _mismatch_errors():
+    from mempalace.backends.base import (
+        DimensionMismatchError,
+        EmbedderIdentityMismatchError,
+        EmbeddingFunctionMismatchError,
+    )
+    from mempalace.embedding import EmbeddingAPIError
+
+    return [
+        EmbedderIdentityMismatchError(
+            "collection was built with embedder 'minilm' but the current embedder is 'x'."
+        ),
+        DimensionMismatchError("collection was built with a 384-dim embedder ('minilm')"),
+        EmbeddingFunctionMismatchError("Embedding model mismatch reading palace at /fake/palace."),
+        EmbeddingAPIError(
+            "Embedding API request to http://127.0.0.1:9/v1/embeddings failed: "
+            "<urlopen error [Errno 111] Connection refused>."
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    "error_index", [0, 1, 2, 3], ids=["identity", "dimension", "chroma-ef", "dead-endpoint"]
+)
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_prints_model_mismatch_cleanly(mock_config_cls, capsys, error_index):
+    """A model/identity mismatch is a configuration problem, not a crash:
+    mine prints the message (as search does) and exits 1, no traceback."""
+    error = _mismatch_errors()[error_index]
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with patch("mempalace.miner.mine", side_effect=error):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_mine(args)
+    assert excinfo.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("mempalace: "), err
+    assert str(error) in err
+    assert "Traceback" not in err
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_refuses_a_misspelled_model_before_the_banner(mock_config_cls, capsys):
+    """The model check runs before mining starts, so the error is not
+    followed by a banner naming a palace that is never created."""
+    from unittest.mock import PropertyMock
+
+    from mempalace.embedding import UnknownEmbeddingModelError
+
+    mock_config_cls.return_value.palace_path = "/fake/palace"
+    type(mock_config_cls.return_value).embedding_model = PropertyMock(
+        side_effect=UnknownEmbeddingModelError("Unknown embedding_model 'embeddinggemm2'")
+    )
+    args = argparse.Namespace(
+        dir="/src",
+        palace=None,
+        mode="projects",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with patch("mempalace.miner.mine") as mine:
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_mine(args)
+    assert excinfo.value.code == 1
+    mine.assert_not_called()
+    captured = capsys.readouterr()
+    assert "mempalace: Unknown embedding_model 'embeddinggemm2'" in captured.err
+    assert "MemPalace Mine" not in captured.out
+
+
 # ── cmd_wakeup ─────────────────────────────────────────────────────────
 
 
@@ -926,6 +1321,46 @@ def test_main_init_dispatches():
         mock_cmd.assert_called_once()
 
 
+def test_main_init_accepts_palace_after_subcommand():
+    """Regression for #2366: ``mempalace init <dir> --palace <path>`` must
+    parse, not raise ``unrecognized arguments: --palace``.
+
+    Pre-fix, ``--palace`` was registered only on the *global* parser, so the
+    natural (human-readable) invocation order the reporter used in the issue
+    body — flag after the subcommand/positional — was rejected. Mirroring the
+    existing ``p_serve`` ``--palace`` (#1877) added a subcommand-level
+    ``--palace`` on ``p_init`` with ``default=argparse.SUPPRESS`` so it cannot
+    clobber the global value on Python <3.12, yet both positions work.
+
+    We assert on the *parsed* ``args.palace`` rather than the env-stamp in
+    ``cmd_init`` (covered by ``test_cmd_init_honors_palace_flag``) — the parser
+    is the layer that was actually broken.
+    """
+    captured = {}
+    with (
+        patch("sys.argv", ["mempalace", "init", "/some/project", "--palace", "/custom/palace"]),
+        patch("mempalace.cli.cmd_init", side_effect=lambda args: captured.update(args.__dict__)),
+    ):
+        main()  # pre-fix would have raised SystemExit("unrecognized arguments") here
+    assert captured["palace"] == "/custom/palace", captured
+    assert captured["dir"] == "/some/project", captured
+
+
+def test_main_init_accepts_palace_before_subcommand():
+    """The global-order invocation (``--palace <path> init <dir>``) — the form
+    ``#1313``'s fix added — must keep working alongside the new natural order.
+    Together the two tests pin the full "either position is accepted" contract.
+    """
+    captured = {}
+    with (
+        patch("sys.argv", ["mempalace", "--palace", "/custom/palace", "init", "/some/project"]),
+        patch("mempalace.cli.cmd_init", side_effect=lambda args: captured.update(args.__dict__)),
+    ):
+        main()
+    assert captured["palace"] == "/custom/palace", captured
+    assert captured["dir"] == "/some/project", captured
+
+
 def test_main_mine_dispatches():
     with (
         patch("sys.argv", ["mempalace", "mine", "/some/dir"]),
@@ -962,6 +1397,9 @@ def test_mcp_command_prints_setup_guidance(monkeypatch, capsys):
     assert "MemPalace MCP quick setup:" in captured.out
     assert "claude mcp add mempalace -- mempalace-mcp" in captured.out
     assert "codex mcp add mempalace -- mempalace-mcp" in captured.out
+    assert "claude mcp add mempalace-light -- mempalace-light-mcp" in captured.out
+    assert "codex mcp add mempalace-light -- mempalace-light-mcp" in captured.out
+    assert "claude mcp add mempalace -- mempalace-light-mcp" not in captured.out
     assert "\nOptional custom palace:\n" in captured.out
     assert "mempalace-mcp --palace /path/to/palace" in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
@@ -980,6 +1418,7 @@ def test_mcp_command_uses_custom_palace_path_when_provided(monkeypatch, capsys):
     assert expanded in captured.out
     assert "claude mcp add mempalace -- mempalace-mcp --palace" in captured.out
     assert "codex mcp add mempalace -- mempalace-mcp --palace" in captured.out
+    assert "claude mcp add mempalace-light -- mempalace-light-mcp --palace" in captured.out
     assert "Optional custom palace:" not in captured.out
     assert "[--palace /path/to/palace]" not in captured.out
     assert captured.err == ""
@@ -994,6 +1433,7 @@ def test_mcp_command_includes_backend_when_provided(monkeypatch, capsys):
 
     captured = capsys.readouterr()
     assert "mempalace-mcp --backend sqlite_exact" in captured.out
+    assert "mempalace-light-mcp --backend sqlite_exact" in captured.out
     assert captured.err == ""
     os.environ.pop("MEMPALACE_BACKEND_EXPLICIT", None)
     os.environ.pop("MEMPALACE_BACKEND", None)
@@ -1745,14 +2185,17 @@ def test_cmd_sync_palace_dir_no_db(mock_config_cls, tmp_path, capsys):
 
 
 @patch("mempalace.cli.MempalaceConfig")
-def test_cmd_sync_daemon_background_submits_job(mock_config_cls, capsys):
+def test_cmd_sync_daemon_background_submits_job(mock_config_cls, capsys, tmp_path):
     from mempalace.cli import cmd_sync
 
     mock_config_cls.return_value.palace_path = "/fake/palace"
+    # Absolute on every platform: the payload resolves its paths, and a
+    # rooted "/project" is drive-relative on Windows.
+    project, extra = str(tmp_path / "project"), str(tmp_path / "extra")
     args = argparse.Namespace(
         palace=None,
-        dir="/project",
-        root=["/extra"],
+        dir=project,
+        root=[extra],
         wing="wing_a",
         dry_run=False,
         daemon=True,
@@ -1766,7 +2209,7 @@ def test_cmd_sync_daemon_background_submits_job(mock_config_cls, capsys):
     mock_submit.assert_called_once()
     assert mock_submit.call_args.args[0] == "sync"
     payload = mock_submit.call_args.args[1]
-    assert payload == {"dir": "/project", "root": ["/extra"], "wing": "wing_a", "dry_run": False}
+    assert payload == {"dir": project, "root": [extra], "wing": "wing_a", "dry_run": False}
     assert mock_submit.call_args.kwargs["wait"] is False
     assert "sync-job" in capsys.readouterr().out
 
@@ -1935,7 +2378,7 @@ def test_cmd_compress_with_config(mock_config_cls, tmp_path, capsys):
 
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_compress_stores_results(mock_config_cls, capsys):
-    """Non-dry-run compress stores to mempalace_closets collection (#1244)."""
+    """Non-dry-run compress stores to the mempalace_aaak collection."""
     mock_config_cls.return_value.palace_path = "/fake/palace"
     args = argparse.Namespace(palace=None, wing=None, dry_run=False, config=None)
     mock_col = MagicMock()
@@ -1966,7 +2409,8 @@ def test_cmd_compress_stores_results(mock_config_cls, capsys):
 
     with (
         patch("mempalace.palace._open_collection_or_explain", return_value=mock_col),
-        patch("mempalace.palace.get_closets_collection", return_value=mock_comp_col),
+        patch("mempalace.palace.get_aaak_collection", return_value=mock_comp_col),
+        patch("mempalace.palace.move_aaak_out_of_closets", return_value=0),
         patch.dict("sys.modules", {"mempalace.dialect": mock_dialect_mod}),
     ):
         cmd_compress(args)
@@ -1974,14 +2418,16 @@ def test_cmd_compress_stores_results(mock_config_cls, capsys):
     assert "Stored" in out
     assert "Total:" in out
     mock_comp_col.upsert.assert_called_once()
-    assert "mempalace_closets" in out
+    assert mock_comp_col.upsert.call_args.kwargs["metadatas"][0]["kind"] == "aaak"
+    assert "mempalace_aaak" in out
 
 
-def test_cmd_compress_output_readable_via_get_closets_collection(tmp_path, capsys):
-    """End-to-end: cmd_compress output must be readable via the same code
-    path palace.py uses (`get_closets_collection`). Regression for #1244."""
+def test_cmd_compress_output_lands_in_the_aaak_collection(tmp_path, capsys):
+    """End-to-end: cmd_compress output is readable through
+    ``get_aaak_collection`` and never lands in the closets search reads."""
+    from mempalace.backends import CollectionNotInitializedError
     from mempalace.backends.chroma import ChromaBackend
-    from mempalace.palace import get_closets_collection, get_collection
+    from mempalace.palace import get_aaak_collection, get_closets_collection, get_collection
 
     palace_path = str(tmp_path / "palace")
 
@@ -2004,17 +2450,20 @@ def test_cmd_compress_output_readable_via_get_closets_collection(tmp_path, capsy
     out = capsys.readouterr().out
     assert "Stored" in out
 
-    # Now read via the *same* code path palace.py / searcher uses.
-    closets = get_closets_collection(palace_path, create=False)
-    got = closets.get(ids=["drawer-1"], include=["documents", "metadatas"])
-    assert got["ids"] == ["drawer-1"], (
-        "compressed drawer not found in mempalace_closets — "
-        "cmd_compress wrote to the wrong collection (#1244)"
-    )
+    aaak = get_aaak_collection(palace_path, create=False)
+    got = aaak.get(ids=["drawer-1"], include=["documents", "metadatas"])
+    assert got["ids"] == ["drawer-1"]
     assert got["documents"] and got["documents"][0], "empty compressed doc"
     meta = got["metadatas"][0]
     assert meta.get("wing") == "test"
+    assert meta.get("kind") == "aaak"
     assert "compression_ratio" in meta
+
+    try:
+        closets = get_closets_collection(palace_path, create=False)
+    except CollectionNotInitializedError:
+        return
+    assert closets.get(ids=["drawer-1"])["ids"] == []
 
 
 def test_cmd_repair_trailing_slash_does_not_recurse():
@@ -2229,3 +2678,129 @@ def test_cmd_repair_rebuild_index_alias_uses_sqlite_archive(mock_config_cls, tmp
         archive_existing_dest=True,
         dry_run=False,
     )
+
+
+class _LockSpy:
+    """Records lock enter/exit around the real context manager machinery."""
+
+    def __init__(self, events):
+        self._events = events
+
+    def __call__(self, palace_path):
+        return self
+
+    def __enter__(self):
+        self._events.append("lock")
+        return None
+
+    def __exit__(self, *exc):
+        self._events.append("unlock")
+        return False
+
+
+def _legacy_repair_palace(tmp_path):
+    """A tiny on-disk palace plus the mock collection the legacy repair reads."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    col = MagicMock()
+    col.count.return_value = 2
+    col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    backend = _mock_backend_for(col=col, new_col=col)
+    backend.create_collection.side_effect = [col, col]
+    return palace_dir, backend
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_holds_the_palace_lock_before_extracting(mock_config_cls, tmp_path):
+    """The legacy repair used to extract every drawer and copy the whole palace
+    backup with no ``mine_palace_lock`` held, so a hook miner starting inside
+    that window made the rebuild abort with ``MineAlreadyRunning`` minutes later
+    and the work was thrown away (#2562). ``rebuild_index`` and
+    ``rebuild_from_sqlite`` both take the lease up front; this pins the same
+    contract on the third entry point."""
+    palace_dir, backend = _legacy_repair_palace(tmp_path)
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+
+    events = []
+
+    def spy_extract(collection, total, batch_size):
+        events.append("extract")
+        return ["id1", "id2"], ["doc1", "doc2"], [{"wing": "a"}, {"wing": "b"}]
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=backend),
+        patch("mempalace.palace.mine_palace_lock", _LockSpy(events)),
+        patch("mempalace.repair._extract_drawers", spy_extract),
+    ):
+        cmd_repair(args)
+
+    assert events[:2] == ["lock", "extract"], events
+    assert events[-1] == "unlock", events
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_confirms_after_releasing_the_palace_lock(mock_config_cls, tmp_path):
+    """The confirmation prompt waits on stdin, so it must not hold the lease."""
+    palace_dir, backend = _legacy_repair_palace(tmp_path)
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=False)
+    events = []
+
+    def spy_extract(collection, total, batch_size):
+        events.append("extract")
+        return ["id1", "id2"], ["doc1", "doc2"], [{"wing": "a"}, {"wing": "b"}]
+
+    def spy_confirm(*_args, **_kwargs):
+        events.append("confirm")
+        return True
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=backend),
+        patch("mempalace.palace.mine_palace_lock", _LockSpy(events)),
+        patch("mempalace.repair._extract_drawers", spy_extract),
+        patch("mempalace.migrate.confirm_destructive_action", spy_confirm),
+    ):
+        cmd_repair(args)
+
+    assert events.index("confirm") > events.index("unlock")
+    assert events[events.index("confirm") + 1] == "lock"
+    assert "extract" in events[events.index("confirm") :]
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_refuses_to_extract_when_the_lock_is_taken(mock_config_cls, tmp_path, capsys):
+    """Contention must be reported before any work, not ten minutes into it."""
+    palace_dir, backend = _legacy_repair_palace(tmp_path)
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+
+    extracted = []
+
+    def deny(palace_path):
+        raise MineAlreadyRunning("mine pid 4242 holds this palace")
+
+    def spy_extract(collection, total, batch_size):
+        extracted.append("extract")
+        return ["id1", "id2"], ["doc1", "doc2"], [{"wing": "a"}, {"wing": "b"}]
+
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=backend),
+        patch("mempalace.palace.mine_palace_lock", deny),
+        patch("mempalace.repair._extract_drawers", spy_extract),
+    ):
+        with pytest.raises(SystemExit) as exit_info:
+            cmd_repair(args)
+
+    assert extracted == []
+    assert exit_info.value.code not in (0, None)
+    out = capsys.readouterr().out
+    assert "4242" in out or "lock" in out.lower()

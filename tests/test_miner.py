@@ -19,7 +19,13 @@ from mempalace.miner import (
     scan_project,
     status,
 )
-from mempalace.palace import NORMALIZE_VERSION, file_already_mined, prefetch_mined_set
+from mempalace.palace import (
+    CONVO_CHUNKER_VERSION,
+    GENERAL_EXTRACTOR_VERSION,
+    NORMALIZE_VERSION,
+    file_already_mined,
+    prefetch_mined_set,
+)
 
 
 def write_file(path: Path, content: str):
@@ -312,6 +318,93 @@ def test_load_config_no_yaml_normalizes_hyphenated_wing():
         assert config["wing"] == "my_cool_app"
     finally:
         shutil.rmtree(parent)
+
+
+# --- project config filename resolution (#2676) -----------------------------
+
+
+@pytest.mark.parametrize("name", ["mempalace.yml", "mempal.yml"])
+def test_load_config_reads_yml_spelling(tmp_path, name):
+    """A project whose only config is ``*.yml`` is read, not ignored (#2676)."""
+    write_file(tmp_path / name, "wing: from_yml\nrooms:\n  - name: backend\n")
+    config = load_config(str(tmp_path))
+    assert config["wing"] == "from_yml"
+    assert config["rooms"] == [{"name": "backend"}]
+
+
+@pytest.mark.parametrize(
+    "present, winner",
+    [
+        (["mempalace.yaml", "mempalace.yml"], "mempalace.yaml"),
+        (["mempalace.yml", "mempal.yaml"], "mempalace.yml"),
+        (["mempal.yaml", "mempal.yml"], "mempal.yaml"),
+        (["mempalace.yaml", "mempalace.yml", "mempal.yaml", "mempal.yml"], "mempalace.yaml"),
+    ],
+)
+def test_load_config_resolution_order_and_shadow_warning(tmp_path, capsys, present, winner):
+    """Order is mempalace.yaml, mempalace.yml, mempal.yaml, mempal.yml; the
+    shadowed files are named on stderr instead of being silently skipped."""
+    from mempalace.miner import PROJECT_CONFIG_FILENAMES, find_project_config
+
+    for name in present:
+        write_file(tmp_path / name, f"wing: {name.replace('.', '_')}\nrooms: []\n")
+    assert PROJECT_CONFIG_FILENAMES == (
+        "mempalace.yaml",
+        "mempalace.yml",
+        "mempal.yaml",
+        "mempal.yml",
+    )
+    assert find_project_config(tmp_path) == tmp_path.resolve() / winner
+    capsys.readouterr()
+
+    config = load_config(str(tmp_path))
+
+    assert config["wing"] == winner.replace(".", "_")
+    err = capsys.readouterr().err
+    assert f"using {winner}" in err
+    for name in present:
+        if name != winner:
+            assert name in err
+
+
+def test_load_config_single_config_is_quiet(tmp_path, capsys):
+    write_file(tmp_path / "mempalace.yml", "wing: solo\nrooms: []\n")
+    assert load_config(str(tmp_path))["wing"] == "solo"
+    assert capsys.readouterr().err == ""
+
+
+def test_project_config_filenames_are_never_mined_as_content():
+    from mempalace.miner import PROJECT_CONFIG_FILENAMES, SKIP_FILENAMES
+
+    assert set(PROJECT_CONFIG_FILENAMES) <= SKIP_FILENAMES
+
+
+def test_mine_honors_mempalace_yml_wing_and_excludes(monkeypatch, tmp_path):
+    """End to end through mine(): wing, rooms and exclude_patterns come from
+    mempalace.yml. Before #2676 the file was ignored, the wing fell back to
+    the directory name and the excluded file was mined."""
+    import mempalace.miner as miner_mod
+
+    project_root = (tmp_path / "proj").resolve()
+    write_file(project_root / "src" / "app.py", "print('app')\n" * 20)
+    write_file(project_root / "secret" / "keys.md", "# do not mine\n" * 20)
+    write_file(
+        project_root / "mempalace.yml",
+        "wing: yml_wing\nrooms:\n  - name: general\n    description: General\n"
+        "exclude_patterns:\n  - secret/\n",
+    )
+
+    seen = []
+    real_process_file = miner_mod.process_file
+
+    def capture(filepath, **kwargs):
+        seen.append((filepath.relative_to(project_root).as_posix(), kwargs["wing"]))
+        return real_process_file(filepath, **kwargs)
+
+    monkeypatch.setattr(miner_mod, "process_file", capture)
+    mine(str(project_root), str(tmp_path / "palace"), dry_run=True)
+
+    assert seen == [("src/app.py", "yml_wing")]
 
 
 def test_scan_project_skips_mempalace_generated_files():
@@ -834,7 +927,7 @@ def test_file_already_mined_check_mtime():
             metadatas=[
                 {
                     "source_file": test_file,
-                    "source_mtime": str(mtime),
+                    "source_mtime": mtime,
                     "normalize_version": NORMALIZE_VERSION,
                 }
             ],
@@ -892,6 +985,7 @@ def test_file_already_mined_scopes_convo_extract_mode():
                     "source_file": source_file,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                 }
             ],
         )
@@ -909,6 +1003,7 @@ def test_file_already_mined_scopes_convo_extract_mode():
                     "source_file": source_file,
                     "extract_mode": "general",
                     "normalize_version": NORMALIZE_VERSION,
+                    "general_extractor_version": GENERAL_EXTRACTOR_VERSION,
                 }
             ],
         )
@@ -918,6 +1013,85 @@ def test_file_already_mined_scopes_convo_extract_mode():
     finally:
         del col, client
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_chunker_versions_only_gate_the_convo_scopes():
+    """An older or missing chunker stamp makes exchange and general rows
+    stale, while project rows (no extract_mode) never carry one and stay
+    current."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        os.makedirs(palace_path)
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection(
+            "mempalace_drawers", metadata={"hnsw:space": "cosine"}
+        )
+        chat = os.path.join(tmpdir, "chat.jsonl")
+        project = os.path.join(tmpdir, "notes.md")
+        general_chat = os.path.join(tmpdir, "general.jsonl")
+        col.add(
+            ids=["old_exchange", "old_general", "project"],
+            documents=["exchange drawer", "general drawer", "project drawer"],
+            metadatas=[
+                {
+                    "source_file": chat,
+                    "extract_mode": "exchange",
+                    "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION - 1,
+                },
+                {
+                    "source_file": general_chat,
+                    "extract_mode": "general",
+                    "normalize_version": NORMALIZE_VERSION,
+                },
+                {"source_file": project, "normalize_version": NORMALIZE_VERSION},
+            ],
+        )
+
+        assert file_already_mined(col, chat, extract_mode="exchange") is False
+        assert chat not in prefetch_mined_set(col, extract_mode="exchange")
+        assert file_already_mined(col, general_chat, extract_mode="general") is False
+        assert general_chat not in prefetch_mined_set(col, extract_mode="general")
+        assert file_already_mined(col, project) is True
+        assert project in prefetch_mined_set(col)
+    finally:
+        del col, client
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_scans_read_chroma_sqlite_instead_of_paging(tmp_path, monkeypatch):
+    """The whole-collection prefetch streams chroma.sqlite3: Chroma's
+    count() loads the HNSW index and its get(offset) paging is quadratic."""
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    current = {
+        "wing": "w",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+    }
+    col.add(
+        ids=["a0", "a1", "b0", "stale"],
+        documents=["a zero", "a one", "b zero", "old"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1], [0.3, 0.3], [0.4, 0.1]],
+        metadatas=[
+            {**current, "source_file": "/a", "source_mtime": 1.0, "chunk_total": 2},
+            {**current, "source_file": "/a", "source_mtime": 1.0, "chunk_total": 2},
+            {**current, "source_file": "/b", "source_mtime": 2.0, "chunk_total": 1},
+            {**current, "source_file": "/c", "convo_chunker_version": 1},
+        ],
+    )
+
+    def _no_paging(*_a, **_k):
+        raise AssertionError("paged through Chroma instead of reading chroma.sqlite3")
+
+    monkeypatch.setattr(ChromaCollection, "count", _no_paging)
+    monkeypatch.setattr(ChromaCollection, "get", _no_paging)
+    assert prefetch_mined_set(col, extract_mode="exchange") == {"/a": 1.0, "/b": 2.0}
 
 
 def test_file_already_mined_extract_mode_paginates_large_sources():
@@ -935,6 +1109,7 @@ def test_file_already_mined_extract_mode_paginates_large_sources():
             "source_file": source_file,
             "extract_mode": "general",
             "normalize_version": NORMALIZE_VERSION,
+            "general_extractor_version": GENERAL_EXTRACTOR_VERSION,
         }
     )
 
@@ -1106,7 +1281,7 @@ def test_sqlite_wing_room_counts_exact_tally(palace_path, seeded_collection):
     join multiplied rows (e.g. a drawer carrying several metadata keys), the
     total would exceed 4 and the room counts would inflate.
     """
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     assert result is not None
@@ -1124,7 +1299,7 @@ def test_status_falls_back_to_chroma_when_sqlite_unreadable(palace_path, seeded_
     correct tally — not crash or print nothing."""
     from unittest.mock import patch
 
-    with patch("mempalace.backends.chroma._sqlite_wing_room_counts", return_value=None):
+    with patch("mempalace.backends.chroma_sqlite._sqlite_wing_room_counts", return_value=None):
         status(palace_path)
 
     out = capsys.readouterr().out
@@ -1138,7 +1313,7 @@ def test_sqlite_wing_room_counts_none_when_collection_absent(palace_path):
     printing a misleading ``0 drawers`` tally (State C, #1498)."""
     import chromadb
 
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     chromadb.PersistentClient(path=palace_path)  # creates chroma.sqlite3, no collection
     assert _sqlite_wing_room_counts(palace_path, "mempalace_drawers") is None
@@ -1150,7 +1325,7 @@ def test_sqlite_wing_room_counts_numeric_wing_not_dropped(palace_path, collectio
     ChromaDB path, which surfaces the native number — not silently bucketed
     under '?'. Without the int/float COALESCE this row would vanish into '?'
     while returning a non-None result that skips the fallback."""
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     collection.add(
         ids=["drawer_numeric_meta"],
@@ -1168,7 +1343,7 @@ def test_sqlite_wing_room_counts_partial_metadata_buckets_question_mark(palace_p
     '?' for the missing axis, never dropped. Guards the LEFT JOINs against
     being narrowed to inner joins, which would silently discard partial
     drawers and undercount the total."""
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     collection.add(
         ids=["drawer_wing_only", "drawer_room_only"],
@@ -1193,7 +1368,7 @@ def test_sqlite_wing_room_counts_returns_none_on_locked_db(palace_path, seeded_c
     import sqlite3 as _sqlite3
     from unittest.mock import patch
 
-    from mempalace.backends.chroma import _sqlite_wing_room_counts
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
 
     with patch(
         "mempalace.backends.chroma.sqlite3.connect",
@@ -1218,11 +1393,14 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
         def upsert(self, documents, ids, metadatas):
             self.batch_sizes.append(len(documents))
 
+        def update(self, ids, metadatas):
+            pass
+
     source = tmp_path / "src.py"
     source.write_text("print('hello')\n" * 20, encoding="utf-8")
     chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
     col = FakeCol()
-    monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
     monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
     monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
@@ -1246,12 +1424,15 @@ def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
 def test_process_file_stamps_chunk_total_for_completion_check(tmp_path, monkeypatch):
     """Every chunk across every batch of one mining pass must carry the
     same ``chunk_total`` so ``file_already_mined`` can tell a complete
-    multi-batch mine from one that crashed partway through (#21)."""
+    multi-batch mine from one that crashed partway through (#21). It is
+    written one too high and set to the real count once the stale drawers
+    are gone."""
     from mempalace import miner
 
     class FakeCol:
         def __init__(self):
             self.metadatas: list = []
+            self.updated: list = []
 
         def get(self, *args, **kwargs):
             return {"ids": []}
@@ -1262,11 +1443,14 @@ def test_process_file_stamps_chunk_total_for_completion_check(tmp_path, monkeypa
         def upsert(self, documents, ids, metadatas):
             self.metadatas.extend(metadatas)
 
+        def update(self, ids, metadatas):
+            self.updated.extend(metadatas)
+
     source = tmp_path / "src.py"
     source.write_text("print('hello')\n" * 20, encoding="utf-8")
     chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
     col = FakeCol()
-    monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
     monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
     monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
@@ -1282,10 +1466,11 @@ def test_process_file_stamps_chunk_total_for_completion_check(tmp_path, monkeypa
     )
 
     assert len(col.metadatas) == 5
-    assert all(m["chunk_total"] == 5 for m in col.metadatas), (
-        "not every chunk carries the pass's chunk_total — "
+    assert all(m["chunk_total"] == 6 for m in col.metadatas), (
+        "not every chunk was written marked unfinished — "
         "file_already_mined can't verify completeness without it on every row"
     )
+    assert [m["chunk_total"] for m in col.updated] == [5] * 5
 
 
 def test_process_file_stamps_metadata_with_read_time_mtime_not_a_later_restat(
@@ -1313,6 +1498,9 @@ def test_process_file_stamps_metadata_with_read_time_mtime_not_a_later_restat(
         def upsert(self, documents, ids, metadatas):
             self.metadatas.extend(metadatas)
 
+        def update(self, ids, metadatas):
+            pass
+
     source = tmp_path / "src.py"
     source.write_text("print('hello')\n" * 20, encoding="utf-8")
 
@@ -1322,7 +1510,7 @@ def test_process_file_stamps_metadata_with_read_time_mtime_not_a_later_restat(
     monkeypatch.setattr(
         miner,
         "_read_text_no_follow",
-        lambda filepath, root: ("print('hello')\n" * 20, read_time_mtime),
+        lambda filepath, root: ("print('hello')\n" * 20, read_time_mtime, "utf-8"),
     )
     monkeypatch.setattr(os.path, "getmtime", lambda path: later_disk_mtime)
     chunks = [{"content": "chunk 0 " * 20, "chunk_index": 0}]
@@ -1348,27 +1536,31 @@ def test_process_file_stamps_metadata_with_read_time_mtime_not_a_later_restat(
     )
 
 
-def test_process_file_aborts_when_stale_drawer_purge_fails(tmp_path, monkeypatch):
-    """A failed stale-drawer purge must abort this file's mine attempt,
-    not silently proceed to upsert on top of it (#23). Proceeding either
-    orphans old tail entries beyond the new chunk count, or overwrites
-    only the overlapping chunk_index positions — not a real re-mine —
-    with zero operator-visible signal unless DEBUG logging happens to be
-    enabled."""
+def test_process_file_reports_a_failed_stale_drawer_purge(tmp_path, monkeypatch):
+    """A failed stale-drawer purge is an error, not a finished re-mine (#23).
+    The new drawers are already written but stay marked unfinished, so the
+    old ones are not orphaned: the next mine sees the file as not mined and
+    finishes the job."""
     from mempalace import miner
 
     class FailingPurgeCol:
         def __init__(self):
             self.upsert_called = False
+            self.update_called = False
 
-        def get(self, *args, **kwargs):
-            return {"ids": []}
+        def get(self, where=None, offset=0, **kwargs):
+            if where and not offset:
+                return {"ids": ["old"], "metadatas": [{"source_file": where["source_file"]}]}
+            return {"ids": [], "metadatas": []}
 
         def delete(self, *args, **kwargs):
             raise RuntimeError("simulated transient backend error")
 
         def upsert(self, documents, ids, metadatas):
             self.upsert_called = True
+
+        def update(self, ids, metadatas):
+            self.update_called = True
 
     source = tmp_path / "src.py"
     source.write_text("print('hello')\n" * 20, encoding="utf-8")
@@ -1388,11 +1580,11 @@ def test_process_file_aborts_when_stale_drawer_purge_fails(tmp_path, monkeypatch
         False,
     )
 
-    assert col.upsert_called is False, (
-        "process_file inserted new chunks even though the stale-drawer "
-        "purge raised — old and new rows can now coexist as duplicates/orphans"
-    )
+    assert col.upsert_called is True
+    assert col.update_called is False, "the new drawers were marked finished"
     assert drawers == 0
+    # Tagged so the mine counts an error, not an "already filed" skip.
+    assert skip_reason == "purge_failed"
 
 
 def test_process_file_purges_closets_even_when_all_chunks_filtered_out(tmp_path, monkeypatch):
@@ -1412,6 +1604,9 @@ def test_process_file_purges_closets_even_when_all_chunks_filtered_out(tmp_path,
 
         def upsert(self, documents, ids, metadatas):
             raise AssertionError("no chunks should be upserted in this scenario")
+
+        def update(self, *args, **kwargs):
+            pass
 
     purged: list = []
 
@@ -1515,8 +1710,10 @@ def test_file_already_mined_detects_incomplete_multi_batch_remine():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_process_file_cleans_partial_drawers_after_a_batch_upsert_failure(tmp_path, monkeypatch):
-    """A failed later batch must not leave mtime-stamped drawers that skip retry (#2122)."""
+def test_process_file_leaves_a_failed_write_marked_unfinished(tmp_path, monkeypatch):
+    """A failed later batch leaves what it wrote marked unfinished, so the next
+    mine retries instead of skipping an incomplete file (#2122), and deletes
+    nothing: the drawers the file had before stay readable."""
     from mempalace import miner
 
     class FailingCollection:
@@ -1525,8 +1722,10 @@ def test_process_file_cleans_partial_drawers_after_a_batch_upsert_failure(tmp_pa
             self.upsert_calls = 0
             self.deleted_sources = []
 
-        def get(self, where=None, limit=None, offset=0, include=None):
+        def get(self, ids=None, where=None, limit=None, offset=0, include=None):
             records = self.records
+            if ids is not None:
+                records = [record for record in records if record["id"] in ids]
             if where and "source_file" in where:
                 records = [
                     record
@@ -1557,6 +1756,9 @@ def test_process_file_cleans_partial_drawers_after_a_batch_upsert_failure(tmp_pa
                 for drawer_id, metadata in zip(ids, metadatas)
             )
 
+        def update(self, *args, **kwargs):
+            pass
+
     class FakeClosets:
         def __init__(self):
             self.deleted_sources = []
@@ -1569,9 +1771,9 @@ def test_process_file_cleans_partial_drawers_after_a_batch_upsert_failure(tmp_pa
     chunks = [{"content": f"chunk {index} " * 20, "chunk_index": index} for index in range(3)]
     collection = FailingCollection()
     closets = FakeClosets()
-    monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
     monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
-    monkeypatch.setattr(miner, "assert_no_collisions", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mempalace.palace.assert_no_collisions", lambda *args, **kwargs: None)
 
     with pytest.raises(RuntimeError, match="second-batch failure"):
         miner.process_file(
@@ -1585,9 +1787,9 @@ def test_process_file_cleans_partial_drawers_after_a_batch_upsert_failure(tmp_pa
             closets_col=closets,
         )
 
-    assert collection.deleted_sources == [str(source), str(source)]
-    assert collection.records == []
-    assert closets.deleted_sources == [str(source)]
+    assert collection.deleted_sources == []
+    assert [r["metadata"]["chunk_total"] for r in collection.records] == [4, 4]
+    assert closets.deleted_sources == []
     assert file_already_mined(collection, str(source), check_mtime=True) is False
 
 
@@ -1892,8 +2094,9 @@ def _make_minable_project(project_root: Path, n_files: int = 3) -> None:
 
 def test_mine_keyboard_interrupt_prints_summary_and_exits_130(tmp_path, capsys):
     """A KeyboardInterrupt mid-loop produces the clean summary + exit 130."""
-    import pytest
     from unittest.mock import patch
+
+    import pytest
 
     project_root = tmp_path / "proj"
     project_root.mkdir()
@@ -1926,8 +2129,9 @@ def test_mine_keyboard_interrupt_quotes_path_with_spaces_in_resume_hint(tmp_path
     spaces / metacharacters yields a copy-paste-safe `mempalace mine ...`
     command. Otherwise users on a path like "My Project" hit a broken
     invocation when they re-run after Ctrl-C."""
-    import pytest
     from unittest.mock import patch
+
+    import pytest
 
     project_root = tmp_path / "my project"
     project_root.mkdir()
@@ -2266,8 +2470,9 @@ def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
     banner before propagating, so users don't see a silent exit-0 with no
     completion message (#1296 Failure 2). Re-raise preserves the traceback
     and yields a non-zero exit code."""
-    import pytest
     from unittest.mock import patch
+
+    import pytest
 
     project_root = tmp_path / "proj"
     project_root.mkdir()
@@ -2296,8 +2501,9 @@ def test_mine_arbitrary_exception_prints_summary_and_reraises(tmp_path, capsys):
 
 def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
     """Our own per-target PID slot is removed in the finally clause."""
-    import pytest
     from unittest.mock import patch
+
+    import pytest
 
     project_root = tmp_path / "proj"
     project_root.mkdir()
@@ -2991,3 +3197,551 @@ def test_mine_limit_summary_counts(tmp_path, capsys):
     assert "Files processed: 2" in out
     assert "Drawers filed: 6" in out
     assert "(limit: 2 new)" in out
+
+
+def test_process_file_records_the_directory_it_mined_from(tmp_path, monkeypatch):
+    """Every drawer carries the inode of the directory its source was read
+    from, which is the directory ``sync`` asks about later. Without it, sync
+    cannot tell a witness in that directory from a witness on a volume
+    mounted there since (#2320)."""
+    from mempalace import miner, source_identity as si
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.metadatas.extend(metadatas)
+
+        def update(self, *args, **kwargs):
+            pass
+
+    project = tmp_path / "proj"
+    (project / "sub").mkdir(parents=True)
+    source = project / "sub" / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+    col = FakeCol()
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    miner.process_file(
+        source,
+        project,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    recorded = si.directory_identity(source.parent)
+    assert recorded is not None
+    # The directory the file lives in, not the root of the mine: that is the
+    # directory sync stats when it forms the verdict.
+    assert recorded != si.directory_identity(project)
+    assert col.metadatas, "nothing was filed"
+    assert all(m["source_dir_ino"] == recorded for m in col.metadatas), col.metadatas
+    # Nothing was written into the tree the README promises stays untouched.
+    assert sorted(p.name for p in project.iterdir()) == ["sub"]
+    assert sorted(p.name for p in source.parent.iterdir()) == ["src.py"]
+
+
+def test_recording_the_directory_writes_nothing_into_the_project(tmp_path):
+    """Taking the identity is a ``stat``, so neither pass leaves a mark.
+
+    ``README.md`` promises mining never writes to the source tree, and both of
+    its container recipes mount the source read-only, so a marker file would
+    have made this unusable there. A dry run and a real one are both checked,
+    and the real one has to come back with the identity actually recorded, or
+    this would pass against a tree where nothing takes it.
+    """
+    from mempalace import miner, source_identity as si
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = project / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    before = sorted(p.name for p in project.iterdir())
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, ids=None, documents=None, metadatas=None, **kwargs):
+            self.metadatas.extend(metadatas or [])
+
+        def update(self, *args, **kwargs):
+            pass
+
+    def run(dry_run):
+        col = FakeCol()
+        miner.process_file(
+            source,
+            project,
+            col,
+            "wing",
+            [{"name": "general", "description": "General"}],
+            "agent",
+            dry_run,
+        )
+        assert sorted(p.name for p in project.iterdir()) == before, "the mine wrote into the source"
+        return col
+
+    assert not run(dry_run=True).metadatas, "a dry run filed a drawer"
+
+    expected = si.directory_identity(project)
+    assert expected is not None, "the filesystem reports no inode to record"
+    filed = run(dry_run=False).metadatas
+    assert filed, "the real pass filed nothing, so it proves nothing about the stamp"
+    assert all(m.get("source_dir_ino") == expected for m in filed), filed
+
+
+def test_a_directory_that_cannot_be_statted_still_mines(tmp_path, monkeypatch):
+    """A directory that answers no inode records no identity and files its
+    drawers anyway; those are then decided by corroboration alone, as before."""
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.metadatas: list = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.metadatas.extend(metadatas)
+
+        def update(self, *args, **kwargs):
+            pass
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = project / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": "chunk " * 40, "chunk_index": 0}]
+    col = FakeCol()
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file, **kwargs: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+    monkeypatch.setattr(miner, "source_directory_identity", lambda *a, **k: None)
+
+    miner.process_file(
+        source,
+        project,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert col.metadatas, "a directory with no identity stopped the mine"
+    assert all("source_dir_ino" not in m for m in col.metadatas), col.metadatas
+
+
+def test_project_mine_reaches_a_yield_point_before_each_file(tmp_path):
+    from mempalace.palace import mine_yield_hook
+
+    project_root = tmp_path / "proj"
+    for n in range(3):
+        write_file(project_root / "backend" / f"mod{n}.py", f"def f{n}():\n    return {n}\n" * 20)
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "proj", "rooms": [{"name": "backend", "description": "code"}]}, f)
+    calls: list = []
+    with mine_yield_hook(lambda: calls.append(1)):
+        mine(str(project_root), str(tmp_path / "palace"))
+    assert len(calls) == 3
+
+
+def test_metadata_scan_reads_a_schema_without_bool_value():
+    """Older chromadb schemas predate bool_value; the scan reads the columns
+    the table has instead of failing on the missing one."""
+    import sqlite3
+
+    from mempalace.backends.chroma_sqlite import _sqlite_iter_metadata
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.executescript(
+            """
+            CREATE TABLE collections (id TEXT, name TEXT);
+            CREATE TABLE segments (id TEXT, collection TEXT, scope TEXT);
+            CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT);
+            CREATE TABLE embedding_metadata
+              (id INTEGER, key TEXT, string_value TEXT, int_value INTEGER, float_value REAL);
+            INSERT INTO collections VALUES ('c', 'drawers');
+            INSERT INTO segments VALUES ('s', 'c', 'METADATA');
+            INSERT INTO embeddings VALUES (1, 's');
+            INSERT INTO embedding_metadata VALUES (1, 'source_file', '/old.md', NULL, NULL);
+            INSERT INTO embedding_metadata VALUES (1, 'chunk_total', NULL, 3, NULL);
+            """
+        )
+        rows = list(_sqlite_iter_metadata(conn, "drawers", ["source_file", "chunk_total"], None))
+    assert rows == [{"source_file": "/old.md", "chunk_total": 3}]
+
+
+def _mined_rows_palace(tmp_path):
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    current = {
+        "wing": "w",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+    }
+    col.add(
+        ids=["a", "b"],
+        documents=["a", "b"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1]],
+        metadatas=[
+            {**current, "source_file": "/a", "source_mtime": 1.0},
+            {**current, "source_file": "/b", "source_mtime": 2.0},
+        ],
+    )
+    return col
+
+
+def test_prefetch_discards_a_failed_fast_scan_and_pages_instead(tmp_path, monkeypatch):
+    """A fast scan that fails after some rows must not leave a partial
+    registry: it reads as "not mined"."""
+    from mempalace.backends.chroma import ChromaCollection
+
+    col = _mined_rows_palace(tmp_path)
+    real = ChromaCollection.iter_metadata
+
+    def breaks_after_one_row(self, keys=None, *, require_key=None):
+        rows = real(self, keys, require_key=require_key)
+
+        def gen():
+            try:
+                yield next(rows)
+                raise sqlite3.OperationalError("injected mid-scan failure")
+            finally:
+                # Release the SQLite reader before Chroma's fallback needs to write.
+                rows.close()
+
+        return gen()
+
+    import sqlite3
+
+    monkeypatch.setattr(ChromaCollection, "iter_metadata", breaks_after_one_row)
+    assert prefetch_mined_set(col, extract_mode="exchange") == {"/a": 1.0, "/b": 2.0}
+
+
+def test_prefetch_raises_when_no_complete_scan_is_possible(tmp_path, monkeypatch):
+    import sqlite3
+
+    import mempalace.palace as palace_pkg
+    from mempalace.palace import MinedSetUnavailable
+
+    col = _mined_rows_palace(tmp_path)
+
+    def broken(*_a, **_k):
+        yield {"source_file": "/a"}
+        raise sqlite3.OperationalError("injected failure")
+
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", broken)
+    monkeypatch.setattr(palace_pkg, "_paged_metadata", broken)
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_mined_set(col, extract_mode="exchange")
+
+
+def _prefetch_cases_palace(tmp_path):
+    """One file per case, with the drawers each case stores for it."""
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    paths = {}
+    for name in (
+        "complete",
+        "legacy",
+        "sentinel",
+        "two_groups",
+        "drift",
+        "changed",
+        "partial",
+        "stale_version",
+        "no_mtime",
+        "old_sentinel",
+        "mixed_totals",
+        "text_total",
+        "missing",
+    ):
+        path = tmp_path / "src" / f"{name}.md"
+        write_file(path, f"{name} content")
+        paths[name] = str(path)
+    mtime = {name: os.path.getmtime(path) for name, path in paths.items()}
+    current = {"normalize_version": NORMALIZE_VERSION}
+
+    def drawers(name, n, **meta):
+        return [{**current, "source_file": paths[name], **meta} for _ in range(n)]
+
+    rows = [
+        *drawers("complete", 2, source_mtime=mtime["complete"], chunk_total=2),
+        *drawers("legacy", 1, source_mtime=mtime["legacy"]),
+        # The convo miner's registry row: no chunk_total, trusted on its own.
+        *drawers(
+            "sentinel",
+            1,
+            source_mtime=mtime["sentinel"],
+            room="_registry",
+            ingest_mode="registry",
+            extract_mode="exchange",
+        ),
+        # An older complete pass next to the current one (additive mining).
+        *drawers("two_groups", 1, source_mtime=mtime["two_groups"] - 50, chunk_total=1),
+        *drawers("two_groups", 3, source_mtime=mtime["two_groups"], chunk_total=3),
+        *drawers("drift", 1, source_mtime=mtime["drift"] + 0.0005, chunk_total=1),
+        *drawers("changed", 1, source_mtime=mtime["changed"] - 10, chunk_total=1),
+        # A crash between upsert batches: 2 of 3 chunks.
+        *drawers("partial", 2, source_mtime=mtime["partial"], chunk_total=3),
+        {
+            "normalize_version": NORMALIZE_VERSION - 1,
+            "source_file": paths["stale_version"],
+            "source_mtime": mtime["stale_version"],
+            "chunk_total": 1,
+        },
+        *drawers("no_mtime", 1, chunk_total=1),
+        *drawers(
+            "old_sentinel",
+            1,
+            source_mtime=mtime["old_sentinel"] - 10,
+            room="_registry",
+            ingest_mode="registry",
+        ),
+        # Two drawers naming different totals: the largest one decides, so
+        # 2 drawers short of 3 is a partial pass.
+        *drawers("mixed_totals", 1, source_mtime=mtime["mixed_totals"], chunk_total=2),
+        *drawers("mixed_totals", 1, source_mtime=mtime["mixed_totals"], chunk_total=3),
+        # A total that is not a number cannot prove completeness -> not mined.
+        *drawers("text_total", 1, source_mtime=mtime["text_total"], chunk_total="one"),
+    ]
+    col.add(
+        ids=[f"d{i}" for i in range(len(rows))],
+        documents=[f"doc {i}" for i in range(len(rows))],
+        embeddings=[[0.1 * (i % 7), 0.2] for i in range(len(rows))],
+        metadatas=rows,
+    )
+    return col, paths
+
+
+def test_prefetch_complete_mtimes_never_skips_a_file_the_per_file_check_would_mine(tmp_path):
+    from mempalace.miner import _prefetched_as_mined
+    from mempalace.palace import prefetch_complete_mtimes
+
+    col, paths = _prefetch_cases_palace(tmp_path)
+    mined_mtimes = prefetch_complete_mtimes(col, list(paths.values()))
+
+    fast = {name for name, path in paths.items() if _prefetched_as_mined(path, mined_mtimes)}
+    per_file = {
+        name for name, path in paths.items() if file_already_mined(col, path, check_mtime=True)
+    }
+    assert fast == {"complete", "legacy", "sentinel", "two_groups", "drift"}
+    assert per_file == fast
+
+    # Sources outside this mine's file list are not tracked.
+    assert set(prefetch_complete_mtimes(col, [paths["complete"]])) == {paths["complete"]}
+
+    # A file edited since it was filed is no longer proven mined.
+    os.utime(paths["complete"], (0, os.path.getmtime(paths["complete"]) + 5))
+    assert not _prefetched_as_mined(paths["complete"], mined_mtimes)
+    assert file_already_mined(col, paths["complete"], check_mtime=True) is False
+
+
+def test_prefetch_complete_mtimes_gives_up_without_a_complete_sqlite_scan(tmp_path, monkeypatch):
+    import sqlite3
+
+    import mempalace.palace as palace_pkg
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import prefetch_complete_mtimes
+
+    col, paths = _prefetch_cases_palace(tmp_path)
+
+    def breaks_after_one_row(self, keys=None, *, require_key=None):
+        def gen():
+            yield {"source_file": paths["complete"], "normalize_version": NORMALIZE_VERSION}
+            raise sqlite3.OperationalError("injected failure")
+
+        return gen()
+
+    monkeypatch.setattr(ChromaCollection, "iter_metadata", breaks_after_one_row)
+    assert prefetch_complete_mtimes(col, list(paths.values())) is None
+
+    # A backend without the sqlite stream keeps the per-file check.
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", lambda *_a, **_k: None)
+    assert prefetch_complete_mtimes(col, list(paths.values())) is None
+
+
+def test_mine_skips_prefetched_files_without_a_per_file_query(tmp_path, monkeypatch):
+    import mempalace.miner as miner_mod
+    import mempalace.palace as palace_pkg
+
+    project_root = tmp_path / "proj"
+    _make_minable_project(project_root, n_files=3)
+    palace_path = str(tmp_path / "palace")
+    mine(str(project_root), palace_path)
+
+    asked = []
+    real_check = miner_mod.file_already_mined
+
+    def recording_check(collection, source_file, **kwargs):
+        asked.append(Path(source_file).name)
+        return real_check(collection, source_file, **kwargs)
+
+    monkeypatch.setattr(miner_mod, "file_already_mined", recording_check)
+
+    # Nothing changed: every file is skipped from the prefetched map.
+    mine(str(project_root), palace_path)
+    assert asked == []
+
+    # An edited file falls through to the per-file check and is re-mined;
+    # the unchanged ones are still skipped without a query.
+    edited = project_root / "f1.py"
+    os.utime(edited, (0, os.path.getmtime(edited) + 5))
+    mine(str(project_root), palace_path)
+    assert asked == ["f1.py", "f1.py"]  # the pre-lock check and the in-lock re-check
+    assert real_check(palace_pkg.get_collection(palace_path), str(edited), check_mtime=True)
+
+    # Without the sqlite stream every file takes the per-file check, and
+    # is still skipped.
+    asked.clear()
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", lambda *_a, **_k: None)
+    mine(str(project_root), palace_path)
+    assert sorted(asked) == ["f0.py", "f1.py", "f2.py"]
+
+
+class _UnreadableCollection:
+    def get(self, **kwargs):
+        raise RuntimeError("palace read failed")
+
+
+def test_file_already_mined_raises_when_the_palace_cannot_be_read(tmp_path):
+    from mempalace.palace import MinedSetUnavailable
+
+    src = tmp_path / "a.md"
+    write_file(src, "content")
+    for check_mtime in (False, True):
+        with pytest.raises(MinedSetUnavailable):
+            file_already_mined(_UnreadableCollection(), str(src), check_mtime=check_mtime)
+
+
+def test_file_already_mined_reads_a_partial_pass_as_unfinished_without_mtime(tmp_path):
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    src = str(tmp_path / "a.md")
+    col.add(
+        ids=["a0", "a1"],
+        documents=["one", "two"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1]],
+        metadatas=[{"source_file": src, "normalize_version": NORMALIZE_VERSION, "chunk_total": 3}]
+        * 2,
+    )
+    assert file_already_mined(col, src) is False
+
+
+def test_mine_aborts_when_the_mined_set_cannot_be_read(tmp_path, monkeypatch):
+    import mempalace.miner as miner_mod
+    from mempalace.palace import MinedSetUnavailable, get_collection
+
+    project_root = tmp_path / "proj"
+    _make_minable_project(project_root, n_files=2)
+    palace_path = str(tmp_path / "palace")
+    mine(str(project_root), palace_path)
+    col = get_collection(palace_path)
+    before = sorted(col.get(include=["metadatas"])["ids"])
+
+    # A backend without Chroma's sqlite stream asks per file, and the palace
+    # read fails underneath it.
+    monkeypatch.setattr(miner_mod, "prefetch_complete_mtimes", lambda *_a, **_k: None)
+    real_get = type(col).get
+
+    def failing_get(self, *args, **kwargs):
+        if "source_file" in (kwargs.get("where") or {}):
+            raise RuntimeError("palace read failed")
+        return real_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(col), "get", failing_get)
+    with pytest.raises(MinedSetUnavailable):
+        mine(str(project_root), palace_path)
+
+    monkeypatch.setattr(type(col), "get", real_get)
+    assert sorted(get_collection(palace_path).get(include=["metadatas"])["ids"]) == before
+
+
+class _RowsCollection:
+    """Pages stored metadata rows in a fixed order, as a backend would."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def count(self):
+        return len(self.rows)
+
+    def get(self, where=None, limit=1000, offset=0, include=None):
+        src = (where or {}).get("source_file")
+        rows = [r for r in self.rows if src is None or r["source_file"] == src]
+        page = rows[offset : offset + limit]
+        return {"ids": [str(offset + i) for i in range(len(page))], "metadatas": page}
+
+
+def _exchange_rows(src, *totals):
+    rows = []
+    for total in totals:
+        meta = {
+            "source_file": src,
+            "source_mtime": 1.0,
+            "normalize_version": NORMALIZE_VERSION,
+            "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
+        }
+        if total is not None:
+            meta["chunk_total"] = total
+        rows.append(meta)
+    return rows
+
+
+@pytest.mark.parametrize("totals", [(2, 3), (3, 2)])
+def test_prefetch_mined_set_reads_mixed_totals_the_same_in_any_order(totals):
+    # Two drawers naming totals 2 and 3 are a partial pass, whichever comes back first.
+    col = _RowsCollection(_exchange_rows("s.jsonl", *totals))
+    assert prefetch_mined_set(col, extract_mode="exchange") == {}
+
+
+def test_prefetch_mined_set_leaves_an_unprovable_source_to_the_per_file_check():
+    col = _RowsCollection(_exchange_rows("s.jsonl", "one"))
+    assert prefetch_mined_set(col, extract_mode="exchange") == {}
+    assert file_already_mined(col, "s.jsonl", extract_mode="exchange") is False
+
+
+def test_a_legacy_numeric_string_total_reads_as_a_number():
+    # Rows written before typed metadata may hold "1" for chunk_total; both
+    # checks read it as 1 instead of re-mining the file forever.
+    col = _RowsCollection(_exchange_rows("s.jsonl", "1"))
+    assert prefetch_mined_set(col, extract_mode="exchange") == {"s.jsonl": 1.0}
+    assert file_already_mined(col, "s.jsonl", extract_mode="exchange") is True
+
+
+@pytest.mark.parametrize("totals", [(None, "x"), ("x", None)])
+def test_file_already_mined_answers_the_same_in_any_row_order(totals):
+    # An untracked row next to one whose total cannot be compared proves nothing.
+    col = _RowsCollection(_exchange_rows("s.jsonl", *totals))
+    assert file_already_mined(col, "s.jsonl", extract_mode="exchange") is False

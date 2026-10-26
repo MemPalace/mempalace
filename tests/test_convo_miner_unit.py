@@ -10,11 +10,11 @@ from mempalace.convo_miner import (
     _emit_bounded,
     _extract_authored_at,
     _file_chunks_locked,
-    _source_file_delete_ids,
     chunk_exchanges,
     detect_convo_room,
     scan_convos,
 )
+from mempalace.palace import _source_file_delete_ids, file_already_mined
 
 
 class TestChunkExchanges:
@@ -56,27 +56,101 @@ class TestChunkExchanges:
         max_len = max(len(c["content"]) for c in chunks)
         assert max_len <= CHUNK_SIZE, f"oversized chunk: max_len={max_len}"
 
-    def test_line_group_fallback_drops_sub_min_trailing_group(self):
-        """A trailing line-group whose stripped length is at or below
-        MIN_CHUNK_SIZE must be dropped, not emitted as a tiny drawer."""
+    def test_line_group_fallback_attaches_sub_min_trailing_group(self):
+        """A trailing line-group at or below MIN_CHUNK_SIZE is kept by
+        attaching it to the previous drawer, not emitted as a tiny drawer
+        and not dropped."""
         lines = [f"Line {i}" for i in range(51)]
         content = "\n".join(lines)
         chunks = chunk_exchanges(content)
-        from mempalace.convo_miner import MIN_CHUNK_SIZE
 
-        assert len(chunks) == 2, (
-            f"expected 2 drawers (groups 0-24 and 25-49); got {len(chunks)}; "
-            f"the single-line tail group should drop below MIN_CHUNK_SIZE={MIN_CHUNK_SIZE}"
-        )
+        assert len(chunks) == 2, f"expected groups 0-24 and 25-50; got {len(chunks)}"
+        assert chunks[1]["content"].endswith("Line 49\nLine 50")
 
     def test_empty_content(self):
         chunks = chunk_exchanges("")
         assert chunks == []
 
-    def test_short_content_skipped(self):
+    def test_short_content_kept(self):
+        """Content below MIN_CHUNK_SIZE is still filed verbatim."""
         chunks = chunk_exchanges("> hi\nbye")
-        # Too short to produce chunks (below MIN_CHUNK_SIZE)
-        assert isinstance(chunks, list)
+        assert [c["content"] for c in chunks] == ["> hi\nbye"]
+
+    def test_response_after_horizontal_rule_kept(self):
+        """A ``---`` rule inside an AI response is part of the response.
+        It used to end the response and drop everything up to the next turn."""
+        content = (
+            "> how do we release?\n"
+            "Phase one: freeze the branch.\n\n---\n\n"
+            "Phase two: tag and publish the wheel.\n\n"
+            "> and the rollback?\n"
+            "Yank the release and repoint latest.\n\n"
+            "> changelog?\n"
+            "Curate it by theme.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert chunks[0]["content"] == (
+            "> how do we release?\n"
+            "Phase one: freeze the branch.\n\n---\n\n"
+            "Phase two: tag and publish the wheel."
+        )
+
+    def test_text_before_first_turn_kept(self):
+        """Text before the first user turn is filed as its own unit."""
+        content = (
+            "Session notes written before the conversation started.\n\n"
+            "> first question here?\nFirst answer with some detail.\n"
+            "> second question here?\nSecond answer with some detail.\n"
+            "> third question here?\nThird answer with some detail.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert chunks[0]["content"] == "Session notes written before the conversation started."
+        assert chunks[1]["content"].startswith("> first question here?")
+
+    def test_tiny_exchange_attached_to_previous(self):
+        """An exchange at or below MIN_CHUNK_SIZE joins the previous drawer."""
+        content = (
+            "> what should we name the module?\nCall it palace_graph, it maps rooms.\n"
+            "> ok\n"
+            "> and the tests?\nMirror the module name under tests/ as usual.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert len(chunks) == 2
+        assert chunks[0]["content"].endswith("it maps rooms.\n> ok")
+        assert chunks[1]["content"].startswith("> and the tests?")
+
+    def test_tiny_exchange_keeps_the_blank_line_before_it(self):
+        """Joining a small unit to the previous drawer keeps the separator that
+        stood between them in the source, not a single newline."""
+        content = (
+            "> what should we name the module?\nCall it palace_graph, it maps rooms.\n\n"
+            "> ok\n"
+            "> and the tests?\nMirror the module name under tests/ as usual.\n"
+        )
+        chunks = chunk_exchanges(content)
+        assert chunks[0]["content"].endswith("it maps rooms.\n\n> ok")
+
+    def test_every_word_survives(self):
+        """No input word is lost across exchange, preamble, rule, and tiny units."""
+        content = (
+            "alpha preamble words\n\n"
+            "> bravo question?\ncharlie answer\n\n---\n\ndelta after rule\n"
+            "> ok\n"
+            "> echo question?\n" + "foxtrot " * 150 + "\n"
+        )
+        stored = " ".join(c["content"] for c in chunk_exchanges(content)).split()
+        for word in content.split():
+            assert word in stored, word
+
+    def test_oversized_exchange_split_at_whitespace(self):
+        """Splitting an oversized exchange never cuts a word in two."""
+        content = "> q?\n" + "wordy " * 300 + "\n> q2?\nanswer text here\n> q3?\nanswer text\n"
+        chunks = chunk_exchanges(content)
+        assert sum("wordy" in c["content"] for c in chunks) > 1
+        input_words = set(content.split())
+        for chunk in chunks:
+            assert len(chunk["content"]) <= CHUNK_SIZE
+            assert set(chunk["content"].split()) <= input_words
 
     def test_chunk_size_zero_raises_valueerror(self):
         """Reject chunk_size == 0 explicitly.
@@ -291,13 +365,38 @@ class TestEmitBounded:
         assert chunks[0]["content"] == "a" * 10
         assert chunks[1]["content"] == " " * 10
 
-    def test_whole_content_below_floor_dropped(self):
-        """The floor is applied to the stripped whole content. An all-whitespace
-        input (stripped length 0) or a too-short input is dropped without slicing."""
+    def test_whitespace_only_content_dropped(self):
+        """Whitespace-only input carries no text and produces no drawer."""
         chunks = []
         _emit_bounded(chunks, " " * 100, chunk_size=10, min_chunk_size=5)
-        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5)
         assert chunks == []
+
+    def test_below_floor_content_kept_on_its_own_without_a_previous_drawer(self):
+        chunks = []
+        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5)
+        assert chunks == [{"content": "ab", "chunk_index": 0}]
+
+    def test_below_floor_content_attached_with_joiner(self):
+        chunks = [{"content": "first", "chunk_index": 0}]
+        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5, joiner="\n\n")
+        assert chunks == [{"content": "first\n\nab", "chunk_index": 0}]
+
+    def test_below_floor_content_emitted_alone_when_previous_is_full(self):
+        chunks = [{"content": "x" * 9, "chunk_index": 0}]
+        _emit_bounded(chunks, "ab", chunk_size=10, min_chunk_size=5)
+        assert [c["content"] for c in chunks] == ["x" * 9, "ab"]
+        assert chunks[1]["chunk_index"] == 1
+
+    def test_split_prefers_whitespace_in_back_half(self):
+        chunks = []
+        _emit_bounded(chunks, "aaaaaa bbbb cc", chunk_size=10, min_chunk_size=0)
+        assert [c["content"] for c in chunks] == ["aaaaaa ", "bbbb cc"]
+
+    def test_split_ignores_whitespace_in_front_half(self):
+        """A cut that early would halve the drawer; cut at chunk_size instead."""
+        chunks = []
+        _emit_bounded(chunks, "ab " + "c" * 20, chunk_size=10, min_chunk_size=0)
+        assert [c["content"] for c in chunks] == ["ab ccccccc", "c" * 10, "ccc"]
 
     def test_split_805_chars_at_chunk_size_800_preserves_tail(self):
         """805 chars at chunk_size=800 produces a 5-char tail. With the
@@ -625,9 +724,12 @@ class TestFileChunksLocked:
             def upsert(self, documents, ids, metadatas):
                 self.batch_sizes.append(len(documents))
 
+            def update(self, *args, **kwargs):
+                pass
+
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
         col = FakeCol()
-        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
         )
@@ -659,6 +761,9 @@ class TestFileChunksLocked:
             def upsert(self, documents, ids, metadatas):
                 self.metas.extend(metadatas)
 
+            def update(self, *args, **kwargs):
+                pass
+
         chunks = [
             {
                 "content": "We changed `MemoryStack` in rag/foo.py via do_thing_now().",
@@ -679,24 +784,31 @@ class TestFileChunksLocked:
         assert "rag/foo.py" in entities
         assert "do_thing_now" in entities
 
-    def test_aborts_when_stale_drawer_purge_fails(self, monkeypatch):
-        """#105: a failed purge must abort the mine attempt, not silently
-        proceed to upsert on top of it — the same swallow already fixed
-        for miner.py's process_file at #23, own instance here."""
+    def test_a_failed_stale_drawer_purge_raises_and_keeps_the_marker(self, monkeypatch):
+        """#105: a failed purge is an error the mine counts. The fresh chunks
+        are already written and stay marked unfinished, so the next mine
+        finishes the job instead of skipping the file."""
         import mempalace.convo_miner as convo_miner
+        from mempalace.palace import StaleDrawerPurgeFailed
 
         class FailingPurgeCol:
             def __init__(self):
-                self.upsert_called = False
+                self.upserted = []
+                self.update_called = False
 
-            def get(self, *args, **kwargs):
-                raise RuntimeError("simulated transient backend error")
+            def get(self, where=None, ids=None, **kwargs):
+                if where is not None:
+                    raise RuntimeError("simulated transient backend error")
+                return {"ids": [], "metadatas": []}
 
             def delete(self, *args, **kwargs):
                 pass
 
             def upsert(self, documents, ids, metadatas):
-                self.upsert_called = True
+                self.upserted.extend(metadatas)
+
+            def update(self, *args, **kwargs):
+                self.update_called = True
 
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
         col = FailingPurgeCol()
@@ -706,25 +818,21 @@ class TestFileChunksLocked:
         monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
         monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
 
-        drawers, room_counts, skipped = _file_chunks_locked(
-            col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
-        )
+        with pytest.raises(StaleDrawerPurgeFailed):
+            _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
 
-        assert col.upsert_called is False, (
-            "_file_chunks_locked inserted new chunks even though the "
-            "stale-drawer purge raised — old and new rows can now coexist "
-            "as duplicates/orphans"
-        )
-        assert drawers == 0
-        assert skipped is True
+        assert [m["chunk_total"] for m in col.upserted] == [4, 4, 4]
+        assert col.update_called is False, "the new drawers were marked finished"
 
     def test_stamps_chunk_total_for_completion_check(self, monkeypatch):
-        """Every convo drawer of one pass must carry chunk_total (#2183)."""
+        """Every convo drawer of one pass must carry chunk_total (#2183),
+        written one too high and then set to the real count."""
         import mempalace.convo_miner as convo_miner
 
         class FakeCol:
             def __init__(self):
                 self.metas = []
+                self.updated = []
 
             def delete(self, *args, **kwargs):
                 pass
@@ -735,9 +843,12 @@ class TestFileChunksLocked:
             def upsert(self, documents, ids, metadatas):
                 self.metas.extend(metadatas)
 
+            def update(self, ids, metadatas):
+                self.updated.extend(metadatas)
+
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
         col = FakeCol()
-        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
         )
@@ -747,13 +858,16 @@ class TestFileChunksLocked:
         _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
 
         assert len(col.metas) == 5
-        assert all(m.get("chunk_total") == 5 for m in col.metas), (
-            "not every convo chunk carries the pass's chunk_total — a mid-file "
+        assert all(m.get("chunk_total") == 6 for m in col.metas), (
+            "not every convo chunk was written marked unfinished — a mid-file "
             "crash would leave mtime-stamped partials that skip forever (#2183)"
         )
+        assert [m["chunk_total"] for m in col.updated] == [5] * 5
 
-    def test_cleans_partial_drawers_after_batch_upsert_failure(self, monkeypatch, tmp_path):
-        """A failed later batch must not leave mtime-stamped partials (#2183)."""
+    def test_a_failed_batch_leaves_its_drawers_marked_unfinished(self, monkeypatch, tmp_path):
+        """A failed later batch leaves what it wrote marked unfinished, so the
+        next mine retries instead of skipping the file (#2183), and deletes
+        nothing the file already had."""
         import mempalace.convo_miner as convo_miner
 
         class FailingCol:
@@ -799,11 +913,14 @@ class TestFileChunksLocked:
                     for drawer_id, metadata in zip(ids, metadatas)
                 )
 
+            def update(self, *args, **kwargs):
+                pass
+
         source = tmp_path / "chat.txt"
         source.write_text("content\n", encoding="utf-8")
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
         col = FailingCol()
-        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
         )
@@ -813,11 +930,9 @@ class TestFileChunksLocked:
         with pytest.raises(RuntimeError, match="second-batch failure"):
             _file_chunks_locked(col, str(source), chunks, "wing", "general", "agent", "exchange")
 
-        assert col.records == [], (
-            "partial convo drawers survived a mid-file upsert failure — the "
-            "next mine would skip this incomplete file forever (#2183)"
-        )
-        assert col.deleted_ids, "cleanup did not delete the partial drawer ids"
+        assert [r["metadata"]["chunk_total"] for r in col.records] == [4, 4]
+        assert col.deleted_ids == []
+        assert not file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
 
 class TestSourceFileDeleteIds:
@@ -927,3 +1042,123 @@ def test_scan_convos_accepts_one_file_without_scanning_siblings(
     )
 
     assert scan_convos(str(selected)) == [selected.resolve()]
+
+
+class TestSourceDirectoryIdentity:
+    """A transcript on a volume that goes away must not have its drawers
+    pruned by a witness that was never on that volume (#2320)."""
+
+    def test_the_identity_is_stamped_on_every_chunk(self, monkeypatch):
+        import contextlib
+
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metadatas: list = []
+
+            def get(self, *args, **kwargs):
+                return {"ids": []}
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.metadatas.extend(metadatas)
+
+            def update(self, *args, **kwargs):
+                pass
+
+        chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(
+            col,
+            "chat.txt",
+            chunks,
+            "wing",
+            "general",
+            "agent",
+            "exchange",
+            source_dir_ino="1000000",
+        )
+
+        assert col.metadatas
+        assert all(m["source_dir_ino"] == "1000000" for m in col.metadatas), col.metadatas
+
+    def test_no_identity_leaves_the_key_off(self, monkeypatch):
+        import contextlib
+
+        import mempalace.convo_miner as convo_miner
+
+        class FakeCol:
+            def __init__(self):
+                self.metadatas: list = []
+
+            def get(self, *args, **kwargs):
+                return {"ids": []}
+
+            def delete(self, *args, **kwargs):
+                pass
+
+            def upsert(self, documents, ids, metadatas):
+                self.metadatas.extend(metadatas)
+
+            def update(self, *args, **kwargs):
+                pass
+
+        col = FakeCol()
+        monkeypatch.setattr(
+            convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
+        )
+        monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
+        monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
+
+        _file_chunks_locked(
+            col,
+            "chat.txt",
+            [{"content": "chunk " * 40, "chunk_index": 0}],
+            "w",
+            "g",
+            "a",
+            "exchange",
+        )
+
+        assert col.metadatas
+        assert all("source_dir_ino" not in m for m in col.metadatas), col.metadatas
+
+
+def test_mine_convos_passes_the_directory_it_read_from(tmp_path, monkeypatch):
+    """The storing half is covered above; this covers the wiring, so removing
+    the call in ``_mine_convos_impl`` cannot pass unnoticed (#2320)."""
+    from mempalace import convo_miner, source_identity as si
+
+    transcripts = tmp_path / "transcripts"
+    transcripts.mkdir()
+    transcript = transcripts / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","message":{"role":"user","content":"'
+        + "a conversation long enough to file a drawer " * 6
+        + '"},"timestamp":"2026-04-13T10:00:00Z","uuid":"u1","sessionId":"s1"}\n',
+        encoding="utf-8",
+    )
+
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen["source_dir_ino"] = kwargs.get("source_dir_ino")
+        # Same shape the real helper returns: (drawers_added, room_delta,
+        # skipped), with the middle one a mapping the caller merges.
+        return (0, {}, True)
+
+    monkeypatch.setattr(convo_miner, "_file_chunks_locked", record)
+    # The stub returns what the real helper returns, so the pass runs to the
+    # end and a failure after the recorded call is a failure of this test.
+    convo_miner.mine_convos(str(transcripts), str(tmp_path / "palace"))
+
+    assert seen.get("source_dir_ino") == si.directory_identity(transcripts)

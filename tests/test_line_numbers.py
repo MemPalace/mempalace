@@ -4,11 +4,10 @@ Run with:
     pytest tests/test_line_numbers.py -v
 """
 
-from mempalace.searcher import (  # noqa: E402
+from mempalace.searcher import (
     extract_line_range,
     render_with_line_numbers,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # render_with_line_numbers

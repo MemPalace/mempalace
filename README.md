@@ -196,15 +196,18 @@ non-default backend is opt-in.
 | Backend | Mode | Install | Namespaces | Lexical | Configure with |
 | ------- | ---- | ------- | :--------: | :-----: | -------------- |
 | `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
-| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
+| `sqlite_exact` | Local (exact NumPy) | bundled | – | ✓ | – |
+| `rust_exact` | Local (native vectors) | wheel / compiled | – | ✓ | – |
 | `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
 | `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
 | `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
 
 Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
-`"backend": "<name>"` in `config.json`. See
-[Storage backends](/guide/configuration#storage-backends) for connection
-variables, namespace behavior, and deployment notes.
+`"backend": "<name>"` in `config.json`. `rust_exact` uses the exact same `sqlite_exact.sqlite3` file on disk as `sqlite_exact` with zero data migration. See [native installation and vector CLI usage](crates/README.md) for the separately distributed wheel and executables.
+
+### Native vector search
+
+`rust_exact` and the standalone `mempalace-native` CLI scan the same `sqlite_exact` database with a native Rust engine. The `rust_exact` adapter falls back to the Python backend for complex filters, requests for returned embeddings, and installs without the native extension; the `mempalace-native` executable is Rust-only and has no Python fallback. No benchmark figures are published for this release; `mempalace-native bench --db <sqlite_exact.sqlite3>` measures it on your own data. See [`crates/`](crates/) for the core workspace, PyO3 bindings, and native CLI.
 
 ## Quickstart
 
@@ -218,6 +221,9 @@ mempalace search "why did we switch to GraphQL"
 
 # Load context for a new session
 mempalace wake-up
+
+# Score how well organized the palace is (read-only, safe while the MCP server runs)
+mempalace audit
 ```
 
 For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/antigravity.html),
@@ -289,7 +295,7 @@ Usage and tool reference:
 
 ## MCP server
 
-45 MCP tools cover palace reads/writes, knowledge-graph operations,
+47 MCP tools cover palace reads/writes, knowledge-graph operations,
 cross-wing navigation, drawer management, agent diaries, and agent
 coordination (logstream events + artifact handoffs). Installation
 and the full tool list:
@@ -326,9 +332,9 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - A vector-store backend (ChromaDB by default)
-- ~300 MB disk for the embedding model. Onboarding (`python -m mempalace.onboarding`) offers `embeddinggemma-300m` (multilingual, 100+ languages, recommended) or `all-MiniLM-L6-v2` (English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
+- ~300 MB disk for the embedding model. Pick it with `mempalace init --embedding-model`: `embeddinggemma` (embeddinggemma-300m, multilingual, 100+ languages, recommended) or `minilm` (all-MiniLM-L6-v2, English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
 - Optional — compute embeddings on a server instead of locally. Set `embedding_model: "openai-compat"` in `~/.mempalace/config.json` together with `embedding_api_url` / `embedding_api_model` (and `embedding_api_key` if the server needs auth) to use any OpenAI-compatible `/v1/embeddings` endpoint — LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted server (e.g. a larger multilingual or GPU-served embedder). Each key is overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. When the endpoint is on your machine or LAN, no content leaves your network. Switching to it requires `mempalace repair rebuild-index` (different vector space).
 
 No API key is required for the core benchmark path.
@@ -351,9 +357,9 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.9.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.12.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
-[python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
+[python-shield]: https://img.shields.io/badge/python-3.10+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/
 [license-shield]: https://img.shields.io/badge/license-MIT-b0e8ff?style=flat-square&labelColor=0a0e14
 [license-link]: https://github.com/MemPalace/mempalace/blob/main/LICENSE

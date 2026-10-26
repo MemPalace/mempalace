@@ -1,13 +1,14 @@
 import json
 import os
-import tempfile
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
 import chromadb
 import pytest
 
+from mempalace import palace
 from mempalace.convo_miner import (
     _is_ai_tool_path,
     _register_file,
@@ -15,11 +16,15 @@ from mempalace.convo_miner import (
     mine_convos,
 )
 from mempalace.palace import (
+    CONVO_CHUNKER_VERSION,
+    GENERAL_EXTRACTOR_VERSION,
     NORMALIZE_VERSION,
     MineAlreadyRunning,
     file_already_mined,
     prefetch_mined_set,
 )
+
+_PREFETCH_SCOPE_THRESHOLD = palace._PREFETCH_SCOPE_THRESHOLD
 
 
 def test_convo_mining():
@@ -44,7 +49,7 @@ def test_convo_mining():
 
 
 def test_mine_convos_does_not_reprocess_short_files(capsys):
-    """Files below MIN_CHUNK_SIZE get a sentinel so they are skipped on re-run."""
+    """A file shorter than MIN_CHUNK_SIZE is filed, not dropped, and skipped on re-run."""
     tmpdir = tempfile.mkdtemp()
     try:
         # A file too short to produce any chunks
@@ -62,6 +67,8 @@ def test_mine_convos_does_not_reprocess_short_files(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         assert file_already_mined(col, resolved_file)
+        stored = col.get(where={"source_file": resolved_file}, include=["documents"])
+        assert "hi" in stored["documents"]
 
         # Second run -- file should be skipped
         mine_convos(tmpdir, palace_path, wing="test")
@@ -117,6 +124,9 @@ def test_mine_convos_allows_general_after_exchange(capsys):
         modes = {meta.get("extract_mode") for meta in rows["metadatas"]}
         assert {"exchange", "general"} <= modes
         assert any(drawer_id.startswith("drawer_test_decision_") for drawer_id in rows["ids"])
+        for meta in rows["metadatas"]:
+            if meta.get("extract_mode") == "general":
+                assert meta["general_extractor_version"] == GENERAL_EXTRACTOR_VERSION
         del col, client
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -201,6 +211,58 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         for meta in rebuilt["metadatas"]:
             assert meta.get("normalize_version") == NORMALIZE_VERSION
         del col, client
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_rebuilds_drawers_from_older_chunker(capsys):
+    """Exchange drawers from an older chunker revision are rebuilt on the next
+    mine, which recovers text the old chunker discarded (here: everything
+    after a ``---`` rule inside a response)."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "chat.txt"
+        convo_path.write_text(
+            "> How do we release?\nFreeze the branch.\n\n---\n\n"
+            "AFTER_RULE_MARKER tag and publish.\n\n"
+            "> Rollback?\nYank the release and repoint latest.\n\n"
+            "> Changelog?\nCurate it by theme.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+        capsys.readouterr()
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        resolved = str(convo_path.resolve())
+        first_pass = col.get(where={"source_file": resolved})
+        for meta in first_pass["metadatas"]:
+            assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+
+        # Simulate drawers written by the v1 chunker, which lost the marker.
+        col.update(
+            ids=list(first_pass["ids"]),
+            documents=["V1 CHUNK"] * len(first_pass["ids"]),
+            metadatas=[{**m, "convo_chunker_version": 1} for m in first_pass["metadatas"]],
+        )
+        del col, client
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        out = capsys.readouterr().out
+        assert "Files skipped (already filed): 0" in out
+
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        rebuilt = col.get(where={"source_file": resolved})
+        assert all("V1 CHUNK" not in d for d in rebuilt["documents"])
+        assert any("AFTER_RULE_MARKER" in d for d in rebuilt["documents"])
+        for meta in rebuilt["metadatas"]:
+            assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+        del col, client
+
+        # Current drawers are skipped again (only mined files are listed).
+        mine_convos(tmpdir, palace_path, wing="test")
+        assert "chat.txt" not in capsys.readouterr().out
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -578,40 +640,41 @@ def test_mine_convos_grown_file_purges_stale_drawers_not_additive(capsys):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_mine_convos_skips_same_content_under_new_filename(capsys):
-    """Re-exporting the same conversation from Claude/ChatGPT under a new
-    filename (fresh export bundle, regenerated slug, etc.) must not create
-    a duplicate set of drawers -- only the exact-new content should file."""
+def _drawer_sources(palace_path, marker):
+    """source_file of every real (non-sentinel) drawer whose text holds marker."""
+    col = chromadb.PersistentClient(path=palace_path).get_collection("mempalace_drawers")
+    rows = col.get(include=["documents", "metadatas"])
+    return sorted(
+        Path(m["source_file"]).name
+        for d, m in zip(rows["documents"], rows["metadatas"])
+        if marker in d and m.get("ingest_mode") != "registry"
+    )
+
+
+def test_mine_convos_files_the_same_conversation_under_each_filename():
+    """The same conversation exported twice under two filenames is filed under
+    both (D-09): dropping the second copy hid it from anything scoped to that
+    source. Re-mining files nothing new."""
     tmpdir = tempfile.mkdtemp()
     try:
         transcript = (
             "> What is the plan?\nStart with the schema, then the API.\n\n"
             "> Any risks?\nMigration ordering is the main one.\n"
         )
-        (Path(tmpdir) / "export_2026-01-01.txt").write_text(transcript)
+        convo_dir = Path(tmpdir) / "convos"
+        convo_dir.mkdir()
+        (convo_dir / "export_2026-01-01.txt").write_text(transcript)
+        (convo_dir / "export_2026-02-01.txt").write_text(transcript)
         palace_path = os.path.join(tmpdir, "palace")
-        mine_convos(tmpdir, palace_path, wing="test")
+        mine_convos(str(convo_dir), palace_path, wing="test")
 
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
-        count_after_first = col.count()
-        assert count_after_first >= 2
+        sources = _drawer_sources(palace_path, "Migration ordering is the main one")
+        assert sources == ["export_2026-01-01.txt", "export_2026-02-01.txt"]
 
-        # Simulate a later export: the same conversation lands under a new
-        # filename, alongside one genuinely new conversation.
-        (Path(tmpdir) / "export_2026-02-01.txt").write_text(transcript)
-        (Path(tmpdir) / "export_2026-02-01_new.txt").write_text(
-            "> What's next?\nUNIQUE_SECOND_EXPORT_MARKER covers the new work.\n"
-        )
-        mine_convos(tmpdir, palace_path, wing="test")
-        out = capsys.readouterr().out
-        assert "duplicate of export_2026-01-01.txt" in out
-
-        col = client.get_collection("mempalace_drawers")
-        docs = col.get(include=["documents"])["documents"]
-        dup_hits = sum(1 for d in docs if "Migration ordering is the main one" in d)
-        assert dup_hits == 1, f"duplicate transcript re-filed: {dup_hits} copies"
-        assert any("UNIQUE_SECOND_EXPORT_MARKER" in d for d in docs)
+        col = chromadb.PersistentClient(path=palace_path).get_collection("mempalace_drawers")
+        count = col.count()
+        mine_convos(str(convo_dir), palace_path, wing="test")
+        assert col.count() == count
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -632,56 +695,61 @@ def _privacy_export_bundle(conversations):
     ]
 
 
-def test_mine_convos_skips_same_conversation_within_re_exported_bundle(capsys):
-    """A Claude.ai privacy export bundles every conversation into one JSON
-    file. Re-exporting that bundle under a new filename with one additional
-    conversation must not re-file the conversations that didn't change --
-    hashing the whole bundle would change the file-level hash the moment
-    any conversation is added, hiding the ones that are still duplicates.
-    """
+def test_re_exported_bundle_files_every_conversation_under_its_own_source():
+    """A re-exported privacy bundle keeps all of its conversations, including
+    the ones an earlier export already filed, under the new file's name."""
     tmpdir = tempfile.mkdtemp()
     try:
         convo_a = ["What is the plan?", "CONVO_A_MARKER: start with the schema."]
         convo_b = ["Any risks?", "CONVO_B_MARKER: migration ordering is the main one."]
         convo_c = ["What's next?", "CONVO_C_MARKER: covers the new work."]
-
-        bundle1 = _privacy_export_bundle([convo_a, convo_b])
-        (Path(tmpdir) / "export_2026-01-01.json").write_text(json.dumps(bundle1))
-
+        old, new = "export_2026-01-01.json", "export_2026-02-01.json"
+        (Path(tmpdir) / old).write_text(json.dumps(_privacy_export_bundle([convo_a, convo_b])))
         palace_path = os.path.join(tmpdir, "palace")
         mine_convos(tmpdir, palace_path, wing="test")
 
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
-        docs_after_first = col.get(include=["documents"])["documents"]
-        assert any("CONVO_A_MARKER" in d for d in docs_after_first)
-        assert any("CONVO_B_MARKER" in d for d in docs_after_first)
-
-        # Re-export: same two conversations plus one genuinely new one, all
-        # under a fresh filename (as a real re-export from Claude would do).
         bundle2 = _privacy_export_bundle([convo_a, convo_b, convo_c])
-        (Path(tmpdir) / "export_2026-02-01.json").write_text(json.dumps(bundle2))
-
+        (Path(tmpdir) / new).write_text(json.dumps(bundle2))
         mine_convos(tmpdir, palace_path, wing="test")
 
-        col = client.get_collection("mempalace_drawers")
-        docs = col.get(include=["documents"])["documents"]
-        a_hits = sum(1 for d in docs if "CONVO_A_MARKER" in d)
-        b_hits = sum(1 for d in docs if "CONVO_B_MARKER" in d)
-        c_hits = sum(1 for d in docs if "CONVO_C_MARKER" in d)
-        assert a_hits == 1, f"conversation A re-filed from the updated bundle: {a_hits} copies"
-        assert b_hits == 1, f"conversation B re-filed from the updated bundle: {b_hits} copies"
-        assert c_hits >= 1, "new conversation C was not filed at all"
+        assert _drawer_sources(palace_path, "CONVO_A_MARKER") == [old, new]
+        assert _drawer_sources(palace_path, "CONVO_B_MARKER") == [old, new]
+        assert _drawer_sources(palace_path, "CONVO_C_MARKER") == [new]
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_content_dedup_is_scoped_per_wing():
-    """Mining the same transcript content into a second wing must file real
-    drawers there, not just the registry sentinel -- the content-hash map
-    is a dedup signal within a wing, not a cross-wing "already have this
-    content anywhere" gate.
-    """
+def test_a_copy_registered_as_a_duplicate_by_an_older_palace_is_mined():
+    """Older palaces registered a copy of an already-filed conversation as a
+    bare sentinel. A sentinel from an older NORMALIZE_VERSION reads as not
+    mined, so the copy gets its own drawers on the next mine."""
+    from mempalace.convo_miner import _register_file
+    from mempalace.palace import NORMALIZE_VERSION, get_collection
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        transcript = "> What is the plan?\nCOPY_MARKER start with the schema.\n"
+        first, copy = Path(tmpdir) / "first.txt", Path(tmpdir) / "copy.txt"
+        first.write_text(transcript)
+        palace_path = os.path.join(tmpdir, "palace")
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        copy.write_text(transcript)
+        col = get_collection(palace_path)
+        _register_file(col, str(copy.resolve()), "test", "mempalace", "exchange")
+        sentinel = col.get(where={"source_file": str(copy.resolve())}, include=["metadatas"])
+        meta = dict(sentinel["metadatas"][0], normalize_version=NORMALIZE_VERSION - 1)
+        col.update(ids=sentinel["ids"], metadatas=[meta])
+
+        mine_convos(tmpdir, palace_path, wing="test")
+        assert _drawer_sources(palace_path, "COPY_MARKER") == ["copy.txt", "first.txt"]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_same_content_mined_into_a_second_wing_files_real_drawers():
+    """Mining the same transcript content into a second wing files real
+    drawers there, not just the registry sentinel."""
     tmpdir = tempfile.mkdtemp()
     try:
         transcript = (
@@ -707,9 +775,7 @@ def test_content_dedup_is_scoped_per_wing():
             for d, m in zip(wing_b_docs["documents"], wing_b_docs["metadatas"])
             if m.get("room") != "_registry"
         ]
-        assert real_drawers, (
-            "wing_b holds only the registry sentinel -- content dedup leaked across wings"
-        )
+        assert real_drawers, "wing_b holds only the registry sentinel"
         assert any("Migration ordering is the main one" in d for d in real_drawers)
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -762,6 +828,7 @@ def test_prefetch_mined_set_none_for_drawer_without_stored_mtime():
                     "chunk_index": 0,
                     "extract_mode": "exchange",
                     "normalize_version": 999,  # force >= current version
+                    "convo_chunker_version": 999,
                 }
             ],
         )
@@ -793,6 +860,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 0,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 },
@@ -803,6 +871,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 1,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 },
@@ -825,6 +894,7 @@ def test_prefetch_mined_set_omits_incomplete_chunk_total_group():
                     "chunk_index": 2,
                     "extract_mode": "exchange",
                     "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
                     "source_mtime": mtime,
                     "chunk_total": 3,
                 }
@@ -907,6 +977,137 @@ def test_register_file_sentinel_includes_source_mtime():
 
 
 # ---------------------------------------------------------------------------
+# prefetch_mined_set, source_files scoping
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_source_drawer(col, source, mtime):
+    meta = {
+        "wing": "test",
+        "room": "general",
+        "source_file": source,
+        "chunk_index": 0,
+        "extract_mode": "exchange",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+        "source_mtime": mtime,
+    }
+    col.upsert(
+        ids=[f"drawer_{abs(hash(source))}"],
+        documents=[f"content for {source}"],
+        metadatas=[meta],
+    )
+
+
+def test_prefetch_mined_set_scoped_matches_unscoped_for_a_named_file():
+    """Below the threshold, passing source_files must return the exact same
+    entry a full unscoped scan would for a file the caller actually names.
+    The scoped where-query must not silently drop or alter what it does see."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/a.txt", 1_700_000_000.0)
+        _seed_two_source_drawer(col, "/fake/b.txt", 1_700_000_100.0)
+
+        unscoped = prefetch_mined_set(col, extract_mode="exchange")
+        scoped = prefetch_mined_set(col, extract_mode="exchange", source_files=["/fake/a.txt"])
+
+        assert scoped == {"/fake/a.txt": unscoped["/fake/a.txt"]}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_scoped_omits_files_outside_source_files():
+    """The scoped where-query must actually narrow the result, not just
+    accept the parameter and still scan everything."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/only.txt", 1_700_000_000.0)
+        _seed_two_source_drawer(col, "/fake/other.txt", 1_700_000_100.0)
+
+        scoped = prefetch_mined_set(col, extract_mode="exchange", source_files=["/fake/only.txt"])
+
+        assert "/fake/only.txt" in scoped
+        assert "/fake/other.txt" not in scoped
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_falls_back_to_full_scan_above_threshold():
+    """A source_files list longer than the scoping threshold must still
+    find a drawer whose path is not even in that list. The fallback to a
+    full unscoped scan must actually run, not just skip the scoped path."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/not_in_list.txt", 1_700_000_000.0)
+
+        oversized_list = [f"/fake/other_{i}.txt" for i in range(_PREFETCH_SCOPE_THRESHOLD + 1)]
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=oversized_list)
+
+        assert "/fake/not_in_list.txt" in mined
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_prefetch_mined_set_scoped_with_no_candidates_returns_empty_without_error():
+    """An empty source_files list (e.g. a dry run over zero new files) must
+    short-circuit to an empty dict rather than issue a where={"$in": []}
+    query or fall through to a full scan."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        palace_path = os.path.join(tmpdir, "palace")
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_or_create_collection("mempalace_drawers")
+        _seed_two_source_drawer(col, "/fake/a.txt", 1_700_000_000.0)
+
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=[])
+        assert mined == {}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
+    """The convo miner must actually pass the candidate file list through to
+    prefetch_mined_set, not just leave the new parameter unused."""
+    import mempalace.convo_miner as convo_miner_module
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        convo_path = Path(tmpdir) / "session.txt"
+        convo_path.write_text(
+            "> What is the plan?\nStart with the schema, then the API.\n\n"
+            "> Any risks?\nMigration ordering is the main one.\n"
+        )
+        palace_path = os.path.join(tmpdir, "palace")
+
+        seen = {}
+        real_prefetch_mined_set = convo_miner_module.prefetch_mined_set
+
+        def _spy_mined_set(collection, extract_mode=None, source_files=None):
+            seen["mined_set_source_files"] = source_files
+            return real_prefetch_mined_set(
+                collection, extract_mode=extract_mode, source_files=source_files
+            )
+
+        monkeypatch.setattr(convo_miner_module, "prefetch_mined_set", _spy_mined_set)
+
+        mine_convos(tmpdir, palace_path, wing="test")
+
+        resolved = str(convo_path.resolve())
+        assert seen["mined_set_source_files"] == [resolved]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # file_conversation_exchange — canonical single-exchange write path
 # ---------------------------------------------------------------------------
 
@@ -952,6 +1153,17 @@ def test_file_conversation_exchange_extra_metadata_cannot_clobber_canonical():
     assert meta["filed_at"] != "1970-01-01"
     # Non-colliding extras still land.
     assert meta["source"] == "hermes"
+
+
+def test_file_conversation_exchange_stamps_current_chunker_version():
+    """A live exchange must read as current to the mined-set check, or a
+    later mine of the same source would purge it as stale."""
+    from mempalace.convo_miner import file_conversation_exchange
+
+    col = _RecordingCollection()
+    file_conversation_exchange(col, **_exchange_kwargs())
+    meta = col.upserts[0]["metadatas"][0]
+    assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
 
 
 def test_file_conversation_exchange_invalid_wing_falls_back_to_wing_general():
@@ -1131,3 +1343,116 @@ def test_mine_convos_dry_run_single_file_does_not_scan_siblings(
     assert "[DRY RUN] selected.txt" in output
     assert "sibling.txt" not in output
     assert not palace_path.exists()
+
+
+def test_mine_convos_reaches_a_yield_point_before_each_file(tmp_path, capsys):
+    """The hub hands its lock to waiting requests at these points (between
+    files), so a long mine no longer blocks every read until it ends."""
+    from mempalace.palace import mine_yield_hook
+
+    src = tmp_path / "convos"
+    src.mkdir()
+    for n in range(3):
+        (src / f"chat{n}.txt").write_text(f"> question {n}?\nanswer {n} with enough words.\n" * 3)
+    calls: list = []
+    with mine_yield_hook(lambda: calls.append(1)):
+        mine_convos(str(src), str(tmp_path / "palace"), wing="test")
+    assert len(calls) == 3
+
+
+_THREE_TURNS = (
+    "> What is memory?\nMemory is persistence of the read.\n\n"
+    "> Why does it matter?\nIt enables continuity of the read.\n\n"
+    "> How do we build it?\nWith structured storage of the read.\n"
+)
+
+
+def test_drawer_source_mtime_is_the_read_not_a_later_stat(tmp_path, monkeypatch):
+    """An append between the read and a later stat must not be skipped forever.
+
+    The stored source_mtime is the one from the same fstat as the bytes that
+    were chunked. A getmtime() after that read can already see the append.
+    """
+    convo = tmp_path / "chat.txt"
+    convo.write_text(_THREE_TURNS, encoding="utf-8")
+    real_mtime = convo.stat().st_mtime
+    monkeypatch.setattr(os.path, "getmtime", lambda _path: real_mtime + 5000)
+
+    palace = tmp_path / "palace"
+    mine_convos(str(tmp_path), str(palace), wing="test")
+
+    client = chromadb.PersistentClient(path=str(palace))
+    col = client.get_collection("mempalace_drawers")
+    metas = col.get(include=["metadatas"])["metadatas"]
+    assert metas
+    for meta in metas:
+        assert abs(float(meta["source_mtime"]) - real_mtime) < 0.001
+        assert abs(float(meta["source_mtime"]) - (real_mtime + 5000)) > 1
+
+
+def test_empty_file_sentinel_uses_the_read_mtime(tmp_path, monkeypatch):
+    blank = tmp_path / "blank.txt"
+    blank.write_text("   \n", encoding="utf-8")
+    real_mtime = blank.stat().st_mtime
+    monkeypatch.setattr(os.path, "getmtime", lambda _path: real_mtime + 5000)
+
+    palace = tmp_path / "palace"
+    mine_convos(str(tmp_path), str(palace), wing="test")
+
+    client = chromadb.PersistentClient(path=str(palace))
+    col = client.get_collection("mempalace_drawers")
+    metas = col.get(where={"source_file": str(blank.resolve())}, include=["metadatas"])["metadatas"]
+    assert len(metas) == 1
+    assert abs(float(metas[0]["source_mtime"]) - real_mtime) < 0.001
+
+
+def test_one_bad_transcript_does_not_abort_the_mine(tmp_path, monkeypatch):
+    """A TypeError in one export is a file error. The rest of the mine still runs."""
+    from mempalace import convo_miner
+    from mempalace.palace import MineFileErrors
+
+    good = tmp_path / "good.txt"
+    good.write_text(
+        "> What stayed?\nUNIQUE_GOOD_MARKER is still here.\n\n"
+        "> And the other file?\nIt failed on its own.\n\n"
+        "> Will the mine stop?\nNo, it records the error and continues.\n",
+        encoding="utf-8",
+    )
+    bad = tmp_path / "bad.json"
+    bad.write_text("[]", encoding="utf-8")
+    real = convo_miner.normalize_conversations_with_mtime
+
+    def flaky(filepath):
+        if filepath.endswith("bad.json"):
+            raise TypeError("expected string or bytes-like object, got 'NoneType'")
+        return real(filepath)
+
+    monkeypatch.setattr(convo_miner, "normalize_conversations_with_mtime", flaky)
+    palace = tmp_path / "palace"
+    with pytest.raises(MineFileErrors) as exc_info:
+        mine_convos(str(tmp_path), str(palace), wing="test")
+
+    assert any(str(path).endswith("bad.json") for path in exc_info.value.failed_files)
+    client = chromadb.PersistentClient(path=str(palace))
+    col = client.get_collection("mempalace_drawers")
+    stored = col.get(include=["documents", "metadatas"])
+    assert any("UNIQUE_GOOD_MARKER" in doc for doc in stored["documents"])
+    assert not any(
+        meta and str(meta.get("source_file", "")).endswith("bad.json")
+        for meta in stored["metadatas"]
+    )
+
+
+def test_a_collision_aborts_the_mine_instead_of_failing_one_file(tmp_path, monkeypatch):
+    """CollisionError means the palace is unsafe to write, not that one file is bad."""
+    from mempalace import convo_miner
+    from mempalace.collision_scan import CollisionError
+
+    (tmp_path / "chat.txt").write_text(_THREE_TURNS, encoding="utf-8")
+
+    def collide(*_args, **_kwargs):
+        raise CollisionError("drawer_x maps to two sources")
+
+    monkeypatch.setattr(convo_miner, "_file_chunks_locked", collide)
+    with pytest.raises(CollisionError):
+        mine_convos(str(tmp_path), str(tmp_path / "palace"), wing="test")

@@ -27,14 +27,20 @@ import os
 import threading
 import time
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from contextlib import contextmanager
 
+from . import paths
+from .backends.base import BaseCollection, PalaceNotFoundError
 from .config import MempalaceConfig, normalize_wing_name
-from .dynamics import initialize_dynamics_fields
-from .palace import get_collection as _get_palace_collection
-from .palace import mine_lock
+from .dynamics import initialize_dynamics_fields, potentiate
+from .fsio import (
+    atomic_write_json as _atomic_write_json,
+    read_json_for_update as _read_json_for_update,
+)
+from .palace import get_collection as _get_palace_collection, mine_lock
+from .timeutil import utc_now_iso
 
-logger = logging.getLogger("mempalace_graph")
+logger = logging.getLogger(__name__)
 
 
 def _normalize_wing(wing: str | None) -> str | None:
@@ -88,12 +94,11 @@ def sqlite_grouped_counts_reader(config=None):
             config.palace_path, explicit=os.environ.get("MEMPALACE_BACKEND_EXPLICIT")
         )
         if backend == "chroma":
-            from .backends.chroma import sqlite_room_wing_hall_counts
+            from .backends.chroma_sqlite import sqlite_room_wing_hall_counts
 
             db_name = "chroma.sqlite3"
-        elif backend == "sqlite_exact":
-            from .backends.sqlite_exact import _DB_FILENAME as db_name
-            from .backends.sqlite_exact import sqlite_room_wing_hall_counts
+        elif backend in {"sqlite_exact", "rust_exact"}:
+            from .backends.sqlite_exact import _DB_FILENAME as db_name, sqlite_room_wing_hall_counts
         else:
             return None
         if not os.path.isfile(os.path.join(config.palace_path, db_name)):
@@ -180,16 +185,56 @@ def invalidate_graph_cache():
         _graph_cache_time = 0.0
 
 
+class GraphUnavailable(RuntimeError):
+    """The palace exists but its drawers could not be read.
+
+    A palace with no drawers collection yet is not this error: the graph is
+    empty. A lock, a corrupt database or any other failure is, so a caller
+    can say the palace is unavailable instead of reporting no rooms.
+    """
+
+    def __init__(self, palace_path=None):
+        where = f" at {palace_path}" if palace_path else ""
+        super().__init__(f"palace{where} could not be read")
+
+
 def _get_collection(config=None):
+    """The drawers collection opened read-only, or ``None`` when the palace
+    or its drawers collection does not exist yet."""
     config = config or MempalaceConfig()
     try:
         return _get_palace_collection(
             config.palace_path,
             collection_name=config.collection_name,
             create=False,
+            read_only=True,
         )
-    except Exception:
+    except PalaceNotFoundError:
         return None
+    except Exception as exc:
+        logger.warning("Graph read of the palace at %s failed", config.palace_path, exc_info=True)
+        raise GraphUnavailable(config.palace_path) from exc
+
+
+def _iter_all_metadata(col):
+    """Yield every drawer's metadata using the backend's own cursor.
+
+    ``get_all_metadata`` is a single pass on every backend; the
+    offset loop it replaces is O(n^2) on qdrant, where each page re-walks the
+    collection from the start. The loop is kept only for collection objects
+    that predate the contract method.
+    """
+    if isinstance(col, BaseCollection):
+        yield from col.get_all_metadata()
+        return
+    total = col.count()
+    offset = 0
+    while offset < total:
+        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
+        yield from batch["metadatas"]
+        if not batch["ids"]:
+            break
+        offset += len(batch["ids"])
 
 
 def build_graph(col=None, config=None):
@@ -231,21 +276,14 @@ def build_graph(col=None, config=None):
     if not col:
         return {}, []
 
-    total = col.count()
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
 
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
-        for meta in batch["metadatas"]:
+    try:
+        for meta in _iter_all_metadata(col):
             # ChromaDB can return ``None`` for drawers without metadata
-            # (legacy data, partial writes — upstream #1020 territory).
-            # Skip these silently rather than crash the whole graph
-            # build — a single None drawer shouldn't take down /stats
-            # or any caller of build_graph for the entire palace. Caught
-            # 2026-04-25 by palace-daemon's verify-routes.sh smoke test
-            # against the canonical 151K palace. Closes the same gap as
-            # upstream #999 / fork PR #1094 in a different read path.
+            # (legacy data, partial writes). Skip them rather than fail the
+            # whole graph build: one bare drawer must not take down every
+            # caller of build_graph.
             if meta is None:
                 continue
             room = meta.get("room", "")
@@ -259,9 +297,10 @@ def build_graph(col=None, config=None):
                 if date:
                     room_data[room]["dates"].add(date)
                 room_data[room]["count"] += 1
-        if not batch["ids"]:
-            break
-        offset += len(batch["ids"])
+    except Exception as exc:
+        palace_path = (config or MempalaceConfig()).palace_path
+        logger.warning("Graph read of the palace at %s failed", palace_path, exc_info=True)
+        raise GraphUnavailable(palace_path) from exc
 
     # Build edges from rooms that span multiple wings
     edges = []
@@ -478,14 +517,18 @@ def _get_tunnel_file(config=None) -> str:
 
 def _legacy_tunnel_file() -> str:
     """The pre-3.3.6 hardcoded path. Kept only for one-time orphan detection."""
-    return os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json")
+    return str(paths.state_path("tunnels.json"))
 
 
-def _load_tunnels(config=None):
+def _load_tunnels(config=None, *, for_write=False):
     """Load explicit tunnels from disk.
 
-    Returns an empty list if the file is missing or corrupt (e.g. truncated
-    by a crash mid-write on a system that lacks atomic-rename semantics).
+    A read (``for_write=False``) returns an empty list if the file is
+    missing or corrupt and leaves the file where it is. A write
+    (``for_write=True``) returns that empty list only when the file is
+    missing. A file that does not parse is moved aside and
+    :class:`CorruptStateError` is raised, so the following save cannot
+    publish a one-entry document over it.
 
     Backwards-compatibility: prior to 3.3.6 the tunnel file was hardcoded at
     ``~/.mempalace/tunnels.json`` regardless of the configured palace_path.
@@ -500,6 +543,8 @@ def _load_tunnels(config=None):
     every helper call within a single create_tunnel cycle.
     """
     current_tunnel_file = _get_tunnel_file(config)
+    if for_write:
+        return list(_read_json_for_update(current_tunnel_file, expect=list) or [])
     if os.path.exists(current_tunnel_file):
         try:
             with open(current_tunnel_file, "r", encoding="utf-8") as f:
@@ -526,15 +571,10 @@ def _load_tunnels(config=None):
 def _save_tunnels(tunnels, config=None):
     """Persist explicit tunnels atomically.
 
-    Writes to ``tunnels.json.tmp`` then ``os.replace``s it into place, so
-    a crash mid-write can never leave a partial/empty tunnels.json that
-    silently wipes every tunnel on next read.
-
-    Also restricts the parent directory to 0o700 and the file to 0o600 —
-    tunnels reveal cross-wing connections (which projects/people/rooms
-    the user has explicitly linked) and should not be world-readable on
-    shared Linux/multi-user systems. Matches the file-permission pattern
-    established by #814 for the other sensitive palace files.
+    The bytes are published by :func:`mempalace.fsio.atomic_write_json`, so
+    a crash mid-write leaves the previous file in place. The parent
+    directory is restricted to 0o700 and the file to 0o600 — tunnels
+    reveal cross-wing connections and should not be world-readable.
 
     ``config`` may be passed in by the caller to avoid re-instantiating
     ``MempalaceConfig`` on every save.
@@ -547,20 +587,7 @@ def _save_tunnels(tunnels, config=None):
     except (OSError, NotImplementedError):
         # Windows / unsupported filesystems — tolerate.
         pass
-    tmp_path = tunnel_file + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(tunnels, f, indent=2)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            # Not all filesystems (or Windows file handles) support fsync — tolerate.
-            pass
-    os.replace(tmp_path, tunnel_file)
-    try:
-        os.chmod(tunnel_file, 0o600)
-    except (OSError, NotImplementedError):
-        pass
+    _atomic_write_json(tunnel_file, tunnels)
 
 
 def _endpoint_key(wing: str, room: str) -> str:
@@ -591,27 +618,134 @@ def _require_name(value: str, field: str) -> str:
 
 
 def _check_room_exists(wing: str, room: str, col) -> bool:
-    """Check if at least one drawer exists for the given wing/room in ChromaDB."""
+    """Check if at least one drawer exists for the given wing/room.
+
+    ``col`` is ``None`` only for a palace with no drawers yet, where there is
+    nothing to check against. A read that fails raises :class:`GraphUnavailable`
+    rather than letting an unverified tunnel through.
+    """
     if col is None:
-        # If collection is unreachable, can't verify, so allow.
-        logger.debug(
-            "ChromaDB collection not reachable, skipping room existence validation for %s/%s",
-            wing,
-            room,
-        )
         return True
     try:
         results = col.get(where={"$and": [{"wing": wing}, {"room": room}]}, limit=1, include=[])
-        return len(results["ids"]) > 0
-    except Exception:
-        # If query fails, assume it's a temporary issue or permissions, and allow.
-        logger.warning(
-            "Error checking room existence in ChromaDB for %s/%s; allowing tunnel creation.",
-            wing,
-            room,
-            exc_info=True,
-        )
-        return True
+    except Exception as exc:
+        logger.warning("Room check for %s/%s failed", wing, room, exc_info=True)
+        raise GraphUnavailable() from exc
+    return len(results["ids"]) > 0
+
+
+# Per-thread map of open tunnel batches, keyed by the normalized tunnel file.
+# Thread-local so a batch never leaks unsaved state into another thread: a
+# second thread's create_tunnel still takes mine_lock and waits for the batch
+# to persist, exactly as it waits for another per-call create today.
+_TUNNEL_BATCH = threading.local()
+
+
+def _tunnel_batch_key(tunnel_file: str) -> str:
+    return os.path.normcase(os.path.abspath(tunnel_file))
+
+
+class _TunnelBatchState:
+    """Tunnels held in memory for one :func:`tunnel_batch`.
+
+    The file is read on first use, not on entry, so a batch that ends up
+    creating nothing (no shared topics, no entity links) costs no load and
+    no save — the same as the per-call path, which never touched the file.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.tunnels = None
+        self.index = None
+        self.dirty = False
+
+    def load(self):
+        if self.tunnels is None:
+            self.tunnels = _load_tunnels(self.config, for_write=True)
+            # setdefault keeps the first record for a duplicated id, matching
+            # the per-call path's linear scan.
+            self.index = {}
+            for t in self.tunnels:
+                if isinstance(t, dict):
+                    self.index.setdefault(t.get("id"), t)
+        return self.tunnels
+
+
+def _active_tunnel_batch(tunnel_file: str):
+    batches = getattr(_TUNNEL_BATCH, "batches", None)
+    if not batches:
+        return None
+    return batches.get(_tunnel_batch_key(tunnel_file))
+
+
+@contextmanager
+def tunnel_batch(config=None):
+    """Load tunnels once, mutate them in memory, persist once on exit.
+
+    Inside the batch, :func:`create_tunnel` calls for the same tunnel file
+    insert or update through an id index instead of loading, scanning and
+    rewriting the whole file per tunnel. The mine's tunnel passes
+    run inside one; outside a batch every call still loads, mutates and
+    saves on its own, so MCP tools and explicit user tunnels are unchanged.
+
+    The tunnel file's ``mine_lock`` is held for the whole batch. The save
+    runs in ``finally``, so a crash mid-batch persists what was created
+    before it, as the per-call save did. Nesting on the same file reuses
+    the outer batch.
+
+    Only ``create_tunnel`` reads the in-memory state. Other tunnel helpers
+    (``list_tunnels``, ``follow_tunnels``, ``delete_tunnel``,
+    ``record_tunnel_traversal``) read the file and must not be called for
+    the same file inside a batch: they would see the pre-batch state, and
+    the writers would block on the lock this batch holds.
+    """
+    config = config or MempalaceConfig()
+    tunnel_file = _get_tunnel_file(config)
+    if _active_tunnel_batch(tunnel_file) is not None:
+        yield
+        return
+    key = _tunnel_batch_key(tunnel_file)
+    with mine_lock(tunnel_file):
+        state = _TunnelBatchState(config)
+        batches = getattr(_TUNNEL_BATCH, "batches", None)
+        if batches is None:
+            batches = _TUNNEL_BATCH.batches = {}
+        batches[key] = state
+        try:
+            yield
+        finally:
+            del batches[key]
+            if state.dirty:
+                _save_tunnels(state.tunnels, config)
+
+
+def _upsert_tunnel(tunnels: list, existing, tunnel: dict) -> dict:
+    """Insert ``tunnel`` into ``tunnels``, or refresh ``existing`` in place.
+
+    Shared by the per-call and batched paths of :func:`create_tunnel` so
+    both store identical records. Returns the stored dict.
+    """
+    if existing is not None:
+        # Preserve original creation timestamp on label updates.
+        tunnel["created_at"] = existing.get("created_at", tunnel["created_at"])
+        tunnel["updated_at"] = utc_now_iso()
+        # Preserve L7 dynamics fields across re-creation events.
+        # Without this, a label update (or any re-create) would
+        # reset the connection's strength / stability / access_count
+        # — defeating the living-connection layer. Backfill any
+        # still-missing fields so legacy records also pick up
+        # defaults on next touch. One dict-update over the field list
+        # keeps that list in one place, so a new field can't be dropped.
+        _dyn_fields = ("strength", "stability", "last_activated", "access_count")
+        tunnel.update({k: existing[k] for k in _dyn_fields if k in existing})
+        initialize_dynamics_fields(tunnel)
+        existing.clear()
+        existing.update(tunnel)
+        return existing
+    # Brand-new tunnel — initialize dynamics from defaults.
+    initialize_dynamics_fields(tunnel)
+    tunnels.append(tunnel)
+    return tunnel
 
 
 def create_tunnel(
@@ -631,7 +765,7 @@ def create_tunnel(
     resolve to the same canonical ID. A second call with the same endpoints
     updates the stored label (and drawer IDs, if provided) rather than
     creating a duplicate. Endpoints are compared **verbatim** — ``"my-wing"``
-    and ``"my_wing"`` are distinct (see Note below and #1504).
+    and ``"my_wing"`` are distinct (see Note below).
 
     The ``source`` / ``target`` fields on the returned dict preserve the
     argument order the caller used, so callers can display it directionally
@@ -666,22 +800,20 @@ def create_tunnel(
         produces two distinct tunnels (canonical IDs differ). Read-path helpers
         (``list_tunnels`` / ``follow_tunnels``) normalize both sides at compare
         time so legacy underscore data and explicit-flag hyphen data both
-        match queries in either form. See #1504.
+        match queries in either form.
     """
     source_wing = _require_name(source_wing, "source_wing")
     source_room = _require_name(source_room, "source_room")
     target_wing = _require_name(target_wing, "target_wing")
     target_room = _require_name(target_room, "target_room")
 
-    # Single MempalaceConfig() per call — reused by _get_tunnel_file /
-    # _load_tunnels / _save_tunnels below. Each MempalaceConfig() re-reads
-    # mempalace.yaml from disk; before this change the helpers each
-    # instantiated their own, triggering several redundant disk reads per
-    # create_tunnel call (flagged by gemini-code-assist on #1469).
+    # One MempalaceConfig() per call, reused by _get_tunnel_file /
+    # _load_tunnels / _save_tunnels below: each instance re-reads its config
+    # from disk.
     config = config or MempalaceConfig()
 
     # Validate room existence for explicit tunnels only. Use the verbatim wing
-    # slugs here so #1504's hyphen-preserving write path remains intact.
+    # slugs here so the hyphen-preserving write path stays intact.
     if kind == "explicit":
         col = _get_collection(config)
         if not _check_room_exists(source_wing, source_room, col):
@@ -697,44 +829,35 @@ def create_tunnel(
         "target": {"wing": target_wing, "room": target_room},
         "label": label,
         "kind": kind,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": utc_now_iso(),
     }
     if source_drawer_id:
         tunnel["source"]["drawer_id"] = source_drawer_id
     if target_drawer_id:
         tunnel["target"]["drawer_id"] = target_drawer_id
 
+    tunnel_file = _get_tunnel_file(config)
+    batch = _active_tunnel_batch(tunnel_file)
+    if batch is not None:
+        # Inside tunnel_batch(): the batch already holds the lock and saves
+        # on exit, so insert or update through the id index in O(1).
+        tunnels = batch.load()
+        stored = _upsert_tunnel(tunnels, batch.index.get(tunnel_id), tunnel)
+        batch.index[tunnel_id] = stored
+        batch.dirty = True
+        # A copy, so a later update of the same id in this batch does not
+        # rewrite a dict already handed back (per-call results are snapshots).
+        return dict(stored)
+
     # Serialize the load → mutate → save cycle. Without this, two concurrent
     # create_tunnel calls can both read the same snapshot and the later
     # writer silently drops the earlier writer's tunnel.
-    with mine_lock(_get_tunnel_file(config)):
-        tunnels = _load_tunnels(config)
-        for existing in tunnels:
-            if existing.get("id") == tunnel_id:
-                # Preserve original creation timestamp on label updates.
-                tunnel["created_at"] = existing.get("created_at", tunnel["created_at"])
-                tunnel["updated_at"] = datetime.now(timezone.utc).isoformat()
-                # Preserve L7 dynamics fields across re-creation events.
-                # Without this, a label update (or any re-create) would
-                # reset the connection's strength / stability / access_count
-                # — defeating the living-connection layer. Backfill any
-                # still-missing fields so legacy records also pick up
-                # defaults on next touch. Per PR #1578 review
-                # (gemini-code-assist, medium priority): use dict-update
-                # with a comprehension so the field list lives in one place
-                # and future schema expansion can't drop a field by accident.
-                _dyn_fields = ("strength", "stability", "last_activated", "access_count")
-                tunnel.update({k: existing[k] for k in _dyn_fields if k in existing})
-                initialize_dynamics_fields(tunnel)
-                existing.clear()
-                existing.update(tunnel)
-                _save_tunnels(tunnels, config)
-                return existing
-        # Brand-new tunnel — initialize dynamics from defaults.
-        initialize_dynamics_fields(tunnel)
-        tunnels.append(tunnel)
+    with mine_lock(tunnel_file):
+        tunnels = _load_tunnels(config, for_write=True)
+        existing = next((t for t in tunnels if t.get("id") == tunnel_id), None)
+        stored = _upsert_tunnel(tunnels, existing, tunnel)
         _save_tunnels(tunnels, config)
-    return tunnel
+    return stored
 
 
 def list_tunnels(wing: str = None):
@@ -748,7 +871,7 @@ def list_tunnels(wing: str = None):
     if norm_wing:
         # Normalize stored wings too: older tunnels.json records hold the
         # underscore form (from the prior write-path normalization), while
-        # post-#1504 records hold whatever the caller passed. Comparing
+        # newer records hold whatever the caller passed. Comparing
         # normalized-on-both-sides matches either.
         # ``t.get(k) or {}`` (not ``t.get(k, {})``) handles ``"source": null``
         # from a hand-edited file — ``.get`` defaults only on missing keys.
@@ -764,17 +887,49 @@ def list_tunnels(wing: str = None):
 def delete_tunnel(tunnel_id: str):
     """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
     with mine_lock(_get_tunnel_file()):
-        tunnels = _load_tunnels()
+        tunnels = _load_tunnels(for_write=True)
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
         _save_tunnels(tunnels)
     return {"deleted": tunnel_id}
 
 
-def follow_tunnels(wing: str, room: str, col=None, config=None):
+def record_tunnel_traversal(tunnel_ids, config=None) -> int:
+    """Potentiate the tunnels an agent just followed; returns how many.
+
+    This is the only place a tunnel's ``access_count`` / ``strength`` rises,
+    so a palace where nothing ever calls it shows every tunnel as never
+    traversed. Best-effort: a lock or write failure is logged and the read
+    that triggered it still returns.
+    """
+    wanted = {t for t in tunnel_ids if t}
+    if not wanted:
+        return 0
+    touched = 0
+    try:
+        with mine_lock(_get_tunnel_file(config)):
+            # A read path: a corrupt file reads as empty and is left in place.
+            tunnels = _load_tunnels(config)
+            for t in tunnels:
+                if isinstance(t, dict) and t.get("id") in wanted:
+                    initialize_dynamics_fields(t)
+                    potentiate(t)
+                    touched += 1
+            if touched:
+                _save_tunnels(tunnels, config)
+    except Exception:
+        logger.debug("Recording tunnel traversal failed", exc_info=True)
+        return 0
+    return touched
+
+
+def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = True):
     """Follow explicit tunnels from a room — returns connected drawers.
 
     Given a location (wing/room), finds all tunnels leading from or to it,
-    and optionally fetches the connected drawer content.
+    and optionally fetches the connected drawer content. Following a tunnel
+    is a traversal: unless ``record`` is off (a read-only server), each
+    tunnel crossed is potentiated so navigation weights and the audit
+    reflect real use.
     """
     # Fall back to raw ``wing`` so an empty/whitespace query string still
     # produces a value to compare with; ``_normalize_wing`` returns ``None``
@@ -782,7 +937,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
     # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
     # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     connections = []
 
     for t in tunnels:
@@ -831,6 +986,9 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
                         c["drawer_preview"] = drawer_map[did][:300]
             except Exception:
                 logger.debug("Drawer preview hydration failed", exc_info=True)
+
+    if record and connections:
+        record_tunnel_traversal([c["tunnel_id"] for c in connections], config)
 
     return connections
 
@@ -931,29 +1089,31 @@ def compute_topic_tunnels(
 
     wings = sorted(wing_topics.keys())
     created: list[dict] = []
-    for i, wa in enumerate(wings):
-        topics_a = wing_topics[wa]
-        for wb in wings[i + 1 :]:
-            topics_b = wing_topics[wb]
-            shared_keys = set(topics_a.keys()) & set(topics_b.keys())
-            if len(shared_keys) < min_count:
-                continue
-            # Stable sort for deterministic tunnel ordering across runs.
-            for key in sorted(shared_keys):
-                # Prefer the casing from whichever wing sorts first — both
-                # are valid; this just keeps the displayed room consistent.
-                topic_name = topics_a[key] if topics_a[key] else topics_b[key]
-                room = topic_room(topic_name)
-                tunnel = create_tunnel(
-                    source_wing=wa,
-                    source_room=room,
-                    target_wing=wb,
-                    target_room=room,
-                    label=f"{label_prefix}: {topic_name}",
-                    kind="topic",
-                    config=config,
-                )
-                created.append(tunnel)
+    # One load and one save for the whole pass, not one per tunnel.
+    with tunnel_batch(config):
+        for i, wa in enumerate(wings):
+            topics_a = wing_topics[wa]
+            for wb in wings[i + 1 :]:
+                topics_b = wing_topics[wb]
+                shared_keys = set(topics_a.keys()) & set(topics_b.keys())
+                if len(shared_keys) < min_count:
+                    continue
+                # Stable sort for deterministic tunnel ordering across runs.
+                for key in sorted(shared_keys):
+                    # Prefer the casing from whichever wing sorts first — both
+                    # are valid; this just keeps the displayed room consistent.
+                    topic_name = topics_a[key] if topics_a[key] else topics_b[key]
+                    room = topic_room(topic_name)
+                    tunnel = create_tunnel(
+                        source_wing=wa,
+                        source_room=room,
+                        target_wing=wb,
+                        target_room=room,
+                        label=f"{label_prefix}: {topic_name}",
+                        kind="topic",
+                        config=config,
+                    )
+                    created.append(tunnel)
     return created
 
 
@@ -994,23 +1154,114 @@ def topic_tunnels_for_wing(
     # ``compute_topic_tunnels`` keeps the threshold and casing logic in
     # one place.
     created: list[dict] = []
-    for other, other_topics in topics_by_wing.items():
-        if not isinstance(other, str) or not other.strip():
-            continue
-        if normalize_wing_name(other.strip()) == wing:
-            continue
-        if not isinstance(other_topics, (list, tuple)) or not other_topics:
-            continue
-        slice_map = {wing: list(own), other: list(other_topics)}
-        created.extend(
-            compute_topic_tunnels(
-                slice_map,
-                min_count=min_count,
-                label_prefix=label_prefix,
-                config=config,
+    # One batch across every per-pair call; each nested compute_topic_tunnels
+    # batch reuses this one instead of saving per other wing.
+    with tunnel_batch(config):
+        for other, other_topics in topics_by_wing.items():
+            if not isinstance(other, str) or not other.strip():
+                continue
+            if normalize_wing_name(other.strip()) == wing:
+                continue
+            if not isinstance(other_topics, (list, tuple)) or not other_topics:
+                continue
+            slice_map = {wing: list(own), other: list(other_topics)}
+            created.extend(
+                compute_topic_tunnels(
+                    slice_map,
+                    min_count=min_count,
+                    label_prefix=label_prefix,
+                    config=config,
+                )
             )
-        )
     return created
+
+
+ENTITY_TUNNEL_MIN_COUNT = 3
+ENTITY_TUNNEL_MAX_PER_WING = 25
+# An entity present in more wings than this share of all wings (and in more
+# than ENTITY_TUNNEL_UBIQUITY_MIN_WINGS) is vocabulary, not a link: ``Server``
+# shows up in every project, ``block_num`` in the two chain-indexer ones.
+ENTITY_TUNNEL_UBIQUITY_SHARE = 0.25
+ENTITY_TUNNEL_UBIQUITY_MIN_WINGS = 3
+
+
+def entity_tunnel_candidates(hallways: list, min_count: int = ENTITY_TUNNEL_MIN_COUNT) -> dict:
+    """``{entity: {wing_norm: (display_wing, strength)}}`` for entities in ≥2 wings.
+
+    Strength is the entity's strongest hallway co-occurrence in that wing.
+    Left out: generic tokens (``content``, ``WebFetch``, ``compose.yml``),
+    entities below ``min_count`` in a wing, and ubiquitous entities — present
+    in more than a quarter of all wings (and in more than three). A tunnel
+    on any of them links nothing.
+
+    Spellings of one entity merge under :func:`canonical_spelling`
+    (``ChatStore.swift`` / ``ChatStore`` → ``ChatStore``, ``src/main.zig`` /
+    ``main.zig`` → ``src/main.zig``),
+    resolved across every wing the same way the hallway miner resolves them
+    inside one. Two files that only share a basename (``src/models/user.py``
+    in one wing, ``tests/fixtures/user.py`` in another) are two entities: a
+    tunnel between them would link unrelated code.
+    """
+    from .hallways import (
+        _spelling_clusters,
+        canonical_spelling,
+        entity_spelling_key,
+        is_generic_entity,
+    )
+
+    def usable(ent) -> bool:
+        return isinstance(ent, str) and bool(ent.strip()) and not is_generic_entity(ent)
+
+    spellings_by_base: dict = defaultdict(set)
+    for h in hallways:
+        if isinstance(h, dict):
+            for ent in (h.get("entity_a"), h.get("entity_b")):
+                if usable(ent):
+                    spellings_by_base[entity_spelling_key(ent)].add(ent)
+    canonical: dict = {}
+    for spellings in spellings_by_base.values():
+        for cluster in _spelling_clusters(sorted(spellings)):
+            name = canonical_spelling(cluster)
+            for spelling in cluster:
+                canonical[spelling] = name
+
+    by_key: dict = {}
+    for h in hallways:
+        if not isinstance(h, dict):
+            continue
+        h_wing = h.get("wing")
+        if not isinstance(h_wing, str) or not h_wing.strip():
+            continue
+        wing_norm = normalize_wing_name(h_wing.strip())
+        # A record without a count is hand-made or legacy; it passes the bar.
+        count = int(h["co_occurrence_count"]) if "co_occurrence_count" in h else min_count
+        for ent_key in ("entity_a", "entity_b"):
+            ent = h.get(ent_key)
+            if not usable(ent):
+                continue
+            key = canonical.get(ent)
+            if key is None:
+                continue  # an ambiguous name: it identifies no single file
+            wings = by_key.setdefault(key, {})
+            prev = wings.get(wing_norm)
+            if prev is None or count > prev[1]:
+                wings[wing_norm] = (h_wing, count)
+    all_wings = {
+        normalize_wing_name(str(h.get("wing")).strip())
+        for h in hallways
+        if isinstance(h, dict) and h.get("wing")
+    }
+    ubiquity_cap = max(
+        ENTITY_TUNNEL_UBIQUITY_MIN_WINGS, int(len(all_wings) * ENTITY_TUNNEL_UBIQUITY_SHARE)
+    )
+    out = {}
+    for key, wings in by_key.items():
+        if len(wings) > ubiquity_cap:
+            continue
+        strong = {w: v for w, v in wings.items() if v[1] >= min_count}
+        if len(strong) >= 2:
+            out[key] = strong
+    return out
 
 
 def entity_tunnels_for_wing(
@@ -1018,6 +1269,8 @@ def entity_tunnels_for_wing(
     hallways: list,
     label_prefix: str = "shared entity",
     config=None,
+    min_count: int = ENTITY_TUNNEL_MIN_COUNT,
+    max_per_wing: int = ENTITY_TUNNEL_MAX_PER_WING,
 ) -> list:
     """Compute entity tunnels involving a single wing.
 
@@ -1040,47 +1293,35 @@ def entity_tunnels_for_wing(
         return []
 
     wing_norm = normalize_wing_name(wing.strip())
-
-    # Build: entity -> {normalized_wing -> original_wing_display_name}
-    # Both entity_a and entity_b positions count toward "this entity is
-    # in this wing"; the hallway primitive treats the pair as unordered.
-    entity_wings: dict = {}
-    for h in hallways:
-        if not isinstance(h, dict):
-            continue
-        h_wing = h.get("wing")
-        if not isinstance(h_wing, str) or not h_wing.strip():
-            continue
-        h_wing_norm = normalize_wing_name(h_wing.strip())
-        for ent_key in ("entity_a", "entity_b"):
-            ent = h.get(ent_key)
-            if not isinstance(ent, str) or not ent.strip():
-                continue
-            # setdefault preserves the first-seen display form so the
-            # tunnel endpoint matches the wing name the caller used.
-            entity_wings.setdefault(ent, {}).setdefault(h_wing_norm, h_wing)
-
-    if not entity_wings:
+    candidates = entity_tunnel_candidates(hallways, min_count=min_count)
+    if not candidates:
         return []
 
-    created: list = []
-    # Stable entity order so tunnels materialize deterministically across
-    # runs — matters for tests and for diff-able tunnels.json files.
-    for entity in sorted(entity_wings.keys()):
-        wings_for_entity = entity_wings[entity]
-        if wing_norm not in wings_for_entity:
+    # The cap counts links, not entities: an entity shared by five wings is
+    # four links from this one, and capping entity names let a wing exceed
+    # its budget several times over. Each (entity, other wing) link ranks by
+    # its weaker side; ties break on the names so tunnels.json stays
+    # diff-able across runs.
+    links = []
+    for entity, wings_for_entity in candidates.items():
+        own = wings_for_entity.get(wing_norm)
+        if own is None:
             continue
-        own_wing_display = wings_for_entity[wing_norm]
-        # Stable other-wing order; ``wing_norm`` itself is excluded so an
-        # entity that lives only in this wing produces zero tunnels.
-        other_wings_norm = sorted(w for w in wings_for_entity if w != wing_norm)
-        for other_norm in other_wings_norm:
-            other_display = wings_for_entity[other_norm]
+        for other_norm, other in wings_for_entity.items():
+            if other_norm != wing_norm:
+                links.append((-min(own[1], other[1]), entity, other_norm))
+    links.sort()
+
+    created: list = []
+    # One load and one save for the whole pass, not one per tunnel.
+    with tunnel_batch(config):
+        for _, entity, other_norm in links[: max(0, max_per_wing)]:
+            wings_for_entity = candidates[entity]
             room = f"entity:{entity}"
             tunnel = create_tunnel(
-                source_wing=own_wing_display,
+                source_wing=wings_for_entity[wing_norm][0],
                 source_room=room,
-                target_wing=other_display,
+                target_wing=wings_for_entity[other_norm][0],
                 target_room=room,
                 label=f"{label_prefix}: {entity}",
                 kind="entity",

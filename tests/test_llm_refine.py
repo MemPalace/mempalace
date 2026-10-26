@@ -5,20 +5,17 @@ Uses a fake provider for deterministic, offline tests. No network.
 
 from dataclasses import dataclass
 
-
 from mempalace.llm_client import LLMError, LLMResponse
 from mempalace.llm_refine import (
     _apply_classifications,
     _build_user_prompt,
     _collect_contexts,
-    _extract_json_candidates,
     _is_authoritative_person,
     _is_authoritative_project,
     _parse_response,
     collect_corpus_text,
     refine_entities,
 )
-
 
 # ── fake provider ───────────────────────────────────────────────────────
 
@@ -154,12 +151,6 @@ def test_parse_response_extracts_fenced_json_after_prose():
     text = 'Sure:\n```json\n{"classifications": [{"name": "X", "label": "PROJECT"}]}\n```'
     out = _parse_response(text, ["X"])
     assert out["X"][0] == "PROJECT"
-
-
-def test_extract_json_candidates_handles_embedded_array():
-    text = 'prefix [{"name": "Y", "label": "PERSON"}] suffix'
-    candidates = _extract_json_candidates(text)
-    assert '[{"name": "Y", "label": "PERSON"}]' in candidates
 
 
 def test_parse_response_ignores_non_json_brackets_before_payload():

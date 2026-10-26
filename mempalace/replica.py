@@ -19,6 +19,8 @@ import re
 import secrets
 from pathlib import Path
 
+from .fsio import atomic_write_text
+
 REPLICA_FILENAME = "replica.json"
 
 _REPLICA_ID_RE = re.compile(r"^rep_(?:[0-9a-f]{12}|[0-9a-f]{32})$")
@@ -55,10 +57,10 @@ def get_replica_id(palace_path: str) -> str:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     replica_id = _mint()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(
+    atomic_write_text(
+        path,
         json.dumps({"replica_id": replica_id, "minted_at_note": "RFC 004 step 0"}, indent=2) + "\n",
-        encoding="utf-8",
+        private=False,
+        follow_symlinks=False,
     )
-    os.replace(tmp, path)
     return replica_id

@@ -20,10 +20,10 @@ Usage:
 """
 
 import re
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
 from .config import DEFAULT_CHUNK_SIZE
-
+from .fsio import decode_source
 
 # =============================================================================
 # MARKER SETS — One per memory type
@@ -245,7 +245,7 @@ def _get_sentiment(text: str) -> str:
     neg = len(words & NEGATIVE_WORDS)
     if pos > neg:
         return "positive"
-    elif neg > pos:
+    if neg > pos:
         return "negative"
     return "neutral"
 
@@ -361,19 +361,49 @@ def _score_markers(text: str, markers: List[str]) -> Tuple[float, List[str]]:
 # =============================================================================
 
 
+def _slice_on_whitespace(content: str, chunk_size: int) -> List[str]:
+    """Split ``content`` into pieces no longer than ``chunk_size``.
+
+    Breaks are on spaces, tabs, or newlines, and the separator stays with
+    the piece before it so ``"".join(pieces) == content``. A token longer
+    than ``chunk_size`` is the only case cut mid-token.
+    """
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+    if len(content) <= chunk_size:
+        return [content]
+    pieces: List[str] = []
+    start = 0
+    length = len(content)
+    while start < length:
+        end = min(start + chunk_size, length)
+        if end < length:
+            window = content[start:end]
+            split = max(window.rfind(" "), window.rfind("\n"), window.rfind("\t"))
+            if split > 0:
+                end = start + split + 1
+        piece = content[start:end]
+        if not piece:
+            break
+        pieces.append(piece)
+        start = end
+    return pieces
+
+
 def extract_memories(
     text: str,
-    min_confidence: float = 0.3,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
 ) -> List[Dict]:
     """
     Extract memories from a text string.
 
+    Every non-blank paragraph is kept. One that matches no marker is
+    stored as ``memory_type="general"``.
+
     Args:
         text: The text to extract from (any format).
-        min_confidence: Minimum confidence threshold (0.0-1.0).
         chunk_size: Per-memory character cap. Segments exceeding this
-            size are sliced verbatim into multiple memories that share
+            size are sliced on whitespace into multiple memories that share
             the same ``memory_type``. Caller (typically ``mine_convos``)
             should pass ``MempalaceConfig.chunk_size`` so config-driven
             sizing reaches this path; the default matches the
@@ -387,60 +417,31 @@ def extract_memories(
     memories = []
 
     for para in paragraphs:
-        if len(para.strip()) < 20:
+        content = para.strip()
+        if not content:
             continue
 
         prose = _extract_prose(para)
 
-        # Score against all types
+        # Score against all types. No hit means the paragraph is still kept.
         scores = {}
         for mem_type, markers in ALL_MARKERS.items():
             score, _ = _score_markers(prose, markers)
             if score > 0:
                 scores[mem_type] = score
 
-        if not scores:
-            continue
-
-        # Length bonus
-        if len(para) > 500:
-            length_bonus = 2
-        elif len(para) > 200:
-            length_bonus = 1
+        if scores:
+            max_type = max(scores, key=scores.get)
+            max_type = _disambiguate(max_type, prose, scores)
         else:
-            length_bonus = 0
+            max_type = "general"
 
-        max_type = max(scores, key=scores.get)
-        max_score = scores[max_type] + length_bonus
-
-        # Disambiguate
-        max_type = _disambiguate(max_type, prose, scores)
-
-        # Confidence
-        confidence = min(1.0, max_score / 5.0)
-        if confidence < min_confidence:
-            continue
-
-        content = para.strip()
-        # Slice oversized segments verbatim. ``memory_type`` is propagated
-        # to every slice — reclassifying sub-segments risks dropping data
-        # (marker may live in only one slice), and the verbatim-store
-        # mandate in CLAUDE.md forbids silent loss. Acceptable trade-off:
-        # the label is an approximation for sub-slices, not a fresh
-        # classification.
-        if len(content) <= chunk_size:
+        # ``memory_type`` is shared by every slice. Reclassifying a slice
+        # would depend on which slice held the marker.
+        for piece in _slice_on_whitespace(content, chunk_size):
             memories.append(
                 {
-                    "content": content,
-                    "memory_type": max_type,
-                    "chunk_index": len(memories),
-                }
-            )
-            continue
-        for i in range(0, len(content), chunk_size):
-            memories.append(
-                {
-                    "content": content[i : i + chunk_size],
+                    "content": piece,
                     "memory_type": max_type,
                     "chunk_index": len(memories),
                 }
@@ -528,8 +529,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     filepath = sys.argv[1]
-    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
+    with open(filepath, "rb") as f:
+        text = decode_source(f.read(), universal_newlines=True)[0]
 
     memories = extract_memories(text)
 
@@ -538,10 +539,8 @@ if __name__ == "__main__":
 
     type_counts = Counter(m["memory_type"] for m in memories)
     print(f"Extracted {len(memories)} memories:")
-    for mtype in ["decision", "preference", "milestone", "problem", "emotional"]:
-        count = type_counts.get(mtype, 0)
-        if count:
-            print(f"  {mtype:12} {count}")
+    for mtype, count in type_counts.most_common():
+        print(f"  {mtype:12} {count}")
 
     print()
     for m in memories[:10]:
