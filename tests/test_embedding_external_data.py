@@ -96,6 +96,30 @@ def test_colocated_input_is_returned_untouched(tmp_path):
     assert not (tmp_path / _EXTERNAL_DATA_DIRNAME).exists()
 
 
+def test_flat_blob_store_is_left_alone(tmp_path):
+    """huggingface_hub < 1.32 keeps both blobs in one directory: nothing to do.
+
+    The snapshot symlinks resolve apart from each other but into the same real
+    directory, which is the layout ORT accepts. The early return has to fire
+    even though the path *is* inside a hub, or every load would rebuild a
+    private copy of a model that already works.
+    """
+    hub = tmp_path / "hub"
+    (hub / "blobs").mkdir(parents=True)
+    (hub / "blobs" / "aabbcc").write_bytes(b"graph-bytes")
+    (hub / "blobs" / "ddeeff").write_bytes(b"weight-bytes")
+    snapshot = (
+        hub / "models--onnx-community--embeddinggemma-300m-ONNX" / "snapshots" / "rev1" / "onnx"
+    )
+    snapshot.mkdir(parents=True)
+    _symlink_or_skip(hub / "blobs" / "aabbcc", snapshot / _MODEL)
+    _symlink_or_skip(hub / "blobs" / "ddeeff", snapshot / _DATA)
+    model_path = str(snapshot / _MODEL)
+
+    assert _co_locate_external_data(model_path, str(snapshot / _DATA)) == model_path
+    assert not (hub / _EXTERNAL_DATA_DIRNAME).exists()
+
+
 def test_unrecognised_layout_is_not_guessed_at(tmp_path):
     left = tmp_path / "one"
     right = tmp_path / "two"
