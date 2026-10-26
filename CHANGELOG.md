@@ -763,6 +763,17 @@ requires Python 3.10.
 - [#2859](https://github.com/MemPalace/mempalace/pull/2859) chore(release): 3.12.0
 - [#2861](https://github.com/MemPalace/mempalace/pull/2861) fix(mine): keep --palace and media options on daemon-routed adapter mines
 
+### Added
+
+- **`mempalace sweep` files what it sweeps under a wing and room when asked.**
+  `--wing` classifies the drawers a sweep adds, as `mine --wing` does, and
+  `--room` defaults to `general`, so message-level catch-up shows under that
+  wing in `status` and `search --wing` instead of as `?/?`. A drawer the palace
+  already holds keeps its wing and room, so a re-sweep does not undo
+  `rooms apply` or `wings split`. Both flags reach a sweep routed to the
+  daemon; a daemon started before the upgrade drops them until it is
+  restarted. (#1207, #1979)
+
 ---
 
 ## [3.11.0] — 2026-10-12
