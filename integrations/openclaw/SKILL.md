@@ -46,7 +46,7 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 
 ## Available Tools
 
-Full MCP surface: 47 tools. Destructive or host-level tools are documented so
+Full MCP surface: 48 tools. Destructive or host-level tools are documented so
 you know they exist, but use them only when the user explicitly asks or when a
 tool-specific workflow below says to.
 
@@ -88,6 +88,8 @@ tool-specific workflow below says to.
 - `mempalace_kg_timeline` — Chronological story of an entity
   - `entity`: filter by entity name (optional — all events if omitted)
 - `mempalace_kg_stats` — Graph overview: entities, triples, relationship types
+- `mempalace_kg_wing_links` — Wings linked by a shared entity, weighted by how specific it is
+  - `limit`: max links to return (default 40, max 200)
 
 ### Palace Graph (Cross-Domain Connections)
 - `mempalace_traverse` — Walk from a room, find connected ideas across wings

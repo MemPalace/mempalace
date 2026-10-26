@@ -84,6 +84,7 @@ Through the MCP server, the knowledge graph is available as tools:
 | `mempalace_kg_supersede` | Atomically replace one current fact with another |
 | `mempalace_kg_timeline` | Chronological entity story |
 | `mempalace_kg_stats` | Graph overview |
+| `mempalace_kg_wing_links` | Wing-to-wing links from shared entities |
 
 ## Storage
 

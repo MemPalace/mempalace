@@ -188,6 +188,35 @@ class TestKGTools:
         result = tool_kg_stats()
         assert result["entities"] >= 4
 
+    def test_kg_wing_links(self, monkeypatch, config, palace_path, seeded_collection, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_wing_links
+
+        # "project" holds drawer_proj_*; "notes" holds drawer_notes_planning_ddd.
+        kg.add_triple("Alice", "works_on", "Auth", source_drawer_id="drawer_proj_backend_aaa")
+        kg.add_triple("Alice", "plans", "Auth", source_drawer_id="drawer_notes_planning_ddd")
+        kg.add_triple("Bob", "likes", "Tea", source_drawer_id="drawer_proj_backend_bbb")
+        kg.add_triple("Carol", "x", "Y")  # no provenance: cannot be placed in a wing
+        kg.add_triple("Dave", "x", "Z", source_drawer_id="drawer_missing")
+
+        result = tool_kg_wing_links()
+        assert result["count"] == 1
+        (link,) = result["links"]
+        assert (link["a"], link["b"]) == ("notes", "project")
+        # Alice and Auth each span two wings: 2 * 1/log2(3).
+        assert link["weight"] == 1.262
+        assert link["entity"] == "Alice"
+
+    def test_kg_wing_links_empty_graph(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_wing_links
+
+        result = tool_kg_wing_links()
+        assert result["links"] == []
+        assert result["count"] == 0
+
     # --- Date validation at the MCP boundary (issue #1164) ---
 
     def test_kg_add_rejects_invalid_valid_from(self, monkeypatch, config, palace_path, kg):
