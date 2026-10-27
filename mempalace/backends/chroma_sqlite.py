@@ -16,10 +16,11 @@ from collections import defaultdict
 from typing import Iterable, Iterator, Optional
 
 from ..lexical import tokenize
+from ..sources.read_visibility import open_logical_reader as open_palace_reader
 from ..stored_text import FLAG, decode_record, decode_value, encode_filter, encode_where
 from ..timeutil import recency_floor, recency_key
 from ._filters import matches_where
-from ._inproc_sqlite import open_reader as open_palace_reader
+from ._inproc_sqlite import open_reader as open_physical_reader
 
 
 class MetadataRecoveryPending(sqlite3.OperationalError):
@@ -41,7 +42,7 @@ def _db_file(palace_path: str) -> Optional[str]:
     return db_path if os.path.isfile(db_path) else None
 
 
-def _read_db(palace_path: str, read, *, busy: bool = False):
+def _read_db(palace_path: str, read, *, busy: bool = False, physical: bool = False):
     """``read(conn)`` on a reader of the palace database, or ``None``.
 
     ``None`` when the file is missing or the read raises ``sqlite3.Error``,
@@ -52,7 +53,7 @@ def _read_db(palace_path: str, read, *, busy: bool = False):
     if db_path is None:
         return None
     try:
-        conn = open_palace_reader(db_path)
+        conn = (open_physical_reader if physical else open_palace_reader)(db_path)
         try:
             if busy:
                 conn.execute("PRAGMA busy_timeout = 3000")
@@ -163,7 +164,7 @@ def _metadata_value_columns(conn) -> list[str]:
     return [c for c in ("string_value", "int_value", "float_value", "bool_value") if c in present]
 
 
-def _decoded_rows(conn, row_ids, where: Optional[dict] = None) -> list[tuple]:
+def _decoded_rows(conn, row_ids, where: Optional[dict] = None, *, documents=True) -> list[tuple]:
     """``(drawer_id, document, metadata)`` for ``row_ids``, in that order, decoded.
 
     The shape Chroma's ``get`` returns: a missing document is ``None``, as is
@@ -187,7 +188,8 @@ def _decoded_rows(conn, row_ids, where: Optional[dict] = None) -> list[tuple]:
             records[row_id] = [drawer_id, None, None]
         for row_id, key, *cells in conn.execute(
             f"SELECT id, key, {', '.join(columns)} FROM embedding_metadata"
-            f" WHERE id IN ({_marks(chunk)})",
+            f" WHERE id IN ({_marks(chunk)})"
+            + ("" if documents else " AND key != 'chroma:document'"),
             chunk,
         ):
             record = records.get(row_id)
@@ -514,7 +516,7 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
         ).fetchone()
         return int(row[0]) if row and row[0] is not None else None
 
-    return _read_db(palace_path, read)
+    return _read_db(palace_path, read, physical=True)
 
 
 def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optional[bool]:
@@ -534,6 +536,7 @@ def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optio
             ).fetchone()
             is not None
         ),
+        physical=True,
     )
 
 

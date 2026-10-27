@@ -187,14 +187,14 @@ def test_update_drift_refuses_entire_batch(monkeypatch, collection, mutation):
 
 
 def test_guard_uses_configured_lock_once_and_refuses_threaded_writer(
-    monkeypatch, collection, tmp_path
+    monkeypatch, collection, palace_path
 ):
     from threading import Thread
 
     collection.add(
         ids=["known"], documents=["before"], metadatas=[{"title": "OLD"}], embeddings=[[1.0, 0.0]]
     )
-    inner = cb.ChromaCollection(collection, palace_path=str(tmp_path))
+    inner = cb.ChromaCollection(collection, palace_path=palace_path)
     errors = []
 
     def write():

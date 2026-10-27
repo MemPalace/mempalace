@@ -70,7 +70,9 @@ class RustExactCollection(SQLiteExactCollection):
         return cached[1] if cached is not None else None
 
     def _ensure_native_index(self, cur):
-        if _NativeVectorIndex is None:
+        # The native loader opens its own physical connection; it cannot
+        # participate in the operation-scoped logical SQL snapshot.
+        if hasattr(cur, "owner") or _NativeVectorIndex is None:
             return None
         db_file = os.path.join(self._handle.palace_path, _DB_FILENAME)
         if not os.path.isfile(db_file):
