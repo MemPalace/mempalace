@@ -2078,7 +2078,22 @@ class ChromaCollection(BaseCollection):
     # Reads
     # ------------------------------------------------------------------
 
-    def query(
+    def _logical_drawers(self):
+        from ..config import get_configured_collection_name
+
+        return (
+            self._palace_path is not None
+            and self._collection.name == get_configured_collection_name()
+        )
+
+    def query(self, **kwargs):
+        if self._logical_drawers():
+            from ..sources.read_visibility import chroma_query
+
+            return chroma_query(self, **kwargs)
+        return self._query_physical(**kwargs)
+
+    def _query_physical(
         self,
         *,
         query_texts=None,
@@ -2162,7 +2177,17 @@ class ChromaCollection(BaseCollection):
             ),
         )
 
-    def get(
+    def get(self, **kwargs):
+        if self._logical_drawers():
+            from ..sources.read_visibility import chroma_get
+
+            return chroma_get(self, **kwargs)
+        return self._get_physical(**kwargs)
+
+    def get_all_rows(self, where=None, include=None):
+        return self.get(where=where, include=include or ["metadatas"])
+
+    def _get_physical(
         self,
         *,
         ids=None,
@@ -2228,8 +2253,26 @@ class ChromaCollection(BaseCollection):
         with self._write_lock():
             self._collection.delete(**kwargs)
 
-    def count(self):
+    def physical_count(self):
         return self._collection.count()
+
+    def count(self):
+        if self._logical_drawers():
+            from ..sources.read_visibility import open_ready_chroma_reader
+            from .chroma_sqlite import _DRAWERS_SQL
+
+            with open_ready_chroma_reader(self) as conn:
+                return conn.execute(
+                    f"SELECT COUNT(*) {_DRAWERS_SQL} WHERE c.name=?", (self._collection.name,)
+                ).fetchone()[0]
+        return self.physical_count()
+
+    def facet_counts(self, field, where=None, limit=1000):
+        from collections import Counter
+
+        rows = self.get_all_metadata(where=where)
+        counts = Counter(str(meta[field]) for meta in rows if meta and field in meta)
+        return dict(sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit])
 
     def iter_metadata(
         self,
@@ -2267,7 +2310,7 @@ class ChromaCollection(BaseCollection):
                     return list(rows)
                 except sqlite3.Error:
                     logger.debug("sqlite metadata scan failed; paging instead", exc_info=True)
-        return super().get_all_metadata(where=where)
+        return self.get_all_rows(where=where).metadatas
 
     def get_recent(
         self,

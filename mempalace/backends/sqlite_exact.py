@@ -276,8 +276,9 @@ def sqlite_wing_room_counts(
     if not os.path.isfile(db_path):
         return None
     try:
-        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
+        from ..sources.read_visibility import open_logical_reader
+
+        conn = open_logical_reader(db_path, backend="exact")
         try:
             conn.execute("PRAGMA busy_timeout=2000")
             row = conn.execute(
@@ -336,8 +337,9 @@ def sqlite_wing_source_counts(palace_path: str, collection_name: str) -> Optiona
     if not os.path.isfile(db_path):
         return None
     try:
-        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
+        from ..sources.read_visibility import open_logical_reader
+
+        conn = open_logical_reader(db_path, backend="exact")
         try:
             conn.execute("PRAGMA busy_timeout=2000")
             row = conn.execute(
@@ -380,8 +382,9 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
     if not os.path.isfile(db_path):
         return None
     try:
-        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
+        from ..sources.read_visibility import open_logical_reader
+
+        conn = open_logical_reader(db_path, backend="exact")
         try:
             conn.execute("PRAGMA busy_timeout=2000")
             row = conn.execute(
@@ -454,6 +457,7 @@ class _SQLiteExactHandle:
         # Native accelerators share one versioned index per collection across
         # the short-lived wrappers created by application searches.
         self._native_cache: dict[str, tuple[tuple, Any]] = {}
+        self._legacy_lifecycle_checks = {}
 
 
 class SQLiteExactCollection(BaseCollection):
@@ -500,11 +504,83 @@ class SQLiteExactCollection(BaseCollection):
                 yield
 
     @contextlib.contextmanager
-    def _cursor(self, *, write: bool = False):
+    def _read_lock(self, *, logical):
+        """Take the reclamation lease before the handle mutex, as GC does.
+
+        Opening a managed reader may block behind GC. It must not hold the
+        mutex GC needs for physical deletion. Keep the mutex over cursor use
+        and recheck handle lifetime after opening the independent snapshot.
+        """
+        from ..sources.lifecycle import StaleLifecycleSnapshot, lifecycle_path
+        from ..sources.read_visibility import open_logical_reader
+
+        registry = lifecycle_path(self._handle.palace_path) if logical else None
+        for _ in range(3):
+            reader = None
+            try:
+                if registry is not None and registry.exists():
+                    reader = open_logical_reader(
+                        os.path.join(self._handle.palace_path, _DB_FILENAME), backend="exact"
+                    )
+                with self._handle.lock:
+                    self._ensure_open()
+                    if reader is None and registry is not None and registry.exists():
+                        # Initialization raced the mutex acquisition. Release
+                        # it before opening a reader, with a bounded retry.
+                        continue
+                    yield reader
+                    return
+            finally:
+                if reader is not None:
+                    reader.close()
+        raise StaleLifecycleSnapshot("registry changed while acquiring exact reader handle")
+
+    @contextlib.contextmanager
+    def _cursor(self, *, write: bool = False, physical: bool = False):
         self._refresh_read_handle()
-        serialization = self._write_lock() if write else self._handle.lock
-        with serialization:
+        from ..config import get_configured_collection_name
+        from ..sources.lifecycle import LifecycleStateError
+
+        logical = (
+            not write and not physical and self._collection_name == get_configured_collection_name()
+        )
+        serialization = self._write_lock() if write else self._read_lock(logical=logical)
+        with serialization as reader:
             self._ensure_open()
+            if logical and reader is None:
+                # Pin before checking the tag-free legacy fast path. A peer
+                # cannot insert a tagged restore between this check and read.
+                if not self._handle.conn.in_transaction:
+                    self._handle.conn.execute("BEGIN")
+                # A vector-only restore must never downgrade tagged content to
+                # legacy. Keep the ordinary cached/read-only handle otherwise.
+                token = (
+                    self._handle.conn,
+                    self._handle.conn.execute("PRAGMA data_version").fetchone()[0],
+                    self._handle.conn.total_changes,
+                )
+                if self._handle._legacy_lifecycle_checks.get(self._collection_name) != token:
+                    tagged = self._handle.conn.execute(
+                        "SELECT 1 FROM documents d JOIN collections c ON c.id=d.collection_id "
+                        "WHERE c.name=? AND (json_type(metadata_json, '$.source_generation') IS NOT NULL "
+                        "OR json_type(metadata_json, '$.source_version') IS NOT NULL) LIMIT 1",
+                        (self._collection_name,),
+                    ).fetchone()
+                    if tagged:
+                        self._handle.conn.rollback()
+                        raise LifecycleStateError(
+                            "managed drawers require the matching source registry"
+                        )
+                    self._handle._legacy_lifecycle_checks[self._collection_name] = token
+            if reader is not None:
+                # A fresh SQL snapshot cannot share a physical cached matrix.
+                # Include its identity in native query/index version checks.
+                cur = reader.cursor()
+                try:
+                    yield cur
+                finally:
+                    cur.close()
+                return
             cur = self._handle.conn.cursor()
             try:
                 yield cur
@@ -973,6 +1049,8 @@ class SQLiteExactCollection(BaseCollection):
         return by_id
 
     def _index_version(self, cur):
+        if hasattr(cur, "owner"):
+            return (cur.owner, cur.owner._epoch())
         if self._handle.immutable:
             db_file = os.path.join(self._handle.palace_path, _DB_FILENAME)
             # Immutable SQLite connections do not observe peer commits at all.
@@ -1121,14 +1199,18 @@ class SQLiteExactCollection(BaseCollection):
         expected = self._collection_dimension(cur, collection_id)
         empty = np.zeros((0, expected or 0), dtype=np.float32)
         empty_norms = np.zeros((0,), dtype=np.float32)
-        data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
+        data_version = self._index_version(cur)
         if self._handle._vector_cache_data_version != data_version:
             self._handle._vector_cache.clear()
-            self._handle._vector_cache_data_version = data_version
-        cached = self._handle._vector_cache.get(collection_id)
+            self._handle._vector_cache_data_version = (
+                None if hasattr(cur, "owner") else data_version
+            )
+        logical = hasattr(cur, "owner")
+        cached = None if logical else self._handle._vector_cache.get(collection_id)
         if cached is None:
             cached = self._load_all_vectors(cur, collection_id, expected)
-            self._handle._vector_cache[collection_id] = cached
+            if not logical:
+                self._handle._vector_cache[collection_id] = cached
         ids, mat, norms, metas = cached
         if not where and not where_document:
             return ids, mat, norms
@@ -1281,6 +1363,13 @@ class SQLiteExactCollection(BaseCollection):
                 rows = rows[:limit]
         return self._get_result(rows, spec)
 
+    def get_all_rows(self, where=None, include=None):
+        """One SQL traversal rather than repeated OFFSET pages."""
+        return self.get(where=where, include=include or ["metadatas"])
+
+    def get_all_metadata(self, where=None):
+        return self.get_all_rows(where=where).metadatas
+
     def get_recent(self, *, limit, where=None, order_field="filed_at", include=None):
         """Newest ``limit`` records by the instant in ``order_field``, read in SQL.
 
@@ -1312,7 +1401,8 @@ class SQLiteExactCollection(BaseCollection):
             scopes = [where or {}, *(where or {}).get("$and", [])]
             hint = ""
             if (
-                order_field == "filed_at"
+                not hasattr(cur, "owner")
+                and order_field == "filed_at"
                 and any("wing" in scope for scope in scopes)
                 and self._handle.has_locus_columns
                 and cur.execute(
@@ -1389,7 +1479,14 @@ class SQLiteExactCollection(BaseCollection):
                     )
 
     def count(self) -> int:
-        with self._cursor() as cur:
+        return self._count()
+
+    def physical_count(self) -> int:
+        """Physical rows for maintenance and identity checks, not public content."""
+        return self._count(physical=True)
+
+    def _count(self, *, physical=False):
+        with self._cursor(physical=physical) as cur:
             collection_id = self._collection_id(cur)
             row = cur.execute(
                 "SELECT COUNT(*) FROM documents WHERE collection_id = ?",
@@ -1434,7 +1531,21 @@ class SQLiteExactCollection(BaseCollection):
             hits = self._lexical_search_fts(cur, query=query, n_results=n_results, where=where)
             if hits is not None:
                 return LexicalResult(hits=hits)
-            rows = self._rows(cur, where=where)
+            if hasattr(cur, "owner"):
+                # No usable FTS: one bounded cursor window, not all documents.
+                import warnings
+
+                cap = max(n_results, min(4096, max(32, n_results * 16)))
+                rows = self._rows(cur, limit=cap)
+                if len(rows) >= cap:
+                    warnings.warn(
+                        "source visibility lexical scan budget exhausted; results truncated",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                rows = [row for row in rows if matches_where(row["metadata"], where)]
+            else:
+                rows = self._rows(cur, where=where)
         scores = bm25_scores(query, [row["document"] for row in rows])
         scored = [
             LexicalHit(
@@ -1458,15 +1569,21 @@ class SQLiteExactCollection(BaseCollection):
         fts_query = " OR ".join(tokens)
         collection_id = self._collection_id(cur)
         try:
-            limit_sql = "" if where else "LIMIT ?"
+            logical = hasattr(cur, "owner")
+            cap = max(n_results, min(4096, max(32, n_results * 16)))
+            limit_sql = "LIMIT ?" if logical or not where else ""
             params = (fts_query, collection_id)
-            if not where:
+            if logical:
+                params = (*params, cap)
+            elif not where:
                 params = (*params, max(n_results * 5, n_results))
             rows = cur.execute(
                 f"""
                 SELECT doc_id, bm25(docs_fts) AS rank
                 FROM docs_fts
                 WHERE docs_fts MATCH ? AND collection_id = ?
+                  AND EXISTS (SELECT 1 FROM documents d WHERE d.collection_id=docs_fts.collection_id
+                              AND d.id=docs_fts.doc_id)
                 ORDER BY rank
                 {limit_sql}
                 """,
@@ -1477,6 +1594,14 @@ class SQLiteExactCollection(BaseCollection):
             return None
         if not rows:
             return []
+        if logical and len(rows) >= cap:
+            import warnings
+
+            warnings.warn(
+                "source visibility lexical candidate budget exhausted; results may be truncated",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         ids = [row[0] for row in rows]
         docs = []
         for start in range(0, len(ids), 900):
@@ -1526,7 +1651,7 @@ class SQLiteExactCollection(BaseCollection):
 
     def maintenance_state(self) -> dict:
         try:
-            rows = self.count()
+            rows = self.physical_count()
         except Exception:
             rows = 0
         # vector_index is null by design — exact cosine over every row, no ANN.

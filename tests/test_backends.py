@@ -1079,6 +1079,41 @@ def test_chroma_get_all_metadata_reads_sqlite_in_one_pass(tmp_path, monkeypatch)
     assert expected[-1] is None  # the "bare" drawer
 
 
+def test_chroma_get_preserves_absent_empty_and_array_only_metadata(tmp_path):
+    backend = ChromaBackend()
+    try:
+        col = backend.get_collection(str(tmp_path / "palace"), "mempalace_drawers", create=True)
+        col.add(ids=["bare"], documents=["no metadata"], embeddings=[[1.0, 0.0]])
+        # Escaping needs a storage flag which decodes to a legitimate empty dict.
+        col.add(
+            ids=["empty"], documents=["empty\x00metadata"], metadatas=[{}], embeddings=[[1.0, 0.0]]
+        )
+        col.add(
+            ids=["arrays"],
+            documents=["array metadata"],
+            metadatas=[{"tags": ["a", "日本語"]}],
+            embeddings=[[1.0, 0.0]],
+        )
+        rows = col.get()
+        assert dict(zip(rows.ids, rows.metadatas)) == {
+            "bare": None,
+            "empty": {},
+            "arrays": {"tags": ["a", "日本語"]},
+        }
+        assert rows.documents == ["no metadata", "empty\x00metadata", "array metadata"]
+        for rid, expected in zip(rows.ids, rows.metadatas):
+            projected = col.get(ids=[rid], include=["metadatas"], limit=1)
+            assert projected.ids == [rid]
+            assert projected.metadatas == [expected]
+            assert projected.documents == []
+        filtered = col.get(where={"tags": {"$contains": "日本語"}}, include=["metadatas"], limit=1)
+        assert filtered.ids == ["arrays"]
+        assert filtered.metadatas == [{"tags": ["a", "日本語"]}]
+        assert filtered.documents == []
+    finally:
+        backend.close()
+
+
 def test_chroma_iter_metadata_projects_keys_and_requires_a_key(tmp_path):
     col = _recent_palace(tmp_path)
     rows = list(col.iter_metadata(["wing", "flag"]))

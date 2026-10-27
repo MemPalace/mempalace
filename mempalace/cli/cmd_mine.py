@@ -69,6 +69,7 @@ def cmd_mine(args):
     )
     from ..media import MediaAssetError, MediaAssetSetupError
     from ..palace import MineAlreadyRunning, MineFileErrors, MineValidationError
+    from ..sources.lifecycle import LifecycleStateError
 
     model_errors = (
         UnknownEmbeddingModelError,
@@ -97,6 +98,9 @@ def cmd_mine(args):
             )
         except (UnknownSourceAdapterError, UnsupportedSourceAdapterProtocolError) as exc:
             print(f"mempalace: {exc}", file=sys.stderr)
+            sys.exit(2)
+        except LifecycleStateError as exc:
+            print(f"mempalace: source adapter failed: {exc}", file=sys.stderr)
             sys.exit(2)
         except MediaAssetSetupError as exc:
             print(f"mempalace: media indexing is unavailable: {exc}", file=sys.stderr)
@@ -330,9 +334,13 @@ def mine_source_adapter(
         ) from exc
 
     if "supports_incremental" in adapter.capabilities:
-        raise UnsupportedSourceAdapterProtocolError(
-            f"source adapter {adapter_name!r} requires incremental ingestion, which "
-            "mempalace mine does not support yet"
+        from ..sources.runner import run_incremental_adapter
+
+        return run_incremental_adapter(
+            adapter=adapter,
+            source_path=source_path,
+            palace_path=palace_path,
+            dry_run=dry_run,
         )
 
     # A dry run must never open a collection: backend opens can create or

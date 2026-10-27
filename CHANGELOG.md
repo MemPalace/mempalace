@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Internal
+
+- Add a source-owned drawer-generation registry, operation-scoped local logical
+  reads, epoch-keyed caches and reader-safe reclamation prerequisites. Physical
+  index accounting remains separate. Connect drawer-only incremental adapters
+  through a guarded item runner on local Chroma and exact backends, with
+  storage-free dry runs, atomic replacement, tombstones and crash recovery.
+  Incremental KG/media and nonlocal backends remain unsupported. Independent
+  review and supported-platform release validation are still required.
+
 ---
 
 ## [3.12.0] — 2026-10-18
