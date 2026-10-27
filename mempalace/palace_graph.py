@@ -38,7 +38,7 @@ from .fsio import (
     read_json_for_update as _read_json_for_update,
 )
 from .palace import get_collection as _get_palace_collection, mine_lock
-from .timeutil import utc_now_iso
+from .timeutil import recency_key, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -891,6 +891,70 @@ def delete_tunnel(tunnel_id: str):
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
         _save_tunnels(tunnels)
     return {"deleted": tunnel_id}
+
+
+def _merge_tunnels(dst: dict, src: dict) -> None:
+    """Fold ``src`` into ``dst`` in place when two tunnels collapse onto the same
+    canonical id after a re-key. Dynamics keep the stronger and more-recent
+    signal so learned weights are not reset."""
+    dst["strength"] = max(float(dst.get("strength", 1.0)), float(src.get("strength", 1.0)))
+    dst["stability"] = max(float(dst.get("stability", 1.0)), float(src.get("stability", 1.0)))
+    if recency_key(src.get("last_activated")) > recency_key(dst.get("last_activated")):
+        dst["last_activated"] = src.get("last_activated")
+    dst["access_count"] = int(dst.get("access_count", 0)) + int(src.get("access_count", 0))
+    dst["updated_at"] = utc_now_iso()
+
+
+def rekey_tunnel_wings(rename_map: dict, config=None) -> int:
+    """Move entity/topic tunnel endpoints and canonical IDs after wing migration.
+
+    Pure renames preserve all other fields. Only affected endpoint collisions
+    merge dynamics; endpoints that become identical are removed. Returns the
+    number of source records moved (including those merged or removed).
+    """
+    renames = {old: new for old, new in rename_map.items() if old != new}
+    if not renames:
+        return 0
+    with mine_lock(_get_tunnel_file(config)):
+        tunnels = _load_tunnels(config, for_write=True)
+        groups = defaultdict(list)
+        changed = 0
+        removed = set()
+        for index, tunnel in enumerate(tunnels):
+            if not isinstance(tunnel, dict):
+                continue
+            source = dict(tunnel.get("source") or {})
+            target = dict(tunnel.get("target") or {})
+            moved = source.get("wing") in renames or target.get("wing") in renames
+            if moved:
+                changed += 1
+                source["wing"] = renames.get(source.get("wing"), source.get("wing"))
+                target["wing"] = renames.get(target.get("wing"), target.get("wing"))
+                if (source.get("wing"), source.get("room")) == (
+                    target.get("wing"),
+                    target.get("room"),
+                ):
+                    removed.add(index)
+                    continue
+                tunnel["source"], tunnel["target"] = source, target
+            # Compare endpoint identity even for legacy IDs/reversed endpoints.
+            key = _canonical_tunnel_id(
+                source.get("wing"), source.get("room"), target.get("wing"), target.get("room")
+            )
+            groups[key].append((index, tunnel, moved))
+        for key, members in groups.items():
+            if not any(moved for _, _, moved in members):
+                continue
+            members.sort(key=lambda member: member[2])
+            index, survivor, _ = members[0]
+            survivor["id"] = key
+            for duplicate_index, other, _ in members[1:]:
+                _merge_tunnels(survivor, other)
+                removed.add(duplicate_index)
+            tunnels[index] = survivor
+        if changed:
+            _save_tunnels([t for i, t in enumerate(tunnels) if i not in removed], config)
+    return changed
 
 
 def record_tunnel_traversal(tunnel_ids, config=None) -> int:
