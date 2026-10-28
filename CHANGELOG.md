@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Optional `rooms suggestions` jobs classify drawers against reviewed room
+  definitions with an installed local Ollama decision model. Background jobs
+  checkpoint progress and support preview, cancel and resume. Explicit apply and
+  undo use a conflict-checked journal on local backends, preserve verbatim text and
+  vectors, and never move drawers by default. See [the guide](docs/room-suggestions.md).
+- A read-only room classifier benchmark compares local decision models, embeddings
+  and a Qwen chat baseline on a held-out snapshot and authored bilingual fixtures.
+
 ---
 
 ## [3.12.0] — 2026-10-18

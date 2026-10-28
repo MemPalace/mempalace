@@ -405,6 +405,10 @@ class RoomDecider(Protocol):
     structured-decision model would use the document. Either returns one
     ``(room_name, confidence)`` per row, in order, with ``room_name`` drawn
     from the room set it was built with.
+
+    Text deciders set ``requires_documents = True`` so planning fetches full
+    drawer text. They require an explicit acceptance threshold; embedding
+    similarity defaults must not silently become probability thresholds.
     """
 
     def decide(self, rows: list[dict]) -> list[tuple[str, float]]: ...
@@ -532,7 +536,7 @@ def plan_rooms(
     col,
     wing: str,
     decider: RoomDecider,
-    threshold: float = DEFAULT_THRESHOLD,
+    threshold: Optional[float] = None,
     progress=None,
     from_rooms: Optional[frozenset] = GENERIC_ROOMS,
 ) -> RoomPlan:
@@ -542,6 +546,10 @@ def plan_rooms(
     move; the rest are counted under their current room as ``kept``. Pass
     ``from_rooms=None`` to reclassify every drawer in the wing.
     """
+    if threshold is None:
+        if getattr(decider, "requires_documents", False):
+            raise ValueError("Text room deciders require an explicit acceptance threshold")
+        threshold = DEFAULT_THRESHOLD
     changes: list[tuple[str, str, str]] = []
     source_moves: dict[tuple[str, str], Counter] = {}
     per_room: dict[str, int] = {}
@@ -593,7 +601,10 @@ def plan_rooms(
         if progress:
             progress(total)
 
-    for row in _iter_wing_rows(col, wing, include=["metadatas", "embeddings"]):
+    include = ["metadatas", "embeddings"]
+    if getattr(decider, "requires_documents", False):
+        include.append("documents")
+    for row in _iter_wing_rows(col, wing, include=include):
         batch.append(row)
         if len(batch) >= _UPDATE_BATCH:
             flush()

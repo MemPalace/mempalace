@@ -683,6 +683,22 @@ def main():
         "rooms", help="Propose a closed room set for a wing with an LLM, then assign drawers to it"
     )
     rooms_sub = p_rooms.add_subparsers(dest="rooms_action")
+    add_room_suggestions_parser(rooms_sub)
+    p_rooms_benchmark = rooms_sub.add_parser(
+        "benchmark", help="Classify a frozen pilot snapshot without modifying any drawers"
+    )
+    p_rooms_benchmark.add_argument("--dataset", required=True, help="Private snapshot JSON")
+    p_rooms_benchmark.add_argument("--output", required=True, help="Directory for private results")
+    p_rooms_benchmark.add_argument(
+        "--algorithm",
+        required=True,
+        choices=["embeddings", "embedding-descriptions", "d3", "d1", "qwen"],
+    )
+    p_rooms_benchmark.add_argument("--endpoint", default="http://127.0.0.1:11434")
+    p_rooms_benchmark.add_argument("--timeout", type=int, default=120)
+    p_rooms_benchmark.add_argument(
+        "--limit", type=int, default=0, help="Smoke-run count; 0 runs all"
+    )
     p_rooms_propose = rooms_sub.add_parser(
         "propose", help="Sample a wing and ask the LLM for a closed room set (saved for review)"
     )

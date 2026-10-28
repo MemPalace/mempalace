@@ -1,5 +1,5 @@
 # Fragment of mempalace.cli — executed into the package namespace.
-# `mempalace rooms propose|apply`: closed room sets per wing (mempalace/rooms.py).
+# `mempalace rooms propose|apply|benchmark`: room sets and read-only evaluation.
 
 
 def _rooms_llm_provider(args):
@@ -70,6 +70,16 @@ def _open_closets_collection(palace_path):
 
 
 def cmd_rooms(args):
+    if getattr(args, "rooms_action", None) == "suggestions":
+        cmd_room_suggestions(args)
+        return
+
+    if getattr(args, "rooms_action", None) == "benchmark":
+        from ..room_benchmark import run
+
+        run(args)
+        return
+
     from ..rooms import (
         DEFAULT_THRESHOLD,
         GENERIC_ROOMS,
