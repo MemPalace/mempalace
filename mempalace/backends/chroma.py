@@ -68,6 +68,9 @@ from .chroma_sqlite import (
 
 logger = logging.getLogger(__name__)
 
+_DRIFT_SUFFIX = ".drift-"
+_CORRUPT_SUFFIX = ".corrupt-"
+
 
 # chromadb persists EmbeddingGemma 2's EF config on the collection and, on
 # every later open, tries to rebuild it from its own registry, which does not
@@ -628,6 +631,14 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return _hnsw_metadata_marker_intact(seg_dir)
 
 
+def _is_segment_dir_name(name: str) -> bool:
+    return "-" in name and not name.startswith(".")
+
+
+def _is_quarantined_name(name: str) -> bool:
+    return _DRIFT_SUFFIX in name or _CORRUPT_SUFFIX in name
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -664,7 +675,10 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         return []
 
     for name in entries:
-        if "-" not in name or name.startswith(".") or ".drift-" in name:
+        if not _is_segment_dir_name(name):
+            continue
+
+        if _is_quarantined_name(name):
             continue
 
         seg_dir = os.path.join(palace_path, name)
@@ -704,7 +718,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
             continue
 
         stamp = filename_stamp()
-        target = f"{seg_dir}.drift-{stamp}"
+        target = f"{seg_dir}{_DRIFT_SUFFIX}{stamp}"
 
         if header_corrupt:
             reason = (
@@ -1504,7 +1518,10 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
 
     moved: list[str] = []
     for name in entries:
-        if "-" not in name or name.startswith(".") or ".drift-" in name or ".corrupt-" in name:
+        if not _is_segment_dir_name(name):
+            continue
+
+        if _is_quarantined_name(name):
             continue
         seg_dir = os.path.join(palace_path, name)
         if not os.path.isdir(seg_dir):
@@ -1573,7 +1590,7 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
             continue
 
         stamp = filename_stamp()
-        target = f"{seg_dir}.corrupt-{stamp}"
+        target = f"{seg_dir}{_CORRUPT_SUFFIX}{stamp}"
         try:
             os.rename(seg_dir, target)
             moved.append(target)

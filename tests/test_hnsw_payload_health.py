@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 
 from mempalace.backends.chroma import (
+    _CORRUPT_SUFFIX,
+    _DRIFT_SUFFIX,
     _HNSW_LINK_TO_DATA_MAX_RATIO,
     _hnsw_link_to_data_ratio,
     _segment_appears_healthy,
@@ -261,3 +263,35 @@ def test_quarantine_still_catches_inconsistent_label_maps(tmp_path):
     moved = quarantine_invalid_hnsw_metadata(str(tmp_path))
     assert len(moved) == 1
     assert not seg_dir.is_dir()
+
+
+DATA_BYTES = 100
+BLOATED_LINK_BYTES = int(DATA_BYTES * (_HNSW_LINK_TO_DATA_MAX_RATIO + 1))
+LIVE_SEGMENT_NAME = "seg-live"
+QUARANTINED_SEGMENT_NAME = "seg-quarantined"
+STAMP = "20261029-112208"
+
+
+def _palace_with_segments(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("sqlite placeholder")
+
+    quarantined_segment = palace / f"{QUARANTINED_SEGMENT_NAME}{_CORRUPT_SUFFIX}{STAMP}"
+    live_segment = palace / LIVE_SEGMENT_NAME
+    for segment in (quarantined_segment, live_segment):
+        _write_segment(segment, data_size=DATA_BYTES, link_size=BLOATED_LINK_BYTES)
+
+    return palace, quarantined_segment, live_segment
+
+
+def test_stale_scan_skips_corrupt(tmp_path):
+    """The stale scan leaves quarantined directories at their original names."""
+    palace, quarantined_segment, live_segment = _palace_with_segments(tmp_path)
+    moved_dirs = quarantine_stale_hnsw(palace)
+
+    assert len(moved_dirs) == 1
+    moved_segment = Path(moved_dirs[0])
+    assert moved_segment.name.startswith(f"{live_segment.name}{_DRIFT_SUFFIX}")
+    assert not live_segment.exists()
+    assert quarantined_segment.is_dir()
