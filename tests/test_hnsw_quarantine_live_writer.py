@@ -13,9 +13,11 @@ from mempalace.backends.chroma import (
     _CORRUPT_SUFFIX,
     _DRIFT_SUFFIX,
     _HNSW_LINK_TO_DATA_MAX_RATIO,
+    ChromaBackend,
     quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
 )
+from mempalace.palace import mine_palace_lock
 
 DATA_BYTES = 100
 BLOATED_LINK_BYTES = int(DATA_BYTES * (_HNSW_LINK_TO_DATA_MAX_RATIO + 1))
@@ -161,3 +163,37 @@ def test_metadata_scan_skips_held(tmp_path, mode):
 
     moved_dirs = quarantine_invalid_hnsw_metadata(palace)
     _assert_segment_quarantined(held_segment, moved_dirs, _CORRUPT_SUFFIX)
+
+
+def _hold_palace_lock(palace_path, ready, release):
+    with mine_palace_lock(palace_path):
+        ready.set()
+        release.wait()
+
+
+def _assert_quarantine_deferred(palace_path, held_segment):
+    ChromaBackend._prepare_palace_for_open(palace_path)
+
+    assert held_segment.is_dir()
+    assert palace_path not in ChromaBackend._quarantined_paths
+
+
+def _assert_quarantine_completed(palace_path, held_segment):
+    ChromaBackend._prepare_palace_for_open(palace_path)
+
+    assert not held_segment.exists()
+    assert palace_path in ChromaBackend._quarantined_paths
+
+
+def test_pre_open_waits_for_lock(tmp_path, monkeypatch):
+    """Pre-open quarantine retries after another process releases the lock."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+    palace = tmp_path / "palace"
+    palace_path = str(palace)
+    held_segment = _write_bloated_segment(palace)
+
+    with _holding_in_child(_hold_palace_lock, palace_path):
+        _assert_quarantine_deferred(palace_path, held_segment)
+
+    _assert_quarantine_completed(palace_path, held_segment)

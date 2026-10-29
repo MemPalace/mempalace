@@ -1670,6 +1670,22 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     return moved
 
 
+def _quarantine_hnsw_under_palace_lock(palace_path: str) -> bool:
+    # Avoid the palace -> backends import cycle.
+    from ..palace import MineAlreadyRunning, mine_palace_lock
+
+    try:
+        with mine_palace_lock(palace_path):
+            quarantine_invalid_hnsw_metadata(palace_path)
+            quarantine_stale_hnsw(palace_path)
+    except MineAlreadyRunning:
+        logger.info("Deferred HNSW quarantine for %s: its palace lock is held.", palace_path)
+        # Leave it out of _quarantined_paths so a later open retries.
+        return False
+
+    return True
+
+
 def _fix_blob_seq_ids(palace_path: str) -> None:
     """Fix ChromaDB 0.6.x -> 1.5.x migration bug: BLOB seq_ids -> INTEGER.
 
@@ -2927,9 +2943,9 @@ class ChromaBackend(BaseBackend):
         """
         _fix_missing_collection_type(palace_path)
         _fix_blob_seq_ids(palace_path)
-        if palace_path not in ChromaBackend._quarantined_paths:
-            quarantine_invalid_hnsw_metadata(palace_path)
-            quarantine_stale_hnsw(palace_path)
+
+        needs_quarantine = palace_path not in ChromaBackend._quarantined_paths
+        if needs_quarantine and _quarantine_hnsw_under_palace_lock(palace_path):
             ChromaBackend._quarantined_paths.add(palace_path)
 
     @staticmethod
