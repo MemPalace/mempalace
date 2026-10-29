@@ -639,6 +639,69 @@ def _is_quarantined_name(name: str) -> bool:
     return _DRIFT_SUFFIX in name or _CORRUPT_SUFFIX in name
 
 
+def _process_has_open_segment_file(proc_dir: str, segment_prefix: str) -> bool:
+    fd_dir = os.path.join(proc_dir, "fd")
+    try:
+        descriptors = os.listdir(fd_dir)
+    except OSError:
+        return False
+
+    for descriptor in descriptors:
+        descriptor_path = os.path.join(fd_dir, descriptor)
+        try:
+            open_file = os.readlink(descriptor_path)
+        except OSError:
+            continue
+
+        if open_file.startswith(segment_prefix):
+            return True
+    return False
+
+
+def _process_has_mapped_segment_file(proc_dir: str, segment_prefix: str) -> bool:
+    maps_path = os.path.join(proc_dir, "maps")
+    try:
+        with open(maps_path, encoding="utf-8", errors="replace") as memory_maps:
+            return any(segment_prefix in mapped_region for mapped_region in memory_maps)
+    except OSError:
+        return False
+
+
+def _segment_holder_pid(seg_dir: str) -> Optional[int]:
+    """Return a holder PID from /proc, or None if no holder is visible."""
+    resolved_seg_dir = os.path.realpath(seg_dir)
+    segment_prefix = f"{resolved_seg_dir}{os.sep}"
+    try:
+        process_names = os.listdir("/proc")
+    except OSError:
+        return None
+
+    for process_name in process_names:
+        if not process_name.isdigit():
+            continue
+
+        proc_dir = os.path.join("/proc", process_name)
+        if _process_has_open_segment_file(proc_dir, segment_prefix):
+            return int(process_name)
+        if _process_has_mapped_segment_file(proc_dir, segment_prefix):
+            return int(process_name)
+    return None
+
+
+def _segment_is_held(seg_dir: str) -> bool:
+    # A process with open or mapped files can keep writing into the renamed directory.
+    holder_pid = _segment_holder_pid(seg_dir)
+    if holder_pid is None:
+        return False
+
+    logger.warning(
+        "Skipped HNSW quarantine for %s: process %d holds its files.",
+        seg_dir,
+        holder_pid,
+    )
+    return True
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -715,6 +778,9 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
                 sqlite_mtime - hnsw_mtime,
                 seg_dir,
             )
+            continue
+
+        if _segment_is_held(seg_dir):
             continue
 
         stamp = filename_stamp()
@@ -1587,6 +1653,9 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                         reason = f"invalid dimensionality {dimensionality!r}"
 
         if reason is None:
+            continue
+
+        if _segment_is_held(seg_dir):
             continue
 
         stamp = filename_stamp()
