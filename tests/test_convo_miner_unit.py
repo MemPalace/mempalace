@@ -991,10 +991,14 @@ class TestFileChunksLockedIncremental:
 
             def get(self, ids=None, include=None, where=None, limit=None, offset=0, **kw):
                 if ids is not None:
-                    got = [self.rows[drawer_id] for drawer_id in ids if drawer_id in self.rows]
+                    got = [
+                        (drawer_id, self.rows[drawer_id])
+                        for drawer_id in ids
+                        if drawer_id in self.rows
+                    ]
                     return {
                         "ids": [drawer_id for drawer_id, _v in got],
-                        "metadatas": [meta for _doc, meta in got],
+                        "metadatas": [meta for _doc, (doc, meta) in got],
                     }
                 page = {drawer_id: (doc, meta) for drawer_id, (doc, meta) in self.rows.items()}
                 ordered_ids = list(page)
@@ -1079,8 +1083,12 @@ class TestFileChunksLockedIncremental:
 
             def get(self, ids=None, include=None, where=None, limit=None, offset=0, **kw):
                 if ids is not None:
-                    got = [self.rows[drawer_id] for drawer_id in ids if drawer_id in self.rows]
-                    return {"ids": [d for d, _v in got], "metadatas": [m for _d, m in got]}
+                    got = [
+                        (drawer_id, self.rows[drawer_id])
+                        for drawer_id in ids
+                        if drawer_id in self.rows
+                    ]
+                    return {"ids": [d for d, _v in got], "metadatas": [m for _d, (_doc, m) in got]}
                 ordered_ids = list(self.rows)
                 ordered = [self.rows[d] for d in ordered_ids]
                 end = offset + (limit or len(ordered))
@@ -1165,8 +1173,12 @@ class TestFileChunksLockedIncremental:
 
             def get(self, ids=None, include=None, where=None, limit=None, offset=0, **kw):
                 if ids is not None:
-                    got = [self.rows[drawer_id] for drawer_id in ids if drawer_id in self.rows]
-                    return {"ids": [d for d, _v in got], "metadatas": [m for _d, m in got]}
+                    got = [
+                        (drawer_id, self.rows[drawer_id])
+                        for drawer_id in ids
+                        if drawer_id in self.rows
+                    ]
+                    return {"ids": [d for d, _v in got], "metadatas": [m for _d, (_doc, m) in got]}
                 ordered_ids = list(self.rows)
                 ordered = [self.rows[d] for d in ordered_ids]
                 end = offset + (limit or len(ordered))

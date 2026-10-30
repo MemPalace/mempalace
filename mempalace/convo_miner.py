@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ from typing import Optional
 
 from .backends import PalaceNotFoundError
 from .entities import entities_metadata
-from .fsio import encoding_metadata, open_source_file
+from .fsio import open_source_file
 from .ids import (
     ID_RECIPE,
     make_convo_drawer_id,
@@ -35,10 +36,13 @@ from .normalize import (
 from .palace import (
     CHUNKER_VERSIONS,
     CONVO_CHUNKER_VERSION,
+    DRAWER_UPSERT_BATCH_SIZE,
     MINE_ABORTS,
     NORMALIZE_VERSION,
     SKIP_DIRS,
+    _metadata_matches_extract_mode,
     _validate_palace_fts5_after_mine,
+    assert_no_collisions,
     file_already_mined,
     get_collection,
     mine_lock,
@@ -985,7 +989,7 @@ def _file_chunks_locked(
 
     Combines the per-file serialization that prevents concurrent agents
     from duplicating work (via mine_lock). Transcripts are not assumed
-    immutable: a Claude Code session keeps appending to its own file
+    immutable: an interactive coding session keeps appending to its own file
     while active, and /compact or /clear can rewrite one in place — which
     is exactly what the incremental path absorbs and what a schema bump
     escalates to the full rebuild.
@@ -1031,6 +1035,12 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
+        # Stable per-file content hash, stamped only on chunk 0 so
+        # multi-conversation files don't O(N²)-duplicate it; it lets
+        # prefetch_content_hashes and the incremental byte-compare tell a
+        # content change from a pure re-file (diary_ingest recipe).
+        first_content = chunks[0].get("content", "") if chunks else ""
+        content_hash = hashlib.sha256(first_content.encode("utf-8", "surrogateescape")).hexdigest()
         chunk_total = len(chunks)
         docs, ids, metas, room_counts_delta = _plan_pass_drawers(
             chunks,
@@ -1047,25 +1057,7 @@ def _file_chunks_locked(
             source_dir_ino=source_dir_ino,
         )
 
-        # A full (delete-then-upsert) rebuild must leave no mtime-stamped
-        # partials behind: an incomplete set would otherwise be trusted
-        # by file_already_mined / prefetch_mined_set and the missing
-        # exchanges would never be re-mined (#2183 / #2122). The
-        # incremental path does not apply this — its untouched stored
-        # rows are exactly what a crash should preserve — so the helper
-        # accepts a flag.
-        def _cleanup_partial() -> None:
-            try:
-                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-                if delete_ids:
-                    collection.delete(ids=delete_ids)
-            except Exception:
-                logger.warning(
-                    "Failed to clean partial convo drawers after upsert error for %s",
-                    source_file,
-                    exc_info=True,
-                )
-
+        drawers_added = 0
         try:
             # Decide the write path. The incremental path is safe only when
             # every stored row for this file was filed at the current
@@ -1111,53 +1103,25 @@ def _file_chunks_locked(
                 )
                 return drawers_added, room_counts_delta, False
 
-            # Legacy full rebuild
-            try:
-                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-                if delete_ids:
-                    collection.delete(ids=delete_ids)
-            except Exception as exc:
-                print(
-                    f"  ! [error] stale-drawer purge failed for {source_file!r} "
-                    f"({exc!r}); leaving existing drawers untouched, will retry "
-                    f"on the next mine",
-                    file=sys.stderr,
-                )
-                logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
-                return 0, room_counts_delta, PURGE_FAILED
-
-            # Batch the full pass into bounded upserts so large transcripts
-            # keep most of the embedding speedup without one huge
-            # Chroma/SQLite request.
-            for batch_start in range(0, len(ids), DRAWER_UPSERT_BATCH_SIZE):
-                slice_end = min(batch_start + DRAWER_UPSERT_BATCH_SIZE, len(ids))
-                assert_no_collisions(
-                    list(zip(ids[batch_start:slice_end], metas[batch_start:slice_end])),
-                    collection,
-                )
-                try:
-                    collection.upsert(
-                        documents=docs[batch_start:slice_end],
-                        ids=ids[batch_start:slice_end],
-                        metadatas=metas[batch_start:slice_end],
-                    )
-                    drawers_added += slice_end - batch_start
-                except Exception as e:
-                    if "already exists" not in str(e).lower():
-                        raise
-        except Exception as exc:
-            # A successful earlier batch has the source's current mtime and
-            # chunk_total. Leaving those drawers behind would make the next
-            # run treat the incomplete set as fully filed (#2183 / #2122).
-            #
-            # Skip if the incremental pass already rolled back its own
-            # upserts (PR #2439 P1): ``_apply_incremental_pass`` ran a
-            # targeted delete of only the partially-upserted new chunks and
-            # left the unchanged byte-identical drawers in place — running
-            # ``_cleanup_partial()`` here would delete those survivors too,
-            # exactly the data loss this fix prevents.
-            if not getattr(exc, _INCREMENTAL_ROLLED_BACK, False):
-                _cleanup_partial()
+            # Legacy full rebuild: delegate to the canonical contract so
+            # the purge order, bounded batching (read from palace globals),
+            # the one-high chunk_total marker, and the
+            # StaleDrawerPurgeFailed / partial-keep semantics all match
+            # what the rest of the palace does and what the unit tests pin.
+            filed = write_file_drawers(
+                collection,
+                source_file,
+                list(zip(ids, docs, metas)),
+                extract_mode=extract_mode,
+                prune=True,
+            )
+            drawers_added = int(filed)
+            return drawers_added, room_counts_delta, False
+        except Exception:
+            # Self-managing write paths: write_file_drawers keeps the new
+            # drawers marked unfinished on a purge or batch failure, and
+            # the incremental pass rolls back its own partial upserts, so a
+            # plain re-raise is all that is left to do here.
             raise
     return drawers_added, room_counts_delta, False
 
