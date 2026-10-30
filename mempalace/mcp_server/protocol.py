@@ -35,6 +35,12 @@ def _fit_response(result, *, tool_name: Optional[str]) -> tuple[object, str]:
         lists = [(k, v) for k, v in result.items() if isinstance(v, list) and v]
         if lists:
             key, items = max(lists, key=lambda kv: len(kv[1]))
+            # A tool that already capped its own result (_cap_facts) reported
+            # the true row count and why; trimming further must not replace
+            # that with the length of the already-capped list.
+            already_capped = result.get("truncated") is True
+            prior_total = result.get("total") if already_capped else None
+            prior_notice = result.get("truncation_notice") if already_capped else None
             # Serialized length grows monotonically with the item count, so the
             # largest prefix that still fits can be found by bisection.
             best: Optional[tuple[dict, str]] = None
@@ -47,12 +53,17 @@ def _fit_response(result, *, tool_name: Optional[str]) -> tuple[object, str]:
                 # rather than leaving it describing the untruncated list.
                 if isinstance(trial.get("count"), int) and trial["count"] == len(items):
                     trial["count"] = mid
-                trial["total"] = len(items)
+                trial["total"] = prior_total if isinstance(prior_total, int) else len(items)
                 trial["truncated"] = True
-                trial["truncation_notice"] = (
+                backstop_notice = (
                     f"{len(items) - mid} more item(s) omitted (showing first {mid} of "
                     f"{len(items)}); the full response was {original_chars} chars, over "
                     f"the {MAX_RESPONSE_CHARS}-char cap — narrow your query"
+                )
+                trial["truncation_notice"] = (
+                    f"{prior_notice}. Then {backstop_notice}"
+                    if isinstance(prior_notice, str) and prior_notice
+                    else backstop_notice
                 )
                 trial_text = json.dumps(trial, indent=2, ensure_ascii=False)
                 if len(trial_text) <= MAX_RESPONSE_CHARS:

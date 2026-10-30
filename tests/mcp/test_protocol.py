@@ -2470,6 +2470,23 @@ class TestOversizedResponseBackstop:
         assert 0 < len(parsed["facts"]) < 200
         assert "narrow your query" in parsed["truncation_notice"]
 
+    def test_backstop_keeps_the_total_of_an_already_capped_result(self, monkeypatch):
+        """A result _cap_facts already cut keeps its true total when trimmed again."""
+        payload = {
+            "entity": "hub",
+            "facts": [{"object": "c" * 200, "i": i} for i in range(100)],
+            "count": 100,
+            "total": 250,
+            "truncated": True,
+            "truncation_notice": "150 more fact(s) omitted (showing first 100 of 250)",
+        }
+        _result, text = self._fit(monkeypatch, payload)
+        parsed = json.loads(text)
+        assert parsed["total"] == 250
+        assert 0 < len(parsed["facts"]) < 100
+        assert parsed["truncation_notice"].startswith("150 more fact(s) omitted")
+        assert "narrow your query" in parsed["truncation_notice"]
+
     def test_existing_notice_field_survives_truncation(self, monkeypatch):
         """Truncation reports in its own field and never overwrites a tool's ``notice``.
 
