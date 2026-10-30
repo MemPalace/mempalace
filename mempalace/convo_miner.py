@@ -21,7 +21,7 @@ from typing import Optional
 
 from .backends import PalaceNotFoundError
 from .entities import entities_metadata
-from .fsio import open_source_file
+from .fsio import encoding_metadata, open_source_file
 from .ids import (
     ID_RECIPE,
     make_convo_drawer_id,
@@ -337,6 +337,8 @@ def _plan_pass_drawers(
     chunk_total,
     content_hash,
     source_dir_ino=None,
+    transforms: str = "",
+    source_encoding: str = "utf-8",
 ):
     """Build this pass's ``(docs, ids, metas)`` plus per-room counters.
 
@@ -381,19 +383,25 @@ def _plan_pass_drawers(
             # ``sync`` can tell a neighbour in the same directory
             # from one on a volume mounted there since (#2320).
             meta["source_dir_ino"] = source_dir_ino
+        if transforms:
+            # Every drawer of a file whose parse changed its text: the
+            # RFC 002 transformations it applied.
+            meta["transforms"] = transforms
+        meta.update(encoding_metadata(source_encoding))
+        if extract_mode in CHUNKER_VERSIONS:
+            # Conversation rows carry the chunker version so the mined-set
+            # checks treat an older/missing row as stale and rebuild it once
+            # (#2591 #2590). Stamped in the single place this pass's metadata
+            # is built, so the legacy and incremental paths stay byte-identical
+            # (#2336).
+            key, version = CHUNKER_VERSIONS[extract_mode]
+            meta[key] = version
         # Stamp content_hash only on chunk 0 so multi-conversation
         # privacy-export hashes are not O(N²)-duplicated across every
         # chunk row. ``prefetch_content_hashes`` still finds them —
         # it scans all drawers and splits comma-joined hash fields.
         if content_hash is not None and chunk.get("chunk_index", 0) == 0:
             meta["content_hash"] = content_hash
-        if extract_mode == "exchange":
-            # Conversation rows carry the chunker version so the mined-set
-            # checks treat an older/missing exchange row as stale and rebuild
-            # it once (#2591). Stamped in the single place this pass's
-            # metadata is built, so the legacy and incremental paths stay
-            # byte-identical (#2336).
-            meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
         metas.append(meta)
     return docs, ids, metas, room_counts_delta
 
@@ -1031,10 +1039,16 @@ def _file_chunks_locked(
         # a stable mtime + any surviving drawer permanently skips the file
         # and the missing exchanges never come back.
         filed_at = datetime.now().isoformat()
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
+        # Prefer the mtime captured with the read (fstat at open time): an
+        # interactive session can append to its own transcript between that
+        # read and the moment we stat again, so a fresh getmtime would record
+        # a time this pass did not actually ingest. Fall back to a live stat
+        # only when the read did not yield one.
+        if source_mtime is None:
+            try:
+                source_mtime = os.path.getmtime(source_file)
+            except OSError:
+                source_mtime = None
         # Stable per-file content hash, stamped only on chunk 0 so
         # multi-conversation files don't O(N²)-duplicate it; it lets
         # prefetch_content_hashes and the incremental byte-compare tell a
@@ -1055,6 +1069,8 @@ def _file_chunks_locked(
             chunk_total,
             content_hash,
             source_dir_ino=source_dir_ino,
+            transforms=transforms,
+            source_encoding=source_encoding,
         )
 
         drawers_added = 0
