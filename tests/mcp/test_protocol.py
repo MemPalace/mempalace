@@ -246,6 +246,25 @@ class TestColdStartDiagnostics:
             "importing mcp_server created the palace root, re-arming the kill-switch"
         )
 
+    def test_uncaught_exception_reaches_the_default_log_file(self, tmp_path):
+        """A crash leaves its traceback in the default log, past the mempalace filter.
+
+        The log file only accepts records from ``mempalace``/``mempalace.*``
+        loggers (_MempalaceLogFilter), so the excepthook must log through one of
+        them or the crash record is silently dropped from the file.
+        """
+        env_overrides = {
+            "MEMPALACE_LOG_FILE": None,
+            **self._clean_home_env(tmp_path, with_palace=True),
+        }
+        extra = "from mempalace import mcp_server  # noqa: F401\nraise RuntimeError('boom-1902')\n"
+        result = self._run_main(env_overrides, extra_code=extra)
+        assert result.returncode != 0
+        log_path = tmp_path / "home_with_palace" / ".mempalace" / "mcp_server.log"
+        body = log_path.read_text(encoding="utf-8")
+        assert "Uncaught exception" in body, body
+        assert "RuntimeError: boom-1902" in body, body
+
     def test_log_file_set_attaches_file_handler_and_persists_startup_line(self, tmp_path):
         log_path = tmp_path / "mcp.log"
         result = self._run_main({"MEMPALACE_LOG_FILE": str(log_path)})
