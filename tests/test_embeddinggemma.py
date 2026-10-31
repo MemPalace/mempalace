@@ -694,6 +694,9 @@ def _patch_provider_sensitive_session(monkeypatch, verdict):
         def __init__(self, providers):
             self.providers = list(providers)
 
+        def get_providers(self):
+            return self.providers
+
         def get_outputs(self):
             return [_ProviderOut("last_hidden_state"), _ProviderOut("sentence_embedding")]
 
@@ -745,6 +748,23 @@ def test_degenerate_accelerator_output_falls_back_to_cpu(
     ], "the failed session must be rebuilt CPU-only"
     assert ef._providers == ["CPUExecutionProvider"], "the fallback must be visible on the EF"
     assert "CoreMLExecutionProvider" in caplog.text and "falling back" in caplog.text
+
+
+@pytest.mark.parametrize("bad", ["nan", "zeros"])
+def test_device_label_updates_after_the_accelerator_health_check(
+    patched_lazy_load, monkeypatch, bad
+):
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+    _patch_provider_sensitive_session(monkeypatch, _accelerator_returns(bad))
+    ef = embedding.get_embedding_function("coreml", "embeddinggemma")
+    assert embedding.describe_device("coreml", "embeddinggemma") == "coreml"
+
+    ef(["texto de prueba"])
+
+    assert embedding.describe_device("coreml", "embeddinggemma") == "cpu"
 
 
 def test_healthy_accelerator_is_kept(patched_lazy_load, monkeypatch):

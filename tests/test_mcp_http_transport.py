@@ -21,6 +21,7 @@ import http.client
 import json
 import logging
 import os
+import socket
 import socketserver
 import ssl
 import threading
@@ -83,6 +84,39 @@ def http_server():
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+def test_listen_backlog_admits_connection_burst():
+    """A burst of simultaneous clients must not be dropped while nothing accepts.
+
+    ``socketserver.TCPServer`` defaults to ``request_queue_size = 5``: with the
+    accept loop busy (or before its first accept), the 7th+ pending connection
+    is dropped and the client sees a connect timeout. The MCP HTTP server
+    fronts a palace behind a single RWLock, so a burst of session handshakes
+    arriving while one slow request holds the lock is the normal case, not an
+    anomaly. Bind the production server but never start ``serve_forever`` —
+    nothing accepts, so every connection parks in the listen queue, the
+    deterministic worst case for a busy accept loop.
+    """
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    conns = []
+    established = 0
+    try:
+        for _ in range(20):
+            try:
+                conns.append(socket.create_connection(("127.0.0.1", port), timeout=2.0))
+                established += 1
+            except OSError:
+                pass
+        assert established == 20, (
+            f"listen backlog dropped {20 - established}/20 pending connections "
+            f"(request_queue_size={type(httpd).request_queue_size})"
+        )
+    finally:
+        for s in conns:
+            s.close()
+        httpd.server_close()
 
 
 def test_post_dispatches_to_handle_request(http_server):
@@ -396,6 +430,63 @@ class TestEmbeddingDoesNotHoldTheHttpLock:
         assert not errors, errors
         assert result["total_drawers"] == 0
         assert elapsed < 0.5, f"status waited on diary embedding: {elapsed:.3f}s"
+
+    def test_status_completes_while_checkpoint_embeds(self, http_server, monkeypatch):
+        """A multi-item checkpoint must yield the lock during each item's embed.
+
+        ``mempalace_checkpoint`` is a composite of ``check_duplicate`` /
+        ``add_drawer`` / ``diary_write``; ``check_duplicate`` and
+        ``diary_write`` already release the request lock around embedding
+        inference (``embedding_release``), while ``add_drawer`` does not —
+        which is why the composite must carry the flag itself rather than
+        inherit it. Held monolithically, an N-item checkpoint blocks every
+        palace request for the whole batch; with the release installed, a
+        concurrent read lands inside the first item's embed window.
+        """
+        port, _ = http_server
+        first_embed_started = threading.Event()
+
+        def slow_checkpoint(**_kwargs):
+            from mempalace.embedding import embedding_section
+
+            for item in range(2):
+                with embedding_section():
+                    if item == 0:
+                        first_embed_started.set()
+                    time.sleep(1.0)
+            return {"added": [], "duplicates": [], "errors": []}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_checkpoint"], "handler", slow_checkpoint)
+
+        def quick_status(**_kwargs):
+            return {"total_drawers": 0, "wings": {}, "rooms": {}}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_status"], "handler", quick_status)
+
+        errors = []
+
+        def writer():
+            try:
+                self._call(
+                    port,
+                    "mempalace_checkpoint",
+                    {"items": [{"wing": "w", "room": "r", "content": "x"}]},
+                    req_id=71,
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        assert first_embed_started.wait(timeout=3)
+        started_at = time.perf_counter()
+        result = self._call(port, "mempalace_status", {}, req_id=72)
+        elapsed = time.perf_counter() - started_at
+        thread.join(timeout=5)
+
+        assert not errors, errors
+        assert result["total_drawers"] == 0
+        assert elapsed < 0.9, f"status waited on the checkpoint's embedding: {elapsed:.3f}s"
 
     def test_status_completes_while_search_embeds(self, http_server, monkeypatch):
         port, _ = http_server

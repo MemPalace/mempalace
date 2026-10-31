@@ -223,8 +223,8 @@ class TestComputeHallways:
         assert len(aya_lumi) == 1
         assert aya_lumi[0]["co_occurrence_count"] == 2
 
-    def test_persists_to_json(self, tmp_path, monkeypatch):
-        """After compute, _load_hallways() returns the new records."""
+    def test_persists_to_the_store(self, tmp_path, monkeypatch):
+        """After compute, _load_hallways() returns the new records from the store."""
         hallway_file = _use_tmp_hallway_file(monkeypatch, tmp_path)
         col = _fake_collection(
             [
@@ -233,7 +233,8 @@ class TestComputeHallways:
             ]
         )
         hallways_mod.compute_hallways_for_wing("wing_aya", col=col, min_count=2)
-        assert hallway_file.exists()
+        assert (tmp_path / "hallways.sqlite3").exists()
+        assert not hallway_file.exists()
         loaded = hallways_mod._load_hallways()
         assert any({h["entity_a"], h["entity_b"]} == {"Aya", "Lumi"} for h in loaded)
 

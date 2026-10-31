@@ -2281,8 +2281,8 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     Absence is not proven for it, which routes it to the probe.
 
     What happens there depends on the interpreter, measured on 3.9, 3.11, 3.12,
-    3.13 and 3.14: up to 3.12 ``pathname2url`` raises ``UnicodeEncodeError``
-    while building the URI, before SQLite is reached, and from 3.13 it
+    3.13 and 3.14: up to 3.11 ``pathname2url`` raises ``UnicodeEncodeError``
+    while building the URI, before SQLite is reached, and from 3.12 it
     percent-encodes the byte and the database opens normally. The first is a
     ``ValueError`` subclass, and the absence gate's docstring promises callers
     never see one; ``palace._validate_palace_fts5_after_mine`` and
@@ -2322,7 +2322,7 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     assert all("quick_check failed" in error for error in errors)
     assert not any("named pipe" in error for error in errors)
     assert repair.sqlite_integrity_status(palace).checked is True
-    if sys.version_info < (3, 13):
+    if sys.version_info < (3, 12):
         assert errors, "pathname2url raises here, and the probe has to report that"
 
 

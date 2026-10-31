@@ -173,6 +173,26 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     return strip_lone_surrogates(value)
 
 
+def sanitize_kg_lookup(value: str, field_name: str = "value") -> str:
+    """Validate a knowledge-graph value that is only looked up, not created.
+
+    For arguments that name an already-stored subject or object (query,
+    invalidate, supersede's old value, timeline). Such a value may predate
+    the length cap or have been written by a path that skips it, so it must
+    stay addressable: same checks as sanitize_kg_value but with no length
+    limit. Names that are being written still go through sanitize_kg_value.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+
+    value = value.strip()
+
+    if "\x00" in value:
+        raise ValueError(f"{field_name} contains null bytes")
+
+    return strip_lone_surrogates(value)
+
+
 # ISO-8601 temporal validator for knowledge-graph temporal parameters
 # (as_of, valid_from, valid_to, ended).
 #
@@ -735,13 +755,16 @@ class MempalaceConfig:
 
     @property
     def hallway_file(self):
-        """Path to the hallway file, sibling of palace_path.
+        """Path to ``hallways.json``, sibling of palace_path.
 
         Mirrors ``tunnel_file`` so within-wing hallway state is scoped to the
         configured palace and survives palace rebuilds (it does not live in
-        ChromaDB which can be recreated). Prior to this property the path was
-        hardcoded under ``~/.mempalace/hallways.json`` and multiple palaces on
-        one host silently shared one file (see ``hallways._legacy_hallway_file``).
+        ChromaDB which can be recreated). The records now live in
+        ``hallways.sqlite3`` beside this path; the first hallway write imports
+        this file once (see ``hallways._import_json_once``). Prior to this
+        property the path was hardcoded under ``~/.mempalace/hallways.json``
+        and multiple palaces on one host silently shared one file (see
+        ``hallways._legacy_hallway_file``).
         """
         return os.path.join(os.path.dirname(self.palace_path), "hallways.json")
 

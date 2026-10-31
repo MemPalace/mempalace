@@ -517,6 +517,84 @@ def _sqlite_embedding_count(palace_path: str, collection_name: str) -> Optional[
     return _read_db(palace_path, read)
 
 
+#: Ceiling on how many drawer ids :func:`searchable_coverage` will hold in
+#: memory. The measurement materializes the live ids and the two searchable
+#: id sets; a palace past this cap gets an unmeasured verdict rather than a
+#: diagnostic command that allocates without bound.
+_SEARCHABLE_COVERAGE_MAX_IDS = 1_000_000
+
+
+def _sqlite_embedding_ids(palace_path: str, collection_name: str) -> Optional[set]:
+    """Live drawer ids for ``collection_name``, or ``None`` when unreadable.
+
+    The same join :func:`_sqlite_embedding_count` counts over, returning the
+    ids instead of the total so the two can never disagree about what "live"
+    means. Gives up past :data:`_SEARCHABLE_COVERAGE_MAX_IDS` rather than
+    materializing an unbounded set.
+    """
+
+    def read(conn):
+        cursor = conn.execute(
+            """
+            SELECT e.embedding_id
+            FROM embeddings e
+            JOIN segments s ON e.segment_id = s.id
+            JOIN collections c ON s.collection = c.id
+            WHERE c.name = ?
+            """,
+            (collection_name,),
+        )
+        ids = set()
+        for (embedding_id,) in cursor:
+            ids.add(embedding_id)
+            if len(ids) > _SEARCHABLE_COVERAGE_MAX_IDS:
+                return None
+        return ids
+
+    return _read_db(palace_path, read)
+
+
+def _wal_pending_ids(palace_path: str, collection_name: str) -> Optional[set]:
+    """Drawer ids still carrying a vector in chroma's write-ahead log.
+
+    Chroma replays ``embeddings_queue`` into the in-memory HNSW index when
+    it opens a collection, so a row here is as searchable as one in the
+    flushed index — that is why a palace below its ``hnsw:sync_threshold``
+    answers queries correctly with no index on disk at all.
+
+    Scoped by topic: the queue is one table for the whole palace, and the
+    topic ends with the collection's own uuid, so drawers and closets do
+    not count toward each other. ``None`` on any sqlite error, including a
+    schema without the columns this reads — an unscoped count would be
+    worse than no measurement.
+    """
+
+    def read(conn):
+        row = conn.execute(
+            "SELECT id FROM collections WHERE name = ?",
+            (collection_name,),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        cursor = conn.execute(
+            """
+            SELECT DISTINCT id
+            FROM embeddings_queue
+            WHERE vector IS NOT NULL
+              AND topic LIKE ?
+            """,
+            (f"%/{row[0]}",),
+        )
+        ids = set()
+        for (queued_id,) in cursor:
+            ids.add(queued_id)
+            if len(ids) > _SEARCHABLE_COVERAGE_MAX_IDS:
+                return None
+        return ids
+
+    return _read_db(palace_path, read)
+
+
 def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optional[bool]:
     """Whether ``collection_name`` holds any drawer, read from chroma.sqlite3.
 

@@ -189,15 +189,23 @@ _STARTUP_INTEGRITY_MAX_MB_DEFAULT = 512.0
 #
 # The existing per-operation palace lock serializes individual writes, but it
 # cannot make another long-lived Chroma PersistentClient forget stale in-memory
-# HNSW/FTS state. Hold the same per-palace mine lock for this MCP process
-# lifetime. A peer MCP process can still serve read tools, but mutating tools
-# refuse before touching Chroma or the knowledge graph.
+# HNSW/FTS state. A mutating tool call takes the same per-palace mine lock and,
+# unless the lease was already held (writable HTTP owns it for the server's
+# life), call_tool releases it again when the call ends, closing the storage
+# handles with it. A stdio server that wrote once and then went idle used to
+# keep the lease until its process exited, so every peer session stayed
+# read-only for hours. A contended call waits briefly for the holder's call
+# to finish, then refuses; read tools are never gated.
 _MCP_WRITER_LOCK_CM = None
 _MCP_WRITER_READ_ONLY = False
 _MCP_WRITER_LOCK_FAILED = False
 _MCP_WRITER_LOCK_ERROR = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
+# How long a mutating call waits for a peer's call to drop the lease. Peers
+# hold it for one call, so this covers a write in flight; a long mine still
+# refuses with -32001.
+_MCP_WRITER_CALL_WAIT_SECONDS = 10.0
 
 # Gate sets, derived in mempalace.tool_capabilities (see the flags there).
 _MUTATING_TOOLS = _tool_capabilities.MUTATING_TOOLS
@@ -394,6 +402,20 @@ def _release_mcp_writer_lock() -> None:
         lock_cm.__exit__(None, None, None)
 
 
+def _end_call_writer_lease(held_before: bool) -> None:
+    """Release a lease the finished tool call took; keep one held before it.
+
+    A release failure is logged, not raised: the call's own result (often a
+    completed write) must still reach the client.
+    """
+    if held_before:
+        return
+    try:
+        _release_mcp_writer_lock()
+    except Exception:
+        logger.exception("Failed to release the MCP writer lease after a tool call")
+
+
 def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     """Acquire this process's per-palace MCP writer lease.
 
@@ -403,8 +425,9 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     Self-healing: a server that came up read-only (a peer held the lease at
     startup) RE-ATTEMPTS the non-blocking flock on every subsequent call.
     ``_mcp_peer_writer_refusal`` invokes this on each mutating tool, so once
-    the original holder exits — the OS releases its flock on process death —
-    the next mutating call transparently promotes this server to writer, with
+    the holder's call ends (``call_tool`` releases a per-call lease) or the
+    holder exits (the OS releases its flock on process death), the next
+    mutating call transparently promotes this server to writer, with
     no restart. The flock is arbitrated by the kernel (LOCK_NB), so two servers
     can never both win the retry. ``_MCP_WRITER_READ_ONLY`` and
     ``_MCP_WRITER_LOCK_FAILED`` are now only status flags for the last attempt;
@@ -511,6 +534,11 @@ def _mcp_peer_writer_refusal(req_id, tool_name: str):
         return None
 
     ok, reason = _acquire_mcp_writer_lock()
+    # Only contention waits; a setup failure would not fix itself in time.
+    deadline = time.monotonic() + _MCP_WRITER_CALL_WAIT_SECONDS
+    while not ok and _MCP_WRITER_READ_ONLY and time.monotonic() < deadline:
+        time.sleep(0.1)
+        ok, reason = _acquire_mcp_writer_lock()
     if ok:
         return None
 

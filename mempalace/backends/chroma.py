@@ -48,11 +48,14 @@ from .base import (
     validate_write_batch,
 )
 from .chroma_sqlite import (
+    _SEARCHABLE_COVERAGE_MAX_IDS,
     CandidateRows as CandidateRows,
     MetadataRecoveryPending as MetadataRecoveryPending,
     _sqlite_embedding_count,
+    _sqlite_embedding_ids,
     _sqlite_recent_records,
     _string_equalities,
+    _wal_pending_ids,
     not_bookkeeping_sql as not_bookkeeping_sql,
     sqlite_diary_rows as sqlite_diary_rows,
     sqlite_documents_for_ids as sqlite_documents_for_ids,
@@ -67,6 +70,9 @@ from .chroma_sqlite import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DRIFT_SUFFIX = ".drift-"
+_CORRUPT_SUFFIX = ".corrupt-"
 
 
 # chromadb persists EmbeddingGemma 2's EF config on the collection and, on
@@ -628,6 +634,77 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return _hnsw_metadata_marker_intact(seg_dir)
 
 
+def _is_segment_dir_name(name: str) -> bool:
+    return "-" in name and not name.startswith(".")
+
+
+def _is_quarantined_name(name: str) -> bool:
+    return _DRIFT_SUFFIX in name or _CORRUPT_SUFFIX in name
+
+
+def _process_has_open_segment_file(proc_dir: str, segment_prefix: str) -> bool:
+    fd_dir = os.path.join(proc_dir, "fd")
+    try:
+        descriptors = os.listdir(fd_dir)
+    except OSError:
+        return False
+
+    for descriptor in descriptors:
+        descriptor_path = os.path.join(fd_dir, descriptor)
+        try:
+            open_file = os.readlink(descriptor_path)
+        except OSError:
+            continue
+
+        if open_file.startswith(segment_prefix):
+            return True
+    return False
+
+
+def _process_has_mapped_segment_file(proc_dir: str, segment_prefix: str) -> bool:
+    maps_path = os.path.join(proc_dir, "maps")
+    try:
+        with open(maps_path, encoding="utf-8", errors="replace") as memory_maps:
+            return any(segment_prefix in mapped_region for mapped_region in memory_maps)
+    except OSError:
+        return False
+
+
+def _segment_holder_pid(seg_dir: str) -> Optional[int]:
+    """Return a holder PID from /proc, or None if no holder is visible."""
+    resolved_seg_dir = os.path.realpath(seg_dir)
+    segment_prefix = f"{resolved_seg_dir}{os.sep}"
+    try:
+        process_names = os.listdir("/proc")
+    except OSError:
+        return None
+
+    for process_name in process_names:
+        if not process_name.isdigit():
+            continue
+
+        proc_dir = os.path.join("/proc", process_name)
+        if _process_has_open_segment_file(proc_dir, segment_prefix):
+            return int(process_name)
+        if _process_has_mapped_segment_file(proc_dir, segment_prefix):
+            return int(process_name)
+    return None
+
+
+def _segment_is_held(seg_dir: str) -> bool:
+    # A process with open or mapped files can keep writing into the renamed directory.
+    holder_pid = _segment_holder_pid(seg_dir)
+    if holder_pid is None:
+        return False
+
+    logger.warning(
+        "Skipped HNSW quarantine for %s: process %d holds its files.",
+        seg_dir,
+        holder_pid,
+    )
+    return True
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -664,7 +741,10 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         return []
 
     for name in entries:
-        if "-" not in name or name.startswith(".") or ".drift-" in name:
+        if not _is_segment_dir_name(name):
+            continue
+
+        if _is_quarantined_name(name):
             continue
 
         seg_dir = os.path.join(palace_path, name)
@@ -703,8 +783,11 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
             )
             continue
 
+        if _segment_is_held(seg_dir):
+            continue
+
         stamp = filename_stamp()
-        target = f"{seg_dir}.drift-{stamp}"
+        target = f"{seg_dir}{_DRIFT_SUFFIX}{stamp}"
 
         if header_corrupt:
             reason = (
@@ -855,6 +938,18 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
     pickle_path = os.path.join(palace_path, segment_id, "index_metadata.pickle")
     if not os.path.isfile(pickle_path):
         return None
+    id_to_label = _hnsw_id_to_label(pickle_path)
+    return None if id_to_label is None else len(id_to_label)
+
+
+def _hnsw_id_to_label(pickle_path: str) -> Optional[dict]:
+    """Return the ``id_to_label`` mapping inside a segment metadata pickle.
+
+    ``None`` when the file cannot be unpickled or does not carry the
+    mapping. Shared by :func:`_hnsw_element_count`, which needs only its
+    size, and :func:`_hnsw_indexed_ids`, which needs the drawer ids
+    themselves, so both read the pickle the same guarded way.
+    """
     try:
         pd = _SafePersistentDataUnpickler.load(pickle_path)
         # ChromaDB serializes PersistentData differently across versions:
@@ -865,12 +960,31 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
             id_to_label = pd.get("id_to_label")
         else:
             id_to_label = getattr(pd, "id_to_label", None)
-        if isinstance(id_to_label, dict):
-            return len(id_to_label)
-        return None
+        return id_to_label if isinstance(id_to_label, dict) else None
     except Exception:
-        logger.debug("_hnsw_element_count failed for %s", pickle_path, exc_info=True)
+        logger.debug("_hnsw_id_to_label failed for %s", pickle_path, exc_info=True)
         return None
+
+
+def _hnsw_indexed_ids(palace_path: str, segment_id: str) -> Optional[set]:
+    """Drawer ids the flushed HNSW metadata holds, for coverage accounting.
+
+    An absent pickle returns the **empty set**, not ``None``: a segment
+    that has never flushed holds zero indexed ids, and that is a measured
+    zero rather than an unknown. :func:`searchable_coverage` needs the two
+    apart, because "nothing flushed yet" is the ordinary state of every
+    palace below its ``hnsw:sync_threshold`` and must not stop the
+    measurement.
+
+    ``None`` is reserved for a pickle that is there but unreadable, where
+    counting zero flushed ids would understate coverage and raise a false
+    alarm on a palace that is fine.
+    """
+    pickle_path = os.path.join(palace_path, segment_id, "index_metadata.pickle")
+    if not os.path.isfile(pickle_path):
+        return set()
+    id_to_label = _hnsw_id_to_label(pickle_path)
+    return None if id_to_label is None else set(id_to_label)
 
 
 # Divergence threshold: chromadb's HNSW flushes asynchronously, so HNSW
@@ -1401,6 +1515,118 @@ def _hnsw_capacity_status_uncached(
     return out
 
 
+#: Coverage at or above this reads as "every drawer accounted for". The
+#: remaining margin absorbs a drawer written or deleted while the three
+#: reads below run, which is a one-row discrepancy, not a lost corpus.
+_SEARCHABLE_COVERAGE_ALERT = 0.99
+
+
+def searchable_coverage(
+    palace_path: str, collection_name: str = "mempalace_drawers"
+) -> dict[str, Any]:
+    """Share of live drawers that vector search can actually reach.
+
+    :func:`hnsw_capacity_status` measures the flushed index against sqlite,
+    which leaves it with nothing to say whenever ``index_metadata.pickle``
+    is absent — the ordinary state of every palace holding fewer records
+    than its ``hnsw:sync_threshold``, since chroma writes that pickle only
+    when a compaction fires. A healthy sub-threshold palace and one that
+    lost its index therefore report the identical ``status: unknown``.
+
+    This measures the thing the pickle was standing in for. A drawer is
+    searchable when its vector is **either** flushed into HNSW **or** still
+    pending in the write-ahead log, so::
+
+        coverage = |live ids ∩ (flushed ids ∪ pending ids)| / |live ids|
+
+    The union matters: chroma purges the queue as it compacts, so after a
+    flush the vectors are split across the two sets and neither alone
+    describes a healthy palace. So does the *set* union rather than the sum
+    of the two counts — a re-upserted drawer sits in both sets, and a sum
+    lets that overlap paper over a genuine gap, which would leave the
+    meter unable to go red.
+
+    Returns a dict with ``coverage`` (``None`` when it could not be
+    measured), ``live_count``, ``covered_count``, ``flushed_count``,
+    ``pending_count``, ``unsearchable_count``, ``degraded`` and
+    ``message``. Never raises. ``flushed_count`` and ``pending_count``
+    partition ``covered_count``: a drawer in both sets counts as flushed,
+    so the two always add up to the drawers search can reach.
+
+    Not called from :func:`hnsw_capacity_status`: that probe runs ahead of
+    every search, duplicate check and status call, and reading three id
+    sets is far past its budget. This is for ``repair-status``, where an
+    operator has asked a question and the answer is worth the read.
+
+    Reads live ids first, then the queue, then the pickle. A drawer written
+    during the measurement lands outside the live set and is ignored; one
+    flushed and purged mid-run was in the pickle before its queue row went,
+    so the later read still sees it. Only a drawer *deleted* mid-run can
+    show as uncovered, by one row, which is what the
+    :data:`_SEARCHABLE_COVERAGE_ALERT` margin is for.
+    """
+    out: dict[str, Any] = {
+        "coverage": None,
+        "live_count": None,
+        "covered_count": None,
+        "flushed_count": None,
+        "pending_count": None,
+        "unsearchable_count": None,
+        "degraded": False,
+        "message": "",
+    }
+    try:
+        live_ids = _sqlite_embedding_ids(palace_path, collection_name)
+        if live_ids is None:
+            # Only now worth a second query: the caller needs to know whether
+            # the read failed or the palace is simply past the id ceiling.
+            live_count = _sqlite_embedding_count(palace_path, collection_name)
+            if live_count is not None and live_count > _SEARCHABLE_COVERAGE_MAX_IDS:
+                out["live_count"] = live_count
+                out["message"] = (
+                    f"searchable coverage not measured: {live_count:,} drawers is past the "
+                    f"{_SEARCHABLE_COVERAGE_MAX_IDS:,}-id ceiling this check holds in memory"
+                )
+            else:
+                out["message"] = "searchable coverage unavailable: could not read the drawer ids"
+            return out
+        out["live_count"] = len(live_ids)
+        if not live_ids:
+            return out
+
+        pending_ids = _wal_pending_ids(palace_path, collection_name)
+        if pending_ids is None:
+            out["message"] = "searchable coverage unavailable: could not read the write log"
+            return out
+
+        segment_id = _vector_segment_id(palace_path, collection_name)
+        flushed_ids = None if segment_id is None else _hnsw_indexed_ids(palace_path, segment_id)
+        if flushed_ids is None:
+            out["message"] = "searchable coverage unavailable: could not read the flushed index"
+            return out
+
+        flushed_live = live_ids & flushed_ids
+        searchable = flushed_live | (live_ids & pending_ids)
+        # A re-upserted drawer sits in both sets; counting it under flushed
+        # only keeps the two buckets a partition of ``covered_count``.
+        out["flushed_count"] = len(flushed_live)
+        out["pending_count"] = len(searchable) - len(flushed_live)
+        out["covered_count"] = len(searchable)
+        out["unsearchable_count"] = len(live_ids) - len(searchable)
+        out["coverage"] = len(searchable) / len(live_ids)
+        if out["coverage"] < _SEARCHABLE_COVERAGE_ALERT:
+            out["degraded"] = True
+            out["message"] = (
+                f"{out['unsearchable_count']:,} of {out['live_count']:,} drawers are in "
+                "neither the flushed HNSW index nor the pending write log, so vector "
+                "search cannot return them"
+            )
+    except Exception:
+        logger.debug("searchable_coverage failed", exc_info=True)
+        out["message"] = "searchable coverage probe raised; skipping"
+    return out
+
+
 def _pin_hnsw_threads(collection) -> None:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 
@@ -1504,7 +1730,10 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
 
     moved: list[str] = []
     for name in entries:
-        if "-" not in name or name.startswith(".") or ".drift-" in name or ".corrupt-" in name:
+        if not _is_segment_dir_name(name):
+            continue
+
+        if _is_quarantined_name(name):
             continue
         seg_dir = os.path.join(palace_path, name)
         if not os.path.isdir(seg_dir):
@@ -1572,8 +1801,11 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
         if reason is None:
             continue
 
+        if _segment_is_held(seg_dir):
+            continue
+
         stamp = filename_stamp()
-        target = f"{seg_dir}.corrupt-{stamp}"
+        target = f"{seg_dir}{_CORRUPT_SUFFIX}{stamp}"
         try:
             os.rename(seg_dir, target)
             moved.append(target)
@@ -1582,6 +1814,29 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
             logger.exception("Failed to quarantine invalid HNSW metadata in %s", seg_dir)
 
     return moved
+
+
+def _quarantine_hnsw_under_palace_lock(palace_path: str) -> bool:
+    # Avoid the palace -> backends import cycle.
+    from ..palace import MineAlreadyRunning, mine_palace_lock
+
+    try:
+        with mine_palace_lock(palace_path):
+            quarantine_invalid_hnsw_metadata(palace_path)
+            quarantine_stale_hnsw(palace_path)
+    except MineAlreadyRunning:
+        logger.info("Deferred HNSW quarantine for %s: its palace lock is held.", palace_path)
+        # Leave it out of _quarantined_paths so a later open retries.
+        return False
+    except OSError as exc:
+        logger.warning(
+            "Skipped pre-open HNSW quarantine for %s: palace lock unavailable (%s).",
+            palace_path,
+            exc,
+        )
+        return False
+
+    return True
 
 
 def _fix_blob_seq_ids(palace_path: str) -> None:
@@ -2841,9 +3096,9 @@ class ChromaBackend(BaseBackend):
         """
         _fix_missing_collection_type(palace_path)
         _fix_blob_seq_ids(palace_path)
-        if palace_path not in ChromaBackend._quarantined_paths:
-            quarantine_invalid_hnsw_metadata(palace_path)
-            quarantine_stale_hnsw(palace_path)
+
+        needs_quarantine = palace_path not in ChromaBackend._quarantined_paths
+        if needs_quarantine and _quarantine_hnsw_under_palace_lock(palace_path):
             ChromaBackend._quarantined_paths.add(palace_path)
 
     @staticmethod

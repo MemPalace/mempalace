@@ -505,6 +505,118 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
     assert mcp_server._MCP_WRITER_READ_ONLY is False
 
 
+def _stub_write_tool(monkeypatch, mcp_server, handler):
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_add_drawer",
+        {
+            "description": "test write tool",
+            "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}},
+            "handler": handler,
+        },
+    )
+
+
+def _call_write_tool(mcp_server):
+    return mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {"name": "mempalace_add_drawer", "arguments": {"content": "hi"}},
+        }
+    )
+
+
+def test_mutating_call_releases_writer_lease(monkeypatch, config):
+    """A stdio server must not keep the lease after its write finishes.
+
+    It used to hold the flock until the process exited, so one idle session
+    left every peer session read-only for hours.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    mcp_server._release_mcp_writer_lock()
+    held_during = {}
+
+    def handler(**kwargs):
+        held_during["value"] = mcp_server._MCP_WRITER_LOCK_CM is not None
+        return {"success": True}
+
+    _stub_write_tool(monkeypatch, mcp_server, handler)
+    response = _call_write_tool(mcp_server)
+
+    assert "error" not in response, response
+    assert held_during["value"] is True
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+    _assert_palace_lock_free(config.palace_path)
+
+
+def test_mutating_call_keeps_lease_it_did_not_take(monkeypatch, config):
+    """Writable HTTP takes the lease at startup; a call must not drop it."""
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    mcp_server._release_mcp_writer_lock()
+    assert mcp_server._acquire_mcp_writer_lock() == (True, "")
+    _stub_write_tool(monkeypatch, mcp_server, lambda **kwargs: {"success": True})
+
+    response = _call_write_tool(mcp_server)
+
+    assert "error" not in response, response
+    assert mcp_server._MCP_WRITER_LOCK_CM is not None
+    mcp_server._release_mcp_writer_lock()
+
+
+def test_contended_mutating_call_waits_for_peer(monkeypatch):
+    """A peer's lease lasts one call, so a short wait beats refusing."""
+    from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls = {"count": 0}
+
+    def busy_twice(palace_path):
+        calls["count"] += 1
+        if calls["count"] <= 2:
+            raise palace.MineAlreadyRunning(f"palace {palace_path} is held by pid=999")
+        return _DummyLock()
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", busy_twice)
+    monkeypatch.setattr(mcp_server, "_discard_mcp_storage_handles", lambda: None)
+    _stub_write_tool(monkeypatch, mcp_server, lambda **kwargs: {"success": True})
+
+    response = _call_write_tool(mcp_server)
+
+    assert "error" not in response, response
+    assert calls["count"] == 3
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+
+
+def test_contended_mutating_call_refuses_after_wait(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    def always_busy(palace_path):
+        raise palace.MineAlreadyRunning(f"palace {palace_path} is held by pid=999")
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", always_busy)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_CALL_WAIT_SECONDS", 0.3)
+    _stub_write_tool(monkeypatch, mcp_server, lambda **kwargs: pytest.fail("handler ran"))
+
+    response = _call_write_tool(mcp_server)
+
+    assert response["error"]["code"] == -32001
+    assert response["error"]["data"]["failure_kind"] == "peer_contention"
+
+
 def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):
     from mempalace import mcp_server
 

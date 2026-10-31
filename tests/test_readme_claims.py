@@ -106,7 +106,6 @@ TOOL_COUNT_CLAIM_FILES = {
     ".cursor-plugin/marketplace.json": 1,
     ".dsh-plugin/README.md": 1,
     ".dsh-plugin/cordis.patch.yml": 2,
-    "integrations/openclaw/SKILL.md": 1,
     "skills/mempalace/SKILL.md": 1,
     "website/guide/claude-code.md": 1,
     "website/guide/lightweight-mcp.md": 2,

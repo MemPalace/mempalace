@@ -16,6 +16,9 @@ from ..hub_client import (
 # hook-budgeted one, so it waits.
 _HUB_MINE_TIMEOUT_S = 3600.0
 _HUB_SEARCH_TIMEOUT_S = 600.0
+# A sync scans drawer metadata and can take as long as a mine on a large
+# palace; the forwarder waits like the mine one does.
+_HUB_SYNC_TIMEOUT_S = 3600.0
 _HUB_SEARCH_MAX_RESULTS = 100
 
 
@@ -303,4 +306,148 @@ def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> boo
     if not result.get("success", False):
         print(f"mempalace: hub mine failed: {result.get('error', 'unknown')}", file=sys.stderr)
         sys.exit(1)
+    return True
+
+
+def _sync_args_forwardable(args) -> bool:
+    """Only forward syncs the ``mempalace_sync`` MCP tool can express.
+
+    The tool takes a single ``project_dir``: a sync scoped to two or more
+    project roots (``dir`` plus ``--root``) keeps the direct path — where a
+    held writer lease still surfaces as the existing MineAlreadyRunning
+    error rather than syncing a silently narrowed scope. An explicit
+    backend override also keeps the direct path, like mine.
+    """
+    if _backend_arg(args):
+        return False
+    roots = []
+    if getattr(args, "dir", None):
+        roots.append(args.dir)
+    roots.extend(getattr(args, "root", None) or [])
+    if len(roots) > 1:
+        return False
+    return True
+
+
+def _print_hub_sync_report(report: dict, dry_run: bool) -> None:
+    """Render a hub sync report using the CLI's human-readable shape."""
+    removed_suffix = "(would remove)" if dry_run else "(removed)"
+    print(f"  Scanned:        {report['scanned']}")
+    print(f"  Kept:           {report['kept']}")
+    print(f"  Gitignored:     {report['gitignored']}  {removed_suffix}")
+    print(f"  Missing:        {report['missing']}  {removed_suffix}")
+    print(f"  Unresolved:     {report['unresolved']}  (kept)")
+    print(f"  No source:      {report['no_source']}  (kept)")
+    print(f"  Out of scope:   {report['out_of_scope']}  (kept)")
+
+    by_source = report.get("by_source") or {}
+    if by_source:
+        top = sorted(by_source.items(), key=lambda kv: -kv[1])[:5]
+        label = "Top sources to remove" if dry_run else "Top sources removed"
+        print(f"\n  {label}:")
+        for src, n in top:
+            print(f"    {src}  ({n})")
+
+    if report["unresolved"]:
+        print("\n  Unresolved drawers are kept: nothing here could show their source file is gone.")
+        unresolved_sources = report.get("unresolved_by_source") or {}
+        if unresolved_sources:
+            top = sorted(unresolved_sources.items(), key=lambda kv: -kv[1])[:5]
+            for src, n in top:
+                print(f"    {src}  ({n})")
+            rest = len(unresolved_sources) - len(top)
+            if rest:
+                print(f"    and {rest} more source file(s)")
+
+    if dry_run:
+        if report["gitignored"] + report["missing"] > 0:
+            print("\n  Re-run with --apply to commit these deletions.")
+    else:
+        print(
+            f"\n  Removed {report['removed_drawers']} drawers, {report['removed_closets']} closets."
+        )
+
+    print(f"\n{'=' * 55}\n")
+
+
+def _forward_sync_to_hub(args, palace_path: str) -> bool:
+    """Run this sync inside the palace's HTTP hub, if one is alive.
+
+    A live hub (``mempalace serve``) holds the MCP writer lease for its
+    whole lifetime, so a direct sync from this process would be refused
+    with MineAlreadyRunning — even a dry run. The hub itself may
+    sync (the palace lock is process-re-entrant there), so hand it
+    the job over HTTP, the way mine and search already do.
+
+    Returns True when the hub handled the sync (this function has already
+    printed the outcome and exited non-zero on failure). Returns False when
+    there is no usable hub — the caller proceeds with the direct path.
+    Once the hub has accepted the request there is no fallback: the job may
+    already be running, and re-syncing directly would race it.
+    """
+    import urllib.error
+
+    hub = HubClient.discover(palace_path, include_self=True)
+    if hub is None or hub.read_only or not hub.healthy():
+        return False
+
+    project_dirs = []
+    if getattr(args, "dir", None):
+        project_dirs.append(os.path.expanduser(args.dir))
+    project_dirs.extend(os.path.expanduser(r) for r in (getattr(args, "root", None) or []))
+
+    arguments: dict = {"apply": not bool(getattr(args, "dry_run", True))}
+    if project_dirs:
+        arguments["project_dir"] = os.path.abspath(project_dirs[0])
+    if getattr(args, "wing", None):
+        arguments["wing"] = args.wing
+
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Sync -- Gitignore-aware drawer prune")
+    print(f"{'=' * 55}")
+    print(f"  Palace:   {palace_path}")
+    if getattr(args, "wing", None):
+        print(f"  Wing:     {args.wing}")
+    for p in project_dirs:
+        print(f"  Project:  {p}")
+    if getattr(args, "dry_run", True):
+        print("  Mode:     DRY RUN (no deletions)")
+    else:
+        print("  Mode:     APPLY (deleting drawers)")
+    print(f"{'-' * 55}\n")
+
+    print(f"mempalace: forwarding sync to palace hub {hub.base_url} (pid {hub.pid})")
+    try:
+        payload = hub.call_tool("mempalace_sync", arguments, timeout=_HUB_SYNC_TIMEOUT_S)
+    except urllib.error.HTTPError as exc:
+        # The hub answered - the request reached it, so no direct fallback.
+        print(f"mempalace: hub rejected sync ({exc.code} {exc.reason})", file=sys.stderr)
+        sys.exit(1)
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        print(
+            f"mempalace: hub at {hub.base_url} did not complete the sync ({exc}); "
+            "not retrying directly - the hub may still be running the job. "
+            f"Set {_HUB_FORWARD_ENV}=0 to force direct syncs.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if payload.get("error"):
+        err = payload["error"]
+        print(
+            f"mempalace: hub refused sync: {err.get('message', 'unknown error')}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        result = tool_result(payload)
+    except (KeyError, IndexError, TypeError, ValueError):
+        print("mempalace: hub returned an unrecognized sync response", file=sys.stderr)
+        sys.exit(1)
+
+    if not result.get("success", False):
+        print(f"mempalace: hub sync failed: {result.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+    _print_hub_sync_report(result, bool(getattr(args, "dry_run", True)))
     return True

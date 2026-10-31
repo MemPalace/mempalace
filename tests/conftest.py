@@ -29,6 +29,46 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
+# ── Drop the developer's own MemPalace settings for the session ─────────
+# Isolating HOME is not enough on a machine that configures MemPalace through
+# the environment. A contributor who exports MEMPALACE_BACKEND=pgvector and
+# MEMPALACE_PGVECTOR_DSN (the documented way to attach a shared backend) hands
+# those to every test, and tests that spawn a subprocess pass them on. Two
+# things then go wrong:
+#
+#   * Tests that build a palace in tmp_path select the ambient backend instead
+#     of the local default, and fail as BackendMismatchError once the on-disk
+#     artifacts disagree with the selected backend.
+#   * A test that redirects HOME and then runs a hook writes to the configured
+#     remote database. The palace path under the temp HOME hashes to a new
+#     table prefix, so the write lands in its own tables rather than the
+#     contributor's real ones — observed on a shared pgvector instance, where
+#     two `tests/test_antigravity_hooks_shell.py` cases left stray tables
+#     behind in the production database.
+#
+# CI sets none of these, so clearing them is what makes a local run reproduce
+# CI rather than the developer's own configuration. Values are captured for
+# the restore in ``_isolate_home`` and only ambient ones are removed: a test
+# that sets MEMPALACE_* through monkeypatch or an explicit subprocess env is
+# unaffected, because that happens after this module is imported.
+_PRESERVE_TEST_ENV = {
+    "MEMPALACE_DOCS_GA_ID",
+    "MEMPALACE_PGVECTOR_LIVE_DSN",
+    "MEMPALACE_PGVECTOR_LIVE_URL",
+    "MEMPALACE_QDRANT_LIVE_API_KEY",
+    "MEMPALACE_QDRANT_LIVE_URL",
+    "MEMPALACE_REQUIRE_NATIVE",
+    "MEMPALACE_RUN_EG2_AUDIO",
+    "MEMPALACE_RUN_EG2_IMAGE",
+    "MEMPALACE_TEST_EMBEDDINGGEMMA_ONNX",
+}
+for _var in [
+    _k
+    for _k in os.environ
+    if _k.startswith(("MEMPALACE_", "MEMPAL_")) and _k not in _PRESERVE_TEST_ENV
+]:
+    _original_env[_var] = os.environ.pop(_var)
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
