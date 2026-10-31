@@ -1828,6 +1828,13 @@ def _quarantine_hnsw_under_palace_lock(palace_path: str) -> bool:
         logger.info("Deferred HNSW quarantine for %s: its palace lock is held.", palace_path)
         # Leave it out of _quarantined_paths so a later open retries.
         return False
+    except OSError as exc:
+        logger.warning(
+            "Skipped pre-open HNSW quarantine for %s: palace lock unavailable (%s).",
+            palace_path,
+            exc,
+        )
+        return False
 
     return True
 
