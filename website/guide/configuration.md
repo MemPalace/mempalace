@@ -86,6 +86,23 @@ Changing only the device keeps the same vector space and needs no rebuild.
 Changing the model, revision, dimension, or modalities requires re-embedding;
 do not mix the new model's vectors with an existing palace's index.
 
+### Other Mac hardware
+
+Device selection checks runtime capabilities and model compatibility; it does
+not depend on a particular M-series chip. The MiniLM CPU selection above also
+applies on Intel Macs and to ONNX Runtime builds without CoreML, provided the
+installed dependencies support that Mac and macOS version. CoreML being listed
+as available does not establish that a model runs on a GPU or Neural Engine.
+
+The optional EmbeddingGemma 2 install has a narrower platform limit. It requires
+`torch>=2.14.0`, whose official macOS wheels are for Apple Silicon; PyTorch
+[ended official Intel Mac support after 2.2.x](https://pytorch.org/blog/pytorch2-2/).
+Selecting `embedding_device=cpu` does not make that extra installable on Intel
+Macs. Use an ONNX model with compatible dependencies, or a configured
+`openai-compat` endpoint, on those machines. CPU fallback applies to a backend
+that is already installed; macOS and Python requirements still depend on its
+packages. Available MPS support is checked at runtime on Apple Silicon.
+
 ## Storage backends
 
 ChromaDB is the default and needs no configuration. MemPalace also ships a
