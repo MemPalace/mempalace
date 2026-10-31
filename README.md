@@ -337,6 +337,13 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 - ~300 MB disk for the embedding model. Pick it with `mempalace init --embedding-model`: `embeddinggemma` (embeddinggemma-300m, multilingual, 100+ languages, recommended) or `minilm` (all-MiniLM-L6-v2, English-only, ~30 MB). See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
 - Optional — compute embeddings on a server instead of locally. Set `embedding_model: "openai-compat"` in `~/.mempalace/config.json` together with `embedding_api_url` / `embedding_api_model` (and `embedding_api_key` if the server needs auth) to use any OpenAI-compatible `/v1/embeddings` endpoint — LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted server (e.g. a larger multilingual or GPU-served embedder). Each key is overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. When the endpoint is on your machine or LAN, no content leaves your network. Switching to it requires `mempalace repair rebuild-index` (different vector space).
 
+For GPU setup, see the [model/device support table](website/guide/configuration.md#embedding-models-and-devices).
+On Apple Silicon, CPU is expected for MiniLM and EmbeddingGemma ONNX: MiniLM
+disables CoreML, while EmbeddingGemma excludes it from automatic selection to
+avoid invalid vectors. Experimental [EmbeddingGemma 2](docs/embeddinggemma2.md)
+supports PyTorch MPS with health checks and CPU fallback. Changing models on an
+existing palace requires re-embedding; changing only the device does not.
+
 No API key is required for the core benchmark path.
 
 ## Docs

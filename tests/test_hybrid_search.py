@@ -242,6 +242,21 @@ def test_hybrid_rank_breaks_score_ties_by_authored_at():
     assert results[1]["metadata"]["authored_at"] == "2026-06-21T10:00:00.000Z"
 
 
+def test_hybrid_rank_tiebreak_compares_timestamp_instants():
+    for nested in (False, True):
+        results = []
+        for timestamp in ("2026-09-09T08:00:00Z", "2026-09-09T01:00:00-09:00"):
+            result = {"text": "alpha beta gamma", "distance": 0.2}
+            metadata = {"authored_at": timestamp}
+            result.update({"metadata": metadata} if nested else metadata)
+            results.append(result)
+        newer = results[1]
+
+        _hybrid_rank(results, "alpha beta gamma")
+
+        assert results[0] is newer
+
+
 def test_hybrid_rank_tiebreak_handles_top_level_authored_at():
     """The search_memories path puts authored_at at the top level (no `metadata`
     nesting); the tie-break must read it there too."""

@@ -1336,7 +1336,8 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
 
     Claude Code stores the absolute working directory on most message
     types (tool_use, tool_result, user/assistant turns), but not all
-    (e.g. queue-operation lines lack it). Scans up to 200 lines. Returns
+    (e.g. queue-operation lines lack it). Codex rollouts store it as
+    ``payload.cwd`` on their ``session_meta`` line. Scans up to 200 lines. Returns
     the path with forward slashes and no trailing slash, with a git
     worktree under ``<project>/.claude/worktrees/`` collapsed to
     ``<project>``, or ``None`` if the file is unreadable, empty, or
@@ -1358,6 +1359,10 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
                 except (json.JSONDecodeError, ValueError):
                     continue
                 cwd = data.get("cwd")
+                # Codex rollouts record it one level down, on the
+                # session_meta / turn_context payload.
+                if not cwd and isinstance(data.get("payload"), dict):
+                    cwd = data["payload"].get("cwd")
                 if not cwd or not isinstance(cwd, str):
                     continue
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")

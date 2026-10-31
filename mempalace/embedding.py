@@ -35,10 +35,10 @@ Three embedding-model options are available, selected via
 Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
 in ``~/.mempalace/config.json``):
 
-* ``auto`` — prefer CUDA ▸ CoreML ▸ DirectML, fall back to CPU
+* ``auto`` — prefer an available, model-compatible accelerator, then CPU
 * ``cpu`` — force CPU (the historical default)
 * ``cuda`` — NVIDIA GPU via ``onnxruntime-gpu`` (``pip install mempalace[gpu]``)
-* ``coreml`` — Apple Neural Engine (macOS)
+* ``coreml`` — Apple Core ML (macOS; see the model restrictions below)
 * ``dml`` — DirectML (Windows / AMD / Intel GPUs)
 
 ``embeddinggemma2`` runs on PyTorch rather than ONNX Runtime and reads the same
@@ -48,6 +48,8 @@ ONNX-only ``coreml`` and ``dml`` read as ``auto`` there, and ``mps`` reads as
 
 Requesting an unavailable accelerator emits a warning and falls back to CPU
 rather than hard-failing — mining must still work on a laptop without CUDA.
+MiniLM's ChromaDB session builder removes CoreML because it is less optimized
+than CPU, so both ``auto`` and an explicit ``coreml`` resolve to CPU for it.
 The same applies to an accelerator that runs but computes the model wrongly:
 ``embeddinggemma`` on CoreML returns NaN or all-zero vectors without raising,
 so ``auto`` never selects CoreML for it and an explicitly requested one is
@@ -130,6 +132,13 @@ _AUTO_ORDER = [
     ("DmlExecutionProvider", "dml"),
 ]
 
+# ChromaDB's MiniLM session builder removes CoreML on every load. Exclude it
+# before caching or reporting the provider so a cold status check stays cheap
+# and agrees with both the upstream and thread-capped session builders.
+_UNSUPPORTED_MODEL_PROVIDERS = {
+    "minilm": {"CoreMLExecutionProvider"},
+}
+
 # Providers that must never be picked *automatically* for a given model,
 # keyed by model name.
 #
@@ -181,12 +190,14 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
     Falls back to CPU (with a one-shot warning) when the requested
     accelerator is not compiled into the installed ``onnxruntime``.
 
-    ``model`` gates ``_AUTO_PROVIDER_DENYLIST``: a provider known to produce
-    wrong results for that model is skipped under ``auto``. Explicit device
-    requests are left alone — a user who names an accelerator gets it.
+    Providers removed by a model's session builder are excluded for every
+    device setting. Providers known to produce wrong results are skipped
+    under ``auto``; explicit requests for those are checked at model load.
     """
     device = (device or "auto").strip().lower()
-    denied = _AUTO_PROVIDER_DENYLIST.get((model or "").strip().lower(), frozenset())
+    model = (model or "minilm").strip().lower()
+    unsupported = _UNSUPPORTED_MODEL_PROVIDERS.get(model, frozenset())
+    denied = unsupported | _AUTO_PROVIDER_DENYLIST.get(model, frozenset())
 
     try:
         import onnxruntime as ort
@@ -222,6 +233,15 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
     preferred = requested[0]
     if preferred == "CPUExecutionProvider":
         return (requested, "cpu")
+
+    if preferred in unsupported:
+        if first_time("embedding", "unsupported-device", model, device):
+            logger.warning(
+                "CoreML is disabled by ChromaDB's MiniLM session builder — "
+                "falling back to CPU for embedding_device=%r.",
+                device,
+            )
+        return (["CPUExecutionProvider"], "cpu")
 
     if preferred not in available:
         if first_time("embedding", "device", device):
@@ -1397,34 +1417,38 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
 def describe_device(device: Optional[str] = None, model: Optional[str] = None) -> str:
     """Return a short human-readable label for the resolved embedding backend.
 
-    Used by the miner CLI header / MCP status so users can see at a glance
-    whether GPU acceleration engaged — or, for the ``openai-compat`` backend,
-    that embeddings are served by a remote endpoint rather than local hardware
-    (in which case the ``embedding_device`` accelerator label is irrelevant).
+    Before inference, report model-compatible provider selection without
+    loading a model. Once a session exists, report its enabled providers so
+    a runtime CPU fallback is visible. An enabled accelerator may still run
+    unsupported graph nodes on CPU. HTTP embeddings report the endpoint.
     """
-    if current_model_name(model).startswith("embeddinggemma2:"):
+    from .config import MempalaceConfig
+
+    cfg = None
+    if model is None:
+        cfg = MempalaceConfig()
+        model = cfg.embedding_model
+    model = _resolve_embedding_model(model)
+    if model == "openai-compat":
+        url = (cfg or MempalaceConfig()).embedding_api_url
+        return f"openai-compat ({url})" if url else "openai-compat"
+    if device is None:
+        device = (cfg or MempalaceConfig()).embedding_device
+    if model == "embeddinggemma2":
         ef = get_embedding_function(device=device, model="embeddinggemma2")
         # An explicit device torch cannot use warns now, before the caller
         # prints the label, and the label says so.
         ef.warn_if_device_unavailable()
         return f"embeddinggemma2 ({ef.device_label()}, float32)"
-    if device is None:
-        from .config import MempalaceConfig
-
-        cfg = MempalaceConfig()
-        if cfg.embedding_model == "openai-compat":
-            url = cfg.embedding_api_url
-            return f"openai-compat ({url})" if url else "openai-compat"
-        device = cfg.embedding_device
-        if model is None:
-            # The resolved device depends on the model (_AUTO_PROVIDER_DENYLIST),
-            # so the label would otherwise name a provider we won't use.
-            model = cfg.embedding_model
-    if model is not None:
-        # Label the provider list the factory will actually build with, which
-        # for an unrecognized model is minilm's.
-        model = _resolve_embedding_model(model)
-    _, effective = _resolve_providers(device, model)
+    providers, effective = _resolve_providers(device, model)
+    ef = _EF_CACHE.get((model, tuple(providers)))
+    # MiniLM's model is a cached_property: reading it normally would load
+    # weights during status. Inspect only an already-published session.
+    session_key = "_session" if model == "embeddinggemma" else "model"
+    session = getattr(ef, "__dict__", {}).get(session_key)
+    if session is not None:
+        active = session.get_providers()
+        return next((name for provider, name in _AUTO_ORDER if provider in active), "cpu")
     return effective
 
 

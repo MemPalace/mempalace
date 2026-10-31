@@ -1,5 +1,6 @@
 import logging
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -391,17 +392,34 @@ def test_auto_skips_coreml_for_embeddinggemma(monkeypatch):
     )
 
 
-def test_auto_still_picks_coreml_for_other_models(monkeypatch):
-    """The denylist is per-model — it must not disable CoreML globally."""
+@pytest.mark.parametrize("model", ["minilm", None])
+def test_auto_skips_coreml_for_minilm(monkeypatch, model):
+    """MiniLM's session builder removes CoreML, so do not advertise it."""
     monkeypatch.setattr(
         "onnxruntime.get_available_providers",
         lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
     )
 
-    assert embedding._resolve_providers("auto", "minilm") == (
-        ["CoreMLExecutionProvider", "CPUExecutionProvider"],
-        "coreml",
+    assert embedding._resolve_providers("auto", model) == (
+        ["CPUExecutionProvider"],
+        "cpu",
     )
+
+
+@pytest.mark.parametrize("has_coreml", [True, False])
+def test_explicit_coreml_for_minilm_warns_once_and_uses_cpu(monkeypatch, caplog, has_coreml):
+    monkeypatch.setattr(
+        "onnxruntime.get_available_providers",
+        lambda: (["CoreMLExecutionProvider"] if has_coreml else []) + ["CPUExecutionProvider"],
+    )
+    for _ in range(2):
+        assert embedding._resolve_providers("coreml", "minilm") == (
+            ["CPUExecutionProvider"],
+            "cpu",
+        )
+    warnings = [record.getMessage() for record in caplog.records if "MiniLM" in record.getMessage()]
+    assert len(warnings) == 1
+    assert "CPU" in warnings[0] and "CoreML" in warnings[0]
 
 
 def test_auto_still_picks_cuda_for_embeddinggemma(monkeypatch):
@@ -442,7 +460,10 @@ def test_cuda_missing_warns_with_gpu_extra(monkeypatch, caplog):
 def test_coreml_missing_warns_with_coreml_extra(monkeypatch, caplog):
     monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
 
-    assert embedding._resolve_providers("coreml") == (["CPUExecutionProvider"], "cpu")
+    assert embedding._resolve_providers("coreml", "embeddinggemma") == (
+        ["CPUExecutionProvider"],
+        "cpu",
+    )
     assert "mempalace[coreml]" in caplog.text
 
 
@@ -703,8 +724,67 @@ def test_describe_device_reports_the_model_aware_resolution(monkeypatch):
         lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
     )
 
-    assert embedding.describe_device("auto", "minilm") == "coreml"
+    assert embedding.describe_device("auto", "minilm") == "cpu"
     assert embedding.describe_device("auto", "embeddinggemma") == "cpu"
+
+
+@pytest.mark.parametrize("device", ["auto", "coreml", "mps"])
+@pytest.mark.parametrize("threads", [0, 2])
+@pytest.mark.parametrize("has_coreml", [False, True], ids=["cpu-only", "coreml-available"])
+def test_minilm_device_label_matches_the_built_session(monkeypatch, device, threads, has_coreml):
+    """Exercise both Chroma's session builder and the thread-capped override."""
+    import onnxruntime as ort
+
+    builds = []
+
+    def session(_path, *, providers, sess_options):
+        builds.append(list(providers))
+        return SimpleNamespace(get_providers=lambda: list(providers))
+
+    monkeypatch.setattr(ort, "InferenceSession", session)
+    available = (["CoreMLExecutionProvider"] if has_coreml else []) + ["CPUExecutionProvider"]
+    monkeypatch.setattr(ort, "get_available_providers", lambda: available)
+    monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: threads)
+    ef = embedding.get_embedding_function(device, "minilm")
+
+    assert embedding.describe_device(device, "minilm") == "cpu"
+    assert builds == []  # A status check must not load or download a model.
+    assert ef.model.get_providers() == ["CPUExecutionProvider"]
+    assert builds == [["CPUExecutionProvider"]]
+    assert embedding.describe_device(device, "minilm") == "cpu"
+
+
+@pytest.mark.parametrize("threads", [0, 2])
+def test_device_label_observes_a_loaded_session_cpu_fallback(monkeypatch, threads):
+    """ORT can load a CPU-only session even when CUDA was requested."""
+    import onnxruntime as ort
+
+    monkeypatch.setattr(
+        ort, "get_available_providers", lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    )
+    monkeypatch.setattr(
+        ort,
+        "InferenceSession",
+        lambda *args, **kwargs: SimpleNamespace(get_providers=lambda: ["CPUExecutionProvider"]),
+    )
+    monkeypatch.setattr(embedding, "_resolve_intra_op_threads", lambda: threads)
+    ef = embedding.get_embedding_function("cuda", "minilm")
+    assert embedding.describe_device("cuda", "minilm") == "cuda"
+    assert ef.model.get_providers() == ["CPUExecutionProvider"]
+    assert embedding.describe_device("cuda", "minilm") == "cpu"
+
+
+def test_describe_device_uses_the_configured_model_with_an_explicit_device(monkeypatch):
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "embeddinggemma")
+    seen = []
+
+    def resolve(device, model=None):
+        seen.append((device, model))
+        return ["CPUExecutionProvider"], "cpu"
+
+    monkeypatch.setattr(embedding, "_resolve_providers", resolve)
+    assert embedding.describe_device("auto") == "cpu"
+    assert seen == [("auto", "embeddinggemma")]
 
 
 # ---------------------------------------------------------------------------

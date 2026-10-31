@@ -59,6 +59,9 @@ _MARKER_FILENAME = "qdrant_backend.json"
 _PAYLOAD_ID = "mempalace_id"
 _PAYLOAD_DOCUMENT = "document"
 _PAYLOAD_METADATA = "metadata"
+_KEYWORD_PAYLOAD_FIELDS = ("wing", "room", "source_file")
+# IDs per has_id request when fetching vectors for locally matched points.
+_VECTOR_ID_BATCH = 1024
 _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
 # Page size for Qdrant's /points/scroll cursor. 4096 (up from the original
 # 256) cuts REST round-trips ~16x for any full-collection walk.
@@ -429,9 +432,7 @@ def _condition(field: str, expression: Any) -> tuple[Optional[dict], list[dict]]
     return {"key": key, "match": {"value": expression}}, []
 
 
-def _requires_local_filter(where: Optional[dict], where_document: Optional[dict] = None) -> bool:
-    if where_document:
-        return True
+def _contains_or_operator(where: Optional[dict]) -> bool:
     if not where:
         return False
     stack = [where]
@@ -440,15 +441,23 @@ def _requires_local_filter(where: Optional[dict], where_document: Optional[dict]
         if not isinstance(node, dict):
             continue
         for key, value in node.items():
-            if key in ("$or", "$contains"):
+            if key == "$or":
                 return True
             if isinstance(value, dict):
-                if "$contains" in value:
-                    return True
                 stack.append(value)
             elif isinstance(value, list):
                 stack.extend(item for item in value if isinstance(item, dict))
     return False
+
+
+def _requires_local_filter(where: Optional[dict], where_document: Optional[dict] = None) -> bool:
+    if where_document:
+        return True
+    if not where:
+        return False
+    if _contains_or_operator(where):
+        return True
+    return _qdrant_filter(where) is None
 
 
 def _qdrant_filter(where: Optional[dict]) -> Optional[dict]:
@@ -461,8 +470,9 @@ def _qdrant_filter(where: Optional[dict]) -> Optional[dict]:
         if key == "$and":
             for clause in expected or []:
                 child = _qdrant_filter(clause)
-                if child:
-                    must.append(child)
+                if child is None:
+                    return None
+                must.append(child)
             continue
         if key == "$or":
             return None
@@ -497,6 +507,22 @@ def _text_any_filter(query: str) -> Optional[dict]:
     return {"must": [{"key": _PAYLOAD_DOCUMENT, "match": {"text_any": " ".join(tokens)}}]}
 
 
+@dataclass
+class _QdrantScrollCursor:
+    """Resume point for sequential ``get(limit, offset)`` paging.
+
+    Only *where to resume* is kept between calls: no rows are buffered and no
+    "exhausted" state is trusted, so a later call always asks the server for
+    points past the last one it handed out. Writes from this or any other
+    handle are therefore visible to the next page.
+    """
+
+    key: tuple[str, bool]
+    position: int
+    resume_from: Any  # point id to read next (inclusive), or None
+    after: Any  # last point id handed out (exclusive), used when resume_from is None
+
+
 class QdrantCollection(BaseCollection):
     def __init__(
         self,
@@ -517,6 +543,11 @@ class QdrantCollection(BaseCollection):
         self._lock = threading.RLock()
         self._closed = False
         self._known_dimension: Optional[int] = None
+        self._scroll_cursor: Optional[_QdrantScrollCursor] = None
+
+    def _invalidate_scroll_cursor(self) -> None:
+        with self._lock:
+            self._scroll_cursor = None
 
     def _ensure_open(self) -> None:
         if self._closed or self._backend._closed:
@@ -571,6 +602,12 @@ class QdrantCollection(BaseCollection):
                 self._client.create_payload_index(
                     self._remote_collection, _PAYLOAD_DOCUMENT, "text"
                 )
+                for field in _KEYWORD_PAYLOAD_FIELDS:
+                    self._client.create_payload_index(
+                        self._remote_collection,
+                        f"{_PAYLOAD_METADATA}.{field}",
+                        "keyword",
+                    )
                 self._known_dimension = dimension
                 return
             remote_dim = self._remote_dimension()
@@ -611,6 +648,88 @@ class QdrantCollection(BaseCollection):
                 return rows[:max_rows]
             if offset is None:
                 return rows
+
+    def _scroll_paged(
+        self,
+        *,
+        where: Optional[dict],
+        with_vector: bool,
+        limit: int,
+        offset: int,
+    ) -> list[dict]:
+        """Resume a Qdrant scroll across sequential offset pages."""
+        validate_where(where)
+        q_filter = _qdrant_filter(where)
+        cache_key = (
+            json.dumps(q_filter, sort_keys=True) if q_filter else "",
+            bool(with_vector),
+        )
+        with self._lock:
+            self._ensure_open()
+            if limit == 0:
+                return []
+            cursor = self._scroll_cursor
+            if cursor is None or cursor.key != cache_key or offset < cursor.position:
+                if not self._remote_exists():
+                    if self._marker_exists():
+                        raise CollectionNotInitializedError(self._collection_name)
+                    return []
+                cursor = _QdrantScrollCursor(
+                    key=cache_key, position=0, resume_from=None, after=None
+                )
+            # Drop the cursor while reading; it is re-armed only on success.
+            self._scroll_cursor = None
+            wanted = offset + limit - cursor.position
+            fetched: list[tuple[Any, dict]] = []
+            page_offset = cursor.resume_from if cursor.resume_from is not None else cursor.after
+            skip_id = cursor.after if cursor.resume_from is None else None
+            server_next: Any = None
+            while len(fetched) < wanted:
+                page_limit = min(
+                    wanted - len(fetched) + (1 if skip_id is not None else 0), _SCROLL_PAGE_SIZE
+                )
+                points, server_next = self._client.scroll_points(
+                    self._remote_collection,
+                    qdrant_filter=q_filter,
+                    limit=page_limit,
+                    offset=page_offset,
+                    with_vector=with_vector,
+                )
+                for point in points:
+                    if skip_id is not None and str(point.get("id")) == str(skip_id):
+                        continue
+                    row = _payload_row(point)
+                    if matches_where(row["metadata"], where):
+                        fetched.append((point.get("id"), row))
+                skip_id = None
+                if server_next is None or not points:
+                    server_next = None
+                    break
+                page_offset = server_next
+            skip = max(0, offset - cursor.position)
+            consumed = fetched[: skip + limit]
+            selected = [row for _pid, row in consumed[skip:]]
+            if len(fetched) > len(consumed):
+                resume_from, after = fetched[len(consumed)][0], None
+            elif server_next is not None:
+                resume_from, after = server_next, None
+            else:
+                last = (
+                    consumed[-1][0]
+                    if consumed
+                    else (cursor.after if cursor.resume_from is None else None)
+                )
+                resume_from, after = None, last
+                if last is None and cursor.resume_from is not None:
+                    # Nothing past the old resume point: re-read from it next time.
+                    resume_from = cursor.resume_from
+            self._scroll_cursor = _QdrantScrollCursor(
+                key=cache_key,
+                position=cursor.position + len(consumed),
+                resume_from=resume_from,
+                after=after,
+            )
+            return selected
 
     def _rows(
         self,
@@ -681,7 +800,12 @@ class QdrantCollection(BaseCollection):
                     },
                 }
             )
-        self._client.upsert_points(self._remote_collection, points)
+        self._invalidate_scroll_cursor()
+        try:
+            self._client.upsert_points(self._remote_collection, points)
+        finally:
+            # A read may have re-armed the cursor while the write was in flight.
+            self._invalidate_scroll_cursor()
         self._backend._write_marker(self._palace, self._config)
 
     def _query_local_exact(
@@ -695,13 +819,31 @@ class QdrantCollection(BaseCollection):
     ) -> QueryResult:
         spec = _IncludeSpec.resolve(include, default_distances=True)
         q_filter = None if _requires_local_filter(where, where_document) else _qdrant_filter(where)
-        rows = self._scroll_all(qdrant_filter=q_filter, with_vector=True)
-        rows = [
-            row
-            for row in rows
+        candidate_rows = self._scroll_all(qdrant_filter=q_filter, with_vector=False)
+        matched_ids = [
+            row["id"]
+            for row in candidate_rows
             if matches_where(row["metadata"], where)
             and matches_where_document(row["document"], where_document)
         ]
+        rows = []
+        # Fetch vectors for matched points in bounded ID batches so each ID is
+        # sent once (sending the full list on every page grows as n^2). Rows are
+        # re-checked against both predicates: a point can change between passes.
+        for start in range(0, len(matched_ids), _VECTOR_ID_BATCH):
+            batch = matched_ids[start : start + _VECTOR_ID_BATCH]
+            id_filter = {"must": [{"has_id": [_point_id(doc_id) for doc_id in batch]}]}
+            batch_set = set(batch)
+            rows.extend(
+                row
+                for row in self._scroll_all(
+                    qdrant_filter=_combine_filters(q_filter, id_filter),
+                    with_vector=True,
+                )
+                if row["id"] in batch_set
+                and matches_where(row["metadata"], where)
+                and matches_where_document(row["document"], where_document)
+            )
         outer_ids: list[list[str]] = []
         outer_docs: list[list[str]] = []
         outer_metas: list[list[dict]] = []
@@ -815,6 +957,25 @@ class QdrantCollection(BaseCollection):
         include=None,
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
+        if (
+            ids is None
+            and limit is not None
+            and limit >= 0
+            and (offset is None or offset >= 0)
+            and not _requires_local_filter(where, where_document)
+        ):
+            rows = self._scroll_paged(
+                where=where,
+                with_vector=spec.embeddings,
+                limit=int(limit),
+                offset=int(offset or 0),
+            )
+            return GetResult(
+                ids=[row["id"] for row in rows],
+                documents=[row["document"] for row in rows] if spec.documents else [],
+                metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
+                embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
+            )
         max_rows = (offset or 0) + limit if limit is not None and ids is None else None
         rows = self._rows(
             ids=ids,
@@ -836,6 +997,70 @@ class QdrantCollection(BaseCollection):
             metadatas=[row["metadata"] for row in rows] if spec.metadatas else [],
             embeddings=[row["embedding"] or [] for row in rows] if spec.embeddings else None,
         )
+
+    def iter_metadata(
+        self,
+        keys: Optional[Any] = None,
+        *,
+        require_key: Optional[str] = None,
+        equals: Optional[dict] = None,
+    ):
+        """Stream every drawer's metadata from Qdrant in one cursor pass.
+
+        Matches :meth:`ChromaCollection.iter_metadata`:
+        - With ``keys``, only those keys are returned, and a drawer that has
+          none of them (or only ``None`` values) is skipped.
+        - With ``keys=None``, every key is returned and a drawer without
+          metadata yields ``None``.
+        - ``require_key`` limits the scan to drawers holding a string value
+          under that key.
+        - ``equals`` limits the scan to drawers whose string value under each
+          key equals the given one (pushed into Qdrant's scroll filter).
+        """
+        key_tuple = tuple(keys) if keys is not None else None
+        equals_dict = dict(equals) if equals else None
+        q_filter = _qdrant_filter(equals_dict) if equals_dict else None
+
+        def rows():
+            self._ensure_open()
+            if not self._remote_exists():
+                if self._marker_exists():
+                    raise CollectionNotInitializedError(self._collection_name)
+                return
+            offset = None
+            while True:
+                points, offset = self._client.scroll_points(
+                    self._remote_collection,
+                    qdrant_filter=q_filter,
+                    limit=_SCROLL_PAGE_SIZE,
+                    offset=offset,
+                    with_vector=False,
+                )
+                for point in points:
+                    payload = point.get("payload") or {}
+                    raw_meta = payload.get(_PAYLOAD_METADATA)
+                    _, meta = decode_record("", raw_meta if isinstance(raw_meta, dict) else {})
+                    if require_key is not None and not isinstance(meta.get(require_key), str):
+                        continue
+                    if equals_dict and not all(
+                        isinstance(meta.get(k), str) and meta.get(k) == v
+                        for k, v in equals_dict.items()
+                    ):
+                        continue
+                    if key_tuple is not None:
+                        # Keep explicit nulls: callers such as the mined-file
+                        # prefetch must tell "absent" from "present but null".
+                        projected = {k: meta[k] for k in key_tuple if k in meta}
+                        if all(v is None for v in projected.values()):
+                            projected = {}
+                        if projected:
+                            yield projected
+                    else:
+                        yield meta if meta else None
+                if offset is None:
+                    break
+
+        return rows()
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
         """Return every matching record's metadata in one cursor pass.
@@ -892,7 +1117,7 @@ class QdrantCollection(BaseCollection):
         # collection has been materialized yet — matching the order used by
         # get()/lexical_search() above.
         validate_where(where)
-        if _requires_local_filter(where):
+        if _requires_local_filter(where) or _contains_or_operator(where):
             raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
         if not self._remote_exists():
             if self._marker_exists():
@@ -914,22 +1139,26 @@ class QdrantCollection(BaseCollection):
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
             return
-        if ids is not None and where is None:
-            self._client.delete_points(
-                self._remote_collection,
-                point_ids=[_point_id(doc_id) for doc_id in ids],
-            )
-            return
-        if ids is None and where is not None and not _requires_local_filter(where):
-            q_filter = _qdrant_filter(where)
-            self._client.delete_points(self._remote_collection, qdrant_filter=q_filter)
-            return
-        rows = self._rows(ids=ids, where=where)
-        if rows:
-            self._client.delete_points(
-                self._remote_collection,
-                point_ids=[_point_id(row["id"]) for row in rows],
-            )
+        self._invalidate_scroll_cursor()
+        try:
+            if ids is not None and where is None:
+                self._client.delete_points(
+                    self._remote_collection,
+                    point_ids=[_point_id(doc_id) for doc_id in ids],
+                )
+                return
+            if ids is None and where is not None and not _requires_local_filter(where):
+                q_filter = _qdrant_filter(where)
+                self._client.delete_points(self._remote_collection, qdrant_filter=q_filter)
+                return
+            rows = self._rows(ids=ids, where=where)
+            if rows:
+                self._client.delete_points(
+                    self._remote_collection,
+                    point_ids=[_point_id(row["id"]) for row in rows],
+                )
+        finally:
+            self._invalidate_scroll_cursor()
 
     def count(self) -> int:
         self._ensure_open()

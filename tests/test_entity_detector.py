@@ -1172,3 +1172,108 @@ def test_al_and_ps1_are_sampled_when_prose_is_scarce(tmp_path):
     found = sorted(p.name for p in entity_detector.scan_for_detection(str(tmp_path)))
 
     assert found == ["Build.AL", "Customer.Codeunit.al", "build.ps1"]
+
+
+# ── issue #2811: entity_languages-aware filters ─────────────────────────
+
+
+def test_extract_candidates_uses_pt_br_stopwords():
+    """Portuguese function words must not become entities under pt-br."""
+    text = "Os Os Os Ele Ele Ele Se Se Se Markdown Markdown Markdown"
+    result = extract_candidates(text, languages=("pt-br",))
+    assert "Os" not in result
+    assert "Ele" not in result
+    assert "Se" not in result
+    assert "Markdown" in result
+
+
+def test_extract_candidates_coca_only_for_english():
+    """The COCA English content-word filter is skipped without 'en'.
+
+    'Data' is a COCA word but also a legitimate pt-br token that may head
+    a name; under pt-br-only configuration it must not be filtered.
+    """
+    text = "Data Data Data Markdown Markdown Markdown"
+    result = extract_candidates(text, languages=("pt-br",))
+    assert "Data" in result
+    assert "Markdown" in result
+
+
+def test_entity_metadata_respects_entity_languages(tmp_path, monkeypatch):
+    """miner._extract_entities_for_metadata filters pt-br function words."""
+    import mempalace.palace as palace
+    from mempalace.miner import _extract_entities_for_metadata
+
+    monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "pt-br")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(palace, "_CANDIDATE_RX_CACHE", None)
+
+    content = (
+        "Ele revisou Markdown. Ele atualizou Markdown. "
+        "Aquilo documenta Markdown. Os registros citam Markdown."
+    )
+    meta = _extract_entities_for_metadata(content)
+    entities = set(meta.split(";")) if meta else set()
+    assert "Markdown" in entities
+    assert "Ele" not in entities
+    assert "Aquilo" not in entities
+
+
+def test_entity_metadata_user_stopwords_file(tmp_path, monkeypatch):
+    """A global entity_stopwords.json in the config dir merges into the filters."""
+    import mempalace.palace as palace
+    from mempalace.miner import _extract_entities_for_metadata
+
+    tmp_path.joinpath("entity_stopwords.json").write_text(
+        json.dumps({"words": ["Fonte", "Tabela"]}), encoding="utf-8"
+    )
+    monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "pt-br")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(palace, "_CANDIDATE_RX_CACHE", None)
+
+    content = (
+        "Fonte descreve Markdown. Tabela registra Markdown. "
+        "Fonte e Tabela citam Markdown outra vez."
+    )
+    meta = _extract_entities_for_metadata(content)
+    entities = set(meta.split(";")) if meta else set()
+    assert "Markdown" in entities
+    assert "Fonte" not in entities
+    assert "Tabela" not in entities
+
+
+def test_closet_lines_respect_entity_languages(tmp_path, monkeypatch):
+    """build_closet_lines filters with the configured language's stopwords."""
+    import mempalace.palace as palace
+
+    monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "pt-br")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(palace, "_CANDIDATE_RX_CACHE", None)
+
+    content = "Ele revisou Markdown. Ele atualizou Markdown. Aquilo documenta Markdown novamente."
+    lines = palace.build_closet_lines("src.md", ["d1"], content, "w", "r")
+    entities_seg = lines[0].split("|")[1]
+    entities = set(entities_seg.split(";")) if entities_seg else set()
+    assert "Markdown" in entities
+    assert "Ele" not in entities
+    assert "Aquilo" not in entities
+
+
+def test_entity_metadata_english_filters_unchanged(tmp_path, monkeypatch):
+    """Default en config still applies the English stoplist and COCA filter."""
+    import mempalace.palace as palace
+    from mempalace.miner import _extract_entities_for_metadata
+
+    monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "en")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(palace, "_CANDIDATE_RX_CACHE", None)
+
+    content = (
+        "The Code changes updated Markdown. After the Code review, Markdown improved. "
+        "The Code base cites Markdown once more."
+    )
+    meta = _extract_entities_for_metadata(content)
+    entities = set(meta.split(";")) if meta else set()
+    assert "Markdown" in entities
+    assert "The" not in entities
+    assert "Code" not in entities
