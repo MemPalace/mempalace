@@ -1,4 +1,4 @@
-﻿# MemPalace DeepSeek Harness Plugin
+# MemPalace DeepSeek Harness Plugin
 
 The [MemPalace](https://github.com/MemPalace/mempalace) plugin for the
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH). It is
