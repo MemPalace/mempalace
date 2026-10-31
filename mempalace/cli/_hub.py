@@ -375,8 +375,8 @@ def _forward_sync_to_hub(args, palace_path: str) -> bool:
 
     A live hub (``mempalace serve``) holds the MCP writer lease for its
     whole lifetime, so a direct sync from this process would be refused
-    with MineAlreadyRunning — even a dry run (#2723). The hub itself may
-    sync (the palace lock is process-re-entrant there, #1859), so hand it
+    with MineAlreadyRunning — even a dry run. The hub itself may
+    sync (the palace lock is process-re-entrant there), so hand it
     the job over HTTP, the way mine and search already do.
 
     Returns True when the hub handled the sync (this function has already

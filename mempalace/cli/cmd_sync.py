@@ -31,7 +31,7 @@ def cmd_sync(args):
 
     # A live HTTP hub for this palace holds the MCP writer lease, so a
     # direct sync here would be refused. Hand the job to the hub instead,
-    # the way mine and search already do (#2723). Reached only on the
+    # the way mine and search already do. Reached only on the
     # direct route: an explicit --daemon request keeps the daemon.
     if _sync_args_forwardable(args) and _forward_sync_to_hub(args, palace_path):
         return
