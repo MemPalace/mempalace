@@ -41,6 +41,42 @@ class TestWriteTools:
         assert stored["metadatas"], stored
         assert stored["metadatas"][0].get("source_dir_ino") == expected
 
+    def test_add_drawer_canonicalizes_wing_slug_issue_2579_regression(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression #2579: add_drawer must store wings in canonical slug
+        form, so ``MyProject`` round-trips into the same wing the project
+        miner files under (``myproject``).
+
+        Before the fix, ``sanitize_name`` only validated and kept the input
+        byte-for-byte, so ``MyProject`` and ``myproject`` became two distinct
+        wings and a mined drawer was invisible to a wing filter spelling.
+        Now ``canonical_wing`` lower-cases before validation, so a
+        ``MyProject`` filed via MCP lands in the same wing the project
+        miner files under (``myproject``) — no more split.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        # Exact case from issue #2579: the MCP path stores the wing as given
+        # (only case-validated), the miner files it slug-normalized. They
+        # must land under the same name.
+        result = tool_add_drawer(
+            wing="MyProject",
+            room="scratch",
+            content="Case-canonicalization probe.",
+        )
+
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"], stored
+        # Canonical form: lower-cased, byte-for-byte otherwise.
+        assert stored["metadatas"][0]["wing"] == "myproject"
+        # Rooms are NOT canonicalized in this change — they stay as given.
+        assert stored["metadatas"][0]["room"] == "scratch"
+
     def test_wal_result_entries_match_tool_outcome_issue_538_regression(
         self, monkeypatch, config, palace_path, kg, tmp_path
     ):
@@ -1007,9 +1043,15 @@ class TestWriteTools:
         assert fetched["room"] == "scratchroom"
 
     def test_update_drawer_identical_case_is_noop(self, monkeypatch, config, palace_path, kg):
-        """Regression for #2395: re-submitting the exact same casing must
-        still be a content-preserving no-op (no spurious write, old value
-        unchanged)."""
+        """Re-submitting the same wing must still be a content-preserving
+        no-op (no spurious write, old value unchanged).
+
+        Under #2579 (write-path canonicalization) the wing is stored in
+        canonical slug form regardless of the casing the client sends, so
+        re-submitting any casing collapses to the same slug and is a true
+        no-op. The assertion below tracks the canonical form, not the client's
+        literal casing.
+        """
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_add_drawer, tool_update_drawer
 
@@ -1019,7 +1061,8 @@ class TestWriteTools:
 
         result = tool_update_drawer(drawer_id, wing="StableWing", room="stable_room")
         assert result["success"] is True
-        assert result["wing"] == "StableWing"
+        # Wing is canonicalized on write; room stays as sent.
+        assert result["wing"] == "stablewing"
         assert result["room"] == "stable_room"
 
     def test_update_drawer_case_variant_with_existing_target_wing(

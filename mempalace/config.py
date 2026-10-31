@@ -66,6 +66,19 @@ def normalize_wing_name(name: str) -> str:
     return slug[:120].strip("_.'")
 
 
+def canonical_wing(value, field_name: str = "wing") -> str:
+    """Validate AND canonicalize a wing to the canonical miner/graph slug.
+
+    Applies ``normalize_wing_name`` first (lower-cases, turns spaces and
+    hyphens into ``_``), then ``sanitize_name`` so the result also passes
+    every path / ChromaDB constraint. Non-string or empty input raises the
+    same ``ValueError`` that ``sanitize_name`` raises.
+    """
+    if isinstance(value, str):
+        value = normalize_wing_name(value)
+    return sanitize_name(value, field_name)
+
+
 # Where a session started in the home directory files (see hooks_cli).
 WORKSTATION_WINGS = frozenset({"mac_workstation", "windows_workstation", "linux_workstation"})
 

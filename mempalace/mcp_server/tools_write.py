@@ -502,7 +502,7 @@ def tool_add_drawer(
     """
     global _metadata_cache
     try:
-        wing = sanitize_name(wing, "wing")
+        wing = canonical_wing(wing, "wing")
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
         if source_file:
@@ -1450,7 +1450,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
         if wing is not None:
             try:
-                wing = sanitize_name(wing, "wing")
+                wing = canonical_wing(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
             # Case-sensitive comparison: a case-only rename IS a rename.
