@@ -534,7 +534,10 @@ class TestTunnelFileFollowsConfig:
         from mempalace.config import MempalaceConfig
 
         cfg = MempalaceConfig()
-        expected = os.path.join(os.path.dirname(cfg.palace_path), "tunnels.json")
+        from mempalace import paths
+
+        key = paths.palace_key(cfg.palace_path)
+        expected = os.path.join(os.path.dirname(cfg.palace_path), f"tunnels_{key}.json")
         assert cfg.tunnel_file == expected
         assert palace_graph._get_tunnel_file(cfg) == expected
 
@@ -546,8 +549,11 @@ class TestTunnelFileFollowsConfig:
         custom_dir = tmp_path / "custom-palace"
         cfg = MempalaceConfig(config_dir=tmp_path)
         cfg._file_config["palace_path"] = str(custom_dir)
-        assert cfg.tunnel_file == str(tmp_path / "tunnels.json")
-        assert palace_graph._get_tunnel_file(cfg) == str(tmp_path / "tunnels.json")
+        from mempalace import paths
+
+        key = paths.palace_key(cfg.palace_path)
+        assert cfg.tunnel_file == str(tmp_path / f"tunnels_{key}.json")
+        assert palace_graph._get_tunnel_file(cfg) == str(tmp_path / f"tunnels_{key}.json")
 
     def test_load_tunnels_warns_on_orphaned_legacy_file(self, tmp_path, monkeypatch, caplog):
         """When the configured tunnel file is missing but a legacy file
@@ -585,6 +591,55 @@ class TestTunnelFileFollowsConfig:
             assert palace_graph._load_tunnels() == []
 
         assert "Legacy tunnels file" not in caplog.text
+
+    def test_load_tunnels_warns_on_orphaned_pre_keyed_file(self, tmp_path, monkeypatch, caplog):
+        """A user upgrading from a build that wrote the unkeyed sibling
+        (``<parent>/tunnels.json``) must see a one-line warning naming both
+        paths when the per-palace-keyed file is missing — otherwise their
+        existing tunnels are silently orphaned. No auto-migration."""
+        palace_parent = tmp_path / "palace-parent"
+        palace_parent.mkdir()
+        pre_keyed = palace_parent / "tunnels.json"
+        pre_keyed.write_text(
+            '[{"id":"orphan","source":{"wing":"a","room":"r"},'
+            '"target":{"wing":"b","room":"r"},"label":""}]',
+            encoding="utf-8",
+        )
+        configured = palace_parent / "tunnels_a1b2c3d4e5f607182930415263748596.json"
+
+        monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(configured))
+        # Pin the older legacy constant somewhere that does not exist so
+        # only the new pre-keyed branch can fire.
+        monkeypatch.setattr(
+            palace_graph,
+            "_legacy_tunnel_file",
+            lambda: str(tmp_path / "nowhere" / "tunnels.json"),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
+            result = palace_graph._load_tunnels()
+
+        assert result == [], "must not auto-migrate from the pre-keyed sibling"
+        assert str(pre_keyed) in caplog.text
+        assert str(configured) in caplog.text
+        assert "Legacy tunnels file" not in caplog.text
+
+    def test_no_pre_keyed_warning_when_paths_match(self, tmp_path, monkeypatch, caplog):
+        """If the resolved path is itself the unkeyed basename (default
+        pre-keying install), the new check must not emit a redundant
+        'ignored' warning."""
+        same = tmp_path / "tunnels.json"
+        monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(same))
+        monkeypatch.setattr(
+            palace_graph,
+            "_legacy_tunnel_file",
+            lambda: str(tmp_path / "nowhere" / "tunnels.json"),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
+            assert palace_graph._load_tunnels() == []
+
+        assert "per-palace name" not in caplog.text
 
 
 # =============================================================================

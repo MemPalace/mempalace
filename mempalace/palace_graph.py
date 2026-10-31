@@ -565,6 +565,15 @@ def _load_tunnels(config=None, *, for_write=False):
             legacy,
             current_tunnel_file,
         )
+
+    pre_keyed = os.path.join(os.path.dirname(current_tunnel_file), "tunnels.json")
+    if pre_keyed != current_tunnel_file and os.path.exists(pre_keyed):
+        logger.warning(
+            "Tunnels file at '%s' is being ignored; the per-palace name is now '%s'. "
+            "Move or copy the file (preserving its contents) to the new path to recover its tunnels.",
+            pre_keyed,
+            current_tunnel_file,
+        )
     return []
 
 

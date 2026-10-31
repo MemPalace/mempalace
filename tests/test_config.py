@@ -1219,8 +1219,11 @@ def test_explicit_palace_path_overrides_env_and_file_config(monkeypatch, tmp_pat
 
     expected = os.path.abspath(os.path.expanduser(str(explicit)))
     assert cfg.palace_path == expected
-    assert cfg.hallway_file == os.path.join(os.path.dirname(expected), "hallways.json")
-    assert cfg.tunnel_file == os.path.join(os.path.dirname(expected), "tunnels.json")
+    from mempalace import paths
+
+    key = paths.palace_key(expected)
+    assert cfg.hallway_file == os.path.join(os.path.dirname(expected), f"hallways_{key}.json")
+    assert cfg.tunnel_file == os.path.join(os.path.dirname(expected), f"tunnels_{key}.json")
 
 
 # ── cfg.lang resolution ────────────────────────────────────────────────

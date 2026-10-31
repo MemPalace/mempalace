@@ -750,23 +750,46 @@ class MempalaceConfig:
 
     @property
     def tunnel_file(self):
-        """Path to the tunnel file, sibling of palace_path."""
-        return os.path.join(os.path.dirname(self.palace_path), "tunnels.json")
+        """Path to the tunnel file, sibling of palace_path.
+
+        The filename incorporates the per-palace key (a
+        SHA-256-derived digest of the normalized ``palace_path``, truncated to
+        the default 24 hex characters — the same convention the codebase uses
+        for ``daemon.py`` state naming and ``server_registry.py``), so that two
+        palaces whose directories share the same parent no longer collide on
+        one shared tunnel file on disk. The key reuses
+        :func:`paths.palace_key` and is stable, case-insensitive.
+        """
+        key = paths.palace_key(self.palace_path)
+        return os.path.join(
+            os.path.dirname(self.palace_path),
+            f"tunnels_{key}.json",
+        )
 
     @property
     def hallway_file(self):
         """Path to ``hallways.json``, sibling of palace_path.
 
-        Mirrors ``tunnel_file`` so within-wing hallway state is scoped to the
-        configured palace and survives palace rebuilds (it does not live in
-        ChromaDB which can be recreated). The records now live in
-        ``hallways.sqlite3`` beside this path; the first hallway write imports
-        this file once (see ``hallways._import_json_once``). Prior to this
-        property the path was hardcoded under ``~/.mempalace/hallways.json``
-        and multiple palaces on one host silently shared one file (see
+        The filename incorporates the per-palace key (a
+        SHA-256-derived digest of the normalized ``palace_path``, truncated to
+        the default 24 hex characters — the same convention the codebase uses
+        for per-palace daemon state in ``daemon.py`` and per-palace
+        server-registry state in ``server_registry.py``), so that two palaces
+        whose directories share the same parent no longer collide on one
+        shared hallways file on disk. Mirrors ``tunnel_file``.
+
+        The records live in ``hallways.sqlite3`` beside this path; the first
+        hallway write imports this file once (see
+        ``hallways._import_json_once``). Prior to this property the path was
+        hardcoded under ``~/.mempalace/hallways.json`` and multiple palaces on
+        one host silently shared one file (see
         ``hallways._legacy_hallway_file``).
         """
-        return os.path.join(os.path.dirname(self.palace_path), "hallways.json")
+        key = paths.palace_key(self.palace_path)
+        return os.path.join(
+            os.path.dirname(self.palace_path),
+            f"hallways_{key}.json",
+        )
 
     @property
     def collection_name(self):
