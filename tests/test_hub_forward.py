@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from mempalace import cli, mcp_proxy, server_registry
+from mempalace import cli, hub_client, server_registry
 from mempalace.config import MempalaceConfig
 
 
@@ -105,7 +105,8 @@ class TestServerRegistry:
     def test_shares_directory_with_server_token(self, isolated_home):
         palace = str(isolated_home / "palace")
         assert (
-            server_registry.serverinfo_path(palace).parent == cli._server_token_path(palace).parent
+            server_registry.serverinfo_path(palace).parent
+            == server_registry.server_token_path(palace).parent
         )
 
     def test_dead_pid_record_is_ignored(self, isolated_home):
@@ -158,13 +159,13 @@ class TestServerRegistry:
         token_path.write_text("palace-b-token\n")
         monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "palace-a-token")
 
-        assert server_registry.load_server_token(palace) == "palace-b-token"
+        assert server_registry.load_server_tokens(palace)[0] == "palace-b-token"
 
     def test_process_environment_is_fallback_without_palace_token(self, isolated_home, monkeypatch):
         palace = str(isolated_home / "palace")
         monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "explicit-token")
 
-        assert server_registry.load_server_token(palace) == "explicit-token"
+        assert server_registry.load_server_tokens(palace) == ("explicit-token",)
 
 
 # ── mine forwarding ──────────────────────────────────────────────────
@@ -173,7 +174,14 @@ class TestServerRegistry:
 class _FakeHub:
     """Minimal /healthz + /mcp endpoint standing in for `mempalace serve`."""
 
-    def __init__(self, mine_result=None, search_result=None, rpc_error=None, required_token=None):
+    def __init__(
+        self,
+        mine_result=None,
+        search_result=None,
+        sync_result=None,
+        rpc_error=None,
+        required_token=None,
+    ):
         self.requests = []
         self.auth_headers = []
         outer = self
@@ -192,6 +200,20 @@ class _FakeHub:
                     "bm25_score": 1.25,
                 }
             ],
+        }
+        sync_result = sync_result or {
+            "success": True,
+            "scanned": 10,
+            "kept": 8,
+            "gitignored": 1,
+            "missing": 1,
+            "unresolved": 0,
+            "no_source": 0,
+            "out_of_scope": 0,
+            "by_source": {},
+            "unresolved_by_source": {},
+            "removed_drawers": 0,
+            "removed_closets": 0,
         }
 
         class Handler(BaseHTTPRequestHandler):
@@ -221,7 +243,12 @@ class _FakeHub:
                     payload = {"jsonrpc": "2.0", "id": request.get("id"), "error": rpc_error}
                 else:
                     tool_name = request.get("params", {}).get("name")
-                    tool_result = search_result if tool_name == "mempalace_search" else mine_result
+                    if tool_name == "mempalace_search":
+                        tool_result = search_result
+                    elif tool_name == "mempalace_sync":
+                        tool_result = sync_result
+                    else:
+                        tool_result = mine_result
                     payload = {
                         "jsonrpc": "2.0",
                         "id": request.get("id"),
@@ -376,6 +403,49 @@ class TestForwardMineToHub:
             assert "read-only server" in capsys.readouterr().err
         finally:
             hub.stop()
+
+
+def _sync_args(source_dir=None, **overrides):
+    defaults = dict(
+        dir=str(source_dir) if source_dir else None,
+        root=[],
+        palace=None,
+        backend=None,
+        global_backend=None,
+        wing=None,
+        dry_run=True,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class TestForwardSyncToHub:
+    def test_forwards_when_hub_alive(self, isolated_home, tmp_path, fake_hub, capsys):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        args = _sync_args(tmp_path / "convos")
+        handled = cli._forward_sync_to_hub(args, palace)
+        assert handled is True
+        (request,) = fake_hub.requests
+        assert request["params"]["name"] == "mempalace_sync"
+        arguments = request["params"]["arguments"]
+        assert arguments["apply"] is False
+        assert arguments["project_dir"] == os.path.abspath(str(tmp_path / "convos"))
+        out = capsys.readouterr().out
+        assert "forwarding sync to palace hub" in out
+        assert "DRY RUN" in out
+
+    def test_no_hub_returns_false(self, isolated_home, tmp_path):
+        palace = str(isolated_home / "palace")
+        assert cli._forward_sync_to_hub(_sync_args(tmp_path), palace) is False
+
+    def test_multi_root_stays_direct(self, tmp_path):
+        args = _sync_args(tmp_path / "a", root=[str(tmp_path / "b")])
+        assert cli._sync_args_forwardable(args) is False
+
+    def test_explicit_backend_is_not_forwardable(self, tmp_path):
+        args = _sync_args(tmp_path, backend="chroma")
+        assert cli._sync_args_forwardable(args) is False
 
 
 class TestForwardSearchToHub:
@@ -746,7 +816,9 @@ class TestForwardSearchToHub:
         ],
     )
     def test_per_invocation_search_override_is_not_forwardable(self, monkeypatch, env_name):
-        for name in cli._SEARCH_OVERRIDE_ENV_VARS:
+        from mempalace.hub_client import SEARCH_OVERRIDE_ENV_VARS
+
+        for name in SEARCH_OVERRIDE_ENV_VARS:
             monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv(env_name, "en")
         assert cli._search_args_forwardable(_search_args()) is False
@@ -861,7 +933,7 @@ class TestStdioProxy:
             hub.stop()
 
     def test_dynamic_proxy_status_adds_local_client_update_state(self, proxied_palace, monkeypatch):
-        from mempalace import mcp_server, mcp_proxy
+        from mempalace import mcp_proxy, mcp_server
 
         hub = _FakeHub(mine_result={"updates": {"server": {"enabled": True, "installed": "3.9.0"}}})
         try:
@@ -978,7 +1050,7 @@ class TestStdioProxy:
         def broken_off(*a):
             raise error
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", broken_off)
+        monkeypatch.setattr(hub_client.HubClient, "post", broken_off)
         write = {
             "jsonrpc": "2.0",
             "id": 9,
@@ -1037,12 +1109,8 @@ class TestThinStdioProxyTokenRetry:
             monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
             request = {"jsonrpc": "2.0", "id": 7, "method": "tools/list"}
 
-            response = mcp_proxy._forward(
-                f"http://127.0.0.1:{hub.port}",
-                {"Content-Type": "application/json"},
-                request,
-                palace,
-            )
+            client = hub_client.HubClient(palace, {"host": "127.0.0.1", "port": hub.port})
+            response = client.post(request)
 
             assert response["id"] == 7
             assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
@@ -1165,7 +1233,7 @@ class TestCmdMineIntegration:
         def uncertain(*args, **kwargs):
             raise TimeoutError("response lost after submission")
 
-        monkeypatch.setattr(server_registry, "urlopen_with_server_tokens", uncertain)
+        monkeypatch.setattr(hub_client.HubClient, "post", uncertain)
         args = _mine_args(
             tmp_path / "project", palace=palace, mode="projects", include_ignored=["notes"]
         )

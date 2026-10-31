@@ -29,12 +29,15 @@ import re
 import stat
 from pathlib import Path
 
+from mempalace import paths
+from mempalace.fsio import decode_source
+
 HOME = Path.home()
 LUMI_DIR = Path(os.environ.get("MEMPALACE_SOURCE_DIR", str(HOME / "Desktop/transcripts")))
 
 # People we know about (for name detection in content)
 # Loaded from ~/.mempalace/known_names.json if it exists; no built-in fallback names.
-_KNOWN_NAMES_PATH = HOME / ".mempalace" / "known_names.json"
+_KNOWN_NAMES_PATH = paths.state_path("known_names.json")
 _KNOWN_NAMES_CACHE = None
 
 
@@ -176,71 +179,148 @@ def extract_subject(lines):
     return "session"
 
 
+def _read_lines(path: Path) -> list[str]:
+    """Lines of ``path`` with their endings, decoded by ``fsio.decode_source``
+    so no byte turns into U+FFFD. Parts are written as UTF-8 with
+    ``surrogateescape``, which puts a stray byte back as it was."""
+    return decode_source(path.read_bytes())[0].splitlines(keepends=True)
+
+
+def _session_segments(lines: list[str], boundaries: list[int]) -> list[tuple[list[str], bool, int]]:
+    """Preamble plus every session, including sessions under 10 lines."""
+    segments = []
+    if boundaries[0] > 0:
+        preamble = lines[: boundaries[0]]
+        if any(line.strip() for line in preamble):
+            segments.append((preamble, True, 0))
+    ends = boundaries + [len(lines)]
+    for index, (start, end) in enumerate(zip(ends, ends[1:])):
+        chunk = lines[start:end]
+        if chunk:
+            segments.append((chunk, False, index))
+    return segments
+
+
+def _suffixed_names(base_name: str):
+    suffix = Path(base_name).suffix
+    stem = base_name[: -len(suffix)] if suffix else base_name
+    yield base_name
+    number = 2
+    while True:
+        yield f"{stem}-{number}{suffix}"
+        number += 1
+
+
+def _output_name(path: Path, chunk: list[str], is_preamble: bool, index: int) -> str:
+    ts_human, _ts_iso = extract_timestamp(chunk)
+    people = extract_people(chunk)
+    subject = extract_subject(chunk)
+    if is_preamble:
+        ts_part = "part00"
+    else:
+        ts_part = ts_human or f"part{index + 1:02d}"
+    people_part = "-".join(people[:3]) if people else "unknown"
+    src_stem = re.sub(r"[^\w-]", "_", path.stem)[:40]
+    name = f"{src_stem}__{ts_part}_{people_part}_{subject}.txt"
+    name = re.sub(r"[^\w\.\-]", "_", name)
+    return re.sub(r"_+", "_", name)
+
+
+def _holds(path: Path, data: bytes) -> bool:
+    """True when ``path`` is a regular file (not a link) whose bytes are ``data``."""
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode) or st.st_size != len(data):
+        return False
+    return path.read_bytes() == data
+
+
+def _write_chunk(out_dir: Path, base_name: str, data: bytes, reserved: set, dry_run: bool):
+    """Write ``data`` under ``base_name`` or the first free ``-2``, ``-3``, ... name.
+
+    A regular file that already holds exactly ``data`` is reused, so a re-run
+    writes nothing new. Anything else at a name (another session, a symlink,
+    a FIFO) is left untouched and the next name is tried; ``O_EXCL`` never
+    follows a link or opens a pipe. Returns ``(path, newly_written)``.
+    """
+    for name in _suffixed_names(base_name):
+        candidate = out_dir / name
+        if candidate in reserved:
+            continue
+        if os.path.lexists(candidate):
+            if _holds(candidate, data):
+                reserved.add(candidate)
+                return candidate, False
+            continue
+        reserved.add(candidate)
+        if dry_run:
+            return candidate, True
+        try:
+            flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+            fd = os.open(candidate, flags, 0o644)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+        except BaseException:
+            candidate.unlink(missing_ok=True)
+            raise
+        return candidate, True
+
+
 def split_file(filepath, output_dir, dry_run=False):
     """
     Split a single mega-file into per-session files.
     Returns list of output paths written (or would be written if dry_run).
+
+    Text before the first session and sessions under 10 lines are written
+    too. Two sessions that generate the same filename get ``-2``, ``-3``, ...
+    instead of overwriting each other, and a session already split out by
+    an earlier run is not written again.
     """
     path = Path(filepath)
     max_size = 500 * 1024 * 1024  # 500 MB safety limit
     if path.stat().st_size > max_size:
         print(f"  SKIP: {path.name} exceeds {max_size // (1024 * 1024)} MB limit")
         return []
-    lines = path.read_text(errors="replace").splitlines(keepends=True)
+    lines = _read_lines(path)
 
     boundaries = find_session_boundaries(lines)
     if len(boundaries) < 2:
         return []  # Not a mega-file
 
-    # Add sentinel at end
-    boundaries.append(len(lines))
-
     out_dir = Path(output_dir) if output_dir else path.parent
+    segments = _session_segments(lines, boundaries)
     written = []
+    reserved: set = set()
 
-    for i, (start, end) in enumerate(zip(boundaries, boundaries[1:])):
-        chunk = lines[start:end]
-        if len(chunk) < 10:
-            continue  # Skip tiny fragments
-
-        ts_human, ts_iso = extract_timestamp(chunk)
-        people = extract_people(chunk)
-        subject = extract_subject(chunk)
-
-        # Build filename: SOURCESTEM__DATE_TIME_People_subject.txt
-        # Source stem prefix prevents collisions when multiple mega-files
-        # produce sessions with the same timestamp/people/subject.
-        ts_part = ts_human or f"part{i + 1:02d}"
-        people_part = "-".join(people[:3]) if people else "unknown"
-        src_stem = re.sub(r"[^\w-]", "_", path.stem)[:40]
-        name = f"{src_stem}__{ts_part}_{people_part}_{subject}.txt"
-        # Sanitize
-        name = re.sub(r"[^\w\.\-]", "_", name)
-        name = re.sub(r"_+", "_", name)
-
-        out_path = out_dir / name
-
+    for position, (chunk, is_preamble, index) in enumerate(segments, 1):
+        name = _output_name(path, chunk, is_preamble, index)
+        data = "".join(chunk).encode("utf-8", "surrogateescape")
+        out_path, new = _write_chunk(out_dir, name, data, reserved, dry_run)
         if dry_run:
-            print(f"  [{i + 1}/{len(boundaries) - 1}] {name}  ({len(chunk)} lines)")
+            print(f"  [{position}/{len(segments)}] {out_path.name}  ({len(chunk)} lines)")
+        elif new:
+            print(f"  + {out_path.name}  ({len(chunk)} lines)")
         else:
-            # The gate in ``main`` covers the files the glob listed; this name
-            # is built here, so nothing has vetted it. Opening a pre-existing
-            # FIFO for writing blocks in the kernel until a reader appears.
-            # ``lexists`` rather than ``exists``: the latter follows the link
-            # and so answers False for a DANGLING symlink, and writing through
-            # one creates the target instead — a chunk landing wherever the
-            # link points, outside the output directory entirely.
-            # ``os.path`` rather than ``Path``: neither call can raise, so a
-            # write that fails still fails at ``write_text`` as it always did.
-            if os.path.lexists(out_path) and not os.path.isfile(out_path):
-                print(f"  SKIP: {name} (not a regular file)")
-                continue
-            out_path.write_text("".join(chunk), encoding="utf-8")
-            print(f"  + {name}  ({len(chunk)} lines)")
-
+            print(f"  = {out_path.name}  (already split)")
         written.append(out_path)
 
     return written
+
+
+def _retire_original(path: Path) -> Path:
+    """Rename ``path`` to the first free ``.mega_backup`` name and return it.
+
+    The rename is how the original bytes stay recoverable, so an existing
+    backup is never replaced: a later one becomes ``-2.mega_backup``.
+    """
+    for name in _suffixed_names(path.with_suffix(".mega_backup").name):
+        backup = path.with_name(name)
+        if not os.path.lexists(backup):
+            path.rename(backup)
+            print(f"  -> Original renamed to {backup.name}\n")
+            return backup
 
 
 def main():
@@ -294,7 +374,7 @@ def main():
         if file_stat.st_size > max_scan_size:
             print(f"  SKIP: {f.name} exceeds {max_scan_size // (1024 * 1024)} MB limit")
             continue
-        lines = f.read_text(errors="replace").splitlines(keepends=True)
+        lines = _read_lines(f)
         boundaries = find_session_boundaries(lines)
         if len(boundaries) >= args.min_sessions:
             mega_files.append((f, len(boundaries)))
@@ -318,9 +398,7 @@ def main():
         total_written += len(written)
 
         if not args.dry_run and written:
-            backup = f.with_suffix(".mega_backup")
-            f.rename(backup)
-            print(f"  -> Original renamed to {backup.name}\n")
+            _retire_original(f)
         else:
             print()
 

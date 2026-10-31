@@ -32,17 +32,19 @@ Usage:
 
 from __future__ import annotations
 
-import json
-import re
-import os
 import functools
-from pathlib import Path
+import json
+import os
+import re
 from collections import defaultdict
+from pathlib import Path
 
 from mempalace.i18n import get_entity_patterns
+from mempalace.project_config import MEMPALACE_PROJECT_FILES
 
+from . import paths
 
-# ==================== COCA CONTENT-WORD FILTER (Tier 2 linguistics cleanup) ====================
+# ==================== COCA CONTENT-WORD FILTER ====================
 #
 # Common English content words that frequently appear capitalized (sentence
 # start, headings, markdown emphasis) but are NOT proper nouns. Filtering
@@ -53,10 +55,8 @@ from mempalace.i18n import get_entity_patterns
 # once on first call via ``_get_coca_filter``. Matching is case-insensitive:
 # callers must lowercase the candidate before lookup.
 #
-# Tier 3 (planned) will add a known-systems lexicon that protects compound
-# names like "Claude Code" — for now, the multi-word path in
-# ``extract_candidates`` is intentionally NOT filtered, so legitimate
-# compounds remain detectable.
+# The multi-word path in ``extract_candidates`` is intentionally NOT
+# filtered, so legitimate compounds like "Claude Code" remain detectable.
 
 
 @functools.lru_cache(maxsize=1)
@@ -78,13 +78,13 @@ def _get_coca_filter() -> frozenset[str]:
         return frozenset()
 
 
-# ==================== KNOWN-SYSTEMS COMPOUND LEXICON (Tier 3 linguistics cleanup) ====================
+# ==================== KNOWN-SYSTEMS COMPOUND LEXICON ====================
 #
 # Multi-word product / system names that must be detected atomically — NOT
 # decomposed into their constituent words. When "Claude Code" appears in
 # content, the entity detector counts the compound, not the parts. Without
 # this pre-pass, the single-word loop would split "Claude Code" into
-# "Claude" + "Code", and the COCA filter (Tier 2) would drop "Code" as a
+# "Claude" + "Code", and the COCA filter would drop "Code" as a
 # content word — leaving "Claude" alone with the wrong attribution.
 #
 # Data file: ``mempalace/data/known_systems.json``. Loaded once on first
@@ -189,6 +189,62 @@ def _get_stopwords(languages: tuple) -> frozenset:
     return frozenset(patterns["stopwords"])
 
 
+def _use_english_filters(languages) -> bool:
+    """Whether the COCA English content-word filter applies.
+
+    The COCA list is English-only; for configurations without English
+    (e.g. ``["pt-br"]``) it would silently drop legitimate entities whose
+    spellings collide with common English words.
+    """
+    return "en" in _normalize_langs(languages)
+
+
+def _user_entity_stopwords() -> frozenset:
+    """User-supplied entity stopwords from ``entity_stopwords.json`` files.
+
+    Both locations are merged when present:
+
+    - ``<config_dir>/entity_stopwords.json`` (global)
+    - ``<palace_path>/config/entity_stopwords.json`` (per-palace)
+
+    Each file accepts a JSON array of words or a mapping with a ``"words"``
+    array (same shape as ``coca_content_words.json``).
+    """
+    from .config import MempalaceConfig
+
+    cfg = MempalaceConfig()
+    return _load_user_entity_stopwords(str(cfg.config_dir), str(cfg.palace_path))
+
+
+@functools.lru_cache(maxsize=8)
+def _load_user_entity_stopwords(config_dir: str, palace_path: str) -> frozenset:
+    words: set = set()
+    for base in (Path(config_dir), Path(palace_path) / "config"):
+        path = base / "entity_stopwords.json"
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            data = data.get("words", [])
+        if isinstance(data, list):
+            words.update(w.strip().lower() for w in data if isinstance(w, str) and w.strip())
+    return frozenset(words)
+
+
+def _entity_blocklist(languages) -> frozenset:
+    """Lowercased words that must never surface as entities.
+
+    Union of the configured languages' i18n stopwords and any
+    user-provided ``entity_stopwords.json`` entries — the language-aware
+    replacement for the English-only closet stoplist in the extraction
+    paths, so ``entity_languages`` actually governs filtering.
+    """
+    return _get_stopwords(_normalize_langs(languages)) | _user_entity_stopwords()
+
+
 # ==================== BACKWARD-COMPAT MODULE CONSTANTS ====================
 #
 # These mirror the old module-level constants so existing imports keep working.
@@ -235,7 +291,7 @@ READABLE_EXTENSIONS = {
     ".rb",
     ".go",
     ".rs",
-    # Mirrors miner.READABLE_EXTENSIONS: Business Central AL (#278) and
+    # Mirrors miner.READABLE_EXTENSIONS: Business Central AL and
     # PowerShell, so an AL-only repo still has files to sample.
     ".al",
     ".ps1",
@@ -252,7 +308,7 @@ SKIP_DIRS = {
     "build",
     ".next",
     "coverage",
-    ".mempalace",
+    paths.DIRNAME,
     ".terraform",
     "vendor",
     "target",
@@ -279,7 +335,7 @@ SKIP_FILENAMES = {
 # Entity-candidate matching is ReDoS-prone: the English candidate pattern's
 # nested alternation (i18n/en.json) backtracks catastrophically on a long
 # unbroken run of printable ASCII (base64, minified JS, hashes, data URIs),
-# pinning a mine on one ~5000-char window for hours (#2063). Such a run is never
+# pinning a mine on one ~5000-char window for hours. Such a run is never
 # a name, so it is collapsed to a space before single-word matching. Scope:
 #   * ASCII-only ([!-~]): non-ASCII scripts (CJK, Cyrillic, Devanagari,
 #     accented Latin) are deliberately left untouched — a CJK paragraph is one
@@ -295,7 +351,7 @@ _LONG_ASCII_RUN_RX = re.compile(rf"[!-~]{{{_MAX_CANDIDATE_TOKEN_LEN},}}")
 
 
 def _collapse_long_ascii_runs(text: str) -> str:
-    """Collapse a long unbroken run of printable ASCII to a single space (#2063).
+    """Collapse a long unbroken run of printable ASCII to a single space.
 
     Applied only before single-word candidate matching — the whitespace-delimited
     multi-word patterns cannot backtrack on such runs. See ``_LONG_ASCII_RUN_RX``
@@ -315,12 +371,12 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
     """
     langs = _normalize_langs(languages)
     patterns = get_entity_patterns(langs)
-    stopwords = _get_stopwords(langs)
-    coca_filter = _get_coca_filter()
+    stopwords = _entity_blocklist(langs)
+    coca_filter = _get_coca_filter() if _use_english_filters(langs) else frozenset()
 
     counts: defaultdict = defaultdict(int)
 
-    # Tier 3 — known-systems compound pre-pass. Find compound product names
+    # Known-systems compound pre-pass. Find compound product names
     # ("Claude Code", "GitHub Copilot", ...) FIRST and mask them out of the
     # working text so the subsequent single-word + multi-word loops don't
     # re-decompose them into their constituent tokens.
@@ -329,7 +385,7 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
         counts[compound] += n
 
     # Single-word candidates — one pre-wrapped pattern per language.
-    # Collapse long ASCII blobs first (base64/minified) to defuse ReDoS (#2063).
+    # Collapse long ASCII blobs first (base64/minified) to defuse ReDoS.
     candidate_text = _collapse_long_ascii_runs(working_text)
     for wrapped_pat in patterns["candidate_patterns"]:
         try:
@@ -340,7 +396,7 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
             wl = word.lower()
             if wl in stopwords:
                 continue
-            # Tier 2 linguistics cleanup: block common English content words
+            # Block common English content words
             # (Code, Brutal, Phase, Line, Note, ...) from entity candidacy.
             # Multi-word path below is intentionally not filtered so
             # compound names like "Claude Code" still get detected.
@@ -883,7 +939,9 @@ def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
     """
     Collect prose file paths for entity detection.
     Prose only (.txt, .md, .rst, .csv) — code files produce too many false positives.
-    Falls back to all readable files if no prose found.
+    Falls back to all readable files if no prose found. MemPalace's own
+    project files are never sampled, so a re-run of ``mempalace init`` does
+    not read back the rooms and entities the first run wrote.
     """
     project_path = Path(project_dir).expanduser().resolve()
     prose_files = []
@@ -893,7 +951,7 @@ def scan_for_detection(project_dir: str, max_files: int = 10) -> list:
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for filename in filenames:
             filepath = Path(root) / filename
-            if filepath.stem.lower() in SKIP_FILENAMES:
+            if filepath.stem.lower() in SKIP_FILENAMES or filename in MEMPALACE_PROJECT_FILES:
                 continue
             ext = filepath.suffix.lower()
             if ext in PROSE_EXTENSIONS:

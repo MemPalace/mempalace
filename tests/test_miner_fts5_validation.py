@@ -21,7 +21,6 @@ from mempalace.palace import (
     _validate_palace_fts5_after_mine,
 )
 
-
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
@@ -275,8 +274,7 @@ def test_full_chain_raises_through_mine_impl(tmp_path, monkeypatch):
     by test_full_chain_auto_heals_isolated_fts5_corruption below, and would
     never reach this raise path at all now that it's auto-healed.
     """
-    from mempalace import miner as miner_mod
-    from mempalace import palace as palace_mod
+    from mempalace import miner as miner_mod, palace as palace_mod
 
     palace = tmp_path / "palace"
     src = tmp_path / "src"
@@ -537,8 +535,7 @@ def test_mine_impl_does_not_print_partial_summary_on_validation_error(
     (ChromaDB's own Rust bindings panic opening a sufficiently corrupted
     file, before this test's validator would ever run).
     """
-    from mempalace import miner as miner_mod
-    from mempalace import palace as palace_mod
+    from mempalace import miner as miner_mod, palace as palace_mod
 
     palace = tmp_path / "palace"
     src = tmp_path / "src"
@@ -737,11 +734,11 @@ def test_mine_formats_dry_run_skips_validator(tmp_path, monkeypatch):
 
 
 def test_mine_formats_keyboard_interrupt_skips_validator(tmp_path, monkeypatch):
-    """KeyboardInterrupt mid-mine routes through the outer `except
-    KeyboardInterrupt` branch, NOT the `else` branch where validation
-    sits, so a Ctrl-C abort must not trigger end-of-mine FTS5 validation.
-    The per-file `except Exception` does not catch BaseException, so the
-    interrupt propagates up to the outer handler as required.
+    """Ctrl-C propagates and does not run the end-of-mine FTS5 check.
+
+    The per-file ``except Exception`` does not catch ``KeyboardInterrupt``.
+    The outer handler prints the summary and re-raises, so the process
+    does not exit 0.
     """
     from mempalace import format_miner as format_mod
 
@@ -764,14 +761,15 @@ def test_mine_formats_keyboard_interrupt_skips_validator(tmp_path, monkeypatch):
     monkeypatch.setattr(format_mod, "scan_formats", lambda *_a, **_k: [fake_doc])
     monkeypatch.setattr(format_mod, "extract_text", _interrupt)
 
-    format_mod.mine_formats(
-        format_dir=str(src),
-        palace_path=str(palace),
-        wing="testwing",
-        agent="mempalace",
-        limit=0,
-        dry_run=False,
-    )
+    with pytest.raises(KeyboardInterrupt):
+        format_mod.mine_formats(
+            format_dir=str(src),
+            palace_path=str(palace),
+            wing="testwing",
+            agent="mempalace",
+            limit=0,
+            dry_run=False,
+        )
 
     assert calls == [], f"mine_formats must not validate on KeyboardInterrupt, got: {calls}"
 

@@ -127,7 +127,7 @@ except Exception:
 #
 # Uses the same sentinel + `sed -n 'Np'` extraction as the Claude Code
 # hooks for bash 3.2 compatibility (mapfile/readarray are unavailable
-# on macOS /bin/bash 3.2.57; #1440 regression). Each line of output is
+# on macOS /bin/bash 3.2.57). Each line of output is
 # pre-sanitised by the Python side to a shell-safe character set.
 mempal_parse_stdin() {
     local input="${1:-}"
@@ -137,18 +137,25 @@ mempal_parse_stdin() {
     # would shadow Python's stdin with the heredoc body, leaving
     # ``json.load(sys.stdin)`` to read nothing and silently fail. The
     # parser body deliberately uses only double-quoted Python strings
-    # so the surrounding bash single-quote is safe verbatim, and uses
-    # only the shell-safe character set (alphanumeric, underscore,
-    # dash, slash, dot, tilde) matching the Claude Code hook's
-    # sanitiser so a hostile transcript_path cannot splice
-    # metacharacters into the parsed output.
+    # so the surrounding bash single-quote is safe verbatim. Identifier
+    # and enum tokens use safe_str, while filesystem paths strip ASCII
+    # control characters via safe_path so newlines cannot shift line
+    # offsets and spaces / Windows separators / Unicode names survive.
     parsed="$(
         umask 077
-        printf '%s' "$input" | "$MEMPAL_PYTHON_BIN" -c '
-import json, re, sys
+        printf '%s' "$input" | PYTHONSAFEPATH=1 "$MEMPAL_PYTHON_BIN" -c '
+import sys
+if sys.path and sys.path[0] == "": del sys.path[0]
+import json, re
 
 def safe_str(value):
     return re.sub(r"[^a-zA-Z0-9_/.\-~]", "", str(value or ""))
+
+def safe_path(value):
+    return "".join(
+        c for c in str(value or "")
+        if ord(c) >= 32 and ord(c) != 127 and not (0xD800 <= ord(c) <= 0xDFFF)
+    )
 
 def safe_int(value):
     try:
@@ -165,14 +172,14 @@ if not isinstance(data, dict):
 
 conv = safe_str(data.get("conversation_id") or data.get("session_id"))
 loop_count = safe_int(data.get("loop_count", 0))
-transcript = safe_str(data.get("transcript_path", ""))
+transcript = safe_path(data.get("transcript_path", ""))
 trigger = safe_str(data.get("trigger", ""))
 status = safe_str(data.get("status", ""))
 
 roots = data.get("workspace_roots") or []
 workspace = ""
 if isinstance(roots, list) and roots:
-    workspace = safe_str(roots[0])
+    workspace = safe_path(roots[0])
 
 print("__MEMPAL_PARSE_OK__")
 print(conv)
@@ -238,7 +245,7 @@ print(status)
     # Expand a leading ~ in the transcript path so downstream
     # ``[ -f "$path" ]`` checks resolve correctly.
     case "$MEMPAL_TRANSCRIPT" in
-        '~/'*) MEMPAL_TRANSCRIPT="$HOME/${MEMPAL_TRANSCRIPT#~/}" ;;
+        '~/'*) MEMPAL_TRANSCRIPT="$HOME/${MEMPAL_TRANSCRIPT#\~/}" ;;
     esac
 }
 
@@ -348,8 +355,8 @@ mempal_consume_pending() {
 #
 # Per-conversation state artifacts (cursor_<conv>.count and
 # cursor_<conv>.pending) accumulate one set per conversation and are
-# never otherwise removed (igorls review, PR #1632 — unbounded state
-# growth). Reads MEMPAL_STATE_TTL_DAYS (default 30), validated
+# never otherwise removed, so they would grow without bound. Reads
+# MEMPAL_STATE_TTL_DAYS (default 30), validated
 # digits-only and leading-zero-stripped (mirrors the SAVE_INTERVAL
 # sanitiser) so `find -mtime` never sees a bad or octal token. Empty or
 # non-numeric floors to 30; a value of 0 means "sweep everything older
@@ -414,10 +421,10 @@ mempal_gc_stale_state() {
 
 # ── Workspace → wing inference ────────────────────────────────────────
 #
-# basename(workspace_root), normalised to [a-z0-9_-]. Edge cases:
+# basename(workspace_root), slugged like normalize_wing_name. Edge cases:
 #   /              → "root"
 #   /path/         → trailing slash stripped, then basename
-#   "/foo bar/"    → "foo_bar" (spaces collapsed to underscores)
+#   "/foo bar/"    → "foo_bar" (spaces and hyphens become underscores)
 #   ""             → "cursor_session"
 #   "C:\\proj"     → "proj" (Windows-style path; basename via tr fallback)
 #
@@ -430,9 +437,10 @@ mempal_infer_wing() {
         printf 'cursor_session'
         return 0
     fi
-    # Strip trailing slashes (but preserve the lone "/" case).
-    while [ "$raw" != "/" ] && [ "${raw%/}" != "$raw" ]; do
+    # Strip trailing slashes and backslashes (but preserve the lone "/" case).
+    while [ "$raw" != "/" ] && { [ "${raw%/}" != "$raw" ] || [ "${raw%\\}" != "$raw" ]; }; do
         raw="${raw%/}"
+        raw="${raw%\\}"
     done
     if [ "$raw" = "/" ]; then
         printf 'root'
@@ -444,14 +452,34 @@ mempal_infer_wing() {
     case "$base" in
         *\\*) base="${base##*\\}" ;;
     esac
-    # Lowercase + replace anything outside [a-z0-9_-] with underscore.
-    # Collapse runs of underscores so "foo  bar" doesn't become
-    # "foo__bar".
-    base="$(printf '%s' "$base" \
-        | tr '[:upper:]' '[:lower:]' \
-        | tr -c 'a-z0-9_-' '_' \
-        | tr -s '_' \
-        | sed 's/^_//; s/_$//')"
+    # The same slug mempalace.config.normalize_wing_name gives, so a
+    # workspace lands in the wing `mempalace mine` and the other harness
+    # hooks use (tests/test_wing_slug.py pins parity). tr and sed work on
+    # bytes, so a name with non-ASCII bytes asks Python itself, keeping
+    # the workspace directory off sys.path as mempal_hook_run.sh does.
+    local slug=""
+    if printf '%s' "$base" | LC_ALL=C grep -q '[^ -~]'; then
+        slug="$(PYTHONSAFEPATH=1 "$MEMPAL_PYTHON_BIN" -c 'import sys
+if sys.path and sys.path[0] == "": del sys.path[0]
+try:
+    from mempalace.config import normalize_wing_name
+    slug = normalize_wing_name(sys.argv[1])
+except Exception:
+    import re
+    slug = sys.argv[1].lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^\w.\x27]+", "_", slug)
+    slug = re.sub(r"\.{2,}", ".", slug)[:120].strip("_.\x27")
+sys.stdout.buffer.write(slug.encode("utf-8", "surrogateescape"))' "$base" 2>/dev/null)" || slug=""
+    fi
+    if [ -z "$slug" ]; then
+        slug="$(printf '%s' "$base" \
+            | LC_ALL=C tr 'A-Z' 'a-z' \
+            | LC_ALL=C tr ' -' '__' \
+            | LC_ALL=C sed -e "s/[^a-z0-9_.']\{1,\}/_/g" -e 's/\.\{2,\}/./g' \
+            | cut -c1-120 \
+            | LC_ALL=C sed -e "s/^[_.']*//" -e "s/[_.']*\$//")"
+    fi
+    base="$slug"
     if [ -z "$base" ]; then
         printf 'cursor_session'
         return 0

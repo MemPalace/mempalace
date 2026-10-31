@@ -368,13 +368,10 @@ class LocalPalaceSearchSource:
 class HubSearchClient:
     """Exact product-search replay through the live local MCP hub."""
 
-    def __init__(self, base_url: str, headers: Mapping[str, str]):
-        self._base_url = base_url
-        self._headers = dict(headers)
+    def __init__(self, hub):
+        self._hub = hub
 
     def __call__(self, query: str, palace_path: str, **kwargs) -> dict:
-        from mempalace.hub_client import forward_json_rpc
-
         if kwargs.get("candidate_strategy") != "vector":
             raise RuntimeError(
                 "the MCP search interface does not expose candidate_strategy='union'"
@@ -387,9 +384,7 @@ class HubSearchClient:
         for name in ("wing", "room", "source_file", "since", "before"):
             if kwargs.get(name) is not None:
                 arguments[name] = kwargs[name]
-        payload = forward_json_rpc(
-            self._base_url,
-            self._headers,
+        payload = self._hub.post(
             {
                 "jsonrpc": "2.0",
                 "id": f"private-search-benchmark-{time.time_ns()}",
@@ -416,12 +411,10 @@ class HubSearchClient:
 
 
 def _live_hub_search(palace_path: str):
-    from mempalace.hub_client import discover_hub
+    from mempalace.hub_client import HubClient
 
-    target = discover_hub(palace_path)
-    if target is None:
-        return None
-    return HubSearchClient(*target)
+    hub = HubClient.discover(palace_path)
+    return None if hub is None else HubSearchClient(hub)
 
 
 class _SourceAlgorithm:

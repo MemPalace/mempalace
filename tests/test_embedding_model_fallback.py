@@ -91,9 +91,7 @@ def unknown_model_palace(monkeypatch, tmp_path, request):
     monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
     monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
-    monkeypatch.setattr(embedding, "_WARNED", set())
     monkeypatch.setattr(embedding, "_DIM_CACHE", {})
-    monkeypatch.setattr(embedding, "_REFUSALS_LOGGED", set())
     _MiniLMStandIn.instances = []
     _MiniLMStandIn.calls = []
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: _MiniLMStandIn)

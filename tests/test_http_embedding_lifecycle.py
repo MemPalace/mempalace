@@ -6,17 +6,18 @@ import time
 from types import SimpleNamespace
 
 import pytest
+
 from mempalace.backends.embedding_wrapper import _embed_texts as production_embed_texts
 
 
 @pytest.mark.parametrize("allow_release", [True, False])
 def test_reconnect_cannot_close_diary_handle_before_embedding(monkeypatch, tmp_path, allow_release):
-    from mempalace import mcp_server as mcp, palace
-    from mempalace.backends import PalaceRef
-    from mempalace.backends.sqlite_exact import SQLiteExactBackend
-    from mempalace.backends.embedding_wrapper import EmbeddingCollection
     import mempalace.backends.embedding_wrapper as wrapper
     import mempalace.embedding as embedding
+    from mempalace import mcp_server as mcp, palace
+    from mempalace.backends import PalaceRef
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
 
     backend = SQLiteExactBackend()
     ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))

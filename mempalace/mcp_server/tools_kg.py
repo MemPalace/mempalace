@@ -28,7 +28,7 @@ def _fact_interval_bucket(row: dict, now_key: str) -> str:
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     """Query the knowledge graph for an entity's relationships."""
     try:
-        entity = sanitize_kg_value(entity, "entity")
+        entity = sanitize_kg_lookup(entity, "entity")
         as_of = sanitize_iso_temporal(as_of, "as_of")
     except ValueError as e:
         return {"error": str(e)}
@@ -36,9 +36,11 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
     if direction not in ("outgoing", "incoming", "both"):
         return {"error": "direction must be 'outgoing', 'incoming', or 'both'"}
 
-    results = _call_kg(lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction))
+    results = _call_kg(
+        lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction), read=True
+    )
     if as_of is None:
-        now_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_key = utc_now_z()
         active = []
         historical = []
         future = []
@@ -75,10 +77,10 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
                 payload["resolved_from"] = entity
                 payload["entity"] = resolved
     else:
-        candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
+        candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity), read=True)
         if candidates:
             payload["candidates"] = candidates
-    return payload
+    return _with_kg_notice(payload)
 
 
 def tool_kg_add(
@@ -150,7 +152,7 @@ def tool_kg_add(
         "fact": f"{subject} → {predicate} → {object}",
     }
     _wal_result("kg_add", outcome)
-    return outcome
+    return _with_kg_notice(outcome)
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -164,9 +166,9 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
     """
     try:
-        subject = sanitize_kg_value(subject, "subject")
+        subject = sanitize_kg_lookup(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        object = sanitize_kg_value(object, "object")
+        object = sanitize_kg_lookup(object, "object")
         ended = sanitize_iso_temporal(ended, "ended")
     except ValueError as e:
         return {"success": False, "error": str(e)}
@@ -184,11 +186,13 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     )
 
     _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
-    return {
-        "success": True,
-        "fact": f"{subject} → {predicate} → {object}",
-        "ended": resolved_ended,
-    }
+    return _with_kg_notice(
+        {
+            "success": True,
+            "fact": f"{subject} → {predicate} → {object}",
+            "ended": resolved_ended,
+        }
+    )
 
 
 def tool_kg_supersede(
@@ -210,9 +214,9 @@ def tool_kg_supersede(
     (``YYYY-MM-DDTHH:MM:SSZ``) and defaults to the current UTC instant.
     """
     try:
-        subject = sanitize_kg_value(subject, "subject")
+        subject = sanitize_kg_lookup(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        old_object = sanitize_kg_value(old_object, "old_object")
+        old_object = sanitize_kg_lookup(old_object, "old_object")
         new_object = sanitize_kg_value(new_object, "new_object")
         at = sanitize_iso_temporal(at, "at")
     except ValueError as e:
@@ -234,12 +238,14 @@ def tool_kg_supersede(
     # -32000 response carries error_class + message in error.data. Only input
     # sanitization above returns the {success: False} envelope.
     triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
-    return {
-        "success": True,
-        "triple_id": triple_id,
-        "fact": f"{subject} → {predicate} → {new_object}",
-        "superseded": old_object,
-    }
+    return _with_kg_notice(
+        {
+            "success": True,
+            "triple_id": triple_id,
+            "fact": f"{subject} → {predicate} → {new_object}",
+            "superseded": old_object,
+        }
+    )
 
 
 def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
@@ -252,7 +258,7 @@ def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
     offset = max(0, offset)
     if entity is not None:
         try:
-            entity = sanitize_kg_value(entity, "entity")
+            entity = sanitize_kg_lookup(entity, "entity")
         except ValueError as e:
             return {"error": str(e)}
 
@@ -262,17 +268,19 @@ def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
             "total": kg.timeline_total(entity),
         }
 
-    result = _call_kg(_query)
-    return {
-        "entity": entity or "all",
-        "timeline": result["timeline"],
-        "count": len(result["timeline"]),
-        "total": result["total"],
-        "offset": offset,
-        "limit": limit,
-    }
+    result = _call_kg(_query, read=True)
+    return _with_kg_notice(
+        {
+            "entity": entity or "all",
+            "timeline": result["timeline"],
+            "count": len(result["timeline"]),
+            "total": result["total"],
+            "offset": offset,
+            "limit": limit,
+        }
+    )
 
 
 def tool_kg_stats():
     """Knowledge graph overview: entities, triples, relationship types."""
-    return _call_kg(lambda kg: kg.stats())
+    return _with_kg_notice(_call_kg(lambda kg: kg.stats(), read=True))

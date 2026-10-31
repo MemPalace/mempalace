@@ -1,6 +1,7 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
 import contextlib
+import json
 import sys
 
 import pytest
@@ -10,11 +11,11 @@ from mempalace.convo_miner import (
     _emit_bounded,
     _extract_authored_at,
     _file_chunks_locked,
-    _source_file_delete_ids,
     chunk_exchanges,
     detect_convo_room,
     scan_convos,
 )
+from mempalace.palace import _source_file_delete_ids, file_already_mined
 
 
 class TestChunkExchanges:
@@ -724,9 +725,12 @@ class TestFileChunksLocked:
             def upsert(self, documents, ids, metadatas):
                 self.batch_sizes.append(len(documents))
 
+            def update(self, *args, **kwargs):
+                pass
+
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
         col = FakeCol()
-        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
         )
@@ -758,6 +762,9 @@ class TestFileChunksLocked:
             def upsert(self, documents, ids, metadatas):
                 self.metas.extend(metadatas)
 
+            def update(self, *args, **kwargs):
+                pass
+
         chunks = [
             {
                 "content": "We changed `MemoryStack` in rag/foo.py via do_thing_now().",
@@ -778,24 +785,31 @@ class TestFileChunksLocked:
         assert "rag/foo.py" in entities
         assert "do_thing_now" in entities
 
-    def test_aborts_when_stale_drawer_purge_fails(self, monkeypatch):
-        """#105: a failed purge must abort the mine attempt, not silently
-        proceed to upsert on top of it — the same swallow already fixed
-        for miner.py's process_file at #23, own instance here."""
+    def test_a_failed_stale_drawer_purge_raises_and_keeps_the_marker(self, monkeypatch):
+        """#105: a failed purge is an error the mine counts. The fresh chunks
+        are already written and stay marked unfinished, so the next mine
+        finishes the job instead of skipping the file."""
         import mempalace.convo_miner as convo_miner
+        from mempalace.palace import StaleDrawerPurgeFailed
 
         class FailingPurgeCol:
             def __init__(self):
-                self.upsert_called = False
+                self.upserted = []
+                self.update_called = False
 
-            def get(self, *args, **kwargs):
-                raise RuntimeError("simulated transient backend error")
+            def get(self, where=None, ids=None, **kwargs):
+                if where is not None:
+                    raise RuntimeError("simulated transient backend error")
+                return {"ids": [], "metadatas": []}
 
             def delete(self, *args, **kwargs):
                 pass
 
             def upsert(self, documents, ids, metadatas):
-                self.upsert_called = True
+                self.upserted.extend(metadatas)
+
+            def update(self, *args, **kwargs):
+                self.update_called = True
 
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
         col = FailingPurgeCol()
@@ -805,26 +819,21 @@ class TestFileChunksLocked:
         monkeypatch.setattr(convo_miner, "mine_lock", lambda source_file: contextlib.nullcontext())
         monkeypatch.setattr(convo_miner, "_detect_hall_cached", lambda content: "conversations")
 
-        drawers, room_counts, skipped = _file_chunks_locked(
-            col, "chat.txt", chunks, "wing", "general", "agent", "exchange"
-        )
+        with pytest.raises(StaleDrawerPurgeFailed):
+            _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
 
-        assert col.upsert_called is False, (
-            "_file_chunks_locked inserted new chunks even though the "
-            "stale-drawer purge raised — old and new rows can now coexist "
-            "as duplicates/orphans"
-        )
-        assert drawers == 0
-        # A failed purge is an error the mine counts, not an "already filed".
-        assert skipped == convo_miner.PURGE_FAILED
+        assert [m["chunk_total"] for m in col.upserted] == [4, 4, 4]
+        assert col.update_called is False, "the new drawers were marked finished"
 
     def test_stamps_chunk_total_for_completion_check(self, monkeypatch):
-        """Every convo drawer of one pass must carry chunk_total (#2183)."""
+        """Every convo drawer of one pass must carry chunk_total (#2183),
+        written one too high and then set to the real count."""
         import mempalace.convo_miner as convo_miner
 
         class FakeCol:
             def __init__(self):
                 self.metas = []
+                self.updated = []
 
             def delete(self, *args, **kwargs):
                 pass
@@ -835,9 +844,12 @@ class TestFileChunksLocked:
             def upsert(self, documents, ids, metadatas):
                 self.metas.extend(metadatas)
 
+            def update(self, ids, metadatas):
+                self.updated.extend(metadatas)
+
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
         col = FakeCol()
-        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
         )
@@ -847,13 +859,16 @@ class TestFileChunksLocked:
         _file_chunks_locked(col, "chat.txt", chunks, "wing", "general", "agent", "exchange")
 
         assert len(col.metas) == 5
-        assert all(m.get("chunk_total") == 5 for m in col.metas), (
-            "not every convo chunk carries the pass's chunk_total — a mid-file "
+        assert all(m.get("chunk_total") == 6 for m in col.metas), (
+            "not every convo chunk was written marked unfinished — a mid-file "
             "crash would leave mtime-stamped partials that skip forever (#2183)"
         )
+        assert [m["chunk_total"] for m in col.updated] == [5] * 5
 
-    def test_cleans_partial_drawers_after_batch_upsert_failure(self, monkeypatch, tmp_path):
-        """A failed later batch must not leave mtime-stamped partials (#2183)."""
+    def test_a_failed_batch_leaves_its_drawers_marked_unfinished(self, monkeypatch, tmp_path):
+        """A failed later batch leaves what it wrote marked unfinished, so the
+        next mine retries instead of skipping the file (#2183), and deletes
+        nothing the file already had."""
         import mempalace.convo_miner as convo_miner
 
         class FailingCol:
@@ -899,11 +914,14 @@ class TestFileChunksLocked:
                     for drawer_id, metadata in zip(ids, metadatas)
                 )
 
+            def update(self, *args, **kwargs):
+                pass
+
         source = tmp_path / "chat.txt"
         source.write_text("content\n", encoding="utf-8")
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
         col = FailingCol()
-        monkeypatch.setattr(convo_miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+        monkeypatch.setattr("mempalace.palace.DRAWER_UPSERT_BATCH_SIZE", 2)
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
         )
@@ -913,11 +931,9 @@ class TestFileChunksLocked:
         with pytest.raises(RuntimeError, match="second-batch failure"):
             _file_chunks_locked(col, str(source), chunks, "wing", "general", "agent", "exchange")
 
-        assert col.records == [], (
-            "partial convo drawers survived a mid-file upsert failure — the "
-            "next mine would skip this incomplete file forever (#2183)"
-        )
-        assert col.deleted_ids, "cleanup did not delete the partial drawer ids"
+        assert [r["metadata"]["chunk_total"] for r in col.records] == [4, 4]
+        assert col.deleted_ids == []
+        assert not file_already_mined(col, str(source), check_mtime=True, extract_mode="exchange")
 
 
 class TestSourceFileDeleteIds:
@@ -954,6 +970,40 @@ class TestExtractAuthoredAt:
     """authored_at = max per-line ``timestamp`` in a transcript (real authored date,
     independent of mine time). Both Claude Code and Codex JSONL carry a top-level
     ISO-8601 ``timestamp`` per line."""
+
+    @pytest.mark.parametrize(
+        ("timestamps", "expected"),
+        [
+            (
+                ["2026-09-09T10:00:00+09:00", "2026-09-09T02:00:00Z"],
+                "2026-09-09T02:00:00Z",
+            ),
+            (
+                ["2026-09-09T02:00:00Z", "2026-09-09T10:00:00+09:00"],
+                "2026-09-09T02:00:00Z",
+            ),
+            (
+                ["2026-09-09T02:00:00Z", "2026-09-09T02:00:00.500Z"],
+                "2026-09-09T02:00:00.500Z",
+            ),
+            (
+                ["not-a-date", "2026-09-09T02:00:00Z", "2026-99-99T00:00:00Z"],
+                "2026-09-09T02:00:00Z",
+            ),
+            (["not-a-date", "2026-99-99T00:00:00Z", ""], None),
+        ],
+        ids=["offsets", "reversed-offsets", "fractional-seconds", "invalid-mixed", "invalid-only"],
+    )
+    def test_selects_latest_valid_instant(self, tmp_path, timestamps, expected):
+        transcript = tmp_path / "session.jsonl"
+        transcript.write_text(
+            "\n".join(json.dumps({"timestamp": value}) for value in timestamps),
+            encoding="utf-8",
+        )
+
+        authored_at = _extract_authored_at(transcript)
+
+        assert authored_at == expected
 
     def test_returns_latest_timestamp(self, tmp_path):
         f = tmp_path / "session.jsonl"
@@ -1051,6 +1101,9 @@ class TestSourceDirectoryIdentity:
             def upsert(self, documents, ids, metadatas):
                 self.metadatas.extend(metadatas)
 
+            def update(self, *args, **kwargs):
+                pass
+
         chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(3)]
         col = FakeCol()
         monkeypatch.setattr(
@@ -1091,6 +1144,9 @@ class TestSourceDirectoryIdentity:
             def upsert(self, documents, ids, metadatas):
                 self.metadatas.extend(metadatas)
 
+            def update(self, *args, **kwargs):
+                pass
+
         col = FakeCol()
         monkeypatch.setattr(
             convo_miner, "file_already_mined", lambda collection, source_file, **kwargs: False
@@ -1115,8 +1171,7 @@ class TestSourceDirectoryIdentity:
 def test_mine_convos_passes_the_directory_it_read_from(tmp_path, monkeypatch):
     """The storing half is covered above; this covers the wiring, so removing
     the call in ``_mine_convos_impl`` cannot pass unnoticed (#2320)."""
-    from mempalace import convo_miner
-    from mempalace import source_identity as si
+    from mempalace import convo_miner, source_identity as si
 
     transcripts = tmp_path / "transcripts"
     transcripts.mkdir()

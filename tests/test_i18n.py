@@ -1,7 +1,7 @@
 """Smoke tests for i18n dictionaries + Dialect integration."""
 
-from mempalace.i18n import load_lang, t, available_languages
 from mempalace.dialect import Dialect
+from mempalace.i18n import available_languages, load_lang, t
 
 
 def test_all_languages_load():

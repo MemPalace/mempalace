@@ -123,7 +123,7 @@ Raw results are in `benchmarks/results_*.jsonl` and `benchmarks/results_*.json`.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - `chromadb` (the only dependency)
 - ~300MB disk for LongMemEval data
 - ~5 minutes for each full benchmark run

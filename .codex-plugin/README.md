@@ -4,7 +4,7 @@ Give your AI a persistent memory -- mine projects and conversations into a searc
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - Codex CLI installed and configured
 - `uv tool install mempalace` (recommended) or `pip install mempalace`
 

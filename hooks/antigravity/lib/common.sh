@@ -57,7 +57,7 @@ MEMPAL_AGY_LOG="$MEMPAL_STATE_DIR/antigravity_hook.log"
 # ISOLATED environment whose interpreter is NOT the system `python3`.
 # So naively resolving `command -v python3` lands on a system Python
 # that can't import mempalace, the `-m mempalace` probe fails, and
-# mining silently never fires. (This bit a real user on PR #1633.)
+# mining silently never fires.
 #
 # Resolution order — first hit wins:
 #   1. $MEMPAL_PYTHON                         — explicit operator override
@@ -162,7 +162,7 @@ mempal_expand_home() {
     esac
 }
 
-# Print the config directory, resolved the way mempalace.config does (#148):
+# Print the config directory, resolved the way mempalace.config does:
 # $MEMPALACE_CONFIG_DIR, then a ~/.mempalace that holds a real install, then
 # $XDG_CONFIG_HOME/mempalace (absolute values only), then ~/.config/mempalace.
 # Both environment values have a leading "~" expanded first, as in Python.
@@ -195,7 +195,7 @@ mempal_kill_switch_tripped() {
     cfg_dir="$(mempal_config_dir)"
 
     # Palace nuke is the strongest signal: respect it before touching
-    # disk for state, logging, etc. A fresh install since #148 lives in the
+    # disk for state, logging, etc. A fresh install lives in the
     # XDG config dir and has no ~/.mempalace, so either directory passes.
     if [ ! -d "$HOME/.mempalace" ] && [ ! -d "$cfg_dir" ]; then
         return 0
@@ -243,9 +243,9 @@ except Exception:
 #
 #   line 1: __MEMPAL_PARSE_OK__       — sentinel (parse success marker)
 #   line 2: conversationId            — sanitized to [A-Za-z0-9._-]
-#   line 3: transcriptPath            — sanitized to a safe path charset
-#   line 4: workspacePath             — workspacePaths[0], sanitized
-#   line 5: artifactDirectoryPath     — sanitized
+#   line 3: transcriptPath            — ASCII control chars stripped
+#   line 4: workspacePath             — workspacePaths[0], ASCII control chars stripped
+#   line 5: artifactDirectoryPath     — ASCII control chars stripped
 #   line 6: executionNum              — integer, default 0
 #   line 7: terminationReason         — sanitized to [a-z_]
 #   line 8: fullyIdle                 — "True" or "False" (string)
@@ -266,8 +266,10 @@ mempal_parse_stdin() {
     local input="$1"
     (
         umask 077
-        printf '%s' "$input" | "$MEMPAL_PYTHON_BIN" -c "
-import sys, json, re
+        printf '%s' "$input" | PYTHONSAFEPATH=1 "$MEMPAL_PYTHON_BIN" -c "
+import sys
+if sys.path and sys.path[0] == '': del sys.path[0]
+import json, re
 
 # IMPORTANT: do NOT wrap json.load in a try/except. If the input is
 # not valid JSON we want Python to exit non-zero BEFORE printing the
@@ -279,8 +281,11 @@ import sys, json, re
 # antigravity_last_python_err.log so operators can debug.
 data = json.load(sys.stdin)
 
-def safe(s, allowed=r'[^a-zA-Z0-9_/.\-~]'):
-    return re.sub(allowed, '', str(s))
+def safe(s):
+    return ''.join(
+        c for c in str(s or '')
+        if ord(c) >= 32 and ord(c) != 127 and not (0xD800 <= ord(c) <= 0xDFFF)
+    )
 
 def safe_id(s):
     return re.sub(r'[^a-zA-Z0-9._-]', '', str(s))
@@ -353,34 +358,61 @@ mempal_is_valid_transcript_path() {
 # ── Wing inference ────────────────────────────────────────────────────
 #
 # Takes the first workspace path from workspacePaths[] (already
-# extracted into $1) and derives a `wing_<slug>` name from its leaf
-# directory. Hyphens become underscores; spaces become underscores.
-# Empty input yields wing_sessions, matching mempalace.hooks_cli's
-# fallback.
+# extracted into $1) and derives the project wing from its leaf
+# directory: the slug mempalace.config.normalize_wing_name gives (ASCII
+# names; tests/test_wing_slug_shell.py pins parity), the same wing the
+# diary, `mempalace mine` and the other harness hooks use. Empty input
+# yields sessions, matching mempalace.hooks_cli's fallback.
 mempal_infer_wing() {
     local workspace="$1"
     if [ -z "$workspace" ]; then
-        printf 'wing_sessions'
+        printf 'sessions'
         return 0
     fi
-    # Strip trailing slashes
-    while [ "${workspace}" != "${workspace%/}" ]; do
+    # Strip trailing slashes and backslashes
+    while [ "${workspace}" != "${workspace%/}" ] || [ "${workspace}" != "${workspace%\\}" ]; do
         workspace="${workspace%/}"
+        workspace="${workspace%\\}"
     done
     if [ -z "$workspace" ]; then
-        printf 'wing_sessions'
+        printf 'sessions'
         return 0
     fi
     local leaf="${workspace##*/}"
+    case "$leaf" in
+        *\\*) leaf="${leaf##*\\}" ;;
+    esac
     if [ -z "$leaf" ]; then
-        printf 'wing_sessions'
+        printf 'sessions'
         return 0
     fi
-    # Lowercase + hyphens-to-underscores. tr is bash 3.2 safe; ${var^^}
-    # / ${var//-/_} on a fresh expansion are bash 4+ only.
-    local slug
-    slug=$(printf '%s' "$leaf" | tr 'A-Z' 'a-z' | tr ' -' '__')
-    printf 'wing_%s' "$slug"
+    # tr and sed work on bytes, so a name with non-ASCII bytes asks
+    # mempalace.config.normalize_wing_name itself, keeping the workspace
+    # directory off sys.path as mempal_hook_run.sh does.
+    local slug=""
+    if printf '%s' "$leaf" | LC_ALL=C grep -q '[^ -~]'; then
+        slug=$(PYTHONSAFEPATH=1 "$MEMPAL_PYTHON_BIN" -c 'import sys
+if sys.path and sys.path[0] == "": del sys.path[0]
+try:
+    from mempalace.config import normalize_wing_name
+    slug = normalize_wing_name(sys.argv[1])
+except Exception:
+    import re
+    slug = sys.argv[1].lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^\w.\x27]+", "_", slug)
+    slug = re.sub(r"\.{2,}", ".", slug)[:120].strip("_.\x27")
+sys.stdout.buffer.write(slug.encode("utf-8", "surrogateescape"))' "$leaf" 2>/dev/null) || slug=""
+    fi
+    # tr and sed with bracket ranges stay bash 3.2 safe; ${var,,} is 4+.
+    if [ -z "$slug" ]; then
+        slug=$(printf '%s' "$leaf" \
+            | LC_ALL=C tr 'A-Z' 'a-z' \
+            | LC_ALL=C tr ' -' '__' \
+            | LC_ALL=C sed -e "s/[^a-z0-9_.']\{1,\}/_/g" -e 's/\.\{2,\}/./g' \
+            | cut -c1-120 \
+            | LC_ALL=C sed -e "s/^[_.']*//" -e "s/[_.']*\$//")
+    fi
+    printf '%s' "${slug:-sessions}"
 }
 
 # ── Save-interval floor ───────────────────────────────────────────────

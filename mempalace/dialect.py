@@ -44,9 +44,8 @@ FLAGS:
 import json
 import os
 import re
-from typing import List, Dict, Optional
 from pathlib import Path
-
+from typing import Dict, List, Optional
 
 # === EMOTION CODES (universal) ===
 
@@ -339,7 +338,7 @@ class Dialect:
         self.skip_names = [n.lower() for n in (skip_names or [])]
 
         # Load language-specific AAAK instruction and regex patterns
-        from mempalace.i18n import load_lang, t, current_lang, get_regex
+        from mempalace.i18n import current_lang, get_regex, load_lang, t
 
         if lang:
             load_lang(lang)

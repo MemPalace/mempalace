@@ -10,9 +10,9 @@ mempalace imports — so that module-level initialisations (e.g.
 instead of the real user profile.
 """
 
-import os
 import hashlib
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -28,6 +28,46 @@ os.environ["HOME"] = _session_tmp
 os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
+
+# ── Drop the developer's own MemPalace settings for the session ─────────
+# Isolating HOME is not enough on a machine that configures MemPalace through
+# the environment. A contributor who exports MEMPALACE_BACKEND=pgvector and
+# MEMPALACE_PGVECTOR_DSN (the documented way to attach a shared backend) hands
+# those to every test, and tests that spawn a subprocess pass them on. Two
+# things then go wrong:
+#
+#   * Tests that build a palace in tmp_path select the ambient backend instead
+#     of the local default, and fail as BackendMismatchError once the on-disk
+#     artifacts disagree with the selected backend.
+#   * A test that redirects HOME and then runs a hook writes to the configured
+#     remote database. The palace path under the temp HOME hashes to a new
+#     table prefix, so the write lands in its own tables rather than the
+#     contributor's real ones — observed on a shared pgvector instance, where
+#     two `tests/test_antigravity_hooks_shell.py` cases left stray tables
+#     behind in the production database.
+#
+# CI sets none of these, so clearing them is what makes a local run reproduce
+# CI rather than the developer's own configuration. Values are captured for
+# the restore in ``_isolate_home`` and only ambient ones are removed: a test
+# that sets MEMPALACE_* through monkeypatch or an explicit subprocess env is
+# unaffected, because that happens after this module is imported.
+_PRESERVE_TEST_ENV = {
+    "MEMPALACE_DOCS_GA_ID",
+    "MEMPALACE_PGVECTOR_LIVE_DSN",
+    "MEMPALACE_PGVECTOR_LIVE_URL",
+    "MEMPALACE_QDRANT_LIVE_API_KEY",
+    "MEMPALACE_QDRANT_LIVE_URL",
+    "MEMPALACE_REQUIRE_NATIVE",
+    "MEMPALACE_RUN_EG2_AUDIO",
+    "MEMPALACE_RUN_EG2_IMAGE",
+    "MEMPALACE_TEST_EMBEDDINGGEMMA_ONNX",
+}
+for _var in [
+    _k
+    for _k in os.environ
+    if _k.startswith(("MEMPALACE_", "MEMPAL_")) and _k not in _PRESERVE_TEST_ENV
+]:
+    _original_env[_var] = os.environ.pop(_var)
 
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
@@ -99,8 +139,9 @@ class _StableTestEmbeddingFunction:
 # don't re-download the 79 MB model on every run. The HOME redirect above
 # would otherwise point ONNXMiniLM_L6_V2.DOWNLOAD_PATH at the empty temp dir.
 try:
-    from pathlib import Path  # noqa: E402
-    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (  # noqa: E402
+    from pathlib import Path
+
+    from chromadb.utils.embedding_functions.onnx_mini_lm_l6_v2 import (
         ONNXMiniLM_L6_V2,
     )
 
@@ -129,10 +170,11 @@ def _stable_embedding_function_for_tests(request, monkeypatch):
 
     ef = _StableTestEmbeddingFunction()
 
+    from chromadb.api.types import DefaultEmbeddingFunction
+
     import mempalace.backends.chroma as chroma_mod
     import mempalace.backends.embedding_wrapper as embedding_wrapper
     import mempalace.embedding as embedding_mod
-    from chromadb.api.types import DefaultEmbeddingFunction
 
     monkeypatch.setattr(DefaultEmbeddingFunction, "__call__", lambda self, input: ef(input=input))
     monkeypatch.setattr(
@@ -188,6 +230,44 @@ def _release_palace_anchors():
     inproc = sys.modules.get("mempalace.backends._inproc_sqlite")
     if inproc is not None:
         inproc.release_all()
+
+
+def _realign_default_backend(palace_module):
+    """Make ``palace._DEFAULT_BACKEND`` the registry's chroma instance again.
+
+    In production the two are the same object. ``reset_backends()`` (called by
+    several test modules) closes that instance and empties the registry, so the
+    next ``get_backend("chroma")`` builds a second one while ``_DEFAULT_BACKEND``
+    keeps pointing at the closed original. Later tests then patch one object
+    and the code under test uses the other.
+    """
+    from mempalace.backends import registry
+    from mempalace.backends.chroma import ChromaBackend
+
+    current = registry.get_backend("chroma")
+    if isinstance(current, ChromaBackend) and current is not palace_module._DEFAULT_BACKEND:
+        palace_module._DEFAULT_BACKEND = current
+
+
+@pytest.fixture(autouse=True)
+def _fresh_one_shot_warnings():
+    """Let every test see the warnings that fire once per process."""
+    from mempalace import _once
+
+    _once.reset()
+
+
+@pytest.fixture(autouse=True)
+def _utc_local_zone(monkeypatch):
+    """Read naive legacy timestamps as UTC so results don't depend on the host zone.
+
+    Tests that need another zone set ``timeutil._LOCAL_TZ`` themselves.
+    """
+    from datetime import timezone
+
+    from mempalace import timeutil
+
+    monkeypatch.setattr(timeutil, "_LOCAL_TZ", timezone.utc)
 
 
 @pytest.fixture(autouse=True)
@@ -277,6 +357,10 @@ def _reset_mcp_cache(monkeypatch):
         except (ImportError, AttributeError):
             pass
 
+        from mempalace import search_util
+
+        search_util._known_wings_cache.clear()
+
         # Release chromadb clients opened through the backend layer. Many tests
         # reach the store via palace.get_collection() (sweep, repair, CLI, ...),
         # which caches one PersistentClient per palace_path on the long-lived
@@ -289,6 +373,7 @@ def _reset_mcp_cache(monkeypatch):
         try:
             from mempalace import palace as _palace
 
+            _realign_default_backend(_palace)
             backend = getattr(_palace, "_DEFAULT_BACKEND", None)
             clients = getattr(backend, "_clients", None)
             if clients:
@@ -320,6 +405,17 @@ def _isolate_home():
         else:
             os.environ[var] = orig
     shutil.rmtree(_session_tmp, ignore_errors=True)
+
+
+@pytest.fixture
+def tokenless_http_hub(monkeypatch):
+    """Serve MCP HTTP without a bearer token, as ``mempalace serve --no-token`` does.
+
+    The transport requires a token by default; suites that drive a loopback
+    hub with raw HTTP requests opt out with this rather than carry a token.
+    """
+    monkeypatch.delenv("MEMPALACE_MCP_HTTP_TOKEN", raising=False)
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN", "1")
 
 
 @pytest.fixture
@@ -420,6 +516,13 @@ def seeded_collection(collection):
         ],
     )
     return collection
+
+
+def pytest_configure(config):
+    """On Windows, replace coverage's fail_under with the pyproject Windows gate."""
+    from coverage_gate import apply_platform_threshold
+
+    apply_platform_threshold(config)
 
 
 @pytest.fixture

@@ -9,7 +9,6 @@ import re
 import sqlite3
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 
@@ -187,15 +186,16 @@ def test_read_only_refuses_exactly_the_refused_set(monkeypatch):
 def test_read_only_refuses_every_daemon_write_tool():
     """Read-only must not be laxer than the daemon's own write classification.
 
-    service.WRITE_TOOLS is a security allowlist: execute_job lets the generic
+    WRITE_TOOLS is a security allowlist: execute_job lets the generic
     mcp_tool escape hatch run write-classified tools only. A tool the daemon
-    calls a write while read-only serves it is the exact gap this fixes, and
-    mempalace_hook_settings was that tool.
+    calls a write while read-only serves it would slip through, and
+    mempalace_hook_settings was such a tool.
     """
-    from mempalace import mcp_server, service
+    from mempalace import mcp_server
+    from mempalace.tool_capabilities import WRITE_TOOLS
 
-    assert service.WRITE_TOOLS <= mcp_server._READ_ONLY_REFUSED_TOOLS
-    assert "mempalace_hook_settings" in service.WRITE_TOOLS
+    assert WRITE_TOOLS <= mcp_server._READ_ONLY_REFUSED_TOOLS
+    assert "mempalace_hook_settings" in WRITE_TOOLS
 
 
 def test_peer_writer_guard_does_not_gate_hook_settings(monkeypatch):
@@ -503,6 +503,118 @@ def test_peer_writer_readonly_self_heals_after_peer_exits(monkeypatch):
     assert calls["count"] == 2  # retried, not stranded read-only
     assert mcp_server._MCP_WRITER_LOCK_CM is not None
     assert mcp_server._MCP_WRITER_READ_ONLY is False
+
+
+def _stub_write_tool(monkeypatch, mcp_server, handler):
+    monkeypatch.setitem(
+        mcp_server.TOOLS,
+        "mempalace_add_drawer",
+        {
+            "description": "test write tool",
+            "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}},
+            "handler": handler,
+        },
+    )
+
+
+def _call_write_tool(mcp_server):
+    return mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {"name": "mempalace_add_drawer", "arguments": {"content": "hi"}},
+        }
+    )
+
+
+def test_mutating_call_releases_writer_lease(monkeypatch, config):
+    """A stdio server must not keep the lease after its write finishes.
+
+    It used to hold the flock until the process exited, so one idle session
+    left every peer session read-only for hours.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    mcp_server._release_mcp_writer_lock()
+    held_during = {}
+
+    def handler(**kwargs):
+        held_during["value"] = mcp_server._MCP_WRITER_LOCK_CM is not None
+        return {"success": True}
+
+    _stub_write_tool(monkeypatch, mcp_server, handler)
+    response = _call_write_tool(mcp_server)
+
+    assert "error" not in response, response
+    assert held_during["value"] is True
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+    _assert_palace_lock_free(config.palace_path)
+
+
+def test_mutating_call_keeps_lease_it_did_not_take(monkeypatch, config):
+    """Writable HTTP takes the lease at startup; a call must not drop it."""
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    mcp_server._release_mcp_writer_lock()
+    assert mcp_server._acquire_mcp_writer_lock() == (True, "")
+    _stub_write_tool(monkeypatch, mcp_server, lambda **kwargs: {"success": True})
+
+    response = _call_write_tool(mcp_server)
+
+    assert "error" not in response, response
+    assert mcp_server._MCP_WRITER_LOCK_CM is not None
+    mcp_server._release_mcp_writer_lock()
+
+
+def test_contended_mutating_call_waits_for_peer(monkeypatch):
+    """A peer's lease lasts one call, so a short wait beats refusing."""
+    from mempalace import mcp_server, palace
+
+    class _DummyLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    calls = {"count": 0}
+
+    def busy_twice(palace_path):
+        calls["count"] += 1
+        if calls["count"] <= 2:
+            raise palace.MineAlreadyRunning(f"palace {palace_path} is held by pid=999")
+        return _DummyLock()
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", busy_twice)
+    monkeypatch.setattr(mcp_server, "_discard_mcp_storage_handles", lambda: None)
+    _stub_write_tool(monkeypatch, mcp_server, lambda **kwargs: {"success": True})
+
+    response = _call_write_tool(mcp_server)
+
+    assert "error" not in response, response
+    assert calls["count"] == 3
+    assert mcp_server._MCP_WRITER_LOCK_CM is None
+
+
+def test_contended_mutating_call_refuses_after_wait(monkeypatch):
+    from mempalace import mcp_server, palace
+
+    def always_busy(palace_path):
+        raise palace.MineAlreadyRunning(f"palace {palace_path} is held by pid=999")
+
+    monkeypatch.delenv(mcp_server._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
+    monkeypatch.setattr(palace, "mine_palace_lock", always_busy)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_CALL_WAIT_SECONDS", 0.3)
+    _stub_write_tool(monkeypatch, mcp_server, lambda **kwargs: pytest.fail("handler ran"))
+
+    response = _call_write_tool(mcp_server)
+
+    assert response["error"]["code"] == -32001
+    assert response["error"]["data"]["failure_kind"] == "peer_contention"
 
 
 def test_sqlite_integrity_gate_refuses_non_status_tool(monkeypatch):
@@ -1185,7 +1297,7 @@ def test_integrity_failure_log_names_the_sqlite_build(monkeypatch, tmp_path, cap
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
     monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
 
-    with caplog.at_level(logging.ERROR, logger="mempalace_mcp"):
+    with caplog.at_level(logging.ERROR, logger="mempalace"):
         mcp_server._refresh_sqlite_integrity_status()
 
     failures = [
@@ -1253,6 +1365,144 @@ def test_sqlite_integrity_payload_never_reads_clean_mid_refresh(monkeypatch, tmp
     mid = seen["mid_refresh"]
     assert mid["ok"] is None, f"a reader saw ok={mid['ok']!r} while the refresh was in flight"
     assert mid["checked"] is False
+
+
+def test_sqlite_integrity_payload_keeps_the_generation_it_started_with(monkeypatch):
+    """A refresh that lands during backend lookup must not rewrite this answer.
+
+    The payload used to read the error list once to choose a branch and again
+    to fill ``ok`` / ``errors``. Those two reads could be different generations.
+    """
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_verdict", None)
+
+    def _swap_in_a_new_generation():
+        mcp_server._sqlite_integrity_errors = ["malformed inverted index"]
+        return "chroma"
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", _swap_in_a_new_generation)
+    payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["ok"] is True
+    assert payload["errors"] == []
+    assert payload["error_count"] == 0
+    assert (payload["ok"] is True) == (payload["error_count"] == 0)
+
+
+def test_sqlite_integrity_payload_answers_from_the_published_verdict_during_a_refresh(
+    monkeypatch,
+):
+    """A refresh holding the lock has only half-written the globals."""
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_selected_backend_name", lambda: "chroma")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_checked", True)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_errors", [])
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_check_error", "")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_no_verdict_reason", "no chroma.sqlite3")
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_verdict", None)
+    monkeypatch.setattr(mcp_server, "_sqlite_integrity_generation", 0)
+    mcp_server._publish_sqlite_integrity_verdict()
+
+    with mcp_server._sqlite_integrity_refresh_lock:
+        # Leaving "no verdict": the reason is cleared, the fresh errors are not in yet.
+        mcp_server._sqlite_integrity_no_verdict_reason = ""
+        payload = mcp_server._sqlite_integrity_payload()
+
+    assert payload["checked"] is False
+    assert payload["ok"] is None
+    assert payload["reason"] == "no chroma.sqlite3"
+
+
+def test_node_profile_counts_drawers_under_the_request_lock(monkeypatch):
+    """Lock-free profile reads must not mutate the collection cache unlocked."""
+    from mempalace import mcp_server
+
+    seen = {}
+
+    def _fake_get_collection(create=False):
+        del create
+        seen["readers"] = mcp_server._HTTP_REQUEST_LOCK._readers
+        return None
+
+    monkeypatch.setattr(mcp_server, "_get_collection", _fake_get_collection)
+    mcp_server._node_profile_cache.clear()
+    profile = mcp_server._node_profile()
+
+    assert seen["readers"] >= 1
+    assert profile["drawers"] is None
+
+
+def test_node_profile_does_not_wait_behind_a_writer(monkeypatch):
+    """Mesh and logstream routes get the last count while a write holds the lock."""
+    import threading
+
+    from mempalace import mcp_server
+
+    class _Collection:
+        def count(self):
+            return 7
+
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _Collection())
+    monkeypatch.setattr(mcp_server, "_last_profile_drawer_count", None)
+    assert mcp_server._drawer_count_for_profile() == 7
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def _writer():
+        with mcp_server._HTTP_REQUEST_LOCK:
+            held.set()
+            release.wait(5)
+
+    writer = threading.Thread(target=_writer)
+    writer.start()
+    try:
+        assert held.wait(2)
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: None)
+        assert mcp_server._drawer_count_for_profile() == 7
+    finally:
+        release.set()
+        writer.join(5)
+
+
+def test_peer_sync_mutation_waits_for_the_mesh_lock():
+    """Peer-sync and known-profile updates share one lock."""
+    import threading
+
+    from mempalace import mcp_server
+
+    mcp_server._PEER_SYNC_STATE.clear()
+    mcp_server._KNOWN_PROFILES.clear()
+    started = threading.Event()
+    finished = threading.Event()
+    mcp_server._MESH_STATE_LOCK.acquire()
+
+    def _worker():
+        started.set()
+        mcp_server._record_peer_sync(
+            {"peer_name": "held", "peer_url": "http://peer.example", "error": "down"}
+        )
+        finished.set()
+
+    worker = threading.Thread(target=_worker)
+    worker.start()
+    try:
+        assert started.wait(2)
+        assert finished.wait(0.2) is False
+        assert "held" not in mcp_server._PEER_SYNC_STATE
+    finally:
+        mcp_server._MESH_STATE_LOCK.release()
+    assert finished.wait(2)
+    worker.join(2)
+    assert mcp_server._PEER_SYNC_STATE["held"]["reachable"] is False
+    mcp_server._PEER_SYNC_STATE.clear()
 
 
 def test_refresh_sqlite_integrity_status_runs_when_under_limit(monkeypatch, tmp_path):

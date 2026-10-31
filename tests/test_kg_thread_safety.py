@@ -1,6 +1,7 @@
 """TDD: KnowledgeGraph.close() must hold self._lock."""
 
 import inspect
+
 from mempalace.knowledge_graph import KnowledgeGraph
 
 

@@ -10,11 +10,18 @@ identity immediately — the same approach the chroma backend uses.
 """
 
 import json
+import logging
 import os
-import tempfile
 from typing import Optional
 
+from ..fsio import (
+    atomic_write_json as _atomic_write_json,
+    read_json_for_update as _read_json_for_update,
+)
+
 EMBEDDER_SIDECAR_FILENAME = "mempalace_embedder.json"
+
+logger = logging.getLogger(__name__)
 
 
 def read_embedder_sidecar(path: Optional[str], collection_name: Optional[str]):
@@ -57,6 +64,10 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
     :class:`~mempalace.backends.base.EmbedderIdentityRecordError` instead of
     passing silently. Only write paths record an identity, so read-only opens
     are unaffected.
+
+    A dimension of 0 means the probe failed. It never overwrites a known
+    dimension for the same model; for a new model it is recorded as unknown
+    with a warning.
     """
     if not path or not collection_name or not identity or not getattr(identity, "model_name", ""):
         return
@@ -70,23 +81,36 @@ def write_embedder_sidecar(path: Optional[str], collection_name: Optional[str], 
             os.chmod(directory, 0o700)
         except (OSError, NotImplementedError):
             pass
-    data: dict = {}
-    if os.path.isfile(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data = loaded
-        except (OSError, json.JSONDecodeError):
-            data = {}
-    data[collection_name] = {
-        "model_name": str(identity.model_name),
-        "dimension": int(identity.dimension or 0),
-    }
+    from ..palace import mine_lock
+
     try:
-        _write_atomically(path, data)
+        with mine_lock(path):
+            # A sidecar that does not parse is moved aside and the write refused.
+            data = dict(_read_json_for_update(path, expect=dict) or {})
+            model_name = str(identity.model_name)
+            dimension = _dimension_to_record(
+                data.get(collection_name), model_name, int(identity.dimension or 0)
+            )
+            data[collection_name] = {"model_name": model_name, "dimension": dimension}
+            _atomic_write_json(path, data)
     except (OSError, NotImplementedError, TypeError, ValueError) as exc:
         raise _record_error(path, collection_name, exc) from exc
+
+
+def _dimension_to_record(previous, model_name: str, dimension: int) -> int:
+    """Keep a known dimension when this write only failed to probe it."""
+    if dimension:
+        return dimension
+    if isinstance(previous, dict) and previous.get("model_name") == model_name:
+        try:
+            return int(previous.get("dimension") or 0)
+        except (TypeError, ValueError):
+            return 0
+    logger.warning(
+        "Recording embedder %r with an unknown dimension: its dimension probe failed.",
+        model_name,
+    )
+    return 0
 
 
 def _record_error(path: str, collection_name: str, exc: BaseException):
@@ -97,38 +121,3 @@ def _record_error(path: str, collection_name: str, exc: BaseException):
         f"in {path}: {type(exc).__name__}: {exc}. Without it a later model swap "
         "would not be detected; check that the palace directory is writable and retry."
     )
-
-
-def _write_atomically(path: str, data: dict) -> None:
-    """Replace ``path`` with ``data`` as JSON, or leave it untouched.
-
-    The JSON goes to a temp file in the same directory (so ``os.replace``
-    stays on one filesystem), is fsynced, then renamed over the sidecar. An
-    interrupted or failed write leaves the previous sidecar intact instead
-    of a truncated file, which would read back as "no identity recorded".
-    A failure re-raises after the temp file is removed.
-    """
-    tmp_path = None
-    try:
-        fd, tmp_path = tempfile.mkstemp(
-            dir=os.path.dirname(path) or ".", prefix=".mempalace_embedder.", suffix=".tmp"
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass  # not every filesystem supports fsync
-        try:
-            os.chmod(tmp_path, 0o600)
-        except (OSError, NotImplementedError):
-            pass
-        os.replace(tmp_path, path)
-        tmp_path = None
-    finally:
-        if tmp_path is not None:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass

@@ -20,7 +20,7 @@ deliberately do not ship is in [`hooks/antigravity/INVESTIGATION.md`](https://gi
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - [`mempalace`](https://github.com/MemPalace/mempalace) installed and
   on `$PATH` (`mempalace --version` to verify)
 - [Antigravity IDE](https://antigravity.google/) installed (`~/.gemini/`

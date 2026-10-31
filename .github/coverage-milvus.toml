@@ -1,0 +1,19 @@
+# Measures mempalace/backends/milvus.py with the milvus extra installed.
+# The package gate stays in pyproject.toml ([tool.coverage.report] fail_under).
+# This file sets no fail_under, so the narrower report is not judged as the
+# package total.
+# Coverage 7.10 reads only [tool.coverage.*]; 7.16 reads that prefix in this file too.
+
+[tool.coverage.run]
+# No source= here. pytest-cov's --cov=<module> imports that module before
+# conftest, and --source makes coverage ignore include. --cov with this
+# include measures the file without that import.
+include = ["*/mempalace/backends/milvus.py"]
+
+[tool.coverage.report]
+show_missing = true
+precision = 2
+exclude_lines = [
+    "if __name__",
+    "pragma: no cover",
+]

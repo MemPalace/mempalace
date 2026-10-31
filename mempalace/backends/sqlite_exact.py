@@ -17,12 +17,21 @@ import os
 import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 
+from ..lexical import bm25_scores, tokenize
+from ..stored_text import (
+    decode_record,
+    decode_value,
+    encode_filter,
+    index_text,
+    prepare_stored_write,
+)
+from ..timeutil import recency_floor, recency_key, utc_now_iso as _utcnow
+from ._filters import matches_where, matches_where_document, validate_where
 from ._magic import has_sqlite_magic, read_header_fields
 from .base import (
     BackendClosedError,
@@ -39,21 +48,30 @@ from .base import (
     PalaceRef,
     QueryResult,
     UnsupportedCapabilityError,
-    UnsupportedFilterError,
     _IncludeSpec,
+    validate_write_batch,
 )
 
 logger = logging.getLogger(__name__)
 
 _DB_FILENAME = "sqlite_exact.sqlite3"
-_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
-_SUPPORTED_OPERATORS = frozenset(
-    {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
-)
+# Compared by immutable readers. A leaf commit does not change the SQLite
+# header fields those readers already probe, and the filesystem clock can
+# stamp the checkpoint with the same mtime as the previous one.
+_WRITE_GENERATION_KEY = "write_generation"
+_WRITE_GENERATION_SQL = "SELECT value FROM meta WHERE key = ?"
 
 
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _bump_write_generation(executor) -> None:
+    """Advance the immutable-reader generation inside the open write transaction."""
+    executor.execute(
+        """
+        INSERT INTO meta(key, value) VALUES (?, '1')
+        ON CONFLICT(key) DO UPDATE SET
+            value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+        """,
+        (_WRITE_GENERATION_KEY,),
+    )
 
 
 def _json_dumps(obj: Any) -> str:
@@ -92,125 +110,6 @@ def _decode_array(blob: bytes | None) -> Optional[np.ndarray]:
     return arr
 
 
-def _tokenize(text: str) -> list[str]:
-    if not text:
-        return []
-    return _TOKEN_RE.findall(text.lower())
-
-
-def _bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
-    query_terms = set(_tokenize(query))
-    n_docs = len(documents)
-    if not query_terms or n_docs == 0:
-        return [0.0] * n_docs
-
-    tokenized = [_tokenize(d) for d in documents]
-    doc_lens = [len(toks) for toks in tokenized]
-    if not any(doc_lens):
-        return [0.0] * n_docs
-    avgdl = sum(doc_lens) / n_docs or 1.0
-
-    df = {term: 0 for term in query_terms}
-    for toks in tokenized:
-        for term in set(toks) & query_terms:
-            df[term] += 1
-
-    idf = {term: np.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1.0) for term in query_terms}
-
-    scores = []
-    for toks, dl in zip(tokenized, doc_lens):
-        if dl == 0:
-            scores.append(0.0)
-            continue
-        tf: dict[str, int] = {}
-        for token in toks:
-            if token in query_terms:
-                tf[token] = tf.get(token, 0) + 1
-        score = 0.0
-        for term, freq in tf.items():
-            num = freq * (k1 + 1)
-            den = freq + k1 * (1 - b + b * dl / avgdl)
-            score += float(idf[term]) * num / den
-        scores.append(score)
-    return scores
-
-
-def _validate_where(where: Optional[dict]) -> None:
-    if not where:
-        return
-    stack = [where]
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, dict):
-            continue
-        for key, value in node.items():
-            if key.startswith("$") and key not in _SUPPORTED_OPERATORS:
-                raise UnsupportedFilterError(f"operator {key!r} not supported by sqlite_exact")
-            if isinstance(value, dict):
-                stack.append(value)
-            elif isinstance(value, list):
-                stack.extend(item for item in value if isinstance(item, dict))
-
-
-def _coerce_comparable(value: Any):
-    if isinstance(value, bool):
-        return int(value)
-    return value
-
-
-def _compare(actual: Any, op: str, expected: Any) -> bool:
-    actual = _coerce_comparable(actual)
-    expected = _coerce_comparable(expected)
-    if op == "$eq":
-        return actual == expected
-    if op == "$ne":
-        return actual != expected
-    if op == "$in":
-        return actual in (expected or [])
-    if op == "$nin":
-        return actual not in (expected or [])
-    if op == "$contains":
-        return str(expected) in str(actual or "")
-    try:
-        if op == "$gt":
-            return actual > expected
-        if op == "$gte":
-            return actual >= expected
-        if op == "$lt":
-            return actual < expected
-        if op == "$lte":
-            return actual <= expected
-    except TypeError:
-        return False
-    raise UnsupportedFilterError(f"operator {op!r} not supported by sqlite_exact")
-
-
-def _matches_where(meta: dict, where: Optional[dict]) -> bool:
-    if not where:
-        return True
-    if not isinstance(where, dict):
-        return False
-    for key, expected in where.items():
-        if key == "$and":
-            if not all(_matches_where(meta, clause) for clause in expected or []):
-                return False
-            continue
-        if key == "$or":
-            if not any(_matches_where(meta, clause) for clause in expected or []):
-                return False
-            continue
-        if key.startswith("$"):
-            raise UnsupportedFilterError(f"operator {key!r} not supported by sqlite_exact")
-        actual = meta.get(key)
-        if isinstance(expected, dict):
-            for op, operand in expected.items():
-                if not _compare(actual, op, operand):
-                    return False
-        elif actual != expected:
-            return False
-    return True
-
-
 _FACET_FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CACHED_META_KEYS = frozenset({"wing", "room", "source_file"})
 # Palace loci. VIRTUAL generated columns + one composite index give
@@ -223,6 +122,11 @@ _LOCUS_INDEX = "idx_documents_coll_wing_room_hall"
 # Locus columns stay wing/room/hall (low-cardinality facets); source_file
 # is high-cardinality and stays in metadata_json.
 _SOURCE_FILE_INDEX = "idx_documents_coll_source_file"
+# Expression indexes for ``get_recent``: newest ``filed_at`` overall, and
+# within a wing (wake-up scopes to the wing's alias set). Both carry ``id``
+# so the ordering reads never touch the rows.
+_FILED_AT_INDEX = "idx_documents_coll_filed_at"
+_WING_FILED_AT_INDEX = "idx_documents_coll_wing_filed_at"
 
 
 def _json_field_sql(key: str, *, locus_columns: bool = True) -> str:
@@ -266,10 +170,10 @@ def _where_uses_only_cached_keys(where: Optional[dict]) -> bool:
 def _equality_where_sql(
     where: Optional[dict], *, locus_columns: bool = True
 ) -> Optional[tuple[str, list]]:
-    """Push equality / ``$and``-of-equality filters into SQL, else ``None``.
+    """Push equality, ``$eq`` / ``$in`` and ``$and`` of them into SQL, else ``None``.
 
-    ``None`` means the filter needs the Python ``_matches_where`` path
-    (``$or``, comparisons, ``$contains``, non-identifier keys).
+    ``None`` means the filter needs the Python ``matches_where`` path
+    (``$or``, comparisons, ``$contains``, ``None`` operands, non-identifier keys).
     """
     if not where:
         return "1=1", []
@@ -289,11 +193,44 @@ def _equality_where_sql(
     clauses = []
     params = []
     for key, expected in where.items():
-        if key.startswith("$") or isinstance(expected, dict) or not _FACET_FIELD_RE.match(key):
+        if key.startswith("$") or not _FACET_FIELD_RE.match(key):
             return None
-        clauses.append(f"{_json_field_sql(key, locus_columns=locus_columns)} = ?")
-        params.append(expected)
+        expr = _json_field_sql(key, locus_columns=locus_columns)
+        if not isinstance(expected, dict):
+            clauses.append(f"{expr} = ?")
+            params.append(encode_filter(expected))
+            continue
+        # ``$eq`` / ``$in`` of scalars push down; ``None`` stays in Python,
+        # where it also matches a missing key.
+        if len(expected) != 1:
+            return None
+        ((op, operand),) = expected.items()
+        if op == "$eq" and _pushable_scalar(operand):
+            clauses.append(f"{expr} = ?")
+            params.append(encode_filter(expected)["$eq"])
+        elif (
+            op == "$in"
+            and isinstance(operand, (list, tuple))
+            and len(operand) <= _MAX_PUSHED_IN
+            and all(_pushable_scalar(value) for value in operand)
+        ):
+            if not operand:
+                clauses.append("0=1")
+                continue
+            clauses.append(f"{expr} IN ({','.join('?' for _ in operand)})")
+            params.extend(encode_filter(expected)["$in"])
+        else:
+            return None
     return (" AND ".join(clauses) if clauses else "1=1"), params
+
+
+_MAX_PUSHED_IN = 500
+
+
+def _pushable_scalar(value) -> bool:
+    return isinstance(value, (str, int, float)) and not (
+        isinstance(value, float) and value != value
+    )
 
 
 def _cosine_distances(
@@ -350,8 +287,14 @@ def sqlite_wing_room_counts(
             if row is None:
                 return None
             collection_id = int(row[0])
+            # Registry rows and sentinels track sources; they are not drawers.
+            not_bookkeeping = (
+                "COALESCE(json_extract(metadata_json, '$.ingest_mode'), '') != 'registry'"
+                " AND COALESCE(json_extract(metadata_json, '$.is_sentinel'), 0)"
+                " NOT IN (1, 'true', 'True', '1')"
+            )
             total_row = conn.execute(
-                "SELECT COUNT(*) FROM documents WHERE collection_id = ?",
+                f"SELECT COUNT(*) FROM documents WHERE collection_id = ? AND {not_bookkeeping}",
                 (collection_id,),
             ).fetchone()
             total = int(total_row[0]) if total_row and total_row[0] is not None else 0
@@ -363,13 +306,13 @@ def sqlite_wing_room_counts(
                 f"""
                 SELECT {wing_expr}, {room_expr}, COUNT(*)
                 FROM documents
-                WHERE collection_id = ?
+                WHERE collection_id = ? AND {not_bookkeeping}
                 GROUP BY 1, 2
                 """,
                 (collection_id,),
             ):
-                wkey = "?" if wing is None else str(wing)
-                rkey = "?" if room is None else str(room)
+                wkey = "?" if wing is None else str(decode_value(wing))
+                rkey = "?" if room is None else str(decode_value(room))
                 dest = wing_rooms.setdefault(wkey, {})
                 dest[rkey] = dest.get(rkey, 0) + int(n)
             return total, wing_rooms
@@ -407,7 +350,7 @@ def sqlite_wing_source_counts(palace_path: str, collection_name: str) -> Optiona
                 if _documents_has_locus_columns(conn)
                 else "json_extract(metadata_json, '$.wing')"
             )
-            return list(
+            rows = list(
                 conn.execute(
                     f"""
                     SELECT {wing_expr}, json_extract(metadata_json, '$.source_file'), COUNT(*)
@@ -424,6 +367,7 @@ def sqlite_wing_source_counts(palace_path: str, collection_name: str) -> Optiona
             conn.close()
     except sqlite3.Error:
         return None
+    return [(decode_value(wing), decode_value(source), n) for wing, source, n in rows]
 
 
 def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
@@ -451,7 +395,7 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
             room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
             wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
             hall_expr = "hall" if locus else "json_extract(metadata_json, '$.hall')"
-            return list(
+            rows = list(
                 conn.execute(
                     f"""
                     SELECT {room_expr}, {wing_expr}, {hall_expr}, COUNT(*),
@@ -467,44 +411,10 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
             conn.close()
     except sqlite3.Error:
         return None
-
-
-def _matches_where_document(document: str, where_document: Optional[dict]) -> bool:
-    if not where_document:
-        return True
-    if not isinstance(where_document, dict):
-        return False
-    for key, value in where_document.items():
-        if key == "$contains":
-            if str(value) not in document:
-                return False
-            continue
-        if key == "$and":
-            if not all(_matches_where_document(document, clause) for clause in value or []):
-                return False
-            continue
-        if key == "$or":
-            if not any(_matches_where_document(document, clause) for clause in value or []):
-                return False
-            continue
-        raise UnsupportedFilterError(f"where_document operator {key!r} not supported")
-    return True
-
-
-def _validate_write_batch(
-    *,
-    documents: list[str],
-    ids: list[str],
-    metadatas: Optional[list[dict]],
-    embeddings: Optional[list[list[float]]],
-) -> None:
-    n = len(ids)
-    if len(documents) != n:
-        raise ValueError(f"documents length {len(documents)} does not match ids length {n}")
-    if metadatas is not None and len(metadatas) != n:
-        raise ValueError(f"metadatas length {len(metadatas)} does not match ids length {n}")
-    if embeddings is not None and len(embeddings) != n:
-        raise ValueError(f"embeddings length {len(embeddings)} does not match ids length {n}")
+    return [
+        (decode_value(room), decode_value(wing), decode_value(hall), n, decode_value(last))
+        for room, wing, hall, n, last in rows
+    ]
 
 
 class _SnapshotChanged(Exception):
@@ -602,6 +512,10 @@ class SQLiteExactCollection(BaseCollection):
                 self._handle.conn.rollback()
                 raise
             else:
+                # No-op write cursors never start a transaction. Bumping them
+                # would drop a warm immutable snapshot that still matches disk.
+                if write and self._handle.conn.in_transaction:
+                    _bump_write_generation(cur)
                 self._handle.conn.commit()
                 if write:
                     self._handle._vector_cache.clear()
@@ -689,28 +603,53 @@ class SQLiteExactCollection(BaseCollection):
                 (self._embedder_meta_key(), str(identity.model_name)),
             )
 
-    def _replace_fts(self, cur, collection_id: int, doc_id: str, document: str) -> None:
-        if not self._fts_available(cur):
+    def _replace_fts(
+        self,
+        cur,
+        collection_id: int,
+        doc_id: str,
+        document: str,
+        *,
+        doc_rowid: Optional[int] = None,
+        existed: bool = True,
+        fts_enabled: Optional[bool] = None,
+    ) -> None:
+        if fts_enabled is None:
+            fts_enabled = self._fts_available(cur)
+        if not fts_enabled:
             return
-        cur.execute(
-            "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
-            (collection_id, doc_id),
-        )
-        cur.execute(
-            "INSERT INTO docs_fts(collection_id, doc_id, document) VALUES (?, ?, ?)",
-            (collection_id, doc_id, document),
-        )
+        document = index_text(document)
+        if doc_rowid is None:
+            row = cur.execute(
+                "SELECT rowid FROM documents WHERE collection_id = ? AND id = ?",
+                (collection_id, doc_id),
+            ).fetchone()
+            if row is not None:
+                doc_rowid = int(row[0])
+        if doc_rowid is not None:
+            if existed:
+                cur.execute("DELETE FROM docs_fts WHERE rowid = ?", (doc_rowid,))
+            cur.execute(
+                "INSERT INTO docs_fts(rowid, collection_id, doc_id, document) VALUES (?, ?, ?, ?)",
+                (doc_rowid, collection_id, doc_id, document),
+            )
+        else:
+            cur.execute(
+                "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
+                (collection_id, doc_id),
+            )
+            cur.execute(
+                "INSERT INTO docs_fts(collection_id, doc_id, document) VALUES (?, ?, ?)",
+                (collection_id, doc_id, document),
+            )
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
-        _validate_write_batch(
-            documents=documents,
-            ids=ids,
-            metadatas=metadatas,
-            embeddings=embeddings,
-        )
+        validate_write_batch(ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
         if embeddings is None:
             raise ValueError("sqlite_exact requires explicit embeddings")
-        metadatas = metadatas or [{} for _ in ids]
+        documents, ids, metadatas = prepare_stored_write(
+            documents, ids, metadatas or [{} for _ in ids]
+        )
         now = _utcnow()
         with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
@@ -719,6 +658,7 @@ class SQLiteExactCollection(BaseCollection):
                 arr = _as_vector_array(emb)
                 prepared.append((doc_id, doc, meta, arr.tobytes(), int(arr.size)))
             self._ensure_collection_dimension(cur, collection_id, [item[4] for item in prepared])
+            fts_enabled = self._fts_available(cur)
             for doc_id, doc, meta, emb_blob, dim in prepared:
                 cur.execute(
                     """
@@ -737,18 +677,23 @@ class SQLiteExactCollection(BaseCollection):
                         now,
                     ),
                 )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                self._replace_fts(
+                    cur,
+                    collection_id,
+                    doc_id,
+                    doc,
+                    doc_rowid=int(cur.lastrowid),
+                    existed=False,
+                    fts_enabled=fts_enabled,
+                )
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
-        _validate_write_batch(
-            documents=documents,
-            ids=ids,
-            metadatas=metadatas,
-            embeddings=embeddings,
-        )
+        validate_write_batch(ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
         if embeddings is None:
             raise ValueError("sqlite_exact requires explicit embeddings")
-        metadatas = metadatas or [{} for _ in ids]
+        documents, ids, metadatas = prepare_stored_write(
+            documents, ids, metadatas or [{} for _ in ids]
+        )
         now = _utcnow()
         with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
@@ -757,31 +702,65 @@ class SQLiteExactCollection(BaseCollection):
                 arr = _as_vector_array(emb)
                 prepared.append((doc_id, doc, meta, arr.tobytes(), int(arr.size)))
             self._ensure_collection_dimension(cur, collection_id, [item[4] for item in prepared])
+            fts_enabled = self._fts_available(cur)
             for doc_id, doc, meta, emb_blob, dim in prepared:
-                cur.execute(
-                    """
-                    INSERT INTO documents
-                        (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(collection_id, id) DO UPDATE SET
-                        document = excluded.document,
-                        metadata_json = excluded.metadata_json,
-                        embedding = excluded.embedding,
-                        dim = excluded.dim,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
+                existing = cur.execute(
+                    "SELECT rowid FROM documents WHERE collection_id = ? AND id = ?",
+                    (collection_id, doc_id),
+                ).fetchone()
+                if existing is None:
+                    cur.execute(
+                        """
+                        INSERT INTO documents
+                            (collection_id, id, document, metadata_json, embedding, dim, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            collection_id,
+                            doc_id,
+                            doc,
+                            _json_dumps(meta),
+                            emb_blob,
+                            dim,
+                            now,
+                            now,
+                        ),
+                    )
+                    self._replace_fts(
+                        cur,
                         collection_id,
                         doc_id,
                         doc,
-                        _json_dumps(meta),
-                        emb_blob,
-                        dim,
-                        now,
-                        now,
-                    ),
-                )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                        doc_rowid=int(cur.lastrowid),
+                        existed=False,
+                        fts_enabled=fts_enabled,
+                    )
+                else:
+                    doc_rowid = int(existing[0])
+                    cur.execute(
+                        """
+                        UPDATE documents
+                        SET document = ?, metadata_json = ?, embedding = ?, dim = ?, updated_at = ?
+                        WHERE rowid = ?
+                        """,
+                        (
+                            doc,
+                            _json_dumps(meta),
+                            emb_blob,
+                            dim,
+                            now,
+                            doc_rowid,
+                        ),
+                    )
+                    self._replace_fts(
+                        cur,
+                        collection_id,
+                        doc_id,
+                        doc,
+                        doc_rowid=doc_rowid,
+                        existed=True,
+                        fts_enabled=fts_enabled,
+                    )
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
         if documents is None and metadatas is None and embeddings is None:
@@ -794,6 +773,7 @@ class SQLiteExactCollection(BaseCollection):
         ):
             if value is not None and len(value) != n:
                 raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
+        documents, ids, metadatas = prepare_stored_write(documents, ids, metadatas)
         with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
             if documents is None and embeddings is None:
@@ -823,7 +803,7 @@ class SQLiteExactCollection(BaseCollection):
             for idx, doc_id in enumerate(ids):
                 row = cur.execute(
                     """
-                    SELECT document, metadata_json, embedding, dim
+                    SELECT rowid, document, metadata_json, embedding, dim
                     FROM documents
                     WHERE collection_id = ? AND id = ?
                     """,
@@ -831,8 +811,9 @@ class SQLiteExactCollection(BaseCollection):
                 ).fetchone()
                 if row is None:
                     continue
-                doc = documents[idx] if documents is not None else row[0]
-                meta = _json_loads(row[1])
+                doc_rowid = int(row[0])
+                doc = documents[idx] if documents is not None else row[1]
+                meta = _json_loads(row[2])
                 if metadatas is not None:
                     meta.update(metadatas[idx] or {})
                 if embeddings is not None:
@@ -840,22 +821,31 @@ class SQLiteExactCollection(BaseCollection):
                     emb_blob = arr.tobytes()
                     dim = int(arr.size)
                 else:
-                    emb_blob = row[2]
-                    dim = row[3]
-                updates.append((doc_id, doc, meta, emb_blob, dim))
+                    emb_blob = row[3]
+                    dim = row[4]
+                updates.append((doc_rowid, doc_id, doc, meta, emb_blob, dim))
             if embeddings is not None:
-                self._ensure_collection_dimension(cur, collection_id, [item[4] for item in updates])
-            for doc_id, doc, meta, emb_blob, dim in updates:
+                self._ensure_collection_dimension(cur, collection_id, [item[5] for item in updates])
+            fts_enabled = self._fts_available(cur) if documents is not None else False
+            for doc_rowid, doc_id, doc, meta, emb_blob, dim in updates:
                 cur.execute(
                     """
                     UPDATE documents
                     SET document = ?, metadata_json = ?, embedding = ?, dim = ?, updated_at = ?
-                    WHERE collection_id = ? AND id = ?
+                    WHERE rowid = ?
                     """,
-                    (doc, _json_dumps(meta), emb_blob, dim, _utcnow(), collection_id, doc_id),
+                    (doc, _json_dumps(meta), emb_blob, dim, _utcnow(), doc_rowid),
                 )
                 if documents is not None:
-                    self._replace_fts(cur, collection_id, doc_id, doc)
+                    self._replace_fts(
+                        cur,
+                        collection_id,
+                        doc_id,
+                        doc,
+                        doc_rowid=doc_rowid,
+                        existed=True,
+                        fts_enabled=fts_enabled,
+                    )
 
     def _rows(
         self,
@@ -867,8 +857,8 @@ class SQLiteExactCollection(BaseCollection):
         offset=None,
         spec: Optional[_IncludeSpec] = None,
     ) -> list[dict]:
-        _validate_where(where)
-        _validate_where(where_document)
+        validate_where(where)
+        validate_where(where_document)
         spec = spec or _IncludeSpec.resolve(None, default_distances=False)
         collection_id = self._collection_id(cur)
         push = (
@@ -878,7 +868,7 @@ class SQLiteExactCollection(BaseCollection):
         )
         python_where = where is not None and push is None
         need_doc = spec.documents or bool(where_document)
-        need_meta = spec.metadatas or python_where
+        need_meta = spec.metadatas or python_where or need_doc
         need_emb = spec.embeddings
         cols = ["id"]
         if need_doc:
@@ -893,7 +883,12 @@ class SQLiteExactCollection(BaseCollection):
             extra_sql, extra_params = push
             sql += " AND " + extra_sql
             params.extend(extra_params)
-        sql += "\nORDER BY rowid"
+            # ``rowid + 0`` prevents SQLite's optimizer from abandoning the locus /
+            # source_file index in favor of an ordered full-collection scan on
+            # ``idx_documents_collection`` when ``LIMIT`` is present.
+            sql += "\nORDER BY rowid + 0"
+        else:
+            sql += "\nORDER BY rowid"
         # Equality where is applied in SQL, so LIMIT/OFFSET are safe there too.
         # Python-side filters still have to scan, then slice.
         can_limit = (not python_where) and not where_document
@@ -917,13 +912,13 @@ class SQLiteExactCollection(BaseCollection):
                 doc = row[idx] or ""
                 idx += 1
             if need_meta:
-                meta = _json_loads(row[idx])
+                doc, meta = decode_record(doc, _json_loads(row[idx]))
                 idx += 1
             if need_emb:
                 emb_blob = row[idx]
-            if python_where and not _matches_where(meta, where):
+            if python_where and not matches_where(meta, where):
                 continue
-            if where_document and not _matches_where_document(doc, where_document):
+            if where_document and not matches_where_document(doc, where_document):
                 continue
             out.append(
                 {
@@ -945,10 +940,11 @@ class SQLiteExactCollection(BaseCollection):
                 unique.append(doc_id)
         if not unique:
             return {}
+        need_meta = spec.documents or spec.metadatas
         cols = ["id"]
         if spec.documents:
             cols.append("document")
-        if spec.metadatas:
+        if need_meta:
             cols.append("metadata_json")
         if spec.embeddings:
             cols.append("embedding")
@@ -968,8 +964,8 @@ class SQLiteExactCollection(BaseCollection):
                 if spec.documents:
                     doc = row[idx] or ""
                     idx += 1
-                if spec.metadatas:
-                    meta = _json_loads(row[idx])
+                if need_meta:
+                    doc, meta = decode_record(doc, _json_loads(row[idx]))
                     idx += 1
                 if spec.embeddings:
                     emb_blob = row[idx]
@@ -1125,8 +1121,8 @@ class SQLiteExactCollection(BaseCollection):
         Equality filters then restrict by id; other filters fall back to
         ``_rows`` only to decide membership.
         """
-        _validate_where(where)
-        _validate_where(where_document)
+        validate_where(where)
+        validate_where(where_document)
         expected = self._collection_dimension(cur, collection_id)
         empty = np.zeros((0, expected or 0), dtype=np.float32)
         empty_norms = np.zeros((0,), dtype=np.float32)
@@ -1149,7 +1145,7 @@ class SQLiteExactCollection(BaseCollection):
             }
             keep = [i for i, doc_id in enumerate(ids) if doc_id in wanted]
         else:
-            keep = [i for i, meta in enumerate(metas) if _matches_where(meta, where)]
+            keep = [i for i, meta in enumerate(metas) if matches_where(meta, where)]
         if not keep:
             return (
                 [],
@@ -1187,11 +1183,11 @@ class SQLiteExactCollection(BaseCollection):
             vecs.append(vec)
             meta = {}
             if wing is not None:
-                meta["wing"] = wing
+                meta["wing"] = decode_value(wing)
             if room is not None:
-                meta["room"] = room
+                meta["room"] = decode_value(room)
             if source_file is not None:
-                meta["source_file"] = source_file
+                meta["source_file"] = decode_value(source_file)
             metas.append(meta)
         if not vecs:
             return (
@@ -1209,26 +1205,16 @@ class SQLiteExactCollection(BaseCollection):
         metas: dict[str, dict] = {}
         if not ids:
             return docs, metas
-        cols = ["id"]
-        if spec.documents:
-            cols.append("document")
-        if spec.metadatas:
-            cols.append("metadata_json")
+        doc_col = "document" if spec.documents else "NULL"
         for start in range(0, len(ids), 900):
             chunk = ids[start : start + 900]
             placeholders = ",".join("?" for _ in chunk)
-            for row in cur.execute(
-                f"SELECT {', '.join(cols)} FROM documents "
+            for doc_id, doc, meta_json in cur.execute(
+                f"SELECT id, {doc_col}, metadata_json FROM documents "
                 f"WHERE collection_id = ? AND id IN ({placeholders})",
                 (collection_id, *chunk),
             ):
-                doc_id = row[0]
-                idx = 1
-                if spec.documents:
-                    docs[doc_id] = row[idx] or ""
-                    idx += 1
-                if spec.metadatas:
-                    metas[doc_id] = _json_loads(row[idx])
+                docs[doc_id], metas[doc_id] = decode_record(doc or "", _json_loads(meta_json))
         return docs, metas
 
     def get(
@@ -1244,8 +1230,8 @@ class SQLiteExactCollection(BaseCollection):
         spec = _IncludeSpec.resolve(include, default_distances=False)
         # get(ids=...) must not scan the collection: look up by primary key.
         if ids is not None:
-            _validate_where(where)
-            _validate_where(where_document)
+            validate_where(where)
+            validate_where(where_document)
             lookup_spec = _IncludeSpec(
                 documents=spec.documents or bool(where_document),
                 metadatas=spec.metadatas or bool(where),
@@ -1259,8 +1245,8 @@ class SQLiteExactCollection(BaseCollection):
                 by_id[doc_id]
                 for doc_id in ids
                 if doc_id in by_id
-                and _matches_where(by_id[doc_id]["metadata"], where)
-                and _matches_where_document(by_id[doc_id]["document"], where_document)
+                and matches_where(by_id[doc_id]["metadata"], where)
+                and matches_where_document(by_id[doc_id]["document"], where_document)
             ]
             if offset:
                 rows = rows[offset:]
@@ -1300,6 +1286,70 @@ class SQLiteExactCollection(BaseCollection):
                 rows = rows[:limit]
         return self._get_result(rows, spec)
 
+    def get_recent(self, *, limit, where=None, order_field="filed_at", include=None):
+        """Newest ``limit`` records by the instant in ``order_field``, read in SQL.
+
+        Text order is instant order only within one timestamp form, so the
+        newest UTC-suffixed values and the newest of the rest are read
+        separately and merged; records without the field follow in storage
+        order. A filter SQL cannot evaluate keeps the base implementation.
+        """
+        if limit is None or limit <= 0:
+            return super().get_recent(
+                limit=limit, where=where, order_field=order_field, include=include
+            )
+        validate_where(where)
+        push = _equality_where_sql(where, locus_columns=self._handle.has_locus_columns)
+        if push is None or not _FACET_FIELD_RE.match(order_field):
+            return super().get_recent(
+                limit=limit, where=where, order_field=order_field, include=include
+            )
+        spec = _IncludeSpec.resolve(include, default_distances=False)
+        filter_sql, filter_params = push
+        # Spelled exactly like the recency indexes so the planner can use them.
+        ts = _json_field_sql(order_field, locus_columns=False)
+        dated = f"typeof({ts}) = 'text' AND {ts} > ''"
+        utc = f"(substr({ts}, -6) = '+00:00' OR substr({ts}, -1) IN ('Z', 'z'))"
+        with self._cursor() as cur:
+            collection_id = self._collection_id(cur)
+            # For a wing ``IN`` list the planner prefers walking the whole
+            # filed_at index over reading each wing's newest from the wing one.
+            scopes = [where or {}, *(where or {}).get("$and", [])]
+            hint = ""
+            if (
+                order_field == "filed_at"
+                and any("wing" in scope for scope in scopes)
+                and self._handle.has_locus_columns
+                and cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    (_WING_FILED_AT_INDEX,),
+                ).fetchone()
+            ):
+                hint = f" INDEXED BY {_WING_FILED_AT_INDEX}"
+
+            def read(condition, condition_params, order):
+                return cur.execute(
+                    f"SELECT id, {ts} FROM documents{hint}"
+                    f" WHERE collection_id = ? AND ({filter_sql}) AND {condition}"
+                    f" ORDER BY {order} LIMIT ?",
+                    (collection_id, *filter_params, *condition_params, limit),
+                ).fetchall()
+
+            # The newest ``limit`` values in text order give a text floor that
+            # bounds how far back either form reads.
+            newest = read(dated, [], f"{ts} DESC")
+            floor = recency_floor(r[1] for r in newest) if len(newest) == limit else ""
+            rows = read(f"{dated} AND {ts} >= ? AND {utc}", [floor], f"{ts} DESC, id") + read(
+                f"{dated} AND {ts} >= ? AND NOT {utc}", [floor], f"{ts} DESC, id"
+            )
+            rows.sort(key=lambda r: r[0])
+            rows.sort(key=lambda r: recency_key(r[1]), reverse=True)
+            ids = [r[0] for r in rows[:limit]]
+            if len(ids) < limit:
+                ids += [r[0] for r in read(f"NOT ({dated})", [], "rowid")][: limit - len(ids)]
+            by_id = self._rows_by_ids(cur, collection_id, ids, spec)
+        return self._get_result([by_id[i] for i in ids if i in by_id], spec)
+
     @staticmethod
     def _get_result(rows: list[dict], spec: _IncludeSpec) -> GetResult:
         return GetResult(
@@ -1317,15 +1367,30 @@ class SQLiteExactCollection(BaseCollection):
             if ids is None:
                 rows = self._rows(cur, where=where)
                 ids = [row["id"] for row in rows]
-            for doc_id in ids or []:
+            target_ids = list(ids or [])
+            if not target_ids:
+                return
+            fts_enabled = self._fts_available(cur)
+            rowids: list[int] = []
+            for start in range(0, len(target_ids), 900):
+                chunk = target_ids[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                found = cur.execute(
+                    f"SELECT rowid FROM documents WHERE collection_id = ? AND id IN ({placeholders})",
+                    (collection_id, *chunk),
+                ).fetchall()
+                rowids.extend(int(r[0]) for r in found)
+            for start in range(0, len(rowids), 900):
+                chunk = rowids[start : start + 900]
+                placeholders = ",".join("?" for _ in chunk)
                 cur.execute(
-                    "DELETE FROM documents WHERE collection_id = ? AND id = ?",
-                    (collection_id, doc_id),
+                    f"DELETE FROM documents WHERE rowid IN ({placeholders})",
+                    chunk,
                 )
-                if self._fts_available(cur):
+                if fts_enabled:
                     cur.execute(
-                        "DELETE FROM docs_fts WHERE collection_id = ? AND doc_id = ?",
-                        (collection_id, doc_id),
+                        f"DELETE FROM docs_fts WHERE rowid IN ({placeholders})",
+                        chunk,
                     )
 
     def count(self) -> int:
@@ -1337,13 +1402,139 @@ class SQLiteExactCollection(BaseCollection):
             ).fetchone()
             return int(row[0]) if row else 0
 
+    def iter_metadata(
+        self,
+        keys: Optional[Any] = None,
+        *,
+        require_key: Optional[str] = None,
+        equals: Optional[dict] = None,
+    ):
+        """Stream every drawer's metadata from sqlite_exact in one linear pass.
+
+        Matches :meth:`ChromaCollection.iter_metadata`:
+        - With ``keys``, only those keys are returned, and a drawer that has
+          none of them (or only ``None`` values) is skipped.
+        - With ``keys=None``, every key is returned and a drawer without
+          metadata yields ``None``.
+        - ``require_key`` limits the scan to drawers holding a string value
+          under that key.
+        - ``equals`` limits the scan to drawers whose string value under each
+          key equals the given one (pushed into SQL via locus/expression
+          indexes when possible).
+        """
+        key_tuple = tuple(keys) if keys is not None else None
+        equals_dict = dict(equals) if equals else None
+
+        def rows():
+            with self._cursor() as cur:
+                collection_id = self._collection_id(cur)
+                locus = self._handle.has_locus_columns
+                clauses = ["collection_id = ?"]
+                params: list[Any] = [collection_id]
+                multi_key: Optional[str] = None
+                multi_vals: Optional[list[str]] = None
+                # True only when every ``equals`` entry is enforced in SQL, so
+                # the source_file shortcut below may skip the Python recheck.
+                fully_pushed = True
+                if equals_dict:
+                    for k, v in equals_dict.items():
+                        if isinstance(v, (list, tuple, set, frozenset)) and not v:
+                            return  # empty membership list matches nothing
+                        if _FACET_FIELD_RE.match(k) and isinstance(v, str):
+                            expr = _json_field_sql(k, locus_columns=locus)
+                            clauses.append(f"{expr} = ?")
+                            params.append(encode_filter(v))
+                        elif (
+                            _FACET_FIELD_RE.match(k)
+                            and multi_key is None
+                            and isinstance(v, (list, tuple, set, frozenset))
+                            and all(isinstance(x, str) for x in v)
+                        ):
+                            multi_key = k
+                            # De-duplicate so a value repeated across 900-item
+                            # chunks cannot yield the same row twice.
+                            multi_vals = list(dict.fromkeys(encode_filter(value) for value in v))
+                        else:
+                            fully_pushed = False
+                if (
+                    fully_pushed
+                    and key_tuple == ("source_file",)
+                    # The shortcut yields string paths only, which is exactly
+                    # require_key="source_file"; otherwise non-string values
+                    # must survive, so take the general path.
+                    and require_key == "source_file"
+                    and multi_key is None
+                ):
+                    sf_expr = _json_field_sql("source_file", locus_columns=locus)
+                    clauses.append(f"{sf_expr} IS NOT NULL")
+                    where_sql = " AND ".join(clauses)
+                    for (sf,) in cur.execute(
+                        f"SELECT {sf_expr} FROM documents WHERE {where_sql}", params
+                    ):
+                        if isinstance(sf, str):
+                            yield {"source_file": decode_value(sf)}
+                    return
+                where_sql = " AND ".join(clauses)
+                if multi_key is not None and multi_vals is not None:
+                    m_expr = _json_field_sql(multi_key, locus_columns=locus)
+                    chunks = (
+                        multi_vals[start : start + 900] for start in range(0, len(multi_vals), 900)
+                    )
+                else:
+                    chunks = (None,)
+                for chunk in chunks:
+                    sql = f"SELECT metadata_json FROM documents WHERE {where_sql}"
+                    query_params = params
+                    if chunk is not None:
+                        ph = ",".join("?" for _ in chunk)
+                        sql += f" AND {m_expr} IN ({ph})"
+                        query_params = (*params, *chunk)
+                    # Keep the cursor lazy: a metadata pass over a large palace
+                    # must not retain every JSON document before yielding one.
+                    for (raw,) in cur.execute(sql, query_params):
+                        _, meta = decode_record("", _json_loads(raw))
+                        if require_key is not None and not isinstance(meta.get(require_key), str):
+                            continue
+                        if equals_dict and not all(
+                            isinstance(meta.get(k), str)
+                            and (
+                                meta.get(k) == v
+                                if isinstance(v, str)
+                                else isinstance(v, (list, tuple, set, frozenset))
+                                and meta.get(k) in v
+                            )
+                            for k, v in equals_dict.items()
+                        ):
+                            continue
+                        if key_tuple is not None:
+                            # Keep explicit nulls so the mined-file prefetch can
+                            # distinguish an absent key from a stored null.
+                            projected = {k: meta[k] for k in key_tuple if k in meta}
+                            if any(v is not None for v in projected.values()):
+                                yield projected
+                        else:
+                            yield meta if meta else None
+
+        return rows()
+
+    def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
+        """Every matching drawer's metadata in one pass."""
+        if where is None:
+            rows = self.iter_metadata()
+            if rows is not None:
+                try:
+                    return [m or {} for m in rows]
+                except sqlite3.Error:
+                    logger.debug("sqlite_exact metadata scan failed; paging instead", exc_info=True)
+        return super().get_all_metadata(where=where)
+
     def facet_counts(
         self,
         field: str,
         where: Optional[dict] = None,
         limit: int = 1000,
     ) -> dict[str, int]:
-        _validate_where(where)
+        validate_where(where)
         if not _FACET_FIELD_RE.match(field):
             raise UnsupportedCapabilityError(f"facet field {field!r} is not a JSON key")
         push = _equality_where_sql(where, locus_columns=self._handle.has_locus_columns)
@@ -1366,16 +1557,16 @@ class SQLiteExactCollection(BaseCollection):
                 """,
                 (collection_id, *params, int(limit)),
             ).fetchall()
-        return {str(key): int(count) for key, count in rows if key is not None}
+        return {str(decode_value(key)): int(count) for key, count in rows if key is not None}
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
-        _validate_where(where)
+        validate_where(where)
         with self._cursor() as cur:
             hits = self._lexical_search_fts(cur, query=query, n_results=n_results, where=where)
             if hits is not None:
                 return LexicalResult(hits=hits)
             rows = self._rows(cur, where=where)
-        scores = _bm25_scores(query, [row["document"] for row in rows])
+        scores = bm25_scores(query, [row["document"] for row in rows])
         scored = [
             LexicalHit(
                 id=row["id"],
@@ -1392,7 +1583,7 @@ class SQLiteExactCollection(BaseCollection):
     def _lexical_search_fts(self, cur, *, query: str, n_results: int, where: Optional[dict]):
         if not self._fts_available(cur):
             return None
-        tokens = [t for t in _tokenize(query) if len(t) >= 2]
+        tokens = [t for t in tokenize(query) if len(t) >= 2]
         if not tokens:
             return None
         fts_query = " OR ".join(tokens)
@@ -1432,14 +1623,17 @@ class SQLiteExactCollection(BaseCollection):
                     (collection_id, *chunk_ids),
                 ).fetchall()
             )
-        by_id = {doc_id: (doc or "", _json_loads(meta_json)) for doc_id, doc, meta_json in docs}
+        by_id = {
+            doc_id: decode_record(doc or "", _json_loads(meta_json))
+            for doc_id, doc, meta_json in docs
+        }
         hits = []
         for doc_id, rank in rows:
             doc_meta = by_id.get(doc_id)
             if doc_meta is None:
                 continue
             doc, meta = doc_meta
-            if not _matches_where(meta, where):
+            if not matches_where(meta, where):
                 continue
             hits.append(
                 LexicalHit(
@@ -1566,10 +1760,11 @@ class SQLiteExactBackend(BaseBackend):
         """Detect completed writer/checkpoint cycles, even with unchanged size.
 
         Stat identity and times detect replacement and updates between
-        checkpoints; the header fields SQLite exposes through pragmas
-        (schema cookie, page count, freelist count, user version, application
-        id) cover the page-1 changes a checkpoint can land without touching the
-        size. Never return a cached snapshot after a failed filesystem read.
+        checkpoints. The header pragmas cover page-1 changes. A leaf commit
+        changes neither, and the filesystem clock can reuse ``st_mtime_ns``,
+        so the header tuple ends with ``meta.write_generation``, advanced on
+        each write transaction. Never return a cached snapshot after a failed
+        filesystem read.
 
         The header is read through a throwaway ``immutable=1`` connection, not
         a plain ``open()``: closing a non-SQLite descriptor on the database
@@ -1578,7 +1773,10 @@ class SQLiteExactBackend(BaseBackend):
         :mod:`mempalace.backends._magic`.
         """
         stat = os.stat(db_path)
-        header = read_header_fields(db_path)
+        header = read_header_fields(
+            db_path,
+            extra=(_WRITE_GENERATION_SQL, (_WRITE_GENERATION_KEY,)),
+        )
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, header)
 
     @staticmethod
@@ -1770,6 +1968,7 @@ class SQLiteExactBackend(BaseBackend):
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
+            self._ensure_fts_rowid_sync(conn)
         except sqlite3.OperationalError:
             conn.execute(
                 """
@@ -1781,6 +1980,67 @@ class SQLiteExactBackend(BaseBackend):
         conn.commit()
 
     @staticmethod
+    def _ensure_fts_rowid_sync(conn: sqlite3.Connection) -> None:
+        """Ensure ``docs_fts.rowid`` matches ``documents.rowid`` for O(log N) updates.
+
+        Prior to v3.11.1, ``_replace_fts`` inserted into ``docs_fts`` without an
+        explicit ``rowid`` and deleted by ``UNINDEXED`` ``(collection_id, doc_id)``
+        columns, causing a full-table FTS5 scan on every write. Synchronizing
+        ``docs_fts.rowid = documents.rowid`` allows ``DELETE FROM docs_fts WHERE
+        rowid = ?`` to use the FTS5 B-tree primary key directly.
+        """
+        synced = conn.execute("SELECT value FROM meta WHERE key = 'fts5_rowid_synced'").fetchone()
+        if synced is not None and synced[0] == "1":
+            return
+        doc_count = int(conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+        if doc_count > 0:
+            fts_count = int(conn.execute("SELECT COUNT(*) FROM docs_fts").fetchone()[0])
+            mismatch = doc_count != fts_count
+            if not mismatch:
+                mismatch_row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM documents d
+                    LEFT JOIN docs_fts f ON f.rowid = d.rowid
+                    WHERE f.rowid IS NULL
+                       OR CAST(f.collection_id AS INTEGER) != d.collection_id
+                       OR f.doc_id != d.id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                mismatch = mismatch_row is not None
+            if mismatch:
+                conn.execute(
+                    """
+                    DELETE FROM docs_fts
+                    WHERE rowid IN (
+                        SELECT f.rowid
+                        FROM docs_fts f
+                        LEFT JOIN documents d ON d.rowid = f.rowid
+                        WHERE d.rowid IS NULL
+                           OR CAST(f.collection_id AS INTEGER) != d.collection_id
+                           OR f.doc_id != d.id
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO docs_fts(rowid, collection_id, doc_id, document)
+                    SELECT d.rowid, d.collection_id, d.id, d.document
+                    FROM documents d
+                    LEFT JOIN docs_fts f ON f.rowid = d.rowid
+                    WHERE f.rowid IS NULL
+                    """
+                )
+        conn.execute(
+            """
+            INSERT INTO meta(key, value)
+            VALUES ('fts5_rowid_synced', '1')
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """
+        )
+
+    @staticmethod
     def _ensure_locus_columns(conn: sqlite3.Connection) -> None:
         """Add VIRTUAL wing/room/hall columns, the locus index, and source_file.
 
@@ -1788,7 +2048,9 @@ class SQLiteExactBackend(BaseBackend):
         1.6 GB palace does not copy embedding blobs. CREATE INDEX walks
         metadata_json once and stores the loci. Existing palaces migrate
         here on the next writable open. The source_file expression index is
-        the closet-enrichment lookup (``get(where={source_file})``).
+        the closet-enrichment lookup (``get(where={source_file})``); the
+        filed_at ones serve ``get_recent``. A read-only open never creates
+        them and reads without.
         """
         cols = _document_column_names(conn)
         for field in _LOCUS_FIELDS:
@@ -1815,6 +2077,18 @@ class SQLiteExactBackend(BaseBackend):
                     collection_id,
                     (json_extract(metadata_json, '$.source_file'))
                 )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_FILED_AT_INDEX}
+                ON documents(collection_id, (json_extract(metadata_json, '$.filed_at')), id)
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_WING_FILED_AT_INDEX}
+                ON documents(collection_id, wing, (json_extract(metadata_json, '$.filed_at')), id)
             """
         )
 
@@ -1846,6 +2120,7 @@ class SQLiteExactBackend(BaseBackend):
                         "INSERT INTO collections(name, created_at) VALUES (?, ?)",
                         (collection_name, _utcnow()),
                     )
+                    _bump_write_generation(handle.conn)
                     handle.conn.commit()
         return SQLiteExactCollection(handle, collection_name, backend=self)
 
@@ -1946,7 +2221,7 @@ class SQLiteExactBackend(BaseBackend):
         bare ``sqlite3.connect()`` against a missing path leaves a 0-byte file
         behind because the SQLite header is written on the first statement,
         not on connection. The 16-byte ``SQLite format 3\\x00`` magic prefix
-        accepts every real palace while rejecting empty / garbage files. See #1893.
+        accepts every real palace while rejecting empty / garbage files.
 
         The probe goes through :func:`mempalace.backends._magic.has_sqlite_magic`
         and never opens a plain descriptor on the file: ``detect()`` runs on
@@ -1974,15 +2249,21 @@ class SQLiteExactBackend(BaseBackend):
             if row is None:
                 raise CollectionNotInitializedError(collection_name)
             collection_id = int(row[0])
-            handle.conn.execute("DELETE FROM documents WHERE collection_id = ?", (collection_id,))
             try:
                 handle.conn.execute(
-                    "DELETE FROM docs_fts WHERE collection_id = ?",
+                    """
+                    DELETE FROM docs_fts
+                    WHERE rowid IN (
+                        SELECT rowid FROM documents WHERE collection_id = ?
+                    )
+                    """,
                     (collection_id,),
                 )
             except sqlite3.OperationalError:
                 pass
+            handle.conn.execute("DELETE FROM documents WHERE collection_id = ?", (collection_id,))
             handle.conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+            _bump_write_generation(handle.conn)
             handle.conn.commit()
 
 

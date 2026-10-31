@@ -25,7 +25,7 @@ def _restamp_palace_db() -> None:
     chroma.sqlite3's mtime. ``_get_client`` compares against the stat taken
     before those writes, so it read the session's own footprint as an external
     change and rebuilt the client, reloading the whole HNSW index, on nearly
-    every call. Same fix as ``ChromaBackend._restamp`` (#2307): record the
+    every call. Same fix as ``ChromaBackend._restamp``: record the
     stat after our own writes, so a later difference is someone else's. A
     write from another process that lands during our own operation is absorbed
     the same way there and picked up on the next change.
@@ -162,12 +162,12 @@ def _get_client():
     if _client_cache is None or inode_changed or mtime_changed or not client_is_current:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
         # if the index is severely undersized, segment load can segfault
-        # the whole MCP server (#1222). The probe is pure sqlite +
+        # the whole MCP server. The probe is pure sqlite +
         # metadata read; never touches the HNSW binary files.
         _refresh_vector_disabled_flag()
         if client_is_current and (inode_changed or mtime_changed):
             ChromaBackend._quarantined_paths.discard(_config.palace_path)
-            # #2002: a peer process changed chroma.sqlite3 on disk. chromadb
+            # A peer process changed chroma.sqlite3 on disk. chromadb
             # caches its System (and the live HNSW segment) keyed by path, so
             # make_client() below would hand back the STALE segment, which then
             # persists its outdated index over the peer's writes, driving the
@@ -350,7 +350,7 @@ def _get_collection(create=False):
                 # Resolve the configured model before _get_client(): building
                 # the client creates the palace folder, and a misspelled model
                 # (UnknownEmbeddingModelError) must leave nothing behind.
-                _config.embedding_model
+                _ = _config.embedding_model
             client = _get_client()
             # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
             # collection but not the EF *instance/configuration*. So a reader or
@@ -359,12 +359,12 @@ def _get_collection(create=False):
             # one we spoof in ``mempalace.embedding`` (both report ``"default"``,
             # the identity check passes), but the *provider list* is chromadb's
             # default rather than the user's resolved device. On bleeding-edge
-            # interpreters (#1299: python 3.14 + chromadb 1.5.x on Apple Silicon)
+            # interpreters (python 3.14 + chromadb 1.5.x on Apple Silicon)
             # that default provider selection can SIGSEGV the host process on
             # first ``col.add()``. The miner / Stop hook ingest path avoids this
             # because it routes through ``ChromaBackend.get_collection``, which
-            # resolves the EF via ``ChromaBackend._resolve_embedding_function``;
-            # the MCP server bypassed that abstraction. Resolve the EF inside the
+            # resolves the EF via ``ChromaBackend._resolve_embedding_function``.
+            # Resolve the EF inside the
             # branches that actually open a collection so warm-cache reads stay
             # zero-cost. Reuse the backend helper so the two call sites can't
             # drift on logging or fallback semantics.
@@ -374,16 +374,16 @@ def _get_collection(create=False):
                 ef_kwargs = {"embedding_function": ChromaBackend._resolve_embedding_function()}
                 # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
                 # HNSW insert path, which has a race in repairConnectionsForUpdate /
-                # addPoint (see issues #974, #965). Set via metadata on fresh
-                # collections and re-applied via _pin_hnsw_threads() for legacy
-                # palaces whose collections were created before this fix (the
+                # addPoint. Set via metadata on fresh collections and
+                # re-applied via _pin_hnsw_threads() for palaces whose
+                # collections were created without it (the
                 # runtime config does not persist cross-process in chromadb 1.5.x,
                 # so the retrofit runs every time _get_collection opens a cache).
                 #
                 # ChromaDB 1.5.x's Rust binding SIGSEGVs when get_or_create_collection
                 # is called with metadata that differs from what's stored. The split
                 # below skips the metadata-comparison codepath for existing
-                # collections, mirroring the backend-layer fix from #1262.
+                # collections, the same way the backend layer does.
                 try:
                     raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 except _ChromaNotFoundError:
@@ -584,6 +584,24 @@ def _is_chroma_backend() -> bool:
         return False
 
 
+def _palace_known_wings() -> frozenset:
+    """The palace's stored wing names, for ``wing_aliases``.
+
+    Chroma reads them from sqlite, without opening the collection.
+    """
+    if _is_chroma_backend() and _config.palace_path:
+        return chroma_known_wings(_config.palace_path)
+    try:
+        return known_wings(_get_collection())
+    except Exception:
+        return frozenset()
+
+
+def _palace_wing_aliases(wing: str) -> list:
+    """``wing_aliases`` for ``wing`` with the palace's stored wing names."""
+    return wing_aliases(wing, _palace_known_wings())
+
+
 def _backend_db_exists() -> bool:
     try:
         return detect_backend_for_path(_config.palace_path) is not None
@@ -605,13 +623,8 @@ def _safe_meta(meta):
 
         AttributeError: 'NoneType' object has no attribute 'get'
 
-    This bug bricked the embeddings_queue cleanup path in issue #1426 —
-    the handler crashed before reaching the ``DELETE FROM embeddings_queue``
-    step, so the queue grew without bound while writes kept appearing
-    successful.
-
-    Centralizing the coercion through this helper makes the contract
-    explicit and keeps the fix self-documenting at every call site:
+    A crash there can stop a cleanup before it finishes (the embeddings_queue
+    then grows without bound while writes keep reporting success), so
     *metadata is always a dict by the time it leaves the boundary*.
     """
     return meta if isinstance(meta, dict) else {}
@@ -620,9 +633,9 @@ def _safe_meta(meta):
 def _fetch_all_metadata(col, where=None):
     """Fetch every matching record's metadata via the backend's best strategy.
 
-    Delegates to BaseCollection.get_all_metadata() (#1796), which Chroma
-    satisfies with the same offset-paginated loop this function used to do
-    inline, and which Qdrant overrides with a single _scroll_all() pass.
+    Delegates to BaseCollection.get_all_metadata(), which Chroma
+    satisfies with an offset-paginated loop and Qdrant overrides with a
+    single _scroll_all() pass.
     Routing through one contract method means every backend gets its own
     correct strategy without this caller needing to know which backend it's
     talking to.
@@ -738,7 +751,7 @@ _MAX_SOURCE_FILE_LENGTH = 4096
 
 
 def _sanitize_optional_source_file(value: str = None) -> str:
-    """Validate an optional source_file search filter (#1815).
+    """Validate an optional source_file search filter.
 
     Unlike wing/room, a source_file is a path: ``/``, ``\\`` and ``.`` are
     legal, so it is NOT run through ``sanitize_name`` (which rejects path
@@ -746,7 +759,7 @@ def _sanitize_optional_source_file(value: str = None) -> str:
     ChromaDB metadata-equality / parameterized-SQL value — never used as a
     filesystem path — so there is no traversal risk to guard against. A null
     byte or a pathological length can still upset the backend (chromadb
-    add/upsert chokes on null bytes / lone surrogates, #1235), so guard those
+    add/upsert chokes on null bytes / lone surrogates), so guard those
     for parity with ``sanitize_name``. Blank / whitespace-only is "no filter".
     """
     if value is None:
@@ -765,11 +778,3 @@ def _sanitize_optional_source_file(value: str = None) -> str:
             f"source_file exceeds maximum length of {_MAX_SOURCE_FILE_LENGTH} characters"
         )
     return value
-
-
-# The #1128 date-filter helpers moved to ``mempalace.date_window`` so the
-# search-side window (#463) can share them without importing this module
-# (whose import installs MCP stdio protection). Aliased under their
-# historical private names — every call site and test keeps working.
-_parse_date_filter = parse_date_bound
-_filed_at_in_window = filed_at_in_window

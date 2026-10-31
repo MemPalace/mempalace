@@ -243,8 +243,9 @@ impl VectorIndex {
             // SQLite exposes bytes with no f32 alignment guarantee. Decode
             // little-endian floats directly into our owned contiguous buffer.
             let start = index.vectors.len();
-            for bytes in blob_ref.chunks_exact(4) {
-                let value = f32::from_le_bytes(bytes.try_into().unwrap());
+            let (chunks, _) = blob_ref.as_chunks::<4>();
+            for bytes in chunks {
+                let value = f32::from_le_bytes(*bytes);
                 if !value.is_finite() {
                     return Err(MemPalaceError::InvalidArgument(format!(
                         "non-finite embedding for document {id}"

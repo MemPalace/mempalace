@@ -18,7 +18,6 @@ mempalace/
 │   ├── searcher/              ← hybrid BM25 + vector search package
 │   ├── palace/                ← collection access, closets, mine locks
 │   ├── layers.py              ← 4-layer memory stack
-│   ├── onboarding.py          ← guided setup
 │   ├── config.py              ← configuration loading
 │   ├── normalize.py           ← chat format converter
 │   ├── entity_detector.py     ← auto-detect people/projects
@@ -91,7 +90,7 @@ Imports conversation exports (Claude, ChatGPT, Slack, Markdown, plaintext). Chun
 
 ### `normalize.py` — Format Converter
 
-Converts 5 chat formats to a standard transcript format before mining.
+Converts 5 chat formats to a standard transcript format before mining. The conversation miner records which lossy steps a file's parse applied (tool output truncated or omitted, tool calls summarized, UI chrome stripped, non-text blocks dropped, Slack roles assigned) and stamps them, sorted and comma-joined, in the `transforms` metadata of every drawer from that file, using the RFC 002 transformation names.
 
 ### `general_extractor.py` — Memory Type Extraction
 
@@ -121,10 +120,6 @@ Loads settings from `~/.mempalace/config.json` and environment variables.
 
 Splits concatenated transcripts into per-session files based on session boundary detection.
 
-### `onboarding.py` — Guided Setup
-
-Interactive setup wizard for `mempalace init`. Generates AAAK bootstrap and wing config.
-
 ### `spellcheck.py` — Spell Checking
 
-Optional spell checking utility (requires `autocorrect` package).
+Optional spell checking utility (requires `autocorrect` package). The conversation miner uses it only when `convo.spellcheck` (or `MEMPALACE_CONVO_SPELLCHECK`) is on, corrects user messages only, and adds `spellcheck_user` to the `transforms` stamp of every drawer from a file whose text the speller changed.
