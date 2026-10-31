@@ -22,7 +22,12 @@ from typing import Optional
 
 from . import paths
 from ._env import env_str, parse_number
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import (
+    _apply_known_systems_prepass,
+    _entity_blocklist,
+    _get_coca_filter,
+    _use_english_filters,
+)
 from .fsio import atomic_write_json, encoding_metadata, move_aside, read_source_text
 
 # Module-level import so tests can patch it as
@@ -402,6 +407,49 @@ def load_gitignore_matcher(dir_path: Path, cache: dict):
     return cache[dir_path]
 
 
+def _repo_common_dir(project_path: Path) -> Optional[Path]:
+    """Resolve the Git directory holding a checkout's shared exclude file."""
+    git_dir = project_path / ".git"
+    if git_dir.is_file():
+        marker = git_dir.read_text(encoding="utf-8", errors="surrogateescape").strip()
+        if not marker.startswith("gitdir:") or not marker[7:].strip():
+            return None
+        git_dir = project_path / marker[7:].strip()
+    elif not git_dir.is_dir():
+        return None
+    try:
+        common = (
+            (git_dir / "commondir").read_text(encoding="utf-8", errors="surrogateescape").strip()
+        )
+    except FileNotFoundError:
+        return git_dir
+    return git_dir / common if common else None
+
+
+def load_repo_exclude_matcher(project_path: Path, cache: dict):
+    """Cache common Git excludes, anchored at the checkout's project root.
+
+    Linked worktrees point to their administration directory through a
+    ``.git`` file, then to the shared Git directory through ``commondir``.
+    Its exclude patterns have lower precedence than per-directory gitignores.
+    The tuple cache key keeps these rules separate from directory matchers.
+    """
+    cache_key = (project_path, "git_info_exclude")
+    if cache_key not in cache:
+        try:
+            common = _repo_common_dir(project_path)
+            lines = (
+                (common / "info" / "exclude").read_text(encoding="utf-8", errors="surrogateescape")
+                if common is not None
+                else ""
+            )
+        except OSError:
+            cache[cache_key] = None
+        else:
+            cache[cache_key] = GitignoreMatcher.from_patterns(project_path, lines.splitlines())
+    return cache[cache_key]
+
+
 def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
     """Apply active .gitignore matchers in ancestor order; last match wins."""
     ignored = False
@@ -412,9 +460,25 @@ def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
     return ignored
 
 
-def should_skip_dir(dirname: str) -> bool:
-    """Skip known generated/cache directories before gitignore matching."""
-    return dirname in SKIP_DIRS or dirname.endswith(".egg-info")
+def should_skip_dir(dir_path: Path) -> bool:
+    """Skip known generated/cache directories before gitignore matching.
+
+    Takes the full directory path so layout-dependent cases can be detected:
+
+    - Any directory whose basename is in ``SKIP_DIRS`` (e.g. ``.worktrees``),
+      or ends in ``.egg-info``, is skipped outright.
+    - A ``worktrees`` directory is skipped ONLY when it sits directly under a
+      ``.claude`` directory (``<project>/.claude/worktrees/``). That is the
+      Claude Code worktree layout containing duplicate checkouts. A
+      genuine ``src/worktrees`` Python package is NOT under ``.claude`` and
+      still mines.
+    """
+    dirname = dir_path.name
+    if dirname in SKIP_DIRS or dirname.endswith(".egg-info"):
+        return True
+    if dirname == "worktrees" and dir_path.parent.name == ".claude":
+        return True
+    return False
 
 
 def normalize_include_paths(include_ignored: list) -> set:
@@ -1144,7 +1208,11 @@ def _extract_entities_for_metadata(content: str) -> str:
         if re.search(left + re.escape(name) + right, content, re.IGNORECASE):
             matched.add(name)
 
-    coca_filter = _get_coca_filter()
+    from .config import MempalaceConfig
+
+    entity_langs = MempalaceConfig().entity_languages
+    entity_stoplist = {w.lower() for w in _ENTITY_STOPLIST} | _entity_blocklist(entity_langs)
+    coca_filter = _get_coca_filter() if _use_english_filters(entity_langs) else frozenset()
     window = content[:_ENTITY_EXTRACT_WINDOW]
     # Known-systems compound pre-pass. Detects
     # multi-word product names atomically and masks them from the window so
@@ -1155,7 +1223,7 @@ def _extract_entities_for_metadata(content: str) -> str:
     words = _candidate_entity_words(working_window)
     freq: dict = dict(compound_counts)
     for w in words:
-        if w in _ENTITY_STOPLIST:
+        if w.lower() in entity_stoplist:
             continue
         # Drop common English content words
         # ("Code", "Line", "Note", "Phase", …) from per-drawer entity
@@ -1808,6 +1876,16 @@ def scan_project(
     Skips symlinks and oversized files. Each skipped symlink is logged to
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why a directory looks empty after walking.
+
+    When ``respect_gitignore`` is set, both per-directory ``.gitignore``
+    files AND the repository-level ``<project>/.git/info/exclude`` are
+    honoured (see :func:`load_repo_exclude_matcher`). The repo-level file is
+    anchored at the project root so its patterns prune the entire tree —
+    this is what keeps a git-worktree that a user excluded locally from being
+    double-mined as a duplicate wing (MemPalace/mempalace#2599).
+    In addition to gitignore, known build/cache directories and Claude Code
+    worktree locations (``.worktrees/``, ``.claude/worktrees/``) are always
+    pruned via :func:`should_skip_dir`, independent of ``respect_gitignore``.
     """
     project_path = Path(project_dir).expanduser().resolve()
     files = []
@@ -1815,6 +1893,16 @@ def scan_project(
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
     exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns or [])
+
+    # Honour the repo-level ``.git/info/exclude`` across the whole tree. It is
+    # anchored at the project root, so it survives the per-directory pruning
+    # of per-directory matchers below (those are dropped as we descend past
+    # their directory, but the root matcher stays because the root is always
+    # an ancestor). Only applies under gitignore, matching ``.gitignore``.
+    if respect_gitignore:
+        repo_exclude_matcher = load_repo_exclude_matcher(project_path, matcher_cache)
+        if repo_exclude_matcher is not None:
+            active_matchers.append(repo_exclude_matcher)
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -1833,7 +1921,7 @@ def scan_project(
             d
             for d in dirs
             if is_force_included(root_path / d, project_path, include_paths)
-            or not should_skip_dir(d)
+            or not should_skip_dir(root_path / d)
         ]
         if respect_gitignore and active_matchers:
             dirs[:] = [
@@ -2330,9 +2418,10 @@ def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
     """Drop tunnels between ``wing`` and every other wing that shares an
     entity via the within-wing hallway primitive.
 
-    Reads hallway records (``mempalace.hallways.list_hallways``) and
-    materializes cross-wing tunnels for any entity that has hallways in
-    this wing AND at least one other wing. Tunnels use ``kind="entity"``
+    Reads each entity's strongest hallway per wing
+    (``mempalace.hallways.entity_strength_records``) and materializes
+    cross-wing tunnels for any entity that has hallways in this wing AND at
+    least one other wing. Tunnels use ``kind="entity"``
     and the synthetic endpoint room ``entity:<name>`` so they're
     distinguishable from explicit and topic tunnels at read time but
     interchangeable with them via the standard ``list_tunnels`` /
@@ -2341,10 +2430,12 @@ def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
     Returns the number of tunnels created or refreshed. Zero means no
     eligible entity exists in this wing yet (or no hallway records do).
     """
-    from .hallways import list_hallways
+    from .hallways import entity_strength_records
     from .palace_graph import entity_tunnels_for_wing
 
-    hallways = list_hallways(config=config)
+    # Not every hallway of the palace: the tunnels read one strength per
+    # (wing, entity), so the store hands over only that.
+    hallways = entity_strength_records(config=config)
     if not hallways:
         return 0
     created = entity_tunnels_for_wing(wing, hallways, config=config)

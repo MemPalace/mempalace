@@ -13,6 +13,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Registered Chinese, Japanese, and Korean entities are tagged when adjacent to
   other words or particles. Mixed-script names retain word boundaries on their
   non-CJK edges.
+- Conversation mining compares transcript timestamps by instant rather than
+  text order, so mixed UTC offsets and fractional seconds select the correct
+  authored time. Invalid timestamps are ignored.
+- Hybrid search breaks authored-time ties by instant across UTC offsets.
+
+### Upgrade notes
+
+- Existing conversation drawers keep their metadata when an unchanged source is
+  skipped. For Chroma palaces with retained JSONL transcripts, run the
+  [authored-time backfill](docs/authored-at.md#backfilling-existing-memory) from
+  this checkout to correct previously selected timestamps without re-embedding.
+  Preview with the default dry run before adding `--apply`.
 
 ---
 
@@ -155,6 +167,18 @@ requires Python 3.10.
   `transforms`, a conversation is filed under every file that holds it (files
   once skipped as duplicates get their own drawers), and non-UTF-8 sources
   keep their exact bytes.
+- **Hallways move from `hallways.json` into `hallways.sqlite3`.** Both sit
+  beside the palace directory. The first hallway write after the upgrade,
+  usually the next mine, imports `hallways.json` in one transaction and then
+  renames it to `hallways.json.imported-<stamp>-<random>`; nothing is
+  deleted. Until that write, hallways are read from the JSON as before. On a
+  palace with 830,000 hallways the import took 25 to 35 s, once. A
+  `hallways.json` that does not parse is moved aside and the write is
+  refused, as a save over it was before. A MemPalace older than 3.12 that
+  mines into the same palace keeps writing `hallways.json`, which this
+  version no longer reads, so upgrade every install that shares a palace.
+  Hallways are derived from drawers: after a downgrade,
+  `mempalace hallways --rebuild` writes them again.
 - **A loopback HTTP MCP server needs no token; anything reachable from another
   machine does.** `mempalace serve` and `mempalace-mcp --transport http` on
   `127.0.0.1`, `::1` or `localhost` serve local clients with no header, as
@@ -329,6 +353,16 @@ requires Python 3.10.
   the daemon's token, endpoint and pid files were written in place, where a
   reader could see half a record. All of them now create a new randomly named
   file and rename it into place.
+- **On Windows, no other server can take over the HTTP hub's port.** The hub
+  bound with `SO_REUSEADDR`, which on Windows lets a later socket bind a port
+  that is already listening and receive some of its connections.
+  `python -m http.server 8765`, a static preview server on the same port,
+  answered requests meant for the hub: authenticated MCP calls failed with
+  `RemoteDisconnected`, and the server that took them over received their
+  `Authorization` header. On Windows the hub now binds with
+  `SO_EXCLUSIVEADDRUSE`, so a later server on its port fails to start, and
+  the hub itself refuses to start on a port another server holds. POSIX
+  binds are unchanged.
 
 ### Performance
 
@@ -340,6 +374,23 @@ requires Python 3.10.
   rows, adding 50 drawers took 10 s and now takes 10 ms. The first writable
   open of an existing palace re-keys the rows that drifted, once (about 3 s
   for 3,000 rows).
+- **A mine no longer reads and rewrites every hallway of the palace.** Each
+  mine loaded the whole `hallways.json`, replaced its own wing's records and
+  wrote the whole file back. Most of that time was spent decoding and
+  encoding JSON while holding the GIL, so an HTTP hub serving the mine
+  answered nothing else meanwhile. Hallways are now rows in
+  `hallways.sqlite3`: a mine reads its own wing's rows, rewrites only the
+  hallways whose count, rooms or entities changed, and leaves an unchanged
+  record as stored, `created_at` included. Listing one wing's hallways, the
+  `mempalace_list_hallways` page and `delete_hallway` read only what they
+  return, and cross-wing entity tunnels read one strength per wing and
+  entity instead of every record. On a copy of a 228,000-drawer palace with
+  830,000 hallways (a 545 MB file), re-mining a wing went from about 20 s to
+  1 to 4 s, listing one wing's hallways from 3.8 s to 27 to 56 ms, and the
+  process peaked at about 150 MB instead of 3.8 GB. A wing holding 386,000
+  of those hallways still takes about 30 s, now spent reading its drawers
+  and pairing their entities rather than in the hallway file. The store is
+  about 1.4 times the size of the JSON it replaces.
 - **Newest-first reads on `sqlite_exact` are fast on large palaces.**
   `$in` and `$eq` filters on plain values, such as the wing filter wake-up
   builds from every spelling a wing was filed under

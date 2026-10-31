@@ -25,26 +25,32 @@ follow-up PR will refactor ``_compute_topic_tunnels_for_wing`` to
 build cross-wing tunnels from hallway data (Wing → Drawer-entities →
 Hallway → Tunnel).
 
-Persistence mirrors ``palace_graph._TUNNEL_FILE``: a JSON file under
-``~/.mempalace/`` so the records survive across mines and are
-inspectable / editable by hand if needed.
+Persistence is one SQLite table, ``hallways.sqlite3``, beside the palace
+where ``hallways.json`` used to be, so the records survive palace rebuilds.
+Each row holds one record verbatim, plus its wing and entities as indexed
+columns: a mine replaces only its own wing's changed rows, and a query reads
+only the rows it asks for. A palace that still has ``hallways.json`` has it
+imported by the first write, and the file is then kept under a new name.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
+import sqlite3
 from collections import defaultdict
 from itertools import combinations
-from typing import Optional
+from pathlib import Path
+from typing import Iterator, Optional
 
 from . import paths
 from .dynamics import initialize_dynamics_fields
 from .fsio import (
-    atomic_write_json as _atomic_write_json,
+    move_aside as _move_aside,
     read_json_for_update as _read_json_for_update,
     refuse_unparsed as _refuse_unparsed,
 )
@@ -53,13 +59,11 @@ from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
-# Persistence target is resolved through ``_get_hallway_file`` below, which
-# mirrors ``palace_graph._get_tunnel_file`` (the 3.3.6 palace-scoped pattern)
-# so the storage layout is uniform across the two related primitives. Tests
-# should monkey-patch ``_get_hallway_file`` and ``_legacy_hallway_file`` rather
-# than poking a module-level constant.
-
-_SCHEMA_VERSION = 1
+# The store is resolved through ``_get_hallway_file`` below, which mirrors
+# ``palace_graph._get_tunnel_file`` (the 3.3.6 palace-scoped pattern), and the
+# database sits beside that path. Tests should monkey-patch
+# ``_get_hallway_file`` and ``_legacy_hallway_file`` rather than poking a
+# module-level constant: both the database and the imported JSON follow it.
 
 
 __all__ = [
@@ -70,28 +74,252 @@ __all__ = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Persistence — JSON file resolved from MempalaceConfig.hallway_file,
-# restricted perms (0600) on POSIX. Pre-3.3.6 behavior (hardcoded
-# ~/.mempalace/hallways.json) is kept only as a one-time orphan detection
-# fallback, matching the palace_graph tunnel-file migration pattern.
+# Persistence — SQLite beside the palace, restricted perms (0600) on POSIX.
+# ``hallways.json`` (MempalaceConfig.hallway_file) is the document this store
+# replaced: the first write imports it in the same transaction that marks the
+# store as the source of truth, and moves it aside once that commits. Until
+# then readers keep reading the JSON, so a read never writes. Pre-3.3.6
+# behavior (hardcoded ~/.mempalace/hallways.json) is kept only as a one-time
+# orphan detection fallback, matching the palace_graph tunnel-file pattern.
 # ─────────────────────────────────────────────────────────────────────────────
+
+# meta key whose presence means the table, not hallways.json, holds the records.
+_IMPORTED_KEY = "json_imported"
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS hallways (
+    id TEXT PRIMARY KEY,
+    wing TEXT,
+    entity_a TEXT,
+    entity_b TEXT,
+    co_occurrence_count,
+    signature TEXT NOT NULL,
+    record TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_hallways_wing ON hallways(wing);
+"""
+
+# An upsert keeps the row's rowid, so list order (insertion order) survives a
+# record being rewritten in place.
+_UPSERT = """
+INSERT INTO hallways (id, wing, entity_a, entity_b, co_occurrence_count, signature, record)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    wing = excluded.wing,
+    entity_a = excluded.entity_a,
+    entity_b = excluded.entity_b,
+    co_occurrence_count = excluded.co_occurrence_count,
+    signature = excluded.signature,
+    record = excluded.record
+"""
 
 
 def _get_hallway_file(config=None) -> str:
-    """Return the path to the hallways.json file, derived from MempalaceConfig.palace_path."""
+    """Return the path to the hallways.json file, derived from MempalaceConfig.palace_path.
+
+    The store replaced that file; it is now only the import source, and the
+    database beside it (:func:`_get_hallway_db`) holds the records.
+    """
     from .config import MempalaceConfig
 
     config = config or MempalaceConfig()
     return config.hallway_file
 
 
-def _hallway_file_lock(config=None):
-    """The per-file lock every hallway writer holds from load to save.
+def _get_hallway_db(config=None) -> str:
+    """The hallway store: ``hallways.sqlite3`` beside :func:`_get_hallway_file`."""
+    root, _ext = os.path.splitext(_get_hallway_file(config))
+    return root + ".sqlite3"
 
-    Same mechanism as ``palace_graph.create_tunnel``: without it two
-    concurrent writers (a mine's recompute and ``hallways --prune-spellings``,
-    or two mines of different wings) each load, edit and save the whole
-    file, and the later save drops the earlier one's records.
+
+def _scalar(value):
+    """A value SQLite can bind as an indexed column; anything else as JSON text."""
+    if value is None or isinstance(value, (str, int, float)):
+        return value
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _signature(record: dict) -> str:
+    """A digest of what a recompute derives for one hallway; equal means nothing to rewrite.
+
+    Dynamics fields and ``created_at`` are left out: a recompute carries the
+    former over and must not rewrite a record only to re-stamp the latter. A
+    128-bit digest rather than the fields themselves keeps the column from
+    repeating the record beside it. The fields are JSON values, whose
+    ``repr`` is deterministic and several times cheaper to build than JSON.
+    """
+    derived = [
+        record.get(key)
+        for key in ("entity_a", "entity_b", "co_occurrence_count", "rooms", "label", "created_by")
+    ]
+    return hashlib.blake2b(repr(derived).encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _row(record: dict) -> tuple:
+    """The table row of one hallway record, which it stores verbatim.
+
+    A hand-made record without an id gets the id a mine would give its pair,
+    so it still has a key; the stored record keeps its own fields as written.
+    """
+    hallway_id = record.get("id")
+    if not isinstance(hallway_id, str) or not hallway_id:
+        hallway_id = _hallway_id(
+            str(record.get("wing")), str(record.get("entity_a")), str(record.get("entity_b"))
+        )
+    return (
+        hallway_id,
+        _scalar(record.get("wing")),
+        _scalar(record.get("entity_a")),
+        _scalar(record.get("entity_b")),
+        _scalar(record.get("co_occurrence_count")),
+        _signature(record),
+        json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str),
+    )
+
+
+def _connect(path: str, *, readonly: bool) -> sqlite3.Connection:
+    """A connection in autocommit mode; writers open explicit transactions.
+
+    A read-only connection never creates the database. A writable one creates
+    it with mode 0600 on POSIX (hallways reveal within-wing entity
+    connections), and SQLite gives its -wal and -shm files the same mode.
+    """
+    if readonly:
+        uri = Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None)
+    else:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if not os.path.exists(path):
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+        conn = sqlite3.connect(path, timeout=30, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_DDL)
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+def _reader(config=None) -> Optional[sqlite3.Connection]:
+    """A read-only connection to the store once it holds the records, else ``None``.
+
+    ``None`` means no write has imported ``hallways.json`` yet, and the caller
+    reads the JSON as before.
+    """
+    path = _get_hallway_db(config)
+    if not os.path.exists(path):
+        return None
+    conn = None
+    try:
+        conn = _connect(path, readonly=True)
+        # A writer creates the file before its tables: no meta table yet is
+        # the same as nothing imported.
+        has_meta = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+        ).fetchone()
+        imported = (
+            has_meta
+            and conn.execute("SELECT 1 FROM meta WHERE key = ?", (_IMPORTED_KEY,)).fetchone()
+        )
+    except sqlite3.Error:
+        if conn is not None:
+            conn.close()
+        logger.warning(
+            "hallways: %s could not be read; reading %s", path, _get_hallway_file(config)
+        )
+        logger.debug("hallways: store open failed", exc_info=True)
+        return None
+    if not imported:
+        conn.close()
+        return None
+    return conn
+
+
+def _import_json_once(conn: sqlite3.Connection, config=None) -> Optional[str]:
+    """Inside a write transaction: import ``hallways.json`` if nothing has yet.
+
+    Returns the JSON path to move aside once the transaction commits, or
+    ``None``. A file that does not parse, or is not the hallway document, is
+    moved aside and the write is refused, as a save over it was before. A
+    record whose id repeats an earlier one replaces it; the moved-aside file
+    keeps both. A later ``hallways.json`` (an older MemPalace still writing
+    one) is not imported again.
+    """
+    if conn.execute("SELECT 1 FROM meta WHERE key = ?", (_IMPORTED_KEY,)).fetchone():
+        return None
+    path = _get_hallway_file(config)
+    loaded = _read_json_for_update(path)
+    records: list = []
+    if loaded is not None:
+        if isinstance(loaded, dict) and isinstance(loaded.get("hallways"), list):
+            records = loaded["hallways"]
+        elif isinstance(loaded, list):
+            records = loaded
+        else:
+            _refuse_unparsed(path, "is not a hallway document")
+    rows = [_row(h) for h in records if isinstance(h, dict)]
+    conn.executemany(_UPSERT, rows)
+    marker = {"source": path if loaded is not None else None, "records": len(rows)}
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?)",
+        (_IMPORTED_KEY, json.dumps({**marker, "at": utc_now_iso()})),
+    )
+    if loaded is None:
+        return None
+    skipped = len(records) - len(rows)
+    logger.info(
+        "hallways: imported %d record(s) from %s into %s%s",
+        len(rows),
+        path,
+        _get_hallway_db(config),
+        f" ({skipped} non-record entries left in the kept file)" if skipped else "",
+    )
+    return path
+
+
+@contextlib.contextmanager
+def _writing(config=None) -> Iterator[sqlite3.Connection]:
+    """One write transaction on the store, after the one-time JSON import.
+
+    ``BEGIN IMMEDIATE`` takes SQLite's write lock up front, so two processes
+    cannot both import or both replace a wing from the same snapshot. Readers
+    keep reading the last committed state meanwhile (WAL).
+    """
+    conn = _connect(_get_hallway_db(config), readonly=False)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            imported = _import_json_once(conn, config)
+            yield conn
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    if imported:
+        try:
+            kept = _move_aside(imported, label="imported")
+            if kept:
+                logger.info("hallways: kept the imported %s as %s", imported, kept)
+        except OSError:
+            logger.warning(
+                "hallways: %s is imported but could not be renamed; it is no longer read",
+                imported,
+                exc_info=True,
+            )
+
+
+def _records(rows) -> list[dict]:
+    return [json.loads(row[0]) for row in rows]
+
+
+def _hallway_file_lock(config=None):
+    """The per-store lock every hallway writer holds from load to save.
+
+    Same mechanism as ``palace_graph.create_tunnel``. Each write is also one
+    SQLite transaction; the lock additionally keeps a load and the save that
+    follows it (``hallways --prune-spellings``, ``wings split``) from
+    interleaving with a mine's recompute.
     """
     from .palace import mine_lock
 
@@ -104,26 +332,32 @@ def _legacy_hallway_file() -> str:
 
 
 def _load_hallways_for_write(config=None) -> list[dict]:
-    """Hallway records a save is allowed to replace.
+    """Hallway records a save is allowed to replace, in list order.
 
-    Missing is an empty list. A file that does not parse, or is not the
-    hallway document, is moved aside and the save is refused. A read that
-    only lists hallways stays on :func:`_load_hallways` and does not move
-    the file.
+    Imports ``hallways.json`` first if no write has yet. A JSON that does not
+    parse, or is not the hallway document, is moved aside and the save is
+    refused. A read that only lists hallways stays on :func:`_load_hallways`
+    and writes nothing.
     """
-    path = _get_hallway_file(config)
-    loaded = _read_json_for_update(path)
-    if loaded is None:
-        return []
-    if isinstance(loaded, dict) and isinstance(loaded.get("hallways"), list):
-        return loaded["hallways"]
-    if isinstance(loaded, list):
-        return loaded
-    _refuse_unparsed(path, "is not a hallway document")
+    with _writing(config) as conn:
+        return _records(conn.execute("SELECT record FROM hallways ORDER BY rowid"))
 
 
 def _load_hallways(config=None) -> list[dict]:
-    """Read all hallway records. Returns ``[]`` if the file is missing or corrupt.
+    """Read all hallway records in list order. ``[]`` when there are none.
+
+    Reads the store once a write has imported ``hallways.json`` into it, and
+    the JSON until then (``[]`` if that is missing or corrupt).
+    """
+    conn = _reader(config)
+    if conn is None:
+        return _load_hallways_json(config)
+    with contextlib.closing(conn):
+        return _records(conn.execute("SELECT record FROM hallways ORDER BY rowid"))
+
+
+def _load_hallways_json(config=None) -> list[dict]:
+    """Read ``hallways.json``. Returns ``[]`` if the file is missing or corrupt.
 
     Backwards-compatibility: prior to this migration the hallway file was
     hardcoded at ``~/.mempalace/hallways.json`` regardless of the configured
@@ -159,21 +393,15 @@ def _load_hallways(config=None) -> list[dict]:
 
 
 def _save_hallways(hallways: list[dict], config=None) -> None:
-    """Atomically persist hallway records to the configured hallway file.
+    """Replace every hallway record with ``hallways``, in one transaction.
 
-    Uses an os.replace temp-file dance so a crash mid-write doesn't
-    corrupt the file. POSIX permission is restricted to 0600 because
-    hallways reveal within-wing entity connections that the user may
-    not want world-readable.
+    For the whole-store rewrites (``--prune-spellings``). A mine replaces
+    only its own wing (:func:`compute_hallways_for_wing`); a crash at any
+    point leaves the previous records in place.
     """
-    hallway_file = _get_hallway_file(config)
-    directory = os.path.dirname(hallway_file)
-    os.makedirs(directory, exist_ok=True)
-    payload = {
-        "schema_version": _SCHEMA_VERSION,
-        "hallways": list(hallways),
-    }
-    _atomic_write_json(hallway_file, payload)
+    with _writing(config) as conn:
+        conn.execute("DELETE FROM hallways")
+        conn.executemany(_UPSERT, [_row(h) for h in hallways if isinstance(h, dict)])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -656,8 +884,10 @@ def compute_hallways_for_wing(
          ``>= min_count``, materialize a hallway record. The record
          carries the pair, the count, and the set of rooms where they
          co-occurred (useful context for navigation).
-      4. Persist the full hallway list (records for other wings preserved,
-         this wing's records replaced) and return the just-computed list.
+      4. Replace this wing's records in the store: a record whose derived
+         fields changed is rewritten, one the drawers no longer produce is
+         dropped, and an unchanged one is left as stored. Other wings'
+         records are not read or rewritten. Return the wing's records.
 
     Args:
         wing: wing name to scan.
@@ -788,41 +1018,53 @@ def compute_hallways_for_wing(
     # rebuild that correctly produced none.
 
     # 3. Materialize hallway records for pairs above the threshold.
-    #    Before building, load existing records so we can PRESERVE L7
-    #    dynamics fields (strength, stability, last_activated, access_count)
-    #    across recomputes. Without this preservation, every mine wipes
-    #    the connection weights accumulated through use — defeating the
-    #    living-connection layer entirely.
-    # Load → materialize → save under the hallway-file lock, or a mine of
-    # another wing in between rewrites the file without this wing's records.
-    with _hallway_file_lock(config):
-        existing = _load_hallways_for_write(config)
-        existing_dynamics_lookup: dict = {}
-        for h in existing:
-            if h.get("wing") != wing:
-                continue
+    #    Read this wing's stored rows first so we can PRESERVE L7 dynamics
+    #    fields (strength, stability, last_activated, access_count) across
+    #    recomputes. Without this preservation, every mine wipes the
+    #    connection weights accumulated through use — defeating the
+    #    living-connection layer entirely. Only this wing's rows are read:
+    #    other wings' records are neither loaded nor rewritten.
+    # Read → materialize → write in one transaction under the hallway lock,
+    # so a concurrent writer cannot replace the wing from the same snapshot.
+    with _hallway_file_lock(config), _writing(config) as conn:
+        stored = conn.execute(
+            "SELECT id, entity_a, entity_b, signature, record FROM hallways"
+            " WHERE wing = ? ORDER BY rowid",
+            (wing,),
+        ).fetchall()
+        stored_by_id = {row[0]: row for row in stored}
+        existing_by_key: dict = {}
+        for row in stored:
             # Canonicalize the lookup key by sorting the entity pair — must
             # match the symmetric ID generation in _hallway_id (which also
             # sorts). Without this, a persisted record with reversed entity
             # order would silently miss the lookup and lose its accumulated
-            # dynamics on every recompute.
+            # dynamics on every recompute. The last record of a key wins.
             key = tuple(
                 sorted(
                     [
-                        file_keys.get(str(h.get("entity_a")), str(h.get("entity_a"))),
-                        file_keys.get(str(h.get("entity_b")), str(h.get("entity_b"))),
+                        file_keys.get(str(row[1]), str(row[1])),
+                        file_keys.get(str(row[2]), str(row[2])),
                     ]
                 )
             )
+            existing_by_key[key] = row[4]
+
+        def preserved_dynamics(key) -> dict:
             # Only copy the fields the dynamics layer cares about; everything
             # else is recomputed deterministically from the drawer set.
-            existing_dynamics_lookup[key] = {
+            raw = existing_by_key.get(key)
+            if raw is None:
+                return {}
+            h = json.loads(raw)
+            return {
                 k: h[k]
                 for k in ("strength", "stability", "last_activated", "access_count")
                 if k in h
             }
 
         created: list[dict] = []
+        changed: list[dict] = []
         created_at = utc_now_iso()
         for key in sorted(pair_counts.keys()):
             count = pair_counts[key]
@@ -844,17 +1086,28 @@ def compute_hallways_for_wing(
                 "created_at": created_at,
                 "created_by": "auto",
             }
+            # A stored record this recompute would derive unchanged stays as
+            # it is, created_at and dynamics included, and is not rewritten.
+            same = stored_by_id.get(record["id"])
+            if same is not None and same[3] == _signature(record):
+                created.append(json.loads(same[4]))
+                continue
             # Apply preserved dynamics if this entity pair existed in the
             # prior wing snapshot. Then initialize any still-missing fields
             # (the new-pair case + the legacy-record case both land cleanly).
-            preserved = existing_dynamics_lookup.get(key, {})
-            record.update(preserved)
+            record.update(preserved_dynamics(key))
             initialize_dynamics_fields(record)
             created.append(record)
+            changed.append(record)
 
-        # 4. Persist — preserve other-wing records, replace this wing's records.
-        preserved_other_wings = [h for h in existing if h.get("wing") != wing]
-        _save_hallways(preserved_other_wings + created, config)
+        # 4. Persist — rewrite this wing's changed records and drop the ones
+        #    the drawers no longer produce. Other wings' rows are untouched.
+        kept_ids = {h["id"] for h in created}
+        conn.executemany(
+            "DELETE FROM hallways WHERE id = ?",
+            [(row[0],) for row in stored if row[0] not in kept_ids],
+        )
+        conn.executemany(_UPSERT, [_row(h) for h in changed])
 
     return created
 
@@ -866,10 +1119,79 @@ def compute_hallways_for_wing(
 
 def list_hallways(wing: Optional[str] = None, config=None) -> list[dict]:
     """List hallway records. Filter by ``wing`` if specified."""
-    all_hallways = _load_hallways(config)
-    if wing is None:
-        return list(all_hallways)
-    return [h for h in all_hallways if h.get("wing") == wing]
+    conn = _reader(config)
+    if conn is None:
+        all_hallways = _load_hallways_json(config)
+        if wing is None:
+            return list(all_hallways)
+        return [h for h in all_hallways if h.get("wing") == wing]
+    with contextlib.closing(conn):
+        if wing is None:
+            return _records(conn.execute("SELECT record FROM hallways ORDER BY rowid"))
+        return _records(
+            conn.execute("SELECT record FROM hallways WHERE wing = ? ORDER BY rowid", (wing,))
+        )
+
+
+def list_hallways_page(
+    wing: Optional[str] = None, limit: int = 100, offset: int = 0, config=None
+) -> tuple[list[dict], int]:
+    """One page of hallway records, strongest first, and how many there are.
+
+    The order is :func:`list_hallways` stably sorted by descending
+    ``co_occurrence_count`` (a missing count sorts as 0). Only the page is
+    read, not every record of the palace.
+    """
+    conn = _reader(config)
+    if conn is None:
+        rows = sorted(
+            list_hallways(wing, config=config),
+            key=lambda h: -int(h.get("co_occurrence_count") or 0),
+        )
+        return rows[offset : offset + limit], len(rows)
+    where, params = ("WHERE wing = ?", (wing,)) if wing is not None else ("", ())
+    with contextlib.closing(conn):
+        total = conn.execute(f"SELECT COUNT(*) FROM hallways {where}", params).fetchone()[0]
+        page = _records(
+            conn.execute(
+                f"SELECT record FROM hallways {where}"
+                " ORDER BY CAST(COALESCE(co_occurrence_count, 0) AS INTEGER) DESC, rowid"
+                " LIMIT ? OFFSET ?",
+                (*params, max(0, limit), max(0, offset)),
+            )
+        )
+    return page, total
+
+
+def entity_strength_records(config=None) -> list[dict]:
+    """The hallway records entity tunnels are computed from, reduced to what they read.
+
+    ``palace_graph.entity_tunnel_candidates`` reads, per wing, each entity's
+    strongest ``co_occurrence_count`` and nothing else, so this returns one
+    ``{"wing", "entity_a", "co_occurrence_count"}`` record per (wing, entity)
+    rather than every hallway of the palace. An entity whose count is missing
+    on some of its records also gets a record without a count, which the
+    candidates read as the minimum, exactly as they read the full records.
+    Before the first write has imported ``hallways.json``, the full records.
+    """
+    conn = _reader(config)
+    if conn is None:
+        return list_hallways(config=config)
+    with contextlib.closing(conn):
+        rows = conn.execute(
+            "SELECT wing, entity, MAX(CAST(n AS INTEGER)), MAX(n IS NULL) FROM ("
+            " SELECT wing, entity_a AS entity, co_occurrence_count AS n FROM hallways"
+            " UNION ALL"
+            " SELECT wing, entity_b, co_occurrence_count FROM hallways"
+            ") GROUP BY wing, entity"
+        ).fetchall()
+    records: list[dict] = []
+    for wing, entity, strongest, missing in rows:
+        if strongest is not None:
+            records.append({"wing": wing, "entity_a": entity, "co_occurrence_count": strongest})
+        if missing:
+            records.append({"wing": wing, "entity_a": entity})
+    return records
 
 
 def prune_spelling_hallways(config=None, apply: bool = False) -> dict:
@@ -993,10 +1315,11 @@ def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
 
 def delete_hallway(hallway_id: str, config=None) -> bool:
     """Remove one hallway record by id. Returns True if a record was removed."""
-    with _hallway_file_lock(config):
-        hallways = _load_hallways_for_write(config)
-        filtered = [h for h in hallways if h.get("id") != hallway_id]
-        if len(filtered) == len(hallways):
-            return False
-        _save_hallways(filtered, config)
-    return True
+    with _hallway_file_lock(config), _writing(config) as conn:
+        return conn.execute("DELETE FROM hallways WHERE id = ?", (hallway_id,)).rowcount > 0
+
+
+def drop_wing_hallways(wing: str, config=None) -> int:
+    """Remove every hallway record of ``wing``. Returns how many were removed."""
+    with _hallway_file_lock(config), _writing(config) as conn:
+        return conn.execute("DELETE FROM hallways WHERE wing = ?", (wing,)).rowcount
