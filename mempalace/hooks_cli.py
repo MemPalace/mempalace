@@ -810,6 +810,8 @@ def _mine_sync():
     for mine_dir, mode in targets:
         try:
             if routing.use_daemon:
+                from .daemon import DaemonWaitTimeout
+
                 try:
                     job = _submit_daemon_job(
                         "mine",
@@ -826,6 +828,9 @@ def _mine_sync():
                         _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
                     elif job.get("state") != "succeeded" or not result.get("success", True):
                         _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
+                except DaemonWaitTimeout as exc:
+                    # Accepted, and the daemon still runs it: not a failure.
+                    _log(f"Daemon sync mine still {exc.state}: job {exc.job_id}")
                 except Exception as exc:
                     # Daemon accepted context — don't fall back (would double-mine).
                     _log(f"Daemon sync mine submission failed: {exc}")
@@ -1187,6 +1192,8 @@ def _save_diary_direct(
 
     try:
         if routing.use_daemon:
+            from .daemon import DaemonWaitTimeout
+
             try:
                 job = _submit_daemon_job(
                     "diary_write",
@@ -1200,6 +1207,13 @@ def _save_diary_direct(
                     wait=True,
                     timeout=30,
                 )
+            except DaemonWaitTimeout as exc:
+                # The daemon runs one job at a time, so a checkpoint submitted
+                # while a mine from an earlier Stop hook still runs waits behind
+                # it. It is filed once that mine ends: not a failure, and not a
+                # reason to write it here as well.
+                _log(f"Daemon diary checkpoint still {exc.state}: job {exc.job_id}")
+                return {"drawers_filed": 0, "messages_folded": 0}
             except Exception as exc:
                 # Daemon accepted context — don't fall back (would double-write).
                 _log(f"Daemon diary checkpoint failed: {exc}")

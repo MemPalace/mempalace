@@ -714,6 +714,43 @@ def test_wait_returns_a_lock_deferred_job_instead_of_waiting_out_the_holder(tmp_
         _stop_server(client, thread, holders)
 
 
+def test_wait_timeout_names_the_job_it_gave_up_on_and_its_state(tmp_path, monkeypatch):
+    """A wait that runs out does not end the job: the daemon keeps it and runs it
+    in turn. The timeout says which job it gave up on and where that job was, so
+    a hook can report a checkpoint queued behind a running mine as pending
+    instead of failed (#2757). It is still a DaemonError for every other caller."""
+    release = threading.Event()
+
+    def fake_execute(kind, payload):
+        release.wait(30)
+        return {"success": True, "exit_code": 0}
+
+    client, thread, palace, holders = _start_server(tmp_path, monkeypatch, fake_execute)
+    try:
+        mine = client.submit("mine", {"source": "src"})
+        deadline = time.monotonic() + 5
+        while client.get_job(mine["id"])["state"] != "running" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        checkpoint = client.submit("diary_write", {"entry": "e"}, priority=10)
+
+        with pytest.raises(daemon.DaemonWaitTimeout) as queued:
+            client.wait(checkpoint["id"], timeout=0.3)
+        assert isinstance(queued.value, daemon.DaemonError)
+        assert queued.value.job_id == checkpoint["id"]
+        assert queued.value.state == "queued"
+        assert str(queued.value) == f"timed out waiting for job {checkpoint['id']}"
+
+        with pytest.raises(daemon.DaemonWaitTimeout) as running:
+            client.wait(mine["id"], timeout=0.3)
+        assert running.value.state == "running"
+
+        release.set()
+        assert client.wait(checkpoint["id"], timeout=10)["state"] == "succeeded"
+    finally:
+        release.set()
+        _stop_server(client, thread, holders)
+
+
 def test_job_deferred_by_lock_ignores_ordinary_queued_and_failed_jobs(tmp_path, monkeypatch):
     """The predicate must not mistake a job merely awaiting its turn -- or a
     genuinely failed one -- for a lock deferral, or the CLI would bail out of a
