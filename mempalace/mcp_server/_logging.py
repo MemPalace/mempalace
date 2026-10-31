@@ -90,7 +90,9 @@ def _init_logging() -> None:
             file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
             # Pin the format: the embedded path never calls basicConfig, so
             # both paths set it here instead of relying on logging's default.
-            file_handler.setFormatter(logging.Formatter("%(message)s"))
+            # The file stream adds a timestamp + level so an appended line can
+            # be correlated across restarts; stderr stays bare (host-formatted).
+            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             # File is a mempalace-only diagnostic stream; keep host / library
             # records out so it stays useful when the handler rides on a
             # host-owned root logger.
