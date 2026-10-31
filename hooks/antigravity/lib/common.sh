@@ -243,9 +243,9 @@ except Exception:
 #
 #   line 1: __MEMPAL_PARSE_OK__       — sentinel (parse success marker)
 #   line 2: conversationId            — sanitized to [A-Za-z0-9._-]
-#   line 3: transcriptPath            — sanitized to a safe path charset
-#   line 4: workspacePath             — workspacePaths[0], sanitized
-#   line 5: artifactDirectoryPath     — sanitized
+#   line 3: transcriptPath            — ASCII control chars stripped
+#   line 4: workspacePath             — workspacePaths[0], ASCII control chars stripped
+#   line 5: artifactDirectoryPath     — ASCII control chars stripped
 #   line 6: executionNum              — integer, default 0
 #   line 7: terminationReason         — sanitized to [a-z_]
 #   line 8: fullyIdle                 — "True" or "False" (string)
@@ -266,8 +266,10 @@ mempal_parse_stdin() {
     local input="$1"
     (
         umask 077
-        printf '%s' "$input" | "$MEMPAL_PYTHON_BIN" -c "
-import sys, json, re
+        printf '%s' "$input" | PYTHONSAFEPATH=1 "$MEMPAL_PYTHON_BIN" -c "
+import sys
+if sys.path and sys.path[0] == '': del sys.path[0]
+import json, re
 
 # IMPORTANT: do NOT wrap json.load in a try/except. If the input is
 # not valid JSON we want Python to exit non-zero BEFORE printing the
@@ -279,8 +281,11 @@ import sys, json, re
 # antigravity_last_python_err.log so operators can debug.
 data = json.load(sys.stdin)
 
-def safe(s, allowed=r'[^a-zA-Z0-9_/.\-~]'):
-    return re.sub(allowed, '', str(s))
+def safe(s):
+    return ''.join(
+        c for c in str(s or '')
+        if ord(c) >= 32 and ord(c) != 127 and not (0xD800 <= ord(c) <= 0xDFFF)
+    )
 
 def safe_id(s):
     return re.sub(r'[^a-zA-Z0-9._-]', '', str(s))
@@ -364,15 +369,19 @@ mempal_infer_wing() {
         printf 'sessions'
         return 0
     fi
-    # Strip trailing slashes
-    while [ "${workspace}" != "${workspace%/}" ]; do
+    # Strip trailing slashes and backslashes
+    while [ "${workspace}" != "${workspace%/}" ] || [ "${workspace}" != "${workspace%\\}" ]; do
         workspace="${workspace%/}"
+        workspace="${workspace%\\}"
     done
     if [ -z "$workspace" ]; then
         printf 'sessions'
         return 0
     fi
     local leaf="${workspace##*/}"
+    case "$leaf" in
+        *\\*) leaf="${leaf##*\\}" ;;
+    esac
     if [ -z "$leaf" ]; then
         printf 'sessions'
         return 0
@@ -384,8 +393,14 @@ mempal_infer_wing() {
     if printf '%s' "$leaf" | LC_ALL=C grep -q '[^ -~]'; then
         slug=$(PYTHONSAFEPATH=1 "$MEMPAL_PYTHON_BIN" -c 'import sys
 if sys.path and sys.path[0] == "": del sys.path[0]
-from mempalace.config import normalize_wing_name
-slug = normalize_wing_name(sys.argv[1])
+try:
+    from mempalace.config import normalize_wing_name
+    slug = normalize_wing_name(sys.argv[1])
+except Exception:
+    import re
+    slug = sys.argv[1].lower().replace(" ", "_").replace("-", "_")
+    slug = re.sub(r"[^\w.\x27]+", "_", slug)
+    slug = re.sub(r"\.{2,}", ".", slug)[:120].strip("_.\x27")
 sys.stdout.buffer.write(slug.encode("utf-8", "surrogateescape"))' "$leaf" 2>/dev/null) || slug=""
     fi
     # tr and sed with bracket ranges stay bash 3.2 safe; ${var,,} is 4+.

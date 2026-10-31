@@ -11,6 +11,7 @@ from mempalace.config import (
     connect_sqlite_read,
     normalize_wing_name,
     sanitize_iso_temporal,
+    sanitize_kg_lookup,
     sanitize_kg_value,
     sanitize_name,
     sqlite_read_uri,
@@ -622,6 +623,41 @@ def test_kg_value_rejects_null_bytes():
 def test_kg_value_rejects_over_length():
     with pytest.raises(ValueError):
         sanitize_kg_value("a" * 129)
+
+
+# --- sanitize_kg_lookup ---
+
+
+def test_kg_lookup_accepts_over_length():
+    assert sanitize_kg_lookup("a" * 200) == "a" * 200
+
+
+def test_kg_lookup_strips_whitespace():
+    assert sanitize_kg_lookup("  hello  ") == "hello"
+
+
+def test_kg_lookup_rejects_empty():
+    with pytest.raises(ValueError):
+        sanitize_kg_lookup("")
+
+
+def test_kg_lookup_rejects_whitespace_only():
+    with pytest.raises(ValueError):
+        sanitize_kg_lookup("   ")
+
+
+def test_kg_lookup_rejects_non_string():
+    with pytest.raises(ValueError):
+        sanitize_kg_lookup(None)
+
+
+def test_kg_lookup_rejects_null_bytes():
+    with pytest.raises(ValueError, match="field contains null bytes"):
+        sanitize_kg_lookup("hello\x00world", "field")
+
+
+def test_kg_lookup_strips_lone_surrogates():
+    assert sanitize_kg_lookup("Alice\udc95") == "Alice\ufffd"
 
 
 # --- sanitize_iso_temporal (date-only inputs) ---
