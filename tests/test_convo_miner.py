@@ -27,6 +27,44 @@ from mempalace.palace import (
 _PREFETCH_SCOPE_THRESHOLD = palace._PREFETCH_SCOPE_THRESHOLD
 
 
+@pytest.mark.parametrize("earlier", ["2026-09-09T10:00:00+09:00", "not-a-date"])
+def test_mine_convos_stores_latest_valid_authored_time(tmp_path, earlier):
+    transcript = tmp_path / "session.jsonl"
+    latest = "2026-09-09T02:00:00Z"
+    transcript.write_text(
+        "\n".join(
+            json.dumps(record)
+            for record in [
+                {
+                    "type": "user",
+                    "timestamp": earlier,
+                    "message": {"role": "user", "content": "Which database did we choose?"},
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": latest,
+                    "message": {
+                        "role": "assistant",
+                        "content": "We chose SQLite for local storage.",
+                    },
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(str(transcript), palace_path, wing="test")
+
+    collection = palace.get_collection(palace_path)
+    stored = collection.get(
+        where={"source_file": str(transcript.resolve())}, include=["documents", "metadatas"]
+    )
+    assert stored["ids"]
+    assert all(meta["authored_at"] == latest for meta in stored["metadatas"])
+    assert "We chose SQLite for local storage." in "\n".join(stored["documents"])
+
+
 def test_convo_mining():
     tmpdir = tempfile.mkdtemp()
     with open(os.path.join(tmpdir, "chat.txt"), "w") as f:
