@@ -763,6 +763,17 @@ requires Python 3.10.
 - [#2859](https://github.com/MemPalace/mempalace/pull/2859) chore(release): 3.12.0
 - [#2861](https://github.com/MemPalace/mempalace/pull/2861) fix(mine): keep --palace and media options on daemon-routed adapter mines
 
+### Added
+
+- **`kg_query` and `KnowledgeGraph.query_entity` return each fact's triple `id` and
+  its `source_file`.** The `id` is the one `add_triple`, `kg_add` and `kg_supersede`
+  return, so a caller can match a fact it reads back to the id a write returned for
+  it, including when several rows share a subject, predicate and object and two of
+  them carry identical dates. `source_file` was stored on write but dropped on read.
+  On `kg_query` facts both keys are present on outgoing and incoming facts, including
+  those found through the candidate-name fallback, and no existing key changes.
+  `kg_timeline` and `query_relationship` facts gain the `id`. (#2184)
+
 ---
 
 ## [3.11.0] — 2026-10-12
