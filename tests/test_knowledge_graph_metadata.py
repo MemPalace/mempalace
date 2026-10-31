@@ -144,10 +144,20 @@ class TestQueryEntityTripleIdentity:
 
     def test_rows_with_identical_dates_keep_distinct_ids(self, kg):
         first = kg.add_triple(
-            "Alice", "works_at", "NewCo", valid_from="2020-01-01", valid_to="2021-01-01"
+            "Alice",
+            "works_at",
+            "NewCo",
+            valid_from="2020-01-01",
+            valid_to="2021-01-01",
+            source_file="a.md",
         )
         second = kg.add_triple(
-            "Alice", "works_at", "NewCo", valid_from="2020-01-01", valid_to="2021-01-01"
+            "Alice",
+            "works_at",
+            "NewCo",
+            valid_from="2020-01-01",
+            valid_to="2021-01-01",
+            source_file="b.md",
         )
 
         facts = kg.query_entity("Alice", direction="outgoing")
