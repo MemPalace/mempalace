@@ -366,17 +366,12 @@ def apply_split(
 
     hallways_dropped = 0
     if moved or resuming:
-        from .hallways import _hallway_file_lock, _load_hallways, _save_hallways
+        from .hallways import drop_wing_hallways
 
-        # Under the hallway-file lock: the palace lock this command holds does
-        # not serialize with a concurrent `hallways --rebuild` or
-        # `--prune-spellings`, which take only the per-sidecar lock.
-        with _hallway_file_lock(config):
-            records = _load_hallways(config)
-            kept = [h for h in records if not (isinstance(h, dict) and h.get("wing") == wing)]
-            hallways_dropped = len(records) - len(kept)
-            if hallways_dropped:
-                _save_hallways(kept, config)
+        # drop_wing_hallways takes the hallway lock: the palace lock this
+        # command holds does not serialize with a concurrent
+        # `hallways --rebuild` or `--prune-spellings`, which take only that one.
+        hallways_dropped = drop_wing_hallways(wing, config)
 
     return {
         "moved": moved,
