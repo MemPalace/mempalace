@@ -616,6 +616,172 @@ def test_scan_project_skip_dirs_still_apply_without_override():
         shutil.rmtree(tmpdir)
 
 
+def _write_repo_exclude(project_root, *lines):
+    """Write a ``.git/info/exclude`` file with the given gitignore-style lines."""
+    exclude_path = project_root / ".git" / "info" / "exclude"
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    exclude_path.write_text(
+        "".join(line + "\n" if not line.endswith("\n") else line for line in lines),
+        encoding="utf-8",
+    )
+
+
+def test_scan_project_honours_repo_git_info_exclude_for_worktree():
+    # #2599: a worktree listed in .git/info/exclude must NOT be mined as a
+    # second copy of the source tree. We use `wt-a/` as the worktree dir name
+    # (NOT in SKIP_DIRS and NOT under .claude/) so the RED evidence is
+    # attributed specifically to the .git/info/exclude matcher, not to
+    # should_skip_dir. Before the fix this FAILS (wt-a/ is scanned in);
+    # after the fix it PASSES (the repo-level exclude matcher prunes it).
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "src" / "main.py", "print('main')\n" * 20)
+        # A worktree copy lives outside the .claude layout and not in
+        # SKIP_DIRS, so only the exclude matcher can drop it.
+        write_file(project_root / "wt-a" / "src" / "main.py", "print('worktree main')\n" * 20)
+        # User kept the checked-in .gitignore pristine; the local exclusion lives
+        # in .git/info/exclude (anchored at the project root).
+        _write_repo_exclude(
+            project_root, "# worktrees are local copies, never mine them\n", "wt-a/\n"
+        )
+
+        assert scanned_files(project_root) == ["src/main.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_honours_repo_git_info_exclude_even_without_dot_gitignore():
+    # The exclude file must be honoured in isolation — no .gitignore present at
+    # all. This isolates the .git/info/exclude code path from .gitignore.
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+
+        write_file(project_root / "app.py", "print('app')\n" * 20)
+        write_file(project_root / "tmp_build" / "artifact.py", "print('build')\n" * 20)
+        _write_repo_exclude(project_root, "tmp_build/\n")
+
+        assert scanned_files(project_root) == ["app.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+@pytest.mark.parametrize("relative_gitdir", [False, True])
+@pytest.mark.parametrize("relative_common", [False, True])
+def test_scan_project_reads_linked_worktree_common_excludes(
+    tmp_path, relative_gitdir, relative_common
+):
+    project = (tmp_path / "linked").resolve()
+    common = (tmp_path / "main" / ".git").resolve()
+    admin = common / "worktrees" / "linked"
+    project.mkdir()
+    admin.mkdir(parents=True)
+    (common / "info").mkdir()
+    (common / "info" / "exclude").write_text("/local-only/\n", encoding="utf-8")
+    gitdir = os.path.relpath(admin, project) if relative_gitdir else str(admin)
+    commondir = os.path.relpath(common, admin) if relative_common else str(common)
+    (project / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    (admin / "commondir").write_text(commondir + "\n", encoding="utf-8")
+    write_file(project / "main.py", "print('source')\n" * 10)
+    write_file(project / "local-only" / "copy.py", "print('duplicate')\n" * 10)
+
+    assert scanned_files(project) == ["main.py"]
+    assert scanned_files(project, respect_gitignore=False) == ["local-only/copy.py", "main.py"]
+
+
+def test_root_gitignore_negation_overrides_common_exclude(tmp_path):
+    project = tmp_path.resolve()
+    _write_repo_exclude(project, "*.md")
+    write_file(project / ".gitignore", "!keep.md\n")
+    write_file(project / "keep.md", "keep this source\n" * 10)
+    write_file(project / "omit.md", "local-only source\n" * 10)
+    assert scanned_files(project) == ["keep.md"]
+
+
+def test_repo_exclude_does_not_reinclude_when_dir_pruned_by_skip_dirs():
+    # Even if should_skip_dir already prunes .worktrees before gitignore runs,
+    # the .git/info/exclude matcher agrees — both mechanisms independently drop
+    # the worktree. No double-emit either way.
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        write_file(project_root / "main.py", "print('main')\n" * 20)
+        write_file(project_root / ".worktrees" / "w" / "main.py", "print('wt')\n" * 20)
+        _write_repo_exclude(project_root, ".worktrees/\n")
+        assert scanned_files(project_root) == ["main.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_skips_dot_worktrees_without_gitignore():
+    # .worktrees/ is a known generated location — SKIP_DIRS prunes it even with
+    # respect_gitignore disabled (no .gitignore needed).
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        write_file(project_root / "main.py", "print('main')\n" * 20)
+        write_file(project_root / ".worktrees" / "proj" / "main.py", "print('wt')\n" * 20)
+
+        assert scanned_files(project_root, respect_gitignore=False) == ["main.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_skips_claude_worktrees_layout():
+    # #2599: the Claude Code worktree layout <project>/.claude/worktrees/<wt>
+    # must not be mined. A bare name-based skip (e.g. "skip any dir named
+    # worktrees") would wrongly drop a genuine src/worktrees package too — this
+    # test pins the layout-specific behaviour.
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        write_file(project_root / "main.py", "print('main')\n" * 20)
+        write_file(
+            project_root / ".claude" / "worktrees" / "wt-a" / "src" / "main.py",
+            "print('wt')\n" * 20,
+        )
+
+        assert scanned_files(project_root, respect_gitignore=False) == ["main.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_does_not_over_skip_legit_worktrees_package():
+    # Guard against over-pruning: a real Python package literally named
+    # worktrees that is NOT under .claude must still be mined.
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        write_file(project_root / "main.py", "print('main')\n" * 20)
+        write_file(project_root / "src" / "worktrees" / "pool.py", "def pool():\n    return 1\n")
+
+        assert scanned_files(project_root, respect_gitignore=False) == [
+            "main.py",
+            "src/worktrees/pool.py",
+        ]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_scan_project_include_override_beats_dot_worktrees_skip():
+    # An explicit include_ignored override still resurfaces a worktree the user
+    # wants back — force-include is the escape hatch, same as other skip dirs.
+    tmpdir = tempfile.mkdtemp()
+    try:
+        project_root = Path(tmpdir).resolve()
+        write_file(project_root / ".worktrees" / "proj" / "main.py", "print('wt')\n" * 20)
+
+        assert scanned_files(
+            project_root,
+            respect_gitignore=False,
+            include_ignored=[".worktrees"],
+        ) == [".worktrees/proj/main.py"]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
 @pytest.mark.skipif(
     sys.platform == "win32",
     reason="symlink creation requires elevated privileges on Windows",
@@ -842,6 +1008,72 @@ def test_entity_metadata_matches_known_names_case_insensitively(monkeypatch):
     matched_mixed = set(result_mixed.split(";")) if result_mixed else set()
     assert "Aya" in matched_mixed
     assert "Lumi" in matched_mixed
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "expected"),
+    [
+        ("资源", "提升资源效率", True),
+        ("会議", "今日会議があります", True),
+        ("회의", "회의에서 결정", True),
+        ("さくら", "さくらさん", True),
+        ("サクラ", "サクラさん", True),
+        ("𠮷", "𠮷さん", True),
+        ("コンピューター", "コンピューターを使う", True),
+        ("佐々", "佐々さん", True),
+        ("ｻｸﾗ", "ｻｸﾗさん", True),
+        ("ｺﾝﾋﾟｭｰﾀｰ", "ｺﾝﾋﾟｭｰﾀｰを使う", True),
+        ("セカ\u3099", "セカ\u3099を使う", True),
+        ("ハ\u309a", "ハ\u309aを使う", True),
+        ("\U00031350", "\U00031350を使う", True),
+        ("渡邉\U000e0100", "渡邉\U000e0100さん", True),
+        ("渡邉\ufe00", "渡邉\ufe00さん", True),
+        ("Aya\U000e0100", "Aya\U000e0100la", False),
+        ("한\u302e", "한\u302e에서", True),
+        ("한\u302f", "한\u302f에서", True),
+        ("ｻｸﾗ\uff65", "ｻｸﾗ\uff65さん", True),
+        ("Aya", "AYA", True),
+        ("Aya", "Ayala", False),
+        ("Мир", "Мирный", False),
+        ("ABC研究所", "ABC研究所で", True),
+        ("ABC研究所", "XABC研究所で", False),
+        ("研究所ABC", "新研究所ABC", True),
+        ("研究所ABC", "新研究所ABCx", False),
+        ("ABC研究所XYZ", "xABC研究所XYZ", False),
+        ("A+B研究所", "A+B研究所で", True),
+        ("A+B研究所", "AAAB研究所で", False),
+    ],
+)
+def test_known_entity_script_boundaries(monkeypatch, name, content, expected):
+    from mempalace import miner
+
+    monkeypatch.setattr(miner, "_load_known_entities", lambda: frozenset({name}))
+
+    entities = miner._extract_entities_for_metadata(content).split(";")
+
+    assert (name in entities) is expected
+
+
+def test_mine_stores_registered_cjk_entities(tmp_path, monkeypatch):
+    from mempalace import miner, palace
+
+    monkeypatch.setattr(miner, "_load_known_entities", lambda: frozenset({"资源", "회의"}))
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "notes.txt"
+    source.write_text(
+        "提升资源效率，控制风险。회의에서 결정한 내용을 보존합니다。\n" * 5, encoding="utf-8"
+    )
+    palace_path = str(tmp_path / "palace")
+
+    (project / "mempalace.yaml").write_text("wing: test\nrooms: []\n", encoding="utf-8")
+    mine(str(project), palace_path)
+
+    rows = palace.get_collection(palace_path).get(
+        where={"source_file": str(source.resolve())}, include=["metadatas"]
+    )
+    assert rows["ids"]
+    assert all({"资源", "회의"} <= set(meta["entities"].split(";")) for meta in rows["metadatas"])
 
 
 def test_scan_project_skips_oversized_files(tmp_path, capsys, monkeypatch):

@@ -1070,7 +1070,27 @@ def test_wing_from_transcript_path_fallback_collapses_worktree():
     assert _wing_from_transcript_path(non_worktree_path) == "gsd_core"
 
 
+def test_wing_from_transcript_path_fallback_collapses_dot_worktrees():
+    """``<project>/.worktrees/<wt>`` flattens to ``--worktrees-<wt>``; before the
+    fix the fallback kept the worktree slug, so every branch got its own wing."""
+    worktree_path = "/Users/u/.claude/projects/-Users-u-dev-webui-app--worktrees-737-list-table-drop-unused/x.jsonl"
+    assert _wing_from_transcript_path(worktree_path) == "webui_app"
+
+
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
+
+
+def test_wing_from_transcript_path_cwd_collapses_dot_worktrees(tmp_path):
+    """A cwd inside ``<project>/.worktrees/<wt>`` files under <project>, same as
+    ``.claude/worktrees/``."""
+    project_dir = tmp_path / "-Users-me-dev-webui-app--worktrees-42-fix-login"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/dev/webui-app/.worktrees/42-fix-login","content":"hi"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "webui_app"
 
 
 def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):
@@ -1170,6 +1190,45 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
         encoding="utf-8",
     )
     assert _wing_from_transcript_path(str(transcript)) == "proper_name"
+
+
+def test_wing_from_transcript_path_uses_codex_session_meta_payload_cwd(tmp_path):
+    """A Codex rollout records cwd only on its session_meta payload; that is
+    the project, not the date-bucketed ``sessions/YYYY/MM/DD`` folder."""
+    day_dir = tmp_path / ".codex" / "sessions" / "2026" / "10" / "28"
+    day_dir.mkdir(parents=True)
+    transcript = day_dir / "rollout-2026-10-28T21-13-25-abc.jsonl"
+    transcript.write_text(
+        '{"type":"session_meta","payload":{"id":"abc","cwd":"/home/me/git/codex-project"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "codex_project"
+
+
+def test_wing_from_transcript_path_top_level_cwd_wins_over_payload(tmp_path):
+    """A top-level cwd keeps precedence on a line that also has a payload."""
+    project_dir = tmp_path / "-Users-me-x"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"x","cwd":"/Users/me/git/top-level","payload":{"cwd":"/Users/me/git/nested"}}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "top_level"
+
+
+def test_wing_from_transcript_path_ignores_non_string_payload_cwd(tmp_path):
+    """A non-string payload cwd is skipped like a non-string top-level one."""
+    project_dir = tmp_path / "-Users-me-x"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"session_meta","payload":{"cwd":42}}\n'
+        '{"type":"session_meta","payload":{"cwd":"/Users/me/git/later-name"}}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "later_name"
 
 
 # --- _wing_slug: special-character project dirs (e.g. +project) ---

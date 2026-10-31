@@ -806,6 +806,8 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         underlying_name = _classify_underlying_tool(tool_name, arguments)
         if not underlying_name:
             return _unknown_target_error(req_id)
+        # A writer lease the preflight takes lasts this call only (see call_tool).
+        lease_held_before = mcp_server._MCP_WRITER_LOCK_CM is not None
         refusal = mcp_server._mcp_tool_preflight_refusal(req_id, underlying_name)
         if refusal is not None:
             return refusal
@@ -832,6 +834,8 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return mcp_server._internal_tool_error(
                 req_id, tool_name, e, include_message=isinstance(e, ValueError)
             )
+        finally:
+            mcp_server._end_call_writer_lease(lease_held_before)
 
     if req_id is None:
         return None
