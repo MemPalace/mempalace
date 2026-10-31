@@ -1054,17 +1054,27 @@ def _diary_write_locked(tool_diary_write, **kwargs) -> dict:
     through an MCP round trip, so nothing has promoted this process to writer.
     On ``sqlite_exact``/``rust_exact`` ``_get_collection`` then opens the
     palace read-only and the write fails with "attempt to write a readonly
-    database" (issue #2884). Taking the same per-palace writer lease a real
-    stdio MCP server takes before mutating lets the collection open read/write.
+    database". Taking the same per-palace writer lease a real stdio MCP
+    server takes before mutating lets the collection open read/write.
     """
-    from .mcp_server import _acquire_mcp_writer_lock, _release_mcp_writer_lock
+    from . import mcp_server as mcp
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
 
-    acquired, _reason = _acquire_mcp_writer_lock()
+    already_owned = mcp._MCP_WRITER_LOCK_CM is not None
+    acquired, reason = mcp._acquire_mcp_writer_lock()
+    if not acquired:
+        if not mcp._MCP_WRITER_LOCK_FAILED:
+            return {
+                "success": False,
+                "error": reason,
+                "error_class": LOCK_REFUSAL_ERROR_CLASS,
+            }
+        return {"success": False, "error": reason}
     try:
         result = tool_diary_write(**kwargs)
     finally:
-        if acquired:
-            _release_mcp_writer_lock()
+        if not already_owned:
+            mcp._release_mcp_writer_lock()
     return result if isinstance(result, dict) else {}
 
 
