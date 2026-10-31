@@ -30,13 +30,13 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime, timezone
 
 # Share miner's mtime-cached registry loader so we don't double-read
 # ~/.mempalace/known_entities.json on every check_text call.
 from .miner import _load_known_entities_raw
+from .timeutil import utc_now
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 
 # Narrow detection patterns — parse "X is Y's Z" and "X's Z is Y".
@@ -259,7 +259,7 @@ def _kg_issues(kg, claims: list) -> list:
 
         # Stale fact: exact match on (subject, predicate, object) but KG
         # closed the window in the past.
-        now_iso = datetime.now(timezone.utc).date().isoformat()
+        now_iso = utc_now().date().isoformat()
         for fact in facts:
             if fact.get("current"):
                 continue

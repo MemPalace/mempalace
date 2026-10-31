@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .timeutil import utc_now_iso
+
 logger = logging.getLogger(__name__)
 
 _MEDIA_MODALITY = {"image": "vision", "audio": "audio", "video": "vision"}
@@ -302,7 +304,7 @@ def store_media_asset(asset: MediaAsset, palace_path: str, *, drawer_collection=
             f"failed to embed {asset.media_type} asset {path.name}: {exc}"
         ) from exc
 
-    indexed_at = datetime.now(timezone.utc).isoformat()
+    indexed_at = utc_now_iso()
     metadata = asset.metadata()
     metadata.update(
         {

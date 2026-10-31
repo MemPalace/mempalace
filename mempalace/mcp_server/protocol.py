@@ -965,6 +965,9 @@ def call_tool(req_id, params: dict, internal: bool = False):
     except ToolArgumentError as e:
         return _json_rpc_error(req_id, -32602, f"Invalid params for tool {tool_name}: {e}"), None
     tool_args.pop("wait_for_previous", None)
+    # A lease this call takes is released when it ends; one already held
+    # (writable HTTP, an embedding host) is left alone.
+    lease_held_before = _MCP_WRITER_LOCK_CM is not None
     preflight_error = _mcp_tool_preflight_refusal(req_id, tool_name)
     if preflight_error is not None:
         return preflight_error, None
@@ -1011,6 +1014,8 @@ def call_tool(req_id, params: dict, internal: bool = False):
     except Exception as exc:
         expose = internal or isinstance(exc, ValueError)
         return _internal_tool_error(req_id, tool_name, exc, include_message=expose), None
+    finally:
+        _end_call_writer_lease(lease_held_before)
 
 
 def handle_request(request):

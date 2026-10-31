@@ -24,10 +24,7 @@ from mempalace.backends import (
 )
 from mempalace.backends._filters import matches_where
 from mempalace.backends._remote_common import as_vector_array
-from mempalace.backends.base import (
-    UnsupportedCapabilityError,
-    recency_sort_key as _recency_sort_key,
-)
+from mempalace.backends.base import UnsupportedCapabilityError
 from mempalace.backends.pgvector import (
     PgVectorBackend,
     _PgVectorClient,
@@ -36,6 +33,18 @@ from mempalace.backends.pgvector import (
     _shared_namespace_slug,
     _vector_distance,
 )
+
+
+def _utc_form(value) -> bool:
+    """The real backend's UTC-suffix predicate on ``metadata->>field``."""
+    return isinstance(value, str) and (value.endswith("+00:00") or value[-1:] in ("Z", "z"))
+
+
+def _sql_text_key(value) -> tuple:
+    """``metadata->>field DESC NULLS LAST`` emulated: text order, missing last."""
+    if not isinstance(value, str) or not value:
+        return (0, "")
+    return (1, value)
 
 
 class _FakePgVectorClient:
@@ -116,6 +125,7 @@ class _FakePgVectorClient:
         limit=None,
         offset=None,
         order_field=None,
+        order_form=None,
     ):
         self.scroll_calls.append(
             {
@@ -124,6 +134,7 @@ class _FakePgVectorClient:
                 "offset": offset,
                 "with_document": with_document,
                 "order_field": order_field,
+                **({"order_form": order_form} if order_form is not None else {}),
             }
         )
         if ids is not None:
@@ -134,13 +145,20 @@ class _FakePgVectorClient:
         else:
             rows = self._filtered(table, where)
         if order_field is not None:
+            if order_form is not None:
+                rows = [
+                    row
+                    for row in rows
+                    if _utc_form((row.get("metadata") or {}).get(order_field))
+                    == (order_form == "utc")
+                ]
             # Mirror the real backend: ORDER BY metadata->>field DESC NULLS
             # LAST, id — then LIMIT/OFFSET. Sorting by id first and then
-            # stable-sorting by the recency key reproduces that tiebreak.
+            # stable-sorting by the text reproduces that tiebreak.
             rows = sorted(rows, key=lambda row: row["id"])
             rows = sorted(
                 rows,
-                key=lambda row: _recency_sort_key(row.get("metadata") or {}, order_field),
+                key=lambda row: _sql_text_key((row.get("metadata") or {}).get(order_field)),
                 reverse=True,
             )
             if offset:
@@ -878,7 +896,8 @@ def test_pgvector_get_recent_orders_newest_first_in_sql(tmp_path, fake_pgvector)
 
     assert page.ids == ["new", "middle"]
     assert page.documents == ["newest drawer", "middle drawer"]
-    # One scan, ordered and limited by the database — not a full fetch + slice.
+    # One scan per timestamp form, ordered and limited by the database — not
+    # a full fetch + slice.
     assert client.scroll_calls == [
         {
             "where": None,
@@ -886,7 +905,16 @@ def test_pgvector_get_recent_orders_newest_first_in_sql(tmp_path, fake_pgvector)
             "offset": None,
             "with_document": True,
             "order_field": "filed_at",
-        }
+            "order_form": "utc",
+        },
+        {
+            "where": None,
+            "limit": 2,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "other",
+        },
     ]
 
 
@@ -894,6 +922,36 @@ def test_pgvector_get_recent_sorts_missing_field_last(tmp_path, fake_pgvector):
     _backend, col = _collection(tmp_path)
     _fill_for_recency(col)
     assert col.get_recent(limit=10).ids == ["new", "middle", "old", "undated"]
+
+
+@pytest.mark.parametrize("where", [None, {"$or": [{"wing": "x"}, {"wing": "y"}]}])
+def test_pgvector_get_recent_merges_naive_local_and_utc_by_instant(
+    tmp_path, fake_pgvector, monkeypatch, where
+):
+    """In UTC+9 an older writer's naive 10:00-10:40 values sort above a UTC
+    value 8h10m newer as text; the newest record must still come first."""
+    from datetime import timedelta, timezone
+
+    from mempalace import timeutil
+
+    monkeypatch.setattr(timeutil, "_LOCAL_TZ", timezone(timedelta(hours=9)))
+    _backend, col = _collection(tmp_path)
+    ids = [f"legacy_{i}" for i in range(5)] + ["utc_new"]
+    stamps = [f"2026-10-02T10:{i}0:00" for i in range(5)] + ["2026-10-02T09:50:00.000000+00:00"]
+    col.add(
+        ids=ids,
+        documents=[f"drawer {i}" for i in ids],
+        metadatas=[{"wing": "x", "filed_at": stamp} for stamp in stamps],
+        embeddings=[[1, 0]] * len(ids),
+    )
+
+    assert col.get_recent(limit=5, where=where).ids == [
+        "utc_new",
+        "legacy_4",
+        "legacy_3",
+        "legacy_2",
+        "legacy_1",
+    ]
 
 
 def test_pgvector_get_recent_pushes_down_equality_filter(tmp_path, fake_pgvector):
@@ -912,7 +970,16 @@ def test_pgvector_get_recent_pushes_down_equality_filter(tmp_path, fake_pgvector
             "offset": None,
             "with_document": True,
             "order_field": "filed_at",
-        }
+            "order_form": "utc",
+        },
+        {
+            "where": {"wing": "x"},
+            "limit": 10,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "other",
+        },
     ]
 
 
@@ -927,7 +994,7 @@ def test_pgvector_get_recent_local_filter_still_orders(tmp_path, fake_pgvector):
 
     assert page.ids == ["new", "middle"]
     # The predicate cannot ride along, but the ORDER BY and the LIMIT still
-    # do: one bounded page, not a fetch of the whole table.
+    # do: one bounded page per timestamp form, not a fetch of the whole table.
     assert client.scroll_calls == [
         {
             "where": None,
@@ -935,7 +1002,16 @@ def test_pgvector_get_recent_local_filter_still_orders(tmp_path, fake_pgvector):
             "offset": None,
             "with_document": True,
             "order_field": "filed_at",
-        }
+            "order_form": "utc",
+        },
+        {
+            "where": None,
+            "limit": 500,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "other",
+        },
     ]
 
 
@@ -964,13 +1040,15 @@ def test_pgvector_get_recent_local_filter_does_not_fetch_whole_table(tmp_path, f
     page = col.get_recent(limit=5, where={"$or": [{"wing": "w1"}, {"wing": "w2"}]})
 
     assert len(page.ids) == 5
-    # Every scroll carries a SQL LIMIT, and the total rows requested is a
-    # small multiple of the answer rather than the whole table.
+    # Every scroll carries a SQL LIMIT, and each timestamp form's walk
+    # requests a small multiple of the answer rather than the whole table.
     assert client.scroll_calls, "expected at least one scroll"
     assert all(call["limit"] is not None for call in client.scroll_calls)
-    assert sum(call["limit"] for call in client.scroll_calls) < rows
-    # One page suffices when the filter is not selective.
-    assert len(client.scroll_calls) == 1
+    for form in ("utc", "other"):
+        walk = [call for call in client.scroll_calls if call["order_form"] == form]
+        # One page suffices when the filter is not selective.
+        assert len(walk) == 1
+        assert walk[0]["limit"] < rows
 
 
 def test_pgvector_get_recent_local_filter_pages_until_enough_match(tmp_path, fake_pgvector):
@@ -995,9 +1073,9 @@ def test_pgvector_get_recent_local_filter_pages_until_enough_match(tmp_path, fak
     # Newest-first among the matches: d0002 was filed after d0001 after d0000.
     assert page.ids == ["d0002", "d0001", "d0000"]
     # Paged, every page bounded, and OFFSET advances rather than re-reading.
-    assert len(client.scroll_calls) == 3
-    assert [call["limit"] for call in client.scroll_calls] == [500, 500, 500]
-    assert [call["offset"] for call in client.scroll_calls] == [None, 500, 1000]
+    utc_walk = [call for call in client.scroll_calls if call["order_form"] == "utc"]
+    assert [call["limit"] for call in utc_walk] == [500, 500, 500]
+    assert [call["offset"] for call in utc_walk] == [None, 500, 1000]
 
 
 def test_pgvector_get_recent_local_filter_caps_pathological_scan(
@@ -1023,7 +1101,8 @@ def test_pgvector_get_recent_local_filter_caps_pathological_scan(
 
     assert page.ids == []
     # Two pages of 10 == the cap, then it stops. Not 100 rows.
-    assert sum(call["limit"] for call in client.scroll_calls) == 20
+    utc_walk = [call for call in client.scroll_calls if call["order_form"] == "utc"]
+    assert sum(call["limit"] for call in utc_walk) == 20
 
 
 def test_pgvector_get_recent_local_filter_dedupes_rows_shifted_by_a_write(

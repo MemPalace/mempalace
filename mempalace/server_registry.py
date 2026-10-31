@@ -27,13 +27,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from pathlib import Path
 
 from mempalace import paths
 from mempalace._env import env_str
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.fsio import atomic_write_text, read_published_bytes
+
+from .timeutil import utc_now_z
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ _TOKEN_ENV = "MEMPALACE_MCP_HTTP_TOKEN"
 
 
 def _utc_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return utc_now_z()
 
 
 def server_state_dir(palace_path: str) -> Path:

@@ -38,9 +38,10 @@ from .query_parser import (  # noqa: E402
     parse_query_input,
 )
 from .search_util import _cosine_scale_distance  # noqa: E402
+from .timeutil import recency_key  # noqa: E402
 from .version import __version__  # noqa: E402
 
-logger = logging.getLogger("mempalace_mcp_light")
+logger = logging.getLogger(__name__)
 
 _PQL_KEYWORDS = {
     "FIND",
@@ -197,7 +198,7 @@ def _enrich_search_results(res: Dict[str, Any]) -> Dict[str, Any]:
 
     by_recency = sorted(
         range(len(results_list)),
-        key=lambda i: _search_timestamp(results_list[i]),
+        key=lambda i: recency_key(_search_timestamp(results_list[i])),
         reverse=True,
     )
     for recency_rank, orig_i in enumerate(by_recency, 1):
@@ -805,6 +806,8 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         underlying_name = _classify_underlying_tool(tool_name, arguments)
         if not underlying_name:
             return _unknown_target_error(req_id)
+        # A writer lease the preflight takes lasts this call only (see call_tool).
+        lease_held_before = mcp_server._MCP_WRITER_LOCK_CM is not None
         refusal = mcp_server._mcp_tool_preflight_refusal(req_id, underlying_name)
         if refusal is not None:
             return refusal
@@ -831,6 +834,8 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return mcp_server._internal_tool_error(
                 req_id, tool_name, e, include_message=isinstance(e, ValueError)
             )
+        finally:
+            mcp_server._end_call_writer_lease(lease_held_before)
 
     if req_id is None:
         return None

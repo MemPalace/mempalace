@@ -819,6 +819,55 @@ def test_checkpoint_child_waits_out_a_held_palace_lock(tmp_path):
     assert (tmp_path / "s_last_save").read_text(encoding="utf-8") == "15"
 
 
+def test_checkpoint_child_takes_writer_lock_on_sqlite_exact(tmp_path, monkeypatch):
+    """Issue #2884: the Stop/PreCompact checkpoint must write on sqlite_exact.
+
+    ``_apply_diary_checkpoint`` calls ``tool_diary_write`` in-process rather
+    than through a stdio MCP round trip, so without taking the writer lease
+    ``_get_collection`` opens sqlite_exact read-only and every checkpoint fails
+    with "attempt to write a readonly database".
+    """
+    from mempalace import mcp_server as mcp
+    from mempalace.config import MempalaceConfig
+
+    palace_dir = tmp_path / "palace"
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+    monkeypatch.setattr(mcp, "_config", MempalaceConfig(palace_path=palace_dir))
+
+    # A mine (or a prior writer-locked call) has already created the DB.
+    ok, _reason = mcp._acquire_mcp_writer_lock()
+    assert ok
+    try:
+        seeded = mcp.tool_diary_write(
+            agent_name="claude", entry="seed", topic="seed", wing="wing_test"
+        )
+    finally:
+        mcp._release_mcp_writer_lock()
+    assert seeded.get("success"), seeded
+
+    # A fresh hook child holds no lease and has no cached writable handle.
+    mcp._collection_cache = None
+    mcp._client_cache = None
+    mcp._collection_cache_backend = None
+    mcp._collection_cache_palace = None
+
+    ok = hooks_cli_mod._apply_diary_checkpoint(
+        {
+            "entry": "CHECKPOINT:regression",
+            "agent_name": "claude",
+            "topic": "checkpoint",
+            "wing": "wing_test",
+            "session_id": "sess-2884",
+            "exchange_count": 3,
+        }
+    )
+    assert ok is True
+    assert (hooks_cli_mod.STATE_DIR / "sess-2884_last_save").read_text(encoding="utf-8") == "3"
+
+    visible = mcp.tool_diary_read(agent_name="claude")
+    assert any("CHECKPOINT:regression" in e["content"] for e in visible["entries"])
+
+
 def test_daemon_available_probe_stays_under_hook_budget(tmp_path, monkeypatch):
     import socket
     import threading
@@ -1070,7 +1119,27 @@ def test_wing_from_transcript_path_fallback_collapses_worktree():
     assert _wing_from_transcript_path(non_worktree_path) == "gsd_core"
 
 
+def test_wing_from_transcript_path_fallback_collapses_dot_worktrees():
+    """``<project>/.worktrees/<wt>`` flattens to ``--worktrees-<wt>``; before the
+    fix the fallback kept the worktree slug, so every branch got its own wing."""
+    worktree_path = "/Users/u/.claude/projects/-Users-u-dev-webui-app--worktrees-737-list-table-drop-unused/x.jsonl"
+    assert _wing_from_transcript_path(worktree_path) == "webui_app"
+
+
 # --- _wing_from_transcript_path: cwd-from-JSONL primary path ---
+
+
+def test_wing_from_transcript_path_cwd_collapses_dot_worktrees(tmp_path):
+    """A cwd inside ``<project>/.worktrees/<wt>`` files under <project>, same as
+    ``.claude/worktrees/``."""
+    project_dir = tmp_path / "-Users-me-dev-webui-app--worktrees-42-fix-login"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"user","cwd":"/Users/me/dev/webui-app/.worktrees/42-fix-login","content":"hi"}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "webui_app"
 
 
 def test_wing_from_transcript_path_uses_cwd_from_jsonl(tmp_path):
@@ -1170,6 +1239,45 @@ def test_wing_from_transcript_path_cwd_handles_non_string_cwd(tmp_path):
         encoding="utf-8",
     )
     assert _wing_from_transcript_path(str(transcript)) == "proper_name"
+
+
+def test_wing_from_transcript_path_uses_codex_session_meta_payload_cwd(tmp_path):
+    """A Codex rollout records cwd only on its session_meta payload; that is
+    the project, not the date-bucketed ``sessions/YYYY/MM/DD`` folder."""
+    day_dir = tmp_path / ".codex" / "sessions" / "2026" / "10" / "28"
+    day_dir.mkdir(parents=True)
+    transcript = day_dir / "rollout-2026-10-28T21-13-25-abc.jsonl"
+    transcript.write_text(
+        '{"type":"session_meta","payload":{"id":"abc","cwd":"/home/me/git/codex-project"}}\n'
+        '{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "codex_project"
+
+
+def test_wing_from_transcript_path_top_level_cwd_wins_over_payload(tmp_path):
+    """A top-level cwd keeps precedence on a line that also has a payload."""
+    project_dir = tmp_path / "-Users-me-x"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"x","cwd":"/Users/me/git/top-level","payload":{"cwd":"/Users/me/git/nested"}}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "top_level"
+
+
+def test_wing_from_transcript_path_ignores_non_string_payload_cwd(tmp_path):
+    """A non-string payload cwd is skipped like a non-string top-level one."""
+    project_dir = tmp_path / "-Users-me-x"
+    project_dir.mkdir()
+    transcript = project_dir / "session.jsonl"
+    transcript.write_text(
+        '{"type":"session_meta","payload":{"cwd":42}}\n'
+        '{"type":"session_meta","payload":{"cwd":"/Users/me/git/later-name"}}\n',
+        encoding="utf-8",
+    )
+    assert _wing_from_transcript_path(str(transcript)) == "later_name"
 
 
 # --- _wing_slug: special-character project dirs (e.g. +project) ---

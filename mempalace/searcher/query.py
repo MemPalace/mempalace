@@ -225,7 +225,7 @@ def search_memories(
         since: Optional inclusive ISO date/datetime lower bound on a
             drawer's ``filed_at`` (ingest time, the ``created_at`` shown in
             results) — ``[since, before)`` window semantics shared with
-            ``list_drawers``: wall-clock naive comparison, drawers
+            ``list_drawers``: compared as instants (see ``date_window``), drawers
             with missing/unparseable ``filed_at`` excluded while a bound is
             active. Filtering happens after retrieval (ChromaDB rejects
             string operands for ``$gte``/``$lt``), so the candidate pool is

@@ -804,6 +804,27 @@ class TestNodeProfile:
         assert payload["profiles"][self_id] == payload["profile"]
         assert payload["profiles"]["rep_cccccccccccc"]["hardware"] == "test-c"
 
+    @pytest.mark.parametrize("model", ["minilm", "embeddinggemma"])
+    def test_profile_reports_the_models_cpu_provider_on_apple(self, server, monkeypatch, model):
+        _port, mcp = server
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", model)
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "auto")
+        monkeypatch.setattr(
+            "onnxruntime.get_available_providers",
+            lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+        )
+
+        assert mcp._node_profile()["accelerator"] == {"provider": "CPU", "embedder": model}
+
+    def test_profile_reports_http_without_advertising_the_endpoint(self, server, monkeypatch):
+        _port, mcp = server
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "openai-compat")
+        monkeypatch.setenv("MEMPALACE_EMBEDDING_API_URL", "http://user:secret@localhost:1234")
+        assert mcp._node_profile()["accelerator"] == {
+            "provider": "openai-compat",
+            "embedder": "openai-compat",
+        }
+
     def test_merge_known_profiles_is_lww_by_advertised_at(self):
         from mempalace import mcp_server as mcp
 

@@ -87,6 +87,7 @@ class _FakeQdrantClient:
         self.collections = {}
         self.query_calls = []
         self.scroll_calls = []
+        self.scroll_details = []
         self.created_indexes = []
         self.facet_calls = []
         _FakeQdrantClient.instances.append(self)
@@ -154,11 +155,17 @@ class _FakeQdrantClient:
         with_vector=False,
     ):
         self.scroll_calls.append(qdrant_filter)
-        points = list(self.collections.get(collection, {"points": {}})["points"].values())
+        self.scroll_details.append((qdrant_filter, limit, offset, with_vector))
+        points = sorted(
+            self.collections.get(collection, {"points": {}})["points"].values(),
+            key=lambda point: point["id"],
+        )
         points = [point for point in points if _fake_match_filter(point, qdrant_filter)]
-        start = int(offset or 0)
-        selected = points[start : start + limit]
-        next_offset = start + limit if start + limit < len(points) else None
+        # Qdrant resumes from an inclusive point ID, not a row number.
+        if offset is not None:
+            points = [point for point in points if point["id"] >= offset]
+        selected = points[:limit]
+        next_offset = points[limit]["id"] if len(points) > limit else None
         out = []
         for point in selected:
             item = {"id": point["id"], "payload": point["payload"]}
@@ -691,3 +698,126 @@ def test_qdrant_facet_counts_ignores_missing_metadata(tmp_path, fake_qdrant):
     assert collection.facet_counts("wing") == {
         "alpha": 1,
     }
+
+
+def test_qdrant_creates_keyword_payload_indexes(tmp_path, fake_qdrant):
+    _backend, col = _collection(tmp_path)
+    col.upsert(ids=["1"], documents=["doc"], metadatas=[{"wing": "w"}], embeddings=[[1, 0]])
+    created = [(field, schema) for _coll, field, schema in fake_qdrant.instances[0].created_indexes]
+    assert ("document", "text") in created
+    assert ("metadata.wing", "keyword") in created
+    assert ("metadata.room", "keyword") in created
+    assert ("metadata.source_file", "keyword") in created
+
+
+def test_qdrant_local_exact_defers_vectors(tmp_path, fake_qdrant):
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["a", "b", "c"],
+        documents=["needle one", "needle two", "other three"],
+        metadatas=[
+            {"wing": "alpha", "room": "r1"},
+            {"wing": "beta", "room": "r1"},
+            {"wing": "gamma", "room": "r2"},
+        ],
+        embeddings=[[1, 0], [0.8, 0.2], [0, 1]],
+    )
+    client = fake_qdrant.instances[0]
+    client.query_calls.clear()
+    client.scroll_details.clear()
+
+    # For $or local filters, _query_local_exact scrolls with_vector=False first
+    # and fetches vectors only for matched IDs in the second pass.
+    res = col.query(
+        query_embeddings=[[1, 0]],
+        n_results=5,
+        where={"$or": [{"wing": "alpha"}, {"wing": "beta"}]},
+    )
+    assert res.ids == [["a", "b"]]
+    assert len(client.scroll_details) == 2
+    assert client.scroll_details[0][3] is False  # first pass: payload-only
+    assert client.scroll_details[1][3] is True  # second pass: vectors for matched IDs only
+
+    # When where_document requires local filtering, _query_local_exact first scrolls
+    # with_vector=False (pushing down where) and only fetches vectors for matched IDs.
+    client.scroll_details.clear()
+    res3 = col.query(
+        query_embeddings=[[1, 0]],
+        n_results=5,
+        where={"wing": "alpha"},
+        where_document={"$contains": "needle"},
+    )
+    assert res3.ids == [["a"]]
+    assert len(client.scroll_details) == 2
+    assert client.scroll_details[0][3] is False  # first pass: payload-only
+    assert client.scroll_details[1][3] is True  # second pass: vectors for matched IDs only
+
+
+def test_qdrant_sequential_get_pagination_uses_scroll_cursor(tmp_path, fake_qdrant):
+    from mempalace.backends.qdrant import _point_id
+
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=[f"id-{i}" for i in range(6)],
+        documents=[f"doc-{i}" for i in range(6)],
+        metadatas=[{"wing": "w", "idx": i} for i in range(6)],
+        embeddings=[[1.0, 0.0] for _ in range(6)],
+    )
+    client = fake_qdrant.instances[0]
+    client.scroll_details.clear()
+
+    p0 = col.get(limit=2, offset=0, include=["metadatas"])
+    p1 = col.get(limit=2, offset=2, include=["metadatas"])
+    p2 = col.get(limit=2, offset=4, include=["metadatas"])
+
+    ordered_ids = sorted((f"id-{i}" for i in range(6)), key=_point_id)
+    assert p0.ids + p1.ids + p2.ids == ordered_ids
+    # Each page resumes at the next unread point ID without growing the limit.
+    offsets_and_limits = [(limit, offset) for _flt, limit, offset, _vec in client.scroll_details]
+    assert offsets_and_limits == [
+        (2, None),
+        (2, _point_id(ordered_ids[2])),
+        (2, _point_id(ordered_ids[4])),
+    ]
+    assert col.get(limit=2, offset=6).ids == []
+
+    # Writes invalidate the scroll cursor so fresh data is visible on the next page read.
+    col.upsert(
+        ids=["id-6"],
+        documents=["doc-6"],
+        metadatas=[{"wing": "w", "idx": 6}],
+        embeddings=[[1.0, 0.0]],
+    )
+    assert col._scroll_cursor is None
+
+
+def test_qdrant_iter_metadata_and_fast_collection_metadata(tmp_path, fake_qdrant):
+    from mempalace.palace import _fast_collection_metadata
+
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["a", "b", "c"],
+        documents=["da", "db", "dc"],
+        metadatas=[
+            {"wing": "w1", "room": "r1", "entities": "Alice;Bob", "source_file": "/a.md"},
+            {"wing": "w1", "room": "r2", "source_file": "/b.md"},
+            {"wing": "w2", "room": "r3", "entities": "Carol;Dave"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0]],
+    )
+    client = fake_qdrant.instances[0]
+    client.scroll_details.clear()
+
+    stream = _fast_collection_metadata(
+        col,
+        ("wing", "room", "entities"),
+        require_key="entities",
+        equals={"wing": "w1"},
+    )
+    assert stream is not None
+    assert list(stream) == [{"wing": "w1", "room": "r1", "entities": "Alice;Bob"}]
+    # Verify equals={"wing": "w1"} was pushed down to Qdrant's scroll filter with_vector=False.
+    assert len(client.scroll_details) == 1
+    q_filter, _limit, _offset, with_vector = client.scroll_details[0]
+    assert with_vector is False
+    assert q_filter == {"must": [{"key": "metadata.wing", "match": {"value": "w1"}}]}

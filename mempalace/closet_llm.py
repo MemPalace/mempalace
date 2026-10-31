@@ -43,7 +43,6 @@ import json
 import os
 import time
 import urllib.parse
-from datetime import datetime
 from typing import Optional
 
 from . import paths
@@ -63,6 +62,7 @@ from .palace import (
     upsert_closet_lines,
 )
 from .search_util import palace_wing_aliases
+from .timeutil import utc_now_iso
 
 MAX_CONTENT_CHARS = 30000
 MAX_OUTPUT_TOKENS = 1500
@@ -364,7 +364,7 @@ def _regenerate_closets_owned(
                     "room": r,
                     "source_file": source,
                     "generated_by": f"llm:{cfg.model}",
-                    "filed_at": datetime.now().isoformat(),
+                    "filed_at": utc_now_iso(),
                     "entities": entities,
                     # Stamp so the miner's stale-drawer gate doesn't treat
                     # LLM closets as leftovers and rebuild over them next run.

@@ -219,6 +219,9 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 source_path=source,
                 palace_path=palace_path,
                 dry_run=dry_run,
+                project=wing,
+                related_drawer_id=payload.get("related_drawer_id"),
+                explicit_palace=bool(payload.get("explicit_palace")),
             )
         elif mode == "convos":
             from .convo_miner import mine_convos

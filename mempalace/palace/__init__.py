@@ -41,11 +41,13 @@ from ..collision_scan import CollisionError, assert_no_collisions
 from ..entity_detector import (
     _apply_known_systems_prepass,
     _collapse_long_ascii_runs,
+    _entity_blocklist,
     _get_coca_filter,
+    _use_english_filters,
 )
 from ..metadata_types import coerce_metadata_types
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 SKIP_DIRS = {
     ".git",
@@ -71,6 +73,7 @@ SKIP_DIRS = {
     ".eggs",
     "htmlcov",
     "target",
+    ".worktrees",
 }
 
 _DEFAULT_BACKEND = get_backend("chroma")

@@ -5,7 +5,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1111,22 +1111,25 @@ class TestListDrawersDateFilters:
 
         from mempalace.date_window import parse_date_bound as _parse_date_filter
 
-        assert _parse_date_filter("2026-04-01", "since") == datetime(2026, 4, 1)
+        assert _parse_date_filter("2026-04-01", "since") == datetime(
+            2026, 4, 1, tzinfo=timezone.utc
+        )
 
     def test_parse_date_filter_full_timestamp(self):
 
         from mempalace.date_window import parse_date_bound as _parse_date_filter
 
-        assert _parse_date_filter("2026-04-01T09:30:00", "since") == datetime(2026, 4, 1, 9, 30)
+        assert _parse_date_filter("2026-04-01T09:30:00", "since") == datetime(
+            2026, 4, 1, 9, 30, tzinfo=timezone.utc
+        )
 
-    def test_parse_date_filter_drops_timezone(self):
+    def test_parse_date_filter_keeps_timezone(self):
 
         from mempalace.date_window import parse_date_bound as _parse_date_filter
 
-        # tz offset dropped -> naive wall-clock, never raises vs naive filed_at.
+        # The offset is kept: bounds are instants, comparable with any filed_at.
         parsed = _parse_date_filter("2026-04-01T09:30:00+02:00", "since")
-        assert parsed == datetime(2026, 4, 1, 9, 30)
-        assert parsed.tzinfo is None
+        assert parsed == datetime(2026, 4, 1, 7, 30, tzinfo=timezone.utc)
 
     def test_parse_date_filter_rejects_garbage(self):
         import pytest
@@ -1170,32 +1173,34 @@ class TestListDrawersDateFilters:
         assert _filed_at_in_window("garbage", since, None) is False
         assert _filed_at_in_window(12345, since, None) is False
 
-    def test_filed_at_in_window_tz_aware_wall_clock(self):
+    def test_filed_at_in_window_tz_aware_instant(self):
 
         from mempalace.date_window import filed_at_in_window as _filed_at_in_window
 
-        # tz dropped on both sides -> wall-clock compare, no TypeError raised.
+        # Aware filed_at vs naive bound: compared as instants, no TypeError raised.
         since = datetime(2026, 1, 2)
         assert _filed_at_in_window("2026-01-02T08:00:00+05:00", since, None) is True
+        assert _filed_at_in_window("2026-01-02T04:00:00+05:00", since, None) is False
 
     def test_parse_date_filter_accepts_zulu_suffix(self):
 
         from mempalace.date_window import parse_date_bound as _parse_date_filter
 
         # "Z" is not accepted by datetime.fromisoformat before 3.11; the helper
-        # strips it so Zulu inputs parse on the 3.9 floor, tz then dropped.
+        # strips it so Zulu inputs parse on the 3.9 floor, as UTC.
         parsed = _parse_date_filter("2026-04-01T09:30:00Z", "since")
-        assert parsed == datetime(2026, 4, 1, 9, 30)
-        assert parsed.tzinfo is None
+        assert parsed == datetime(2026, 4, 1, 9, 30, tzinfo=timezone.utc)
+        assert parsed.utcoffset().total_seconds() == 0
 
         # Date-only with a Zulu suffix must also parse on 3.9/3.10 (appending
         # "+00:00" would have raised there; stripping Z does not).
         parsed_date = _parse_date_filter("2026-04-01Z", "since")
-        assert parsed_date == datetime(2026, 4, 1)
-        assert parsed_date.tzinfo is None
+        assert parsed_date == datetime(2026, 4, 1, tzinfo=timezone.utc)
 
         # Lowercase z is tolerated too.
-        assert _parse_date_filter("2026-04-01t09:30:00z", "since") == datetime(2026, 4, 1, 9, 30)
+        assert _parse_date_filter("2026-04-01t09:30:00z", "since") == datetime(
+            2026, 4, 1, 9, 30, tzinfo=timezone.utc
+        )
 
     def test_filed_at_in_window_accepts_zulu_filed_at(self):
 

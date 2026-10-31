@@ -34,6 +34,7 @@ from .search_util import (
     _metric_for_collection,
     build_where_filter,
 )
+from .timeutil import recency_key
 
 
 def _get_collection(*args, **kwargs):
@@ -402,11 +403,9 @@ class Layer1:
                     except (ValueError, TypeError):
                         pass
                     break
-            # filed_at is an ISO-8601 string; ISO strings sort lexicographically
-            # in chronological order. Coerce to str so a missing/odd value sorts
-            # oldest rather than raising during the comparison.
-            recency = str(meta.get("filed_at") or "")
-            scored.append((importance, recency, meta, doc))
+            # By instant: naive local and UTC filed_at do not sort as text.
+            # A missing or odd value sorts oldest.
+            scored.append((importance, recency_key(meta.get("filed_at")), meta, doc))
 
         # Sort by importance desc, then recency (filed_at) desc; take top N.
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)

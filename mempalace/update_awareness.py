@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 from . import paths
 from .fsio import atomic_publish, read_published_bytes
+from .timeutil import utc_now
 from .version import __version__
 
 _POLICY_FILE = "updates.json"
@@ -141,7 +142,7 @@ def check_updates(
     if not enabled and not force:
         return {"enabled": False, "installed": installed_version, "checked": False}
 
-    now = now or datetime.now(timezone.utc)
+    now = now or utc_now()
     attempted_at = cache.get("attempted_at") or cache.get("checked_at")
     if not force and attempted_at:
         try:

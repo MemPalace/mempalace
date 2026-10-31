@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 from unittest.mock import MagicMock
@@ -513,7 +514,7 @@ class TestColdStartDiagnostics:
             "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
             "logging.getLogger('host.app').warning('HOST-ONLY-LINE-xyz')\n"
             "logging.getLogger('mempalace.embedding').info('MEMPALACE-DOTTED-LINE-xyz')\n"
-            "logging.getLogger('mempalace_mcp').info('MEMPALACE-FLAT-LINE-xyz')\n"
+            "logging.getLogger('mempalace.mcp_server').info('MEMPALACE-SERVER-LINE-xyz')\n"
             "logging.shutdown()\n"
             "raise SystemExit(0)\n"
         )
@@ -522,12 +523,16 @@ class TestColdStartDiagnostics:
         assert log_path.exists(), f"log file missing; stderr={result.stderr!r}"
         body = log_path.read_text(encoding="utf-8")
         assert "MEMPALACE-DOTTED-LINE-xyz" in body, body
-        assert "MEMPALACE-FLAT-LINE-xyz" in body, body
+        assert "MEMPALACE-SERVER-LINE-xyz" in body, body
         assert "HOST-ONLY-LINE-xyz" not in body, body
-        # Format is "%(message)s" in the embedded path too: the line is the bare
-        # message with no "LEVEL:name:" prefix (the file handler sets its own
-        # formatter, independent of basicConfig which never runs here).
-        assert any(line == "MEMPALACE-FLAT-LINE-xyz" for line in body.splitlines()), body
+        # The file handler stamps time and level on each line (#2620), so a
+        # server-side record can be ordered and matched against a client-side
+        # timeout. basicConfig never runs here, so this format comes from the
+        # file handler's own formatter, not the host's.
+        stamped = re.compile(
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} INFO MEMPALACE-SERVER-LINE-xyz$"
+        )
+        assert any(stamped.match(line) for line in body.splitlines()), body
 
     def test_embedded_host_warning_root_gates_mempalace_info(self, tmp_path):
         """Documents the intentional embedded-mode level-gating tradeoff: when
@@ -541,8 +546,8 @@ class TestColdStartDiagnostics:
             "import logging\n"
             "logging.basicConfig(level=logging.WARNING, format='%(message)s')\n"
             "from mempalace import mcp_server  # noqa: F401 — triggers _init_logging()\n"
-            "logging.getLogger('mempalace_mcp').info('INFO-HEARTBEAT-xyz')\n"
-            "logging.getLogger('mempalace_mcp').warning('WARN-DIAG-xyz')\n"
+            "logging.getLogger('mempalace.mcp_server').info('INFO-HEARTBEAT-xyz')\n"
+            "logging.getLogger('mempalace.mcp_server').warning('WARN-DIAG-xyz')\n"
             "logging.shutdown()\n"
             "raise SystemExit(0)\n"
         )

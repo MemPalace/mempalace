@@ -41,7 +41,6 @@ import os
 import re
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Optional
 from urllib import parse as urlparse
@@ -50,6 +49,7 @@ import numpy as np
 
 from ..lexical import bm25_scores
 from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
+from ..timeutil import utc_now_iso as _utcnow
 from ._filters import matches_where, matches_where_document, validate_where
 from ._remote_common import (
     RemoteMarkerMixin,
@@ -75,6 +75,7 @@ from .base import (
     UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
+    recency_sort_key,
     validate_write_batch,
 )
 
@@ -117,12 +118,16 @@ _RECENT_SCAN_PAGE_MAX = 5000
 _RECENT_SCAN_ROW_CAP = 50_000
 
 
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _merge_recent(rows: list[dict], order_field: str) -> list[dict]:
+    """Rows newest first by instant (ties by id), each id once."""
+    unique = list({row["id"]: row for row in rows}.values())
+    unique.sort(key=lambda row: row["id"])
+    unique.sort(key=lambda row: recency_sort_key(row["metadata"], order_field), reverse=True)
+    return unique
 
 
 def _requires_local_filter(where: Optional[dict], where_document: Optional[dict] = None) -> bool:
@@ -674,6 +679,7 @@ class _PgVectorClient:
         limit: Optional[int] = None,
         offset: Optional[int] = None,
         order_field: Optional[str] = None,
+        order_form: Optional[str] = None,
     ) -> list[dict]:
         qi = _quote_identifier(table)
         params: list = []
@@ -692,13 +698,21 @@ class _PgVectorClient:
         if with_embedding:
             cols += ", embedding"
         sql = f"SELECT {cols} FROM {qi} WHERE {where_sql}"
+        if order_field is not None and order_form is not None:
+            # Text order is instant order only within one timestamp form, so
+            # recency reads fetch the UTC-suffixed values ("utc") and the rest
+            # ("other") separately and merge them by instant.
+            params.extend([order_field, order_field])
+            utc = "(right(metadata->>%s, 6) = '+00:00' OR right(metadata->>%s, 1) IN ('Z', 'z'))"
+            sql += f" AND {utc}" if order_form == "utc" else f" AND NOT COALESCE({utc}, FALSE)"
         # Push pagination into SQL when a page is requested. ORDER BY the
         # primary key gives OFFSET a stable order (an unordered scan may skip
         # or repeat rows across pages); callers that scroll the whole table
         # pass neither bound, leaving their SQL unchanged.
         if order_field is not None:
-            # Newest-first on an ISO-8601 metadata field. ISO-8601 sorts
-            # chronologically as text, so ``metadata->>field DESC`` needs no
+            # Newest-first on an ISO-8601 metadata field. Within one form
+            # (``order_form``) it sorts chronologically as text, so
+            # ``metadata->>field DESC`` needs no
             # timestamp cast (a cast would also fail hard on one malformed
             # value). NULLS LAST keeps records without the field at the end;
             # ``id`` breaks ties so the order is total and stable.
@@ -914,6 +928,7 @@ class PgVectorCollection(BaseCollection):
         limit=None,
         offset=None,
         order_field=None,
+        order_form=None,
     ) -> list[dict]:
         self._ensure_open()
         if not self._table_exists():
@@ -929,6 +944,7 @@ class PgVectorCollection(BaseCollection):
             limit=limit,
             offset=offset,
             order_field=order_field,
+            order_form=order_form,
         )
 
     def get_all_metadata(self, where=None) -> list[dict]:
@@ -1218,35 +1234,41 @@ class PgVectorCollection(BaseCollection):
         # guard tolerates means "no bound", which on this branch is the cap.
         target = _RECENT_SCAN_ROW_CAP if limit is None else int(limit)
         page_size = max(_RECENT_SCAN_PAGE_MIN, min(target, _RECENT_SCAN_PAGE_MAX))
-        matched: list[dict] = []
-        seen: set[str] = set()
-        offset = 0
-        scanned = 0
-        while len(matched) < target and scanned < _RECENT_SCAN_ROW_CAP:
-            want = min(page_size, _RECENT_SCAN_ROW_CAP - scanned)
-            page = self._scroll(
-                where=None,
-                with_embedding=with_embedding,
-                with_document=with_document,
-                limit=want,
-                offset=offset or None,
-                order_field=order_field,
-            )
-            if not page:
-                break
-            scanned += len(page)
-            offset += len(page)
-            for row in page:
-                if row["id"] in seen:
-                    continue
-                seen.add(row["id"])
-                if matches_where(row["metadata"], where):
-                    matched.append(row)
-                    if len(matched) >= target:
-                        break
-            if len(page) < want:
-                break  # short page — end of table
-        return matched[:target]
+
+        def walk(order_form):
+            matched: list[dict] = []
+            seen: set[str] = set()
+            offset = 0
+            scanned = 0
+            while len(matched) < target and scanned < _RECENT_SCAN_ROW_CAP:
+                want = min(page_size, _RECENT_SCAN_ROW_CAP - scanned)
+                page = self._scroll(
+                    where=None,
+                    with_embedding=with_embedding,
+                    with_document=with_document,
+                    limit=want,
+                    offset=offset or None,
+                    order_field=order_field,
+                    order_form=order_form,
+                )
+                if not page:
+                    break
+                scanned += len(page)
+                offset += len(page)
+                for row in page:
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    if matches_where(row["metadata"], where):
+                        matched.append(row)
+                        if len(matched) >= target:
+                            break
+                if len(page) < want:
+                    break  # short page — end of table
+            return matched
+
+        # Each timestamp form is walked in its own text order, then merged.
+        return _merge_recent(walk("utc") + walk("other"), order_field)[:target]
 
     def get_recent(self, *, limit, where=None, order_field="filed_at", include=None):
         """Newest-first fetch with the ordering pushed into SQL.
@@ -1278,23 +1300,15 @@ class PgVectorCollection(BaseCollection):
         pushdown branch treats it as unbounded; the local branch cannot, and
         treats it as the scan cap.
 
-        Ordering is on the JSON *text* of ``order_field``, matching the text
-        ordering :func:`recency_sort_key` already applies in Layer 1. See that
-        function for what text ordering does and does not promise; this method
-        inherits those limits rather than introducing them. At least three
-        places where the SQL order and ``recency_sort_key`` differ, none of
-        them reachable through anything that writes ``filed_at``:
-
-        * a JSON value that is not a string sorts by its text form here but
-          sorts last there;
-        * an empty string sorts above SQL NULL here but ties with a missing
-          key there;
-        * both ``metadata->>%s`` and the ``id`` tiebreak sort under the
-          database collation, while ``recency_sort_key`` sorts by Python
-          codepoint. Under a collation such as ``en_US.UTF-8`` punctuation is
-          weighted differently, so the two can disagree on timestamps that
-          differ only in punctuation (``+00:00`` against ``Z``). The test
-          double emulates the ordering in Python and so cannot catch this.
+        SQL orders the JSON *text* of ``order_field``, which is instant order
+        only within one timestamp form, so the newest ``limit`` of the
+        UTC-suffixed values and of the rest are fetched separately and merged
+        by :func:`recency_sort_key` (the instant). Within a form the SQL text
+        order can still differ from Python's where nothing that writes
+        ``filed_at`` reaches: a non-string JSON value sorts by its text form,
+        an empty string sorts above SQL NULL, and the database collation can
+        weigh punctuation differently from Python codepoints. The test double
+        emulates the ordering in Python and so cannot catch the last one.
         """
         if limit is not None and limit <= 0:
             return GetResult.empty()
@@ -1317,12 +1331,20 @@ class PgVectorCollection(BaseCollection):
                 with_document=spec.documents,
             )
         else:
-            rows = self._scroll(
-                where=where,
-                with_embedding=spec.embeddings,
-                limit=limit,
-                order_field=order_field,
-            )
+            rows = _merge_recent(
+                [
+                    row
+                    for order_form in ("utc", "other")
+                    for row in self._scroll(
+                        where=where,
+                        with_embedding=spec.embeddings,
+                        limit=limit,
+                        order_field=order_field,
+                        order_form=order_form,
+                    )
+                ],
+                order_field,
+            )[:limit]
         return GetResult(
             ids=[row["id"] for row in rows],
             documents=[row["document"] for row in rows] if spec.documents else [],

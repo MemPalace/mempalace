@@ -84,6 +84,7 @@ from .. import (  # noqa: E402
     tool_capabilities as _tool_capabilities,
 )
 from .._env import env_bool, env_float, env_int, env_list, env_str  # noqa: E402
+from .._once import first_time  # noqa: E402
 from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from ..backends.base import (  # noqa: E402
     DimensionMismatchError,
@@ -110,6 +111,7 @@ from ..config import (  # noqa: E402
     normalize_wing_name,
     sanitize_content,
     sanitize_iso_temporal,
+    sanitize_kg_lookup,
     sanitize_kg_value,
     sanitize_name,
     sqlite_read_uri,
@@ -126,6 +128,7 @@ from ..embedding import (  # noqa: E402
 from ..hallways import (  # noqa: E402
     delete_hallway,
     list_hallways,
+    list_hallways_page,
 )
 from ..ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 from ..knowledge_graph import KnowledgeGraph, knowledge_graph_notice  # noqa: E402
@@ -159,6 +162,7 @@ from ..stored_text import (  # noqa: E402
     dumps_client,
     dumps_internal,
 )
+from ..timeutil import recency_key, utc_now_iso, utc_now_z  # noqa: E402
 from ..version import __version__  # noqa: E402
 
 # ==================== WRITE-AHEAD LOG ====================

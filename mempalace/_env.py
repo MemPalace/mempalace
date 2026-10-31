@@ -11,19 +11,17 @@ import math
 import os
 from typing import Optional
 
+from ._once import first_time
+
 logger = logging.getLogger(__name__)
 
 TRUTHY = frozenset({"1", "true", "yes", "y", "on"})
 FALSY = frozenset({"0", "false", "no", "n", "off"})
 
-_warned: set = set()
-
 
 def _warn_once(name: str, raw: str, expected: str) -> None:
-    key = (name, raw)
-    if key in _warned:
+    if not first_time("env", name, raw):
         return
-    _warned.add(key)
     logger.warning("%s=%r is not recognized (expected %s); using the default", name, raw, expected)
 
 

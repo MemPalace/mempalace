@@ -330,7 +330,8 @@ TOOLS = {
                     "description": (
                         "Only drawers filed on/after this ISO date or datetime "
                         "(inclusive), e.g. '2026-04-01' or '2026-04-01T09:30:00'. "
-                        "Compares the drawer's created_at (filed_at) wall-clock; "
+                        "A value without an offset is local time. Compares the "
+                        "drawer's created_at (filed_at) as an instant; "
                         "drawers without a filed_at are excluded while set."
                     ),
                 },

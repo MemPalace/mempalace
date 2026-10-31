@@ -18,6 +18,7 @@ from pathlib import Path
 import yaml
 
 from .project_config import find_project_config
+from .timeutil import filename_stamp
 
 logger = logging.getLogger(__name__)
 
@@ -289,9 +290,8 @@ def _write_backup(path: Path, data: bytes) -> Path:
     variants of that. Each candidate is created with ``O_EXCL``, so an
     existing backup is never overwritten, even by a concurrent init.
     """
-    from datetime import datetime
 
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = filename_stamp()
     candidates = [path.with_name(f"{path.name}.bak"), path.with_name(f"{path.name}.bak.{stamp}")]
     candidates += [path.with_name(f"{path.name}.bak.{stamp}-{n}") for n in range(1, 100)]
     for candidate in candidates:

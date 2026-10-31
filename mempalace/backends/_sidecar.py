@@ -21,7 +21,7 @@ from ..fsio import (
 
 EMBEDDER_SIDECAR_FILENAME = "mempalace_embedder.json"
 
-logger = logging.getLogger("mempalace")
+logger = logging.getLogger(__name__)
 
 
 def read_embedder_sidecar(path: Optional[str], collection_name: Optional[str]):

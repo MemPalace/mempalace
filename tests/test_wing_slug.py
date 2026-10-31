@@ -1,5 +1,6 @@
 """One wing slug for every producer, and the aliases that keep old wings reachable."""
 
+import json
 import os
 import subprocess
 import sys
@@ -29,6 +30,8 @@ SHELL_CORPUS = [
     "a - b",
     "__init__",
     "C++ Tool",
+    "@my-org",
+    "My Project (v2)",
     "x" * 200,
     # Non-ASCII names go through Python itself.
     "Café Notes",
@@ -129,3 +132,150 @@ def _shell_slug(lib: Path, name: str) -> str:
 def test_shell_hooks_slug_like_python(harness, fallback, name):
     expected = normalize_wing_name(name) or fallback
     assert _shell_slug(HOOKS / harness / "lib" / "common.sh", name) == expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bash hook scripts are POSIX-only")
+@pytest.mark.parametrize(
+    "harness, fallback", [("cursor", "cursor_session"), ("antigravity", "sessions")]
+)
+@pytest.mark.parametrize("name", SHELL_CORPUS)
+def test_shell_hooks_parse_stdin_preserves_paths_and_wing_slugs(harness, fallback, name, tmp_path):
+    lib = HOOKS / harness / "lib" / "common.sh"
+    workspace = f"/Users/me/My Projects (Café)/{name}"
+    transcript = f"{workspace}/session.jsonl"
+    if harness == "cursor":
+        payload = json.dumps(
+            {
+                "conversation_id": "conv-1",
+                "transcript_path": transcript,
+                "workspace_roots": [workspace],
+            }
+        )
+        script = (
+            '. "$1" >/dev/null 2>&1; mempal_parse_stdin "$2"; '
+            'wing=$(mempal_infer_wing "$MEMPAL_WORKSPACE"); '
+            'printf "%s\\n%s" "$MEMPAL_TRANSCRIPT" "$wing"'
+        )
+    else:
+        payload = json.dumps(
+            {
+                "conversationId": "conv-1",
+                "transcriptPath": transcript,
+                "workspacePaths": [workspace],
+                "invocationNum": 1,
+            }
+        )
+        script = (
+            '. "$1" >/dev/null 2>&1; parsed=$(mempal_parse_stdin "$2"); '
+            'tp=$(printf "%s\\n" "$parsed" | sed -n "3p"); '
+            'wp=$(printf "%s\\n" "$parsed" | sed -n "4p"); '
+            'wing=$(mempal_infer_wing "$wp"); '
+            'printf "%s\\n%s" "$tp" "$wing"'
+        )
+
+    out = subprocess.run(
+        ["bash", "-c", script, "_", str(lib), payload],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            **os.environ,
+            "MEMPAL_PYTHON": sys.executable,
+            "MEMPAL_STATE_DIR": str(tmp_path),
+        },
+        timeout=30,
+    )
+    assert out.returncode == 0, out.stderr
+    parsed_transcript, parsed_wing = out.stdout.split("\n", 1)
+    assert parsed_transcript == transcript
+    assert parsed_wing == (normalize_wing_name(name) or fallback)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bash hook scripts are POSIX-only")
+@pytest.mark.parametrize("harness", ["cursor", "antigravity"])
+def test_shell_hooks_parse_stdin_strips_control_chars_without_shifting_lines(harness, tmp_path):
+    lib = HOOKS / harness / "lib" / "common.sh"
+    if harness == "cursor":
+        payload = (
+            '{"conversation_id":"conv-1\\nevil",'
+            '"loop_count":4,'
+            '"transcript_path":"~/a\\r\\nb\\ud800/t.jsonl",'
+            '"workspace_roots":["C:\\\\Users\\\\me\\\\MyProj\\\\"],'
+            '"status":"completed"}'
+        )
+        script = (
+            '. "$1" >/dev/null 2>&1; mempal_parse_stdin "$2"; '
+            'wing=$(mempal_infer_wing "$MEMPAL_WORKSPACE"); '
+            'printf "%s|%s|%s|%s" "$MEMPAL_LOOP_COUNT" "$MEMPAL_TRANSCRIPT" "$wing" "$MEMPAL_STATUS"'
+        )
+        expected = f"4|{tmp_path}/ab/t.jsonl|myproj|completed"
+    else:
+        payload = (
+            '{"conversationId":"conv-1\\nevil",'
+            '"transcriptPath":"/tmp/a\\r\\nb\\ud800/t.jsonl",'
+            '"workspacePaths":["C:\\\\Users\\\\me\\\\MyProj\\\\"],'
+            '"invocationNum":7}'
+        )
+        script = (
+            '. "$1" >/dev/null 2>&1; parsed=$(mempal_parse_stdin "$2"); '
+            'tp=$(printf "%s\\n" "$parsed" | sed -n "3p"); '
+            'wp=$(printf "%s\\n" "$parsed" | sed -n "4p"); '
+            'wing=$(mempal_infer_wing "$wp"); '
+            'inv=$(printf "%s\\n" "$parsed" | sed -n "9p"); '
+            'printf "%s|%s|%s" "$tp" "$wing" "$inv"'
+        )
+        expected = "/tmp/ab/t.jsonl|myproj|7"
+
+    out = subprocess.run(
+        ["bash", "-c", script, "_", str(lib), payload],
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "MEMPAL_PYTHON": sys.executable,
+            "MEMPAL_STATE_DIR": str(tmp_path),
+        },
+        timeout=30,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="bash hook scripts are POSIX-only")
+@pytest.mark.parametrize("harness", ["cursor", "antigravity"])
+@pytest.mark.parametrize("name", ["Café Notes", "日本語-プロジェクト", "émigré café"])
+def test_shell_hooks_non_ascii_slug_fallback_without_mempalace_import(harness, name, tmp_path):
+    lib = HOOKS / harness / "lib" / "common.sh"
+    # Poison cwd with re.py and json.py and unset PYTHONSAFEPATH so the
+    # test verifies Python 3.10 sys.path[0] removal before stdlib imports.
+    (tmp_path / "re.py").write_text("raise RuntimeError('cwd re.py imported')\n", encoding="utf-8")
+    (tmp_path / "json.py").write_text(
+        "raise RuntimeError('cwd json.py imported')\n", encoding="utf-8"
+    )
+    stub_py = tmp_path / "python3_no_site"
+    stub_py.write_text(
+        f'#!/bin/sh\nunset PYTHONSAFEPATH PYTHONPATH\nexec "{sys.executable}" -S "$@"\n',
+        encoding="utf-8",
+    )
+    stub_py.chmod(0o755)
+    out = subprocess.run(
+        [
+            "bash",
+            "-c",
+            '. "$1" >/dev/null 2>&1; mempal_infer_wing "/work/$2"',
+            "_",
+            str(lib),
+            name,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        encoding="utf-8",
+        env={
+            **os.environ,
+            "MEMPAL_PYTHON": str(stub_py),
+            "MEMPAL_STATE_DIR": str(tmp_path),
+        },
+        timeout=30,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout == normalize_wing_name(name)

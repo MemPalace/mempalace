@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
 
 from .paths import config_dir
+from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         else:
             safe_params[k] = v
     entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": utc_now_iso(),
         "operation": operation,
         "params": safe_params,
         "result": result,
@@ -127,7 +127,7 @@ def _wal_result(operation: str, result: dict):
     error contract.
     """
     entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": utc_now_iso(),
         "operation": operation,
         "result": result,
     }

@@ -38,6 +38,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         return _collection_error_or_no_palace()
 
     now = datetime.now()
+    filed_at = utc_now_iso()
     entry_id = (
         f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S%f')}_"
         f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
@@ -65,7 +66,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "topic": topic,
             "type": "diary_entry",
             "agent": agent_name,
-            "filed_at": now.isoformat(),
+            "filed_at": filed_at,
             "date": now.strftime("%Y-%m-%d"),
         }
         chunk_size = _config.chunk_size
@@ -81,7 +82,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 "entry_id": entry_id,
                 "agent": agent_name,
                 "topic": topic,
-                "timestamp": now.isoformat(),
+                "timestamp": filed_at,
                 "chunks": 1,
             }
 
@@ -128,7 +129,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
             "entry_id": entry_id,
             "agent": agent_name,
             "topic": topic,
-            "timestamp": now.isoformat(),
+            "timestamp": filed_at,
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
         }
@@ -275,7 +276,7 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
 
             # Keep memory bounded while scanning: only candidates for the
             # final newest-N result need to survive into the next page.
-            entries.sort(key=lambda x: x["timestamp"], reverse=True)
+            entries.sort(key=lambda x: recency_key(x["timestamp"]), reverse=True)
             del entries[last_n:]
 
             offset += len(batch_ids)

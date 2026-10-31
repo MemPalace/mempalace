@@ -47,8 +47,9 @@ from typing import Optional
 from . import paths
 from .config import sanitize_iso_temporal, strip_lone_surrogates
 from .fsio import atomic_publish, read_published_bytes
+from .timeutil import filename_stamp, utc_now_z
 
-logger = logging.getLogger("mempalace_logstream")
+logger = logging.getLogger(__name__)
 
 LOGSTREAM_DB_FILENAME = "logstream.sqlite3"
 
@@ -88,7 +89,7 @@ def _utc_now_iso() -> str:
     compare like against like. Ordering ties within one second are
     resolved by the SQLite rowid (``seq``), not the timestamp.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return utc_now_z()
 
 
 def _new_id(prefix: str) -> str:
@@ -98,7 +99,7 @@ def _new_id(prefix: str) -> str:
     from the rowid, so clock skew between writers cannot reorder or
     collide events.
     """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    stamp = filename_stamp("T", utc=True)
     return f"{prefix}_{stamp}_{secrets.token_hex(6)}"
 
 

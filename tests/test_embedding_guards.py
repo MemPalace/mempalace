@@ -12,9 +12,7 @@ import mempalace.embedding as embedding
 @pytest.fixture(autouse=True)
 def isolate_embedding_state(monkeypatch):
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
-    monkeypatch.setattr(embedding, "_WARNED", set())
     monkeypatch.setattr(embedding, "_DIM_CACHE", {})
-    monkeypatch.setattr(embedding, "_DIM_PROBE_WARNED", set())
 
 
 @pytest.mark.parametrize(

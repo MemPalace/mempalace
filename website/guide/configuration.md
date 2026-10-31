@@ -28,6 +28,81 @@ and `--backend`. Defaults stay out of the file, so a later release's defaults
 still reach you, and a `MEMPALACE_PALACE_PATH` set in your shell is not
 copied into it.
 
+## Embedding models and devices
+
+Set `embedding_model` and `embedding_device` in `config.json`, or use
+`MEMPALACE_EMBEDDING_MODEL` and `MEMPALACE_EMBEDDING_DEVICE` in the shell that
+runs MemPalace. Environment values take precedence. Without a configured model,
+`minilm` is the compatibility default; the device defaults to `auto`.
+
+| Model / runtime | CPU | NVIDIA CUDA (`cuda`) | Windows DirectML (`dml`) | Apple Core ML (`coreml`) | Apple Metal (`mps`) |
+| --- | --- | --- | --- | --- | --- |
+| `minilm` / ONNX | Yes | Install `mempalace[gpu]` | Install `mempalace[dml]` | Disabled by ChromaDB; uses CPU | No; interpreted as `auto` |
+| `embeddinggemma` / ONNX | Yes | Install `mempalace[gpu]` | Install `mempalace[dml]` | Skipped by `auto`; explicit requests must pass a health check or fall back to CPU | No; interpreted as `auto` |
+| `embeddinggemma2` / PyTorch, experimental | Yes | Requires a CUDA-enabled PyTorch build | No; interpreted as `auto` | No; interpreted as `auto` | Yes, when PyTorch and the model health checks support it |
+| `openai-compat` / HTTP endpoint | Endpoint decides | Endpoint decides | Endpoint decides | Endpoint decides | Endpoint decides |
+
+`auto` selects an available provider compatible with the model. For the built-in
+ONNX models this means CUDA, then DirectML, then CPU. EmbeddingGemma 2 prefers
+CUDA, then MPS, then CPU. An unavailable accelerator warns and falls back to CPU.
+An enabled ONNX accelerator can still run unsupported graph nodes on CPU; its
+presence does not mean every operation runs on the GPU. For `openai-compat`,
+hardware selection belongs to the endpoint and `embedding_device` has no effect.
+
+### Apple Silicon mining
+
+CPU is expected for the standard ONNX models on M-series Macs:
+
+- **MiniLM:** ChromaDB removes CoreML from its inference session because that
+  path is less optimized than CPU. Both `auto` and explicit `coreml` report CPU.
+- **EmbeddingGemma 300m ONNX:** CoreML has produced NaN or all-zero vectors for
+  the quantized model. Automatic selection excludes it; an explicit `coreml`
+  request is checked before embedding and falls back to CPU if the check fails.
+
+Installing `mempalace[coreml]` or setting `embedding_device=mps` does not enable
+Apple GPU inference for these ONNX models. You can keep the existing model and
+make CPU selection explicit:
+
+```bash
+MEMPALACE_EMBEDDING_DEVICE=cpu mempalace mine /path/to/project --wing MyProject
+```
+
+For an experimental Apple GPU path, install `mempalace[embeddinggemma2]` in an
+isolated environment and select `embedding_model=embeddinggemma2` with
+`embedding_device=mps` (or `auto`). MPS failures or invalid/non-repeatable vectors
+warn and retry on CPU. Follow the [EmbeddingGemma 2 setup and safe migration
+guide](https://github.com/MemPalace/mempalace/blob/develop/docs/embeddinggemma2.md)
+before changing an existing palace's model. Another option is a deliberately
+configured local `openai-compat` endpoint whose embedding server supports Metal.
+
+The `Device:` line in `mempalace mine` and `mempalace status` shows the resolved
+provider. Before the first inference it uses model-compatible selection without
+loading weights; subsequent status checks in the same process reflect a loaded
+session's CPU fallback. A fresh process cannot know whether an earlier process
+fell back. Warnings during inference explain later changes. Mesh node profiles
+use the same device reporting, subject to their 60-second profile cache.
+
+Changing only the device keeps the same vector space and needs no rebuild.
+Changing the model, revision, dimension, or modalities requires re-embedding;
+do not mix the new model's vectors with an existing palace's index.
+
+### Other Mac hardware
+
+Device selection checks runtime capabilities and model compatibility; it does
+not depend on a particular M-series chip. The MiniLM CPU selection above also
+applies on Intel Macs and to ONNX Runtime builds without CoreML, provided the
+installed dependencies support that Mac and macOS version. CoreML being listed
+as available does not establish that a model runs on a GPU or Neural Engine.
+
+The optional EmbeddingGemma 2 install has a narrower platform limit. It requires
+`torch>=2.14.0`, whose official macOS wheels are for Apple Silicon; PyTorch
+[ended official Intel Mac support after 2.2.x](https://pytorch.org/blog/pytorch2-2/).
+Selecting `embedding_device=cpu` does not make that extra installable on Intel
+Macs. Use an ONNX model with compatible dependencies, or a configured
+`openai-compat` endpoint, on those machines. CPU fallback applies to a backend
+that is already installed; macOS and Python requirements still depend on its
+packages. Available MPS support is checked at runtime on Apple Silicon.
+
 ## Storage backends
 
 ChromaDB is the default and needs no configuration. MemPalace also ships a

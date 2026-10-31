@@ -16,7 +16,6 @@ import os
 import re
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Optional
 
@@ -74,10 +73,6 @@ RESERVED_FIELDS = {
 }
 
 _FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def milvus_uri_is_server(uri: Optional[str]) -> bool:

@@ -39,25 +39,30 @@ def _window_sql_prefilters(since_dt, before_dt) -> list:
     space separator, minute precision, Z/offset suffixes) — a
     full-isoformat bound would sort after some of those on the boundary
     day and drop an in-window row at the SQL layer, where the
-    authoritative Python re-filter (offset drop, unparseable exclusion —
-    mirroring the wing/room double-check) can't recover it. Day
-    granularity costs at most one extra day of candidates per bound;
-    Python decides the exact window.
+    authoritative Python re-filter (instant comparison, unparseable
+    exclusion — mirroring the wing/room double-check) can't recover it.
+    Stored values are UTC or naive local, so a stored date can sit up to a
+    day either side of the bound's UTC date; the narrowing widens by that
+    day. Python decides the exact window.
     """
     prefilters = []
     if since_dt is not None:
-        prefilters.append((">=", since_dt.date().isoformat()))
+        try:
+            lower = (localize(since_dt).astimezone(timezone.utc) - timedelta(days=1)).date()
+            prefilters.append((">=", lower.isoformat()))
+        except OverflowError:
+            # since at the calendar floor: nothing to narrow by.
+            pass
     if before_dt is not None:
         try:
-            upper = (before_dt + timedelta(days=1)).date().isoformat()
+            upper = (localize(before_dt).astimezone(timezone.utc) + timedelta(days=2)).date()
+            prefilters.append(("<", upper.isoformat()))
         except OverflowError:
             # before at the calendar ceiling ("9999-12-31" as an open-ended
             # sentinel): there is no next day to bound by, so skip the SQL
             # narrowing entirely — the Python re-filter stays authoritative
             # and such a window is effectively unbounded above anyway.
-            upper = None
-        if upper is not None:
-            prefilters.append(("<", upper))
+            pass
     return prefilters
 
 

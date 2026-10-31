@@ -451,7 +451,7 @@ class TestHyphenatedWingNormalization:
     def test_find_tunnels_warns_on_empty_result(self, tmp_path, monkeypatch, caplog):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
         # No data in collection, so build_graph returns empty nodes
-        with caplog.at_level("WARNING", logger="mempalace_graph"):
+        with caplog.at_level("WARNING", logger="mempalace"):
             result = palace_graph.find_tunnels("nonexistent-wing")
         assert result == []
         assert "No tunnels found" in caplog.text
@@ -566,7 +566,7 @@ class TestTunnelFileFollowsConfig:
         monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(configured))
         monkeypatch.setattr(palace_graph, "_legacy_tunnel_file", lambda: str(legacy))
 
-        with caplog.at_level(logging.WARNING, logger="mempalace_graph"):
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
             result = palace_graph._load_tunnels()
 
         assert result == [], "must not auto-migrate from legacy file"
@@ -581,7 +581,7 @@ class TestTunnelFileFollowsConfig:
         monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(same))
         monkeypatch.setattr(palace_graph, "_legacy_tunnel_file", lambda: str(same))
 
-        with caplog.at_level(logging.WARNING, logger="mempalace_graph"):
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
             assert palace_graph._load_tunnels() == []
 
         assert "Legacy tunnels file" not in caplog.text

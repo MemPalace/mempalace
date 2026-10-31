@@ -246,6 +246,78 @@ def test_post_json_masks_a_key_in_the_url():
     assert "SECRETQUERYKEY" not in str(raised.value)
 
 
+# A configured endpoint can carry its credential in the URL itself.
+SECRET_URL = (
+    "https://user:hunter2pass@llm.example/v1"
+    "?key=SECRETKEY1&api_key=SECRETKEY2&access_token=SECRETKEY3"
+)
+URL_SECRETS = ("hunter2pass", "SECRETKEY1", "SECRETKEY2", "SECRETKEY3")
+
+
+def _assert_masked(text):
+    for secret in URL_SECRETS:
+        assert secret not in text, text
+    assert "llm.example" in text, text
+
+
+def test_post_json_masks_url_userinfo_and_query_credentials():
+    from urllib.error import URLError
+
+    with patch("mempalace.llm_client.urlopen", side_effect=URLError("refused")):
+        with pytest.raises(LLMError) as raised:
+            post_json(SECRET_URL, {}, {}, timeout=5)
+    _assert_masked(str(raised.value))
+
+
+def test_ollama_check_available_masks_endpoint_credentials():
+    from urllib.error import URLError
+
+    with patch("mempalace.llm_client.urlopen", side_effect=URLError("refused")):
+        ok, msg = OllamaProvider(model="m", endpoint=SECRET_URL).check_available()
+    assert not ok
+    _assert_masked(msg)
+
+
+def test_openai_compat_check_available_masks_endpoint_credentials():
+    from urllib.error import URLError
+
+    with patch("mempalace.llm_client.urlopen", side_effect=URLError("refused")):
+        ok, msg = OpenAICompatProvider(model="m", endpoint=SECRET_URL).check_available()
+    assert not ok
+    _assert_masked(msg)
+
+
+def test_openai_compat_empty_model_list_masks_endpoint_credentials():
+    mock = MagicMock()
+    mock.read.return_value = json.dumps({"data": []}).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        ok, msg = OpenAICompatProvider(model="auto", endpoint=SECRET_URL).check_available()
+    assert not ok
+    _assert_masked(msg)
+
+
+def test_openai_compat_unlisted_model_warning_masks_endpoint_credentials(caplog):
+    mock = MagicMock()
+    mock.read.return_value = json.dumps({"data": [{"id": "other"}]}).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        with caplog.at_level("WARNING", logger="mempalace"):
+            ok, _ = OpenAICompatProvider(model="m", endpoint=SECRET_URL).check_available()
+    assert ok
+    _assert_masked(caplog.text)
+
+
+def test_external_refusal_masks_endpoint_credentials():
+    p = OpenAICompatProvider(model="m", endpoint=SECRET_URL)
+    with pytest.raises(LLMError) as raised:
+        p.classify("system", "user")
+    assert "Refusing" in str(raised.value)
+    _assert_masked(str(raised.value))
+
+
 # ── OllamaProvider ──────────────────────────────────────────────────────
 
 
@@ -434,7 +506,7 @@ def test_openai_compat_check_warns_but_passes_on_model_mismatch(caplog):
     # decides, so a mismatch is a warning that names the served models.
     with patch("mempalace.llm_client.urlopen", return_value=_models_response(["other"])):
         p = OpenAICompatProvider(model="gone", endpoint="http://localhost:1")
-        with caplog.at_level("WARNING", logger="mempalace_llm"):
+        with caplog.at_level("WARNING", logger="mempalace"):
             ok, msg = p.check_available()
     assert ok and msg == "ok"
     assert "other" in caplog.text and "auto" in caplog.text

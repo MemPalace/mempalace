@@ -23,7 +23,7 @@ import re
 
 from mempalace.config import strip_lone_surrogates
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 # --- Constants ---
 MAX_QUERY_LENGTH = 250  # Above this, prompt contamination increasingly dominates

@@ -17,6 +17,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import ClassVar, Optional, Protocol, runtime_checkable
 
+from ..timeutil import recency_key
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -405,29 +407,18 @@ class LexicalResult:
     hits: list[LexicalHit]
 
 
-def recency_sort_key(meta: Optional[dict], order_field: str = "filed_at") -> tuple[int, str]:
+def recency_sort_key(meta: Optional[dict], order_field: str = "filed_at") -> tuple:
     """Sort key for newest-first ordering on an ISO-8601 metadata field.
 
-    Returns ``(1, value)`` for a usable timestamp string and ``(0, "")``
-    otherwise, so that with ``reverse=True`` records missing the field sort
-    last instead of raising on a str/None comparison. Backends that implement
-    :meth:`BaseCollection.get_recent` with a local sort MUST use this key so
-    every backend orders identically.
-
-    This compares the timestamps as *text*, which is chronological only while
-    every value shares one offset representation. It is not a new assumption:
-    Layer 1 has sorted ``filed_at`` as text and this key just
-    names the behaviour. It is also not currently true of ``filed_at`` --
-    ``diary_ingest`` writes ``datetime.now(timezone.utc).isoformat()``
-    (``...+00:00``) while every other writer uses ``datetime.now().isoformat()``
-    (naive local), so on a host that is not on UTC the two sort against each
-    other skewed by the local offset. Standardising the writers is a separate
-    change; it needs a migration for palaces that already hold both forms.
+    Orders by the parsed instant (:func:`timeutil.recency_key`), so naive
+    local values from older writers and UTC values interleave correctly;
+    with ``reverse=True`` records missing the field sort last. Backends that
+    implement :meth:`BaseCollection.get_recent` MUST produce this order. Text
+    order is chronological only within one form, so a SQL top-N read fetches
+    the UTC-suffixed values and the rest separately and merges them by this
+    key.
     """
-    value = (meta or {}).get(order_field)
-    if not isinstance(value, str) or not value:
-        return (0, "")
-    return (1, value)
+    return recency_key((meta or {}).get(order_field))
 
 
 def _recency_order(metadatas: list[dict], order_field: str) -> list[int]:
@@ -690,8 +681,8 @@ class BaseCollection(ABC):
         """Return up to ``limit`` records, newest first by ``order_field``.
 
         ``order_field`` names a metadata key holding an ISO-8601 timestamp
-        string (``filed_at`` for drawers). Ordering is descending on that
-        string; see :func:`recency_sort_key` for what text ordering promises.
+        string (``filed_at`` for drawers). Ordering is descending on the
+        instant it names; see :func:`recency_sort_key`.
         Records whose value is missing, empty, or not a string sort last.
 
         The default implementation pages through :meth:`get` in storage order
@@ -707,9 +698,9 @@ class BaseCollection(ABC):
         * The returned records really are the top ``limit`` under the ordering
           above, at any collection size, **whenever the backend can also
           evaluate ``where`` in storage** (including ``where=None``).
-        * It says nothing about whether that text ordering matches wall-clock
-          order. That is a property of what the writers store, not of the
-          backend.
+        * The ordering is by instant (:func:`recency_sort_key`), so naive
+          local and UTC timestamps interleave correctly; an override that
+          orders text in storage must read each timestamp form separately.
         * A filter the backend cannot push into storage has to be evaluated
           record by record, so a backend MAY bound how far it walks and return
           fewer than ``limit`` records rather than read the whole collection.

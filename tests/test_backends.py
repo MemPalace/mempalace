@@ -21,6 +21,8 @@ from mempalace.backends import (
     get_backend,
 )
 from mempalace.backends.chroma import (
+    _CORRUPT_SUFFIX,
+    _DRIFT_SUFFIX,
     _HNSW_MISSING_METADATA_DATA_FLOOR,
     ChromaBackend,
     ChromaCollection,
@@ -2006,8 +2008,16 @@ def test_client_quarantines_corrupt_segment_on_first_open(tmp_path, monkeypatch)
         backend.close()
 
     assert not seg.exists(), "_client() should have quarantined the corrupt segment"
-    drift_dirs = [p for p in palace.iterdir() if ".drift-" in p.name]
-    assert len(drift_dirs) == 1
+    quarantined_segments = []
+    for palace_entry in palace.iterdir():
+        is_quarantined = _DRIFT_SUFFIX in palace_entry.name or _CORRUPT_SUFFIX in palace_entry.name
+        if is_quarantined:
+            quarantined_segments.append(palace_entry)
+
+    assert len(quarantined_segments) == 1
+    quarantined_name = quarantined_segments[0].name
+    assert quarantined_name.count(_CORRUPT_SUFFIX) == 1
+    assert _DRIFT_SUFFIX not in quarantined_name
 
 
 def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch):

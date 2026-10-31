@@ -952,17 +952,17 @@ def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
 
     A palace of any size holds hundreds of thousands of hallways; returning
     them all in one response closed the MCP connection. The page is sorted by
-    co-occurrence count so the first page is the one worth reading.
+    co-occurrence count so the first page is the one worth reading, and only
+    that page is read from the store.
     """
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    rows = sorted(list_hallways(wing), key=lambda h: -int(h.get("co_occurrence_count") or 0))
-    page = rows[offset : offset + limit]
+    page, total = list_hallways_page(wing, limit=limit, offset=offset)
     return {
         "hallways": page,
-        "total": len(rows),
+        "total": total,
         "count": len(page),
         "offset": offset,
         "limit": limit,

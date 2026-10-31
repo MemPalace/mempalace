@@ -1,5 +1,6 @@
 """SQLite diary reads preserve the legacy response without opening Chroma."""
 
+from datetime import datetime
 from unittest.mock import Mock
 
 import chromadb
@@ -218,11 +219,13 @@ def test_diary_sqlite_reads_fresh_writes_updates_and_deletes_without_sdk_reads(
         "TestAgent", "Original 日本語 entry", topic="fresh", wing="wing_alpha"
     )
     assert written["success"] is True
+    # filed_at is UTC; the date field is the writer's local day.
+    local_day = datetime.fromisoformat(written["timestamp"]).astimezone().date()
     expected = {
         "agent": "testagent",
         "entries": [
             {
-                "date": written["timestamp"][:10],
+                "date": local_day.isoformat(),
                 "timestamp": written["timestamp"],
                 "topic": "fresh",
                 "content": "Original 日本語 entry",

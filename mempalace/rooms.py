@@ -35,13 +35,13 @@ import random
 import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from typing import Iterable, Optional, Protocol
 
 from .config import MempalaceConfig, sanitize_name
 from .fsio import atomic_write_json
 from .llm_client import parse_json_reply
 from .metadata_types import is_bookkeeping
+from .timeutil import utc_now_iso
 
 ROOM_SET_SCHEMA_VERSION = 1
 DEFAULT_SAMPLE_SIZE = 60
@@ -389,7 +389,7 @@ def propose_rooms(
         _, assignments = _parse_room_json_assignments(follow_up.text)
         _record_exemplars(room_set, samples, assignments)
     room_set.proposed_by = f"{getattr(provider, 'name', 'llm')}/{getattr(provider, 'model', '')}"
-    room_set.proposed_at = datetime.now(timezone.utc).isoformat()
+    room_set.proposed_at = utc_now_iso()
     room_set.sample_size = len(samples)
     return room_set
 
@@ -678,7 +678,7 @@ def rekey_closets_by_ids(closets_col, wing: str, moves: dict) -> int:
     for _source, _old, target in moves.values():
         if sanitize_name(str(target), "room") != str(target):
             raise ValueError("closet destination must retain its approved room spelling")
-    stamp = datetime.now(timezone.utc).isoformat()
+    stamp = utc_now_iso()
     move_ids: list[str] = []
     metas: list[dict] = []
     found: set[str] = set()
@@ -764,7 +764,7 @@ def save_pending_apply(
         moves = {}
     payload = {
         "wing": wing,
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": utc_now_iso(),
         "ambiguous": int(ambiguous),
         "inputs": inputs,
         "closets": [[src, old, new] for (src, old), new in sorted(targets.items())],
@@ -870,7 +870,7 @@ def apply_plan(col, plan: RoomPlan, progress=None) -> int:
     so it finishes the remainder and a completed apply is a no-op. Only
     ``room`` metadata changes; content is never rewritten.
     """
-    stamp = datetime.now(timezone.utc).isoformat()
+    stamp = utc_now_iso()
     done = 0
     for start in range(0, len(plan.changes), _UPDATE_BATCH):
         chunk = plan.changes[start : start + _UPDATE_BATCH]

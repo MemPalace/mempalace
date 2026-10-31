@@ -59,11 +59,9 @@ def _provider(monkeypatch, *, cuda=False, mps=False, device="auto", batch_size=N
 
 
 @pytest.fixture(autouse=True)
-def _fresh_warnings():
-    embedding._WARNED.clear()
+def _fresh_ef_cache():
     embedding._EF_CACHE.clear()
     yield
-    embedding._WARNED.clear()
     embedding._EF_CACHE.clear()
 
 
@@ -263,7 +261,6 @@ def test_invalid_batch_size_env_warns_once_and_means_the_device_default(
 ):
     import mempalace.config as config_mod
 
-    monkeypatch.setattr(config_mod, "_BATCH_SIZE_WARNED", set())
     monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE", raw)
     with caplog.at_level(logging.WARNING, logger="mempalace.config"):
         assert config_mod.MempalaceConfig().embeddinggemma2_batch_size is None
@@ -280,7 +277,6 @@ def test_invalid_batch_size_config_warns_once_and_means_the_device_default(
 ):
     import mempalace.config as config_mod
 
-    monkeypatch.setattr(config_mod, "_BATCH_SIZE_WARNED", set())
     eg2_config(embeddinggemma2_batch_size=raw)
     with caplog.at_level(logging.WARNING, logger="mempalace.config"):
         assert config_mod.MempalaceConfig().embeddinggemma2_batch_size is None

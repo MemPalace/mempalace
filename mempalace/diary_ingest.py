@@ -20,7 +20,6 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 
 from . import paths
@@ -39,6 +38,7 @@ from .palace import (
     write_file_drawers,
 )
 from .source_identity import identity_metadata
+from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +164,7 @@ def ingest_diaries(
         # not only on entry-count growth.
         content_changed = prev_hash is not None and curr_hash != prev_hash
 
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = utc_now_iso()
         entities = _extract_entities_for_metadata(text)
         source_file = str(diary_path)
 

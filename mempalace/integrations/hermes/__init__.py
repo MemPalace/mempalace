@@ -98,6 +98,8 @@ except ImportError:  # pragma: no cover - Hermes not installed
         """Stub used when ``agent.memory_provider`` cannot be imported."""
 
 
+# Named explicitly, not ``__name__``: Hermes can load this plugin by file path,
+# and the name must stay under ``mempalace`` either way.
 logger = logging.getLogger("mempalace.hermes")
 
 

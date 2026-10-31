@@ -9,15 +9,13 @@ class _MempalaceLogFilter(logging.Filter):
     Lets the ``MEMPALACE_LOG_FILE`` handler attach to an already-configured
     root logger (a host app embedding the server) without copying the
     host's — or a third-party library's — records into mempalace's diagnostic
-    file. mempalace loggers are ``mempalace`` / ``mempalace.*`` (the dotted
-    ``__name__`` family) plus the flat ``mempalace_mcp`` /
-    ``mempalace_format_miner`` / ``mempalace_hallways`` / ``mempalace_graph``
-    loggers — every one is prefixed ``mempalace``.
+    file. Every mempalace module logs through ``logging.getLogger(__name__)``,
+    so its records are ``mempalace`` or ``mempalace.*``.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         name = record.name
-        return name == "mempalace" or name.startswith(("mempalace.", "mempalace_"))
+        return name == "mempalace" or name.startswith("mempalace.")
 
 
 # Preserved across importlib.reload via globals(): a reload re-executes this
@@ -92,7 +90,9 @@ def _init_logging() -> None:
             file_handler = logging.FileHandler(log_file, mode="a", encoding="utf-8")
             # Pin the format: the embedded path never calls basicConfig, so
             # both paths set it here instead of relying on logging's default.
-            file_handler.setFormatter(logging.Formatter("%(message)s"))
+            # The file stream adds a timestamp + level so an appended line can
+            # be correlated across restarts; stderr stays bare (host-formatted).
+            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             # File is a mempalace-only diagnostic stream; keep host / library
             # records out so it stays useful when the handler rides on a
             # host-owned root logger.
@@ -117,7 +117,7 @@ def _init_logging() -> None:
         logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=handlers)
 
     if file_handler_error is not None:
-        logging.getLogger("mempalace_mcp").warning(
+        logging.getLogger(__name__).warning(
             "MEMPALACE_LOG_FILE=%r could not be opened (%s); file logging disabled",
             log_file,
             file_handler_error,
@@ -125,4 +125,4 @@ def _init_logging() -> None:
 
 
 _init_logging()
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)

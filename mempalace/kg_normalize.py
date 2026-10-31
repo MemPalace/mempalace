@@ -24,12 +24,12 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig
 from .fsio import atomic_write_json
 from .llm_client import parse_json_reply
+from .timeutil import utc_now_iso, utc_now_z
 
 NORMALIZE_SCHEMA_VERSION = 1
 DEFAULT_VOCABULARY = (
@@ -110,7 +110,7 @@ def plan_normalize(
         return {
             "schema_version": NORMALIZE_SCHEMA_VERSION,
             "vocabulary": list(vocabulary),
-            "planned_at": datetime.now(timezone.utc).isoformat(),
+            "planned_at": utc_now_iso(),
             "facts": [],
             "rejected": 0,
         }
@@ -153,7 +153,7 @@ def plan_normalize(
     return {
         "schema_version": NORMALIZE_SCHEMA_VERSION,
         "vocabulary": list(vocabulary),
-        "planned_at": datetime.now(timezone.utc).isoformat(),
+        "planned_at": utc_now_iso(),
         "proposed_by": f"{getattr(provider, 'name', 'llm')}/{getattr(provider, 'model', '')}",
         "facts": rows,
         "rejected": rejected,
@@ -199,7 +199,7 @@ def apply_normalize(kg, plan: dict, at: Optional[str] = None) -> dict:
     was closed or replaced while the plan sat under review is left alone
     and counted in ``stale`` instead of being resurrected.
     """
-    boundary = at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    boundary = at or utc_now_z()
     applied = skipped = stale = 0
     for row in plan["facts"]:
         if row["old_predicate"] == row["predicate"] and row["old_object"] == row["object"]:

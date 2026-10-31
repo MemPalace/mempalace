@@ -14,7 +14,6 @@ import os
 import stat
 import sys
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -52,8 +51,9 @@ from .palace import (
     write_file_drawers,
 )
 from .source_identity import identity_metadata, source_directory_identity
+from .timeutil import parse_timestamp, utc_now_iso
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 # Cached hall keywords — avoids re-reading config per drawer
 _HALL_KEYWORDS_CACHE = None
@@ -127,7 +127,7 @@ def file_conversation_exchange(
             "file_conversation_exchange: invalid room %r — filing under conversations", room
         )
         room = "conversations"
-    filed_at = datetime.now().isoformat()
+    filed_at = utc_now_iso()
     drawer_id = make_exchange_drawer_id(wing, room, source_file, filed_at, text)
     metadata = {
         "wing": wing,
@@ -239,7 +239,7 @@ def _register_file(
         "room": "_registry",
         "source_file": source_file,
         "added_by": agent,
-        "filed_at": datetime.now().isoformat(),
+        "filed_at": utc_now_iso(),
         "ingest_mode": "registry",
         "extract_mode": extract_mode,
         "normalize_version": NORMALIZE_VERSION,
@@ -609,6 +609,7 @@ def _extract_authored_at(filepath):
     if path.suffix != ".jsonl":
         return None
     latest = None
+    latest_instant = None
     try:
         with path.open(encoding="utf-8", errors="ignore") as fh:
             for line in fh:
@@ -619,10 +620,10 @@ def _extract_authored_at(filepath):
                     ts = json.loads(line).get("timestamp")
                 except (ValueError, TypeError, AttributeError):
                     continue
-                # ISO-8601 timestamps are strings; guard against a non-string
-                # ``timestamp`` so a malformed line can't raise TypeError on compare.
-                if isinstance(ts, str) and (latest is None or ts > latest):
+                instant = parse_timestamp(ts)
+                if instant is not None and (latest_instant is None or instant > latest_instant):
                     latest = ts
+                    latest_instant = instant
     except OSError:
         return None
     return latest
@@ -667,7 +668,7 @@ def _file_chunks_locked(
         # One filed_at per source file so all transcript drawers share an
         # ingest timestamp. Prefer the mtime captured with the read: a fresh
         # stat here can observe an append that this pass did not ingest.
-        filed_at = datetime.now().isoformat()
+        filed_at = utc_now_iso()
         if source_mtime is None:
             try:
                 source_mtime = os.path.getmtime(source_file)

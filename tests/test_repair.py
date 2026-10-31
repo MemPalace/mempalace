@@ -2281,8 +2281,8 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     Absence is not proven for it, which routes it to the probe.
 
     What happens there depends on the interpreter, measured on 3.9, 3.11, 3.12,
-    3.13 and 3.14: up to 3.12 ``pathname2url`` raises ``UnicodeEncodeError``
-    while building the URI, before SQLite is reached, and from 3.13 it
+    3.13 and 3.14: up to 3.11 ``pathname2url`` raises ``UnicodeEncodeError``
+    while building the URI, before SQLite is reached, and from 3.12 it
     percent-encodes the byte and the database opens normally. The first is a
     ``ValueError`` subclass, and the absence gate's docstring promises callers
     never see one; ``palace._validate_palace_fts5_after_mine`` and
@@ -2322,7 +2322,7 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     assert all("quick_check failed" in error for error in errors)
     assert not any("named pipe" in error for error in errors)
     assert repair.sqlite_integrity_status(palace).checked is True
-    if sys.version_info < (3, 13):
+    if sys.version_info < (3, 12):
         assert errors, "pathname2url raises here, and the probe has to report that"
 
 
@@ -3947,14 +3947,14 @@ def test_declined_heal_message_renders_as_one_log_record(tmp_path, caplog):
     ``_validate_palace_fts5_after_mine`` passes ``logger.warning`` as
     ``progress`` so the MCP process does not print into its JSON-RPC stream. A
     message that opens with a newline renders there as a bare
-    ``WARNING:mempalace_mcp:`` header above an empty line, which reads as a
+    ``WARNING:mempalace.mcp_server:`` header above an empty line, which reads as a
     truncated record rather than an explanation.
     """
     palace = _make_fts5_palace(tmp_path, corrupt=False)
     page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
 
-    logger = logging.getLogger("mempalace_mcp")
-    with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+    logger = logging.getLogger("mempalace.mcp_server")
+    with caplog.at_level(logging.WARNING, logger="mempalace"):
         repair.maybe_autoheal_fts5_index(palace, page_errors, progress=logger.warning)
 
     assert caplog.records, "the decline must be logged, not swallowed"

@@ -25,9 +25,10 @@ import re
 import stat
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple, Union
+
+from .timeutil import filename_stamp
 
 PathLike = Union[str, os.PathLike]
 
@@ -394,7 +395,7 @@ def move_aside(path: PathLike, *, label: str) -> Optional[str]:
     raises: a file that could not be moved is not one to write over.
     """
     path = write_target(path)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = filename_stamp()
     fd, target = open_new_temp_file(path.parent, prefix=f"{path.name}.{label}-{stamp}-")
     os.close(fd)
     try:

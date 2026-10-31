@@ -33,7 +33,7 @@ from .transport import (
     load_peers,
 )
 
-logger = logging.getLogger("mempalace.logsync")
+logger = logging.getLogger(__name__)
 
 _PULL_BATCH = 500
 

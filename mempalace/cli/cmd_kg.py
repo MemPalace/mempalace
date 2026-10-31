@@ -106,7 +106,8 @@ def _kg_import_legacy(args, config):
     conflicts = counts["triples"]["conflicts"]
     if conflicts:
         print(
-            f"\n  {len(conflicts)} current fact(s) not copied: this palace already holds a "
+            f"\n  {len(conflicts)} current fact(s) not copied: the target or an earlier "
+            "accepted source fact holds a "
             "different current value for the same subject and predicate. Add the ones "
             "you want by hand (kg_supersede or kg_add):"
         )
@@ -115,5 +116,14 @@ def _kg_import_legacy(args, config):
                 f"    {c['subject']} | {c['predicate']} | {c['object']} "
                 f"(here: {c['current_object']})"
             )
+    id_conflicts = counts["triples"]["id_conflicts"]
+    if id_conflicts:
+        print(
+            f"\n  {len(id_conflicts)} fact ID conflict(s) not copied: the target keeps "
+            "a different fact or validity window under the same ID. Review these "
+            "facts before importing them:"
+        )
+        for triple_id in id_conflicts:
+            print(f"    {triple_id}")
     if not apply:
         print("\n  Nothing written. Re-run with --yes to copy them.")

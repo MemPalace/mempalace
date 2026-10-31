@@ -2,7 +2,6 @@ import logging
 
 import pytest
 
-from mempalace import _env
 from mempalace._env import (
     env_bool,
     env_flag,
@@ -20,7 +19,6 @@ VAR = "MEMPALACE_TEST_ENV_VAR"
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     monkeypatch.delenv(VAR, raising=False)
-    monkeypatch.setattr(_env, "_warned", set())
 
 
 @pytest.mark.parametrize("raw", ["1", "true", "TRUE", " yes ", "Y", "on"])

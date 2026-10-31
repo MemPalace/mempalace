@@ -535,7 +535,7 @@ def tool_add_drawer(
         "room": room,
         "source_file": source_file or "",
         "added_by": added_by,
-        "filed_at": datetime.now().isoformat(),
+        "filed_at": utc_now_iso(),
         "id_recipe": ID_RECIPE,
     }
     if source_file:
@@ -1024,6 +1024,24 @@ def tool_mine(
     finally:
         if not dry_run:
             _invalidate_overview_caches()
+            _return_freed_heap_to_os()
+
+
+def _return_freed_heap_to_os() -> None:
+    """Ask glibc to hand freed heap pages back to the OS.
+
+    A mine frees a large amount of memory when it ends: its scans, its write
+    buffers, the client it closes. glibc keeps most of that in its arenas, so
+    a long-lived server's resident size stays near the mine's peak instead of
+    returning to where it started. No-op where there is no ``malloc_trim``
+    (musl, macOS, Windows).
+    """
+    try:
+        import ctypes
+
+        ctypes.CDLL(None).malloc_trim(0)
+    except Exception:
+        pass
 
 
 def tool_delete_by_source(source_file: str, dry_run: bool = True):
@@ -1468,7 +1486,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             if room != str(old_meta.get("room") or ""):
                 new_meta["room"] = room
 
-        new_meta["last_modified"] = datetime.now().isoformat()
+        new_meta["last_modified"] = utc_now_iso()
 
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size

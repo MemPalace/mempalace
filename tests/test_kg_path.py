@@ -37,7 +37,6 @@ def mcp(monkeypatch):
     from mempalace import mcp_server
 
     monkeypatch.setattr(mcp_server, "_kg_by_path", {})
-    monkeypatch.setattr(mcp_server, "_kg_notices_logged", set())
     monkeypatch.setattr(mcp_server, "_palace_flag_given", False)
     yield mcp_server
     for kg in mcp_server._kg_by_path.values():
@@ -229,7 +228,7 @@ def test_mcp_puts_the_notice_in_kg_responses_and_logs_it_once(
     _graph(os.path.join(palace, FILENAME), "full")
     _graph(paths.legacy_knowledge_graph_path(), "full")
 
-    with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+    with caplog.at_level(logging.WARNING, logger="mempalace"):
         stats = mcp.tool_kg_stats()
         query = mcp.tool_kg_query("alice")
 

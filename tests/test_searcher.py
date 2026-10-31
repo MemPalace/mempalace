@@ -6,7 +6,7 @@ plus mock-based tests for error paths.
 """
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -748,8 +748,8 @@ class TestSearchCLI:
         ):
             search("anything", fake_palace_path, since="2026-01-01", before="2026-02-01")
 
-        assert seen["since_dt"] == datetime(2026, 1, 1)
-        assert seen["before_dt"] == datetime(2026, 2, 1)
+        assert seen["since_dt"] == datetime(2026, 1, 1, tzinfo=timezone.utc)
+        assert seen["before_dt"] == datetime(2026, 2, 1, tzinfo=timezone.utc)
 
     def test_search_rejects_inverted_window_before_probing_a_diverged_index(self, fake_palace_path):
         """An inverted window is a caller error, so it must raise the same way
@@ -1240,8 +1240,8 @@ class TestSearchMemoriesDateFilter:
         result = search_memories(self.BROAD, palace_path, n_results=10)
         assert "undated.md" in [r["source_file"] for r in result["results"]]
 
-    def test_aware_filed_at_matches_wall_clock(self, palace_path, seeded_collection):
-        # diary_ingest stamps aware UTC; the window compares wall-clock fields.
+    def test_aware_filed_at_compared_as_instant(self, palace_path, seeded_collection):
+        # Writers stamp aware UTC; the window compares instants.
         seeded_collection.upsert(
             ids=["aware1"],
             documents=["Aware planning entry about database sprint authentication."],

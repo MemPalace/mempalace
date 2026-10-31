@@ -176,6 +176,23 @@ class TestPalaceExec:
         assert get_payload.get("room") == "test_room"
         assert "OAuth2 token rotation" in get_payload.get("content", "")
 
+    def test_write_releases_writer_lease(self, monkeypatch, config, collection, kg):
+        """The light server's writes take the peer-writer lease per call too."""
+        _patch_light_server(monkeypatch, config, kg)
+        mcp_server._release_mcp_writer_lock()
+        add_req = {
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_exec",
+                "arguments": 'ADD IN test_wing/test_room "lease release check" SOURCE lease.md',
+            },
+        }
+        res = mcp_light_server.handle_light_request(add_req)
+        assert json.loads(res["result"]["content"][0]["text"]).get("success") is True
+        assert mcp_server._MCP_WRITER_LOCK_CM is None
+
     def test_kg_add_and_query(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
         # 1. KG ADD

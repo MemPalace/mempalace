@@ -66,7 +66,6 @@ import os
 import re
 import sys
 from collections import defaultdict
-from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
@@ -98,6 +97,7 @@ from .palace import (
     write_file_drawers,
 )
 from .source_identity import identity_metadata, source_directory_identity
+from .timeutil import utc_now_iso
 
 __all__ = [
     "SUPPORTED_FORMATS",
@@ -114,7 +114,7 @@ __all__ = [
 MIN_CHUNK_SIZE = 50
 
 
-logger = logging.getLogger("mempalace_format_miner")
+logger = logging.getLogger(__name__)
 
 
 # Extensions MarkItDown can convert. Lowercase, leading dot. Case-insensitive
@@ -569,7 +569,7 @@ def _register_file(
         "source_file": source_file,
         "chunk_index": -1,
         "added_by": agent,
-        "filed_at": datetime.now().isoformat(),
+        "filed_at": utc_now_iso(),
         "ingest_mode": "extract",
         "extract_mode": "format",
         "normalize_version": NORMALIZE_VERSION,
@@ -646,7 +646,7 @@ def _file_chunks_locked(
         if file_already_mined(collection, source_file, check_mtime=True, extract_mode="format"):
             return 0, True
 
-        filed_at = datetime.now().isoformat()
+        filed_at = utc_now_iso()
         drawers = []
         for chunk in chunks:
             text = chunk["content"]
