@@ -173,6 +173,26 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
     return strip_lone_surrogates(value)
 
 
+def sanitize_kg_lookup(value: str, field_name: str = "value") -> str:
+    """Validate a knowledge-graph value that is only looked up, not created.
+
+    For arguments that name an already-stored subject or object (query,
+    invalidate, supersede's old value, timeline). Such a value may predate
+    the length cap or have been written by a path that skips it, so it must
+    stay addressable: same checks as sanitize_kg_value but with no length
+    limit. Names that are being written still go through sanitize_kg_value.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+
+    value = value.strip()
+
+    if "\x00" in value:
+        raise ValueError(f"{field_name} contains null bytes")
+
+    return strip_lone_surrogates(value)
+
+
 # ISO-8601 temporal validator for knowledge-graph temporal parameters
 # (as_of, valid_from, valid_to, ended).
 #

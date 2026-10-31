@@ -1022,6 +1022,65 @@ class TestWriteTools:
         assert result["wing"] == "StableWing"
         assert result["room"] == "stable_room"
 
+    def test_update_drawer_case_variant_with_existing_target_wing(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression for #2748: rename a drawer whose source wing is a
+        case-variant of an *existing* target wing.
+
+        #2395/#2426 proved the case-only rename applies when the destination
+        wing is fresh. The reporter in #2748 hit the bug on 3.10.0 with the
+        destination wing already populated (``wing_Codex`` had 1 drawer,
+        ``wing_codex`` had many). On pre-#2426 code the update returned
+        ``success:true`` but echoed the *old* wing and the drawer stayed put
+        (silent no-op); on current develop the rename applies and the
+        source wing is cleanly vacated.
+
+        This test pins that coexisting-wings scenario to the fix.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import (
+            tool_add_drawer,
+            tool_get_drawer,
+            tool_list_wings,
+            tool_update_drawer,
+        )
+
+        # Existing destination wing with several drawers (issue's "wing_codex
+        # has many" half).
+        for i in range(3):
+            existed = tool_add_drawer(
+                wing="wing_codex", room="general", content=f"existing codex drawer {i}"
+            )
+            assert existed["success"] is True, existed
+
+        # Source wing with the drawer we intend to move (issue's "wing_Codex
+        # has 1" half).
+        added = tool_add_drawer(wing="wing_Codex", room="diary", content="the drawer we are moving")
+        assert added["success"] is True
+        drawer_id = added["drawer_id"]
+
+        pre = tool_list_wings()
+        assert pre["wings"].get("wing_Codex") == 1
+        assert pre["wings"].get("wing_codex") == 3
+
+        res = tool_update_drawer(drawer_id, wing="wing_codex", room="diary")
+        assert res["success"] is True, res
+        # The echoed wing must be the caller's casing (the rename applied),
+        # not a stale echo of the old wing — the #2748 no-op symptom.
+        assert res["wing"] == "wing_codex", res
+
+        # Stored record must agree with the response.
+        stored = tool_get_drawer(drawer_id)
+        assert stored["wing"] == "wing_codex"
+        assert stored["room"] == "diary"
+
+        # Clean move: source wing is fully vacated, destination absorbed the
+        # drawer. No leftover ghost row, no counter drift (#2748 symptom).
+        post = tool_list_wings()
+        assert post["wings"].get("wing_codex") == 4
+        assert "wing_Codex" not in post["wings"]
+
     def test_update_drawer_content_purges_matching_closets(
         self, monkeypatch, config, palace_path, seeded_collection, kg
     ):
