@@ -546,4 +546,3 @@ def test_linux_uses_ofd_locks_even_when_fcntl_does_not_export_the_constant():
 
     assert M._F_OFD_SETLK == getattr(fcntl, "F_OFD_SETLK", 37) == 37
     assert M._ANCHORED is True and M._HOLD_LOCKS is False
-
