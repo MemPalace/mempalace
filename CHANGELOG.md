@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Bug Fixes
+### Fixed
 
 - **Replaying an identical closed historical assertion through `add_triple` returns the
   original row instead of storing a duplicate.** The dedup check matched only open triples
@@ -17,7 +17,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   assertion under a new id, and the as-of query returned the same fact twice. A replay must
   match subject, predicate, object, both bounds, confidence and all provenance columns; a
   recurring interval or an independently sourced assertion of the same interval stays two
-  separate facts. (#2598)
+  separate facts.
+- **A writer with a different `HOME` no longer bypasses the palace's writer
+  lock.** The lock that keeps one writer per palace lived only under
+  `~/.mempalace/locks`, so a process started with another `HOME` on the same
+  palace (a service account, a container, a profile manager) took its own lock
+  and wrote beside the holder. Writers now also lock
+  `.<palace-name>.mempalace.lock` next to the palace directory, which every
+  process that can write the palace contends for, and a different-`HOME`
+  writer is refused like any other second writer. The `~` lock is still taken
+  too, so an older and a newer version that share a `HOME` keep excluding each
+  other. When the palace's parent directory cannot hold the file, the file
+  there cannot be opened, or the name there is a link or anything but a
+  regular file, a warning is logged and only the `~` lock is used, as before.
+- Registered Chinese, Japanese, and Korean entities are tagged when adjacent to
+  other words or particles. Mixed-script names retain word boundaries on their
+  non-CJK edges.
+- Conversation mining compares transcript timestamps by instant rather than
+  text order, so mixed UTC offsets and fractional seconds select the correct
+  authored time. Invalid timestamps are ignored.
+- Hybrid search breaks authored-time ties by instant across UTC offsets.
+
+### Upgrade notes
+
+- Existing conversation drawers keep their metadata when an unchanged source is
+  skipped. For Chroma palaces with retained JSONL transcripts, run the
+  [authored-time backfill](docs/authored-at.md#backfilling-existing-memory) from
+  this checkout to correct previously selected timestamps without re-embedding.
+  Preview with the default dry run before adding `--apply`.
 
 ---
 
