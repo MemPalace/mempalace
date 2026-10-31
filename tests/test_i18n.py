@@ -57,6 +57,7 @@ def test_dialect_compress_samples():
         "zh-CN": "我们决定从SQLite迁移到PostgreSQL以获得更好的并发写入。Ben昨天批准了PR。",
         "id": "Kami memutuskan untuk migrasi dari SQLite ke PostgreSQL untuk penulisan bersamaan yang lebih baik. Ben telah menyetujui PR kemarin.",
         "be": "Мы вырашылі перайсці з SQLite на PostgreSQL для паляпшэння паралельнага запісу. Зміцер ухваліў PR ўчора.",
+        "ro": "Am decis să migrăm de la SQLite la PostgreSQL pentru scrieri concurente mai bune. Ben a aprobat PR-ul ieri.",
     }
 
     for lang, text in samples.items():
@@ -131,6 +132,21 @@ def test_fr_entity_section_loads():
     assert p["direct_address_patterns"], "fr: empty direct_address_patterns"
     assert p["project_verb_patterns"], "fr: empty project_verb_patterns"
     assert len(p["stopwords"]) > 50, f"fr: stopwords too short ({len(p['stopwords'])})"
+
+
+def test_ro_entity_section_loads():
+    """Romanian entity section loads all pattern lists non-empty."""
+    from mempalace.i18n import get_entity_patterns
+
+    p = get_entity_patterns(("ro",))
+    assert p["candidate_patterns"], "ro: empty candidate_patterns"
+    assert p["multi_word_patterns"], "ro: empty multi_word_patterns"
+    assert p["person_verb_patterns"], "ro: empty person_verb_patterns"
+    assert p["pronoun_patterns"], "ro: empty pronoun_patterns"
+    assert p["dialogue_patterns"], "ro: empty dialogue_patterns"
+    assert p["direct_address_patterns"], "ro: empty direct_address_patterns"
+    assert p["project_verb_patterns"], "ro: empty project_verb_patterns"
+    assert len(p["stopwords"]) > 50, f"ro: stopwords too short ({len(p['stopwords'])})"
 
 
 def test_direct_address_key_is_singular_string_for_all_locales():
@@ -210,3 +226,27 @@ def test_get_stopwords_every_locale_has_nonempty_set():
         sw = get_stopwords(lang)
         assert isinstance(sw, set)
         assert len(sw) > 0, f"{lang}: regex.stop_words missing or empty"
+
+
+def test_get_stopwords_ro_covers_diacritic_spellings():
+    """Romanian stop words match comma-below, cedilla and diacritic-less spellings."""
+    from mempalace.i18n import get_stopwords
+
+    ro = get_stopwords("RO")
+    assert all(w == w.lower() for w in ro)
+    for word in ("și", "şi", "si", "în", "in", "până", "pana", "pentru", "care", "este"):
+        assert word in ro, f"ro: missing stop word {word!r}"
+    # "într-un" tokenizes to "într" + "un": the fragment must be filtered too.
+    assert {"într", "intr", "dintr", "printr"} <= ro
+    for content_word in ("contract", "lege", "proiect", "factură"):
+        assert content_word not in ro, f"ro: content word {content_word!r} is a stop word"
+
+
+def test_ro_stop_words_filter_bm25_tokens():
+    """With the ro list, Romanian function words drop out of BM25 tokens."""
+    from mempalace.i18n import get_stopwords
+    from mempalace.lexical import tokenize
+
+    ro = frozenset(get_stopwords("ro"))
+    tokens = tokenize("Contractul de mentenanță și într-un final plata pentru facturi", ro)
+    assert tokens == ["contractul", "mentenanță", "final", "plata", "facturi"]

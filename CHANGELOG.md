@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Romanian locale `ro`, with BM25 stop words for lexical search.** CLI strings,
+  the AAAK instruction, entity-detection patterns and a `regex.stop_words` list of
+  Romanian function words (articles, prepositions, conjunctions, pronouns and
+  clitics, forms of *a fi* / *a avea* / *a vrea*, topic-free adverbs). Each word is
+  listed with comma-below diacritics (`și`, `ț`), the legacy cedilla spelling
+  (`şi`) and the diacritic-less spelling people type (`si`, `pana`, `intr`), so
+  `lang: ro` filters them whichever way a drawer was written.
+
 ---
 
 ## [3.12.0] — 2026-10-31
