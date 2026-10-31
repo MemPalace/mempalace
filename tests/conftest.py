@@ -51,7 +51,22 @@ os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 # the restore in ``_isolate_home`` and only ambient ones are removed: a test
 # that sets MEMPALACE_* through monkeypatch or an explicit subprocess env is
 # unaffected, because that happens after this module is imported.
-for _var in [_k for _k in os.environ if _k.startswith(("MEMPALACE_", "MEMPAL_"))]:
+_PRESERVE_TEST_ENV = {
+    "MEMPALACE_DOCS_GA_ID",
+    "MEMPALACE_PGVECTOR_LIVE_DSN",
+    "MEMPALACE_PGVECTOR_LIVE_URL",
+    "MEMPALACE_QDRANT_LIVE_API_KEY",
+    "MEMPALACE_QDRANT_LIVE_URL",
+    "MEMPALACE_REQUIRE_NATIVE",
+    "MEMPALACE_RUN_EG2_AUDIO",
+    "MEMPALACE_RUN_EG2_IMAGE",
+    "MEMPALACE_TEST_EMBEDDINGGEMMA_ONNX",
+}
+for _var in [
+    _k
+    for _k in os.environ
+    if _k.startswith(("MEMPALACE_", "MEMPAL_")) and _k not in _PRESERVE_TEST_ENV
+]:
     _original_env[_var] = os.environ.pop(_var)
 
 # Now it is safe to import mempalace modules that trigger initialisation.
