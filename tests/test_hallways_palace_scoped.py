@@ -158,7 +158,7 @@ class TestMultiPalaceIsolation:
                 }
             ]
         )
-        assert os.path.exists(str(tmp_path / "a" / "hallways.json"))
+        assert os.path.exists(str(tmp_path / "a" / "hallways.sqlite3"))
 
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace_b))
         assert hallways_mod._load_hallways() == []

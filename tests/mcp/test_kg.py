@@ -585,4 +585,100 @@ class TestKGLazyCache:
         assert query_a.get("count", 0) >= 1, f"tenant A lost its own fact: {query_a}"
 
 
+class TestKGLookupLengthCap:
+    """Tools that only look up a stored value must not cap its length.
+
+    A fact whose object is longer than MAX_NAME_LENGTH can already be in the
+    graph (written before the cap existed, or by a path that skips it). The
+    tools have to stay able to end, supersede and query it, while new names
+    are still capped.
+    """
+
+    LONG = "x" * 130
+
+    def test_invalidate_long_object(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        kg.add_triple("Bot", "notes", self.LONG, valid_from="2026-05-01")
+        result = tool_kg_invalidate(
+            subject="Bot", predicate="notes", object=self.LONG, ended="2026-06-01"
+        )
+        assert result["success"] is True, result
+        current = [
+            f
+            for f in kg.query_entity("Bot", as_of="2026-07-01", direction="outgoing")
+            if f["predicate"] == "notes"
+        ]
+        assert current == []
+
+    def test_supersede_long_old_object(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_supersede
+
+        kg.add_triple("Bot", "notes", self.LONG, valid_from="2026-05-01")
+        result = tool_kg_supersede(
+            subject="Bot",
+            predicate="notes",
+            old_object=self.LONG,
+            new_object="short",
+            at="2026-06-02",
+        )
+        assert result["success"] is True, result
+        notes = [
+            f["object"]
+            for f in kg.query_entity("Bot", as_of="2026-06-02", direction="outgoing")
+            if f["predicate"] == "notes"
+        ]
+        assert notes == ["short"]
+        before = [
+            f["object"]
+            for f in kg.query_entity("Bot", as_of="2026-05-15", direction="outgoing")
+            if f["predicate"] == "notes"
+        ]
+        assert before == [self.LONG]
+
+    def test_query_long_entity(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        kg.add_triple("Bot", "notes", self.LONG, valid_from="2026-05-01")
+        result = tool_kg_query(entity=self.LONG)
+        assert "error" not in result, result
+        assert result["count"] == 1
+
+    def test_timeline_long_entity(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_timeline
+
+        kg.add_triple("Bot", "notes", self.LONG, valid_from="2026-05-01")
+        result = tool_kg_timeline(entity=self.LONG)
+        assert "error" not in result, result
+        assert len(result["timeline"]) == 1
+
+    def test_add_still_caps_object(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(subject="Bot", predicate="notes", object="y" * 200)
+        assert result["success"] is False
+        assert "exceeds maximum length" in result["error"]
+
+    def test_supersede_still_caps_new_object(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_supersede
+
+        kg.add_triple("Bot", "notes", "old", valid_from="2026-05-01")
+        result = tool_kg_supersede(
+            subject="Bot", predicate="notes", old_object="old", new_object="y" * 200
+        )
+        assert result["success"] is False
+        assert "new_object exceeds maximum length" in result["error"]
+        assert [
+            f["object"]
+            for f in kg.query_entity("Bot", direction="outgoing")
+            if f["predicate"] == "notes"
+        ] == ["old"]
+
+
 # ── Structured error codes + MineAlreadyRunning (#1552) ─────────────────
