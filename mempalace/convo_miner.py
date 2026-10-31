@@ -17,6 +17,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
+from ._source_state import source_fingerprint
 from .backends import PalaceNotFoundError
 from .entities import entities_metadata
 from .fsio import encoding_metadata, open_source_file
@@ -216,6 +217,7 @@ def _register_file(
     agent: str,
     extract_mode: str,
     source_mtime: Optional[float] = None,
+    source_metadata: Optional[dict] = None,
 ):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
@@ -223,16 +225,11 @@ def _register_file(
     re-read and re-processed on every mine run because nothing was written to
     ChromaDB on the first pass.
 
-    Stamps source_mtime like every real drawer does, so a file that later
+    Stamps the verified source state like every real drawer does, so a file that later
     grows past the min-chunk-size floor (e.g. a short session that gets
     extended) is correctly detected as changed on the next mine instead of
     being skipped forever by this sentinel.
     """
-    if source_mtime is None:
-        try:
-            source_mtime = os.path.getmtime(source_file)
-        except OSError:
-            source_mtime = None
     sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
     meta = {
         "wing": wing,
@@ -250,6 +247,7 @@ def _register_file(
         meta[key] = version
     if source_mtime is not None:
         meta["source_mtime"] = source_mtime
+    meta.update(source_metadata or {})
     write_file_drawers(
         collection,
         source_file,
@@ -640,6 +638,7 @@ def _file_chunks_locked(
     authored_at=None,
     source_dir_ino=None,
     source_mtime: Optional[float] = None,
+    source_metadata: Optional[dict] = None,
     transforms: str = "",
     source_encoding: str = "utf-8",
     aaak_col=None,
@@ -649,7 +648,7 @@ def _file_chunks_locked(
     The lock stops concurrent agents from duplicating work, and
     ``write_file_drawers`` files the fresh chunks before it drops the stale
     ones. That rebuild fires on either a normalize-version bump or a
-    changed/grown source file (mtime differs from what's stored) --
+    changed/grown source file (fingerprint differs from what's stored) --
     transcripts are not assumed immutable, since a Claude Code session keeps
     appending to its own file while active and /compact or /clear can rewrite
     one in place.
@@ -661,19 +660,20 @@ def _file_chunks_locked(
     room_counts_delta: dict = defaultdict(int)
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
-        # at the current schema/mtime.
-        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
+        # at the current schema/fingerprint.
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            extract_mode=extract_mode,
+            check_source_fingerprint=True,
+        ):
             return 0, room_counts_delta, True
 
         # One filed_at per source file so all transcript drawers share an
         # ingest timestamp. Prefer the mtime captured with the read: a fresh
         # stat here can observe an append that this pass did not ingest.
         filed_at = utc_now_iso()
-        if source_mtime is None:
-            try:
-                source_mtime = os.path.getmtime(source_file)
-            except OSError:
-                source_mtime = None
         drawers = []
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
@@ -699,6 +699,7 @@ def _file_chunks_locked(
                 meta[key] = version
             if source_mtime is not None:
                 meta["source_mtime"] = source_mtime
+            meta.update(source_metadata or {})
             if transforms:
                 # Every drawer of a file whose parse changed its text: the
                 # RFC 002 transformations it applied.
@@ -748,26 +749,19 @@ def _is_ai_tool_path(path: Path) -> bool:
     return False
 
 
-def _is_unchanged_since_last_mine(source_file: str, mined_mtimes: dict) -> bool:
-    """True iff source_file was mined at the current schema AND its on-disk
-    mtime still matches what was stored -- the mtime-aware replacement for
-    "we've seen this source_file before" (transcripts are not immutable).
+def _is_unchanged_since_last_mine(source_file: str, mined_fingerprints: dict) -> bool:
+    """Skip only a complete, verified snapshot matching the source exactly.
 
-    False (re-mine) whenever the file isn't in mined_mtimes at all, its
-    stored mtime is None (never recorded -- pre-mtime-tracking drawer, or
-    getmtime failed when it was written), or getmtime fails right now
-    (treat as changed rather than silently trusting stale data).
+    Legacy rows without a fingerprint need one re-mine. A failed stat also
+    leaves the source eligible rather than trusting stale content.
     """
-    if source_file not in mined_mtimes:
-        return False
-    stored_mtime = mined_mtimes[source_file]
-    if stored_mtime is None:
+    fingerprint = mined_fingerprints.get(source_file)
+    if fingerprint is None:
         return False
     try:
-        current_mtime = os.path.getmtime(source_file)
+        return fingerprint == source_fingerprint(os.stat(source_file))
     except OSError:
         return False
-    return abs(stored_mtime - current_mtime) < 0.001
 
 
 def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
@@ -879,6 +873,7 @@ def _normalize_convo_conversations(
     agent: str,
     extract_mode: str,
     dry_run: bool,
+    source_metadata: Optional[dict] = None,
 ) -> Optional[tuple[list, float]]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
@@ -889,21 +884,33 @@ def _normalize_convo_conversations(
     On success the second item is the mtime from the same ``fstat`` as the
     read. Callers stamp that value; they must not stat the file again.
     """
+    if source_metadata is None:
+        source_metadata = {}
     try:
-        conversations, source_mtime = normalize_conversations_with_mtime(str(filepath))
+        conversations, source_mtime = normalize_conversations_with_mtime(
+            str(filepath), source_metadata=source_metadata
+        )
         conversations = [c for c in conversations if c]
-    except UnparsedCodexTranscriptError as exc:
+    except (OSError, UnparsedCodexTranscriptError) as exc:
         logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
         return None
-    except (OSError, ValueError):
+    except ValueError:
         if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+            _register_file(
+                collection, source_file, wing, agent, extract_mode, source_metadata=source_metadata
+            )
         return None
 
     if not any(c.strip() for c in conversations):
         if not dry_run:
             _register_file(
-                collection, source_file, wing, agent, extract_mode, source_mtime=source_mtime
+                collection,
+                source_file,
+                wing,
+                agent,
+                extract_mode,
+                source_mtime=source_mtime,
+                source_metadata=source_metadata,
             )
         return None
 
@@ -1000,16 +1007,19 @@ def _mine_convos_impl(
     )
     aaak_col = None if dry_run else open_aaak_collection(palace_path)
 
-    # Bulk pre-fetch already-mined source_file -> stored mtime in one
+    # Bulk pre-fetch already-mined source_file -> verified fingerprint in one
     # paginated pass instead of `len(files)` separate WHERE-source_file
     # queries. On a 150k-drawer palace each per-file query costs ~2s, so a
     # 2000-file sweep used to spend >1h just deciding to skip.
     # prefetch_mined_set() does the same decisions in a single scan; loop
-    # body becomes an O(1) dict lookup + a cheap local mtime comparison.
+    # body becomes an O(1) dict lookup + a cheap local stat comparison.
     candidate_source_files = [str(f) for f in files]
-    mined_mtimes: dict = (
+    mined_fingerprints: dict = (
         prefetch_mined_set(
-            collection, extract_mode=extract_mode, source_files=candidate_source_files
+            collection,
+            extract_mode=extract_mode,
+            source_files=candidate_source_files,
+            source_fingerprints=True,
         )
         if collection is not None
         else {}
@@ -1036,7 +1046,7 @@ def _mine_convos_impl(
             # Falling through re-mines: _file_chunks_locked drops this
             # source_file's stale drawers once the fresh ones are filed, so
             # this never leaves duplicates behind.
-            if _is_unchanged_since_last_mine(source_file, mined_mtimes):
+            if _is_unchanged_since_last_mine(source_file, mined_fingerprints):
                 files_skipped += 1
                 continue
 
@@ -1044,6 +1054,7 @@ def _mine_convos_impl(
                 files_skipped += 1
                 continue
 
+            source_metadata: dict = {}
             with recording_transforms(spellcheck=spellcheck) as normalize_run:
                 normalized = _normalize_convo_conversations(
                     filepath,
@@ -1053,6 +1064,7 @@ def _mine_convos_impl(
                     agent,
                     extract_mode,
                     dry_run,
+                    source_metadata=source_metadata,
                 )
             if normalized is None:
                 continue
@@ -1085,6 +1097,7 @@ def _mine_convos_impl(
                         agent,
                         extract_mode,
                         source_mtime=source_mtime,
+                        source_metadata=source_metadata,
                     )
                 continue
 
@@ -1129,6 +1142,7 @@ def _mine_convos_impl(
                 authored_at=_extract_authored_at(filepath),
                 source_dir_ino=source_directory_identity(filepath),
                 source_mtime=source_mtime,
+                source_metadata=source_metadata,
                 transforms=normalize_run.transforms,
                 source_encoding=normalize_run.encoding,
                 aaak_col=aaak_col,
