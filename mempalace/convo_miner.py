@@ -297,7 +297,7 @@ def _source_file_stored_drawers(collection, source_file: str, extract_mode: str)
     Same row scoping as ``_source_file_delete_ids`` (which decides which
     drawers belong to this convo-miner pass), but also returns the documents
     so an incremental re-mine can byte-compare each stored chunk against the
-    re-derived one and skip the identical ones (#2336). Raises on backend
+    re-derived one and skip the identical ones. Raises on backend
     errors so the caller can fall back to the legacy full-purge path.
     """
     stored: dict = {}
@@ -345,7 +345,7 @@ def _plan_pass_drawers(
     Pure construction — the collection is never touched — so the legacy
     full-purge path and the incremental path derive identical metadata from
     the same code. The incremental path additionally byte-compares these
-    documents against the stored rows before upserting (#2336).
+    documents against the stored rows before upserting.
     """
     room_counts_delta: dict = defaultdict(int)
     docs: list = []
@@ -381,7 +381,7 @@ def _plan_pass_drawers(
         if source_dir_ino:
             # Which directory this transcript was read from, so
             # ``sync`` can tell a neighbour in the same directory
-            # from one on a volume mounted there since (#2320).
+            # from one on a volume mounted to that directory.
             meta["source_dir_ino"] = source_dir_ino
         if transforms:
             # Every drawer of a file whose parse changed its text: the
@@ -390,10 +390,9 @@ def _plan_pass_drawers(
         meta.update(encoding_metadata(source_encoding))
         if extract_mode in CHUNKER_VERSIONS:
             # Conversation rows carry the chunker version so the mined-set
-            # checks treat an older/missing row as stale and rebuild it once
-            # (#2591 #2590). Stamped in the single place this pass's metadata
-            # is built, so the legacy and incremental paths stay byte-identical
-            # (#2336).
+            # checks treat an older/missing row as stale and rebuild it once.
+            # Stamped in the single place this pass's metadata
+            # is built, so the legacy and incremental paths stay byte-identical.
             key, version = CHUNKER_VERSIONS[extract_mode]
             meta[key] = version
         # Stamp content_hash only on chunk 0 so multi-conversation
@@ -781,7 +780,8 @@ def _extract_authored_at(filepath):
 # inside ``_file_chunks_locked``'s outer ``try`` (the legacy rebuild handler);
 # without the marker that handler would run the source-wide partial cleanup a
 # SECOND time, deleting the byte-identical drawers the incremental path was
-# preserving (PR #2439 P1: a crash must leave the existing palace untouched).
+# preserving — the fail-safe requirement that a crash must leave the
+# existing palace untouched.
 # We keep the attribute (rather than a sentinel type) so the operator still
 # sees the backend's real error type + message.
 _INCREMENTAL_ROLLED_BACK = "_convo_incremental_rolled_back"
@@ -797,7 +797,7 @@ def _apply_incremental_pass(
     metas,
     room_counts_delta,
 ) -> tuple:
-    """Execute the incremental re-mine (bounded slice, #2336).
+    """Execute the incremental re-mine (bounded slice).
 
     Purges only the orphans this pass will not rewrite, upserts only the
     changed / new drawers (batched), and refreshes the bookkeeping
@@ -812,7 +812,7 @@ def _apply_incremental_pass(
     were never in the upsert set) in place. The source-wide partial
     cleanup belongs to the legacy rebuild only — that path deletes the
     full set before upserting, so a mid-file crash there is lossy
-    regardless (fail-safe: re-file from scratch, #2122 / #2183 / #2403).
+    regardless (fail-safe: re-file from scratch).
     The metadata-only ``update()`` failure is fail-safe only (wasteful,
     never lossy) and does NOT fall into any cleanup.
     """
@@ -821,7 +821,8 @@ def _apply_incremental_pass(
     # position N no longer maps to the old chunk N). Identical
     # and changed chunks are both rewritten in place by the
     # upsert below — no delete needed for id correctness
-    # (drawer ids are positional, #2336), and upsert-overwrite
+    # (drawer ids are positional, as this re-file rewrites by index),
+    # and upsert-overwrite
     # re-embeds the changed content exactly like a rebuild.
     keep_ids = set(ids)
     orphan_ids = [drawer_id for drawer_id in incremental if drawer_id not in keep_ids]
@@ -888,12 +889,12 @@ def _apply_incremental_pass(
                 upserted_ok_ids.extend(batch_ids)
         drawers_added = len(upsert_ids)
     except Exception as exc:
-        # Targeted rollback (PR #2439 P1): delete only the chunks this
+        # Targeted rollback: delete only the chunks this
         # pass successfully upserted before the later batch failed. The
         # unchanged, byte-identical drawers are NOT in upsert_ids (they
         # were routed to skip_ids), so they survive the crash — the
         # documented requirement that a mid-file crash leaves the
-        # existing palace untouched (#2122 / #2183 / #2403 fail-safe).
+        # existing palace untouched (fail-safe).
         # The source-wide ``cleanup_partial()`` is NOT invoked here;
         # that semantic belongs to the legacy rebuild only, where the
         # full set was already deleted before the upsert started.
@@ -920,7 +921,7 @@ def _apply_incremental_pass(
         # which is exactly right when the pass has no mtime.
         # If this fails the skipped rows simply keep their old
         # mtime and the file is re-mined next pass: wasteful,
-        # never lossy (#2336 fail-safe) — so it must NOT fall
+        # never lossy (fail-safe) — so it must NOT fall
         # through to the full-rebuild cleanup, where the
         # already-upserted changed chunks would be deleted and
         # re-filed needlessly.
@@ -970,7 +971,7 @@ def _file_chunks_locked(
 
     Two paths share this contract:
 
-    * **Incremental** (preferred, #2336): the file was already mined at the
+    * **Incremental** (preferred): the file was already mined at the
       current schema, so only the delta is written. Stored drawers whose
       re-derived document is byte-identical are left exactly as stored —
       not re-embedded, not re-filed — and only stored ids this pass will
@@ -990,7 +991,7 @@ def _file_chunks_locked(
       before. A failed purge must abort this file's mine attempt rather
       than fall through to upsert: proceeding on top of an unpurged (or
       partially purged) set produces duplicate/stale drawers, with no
-      operator-visible signal beyond a debug log (#105 — convo_miner's
+      operator-visible signal beyond a debug log (the pre-existing
       own instance of the same swallow already fixed for miner.py at
       #23). Returning here leaves the old drawers' stored mtime
       untouched, so the next mine still sees a mismatch and retries.
@@ -1003,8 +1004,8 @@ def _file_chunks_locked(
     escalates to the full rebuild.
 
     Reliability of an interrupted re-mine (data loss between the purge
-    and the re-file of changed chunks) is tracked separately as #2403;
-    both paths retain the ``chunk_total`` completion guard from #2183 so
+    and the re-file of changed chunks) is tracked separately;
+    both paths retain the ``chunk_total`` completion guard so
     a mid-file crash is still detectable on the next pass.
 
     Returns (drawers_added, room_counts_delta, skipped). Raises
@@ -1023,10 +1024,10 @@ def _file_chunks_locked(
         # legacy purge must run in that order — purging first would destroy
         # the stored rows the incremental path needs to byte-compare, and a
         # "purge-then-rebuild" failure would wipe the source-wide set even
-        # though the incremental path had not touched it (#2439: on a crash
+        # though the incremental path had not touched it (crash-safety:
         # the unchanged drawers must survive). The legacy full-rebuild
         # path below owns the purge and returns PURGE_FAILED if it
-        # raises (#105).
+        # raises (the same swallow that was already fixed for miner.py).
 
         # Batch chunks into bounded upserts so large transcripts keep most of
         # the embedding speedup without one huge Chroma/SQLite request. Keep
@@ -1035,7 +1036,7 @@ def _file_chunks_locked(
         #
         # Every drawer of this pass carries ``chunk_total`` so
         # ``file_already_mined`` / ``prefetch_mined_set`` can tell a complete
-        # multi-batch mine from one that crashed mid-file (#2183). Without it
+        # multi-batch mine from one that crashed mid-file. Without it
         # a stable mtime + any surviving drawer permanently skips the file
         # and the missing exchanges never come back.
         filed_at = datetime.now().isoformat()
