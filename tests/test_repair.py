@@ -4,7 +4,6 @@ import errno
 import logging
 import os
 import sqlite3
-import sys
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
@@ -2280,20 +2279,28 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     through ``surrogateescape``, so a palace can legitimately live under one.
     Absence is not proven for it, which routes it to the probe.
 
-    What happens there depends on the interpreter, measured on 3.9, 3.11, 3.12,
-    3.13 and 3.14: up to 3.12 ``pathname2url`` raises ``UnicodeEncodeError``
-    while building the URI, before SQLite is reached, and from 3.13 it
-    percent-encodes the byte and the database opens normally. The first is a
-    ``ValueError`` subclass, and the absence gate's docstring promises callers
-    never see one; ``palace._validate_palace_fts5_after_mine`` and
-    ``cli.cmd_repair`` both call this without a guard, so raising there is a
-    traceback out of ``mempalace mine`` and ``mempalace repair`` on a database
-    sitting right at the end of that path.
+    What happens there depends on how ``pathname2url`` encodes the name, which
+    is set by the interpreter's filesystem-encoding error handler, not directly
+    by its version. CPython 3.13 and later build the URI with the
+    filesystem's own handler (``sys.getfilesystemencodeerrors()``), and on the
+    usual ``surrogateescape`` setting that handler percent-encodes the byte and
+    the database opens normally; ``quote()``'s ``errors=`` argument is exactly
+    that call, so reading it is the discriminator on every CPython in range.
+    Older builds pass ``strict`` to ``quote()``, and there ``pathname2url``
+    raises ``UnicodeEncodeError`` before SQLite is reached. Either way the
+    first is a ``ValueError`` subclass and the probe behind the absence gate
+    has to answer it rather than let it escape; ``palace._validate_palace_fts5_
+    after_mine`` and ``cli.cmd_repair`` both call this without a guard, so a
+    raise either way is a traceback out of ``mempalace mine`` and ``mempalace
+    repair`` on a database sitting right at the end of that path.
 
-    The invariant asserted here is that the call answers. The version-gated
-    half is what pins the ``ValueError`` catch on the versions where it is
-    reachable at all. Filesystems that enforce UTF-8 names cannot hold this
-    palace, so there the state does not exist and the test says so.
+    The invariant asserted here is that the call answers. The handler-gated
+    half is what pins the ``ValueError`` catch on the interpreters where it is
+    reachable at all: a strict handler must report it, and the usual
+    ``surrogateescape`` handler percent-encodes so the same name must come
+    back as a clean verdict instead, and that clean read is asserted.
+    Filesystems that enforce UTF-8 names cannot hold this palace, so there the
+    state does not exist and the test says so.
     """
     palace = os.fsdecode(os.path.join(os.fsencode(str(tmp_path)), b"pal\xff"))
     try:
@@ -2322,8 +2329,31 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     assert all("quick_check failed" in error for error in errors)
     assert not any("named pipe" in error for error in errors)
     assert repair.sqlite_integrity_status(palace).checked is True
-    if sys.version_info < (3, 13):
+    # The split depends on how pathname2url encodes the name, and that is set
+    # by the interpreter's filesystem-encoding error handler (sys.
+    # getfilesystemencodeerrors()), not by its version: builds whose
+    # pathname2url builds the URI via quote() with that handler percent-encode
+    # a surrogateescape/ignore byte, while any build whose pathname2url
+    # hard-codes strict encoding lets pathname2url raise before SQLite is
+    # reached. Rather than infer which is active from the version — the change
+    # landed on different CPython releases — mirror the code under test and ask
+    # pathname2url directly, so the gate holds on every CPython and locale.
+    try:
+        from urllib.request import pathname2url
+
+        pathname2url(os.path.join(palace, "chroma.sqlite3"))
+        encodable = True
+    except UnicodeEncodeError:
+        encodable = False
+    if not encodable:
+        # pathname2url raised: the ValueError must surface through the probe.
         assert errors, "pathname2url raises here, and the probe has to report that"
+    else:
+        # pathname2url encoded the byte cleanly, so the database opens and
+        # quick_check answers ok: there is nothing for the probe to report.
+        assert not errors, (
+            f"pathname2url encoded the byte cleanly, yet the probe reported: {errors}"
+        )
 
 
 @needs_posix_path_errno
