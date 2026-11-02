@@ -16,16 +16,17 @@ uv sync --extra dev
 # Or with pip in your own venv:
 # pip install -e ".[dev]"
 
-# Activate pre-commit hooks (one-time, per clone)
+# Install commit and push hooks (one-time, per clone)
 pre-commit install
 ```
 
-The `pre-commit install` step is important: the repo has a
-`.pre-commit-config.yaml` that pins ruff to the exact version CI uses,
-but the actual git hook is per-machine and **must be installed
-locally**. Without this step, you can commit code that passes your
-local lint (using whatever ruff version you happen to have installed)
-but fails CI on push.
+Run `pre-commit install` after setup, including in existing clones, to install
+both hooks. Linked Git worktrees share the clone's hooks. The configuration pins
+Ruff to the same version as the merge checks. Commits fix Python lint and formatting;
+pushes check changed Python files with `ruff check` and `ruff format --check`
+without editing them. When Rust files change, pushes also run
+`cargo fmt --all --check` for the workspace; install Rust with the `rustfmt`
+component for that check. Push hooks run no type checks or tests.
 
 ## Running Tests
 

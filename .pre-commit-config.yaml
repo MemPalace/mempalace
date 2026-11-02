@@ -1,3 +1,5 @@
+default_install_hook_types: [pre-commit, pre-push]
+
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Keep this rev in lock-step with the exact ruff pin in pyproject.toml
@@ -8,4 +10,22 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
+        stages: [pre-commit]
       - id: ruff-format
+        stages: [pre-commit]
+      - id: ruff
+        name: ruff check (pre-push)
+        stages: [pre-push]
+      - id: ruff-format
+        name: ruff format --check (pre-push)
+        args: [--check]
+        stages: [pre-push]
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check (pre-push)
+        entry: cargo fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
