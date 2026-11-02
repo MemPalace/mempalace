@@ -1,0 +1,11 @@
+# Inert operator template. Configure paths and approve a dry-run before installation.
+[Unit]
+Description=Propose checks for repeated structured review failures
+ConditionPathExists=/etc/review-audit/approved
+
+[Service]
+Type=oneshot
+UMask=0077
+EnvironmentFile=/etc/review-audit/operator.env
+ExecStart=/opt/review-tooling/.venv/bin/python /opt/review-tooling/tools/review_audit.py --publish --verdict-root ${REVIEW_AUDIT_VERDICT_ROOT} --state-dir ${REVIEW_AUDIT_STATE_DIR} --endpoint ${REVIEW_AUDIT_ENDPOINT} --token-file ${REVIEW_AUDIT_TOKEN_FILE} --board ${REVIEW_AUDIT_BOARD}
+NoNewPrivileges=true

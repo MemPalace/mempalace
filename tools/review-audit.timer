@@ -1,0 +1,12 @@
+# Opt-in template only; copying this repository never installs or enables it.
+[Unit]
+Description=Weekly repeated-review-failure audit
+
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=15m
+Persistent=true
+Unit=review-audit.service
+
+[Install]
+WantedBy=timers.target
