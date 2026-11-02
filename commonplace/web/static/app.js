@@ -523,6 +523,7 @@ async function refresh({ background = false, events = [] } = {}) {
     return true;
   } catch (error) {
     if (!current() || !state.me) return;
+    if (state.base === "#/rules") rulesUI.force = false;
     showError(error.message);
     if (!root.querySelector("#content").children.length) root.querySelector("#content").innerHTML = message(error.message, true);
     return false;
@@ -861,7 +862,7 @@ root.addEventListener("click", async (event) => {
       restore(saved);
       root.querySelector(`.cs [data-path="${CSS.escape(b.dataset.path)}"]`)?.focus({ preventScroll: true });
     } else if (action === "backlog") { state.backlog = !state.backlog; const saved = remember(); boardView(); restore(saved); }
-    else if (action === "retry") await refresh();
+    else if (action === "retry") await refresh({ background: state.base === "#/rules" && rulesUI.busy() });
     else if (action === "older-messages") await olderMessages();
     else if (action === "space-tab") {
       voice.stop();

@@ -566,6 +566,151 @@ def test_suggestions_do_not_change_rules_and_acceptance_is_versioned(hub, env):
     assert env.owner.list_rules()["rules"] == [retired]
 
 
+@pytest.mark.parametrize("summary_only", [False, True])
+def test_suggestion_prompt_base_rejects_delayed_reply_atomically(hub, env, summary_only):
+    original = (
+        env.owner.create(env.agent.actor, "Original effective text", "instruction")
+        if summary_only
+        else publish(env)
+    )
+    effective = env.worker.rules_get(effective=True, format="md")
+    current = env.owner.edit(
+        original["id"],
+        original["version"],
+        **({"summary": "Display only."} if summary_only else {"text": "Current owner text"}),
+    )
+    assert current["version"] == original["version"] + 1
+    after_edit = env.worker.rules_get(effective=True, format="md")
+    if summary_only:
+        assert current["text"] == original["text"]
+        assert current["status"] == original["status"] == "accepted"
+        assert after_edit["rules_seq"] == effective["rules_seq"]
+    listing = env.owner.list_rules()
+    history = env.owner.history(original["id"])
+    emitted = events.after(hub.db, hub.workspace)
+    assert api(
+        hub,
+        env.cookie,
+        "POST",
+        f"/api/rules/{original['id']}/suggestions",
+        {"text": "Delayed reply", "from_agent": "helper", "base_version": original["version"]},
+    ) == (409, {"error": "rule changed", "current": current})
+    assert env.owner.list_rules() == listing
+    assert listing["suggestions"] == []
+    assert env.owner.history(original["id"]) == history
+    assert env.owner.store.seq == current["seq"]
+    assert env.worker.rules_get(effective=True, format="md")["rules_seq"] == after_edit["rules_seq"]
+    assert events.after(hub.db, hub.workspace) == emitted
+
+
+def test_suggestion_prompt_base_matching_is_verbatim_until_owner_accepts(hub, env):
+    current = env.owner.create(env.agent.actor, "Original rule", "instruction")
+    text = '  Clearer\n\t<rule> "& 日本語\n  '
+    listing = env.owner.list_rules()
+    history = env.owner.history(current["id"])
+    effective = env.worker.rules_get(effective=True, format="md")["rules_seq"]
+    emitted = events.after(hub.db, hub.workspace)
+    status, suggestion = api(
+        hub,
+        env.cookie,
+        "POST",
+        f"/api/rules/{current['id']}/suggestions",
+        {"text": text, "from_agent": "helper", "base_version": current["version"]},
+    )
+    assert status == 201
+    assert suggestion["text"] == text and suggestion["base_version"] == current["version"]
+    assert suggestion["status"] == "open"
+    assert env.owner.list_rules() == {**listing, "suggestions": [suggestion]}
+    assert env.owner.history(current["id"]) == history
+    assert env.owner.store.seq == current["seq"]
+    assert env.worker.rules_get(effective=True, format="md")["rules_seq"] == effective
+    new_events = events.after(hub.db, hub.workspace)[len(emitted) :]
+    assert [(event["kind"], event["data"]) for event in new_events] == [
+        (
+            "rule.suggestion",
+            {"rule_id": current["id"], "suggestion_id": suggestion["id"], "action": "stored"},
+        )
+    ]
+    accepted = env.owner.decide_suggestion(suggestion["id"], "accept", current["version"])
+    assert accepted["text"] == text and accepted["version"] == current["version"] + 1
+    assert env.owner.history(current["id"])[-1]["text"] == text
+
+
+def test_suggestion_prompt_base_omission_keeps_legacy_storage_time_version(hub, env):
+    original = publish(env)
+    current = env.owner.edit(original["id"], original["version"], text="Later rule")
+    path = f"/api/rules/{current['id']}/suggestions"
+    status, rest = api(hub, env.cookie, "POST", path, {"text": "Old reply", "from_agent": "helper"})
+    direct = env.owner.suggest(current["id"], "Other old reply", "helper")
+    assert status == 201
+    assert rest["base_version"] == direct["base_version"] == current["version"]
+    assert env.owner.list_rules()["rules"] == [current]
+    assert env.owner.list_rules()["suggestions"] == [rest, direct]
+
+
+@pytest.mark.parametrize("base", [None, True, False, "1", 1.5, [], {}])
+def test_suggestion_prompt_base_invalid_is_not_omission(hub, env, base):
+    current = publish(env)
+    listing = env.owner.list_rules()
+    history = env.owner.history(current["id"])
+    emitted = events.after(hub.db, hub.workspace)
+    assert api(
+        hub,
+        env.cookie,
+        "POST",
+        f"/api/rules/{current['id']}/suggestions",
+        {"text": "Reply", "from_agent": "helper", "base_version": base},
+    ) == (400, {"error": "version must be an integer"})
+    with pytest.raises(ToolError, match="version must be an integer"):
+        env.owner.suggest(current["id"], "Reply", "helper", base)
+    assert env.owner.list_rules() == listing
+    assert env.owner.history(current["id"]) == history
+    assert events.after(hub.db, hub.workspace) == emitted
+
+
+@pytest.mark.parametrize("base", [-1, 0, 2])
+def test_suggestion_prompt_base_wrong_integer_conflicts(hub, env, base):
+    current = publish(env)
+    assert api(
+        hub,
+        env.cookie,
+        "POST",
+        f"/api/rules/{current['id']}/suggestions",
+        {"text": "Reply", "from_agent": "helper", "base_version": base},
+    ) == (409, {"error": "rule changed", "current": current})
+    assert env.owner.list_rules()["suggestions"] == []
+
+
+def test_suggestion_prompt_base_preserves_authority_and_body_validation(hub, env):
+    current = publish(env)
+    body = {"text": "Reply", "from_agent": "helper", "base_version": current["version"]}
+    path = f"/api/rules/{current['id']}/suggestions"
+    assert api(hub, env.cookie, "POST", path, {**body, "unknown": True}) == (
+        400,
+        {"error": "unknown arguments"},
+    )
+    for missing in ("text", "from_agent"):
+        assert api(
+            hub, env.cookie, "POST", path, {k: v for k, v in body.items() if k != missing}
+        ) == (
+            400,
+            {"error": f"{missing} is required"},
+        )
+    member_id = hub.db.create_user("member@example.test")
+    hub.db.add_member(hub.workspace, member_id, role="member", actor=hub.admin)
+    member = sessions.person_principal(hub.db, member_id, hub.workspace)
+    session = sessions.redeem_login_link(
+        hub.db, sessions.create_login_link(hub.db, member.user_email, hub.workspace)
+    )
+    cookie = {"Cookie": f"{sessions.COOKIE}={session}"}
+    for auth in (env.token, cookie):
+        assert api(hub, auth, "POST", path, body)[0] == 403
+    for principal in (env.agent, member):
+        with pytest.raises(ToolError, match="only a workspace owner"):
+            service(hub, principal).suggest(current["id"], "Reply", "helper", current["version"])
+    assert env.owner.list_rules()["suggestions"] == []
+
+
 def test_rule_events_follow_commit_and_noops_emit_nothing(hub, env, monkeypatch):
     emitted = []
     real_emit = events.emit

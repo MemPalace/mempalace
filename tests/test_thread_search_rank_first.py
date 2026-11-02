@@ -2,7 +2,6 @@
 
 import sqlite3
 import tempfile
-from itertools import count
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,10 +30,10 @@ from commonplace.handoff.thread_store import ThreadStore
     ).map(" ".join),
 )
 def test_rank_first_matches_original(corpora, query, data):
-    counter = count()
+    tokens = iter(data.draw(st.permutations([f"{i:016x}" for i in range(len(corpora))])))
     with patch(
         "commonplace.handoff.thread_store.secrets.token_hex",
-        side_effect=lambda _: f"{next(counter):016x}",
+        side_effect=lambda _: next(tokens),
     ):
         directory = tempfile.TemporaryDirectory()
         path = str(Path(directory.name) / "threads.sqlite3")
@@ -145,15 +144,19 @@ def test_scope_excludes_global_top_hits():
 def test_ties_use_thread_and_chunk_order_across_id_batches():
     store = ThreadStore(":memory:")
     try:
-        ids = [
-            store.store(
-                "test",
-                str(i),
-                [ThreadMessage(j, "user", "message", "alpha " * 600, raw="") for j in range(3)],
-                actor="test",
-            ).id
-            for i in range(8)
-        ]
+        with patch(
+            "commonplace.handoff.thread_store.secrets.token_hex",
+            side_effect=[f"{i:016x}" for i in (7, 1, 5, 0, 6, 3, 2, 4)],
+        ):
+            ids = [
+                store.store(
+                    "test",
+                    str(i),
+                    [ThreadMessage(j, "user", "message", "alpha " * 600, raw="") for j in range(3)],
+                    actor="test",
+                ).id
+                for i in range(8)
+            ]
         ids.sort(reverse=True)
         expected = old_search(store, ids, "alpha", 100)
         assert len({hit.score for hit in expected}) == 1
@@ -265,5 +268,163 @@ def test_hybrid_plans_match_original(query, expected_plan):
         assert hits == old_search(store, ids, query, 1)
         assert any(expected_plan in sql for sql in statements)
         assert_alignment(store)
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("first_search", ["false-positive", "false-negative"])
+def test_gateway_stays_open_across_legacy_and_no_fts_writes(tmp_path, first_search):
+    path = str(tmp_path / "threads.sqlite3")
+    gateway = ThreadStore(path)
+    fallback = ThreadStore(path)
+    try:
+        gateway.store(
+            "test", "first", [ThreadMessage(0, "user", "message", "alpha", "raw")], actor="test"
+        )
+        fallback._fts_enabled = False
+        allowed = fallback.store(
+            "test", "allowed", [ThreadMessage(0, "user", "message", "public", "raw")], actor="test"
+        )
+        denied = fallback.store(
+            "other", "denied", [ThreadMessage(0, "user", "message", "secret", "raw")], actor="test"
+        )
+        with sqlite3.connect(path) as legacy:
+            legacy.execute(
+                "INSERT INTO chunks_fts(thread_id, idx, text) "
+                "SELECT thread_id, idx, text FROM chunks WHERE thread_id=?",
+                (denied.id,),
+            )
+        gateway.store(
+            "test", "neutral", [ThreadMessage(0, "user", "message", "neutral", "raw")], actor="test"
+        )
+        with sqlite3.connect(path) as legacy:
+            legacy.execute(
+                "INSERT INTO chunks_fts(thread_id, idx, text) "
+                "SELECT thread_id, idx, text FROM chunks WHERE (thread_id, idx) NOT IN "
+                "(SELECT thread_id, idx FROM chunks_fts)"
+            )
+        # A foreign logical identity currently indexes the allowed chunk rowid.
+        assert (
+            gateway._conn.execute("SELECT thread_id FROM chunks_fts WHERE rowid=2").fetchone()[0]
+            == denied.id
+        )
+        with patch.object(gateway, "_repair_fts", wraps=gateway._repair_fts) as repair:
+            if first_search == "false-positive":
+                assert gateway.search([allowed.id], "secret") == []
+            else:
+                assert gateway.search([denied.id], "secret")
+            assert repair.call_count == 1
+            for scope in ([allowed.id], [denied.id], [allowed.id, denied.id]):
+                for query in ("public", "secret", "alpha public"):
+                    assert gateway.search(scope, query) == old_search(gateway, scope, query)
+            assert repair.call_count == 1
+        assert gateway.search([allowed.id], "public")
+        assert gateway.search([denied.id], "secret")
+        assert_alignment(gateway)
+        # A later no-FTS commit must recover even with zero selected candidates.
+        missing = fallback.store(
+            "test",
+            "missing",
+            [ThreadMessage(0, "user", "message", "zeroentry", "raw")],
+            actor="test",
+        )
+        assert old_search(gateway, [missing.id], "zeroentry") == []
+        assert gateway.search([missing.id], "zeroentry") == old_search(
+            gateway, [missing.id], "zeroentry"
+        )
+        assert gateway.search([missing.id], "zeroentry")
+        assert_alignment(gateway)
+    finally:
+        fallback.close()
+        gateway.close()
+
+
+@pytest.mark.parametrize("plan", ["scope AS MATERIALIZED", "CROSS JOIN"])
+@pytest.mark.parametrize("readonly", [False, True])
+def test_identity_fallback_reruns_full_scope_before_limit(tmp_path, plan, readonly):
+    from commonplace.handoff.thread_store_migrate import read_store
+
+    path = tmp_path / "threads.sqlite3"
+    store = ThreadStore(str(path))
+    tokens = ["z", "a", "b", "c"]
+    with patch("commonplace.handoff.thread_store.secrets.token_hex", side_effect=tokens):
+        ids = [
+            store.store(
+                "test", str(i), [ThreadMessage(0, "user", "message", text, "raw")], actor="test"
+            ).id
+            for i, text in enumerate(["secret", "public", "secret", "filler " * 1500])
+        ]
+    # Same-connection changes do not change data_version: selected validation
+    # must still reject the foreign identity, then rerank the entire scope.
+    store._conn.execute("UPDATE chunks_fts SET rowid=100 WHERE rowid=1")
+    store._conn.execute("UPDATE chunks_fts SET rowid=1 WHERE rowid=2")
+    store._conn.execute("UPDATE chunks_fts SET rowid=2 WHERE rowid=100")
+    scope = [ids[1], ids[2]] + ([ids[3]] if plan == "CROSS JOIN" else [])
+    expected = old_search(store, scope, "secret", 1)
+    assert len(expected) == 1 and expected[0].stored_thread_id == ids[2]
+    if readonly:
+        store.close()
+        before = path.read_bytes()
+        with read_store(path) as reader:
+            statements = []
+            reader._conn.set_trace_callback(statements.append)
+            assert reader.search(scope, "secret", 1) == expected
+            assert reader.search([ids[1]], "secret") == []
+            assert reader._conn.total_changes == 0
+            assert not hasattr(reader, "_fts_verified_version")
+            assert not any(sql.startswith(("INSERT", "DELETE", "UPDATE")) for sql in statements)
+        assert path.read_bytes() == before
+    else:
+        try:
+            statements = []
+            store._conn.set_trace_callback(statements.append)
+            assert store.search(scope, "secret", 1) == expected
+            assert any(plan in sql for sql in statements)
+            assert store._fts_verified_version is None
+        finally:
+            store.close()
+
+
+@pytest.mark.skipif(not hasattr(sqlite3.Connection, "setlimit"), reason="Python 3.11+ API")
+@pytest.mark.parametrize("query", ["alpha", "rare", "absent"])
+def test_single_global_probe_uses_largest_nonempty_batch(query):
+    store = ThreadStore(":memory:")
+    try:
+        ids = []
+        with patch(
+            "commonplace.handoff.thread_store.secrets.token_hex", side_effect=["d", "b", "a", "c"]
+        ):
+            for i, count in enumerate([1, 3, 1, 3]):
+                items = [
+                    ThreadMessage(
+                        j,
+                        "user",
+                        "message",
+                        "alpha " * 400 + ("rare" if j == 0 and i != 2 else "filler"),
+                        "raw",
+                    )
+                    for j in range(count)
+                ]
+                ids.append(store.store("test", str(i), items, actor="test").id)
+        # Counts 2, 6, 0, independently permuted from insertion and lexical order.
+        scope = [ids[2], ids[0], ids[3], ids[1], "missing"]
+        store._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 4)
+        statements = []
+        store._conn.set_trace_callback(statements.append)
+        hits = store.search(scope, query, 3)
+        store._conn.set_trace_callback(None)
+        assert hits == old_search(store, scope, query, 3)
+        probes = [sql for sql in statements if sql.startswith("SELECT count(*) FROM (SELECT 1")]
+        assert len(probes) == 1
+        assert "LIMIT 6)" in probes[0]
+        if query == "rare":
+            assert any("scope AS MATERIALIZED" in sql for sql in statements)
+            assert any("CROSS JOIN" in sql for sql in statements)
+        statements.clear()
+        store._conn.set_trace_callback(statements.append)
+        assert store.search(["missing"], query) == []
+        assert store.search([], query) == []
+        store._conn.set_trace_callback(None)
+        assert not any(sql.startswith("SELECT count(*) FROM (SELECT 1") for sql in statements)
     finally:
         store.close()

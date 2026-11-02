@@ -241,3 +241,9 @@ def row_factory(cursor, row):
     """The two DB-API extensions require their own Row implementation."""
     module = driver() if type(cursor).__module__.startswith("sqlcipher3") else sqlite3
     return module.Row(cursor, row)
+
+
+def integrity_error_type(connection):
+    """Return the connection driver's specific constraint exception class."""
+    module = driver() if type(connection).__module__.startswith("sqlcipher3") else sqlite3
+    return module.IntegrityError

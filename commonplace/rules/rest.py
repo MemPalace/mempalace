@@ -100,6 +100,6 @@ def dispatch(service, h, parts, method):
                 )
             if parts[2] == "suggestions":
                 return 201, service.suggest(
-                    rule_id, **body(("text", "from_agent"), ("text", "from_agent"))
+                    rule_id, **body(("text", "from_agent", "base_version"), ("text", "from_agent"))
                 )
     raise HTTPError(404, "not found")

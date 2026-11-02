@@ -732,12 +732,16 @@ class RuleService:
                 raise ToolError("no: invalid action")
             return self._change(conn, row, updates)
 
-    def suggest(self, rule_id, text, from_agent):
+    def suggest(self, rule_id, text, from_agent, base_version=_UNSET):
         self._person(owner=True)
         rule_text(text)
         validate_text(from_agent, "from_agent", required=True, limit=1000)
         with self.transaction() as conn:
-            row = row_for(conn, rule_id)
+            row = (
+                row_for(conn, rule_id)
+                if base_version is _UNSET
+                else self._versioned(conn, rule_id, base_version)
+            )
             cursor = conn.execute(
                 "INSERT INTO rule_suggestions(rule_id,text,from_agent,base_version,status,stamp_user,created_at) VALUES (?,?,?,?,'open',?,?)",
                 (row["id"], text, from_agent, row["version"], self.principal.user_id, now()),

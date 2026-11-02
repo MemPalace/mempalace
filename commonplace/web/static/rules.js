@@ -124,9 +124,30 @@ export function rulesHandlers(root, api, refresh, showError) {
     const buttons = [...element.querySelectorAll("button")];
     buttons.forEach((button) => { button.disabled = true; });
     // A finished write renders once even if a background refresh overtakes this one.
-    try { if (await work() !== false) { ui.force = true; await refresh(); } }
+    try {
+      const saved = await work();
+      if (saved !== false) {
+        const row = element.dataset?.ruleForm === "edit" ? element.closest("[data-rule-id]") : null;
+        if (row && String(saved?.id) === row.dataset.ruleId && Number.isInteger(saved?.version)) {
+          payload = { ...payload, rules: payload.rules.map((rule) => String(rule.id) === row.dataset.ruleId ? saved : rule) };
+          row.dataset.version = String(saved.version);
+          element.querySelector("[data-rule-current]").innerHTML = "";
+        }
+        ui.force = true; await refresh();
+      }
+    }
     catch (error) {
-      if (error.status === 409) { ui.force = true; await refresh(); showError("Rule changed. Review it and try again."); }
+      if (element.dataset?.ruleForm === "edit") {
+        const row = element.closest("[data-rule-id]"), current = error.payload?.current;
+        if (error.status === 409 && !error.payload?.store_lost && row && current && String(current.id) === row.dataset.ruleId && Number.isInteger(current.version)) {
+          payload = { ...payload, rules: payload.rules.map((rule) => String(rule.id) === row.dataset.ruleId ? current : rule) };
+          row.dataset.version = String(current.version);
+          const explanation = current.status === "retired" ? "Rule retired. Restore it before saving. Your draft is kept." : "Rule changed. Your draft is kept. Review the current rule and Save again.";
+          element.querySelector("[data-rule-current]").innerHTML = `<section class="rule-proposal"><p class="rule-text">${e(explanation)}</p><h4>Current rule</h4><div class="rule-chips"><span class="pill">${e(agentName(current.agent))}</span><span class="pill">${e(current.status)}</span><span class="pill">${e(current.kind)}</span><span class="pill">${e(current.scope)}${current.scope_ref == null ? "" : ` ${e(current.scope_ref)}`}</span></div><p class="rule-text">${e(current.text)}</p><p class="rule-text quiet">Summary: ${e(current.summary ?? "None")}</p></section>`;
+          showError("");
+        } else showError(error.message);
+      } else if (element.dataset?.ruleForm === "new" || error.payload?.store_lost) showError(error.message);
+      else if (error.status === 409) { ui.force = true; await refresh(); showError("Rule changed. Review it and try again."); }
       else showError(error.message);
     } finally { pending.delete(key); buttons.forEach((button) => { button.disabled = false; }); await refreshIfStale(); }
   }
@@ -175,6 +196,7 @@ export function rulesHandlers(root, api, refresh, showError) {
         const bridge = desktopBridge(); if (!bridge) return;
         const select = panel.querySelector("[data-ask-agent]"), agent = select.value, name = select.selectedOptions[0].textContent;
         const { rules, prompt, single } = context(panel), reply = panel.querySelector("[data-rule-reply]");
+        const baseVersions = new Map(rules.map((rule) => [rule.id, rule.version]));
         await mutate(`ask-${panel.dataset.clarifyRule || panel.dataset.clarifyAgent}`, panel, async () => {
           reply.textContent = `Asking ${name}…`;
           try {
@@ -185,12 +207,12 @@ export function rulesHandlers(root, api, refresh, showError) {
               reply.innerHTML = `<p class="rule-text" data-reply-text>${e(answer.text)}</p>${actionButton("copy-reply", "Copy")}`;
               return false;
             }
-            for (const match of matches) await api(`/api/rules/${encodeURIComponent(match.rule_id)}/suggestions`, { method: "POST", body: { text: match.text, from_agent: name } });
+            for (const match of matches) await api(`/api/rules/${encodeURIComponent(match.rule_id)}/suggestions`, { method: "POST", body: { text: match.text, from_agent: name, base_version: baseVersions.get(match.rule_id) } });
             reply.textContent = "";
           } catch (error) { reply.textContent = ""; throw error; }
         });
       } else if (action === "edit" && owner && rule) {
-        row.querySelector("[data-rule-body]").innerHTML = `<form class="form-tile" data-rule-form="edit">${fields(rule)}<div class="opts"><button class="blockbtn">Save</button>${actionButton("cancel-edit", "Cancel")}</div></form>`;
+        row.querySelector("[data-rule-body]").innerHTML = `<form class="form-tile" data-rule-form="edit">${fields(rule)}<div data-rule-current role="status" aria-live="polite"></div><div class="opts"><button class="blockbtn">Save</button>${actionButton("cancel-edit", "Cancel")}</div></form>`;
         row.querySelector("textarea").focus();
       } else if (action === "cancel-edit") await refresh();
       else if (action === "cancel-new") { const panel = button.closest(".rule-new"); panel.hidden = true; panel.querySelector("form").reset(); panel.querySelector("[data-scope-ref]").hidden = true; panel.querySelector('[name="scope_ref"]').required = false; const trigger = root.querySelector('[data-rule-action="new"]'); trigger.setAttribute("aria-expanded", "false"); trigger.focus(); await refreshIfStale(); }

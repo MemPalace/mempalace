@@ -12,6 +12,7 @@ from .handoff.api import _object, _read_json, _RequestError, _text
 from .handoff.models import THREADS_WING
 from .handoff.thread_store import ThreadConflict, ThreadStorageLimit
 from .http_util import log_failure
+from .import_parts import append_part
 from .import_sources import SOURCES, parse_import
 from .workspace_store import thread_path, workspace_path
 
@@ -73,14 +74,15 @@ def _batch(ctx, principal, source, threads):
     for index, item in enumerate(threads):
         row = {"index": index, "status": "error"}
         try:
-            _object(item, {"thread_id", "transcript", "format"})
+            _object(item, {"thread_id", "transcript", "format", "part"})
             thread_id = _text(item, "thread_id", required=True)
             if len(thread_id) > 512:
                 raise _RequestError(400, "thread_id must be at most 512 characters")
             row["thread_id"] = thread_id
-            transcript = _text(item, "transcript", required=True)
+            multipart = "part" in item
+            transcript = _text(item, "transcript", required=not multipart)
             fmt = _text(item, "format", "auto")
-            messages = parse_import(source, transcript, fmt)
+            messages = None if multipart else parse_import(source, transcript, fmt)
             # A fresh store has schema/WAL overhead. Refuse before creating it
             # when the account cannot fit even that, using an uncached meter.
             used = plans.StorageMeter._walk(directory)
@@ -103,6 +105,39 @@ def _batch(ctx, principal, source, threads):
                     if candidate.exists()
                 )
                 maximum = limit - (plans.StorageMeter._walk(directory) - own_bytes)
+            if multipart:
+                # Compute allowance inside the writer transaction, including
+                # the post-write quota check. Exact retries bypass writes.
+                def allowance():
+                    if limit is None:
+                        return None
+                    path = thread_path(directory)
+                    own = sum(
+                        p.stat().st_size
+                        for p in (
+                            path,
+                            path.with_name(path.name + "-wal"),
+                            path.with_name(path.name + "-shm"),
+                        )
+                        if p.exists()
+                    )
+                    return limit - (plans.StorageMeter._walk(directory) - own)
+
+                row.update(
+                    append_part(
+                        store,
+                        principal.workspace_id,
+                        source,
+                        thread_id,
+                        fmt,
+                        transcript,
+                        item["part"],
+                        actor=principal.actor,
+                        maximum=allowance,
+                    )
+                )
+                results.append(row)
+                continue
             stored = store.store(
                 principal.workspace_id,
                 source_id,

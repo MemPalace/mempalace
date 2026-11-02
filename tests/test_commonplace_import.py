@@ -547,3 +547,425 @@ def test_example_client_authenticates_and_reports_each_conversation(
     assert sum(r["imported"] for r in reports) == 1
     assert sum(r["duplicates"] for r in reports) == 1
     assert all(r["facts"] == 1 for r in reports)
+
+
+# Multipart cases are synthetic and intentionally separate from snapshot tests.
+def multipart_items(chunks, *, source="claude-code", identity="multipart", fmt=None, digest=None):
+    import hashlib
+
+    whole = "".join(chunks).encode("utf-8")
+    prefix = hashlib.sha256()
+    offset = 0
+    result = []
+    for index, chunk in enumerate(chunks):
+        raw = chunk.encode("utf-8")
+        result.append(
+            {
+                "thread_id": identity,
+                "format": fmt or ("codex" if source == "t3" else source),
+                "transcript": chunk,
+                "part": dict(
+                    version=1,
+                    session_bytes=len(whole),
+                    session_sha256=digest or hashlib.sha256(whole).hexdigest(),
+                    index=index,
+                    offset=offset,
+                    prefix_sha256=prefix.hexdigest(),
+                    sha256=hashlib.sha256(raw).hexdigest(),
+                    final=index == len(chunks) - 1,
+                ),
+            }
+        )
+        offset += len(raw)
+        prefix.update(raw)
+    return result
+
+
+def multipart_row(surface, item, source="claude-code", **kwargs):
+    status, report = upload(surface, source, [item], **kwargs)
+    assert status == 200
+    return report["results"][0]
+
+
+def multipart_snapshot(surface, stored_id):
+    store = surface.gateway.handoff.store_for(surface.workspace)
+    return store.get(stored_id), store.messages(stored_id), store.chunks(stored_id)
+
+
+@pytest.mark.parametrize("source", ["claude-code", "codex", "t3"])
+def test_multipart_three_parts_readback_stale_replay_and_actor(surface, source):
+    import hashlib
+
+    native, _ = fixture(source)
+    chunks = [" \r\nnull\r", native + native, '{"unknown":"café 🦉\u2028\u2029\u0085"}']
+    items = multipart_items(chunks, source=source)
+    rows = [multipart_row(surface, part, source) for part in items]
+    assert [r["status"] for r in rows] == ["imported"] * 3
+    assert [r["session_state"] for r in rows] == ["incomplete", "incomplete", "complete"]
+    assert len({r["stored_thread_id"] for r in rows}) == 1
+    stored_id = rows[0]["stored_thread_id"]
+    stored, messages, _ = multipart_snapshot(surface, stored_id)
+    assert stored.source_thread_id == f"import:{source}:multipart"
+    assert stored.created_by == f"user:{surface.user}"
+    assert [m.seq for m in messages] == list(range(len(messages)))
+    assert [m.raw for m in messages if m.name == "import.raw"] == chunks
+    assert [m.text for m in messages if m.text == WORDS] == [WORDS, WORDS]
+    assert [m.at for m in messages if m.text == WORDS] == [AT, AT]
+    metadata = [json.loads(m.raw) for m in messages if m.name == "import.part"]
+    assert [m["part"] for m in metadata] == [i["part"] for i in items]
+    assert [m["recognized"] for m in metadata] == [False, True, True]
+    assert all(not m.text for m in messages if m.name in ("import.raw", "import.part"))
+    raw_hash = hashlib.sha256("".join(chunks).encode()).hexdigest()
+    assert rows[-1]["prefix_sha256"] == raw_hash != stored.sha256
+    before = multipart_snapshot(surface, stored_id)
+    # Lost response: replay part zero after *all* subsequent commits, then all.
+    for part in [items[0], *items]:
+        row = multipart_row(surface, part, source)
+        assert row["status"] == "duplicate" and row["part"] == part["part"]
+        assert row["offset"] == len("".join(chunks).encode())
+        assert row["next_index"] == 3 and row["session_state"] == "complete"
+    assert multipart_snapshot(surface, stored_id) == before
+    assert rows[-1]["prefix_work"]["previous_source_bytes"] == len("".join(chunks[:2]).encode())
+    assert rows[-1]["prefix_work"]["previous_rows"] < len(messages)
+    assert rows[-1]["prefix_work"]["readback_rows"] == len(messages)
+    status, visible = api(surface, "GET", f"/api/threads/{stored_id}/messages")
+    assert status == 200 and visible[0]["raw"] == chunks[0]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "index",
+        "offset",
+        "prefix_sha256",
+        "session_sha256",
+        "session_bytes",
+        "format",
+        "bytes",
+        "final",
+        "sha256",
+    ],
+)
+def test_multipart_conflicts_preserve_all_saved_state(surface, change):
+    import copy
+
+    native = fixture("claude-code")[0]
+    parts = multipart_items([native, native, native])
+    stored_id = multipart_row(surface, parts[0])["stored_thread_id"]
+    before = multipart_snapshot(surface, stored_id)
+    bad = copy.deepcopy(parts[1])
+    if change == "format":
+        bad["format"] = "codex"
+    elif change == "bytes":
+        bad["transcript"] = bad["transcript"].replace("every", "other")
+    elif change in ("index", "offset", "session_bytes"):
+        bad["part"][change] += 1
+    elif change == "final":
+        bad["part"][change] = True
+    else:
+        bad["part"][change] = "f" * 64
+    assert multipart_row(surface, bad)["status"] == "error"
+    assert multipart_snapshot(surface, stored_id) == before
+    assert multipart_row(surface, parts[2])["code"] == "conflict"  # gap
+    assert multipart_snapshot(surface, stored_id) == before
+    assert multipart_row(surface, parts[1])["status"] == "imported"
+    assert multipart_row(surface, parts[2])["session_state"] == "complete"
+    # A changed old boundary is never an exact duplicate.
+    bad = copy.deepcopy(parts[0])
+    bad["part"]["prefix_sha256"] = "1" * 64
+    assert multipart_row(surface, bad)["code"] == "conflict"
+
+
+def test_multipart_final_digest_recognition_and_legacy_collisions(surface):
+    native = fixture("claude-code")[0]
+    parts = multipart_items([native, native], digest="0" * 64)
+    stored_id = multipart_row(surface, parts[0])["stored_thread_id"]
+    before = multipart_snapshot(surface, stored_id)
+    assert multipart_row(surface, parts[1])["code"] == "conflict"
+    assert multipart_snapshot(surface, stored_id) == before
+    unrecognized = multipart_items([" \n", "null\n"], identity="unrecognized")
+    assert multipart_row(surface, unrecognized[0])["session_state"] == "incomplete"
+    assert multipart_row(surface, unrecognized[1])["code"] == "conflict"
+    # Both collision directions retain their original representation and ID.
+    snapshot = {"thread_id": "legacy", "format": "claude-code", "transcript": native}
+    assert multipart_row(surface, snapshot)["status"] == "imported"
+    assert (
+        multipart_row(surface, multipart_items([native], identity="legacy")[0])["code"]
+        == "conflict"
+    )
+    changed = dict(snapshot, transcript=native.replace("every", "other"))
+    assert multipart_row(surface, changed)["code"] == "conflict"
+    assert multipart_row(surface, dict(snapshot, thread_id="multipart"))["code"] == "conflict"
+
+
+@pytest.mark.parametrize("tail", ['{"type":', '{"private secret": nope}\n', '{"bad": nope}'])
+def test_multipart_strict_tail_and_snapshot_live_tail_asymmetry(surface, tail):
+    native = fixture("claude-code")[0]
+    part = multipart_items([native + tail])[0]
+    row = multipart_row(surface, part)
+    assert row["code"] == "invalid_transcript" and "secret" not in json.dumps(row)
+    store = surface.gateway.handoff.store_for(surface.workspace)
+    assert store.by_source(surface.workspace, "import:claude-code:multipart") is None
+    legacy = dict(thread_id="live-tail", format="claude-code", transcript=native + tail)
+    row = multipart_row(surface, legacy)
+    assert row["status"] == ("imported" if tail == '{"type":' else "error")
+    if row["status"] == "imported":
+        assert store.messages(row["stored_thread_id"])[0].raw == native + tail
+
+
+def test_multipart_quota_append_readback_rollback_and_duplicate_at_limit(surface, monkeypatch):
+    native = fixture("claude-code")[0]
+    parts = multipart_items([native, native, native])
+    stored_id = multipart_row(surface, parts[0])["stored_thread_id"]
+    store = surface.gateway.handoff.store_for(surface.workspace)
+    before = multipart_snapshot(surface, stored_id)
+    check = store._check_storage_budget
+
+    def refuse_commit(maximum, messages=()):
+        if not messages:
+            raise ThreadStorageLimit()
+        return check(maximum, messages)
+
+    monkeypatch.setattr(store, "_check_storage_budget", refuse_commit)
+    assert multipart_row(surface, parts[1])["code"] == "storage_limit"
+    assert multipart_snapshot(surface, stored_id) == before
+    monkeypatch.setattr(store, "_check_storage_budget", check)
+    append = store.append
+
+    def fail_after_append(*args, **kwargs):
+        append(*args, **kwargs)
+        raise RuntimeError("private storage detail")
+
+    monkeypatch.setattr(store, "append", fail_after_append)
+    assert multipart_row(surface, parts[1])["code"] == "import_unavailable"
+    assert multipart_snapshot(surface, stored_id) == before
+    monkeypatch.setattr(store, "append", append)
+    read = store.messages
+    reads = 0
+
+    def fail_readback(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        # Prefix load, optional v1 append load, then post-write readback.
+        result = read(*args, **kwargs)
+        if store.get(stored_id).message_count > before[0].message_count:
+            raise RuntimeError("private readback detail")
+        return result
+
+    monkeypatch.setattr(store, "messages", fail_readback)
+    assert multipart_row(surface, parts[1])["code"] == "import_unavailable"
+    monkeypatch.setattr(store, "messages", read)
+    assert multipart_snapshot(surface, stored_id) == before and reads >= 2
+    padding = surface.directory / "quota.bin"
+    with padding.open("wb") as stream:
+        stream.truncate(plans.FREE.storage_bytes - plans.StorageMeter._walk(surface.directory))
+    assert multipart_row(surface, parts[0])["status"] == "duplicate"
+    assert multipart_row(surface, parts[1])["code"] == "storage_limit"
+    assert multipart_snapshot(surface, stored_id) == before
+
+
+def test_multipart_concurrent_duplicates_and_conflicts(surface):
+    from concurrent.futures import ThreadPoolExecutor
+
+    native = fixture("claude-code")[0]
+    same = multipart_items([native, native])[0]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows = list(pool.map(lambda _: multipart_row(surface, same), range(2)))
+    assert sorted(row["status"] for row in rows) == ["duplicate", "imported"]
+    one = multipart_items([native], identity="race")[0]
+    other = multipart_items([native.replace("every", "other")], identity="race")[0]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows = list(pool.map(lambda part: multipart_row(surface, part), [one, other]))
+    assert sorted(row["status"] for row in rows) == ["error", "imported"]
+    assert next(row for row in rows if row["status"] == "error")["code"] == "conflict"
+    winner = next(row for row in rows if row["status"] == "imported")
+    _, messages, _ = multipart_snapshot(surface, winner["stored_thread_id"])
+    assert len([m for m in messages if m.name == "import.part"]) == 1
+    assert [m.raw for m in messages if m.name == "import.raw"] in [
+        [one["transcript"]],
+        [other["transcript"]],
+    ]
+
+
+def test_multipart_auth_scope_origin_workspace_and_multiblock(surface):
+    native = (
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": AT,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": WORDS},
+                        {
+                            "type": "tool_use",
+                            "id": "call-1",
+                            "name": "example",
+                            "input": {"a": WORDS},
+                        },
+                        {"type": "tool_result", "tool_use_id": "call-1", "content": WORDS},
+                    ],
+                },
+            }
+        )
+        + "\r\n"
+    )
+    parts = multipart_items([native, native])
+    assert upload(surface, "claude-code", parts[:1], cookie=False)[0] == 401
+    assert (
+        upload(surface, "claude-code", parts[:1], headers={"Origin": "https://another.example"})[0]
+        == 403
+    )
+    for restricted in (
+        dict(scopes=["memory:write"]),
+        dict(read_wings=["inbox"]),
+        dict(trust="untrusted", write_wing="threads"),
+    ):
+        assert (
+            upload(
+                surface, "claude-code", parts[:1], cookie=False, token=token(surface, **restricted)
+            )[0]
+            == 403
+        )
+    bearer = token(surface)
+    first = multipart_row(surface, parts[0], cookie=False, token=bearer)
+    original_actor = multipart_snapshot(surface, first["stored_thread_id"])[0].created_by
+    assert original_actor.startswith("conn:")
+    # A different authenticated filer must not change the original actor.
+    assert multipart_row(surface, parts[1])["status"] == "imported"
+    stored, messages, _ = multipart_snapshot(surface, first["stored_thread_id"])
+    assert stored.created_by == original_actor
+    assert [m.kind for m in messages[2:5]] == ["message", "tool_call", "tool_result"]
+    assert messages[3].call_id == messages[4].call_id == "call-1"
+    assert [m.raw for m in messages if m.name == "import.raw"] == [native, native]
+    other = surface.db.create_user("isolation@example.com")
+    workspace = surface.db.create_workspace("isolation", other, personal=True)
+    cookie = sessions.start_session(surface.db, other, workspace)
+    assert (
+        api(
+            surface,
+            "GET",
+            f"/api/threads/{stored.id}",
+            headers={"Cookie": f"{sessions.COOKIE}={cookie}"},
+        )[0]
+        == 404
+    )
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("version", True),
+        ("index", False),
+        ("offset", -1),
+        ("session_bytes", 0),
+        ("session_bytes", 2**63),
+        ("sha256", "A" * 64),
+        ("final", 1),
+        ("extra", 1),
+    ],
+)
+def test_multipart_descriptor_types_and_bounds(surface, key, value):
+    part = multipart_items([fixture("claude-code")[0]])[0]
+    part["part"][key] = value
+    assert multipart_row(surface, part)["code"] == "invalid_transcript"
+    assert (
+        surface.gateway.handoff.store_for(surface.workspace).by_source(
+            surface.workspace, "import:claude-code:multipart"
+        )
+        is None
+    )
+
+
+def test_multipart_writer_transaction_across_store_connections(surface):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from commonplace.handoff.thread_store import ThreadConflict
+    from commonplace.import_parts import append_part
+
+    primary = surface.gateway.handoff.store_for(surface.workspace)
+    peers = [type(primary)(str(thread_path(surface.directory))) for _ in range(2)]
+    native = fixture("claude-code")[0]
+    first = multipart_items([native, native], identity="independent")[0]
+    barrier = threading.Barrier(2)
+
+    def write(pair):
+        peer, part = pair
+        barrier.wait(timeout=5)
+        try:
+            return append_part(
+                peer,
+                surface.workspace,
+                "claude-code",
+                part["thread_id"],
+                part["format"],
+                part["transcript"],
+                part["part"],
+                actor="user:synthetic",
+                maximum=None,
+            )["status"]
+        except ThreadConflict:
+            return "conflict"
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert sorted(pool.map(write, zip(peers, [first, first]))) == ["duplicate", "imported"]
+        conflicting = [
+            multipart_items([value], identity="independent-race")[0]
+            for value in (native, native.replace("every", "other"))
+        ]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert sorted(pool.map(write, zip(peers, conflicting))) == ["conflict", "imported"]
+    finally:
+        for peer in peers:
+            peer.close()
+
+
+def test_multipart_example_client_route_preflight_replay(surface, tmp_path, monkeypatch, capsys):
+    path = Path(__file__).parents[1] / "examples" / "import_memory.py"
+    spec = importlib.util.spec_from_file_location("native_route_example", path)
+    client = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(client)
+    monkeypatch.setenv("COMMONPLACE_TOKEN", token(surface))
+    monkeypatch.setattr(client, "MAX_IMPORT_BYTES", 900)
+    raw = (" \r\n" + fixture("codex")[0] * 16 + '{"unknown":1}').encode()
+    export = tmp_path / "native.jsonl"
+    export.write_bytes(raw)
+    args = [
+        str(export),
+        "--source",
+        "t3",
+        "--thread-id",
+        "route-original",
+        "--url",
+        f"http://127.0.0.1:{surface.port}",
+    ]
+    assert client.main(args) == 0
+    reports = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(reports) >= 3 and all(report["imported"] == 1 for report in reports)
+    assert reports[-1]["progress"]["acknowledged_bytes"] == len(raw)
+    assert reports[-1]["progress"]["session_state"] == "complete"
+    stored_id = reports[-1]["progress"]["stored_thread_id"]
+    before = multipart_snapshot(surface, stored_id)
+    assert b"".join(m.raw.encode() for m in before[1] if m.name == "import.raw") == raw
+    assert client.main(args) == 0
+    retries = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert len(retries) == len(reports) and all(report["duplicates"] == 1 for report in retries)
+    assert multipart_snapshot(surface, stored_id) == before
+
+
+def test_multipart_record_boundaries_whitespace_and_empty_parts(surface):
+    native = fixture("claude-code")[0]
+    # A complete JSON object is not a legal *nonfinal* physical record prefix.
+    nonfinal = multipart_items([native.rstrip("\r\n"), native], identity="unterminated")[0]
+    assert multipart_row(surface, nonfinal)["code"] == "invalid_transcript"
+    split = multipart_items([native[:-1], "\n" + native], identity="split-crlf")
+    first = multipart_row(surface, split[0])
+    before = multipart_snapshot(surface, first["stored_thread_id"])
+    assert multipart_row(surface, split[1])["code"] == "conflict"
+    assert multipart_snapshot(surface, first["stored_thread_id"]) == before
+    chunks = multipart_items([" \n\t\r", native, "  "], identity="whitespace")
+    assert [multipart_row(surface, part)["status"] for part in chunks] == ["imported"] * 3
+    assert multipart_row(surface, chunks[0])["session_state"] == "complete"
+    empty = multipart_items([native, ""], identity="empty")[-1]
+    assert multipart_row(surface, empty)["code"] == "invalid_transcript"

@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 from _thread_search_oracle import assert_alignment, old_search
@@ -727,3 +728,201 @@ def test_concurrent_different_content_has_one_winner(make_store):
     assert len(winners) == 1
     assert first.get(winners[0].id) == winners[0]
     assert first._conn.execute("SELECT count(*) FROM threads").fetchone()[0] == 1
+
+
+class FTSFailureConnection(sqlite3.Connection):
+    failure = None
+    abort_on_failure = False
+    fts_attempts = 0
+    partial_counts = None
+
+    def executemany(self, sql, parameters):
+        if sql.startswith("INSERT INTO chunks_fts"):
+            self.fts_attempts += 1
+            if self.failure:
+                error, self.failure = self.failure, None
+                super().execute(sql, next(iter(parameters)))
+                if self.abort_on_failure:
+                    self.rollback()
+                raise error
+            try:
+                return super().executemany(sql, parameters)
+            except sqlite3.IntegrityError:
+                self.partial_counts = (
+                    self.execute("SELECT count(*) FROM chunks").fetchone()[0],
+                    self.execute("SELECT count(*) FROM chunks_fts").fetchone()[0],
+                )
+                raise
+        return super().executemany(sql, parameters)
+
+
+def _write_state(store):
+    return {
+        table: list(map(tuple, store._conn.execute(f"SELECT * FROM {table} ORDER BY rowid")))
+        for table in ("threads", "messages", "chunks", "chunks_fts", "handoff_docs")
+    }
+
+
+def _orphan_after_next_chunk(store):
+    rowid = store._conn.execute("SELECT max(rowid)+2 FROM chunks").fetchone()[0]
+    store._conn.execute(
+        "INSERT INTO chunks_fts(rowid, thread_id, idx, text) VALUES (?, 'orphan', 0, 'stale')",
+        (rowid,),
+    )
+
+
+def _collision_operation(store, operation, old, items):
+    if operation == "store":
+        return store.store("test", "new", items, actor="test")
+    return store.append(old.id, store.messages(old.id) + items)
+
+
+@pytest.mark.parametrize("operation", ["store", "append"])
+def test_live_fts_collision_rolls_back_partial_batch_then_retries_once(
+    monkeypatch, make_store, operation
+):
+    use_connection(monkeypatch, FTSFailureConnection)
+    store = make_store()
+    old = store.store("test", "old", [message("old boundary")], actor="test")
+    before_chunks = store.chunks(old.id)
+    _orphan_after_next_chunk(store)
+    count = store._conn.fts_attempts
+    offset = int(operation == "append")
+    items = [message(" café\r\n\t" * 1000, seq=offset), message("tail\x00", seq=offset + 1)]
+    expected = ([message("old boundary")] if offset else []) + items
+    with patch.object(store, "_repair_fts", wraps=store._repair_fts) as repair:
+        result = _collision_operation(store, operation, old, items)
+    assert repair.call_count == 1
+    assert store._conn.fts_attempts == count + 2
+    # At the collision, the first item in the attempted batch was indexed.
+    assert store._conn.partial_counts[0] > 2
+    assert store._conn.partial_counts[1] == 3
+    assert store.messages(result.id) == expected
+    assert result.sha256 == canonical_sha256(expected)
+    assert result.message_count == len(expected)
+    assert result.chunk_count == len(store.chunks(result.id))
+    assert store.chunks(old.id)[: len(before_chunks)] == before_chunks
+    assert_alignment(store)
+    changes = store._conn.total_changes
+    if operation == "store":
+        assert store.store("test", "new", items, actor="other") == result
+    else:
+        assert store.append(old.id, expected) == result
+    assert store._conn.total_changes == changes
+
+
+@pytest.mark.parametrize("operation", ["store", "append"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        sqlite3.IntegrityError("unrelated constraint"),
+        sqlite3.IntegrityError("constraint failed"),
+        sqlite3.OperationalError("disk I/O error"),
+        RuntimeError("interrupted"),
+    ],
+    ids=["integrity", "unverified-constraint", "io", "interruption"],
+)
+def test_unrelated_fts_failure_preserves_caller_writes_and_does_not_repair(
+    monkeypatch, make_store, operation, error
+):
+    use_connection(monkeypatch, FTSFailureConnection)
+    store = make_store()
+    old = store.store("test", "old", [message("old")], actor="test")
+    _orphan_after_next_chunk(store)
+    with store._transaction():
+        store.put_doc("caller", "earlier caller write")
+        before = _write_state(store)
+        store._conn.failure = error
+        with patch.object(store, "_repair_fts", wraps=store._repair_fts) as repair:
+            with pytest.raises(type(error), match=str(error)):
+                _collision_operation(
+                    store, operation, old, [message("new", seq=int(operation == "append"))]
+                )
+        assert repair.call_count == 0
+        assert store._conn.in_transaction
+        assert _write_state(store) == before
+    assert store.doc("caller") == "earlier caller write"
+
+
+@pytest.mark.parametrize("operation", ["store", "append"])
+@pytest.mark.parametrize("failure", ["repair", "second-retry", "quota"])
+def test_collision_recovery_failure_is_atomic(monkeypatch, make_store, operation, failure):
+    use_connection(monkeypatch, FTSFailureConnection)
+    store = make_store()
+    old = store.store("test", "old", [message("old")], actor="test")
+    _orphan_after_next_chunk(store)
+    before = _write_state(store)
+    repair = store._repair_fts
+
+    def fail_repair():
+        repair()
+        if failure == "repair":
+            raise sqlite3.OperationalError("repair failed")
+        if failure == "second-retry":
+            _orphan_after_next_chunk(store)
+
+    monkeypatch.setattr(store, "_repair_fts", fail_repair)
+    if failure == "quota":
+        check = store._check_storage_budget
+
+        def quota(maximum, messages=()):
+            check(maximum, messages)
+            if not messages:
+                raise store_module.ThreadStorageLimit("quota failed")
+
+        monkeypatch.setattr(store, "_check_storage_budget", quota)
+    error_type = {
+        "repair": sqlite3.OperationalError,
+        "second-retry": sqlite3.IntegrityError,
+        "quota": store_module.ThreadStorageLimit,
+    }[failure]
+    count = store._conn.fts_attempts
+    with pytest.raises(error_type):
+        _collision_operation(
+            store,
+            operation,
+            old,
+            [message("needle " * 1200, seq=int(operation == "append"))],
+        )
+    assert store._conn.fts_attempts == count + (1 if failure == "repair" else 2)
+    assert _write_state(store) == before
+    assert store._fts_verified_version is None
+    assert not store._conn.in_transaction
+
+
+@pytest.mark.parametrize("operation", ["store", "append"])
+def test_collision_repair_and_ingest_follow_outer_rollback(store, operation):
+    old = store.store("test", "old", [message("old")], actor="test")
+    _orphan_after_next_chunk(store)
+    before = _write_state(store)
+    with pytest.raises(RuntimeError, match="outer rollback"):
+        with store._transaction():
+            _collision_operation(
+                store,
+                operation,
+                old,
+                [message("needle " * 1200, seq=int(operation == "append"))],
+            )
+            assert_alignment(store)
+            assert store._conn.in_transaction
+            raise RuntimeError("outer rollback")
+    assert _write_state(store) == before
+    assert store._fts_verified_version is None
+
+
+@pytest.mark.parametrize("operation", ["store", "append"])
+def test_database_aborted_ingest_preserves_original_failure(monkeypatch, make_store, operation):
+    use_connection(monkeypatch, FTSFailureConnection)
+    store = make_store()
+    old = store.store("test", "old", [message("old")], actor="test")
+    before = _write_state(store)
+    error = sqlite3.OperationalError("disk I/O error")
+    store._conn.failure = error
+    store._conn.abort_on_failure = True
+    with pytest.raises(sqlite3.OperationalError) as caught:
+        _collision_operation(
+            store, operation, old, [message("new", seq=int(operation == "append"))]
+        )
+    assert caught.value is error
+    assert not store._conn.in_transaction
+    assert _write_state(store) == before
