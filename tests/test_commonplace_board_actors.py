@@ -3,6 +3,7 @@
 import shutil
 import sqlite3
 import subprocess
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -350,17 +351,67 @@ def test_parent_connections_require_same_workspace_active_parent_and_no_cycles(h
     foreign, _, _ = actor(hub, "foreign", workspace=other)
     with pytest.raises(ControlError):
         actor(hub, "cross-workspace", parent=foreign)
-    for target in (principal.connection_id, cid):
-        with pytest.raises(sqlite3.IntegrityError, match="cycle"):
-            hub.db._conn.execute(
-                "UPDATE connections SET parent_id=?,started_by='agent' WHERE id=?",
-                (target, principal.connection_id),
-            )
-    with pytest.raises(sqlite3.IntegrityError):
-        hub.db._conn.execute("UPDATE connections SET started_by='user' WHERE id=?", (cid,))
+    with hub.db._lock:
+        assert not hub.db._conn.in_transaction
+    # Exercise persistent database guards through an independent client, rather
+    # than issuing unlocked statements on the gateway's shared connection.
+    with closing(sqlite3.connect(hub.db.path, timeout=5, isolation_level=None)) as probe:
+        probe.execute("PRAGMA foreign_keys=ON")
+        selection = "SELECT * FROM connections WHERE id IN (?,?) ORDER BY id"
+        ids = (principal.connection_id, cid)
+        before = probe.execute(selection, ids).fetchall()
+        assert len(before) == 2
+        for target in ids:
+            with pytest.raises(sqlite3.IntegrityError, match="cycle"):
+                probe.execute(
+                    "UPDATE connections SET parent_id=?,started_by='agent' WHERE id=?",
+                    (target, principal.connection_id),
+                )
+            assert probe.execute(selection, ids).fetchall() == before
+        with pytest.raises(sqlite3.IntegrityError):
+            probe.execute("UPDATE connections SET started_by='user' WHERE id=?", (cid,))
+        assert probe.execute(selection, ids).fetchall() == before
     hub.db.revoke(cid, actor=hub.admin)
     with pytest.raises(ControlError, match="revoked"):
         actor(hub, "revoked-parent", parent=cid)
+
+
+def test_parent_triggers_protect_fresh_non_admin_connections(hub):
+    user = hub.db.create_user("fresh-ancestry@example.test")
+    workspace = hub.db.create_workspace("Fresh ancestry", user)
+    assert not hub.db.user(user)["is_admin"]
+    policy = Policy.build(scopes=["memory:read"], read_wings=["shared"], trust="standard")
+    parent, _ = hub.db.create_token(
+        workspace_ref=workspace,
+        user_ref=user,
+        name="parent",
+        client="test",
+        policy=policy,
+        actor=user,
+    )
+    child, _ = hub.db.create_token(
+        workspace_ref=workspace,
+        user_ref=user,
+        name="child",
+        client="test",
+        policy=policy,
+        actor=user,
+        parent=parent,
+    )
+    with closing(sqlite3.connect(hub.db.path, timeout=5, isolation_level=None)) as probe:
+        probe.execute("PRAGMA foreign_keys=ON")
+        selection = "SELECT * FROM connections WHERE id IN (?,?) ORDER BY id"
+        ids = (parent, child)
+        before = probe.execute(selection, ids).fetchall()
+        assert len(before) == 2
+        with pytest.raises(sqlite3.IntegrityError):
+            probe.execute("UPDATE connections SET started_by='user' WHERE id=?", (child,))
+        assert probe.execute(selection, ids).fetchall() == before
+        with pytest.raises(sqlite3.IntegrityError, match="cycle"):
+            probe.execute(
+                "UPDATE connections SET parent_id=?,started_by='agent' WHERE id=?", (child, parent)
+            )
+        assert probe.execute(selection, ids).fetchall() == before
 
 
 def test_connection_listing_and_cli_expose_ancestry(hub, env, tmp_path, capsys):  # noqa: F811

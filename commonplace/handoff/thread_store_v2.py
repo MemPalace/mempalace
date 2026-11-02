@@ -244,7 +244,16 @@ class ThreadStoreV2(V1ThreadStore):
                 for value in trained
             ]
 
-    def store(self, workspace_id, source_thread_id, messages, *, actor, parent_stored_id=""):
+    def store(
+        self,
+        workspace_id,
+        source_thread_id,
+        messages,
+        *,
+        actor,
+        parent_stored_id="",
+        max_storage_bytes=None,
+    ):
         messages = list(messages)
         self._validate(messages)
         if not messages:
@@ -257,6 +266,7 @@ class ThreadStoreV2(V1ThreadStore):
                 if existing.sha256 != digest:
                     raise ThreadConflict("Source thread already has different stored content")
                 return existing
+            self._check_storage_budget(max_storage_bytes, messages)
             stored_id = "thr_" + secrets.token_hex(8)
             chunks = chunk_messages(messages)
             self._conn.execute(
@@ -276,6 +286,7 @@ class ThreadStoreV2(V1ThreadStore):
             )
             cache = self._write_messages(stored_id, messages)
             self._write_chunks(stored_id, chunks, messages, cache=cache)
+            self._check_storage_budget(max_storage_bytes)
             return self.get(stored_id)
 
     @staticmethod

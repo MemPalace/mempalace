@@ -1273,7 +1273,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             MAX_REQUEST_BYTES
             if path == "/mcp"
             else HANDOFF_REQUEST_BYTES
-            if path == "/api/handoff"
+            if path in ("/api/handoff", "/api/import")
             else 1_920_000
             if path == "/api/voice/transcribe"
             else 65536
@@ -1444,6 +1444,10 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         handler(self)
 
     def _plan_limit(self, path, principal, request, plan):
+        if path == "/api/import":
+            # Import checks projected storage per thread inside the store
+            # transaction, and permits no-op reimports even at the limit.
+            return False
         if path != "/mcp" and not path.startswith("/api/"):
             return False
         if plan is None or plan.storage_bytes is None:

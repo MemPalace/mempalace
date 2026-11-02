@@ -249,7 +249,7 @@ class _API:
     def handle(self, handler) -> None:
         # An unread body must never become the next request on this connection.
         handler._handoff_body_read = False
-        principal = self.ctx.gateway.authenticate(handler.headers.get("Authorization"))
+        principal = self.ctx.gateway.principal_for(handler)
         if principal is None:
             handler.close_connection = True
             handler._send_json(

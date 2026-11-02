@@ -54,6 +54,8 @@ Unset, empty or `off` keeps plans off: self-hosted installations have no limits 
 
 Optional handoff saves a full thread in Memory and starts a fresh agent with a pointer to it. It is installed with the gateway and off by default. Thread tools appear once a workspace enables handoff or has stored threads. Pages use the hub's web sign-in; events use its signed webhooks with the `handoff` preset. See [setup and API](../docs/handoff.md).
 
+One-time conversation and memory-fact imports use the authenticated workspace route independently of handoff. See [supported sources, command and reports](../docs/one-time-import.md).
+
 ## Policy
 
 | Field | Meaning |
