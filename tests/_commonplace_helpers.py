@@ -18,6 +18,32 @@ REVIEW_CONTEXT = "The implementation is complete and the affected tests have pas
 REVIEW_OPTIONS = ["Proceed with the change", "Wait for more information"]
 
 
+@pytest.fixture
+def functional_worker_transport(monkeypatch):
+    """Keep functional reads independent of the real startup socket budget.
+
+    Logical deadline checks still run first. Only worker transport gets the
+    Hub client's bounded allowance; explicit deadline tests use no shim.
+    """
+    from commonplace.gateway import WORKER_TIMEOUT_S
+    from commonplace.rules import checks
+
+    original = checks.remaining
+    calls = 0
+
+    def remaining(timeout):
+        nonlocal calls
+        bounded = original(timeout)
+        if timeout == WORKER_TIMEOUT_S:
+            calls += 1
+            return 30.0
+        return bounded
+
+    monkeypatch.setattr(checks, "remaining", remaining)
+    yield
+    assert calls, "Functional acceptance must exercise the worker transport"
+
+
 class InProcessLauncher:
     """Starts the production MCP HTTP server in this process, on loopback.
 

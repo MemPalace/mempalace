@@ -244,6 +244,7 @@ def sqlite_collection_scope(collection, where=None, *, compact=False):
                 f"AND documents.collection_id=docs_fts.collection_id WHERE documents.collection_id=? AND ({filter_sql})"
             )
         raw = {}
+        decompressors = {}  # Owned by this reader and its dictionary snapshot.
 
         def load(ids):
             for start in range(0, len(ids), 900):
@@ -264,7 +265,9 @@ def sqlite_collection_scope(collection, where=None, *, compact=False):
                 for row in rows:
                     row_id, doc_id, document, metadata = row[:4]
                     if compact:
-                        document = collection._decompress(conn.cursor(), document, row[4])
+                        document = collection._decompress(
+                            conn.cursor(), document, row[4], cache=decompressors
+                        )
                     raw[row_id] = (doc_id, document or "", metadata)
 
         def load_texts(ids):

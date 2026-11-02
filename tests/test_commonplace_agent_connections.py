@@ -14,10 +14,13 @@ import pytest
 from commonplace import sessions, urls
 from commonplace.boards import BoardService
 from commonplace.extensions import ToolContext
-from commonplace.rules import RuleService, render
+from commonplace.rules import RuleService, checks, render
 from commonplace.social import accounts
 from commonplace.social.providers import Profile
-from tests._commonplace_helpers import hub_fixture  # noqa: F401
+from tests._commonplace_helpers import (
+    functional_worker_transport,  # noqa: F401
+    hub_fixture,  # noqa: F401
+)
 
 
 def http(hub, method, path="/api/connections", *, cookie=None, token=None, body=None, **headers):
@@ -120,7 +123,11 @@ def test_fresh_user_creates_connects_and_claims_without_admin(hub, fresh):
     assert card["proposal_status"] is None
 
 
-def test_initialize_uses_canonical_rules_and_memory_and_writes_stay_proposals(hub, fresh):
+@pytest.mark.usefixtures("functional_worker_transport")
+def test_initialize_uses_canonical_rules_and_memory_and_writes_stay_proposals(
+    hub, fresh, monkeypatch
+):
+    monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
     memory = "Workspace decisions: keep these exact words. Ω\n  Preserve spacing."
     seed_memory(fresh, memory, "shared")
     seed_memory(fresh, "PRIVATE_STARTUP_CANARY", "private.notes")

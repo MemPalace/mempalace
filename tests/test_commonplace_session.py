@@ -11,7 +11,10 @@ from commonplace import extensions, session
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.policy import Policy
 from commonplace.rules import RuleService, checks, render
-from tests._commonplace_helpers import hub_fixture  # noqa: F401
+from tests._commonplace_helpers import (
+    functional_worker_transport,  # noqa: F401
+    hub_fixture,  # noqa: F401
+)
 
 
 @pytest.fixture
@@ -235,7 +238,10 @@ def test_board_repo_filters_only_visible_theme_without_store_creation(ctx, monke
     assert [name for name, _, _ in calls] == ["rules_get"]
 
 
-def test_real_policy_reads_private_visibility_and_explicit_session_serves_rules(hub):
+@pytest.mark.usefixtures("functional_worker_transport")
+def test_real_policy_reads_private_visibility_and_explicit_session_serves_rules(hub, monkeypatch):
+    # Functional policy coverage; real deadline/socket failures are separate.
+    monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
     owner_token = hub.owner_token()
     owner = hub.gateway.authenticate(f"Bearer {owner_token}")
     from commonplace import sessions

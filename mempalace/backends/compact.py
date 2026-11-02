@@ -573,8 +573,11 @@ class CompactCollection(SQLiteExactCollection):
             raise BackendError("compact document dictionary is missing")
         return zstd.ZstdCompressionDict(row[0])
 
-    def _decompress(self, cur, blob, dictionary_id):
-        cache = self._handle.__dict__.setdefault("compact_decompressors", {})
+    def _decompress(self, cur, blob, dictionary_id, *, cache=None):
+        # Handle reads are serialized. Independent SQLite snapshots must supply
+        # their own cache: Zstandard contexts cannot serve overlapping reads.
+        if cache is None:
+            cache = self._handle.__dict__.setdefault("compact_decompressors", {})
         if dictionary_id not in cache:
             cache[dictionary_id] = zstd.ZstdDecompressor(
                 dict_data=self._dictionary(cur, dictionary_id)

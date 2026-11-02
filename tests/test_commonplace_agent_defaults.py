@@ -14,7 +14,10 @@ from commonplace.boards import BoardService
 from commonplace.extensions import ToolContext
 from commonplace.policy import Policy
 from commonplace.rules import RuleService, render
-from tests._commonplace_helpers import hub_fixture  # noqa: F401
+from tests._commonplace_helpers import (
+    functional_worker_transport,  # noqa: F401
+    hub_fixture,  # noqa: F401
+)
 
 QUERY = "workspace decisions preferences current work"
 MEMORY = '  Workspace decisions: prefer exact words. Ω\r\n"Keep this spacing."\n  '
@@ -167,6 +170,7 @@ def test_fresh_connections_get_canonical_startup_without_creating_stores(
     assert "effective rules: 0" in context and not _quoted_memories(context)
 
 
+@pytest.mark.usefixtures("functional_worker_transport")
 def test_warm_initialize_and_session_share_authorized_data_but_only_explicit_read_serves_rules(
     hub, fresh, monkeypatch
 ):
@@ -203,6 +207,7 @@ def test_warm_initialize_and_session_share_authorized_data_but_only_explicit_rea
     assert PRIVATE_MEMORY not in denied and PRIVATE_RULE not in denied
 
 
+@pytest.mark.usefixtures("functional_worker_transport")
 def test_late_initialize_keeps_rules_and_explicit_read_recovers_exact_memory(
     hub, fresh, monkeypatch, caplog
 ):

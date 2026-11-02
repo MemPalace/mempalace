@@ -279,6 +279,50 @@ def test_stalled_worker_read_fails_open_within_startup_budget(local, session_mod
         right.close()
 
 
+@pytest.mark.parametrize("phase", ["headers", "body"])
+def test_real_socket_timeout_survives_a_frozen_logical_clock(
+    local, session_module, monkeypatch, phase
+):
+    left, right = socket.socketpair()
+    client = WorkerClient(None)
+    failures = []
+    monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
+
+    def connect(conn):
+        conn.sock = left
+        left.settimeout(conn.timeout)
+
+    def context(ctx, *, budget):
+        with checks.deadline(0.04):
+            try:
+                client._post(
+                    SimpleNamespace(
+                        host="127.0.0.1", port=1, host_header="127.0.0.1:1", token="test"
+                    ),
+                    ctx.principal,
+                    REQUEST,
+                )
+            except WorkerUnavailable as error:
+                failures.append(error)
+                raise
+        return "unreachable"
+
+    session_module.initialize_context = context
+    monkeypatch.setattr("commonplace.gateway.http.client.HTTPConnection.connect", connect)
+    if phase == "body":
+        right.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n")
+    try:
+        text = initialize(local)["result"]["instructions"]
+        assert len(failures) == 1
+        assert isinstance(failures[0].__cause__, TimeoutError)
+        assert "Automatically call session_start for full context." in text
+        assert "unreachable" not in text
+        assert left.fileno() == -1
+    finally:
+        left.close()
+        right.close()
+
+
 def test_expired_worker_deadline_refuses_before_opening_connection(local, http_worker, monkeypatch):
     def unexpected_connection(*args, **kwargs):
         pytest.fail("Expired request must not open a connection")

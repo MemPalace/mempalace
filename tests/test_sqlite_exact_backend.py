@@ -779,6 +779,10 @@ def test_open_then_search_during_external_commits_has_no_closed_errors(tmp_path,
             finish.wait(30)
         assert not errors
         assert len(searches) == rounds * 10
+    except threading.BrokenBarrierError as barrier_error:
+        if errors:
+            raise errors[0] from barrier_error
+        raise
     finally:
         start.abort()
         finish.abort()
