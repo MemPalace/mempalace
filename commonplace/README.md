@@ -40,14 +40,18 @@ Claude Code: [local setup and repeatable fresh-install check](../docs/commonplac
 
 Set `COMMONPLACE_PLANS=on` to enable hosted plans. New email and social sign-ups receive Free:
 250 MB storage per account and 10 minutes of server voice transcription per UTC day.
-The chat-sync interval hook is every 15 minutes for Free and live for Paid; sync is not built here.
+Opt-in native chat capture accepts updates every 15 minutes for Free and at
+configured hook events for Paid; see [transcript capture](../docs/transcript-capture.md).
 Paid has *unlimited*\*\* storage and transcription and a server-load throttle hook.
 
 ** zolang de server het aankan / as long as the server can handle it
 
 Admins manage plans with `commonplace plan set <user email|id> free|paid|none` and inspect
-usage with `commonplace plan show <user email|id>`. Payment is not built. The transcription
-meter is a hook for a future endpoint. Accounts without a plan have no limits and every feature.
+usage with `commonplace plan show <user email|id>`. Payment is not built. Voice transcription
+charges the signed-in person's account for received audio, rounded up to whole seconds per clip.
+Invalid input and model failures do not consume quota. Each successful POST is a separate clip;
+there is no replay cache or idempotency key. Limit errors return HTTP 429 with
+`limit: "transcription"` and the daily reset time. Accounts without a plan have no limits and every feature.
 Unset, empty or `off` keeps plans off: self-hosted installations have no limits or plan UI.
 
 ## Context handoff
@@ -82,3 +86,9 @@ Operators: [nightly backups and scratch restore](../docs/backups.md) covers
 consistent snapshots, encrypted off-host storage, 30-day retention and alerts.
 
 Agents create and claim their own board cards with every client preset. Child-created cards need direct-parent or signed-in-owner approval; orchestrators can create assigned child cards directly. See [the board API](../docs/boards/API.md) for `task_approve`, `task_heartbeat`, expiry, review requirements, and space creation.
+
+## Native transcript capture
+
+Workspace owners can opt in to private, append-only Claude Code and Codex capture.
+See [transcript capture](../docs/transcript-capture.md) for local selection,
+hook and scheduler setup, storage limits and supported source formats.

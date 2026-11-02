@@ -250,8 +250,8 @@ Check modes live in the control database: a connection's `off`, `warn` or
 refused when that connection cannot call `rules_get`. Mode changes record an
 ids-only `rules.check` audit entry and emit `rule.check`. The server reads
 `COMMONPLACE_RULES_CHECK=off` and `COMMONPLACE_RULES_INJECT=off` at startup.
-This core stores settings without checking writes yet. MCP calls and board,
-memory and fact REST writes already discard an optional `rules_seq` field.
+Checking is opt-in; no setting means off. MCP calls and board, memory, fact
+and handoff REST writes discard a compatibility `rules_seq` body field.
 Internal gateway calls use a thread-local `internal_call()` context, so one
 request cannot exempt another request on a different thread.
 
@@ -302,8 +302,68 @@ recovery and owner approval of imported proposals.
 
 ### Write sequence checks
 
-Write enforcement is delivered separately using the shared version, served
-state, control settings and internal-call marker.
+Owners opt individual connections or the workspace into `warn` or `enforce`.
+Off keeps existing clients working. Warn permits the write and adds a second
+MCP text block (leaving the first JSON block parseable), or a REST
+`Commonplace-Rules-Notice` header. Enforce refuses before mutation with an MCP
+`isError` result or REST 428 and `rules_refresh: true`. Signed-in people are
+exempt on every route; the owner's agent tokens remain checked.
+
+Checked MCP tools are `task_add`, `task_update`, `task_comment`, `task_take_next`,
+`task_handoff`, `task_approve`, `ask`, `space_post`, `board_add`, `board_set`,
+`decide`, `memory_save`, `memory_link`, `fact_save`, `handoff_start` and
+`rules_publish`. Their schemas gain a `rules_seq` integer or decimal string in
+warn/enforce; it is required in enforce except for `ask`. Schemas are copied
+per caller. Every MCP call strips the argument before dispatch. Existing
+visibility and owner-only gates run first.
+
+A write must supply the current per-connection version, and that connection
+must have fetched the full effective set at that version. `session_start` and
+`rules_get effective=true format=md` provide that read; initialize injection,
+default reads and change polls do not. A refusal instructs the caller to fetch
+the full rules, follow them and retry with the returned value. Clients that
+cannot send a newly advertised parameter must reconnect. Threads sharing a
+token share its served state; this proves a connection read, not compliance
+by an individual session.
+
+REST board/card writes, chat, proposal approvals, memory/fact saves and manual
+handoff relaunch take the `Commonplace-Rules-Seq` header after the same MCP
+read. A body `rules_seq` is discarded and cannot replace the header. An exact
+`version` + `callstack` card PATCH is exempt. See [API](../boards/API.md).
+
+A current `too_large` served marker refuses checked writes, except `ask`, which
+passes even without a valid value so the agent can ask the owner to trim the
+set. Warn permits writes with a notice. A rules change invalidates this marker
+and requires a new read. A connection unable to read `rules_get` gets warn
+behavior. Unknown settings, unmigrated, locked or replaced stores fail open
+with an audited `rules_seq unchecked` reason and no notice. Store identities
+are probed even in off mode; loss emits the existing owner-confirmation event.
+After more than five unchecked writes per connection in an hour, an ids-only
+`rule.unchecked` event fires once per hour. Audit entries include authenticated
+workspace/connection ids, the stable failure reason and `transport=mcp|rest`.
+The Rules screen's incident-count projection is a separate follow-up.
+
+The following paths deliberately remain open, retaining existing authorization:
+
+- `task_heartbeat`: mechanical claim renewal.
+- `webhook_add`, `webhook_remove`, `webhook_test`: configuration and outbound automation.
+- `mempalace_add_drawer`, `mempalace_update_drawer`, `mempalace_diary_write`,
+  `mempalace_kg_add`, `mempalace_kg_invalidate`, `mempalace_kg_supersede`,
+  `mempalace_kg_save`, `mempalace_create_tunnel`, `mempalace_checkpoint`,
+  `mempalace_memories_filed_away`: hook, miner and automatic memory/graph writes.
+- `mempalace_delete_drawer`, `mempalace_delete_drawers`,
+  `mempalace_delete_by_source`, `mempalace_delete_tunnel`,
+  `mempalace_delete_hallway`: deletes keep their scope/trust/visibility checks.
+- `mempalace_event_append`, `mempalace_task_create`, `mempalace_patch_submit`,
+  `mempalace_artifact_put`, `mempalace_event_ack`: legacy machine traffic.
+- Automatic REST handoff upload, successor and launch-failure reporting;
+  handoff settings; webhook configuration/automation; read-only recall POST.
+- Server-owned calls within `internal_call()` and the local CLI outside the gateway.
+
+These are known alternate write paths, not a guarantee against a malicious
+agent. A new MCP write needs a checked/exempt inventory entry with a reason;
+a new REST write shape needs a route-map entry in `rules/enforce.py`. Reviewer
+checklist: verify that inventory and preserve the documented exemptions.
 
 ### Reviewer checks
 

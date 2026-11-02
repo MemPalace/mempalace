@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     personal_of TEXT REFERENCES users(id),
+    initial_space_pending INTEGER NOT NULL DEFAULT 0 CHECK (initial_space_pending IN (0,1)),
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS memberships (
@@ -210,6 +211,12 @@ class ControlDB:
         with self._lock:
             self._conn.executescript(_SCHEMA)
             with self._tx() as conn:
+                workspace_columns = {r[1] for r in conn.execute("PRAGMA table_info(workspaces)")}
+                if "initial_space_pending" not in workspace_columns:
+                    conn.execute(
+                        "ALTER TABLE workspaces ADD COLUMN initial_space_pending INTEGER "
+                        "NOT NULL DEFAULT 0 CHECK (initial_space_pending IN (0,1))"
+                    )
                 columns = {r[1] for r in conn.execute("PRAGMA table_info(connections)")}
                 if "parent_id" not in columns:
                     conn.execute(
@@ -322,7 +329,14 @@ class ControlDB:
             return self._conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
 
     # ── workspaces and memberships ──
-    def create_workspace(self, name: str, owner_ref: str, *, personal: bool = False) -> str:
+    def create_workspace(
+        self,
+        name: str,
+        owner_ref: str,
+        *,
+        personal: bool = False,
+        initial_space_pending: bool = False,
+    ) -> str:
         owner = self.user(owner_ref)
         name = name.strip()
         if not name:
@@ -331,8 +345,9 @@ class ControlDB:
         now = _iso(_now())
         with self._lock, self._tx() as conn:
             conn.execute(
-                "INSERT INTO workspaces(id, name, personal_of, created_at) VALUES (?,?,?,?)",
-                (wid, name, owner["id"] if personal else None, now),
+                "INSERT INTO workspaces(id, name, personal_of, initial_space_pending, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (wid, name, owner["id"] if personal else None, int(initial_space_pending), now),
             )
             conn.execute(
                 "INSERT INTO memberships(workspace_id, user_id, role, created_at) VALUES (?,?,?,?)",

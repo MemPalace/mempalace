@@ -1,6 +1,7 @@
 """Contract REST routes; all policy and state changes run in BoardService."""
 
 from commonplace.extensions import ToolContext, ToolError
+from commonplace.rules.enforce import RulesRefresh, rest_write
 
 from ._http import (
     HTTPError,
@@ -34,6 +35,9 @@ def install(gateway):
         method = h.command
         try:
             status, result = dispatch(service, h, parts, method)
+        except RulesRefresh as exc:
+            send_json(h, 428, exc.payload)
+            return
         except VersionClash as exc:
             send_json(
                 h, 409, {"error": "card changed", "current": with_urls(service.ctx, exc.current)}
@@ -109,10 +113,11 @@ def _space_route(service, h, parts, method):
                 raise HTTPError(400, "invalid cursor") from None
             return 200, service.space_read(parts[1], **cursors)
         body = read_json(h)
-        body.pop("board", None)
-        if tool == "board_set":
-            return 200, service.board_set(parts[1], **body)
-        return 201, service.space_post(parts[1], **body)
+        with rest_write(service.ctx, h, tool, body):
+            body.pop("board", None)
+            if tool == "board_set":
+                return 200, service.board_set(parts[1], **body)
+            return 201, service.space_post(parts[1], **body)
     return None
 
 
@@ -123,10 +128,11 @@ def _card_route(service, h, parts, method):
             return 200, service.task_show(task)
         if method == "PATCH":
             body = read_json(h)
-            if "version" not in body or body["version"] is None:
-                raise HTTPError(400, "version is required")
-            body.pop("task", None)
-            return 200, service.task_update(task, **body)
+            with rest_write(service.ctx, h, "task_update", body):
+                if "version" not in body or body["version"] is None:
+                    raise HTTPError(400, "version is required")
+                body.pop("task", None)
+                return 200, service.task_update(task, **body)
     if len(parts) == 3 and method == "POST":
         handlers = {
             "comments": service.task_comment,
@@ -137,11 +143,19 @@ def _card_route(service, h, parts, method):
         }
         if parts[2] in handlers:
             body = read_json(h)
-            # A decision answers the ask the person saw; a newer ask is a 409.
-            if parts[2] == "decide" and body.get("version") is None:
-                raise HTTPError(400, "version is required")
-            body.pop("task", None)
-            return 200, handlers[parts[2]](task, **body)
+            tool = {
+                "comments": "task_comment",
+                "handoff": "task_handoff",
+                "decide": "decide",
+                "heartbeat": "task_heartbeat",
+                "approve": "task_approve",
+            }[parts[2]]
+            with rest_write(service.ctx, h, tool, body):
+                # A decision answers the ask the person saw; a newer ask is a 409.
+                if parts[2] == "decide" and body.get("version") is None:
+                    raise HTTPError(400, "version is required")
+                body.pop("task", None)
+                return 200, handlers[parts[2]](task, **body)
     raise HTTPError(404, "not found")
 
 
@@ -154,7 +168,9 @@ def dispatch(service, h, parts, method):
         if method == "GET":
             return 200, {"boards": service.board_list(top_level=True)}
         if method == "POST":
-            return 201, service.board_add(**read_json(h))
+            body = read_json(h)
+            with rest_write(service.ctx, h, "board_add", body):
+                return 201, service.board_add(**body)
     if len(parts) == 3 and parts[0] == "boards" and parts[2] == "cards":
         if method == "GET":
             cards = service.task_list(
@@ -166,8 +182,9 @@ def dispatch(service, h, parts, method):
             }
         if method == "POST":
             body = read_json(h)
-            body.pop("board", None)
-            return 201, service.task_add(board=parts[1], **body)
+            with rest_write(service.ctx, h, "task_add", body):
+                body.pop("board", None)
+                return 201, service.task_add(board=parts[1], **body)
     if parts == ["cards"] and method == "GET":
         return 200, open_cards(service.task_list(top_level=True), query(h).get("limit"))
     if parts == ["needs-me"] and method == "GET":

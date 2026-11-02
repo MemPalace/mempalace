@@ -1,9 +1,11 @@
-"""Bounded, fail-open native hooks. Never read transcripts or credential files."""
+"""Fail-open native hooks; opt-in capture delegates file reads to a child."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -69,10 +71,50 @@ def _check(args, payload):
     return {"systemMessage": LOCAL_WARNING} if changes else {}
 
 
+def _capture(args, payload):
+    """Reuse the native Stop hook, leaving network and file reads to its child."""
+    if os.environ.get("COMMONPLACE_CAPTURE") != "on":
+        return {}
+    path = payload.get("transcript_path") or payload.get("rollout_path")
+    if not isinstance(path, str) or not Path(path).is_absolute():
+        return {}
+    options = (
+        {"start_new_session": True}
+        if os.name != "nt"
+        else {
+            "creationflags": subprocess.CREATE_NO_WINDOW
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_BREAKAWAY_FROM_JOB
+        }
+    )
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "commonplace.capture_client",
+            "--source",
+            "claude-code" if args.client == "claude" else "codex",
+            "--file",
+            path,
+            *(["--url", args.url] if args.url else []),
+        ],
+        env=dict(os.environ, COMMONPLACE_TOKEN=os.environ.get(args.token_env, "")),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        **options,
+    )
+    return {}
+
+
 def main(argv=None, *, stdin=None, stdout=None) -> int:
     """Return native JSON and zero even when the service/checker is unavailable."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--event", required=True, choices=("session-start", "check-local"))
+    parser.add_argument(
+        "--event", required=True, choices=("session-start", "check-local", "capture")
+    )
     parser.add_argument("--client", required=True, choices=("claude", "codex"))
     parser.add_argument("--url")
     parser.add_argument("--token-env", default="COMMONPLACE_TOKEN")
@@ -92,6 +134,8 @@ def main(argv=None, *, stdin=None, stdout=None) -> int:
                     "additionalContext": _session(args, payload),
                 }
             }
+        elif args.event == "capture":
+            result = _capture(args, payload)
         else:
             result = _check(args, payload)
     except Exception:
@@ -100,6 +144,8 @@ def main(argv=None, *, stdin=None, stdout=None) -> int:
         result = (
             {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": FOLLOWUP}}
             if args.event == "session-start"
+            else {}
+            if args.event == "capture"
             else {
                 "systemMessage": "Commonplace local-only check unavailable; run commonplace check when available."
             }

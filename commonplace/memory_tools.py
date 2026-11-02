@@ -21,6 +21,7 @@ from ._http import BadRequest, path_parts, query, read_json, require_principal, 
 from .extensions import LocalTool, ToolContext, ToolError, register
 from .http_util import log_failure
 from .policy import canonical_wing
+from .rules.enforce import RulesRefresh, rest_write
 
 logger = logging.getLogger(__name__)
 _AMSTERDAM = ZoneInfo("Europe/Amsterdam")
@@ -505,8 +506,8 @@ def install(gateway):
                 if principal.policy.refusal("memory_save"):
                     raise ToolError("no: memory write refused")
                 body = read_json(h)
-                body.pop("rules_seq", None)
-                memory_id, _ = _save(ctx, body)
+                with rest_write(ctx, h, "memory_save", body):
+                    memory_id, _ = _save(ctx, body)
                 send_json(h, 201, {"id": memory_id})
             elif h.command == "GET" and parts == ["search"]:
                 if principal.policy.refusal("memory_search"):
@@ -525,6 +526,8 @@ def install(gateway):
                 send_json(h, 404, {"error": "not found"})
         except BadRequest:
             pass
+        except RulesRefresh as exc:
+            send_json(h, 428, exc.payload)
         except ToolError as exc:
             status = 404 if str(exc) == "no: memory not found" else 403
             send_json(h, status, {"error": str(exc)})
@@ -541,12 +544,14 @@ def install(gateway):
                 raise ToolError("no: fact write refused")
             ctx = ToolContext(principal=principal, gateway=gateway)
             body = read_json(h)
-            body.pop("rules_seq", None)
-            result = _file_fact(ctx, body)
-            _emit(ctx, "fact.saved", result.get("triple_id"), action=result.get("action"))
+            with rest_write(ctx, h, "fact_save", body):
+                result = _file_fact(ctx, body)
+                _emit(ctx, "fact.saved", result.get("triple_id"), action=result.get("action"))
             send_json(h, 201, result)
         except BadRequest:
             pass
+        except RulesRefresh as exc:
+            send_json(h, 428, exc.payload)
         except ToolError as exc:
             send_json(h, 403, {"error": str(exc)})
         except Exception as exc:

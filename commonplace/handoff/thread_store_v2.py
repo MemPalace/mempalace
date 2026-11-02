@@ -253,14 +253,14 @@ class ThreadStoreV2(V1ThreadStore):
         actor,
         parent_stored_id="",
         max_storage_bytes=None,
+        wing=THREADS_WING,
     ):
         messages = list(messages)
         self._validate(messages)
         if not messages:
             raise ValueError("Thread must contain at least one message")
         digest = canonical_sha256(messages)
-        with self._lock, self._conn:
-            self._conn.execute("BEGIN IMMEDIATE")
+        with self._transaction():
             existing = self.by_source(workspace_id, source_thread_id)
             if existing is not None:
                 if existing.sha256 != digest:
@@ -279,7 +279,7 @@ class ThreadStoreV2(V1ThreadStore):
                     len(messages),
                     len(chunks),
                     digest,
-                    THREADS_WING,
+                    wing,
                     datetime.now(timezone.utc).isoformat(),
                     actor,
                 ),
@@ -294,11 +294,10 @@ class ThreadStoreV2(V1ThreadStore):
         if any(message.seq != seq for seq, message in enumerate(messages)):
             raise ValueError("Message sequence must start at zero and be contiguous")
 
-    def append(self, stored_id, messages):
+    def append(self, stored_id, messages, *, max_storage_bytes=None):
         messages = list(messages)
         self._validate(messages)
-        with self._lock, self._conn:
-            self._conn.execute("BEGIN IMMEDIATE")
+        with self._transaction():
             stored = self.get(stored_id)
             if stored is None:
                 raise ValueError("Thread not found")
@@ -314,6 +313,7 @@ class ThreadStoreV2(V1ThreadStore):
             if len(messages) <= stored.message_count:
                 return stored
             added = messages[stored.message_count :]
+            self._check_storage_budget(max_storage_bytes, added)
             cache = self._write_messages(stored_id, added)
             self._write_chunks(
                 stored_id, chunk_messages(added), added, stored.chunk_count, cache=cache
@@ -329,6 +329,7 @@ class ThreadStoreV2(V1ThreadStore):
                     stored_id,
                 ),
             )
+            self._check_storage_budget(max_storage_bytes)
             return self.get(stored_id)
 
     def _write_messages(self, stored_id, added):

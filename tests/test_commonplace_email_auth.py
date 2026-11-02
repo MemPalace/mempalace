@@ -236,7 +236,7 @@ def test_fresh_signup_isolation_logout_and_closed_signup_relogin(fresh, monkeypa
         pending = [tuple(row) for row in client.db._conn.execute("SELECT * FROM email_challenges")]
         assert len(pending) == 1 and token not in str(pending)
     status, headers, content = client.verify(link)
-    assert status == 303 and headers["Location"] == "/app/" and not content
+    assert status == 303 and headers["Location"] == "/app/#/board/commonplace" and not content
     assert headers["Referrer-Policy"] == "no-referrer"
     cookie = headers["Set-Cookie"].split(";", 1)[0]
     for attr in ("HttpOnly", "SameSite=Lax", "Path=/"):
@@ -438,7 +438,7 @@ def test_unsafe_destinations_do_not_redirect_or_affect_mailed_origin(fresh, next
     client, mailbox = fresh()
     assert client.ask(next=next_path)[0] == 202
     assert mailbox.link().startswith(urls.APP_URL + "/app/auth/email/verify?t=")
-    assert client.verify(mailbox.link())[1]["Location"] == "/app/"
+    assert client.verify(mailbox.link())[1]["Location"] == "/app/#/board/commonplace"
 
 
 def test_safe_destination_is_bound_to_challenge_and_secure_cookie(fresh):

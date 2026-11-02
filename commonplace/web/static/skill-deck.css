@@ -1,0 +1,30 @@
+/* Public previews share the application tokens while scrolling as documents. */
+body.skill-deck { height: auto; min-height: 100%; overflow: auto; font-size: 14px; line-height: 1.6; }
+.skill-deck header, .skill-deck main { max-width: 1200px; margin: 0 auto; padding: 24px; }
+.skill-deck header { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+.skill-deck a { color: var(--strong); text-underline-offset: 4px; }
+.skill-deck h1 { font-size: 24px; line-height: 1.3; margin: 0 0 24px; overflow-wrap: anywhere; }
+.skill-deck h2 { font-size: 16px; line-height: 1.5; margin: 0 0 12px; overflow-wrap: anywhere; }
+.skill-deck .layout { display: grid; grid-template-columns: minmax(0, 1fr) 304px; gap: 32px; align-items: start; }
+.skill-deck section, .skill-deck article { min-width: 0; }
+.skill-deck article, .skill-deck section > section { margin-top: 32px; }
+.skill-deck pre { margin: 12px 0 0; padding: 20px; border: 1px solid var(--line); background: var(--surface); white-space: pre-wrap; overflow-wrap: anywhere; }
+.skill-deck code { font: inherit; }
+.skill-deck p { margin: 0 0 16px; overflow-wrap: anywhere; }
+.skill-deck label { display: block; margin: 16px 0 12px; }
+.skill-deck input[type="checkbox"] { width: 18px; height: 18px; min-height: 0; vertical-align: middle; accent-color: var(--strong); }
+.skill-deck textarea { display: block; width: 100%; font: inherit; color: var(--ink); background: var(--surface); resize: vertical; padding: 10px; border: 1px solid var(--line-2); }
+.skill-deck button { font: inherit; font-weight: 600; min-height: 44px; padding: 8px 16px; border: 1px solid var(--line-2); background: transparent; color: var(--strong); cursor: pointer; }
+.skill-deck #add { background: var(--strong); color: var(--bg); border-color: var(--strong); }
+.skill-deck button:disabled, .skill-deck #add:disabled { background: var(--surface-2); color: var(--muted); border-color: var(--line); cursor: default; }
+.skill-deck button:hover:enabled { border-color: var(--strong); }
+.skill-deck button:active:enabled { transform: translateY(1px); }
+.skill-deck :focus-visible { outline: 2px solid var(--strong); outline-offset: 3px; }
+.skill-deck [role="status"] { margin-top: 12px; }
+@media (max-width: 1100px) {
+  .skill-deck .layout { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 480px) {
+  .skill-deck header, .skill-deck main { padding: 20px; }
+  .skill-deck pre { padding: 16px; }
+}

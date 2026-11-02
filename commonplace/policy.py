@@ -28,6 +28,7 @@ SCOPES = (
     "memory:read",
     "memory:write",
     "memory:delete",
+    "skills:read",
     "kg:read",
     "kg:write",
     "events:read",

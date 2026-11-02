@@ -113,9 +113,10 @@ def install(gateway, data_dir=None, **_ignored) -> HandoffContext:
     )
     gateway.handoff = ctx
     api.register(ctx)
-    from commonplace import imports
+    from commonplace import capture, imports
 
     imports.register(ctx)
+    capture.register(ctx)
     web.register(ctx)
     # Events a crash left queued (handoff.completed) go out now.
     ctx.service.replay_pending()

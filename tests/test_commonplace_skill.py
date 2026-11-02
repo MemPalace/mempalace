@@ -39,7 +39,7 @@ def _contract_tools() -> set:
 
 
 _TOOLISH = re.compile(r"\b(?:task|board|memory|needs|rules|session|ask|decide)(?:_[a-z]+)*\b")
-_ARGS = {"status_line"}
+_ARGS = {"status_line", "rules_seq"}
 
 
 def test_tool_references_match_contract():

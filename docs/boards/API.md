@@ -378,9 +378,29 @@ for example `env:COMMONPLACE_WEBHOOK_AUTH_COORDINATOR`. Set the variable only
 in the server environment; the database stores the reference, not its value.
 
 
-## Rules version compatibility
+## Rules freshness
 
-Board and card REST write bodies may carry `rules_seq` as an integer or string.
-The rules core discards it before passing the remaining fields to board
-operations; write enforcement is delivered separately. Existing response shapes
+Agent board/card writes and chat posts use `Commonplace-Rules-Seq: <value>`.
+Memory saves, fact saves and manual handoff relaunch use the same header.
+First call the MCP tool `rules_get format=md effective=true`, follow the full
+set, and send the returned numeric `rules_seq`. REST rule routes are for people;
+REST-only writers still need that MCP read. The ordinary `seq` is a change
+cursor and cannot substitute for `rules_seq`.
+
+Under enforce, missing, stale or unread versions return 428 with
+`{"error": "<refresh guidance>", "rules_refresh": true}` before mutation. Read
+again and retry with the new value. Warn permits the write and sends a
+`Commonplace-Rules-Notice` response header. Off preserves existing behavior.
+People's session writes are exempt; the owner's agent tokens are checked.
+An unavailable store permits writes with an audited unchecked reason and alarm.
+
+Only a card PATCH containing exactly `version` and `callstack` is exempt.
+Proposal approvals are checked; mechanical claim heartbeats are exempt.
+Automatic handoff upload, successor and launch-failed, handoff settings and
+webhooks also bypass freshness. Reads, including recall POST, stay reads.
+These paths retain their existing authorization. See the Rules design for the
+complete list of deliberately open paths.
+
+Board and card REST bodies may carry a compatibility `rules_seq` field, but
+it is discarded before dispatch and never replaces the header. Response shapes
 are unchanged. The internal PR repository backfill does not add a card field.

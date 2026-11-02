@@ -24,6 +24,7 @@ Call `session_start` automatically at session start, resume and after compaction
 
 Between session reads, call `rules_changed since=<last seq>`; whenever `seq` advanced, call `rules_get effective=true format=md`.
 Follow the effective `text`: owner edits win, and retired rules mean stop following them.
+Keep the numeric `rules_seq` from `session_start` or `rules_get effective=true format=md` and pass it on checked writes. After a refresh refusal, read the full set, follow it, then retry with its new value. If no numeric value is returned, call `ask` without one; an over-cap set allows only `ask` under enforce. A change poll does not serve the rules. REST writes use the `Commonplace-Rules-Seq` header after the same MCP read.
 For a new rule, call `rules_publish rules=[{text: <exact words>, kind: instruction}]`. Default `agent=self` proposes for you; `agent='*'` proposes for All agents and needs owner approval before taking effect. Imported rules also remain proposals until accepted.
 When replacing your complete own rule set, call `rules_publish` with `replace=true`; preserve rules outside that set. Never self-accept proposals.
 

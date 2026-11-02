@@ -45,7 +45,7 @@ def detect_format(text: str) -> str:
     raise ValueError("Unrecognized transcript format")
 
 
-def parse(text: str, fmt: str = "auto") -> list[ThreadMessage]:
+def parse(text: str, fmt: str = "auto", *, require_recognized: bool = True) -> list[ThreadMessage]:
     """Parse a whole transcript. ``seq`` is dense from 0. Raises ValueError on garbage."""
     if fmt not in FORMATS:
         raise ValueError("Unknown transcript format")
@@ -85,7 +85,7 @@ def parse(text: str, fmt: str = "auto") -> list[ThreadMessage]:
                 _add(messages, raw, at)
         else:
             _codex(messages, record, raw, at)
-    if not recognized:
+    if not recognized and require_recognized:
         raise ValueError("Unrecognized transcript format")
     return messages
 

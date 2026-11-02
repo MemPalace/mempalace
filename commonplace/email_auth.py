@@ -292,24 +292,17 @@ class EmailAuth:
                     )
                 if row is None or row["expires_at"] <= sessions._now().isoformat():
                     raise SignInError("expired")
-                uid = accounts.resolve(
-                    self.db,
+                session, first_landing = accounts.complete_signin(
+                    self.gateway,
                     "email",
                     Profile(row["email"], "", (row["email"],)),
                     signup=accounts.signup_enabled(),
                 )
-                workspace = sessions.home_workspace(self.db, uid)
-                if workspace is None:
-                    raise SignInError("account")
-                login = sessions.create_login_link(self.db, self.db.user(uid)["email"], workspace)
-                session = sessions.redeem_login_link(self.db, login)
-                if not session or sessions.session_principal(self.db, session) is None:
-                    raise SignInError("failed")
             next_path = row["next"]
             destination = (
                 urls.AGENT_URL + next_path
                 if next_path.startswith("/oauth/")
-                else next_path or "/app/"
+                else next_path or first_landing
             )
             redirect(
                 h,

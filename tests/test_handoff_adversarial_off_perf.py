@@ -195,6 +195,7 @@ def _principal():
     return SimpleNamespace(
         workspace_id="workspace-review",
         role="owner",
+        person=False,
         policy=Policy.build(
             profile="full",
             scopes=["memory:read", "threads:read"],
@@ -429,7 +430,6 @@ _RANGE = {"source_thread", "source_seq_start", "source_seq_end"}
 _FACT = {"wing", "sensitivity"}
 _FILTER = {"wings", "sensitivities"}
 ADDED_SINCE_BASELINE = {
-    "rules_get": {"effective"},
     "memory_save": {"source"},
     "mempalace_add_drawer": _RANGE,
     "mempalace_kg_add": _RANGE | _FACT | {"sensitivities"},
@@ -532,6 +532,12 @@ def legacy(tmp_path_factory):
     shutil.copytree(
         ROOT / "commonplace" / "boards",
         snapshot / "commonplace" / "boards",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    # Current board routes import rules; keep the pinned gateway and policy.
+    shutil.copytree(
+        ROOT / "commonplace" / "rules",
+        snapshot / "commonplace" / "rules",
         ignore=shutil.ignore_patterns("__pycache__"),
     )
     shutil.copy2(ROOT / "commonplace" / "callstack.py", snapshot / "commonplace" / "callstack.py")

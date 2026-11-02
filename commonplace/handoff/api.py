@@ -28,6 +28,9 @@ import math
 from dataclasses import fields, is_dataclass, replace
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from commonplace.extensions import ToolContext
+from commonplace.rules.enforce import RulesRefresh, rest_write
+
 from .authority import HandoffPermissionError, require_launch_authority
 from .db import HandoffDBError
 from .models import (
@@ -157,6 +160,7 @@ def _read_json(handler, limit: int = MAX_BODY_BYTES, *, allow_empty: bool = Fals
         raise _RequestError(400, "invalid JSON") from None
     if not isinstance(data, dict):
         raise _RequestError(400, "JSON object required")
+    data.pop("rules_seq", None)
     return data
 
 
@@ -262,6 +266,8 @@ class _API:
             target = urlsplit(handler.path)
             query = parse_qs(target.query, keep_blank_values=True)
             status, result = self.dispatch(handler, principal, target.path, query)
+        except RulesRefresh as error:
+            status, result = 428, error.payload
         except _RequestError as error:
             status, result = error.status, {"error": error.message}
         except HandoffPermissionError as error:
@@ -390,10 +396,13 @@ class _API:
                 if parts[1] == "relaunch":
                     require_launch_authority(principal)
                     self.handoff(principal, record_id, write=True)
-                    _object(_read_json(handler, allow_empty=True), set())
-                    return 200, self.result(
-                        principal, self.ctx.service.relaunch(principal, record_id)
-                    )
+                    body = _read_json(handler, allow_empty=True)
+                    ctx = ToolContext(principal=principal, gateway=self.ctx.gateway)
+                    with rest_write(ctx, handler, "relaunch", body):
+                        _object(body, set())
+                        return 200, self.result(
+                            principal, self.ctx.service.relaunch(principal, record_id)
+                        )
                 self.require(principal, SCOPE_HANDOFF)
                 self.handoff(principal, record_id, write=True)
                 if parts[1] == "launch-failed":

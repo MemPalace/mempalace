@@ -10,9 +10,11 @@ import os
 import threading
 import time
 
+from commonplace import plans
 from commonplace.http_util import query, read_json, require_principal, send_json
 
-MAX_PCM_BYTES = 60 * 16000 * 2
+PCM_BYTES_PER_SECOND = 16000 * 2
+MAX_PCM_BYTES = 60 * PCM_BYTES_PER_SECOND
 LANGUAGES = ("en", "nl")
 logger = logging.getLogger(__name__)
 
@@ -278,9 +280,18 @@ def install(gateway):
         if len(pcm) != length:
             send_json(h, 400, {"error": "Incomplete PCM body"})
             return
+        # The wire format fixes sample rate/channels/width. Bill received samples,
+        # rounding up to the meter's whole seconds, never a client duration claim.
+        seconds = (len(pcm) + PCM_BYTES_PER_SECOND - 1) // PCM_BYTES_PER_SECOND
+        try:
+            day = plans.use_transcription(gateway.db, principal.user_id, seconds)
+        except plans.LimitReached as exc:
+            send_json(h, 429, {"error": str(exc), "limit": "transcription"})
+            return
         try:
             text = gateway.voice_engine.transcribe(language, pcm)
         except Exception as exc:
+            plans.refund_transcription(gateway.db, principal.user_id, seconds, day)
             # Exception messages and args may contain user content.
             logger.warning("voice transcription failed: %s (%s)", type(exc).__name__, language)
             send_json(h, 503, {"error": "Could not transcribe. Voice model is unavailable."})

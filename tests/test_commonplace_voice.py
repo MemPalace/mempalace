@@ -7,13 +7,17 @@ import logging
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from commonplace import sessions, voice
+from commonplace import plans, sessions, voice
 from commonplace.control_db import ControlDB
+from commonplace.social import accounts
+from commonplace.social.providers import Profile
 from tests._commonplace_helpers import Hub
 from tests.test_commonplace_web import login, request
 
@@ -67,6 +71,195 @@ def enable(app):
         200,
         {"available": True, "enabled": True, "languages": ["en", "nl"], "owner": True},
     )
+
+
+def fresh_voice_user(hub, email):
+    user = accounts.resolve(hub.db, "synthetic", Profile(email, "New user", (email,)), signup=True)
+    assert not hub.db.user(user)["is_admin"]
+    workspace = next(row["id"] for row in hub.db.workspaces() if row["personal_of"] == user)
+    token = sessions.create_login_link(hub.db, email, workspace)
+    status, headers, _ = request(hub, f"/app/login?t={token}")
+    assert status == 302
+    user_app = hub, {"Cookie": headers["Set-Cookie"].split(";", 1)[0]}
+    assert call(user_app, path="/api/me")[1]["workspace"] == workspace
+    enable(user_app)
+    return user_app, user
+
+
+@pytest.fixture
+def limited_voice(app, monkeypatch):
+    monkeypatch.setenv("COMMONPLACE_PLANS", "on")
+    monkeypatch.setitem(plans.PLANS, "free", replace(plans.FREE, transcription_seconds=1))
+    return fresh_voice_user(app[0], "fresh@example.com")
+
+
+@pytest.mark.parametrize("samples,expected", [(15999, 200), (16000, 200), (16001, 429)])
+def test_fresh_user_transcription_quota_uses_received_audio(limited_voice, samples, expected):
+    app, user = limited_voice
+    hub, _ = app
+    assert plans.get_plan(hub.db, user).transcription_seconds == 1
+    pcm = b"\0\0" * samples
+    status, result = call(
+        app,
+        "POST",
+        "/api/voice/transcribe?lang=en&duration=0&seconds=0",
+        pcm,
+        {"X-Audio-Duration": "0"},
+    )
+    assert status == expected
+    if expected == 200:
+        assert result == {"text": hub.gateway.voice_engine.text}
+        assert hub.gateway.voice_engine.calls == [("en", pcm)]
+        assert plans.transcription_used(hub.db, user) == 1
+        # A successful replay is another clip, and cannot bypass the quota.
+        assert call(app, "POST", "/api/voice/transcribe?lang=en", pcm)[0] == 429
+        assert len(hub.gateway.voice_engine.calls) == 1
+    else:
+        assert result == {
+            "error": plans.transcription_message(plans.get_plan(hub.db, user)),
+            "limit": "transcription",
+        }
+        assert "1 second" in result["error"] and "00:00 UTC" in result["error"]
+        assert hub.gateway.voice_engine.calls == []
+        assert plans.transcription_used(hub.db, user) == 0
+        assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0" * 16000)[0] == 200
+    assert plans.transcription_used(hub.db, hub.admin) == 0
+    status, payload = call(app, path="/api/plan")
+    assert status == 200 and payload["transcription"] == {"used_today": 1, "limit": 1}
+
+
+@pytest.mark.parametrize(
+    "path,body,headers,expected",
+    [
+        ("?lang=en", b"", {}, 400),
+        ("?lang=en", b"\0", {}, 400),
+        ("?lang=de", b"\0\0", {}, 400),
+        ("?lang=en", b"\0\0", {"Content-Type": "text/plain"}, 403),
+        ("?lang=en", b"\0\0", {"Content-Length": "-2"}, 400),
+        ("?lang=en", b"", {"Content-Length": str(voice.MAX_PCM_BYTES + 2)}, 413),
+    ],
+)
+def test_invalid_audio_does_not_charge(limited_voice, path, body, headers, expected):
+    app, user = limited_voice
+    hub, _ = app
+    assert call(app, "POST", "/api/voice/transcribe" + path, body, headers)[0] == expected
+    assert plans.transcription_used(hub.db, user) == 0
+    assert hub.gateway.voice_engine.calls == []
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0" * 16000)[0] == 200
+
+
+def test_incomplete_audio_does_not_charge(limited_voice):
+    import socket
+
+    app, user = limited_voice
+    hub, cookie = app
+    conn = http.client.HTTPConnection("127.0.0.1", hub.port, timeout=5)
+    try:
+        conn.request(
+            "POST",
+            "/api/voice/transcribe?lang=en",
+            b"\0\0",
+            {**cookie, "Content-Type": "application/octet-stream", "Content-Length": "32000"},
+        )
+        conn.sock.shutdown(socket.SHUT_WR)
+        response = conn.getresponse()
+        assert response.status == 400
+        assert json.loads(response.read()) == {"error": "Incomplete PCM body"}
+    finally:
+        conn.close()
+    assert plans.transcription_used(hub.db, user) == 0
+    assert hub.gateway.voice_engine.calls == []
+
+
+def test_off_unavailable_and_failed_model_do_not_charge(limited_voice):
+    app, user = limited_voice
+    hub, _ = app
+    engine = hub.gateway.voice_engine
+    assert call(app, "PATCH", body={"enabled": False})[0] == 200
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0")[0] == 403
+    enable(app)
+    engine.present = False
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0")[0] == 503
+    engine.present, engine.error = True, True
+    pcm = b"\0\0" * 16000
+    for _ in range(2):
+        assert call(app, "POST", "/api/voice/transcribe?lang=en", pcm)[0] == 503
+        assert plans.transcription_used(hub.db, user) == 0
+    engine.error = False
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", pcm)[0] == 200
+    assert plans.transcription_used(hub.db, user) == 1
+
+
+def test_inflight_quota_is_atomic_and_other_users_are_independent(limited_voice, monkeypatch):
+    app, user = limited_voice
+    hub, _ = app
+    other_app, other_user = fresh_voice_user(hub, "independent@example.com")
+    entered, release = threading.Event(), threading.Event()
+    pcm, other_pcm = b"\0\0" * 16000, b"\1\0" * 16000
+
+    def recognize(language, audio):
+        if audio == pcm:
+            entered.set()
+            assert release.wait(5)
+        return "verbatim"
+
+    monkeypatch.setattr(hub.gateway.voice_engine, "transcribe", recognize)
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        first = pool.submit(call, app, "POST", "/api/voice/transcribe?lang=en", pcm)
+        try:
+            assert entered.wait(5)
+            assert plans.transcription_used(hub.db, user) == 1
+            denied = [
+                pool.submit(call, app, "POST", "/api/voice/transcribe?lang=en", other_pcm)
+                for _ in range(3)
+            ]
+            independent = pool.submit(
+                call, other_app, "POST", "/api/voice/transcribe?lang=nl", other_pcm
+            )
+            assert [future.result(5)[0] for future in denied] == [429, 429, 429]
+            assert independent.result(5) == (200, {"text": "verbatim"})
+            assert plans.transcription_used(hub.db, other_user) == 1
+        finally:
+            release.set()
+        assert first.result(5) == (200, {"text": "verbatim"})
+    assert plans.transcription_used(hub.db, user) == 1
+
+
+def test_failed_reservation_refunds_original_day_after_plan_change(limited_voice, monkeypatch):
+    app, user = limited_voice
+    hub, _ = app
+    now = [datetime(2026, 1, 1, 23, 59, 59, tzinfo=timezone.utc)]
+    monkeypatch.setattr(plans, "_now", lambda: now[0])
+
+    def fail(language, pcm):
+        assert plans.transcription_used(hub.db, user) == 1
+        now[0] += timedelta(seconds=1)
+        plans.use_transcription(hub.db, user, 1)
+        plans.set_plan(hub.db, user, "paid", actor=hub.admin)
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(hub.gateway.voice_engine, "transcribe", fail)
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0")[0] == 503
+    with hub.db._lock:
+        rows = hub.db._conn.execute(
+            "SELECT day, seconds FROM transcription_usage WHERE user_id=? ORDER BY day", (user,)
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [("2026-01-01", 0), ("2026-01-02", 1)]
+
+
+@pytest.mark.parametrize("switch,name", [("off", "free"), ("on", "paid"), ("on", "none")])
+def test_unmetered_voice_does_not_record_usage(limited_voice, monkeypatch, switch, name):
+    app, user = limited_voice
+    hub, _ = app
+    monkeypatch.setenv("COMMONPLACE_PLANS", switch)
+    monkeypatch.setattr(plans, "load_ratio", lambda: 0)
+    plans.set_plan(hub.db, user, name, actor=hub.admin)
+    for error, expected in [(False, 200), (True, 503)]:
+        hub.gateway.voice_engine.error = error
+        assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0" * 32000)[0] == expected
+    assert plans.transcription_used(hub.db, user) == 0
+    with hub.db._lock:
+        assert hub.db._conn.execute("SELECT * FROM transcription_usage").fetchall() == []
 
 
 def test_default_owner_toggle_persists_and_workspace_isolated(app):

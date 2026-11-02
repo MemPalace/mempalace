@@ -321,10 +321,14 @@ class Mediator:
             tool = extensions.get(name)
             if policy.tool_visible(name) and tool.usable_by(principal, self.gateway):
                 visible.append(tool.schema())
+        from commonplace.rules import checks, enforce
+
+        mode = "off" if principal.person else checks.mode(self.gateway, principal)
+        visible = [enforce.schema(tool, mode) for tool in visible]
         response["result"]["tools"] = visible
         return response
 
-    def _local_call(self, principal: Principal, tool, req_id, args: dict) -> dict:
+    def _local_call(self, principal: Principal, tool, req_id, args: dict, rule_check) -> dict:
         if not tool.usable_by(principal, self.gateway):
             self._audit(principal, tool.name, "deny", "owner only" if tool.owner_only else "off")
             return _rpc_error(req_id, -32601, f"Unknown tool: {tool.name}")
@@ -333,7 +337,7 @@ class Mediator:
             result = tool.handler(ctx, args)
         except extensions.ToolError as exc:
             if tool.kind == "write":
-                self._audit(principal, tool.name, "deny", str(exc)[:200])
+                self._audit(principal, tool.name, "deny", rule_check.reason or str(exc)[:200])
             text = str(exc)
             if not text.startswith("no:"):
                 text = f"no: {text}"
@@ -343,7 +347,7 @@ class Mediator:
                 "result": {"content": [{"type": "text", "text": text}], "isError": True},
             }
         if tool.kind == "write":
-            self._audit(principal, tool.name, "ok")
+            self._audit(principal, tool.name, "ok", rule_check.reason)
         if isinstance(result, str):
             text = result
         else:
@@ -364,25 +368,45 @@ class Mediator:
         from mempalace.stored_text import user_tool_arguments
 
         args = user_tool_arguments(dict(args), tool_name=name) if isinstance(args, dict) else {}
-        args.pop("rules_seq", None)
+        supplied_rules_seq = args.pop("rules_seq", None)
         policy = principal.policy
         if not isinstance(name, str):
             return _rpc_error(req_id, -32602, "Invalid params: tool name must be a string")
 
         local = extensions.get(name)
         refusal = policy.refusal(name)
-        if local is not None and local.available is not None:
-            # A feature a workspace doesn't use is audited like a tool that
-            # doesn't exist, whatever the token holds.
+        if local is not None and (local.available is not None or refusal is None):
+            # Visibility and owner gates precede freshness, so hidden tools
+            # keep the same refusal regardless of the supplied rules version.
             if not local.usable_by(principal, self.gateway):
-                refusal = "unknown tool"
+                refusal = "unknown tool" if local.available is not None else "owner only"
         if refusal is not None:
             self._audit(principal, name, "deny", refusal)
             # A hidden tool looks exactly like a tool that doesn't exist.
             return _rpc_error(req_id, -32601, f"Unknown tool: {name}")
 
+        from commonplace.rules import enforce
+
+        rule_check = enforce.Check()
+        if name in enforce.CHECKED_WRITES:
+            ctx = extensions.ToolContext(principal=principal, gateway=self.gateway)
+            rule_check = enforce.check(ctx, name, supplied_rules_seq)
+            if rule_check.denied:
+                self._audit(principal, name, "deny", rule_check.reason)
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": rule_check.notice}],
+                        "isError": True,
+                    },
+                }
+
         if local is not None:
-            return self._local_call(principal, local, req_id, args)
+            response = self._local_call(principal, local, req_id, args, rule_check)
+            if rule_check.notice and "result" in response:
+                response["result"]["content"].append({"type": "text", "text": rule_check.notice})
+            return response
 
         rule = TOOL_RULES[name][1]
         notes: list = []
@@ -434,15 +458,14 @@ class Mediator:
         return response
 
     def _audit(self, principal, tool, decision, reason="", wing=None, target_ids=()):
-        self.db.audit(
-            action="tool.call",
-            decision=decision,
-            workspace_id=principal.workspace_id,
-            user_id=principal.user_id,
-            connection_id=principal.connection_id,
-            auth=principal.auth,
-            tool=tool,
-            reason=reason,
+        from commonplace.rules.enforce import audit
+
+        audit(
+            self.db,
+            principal,
+            tool,
+            decision,
+            reason,
             wing=wing,
             target_ids=target_ids,
         )
@@ -957,7 +980,7 @@ def _host_name(authority: str) -> str:
 def _public_route(method: str, path: str) -> bool:
     if method == "GET":
         return path in ("/app", "/app/login", "/oauth/authorize") or path.startswith(
-            ("/app/", "/s/", "/.well-known/")
+            ("/app/", "/s/", "/.well-known/", "/skills/decks/")
         )
     return method == "POST" and (
         path.startswith("/app/auth/")
@@ -1243,6 +1266,10 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             super().send_header(keyword, value)
 
     def end_headers(self):
+        notice = getattr(self, "_rules_notice", "")
+        if notice:
+            super().send_header("Commonplace-Rules-Notice", notice)
+            self._rules_notice = ""
         if self.close_connection and not getattr(self, "_connection_header", False):
             super().send_header("Connection", "close")
         super().send_header("X-Content-Type-Options", "nosniff")
@@ -1284,7 +1311,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             MAX_REQUEST_BYTES
             if path == "/mcp"
             else HANDOFF_REQUEST_BYTES
-            if path in ("/api/handoff", "/api/import")
+            if path in ("/api/handoff", "/api/import", "/api/capture")
             else 1_920_000
             if path == "/api/voice/transcribe"
             else 65536
@@ -1455,8 +1482,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         handler(self)
 
     def _plan_limit(self, path, principal, request, plan):
-        if path == "/api/import":
-            # Import checks projected storage per thread inside the store
+        if path in ("/api/import", "/api/capture", "/api/settings/capture"):
+            # Ingest checks projected storage per thread inside the store
             # transaction, and permits no-op reimports even at the limit.
             return False
         if path != "/mcp" and not path.startswith("/api/"):

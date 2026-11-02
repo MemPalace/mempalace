@@ -1,0 +1,3 @@
+# Optional, used only by the standalone fresh-user release gate.
+mcp>=1.13,<2
+playwright>=1.49,<2
