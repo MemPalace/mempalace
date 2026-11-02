@@ -1,6 +1,7 @@
 """Control DB: accounts, roles, tokens stored as hashes, append-only audit."""
 
 import sqlite3
+import threading
 
 import pytest
 
@@ -18,6 +19,79 @@ def db(tmp_path):
     d = ControlDB(str(tmp_path / "control.sqlite3"))
     yield d
     d.close()
+
+
+def test_pre_close_callback_runs_once_without_sql_lock_and_refuses_late_registration(db):
+    checked = threading.Event()
+    calls = []
+
+    def check_connection():
+        with db._lock:
+            db._conn.execute("SELECT 1")
+            checked.set()
+
+    def stop_resource():
+        calls.append("stop")
+        worker = threading.Thread(target=check_connection, daemon=True)
+        worker.start()
+        worker.join(timeout=3)
+        assert not worker.is_alive() and checked.is_set()
+
+    db.add_pre_close_callback(stop_resource)
+    db.close()
+    db.close()
+    assert calls == ["stop"]
+    with pytest.raises(sqlite3.ProgrammingError):
+        db._conn.execute("SELECT 1")
+    with pytest.raises(RuntimeError, match="closed"):
+        db.add_pre_close_callback(lambda: None)
+
+
+def test_concurrent_close_serializes_callbacks(db):
+    entered, release = threading.Event(), threading.Event()
+    calls, errors = [], []
+
+    def stop_resource():
+        calls.append("stop")
+        entered.set()
+        assert release.wait(3)
+
+    def close():
+        try:
+            db.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    db.add_pre_close_callback(stop_resource)
+    first = threading.Thread(target=close, daemon=True)
+    second = threading.Thread(target=close, daemon=True)
+    first.start()
+    try:
+        assert entered.wait(3)
+        second.start()
+    finally:
+        release.set()
+        first.join(timeout=3)
+        if second.ident is not None:
+            second.join(timeout=3)
+    assert not first.is_alive() and not second.is_alive()
+    assert calls == ["stop"] and not errors
+
+
+def test_callback_failure_still_stops_other_resources_and_closes_sqlite(db):
+    calls = []
+
+    def fail():
+        raise RuntimeError("stop failed")
+
+    db.add_pre_close_callback(fail)
+    db.add_pre_close_callback(lambda: calls.append(db._conn.execute("SELECT 1").fetchone()[0]))
+    with pytest.raises(RuntimeError, match="stop failed"):
+        db.close()
+    assert calls == [1]
+    with pytest.raises(sqlite3.ProgrammingError):
+        db._conn.execute("SELECT 1")
+    db.close()
 
 
 def _setup(db):

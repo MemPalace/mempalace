@@ -29,7 +29,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from . import tokens
 from .policy import Policy
@@ -200,6 +200,9 @@ class ControlDB:
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent, exist_ok=True)
         self._lock = threading.RLock()
+        self._close_lock = threading.Lock()
+        self._closed = False
+        self._pre_close: list[Callable[[], None]] = []
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -246,9 +249,30 @@ class ControlDB:
         except OSError:
             pass
 
+    def add_pre_close_callback(self, callback: Callable[[], None]) -> None:
+        """Register an owned resource to stop before SQLite closes."""
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("Control database is closed")
+            self._pre_close.append(callback)
+
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            error = None
+            for callback in self._pre_close:
+                try:
+                    # A callback may join a worker that needs the SQL lock.
+                    callback()
+                except Exception as exc:
+                    error = error or exc
+            with self._lock:
+                self._conn.close()
+                self._closed = True
+            self._pre_close.clear()
+            if error is not None:
+                raise error
 
     def _tx(self):
         conn = self._conn

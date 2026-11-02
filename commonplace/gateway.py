@@ -1170,7 +1170,18 @@ class Gateway:
         return None
 
     def build_server(self, host: str, port: int) -> ThreadingHTTPServer:
-        server = ThreadingHTTPServer((host, port), _GatewayHandler)
+        gateway = self
+
+        class Server(ThreadingHTTPServer):
+            def server_close(self):
+                try:
+                    super().server_close()
+                finally:
+                    email_auth = getattr(gateway, "email_auth", None)
+                    if email_auth is not None:
+                        email_auth.close()
+
+        server = Server((host, port), _GatewayHandler)
         server.gateway = self
         server.daemon_threads = True
         return server
