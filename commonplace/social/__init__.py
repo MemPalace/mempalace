@@ -269,7 +269,7 @@ def install(gateway):
     gateway.sign_in = SignIn(
         db=gateway.db,
         providers=configured(),
-        signup=signup in ("", "open"),
+        signup=accounts.signup_enabled(),
     )
     for method in ("GET", "POST"):
         gateway.add_prefix_route(method, "/app/auth/", lambda h: gateway.sign_in.handle(gateway, h))

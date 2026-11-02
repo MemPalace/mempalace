@@ -59,13 +59,21 @@ def body(h, *, as_json: bool = False) -> dict:
     return data
 
 
-def send(h, status: int, payload: bytes = b"", *, media="application/json", headers=()) -> None:
+def send(
+    h,
+    status: int,
+    payload: bytes = b"",
+    *,
+    media="application/json",
+    headers=(),
+    referrer_policy="no-referrer",
+) -> None:
     h.send_response(status)
     h.send_header("Content-Type", media)
     h.send_header("Content-Length", str(len(payload)))
     h.send_header("Cache-Control", "no-store")
     h.send_header("Pragma", "no-cache")
-    h.send_header("Referrer-Policy", "no-referrer")
+    h.send_header("Referrer-Policy", referrer_policy)
     h.send_header("X-Content-Type-Options", "nosniff")
     for key, value in headers:
         h.send_header(key, value)

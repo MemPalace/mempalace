@@ -920,7 +920,12 @@ root.addEventListener("submit", async (event) => {
       try { token = new URL(token).searchParams.get("t") || token; } catch { /* A bare token is valid. */ }
       location.assign(`/app/login?t=${enc(token)}`);
     } else if (kind === "agent") await createAgent(form);
-    else if (kind === "reply") await decide(Number(form.dataset.card), { ...payload, then: payload.then || "return" }, form);
+    else if (kind === "email-login") {
+      const result = await api("/app/auth/email", { method: "POST", body: { email: payload.email, next: payload.next || signinNext } });
+      let status = root.querySelector(".signin [role=status]");
+      if (!status) { status = document.createElement("div"); status.className = "message"; status.setAttribute("role", "status"); form.after(status); }
+      status.textContent = result.message;
+    } else if (kind === "reply") await decide(Number(form.dataset.card), { ...payload, then: payload.then || "return" }, form);
     else if (kind === "comment") await mutate(`card-${state.card.number}`, async () => {
       await api(`/api/cards/${state.card.number}/comments`, { method: "POST", body: payload });
       state.drafts.delete(`comment-${state.card.number}`); form.reset();

@@ -15,6 +15,10 @@ Social sign-in: [provider setup](SETUP.md).
 
 ## Mail
 
+The signed-out app accepts an email address and sends a single-use sign-in link, valid for 15 minutes. New accounts and personal workspaces are created only after verification with `COMMONPLACE_SIGNUP=open`. Signup is closed by default; existing accounts can still sign in. The request gives the same neutral response for unknown addresses and delivery failures.
+
+`POST /app/auth/email` accepts JSON or form data with `email` and optional `next`. The mailed link opens `/app/auth/email/verify?t=…` and starts a normal web session. Only safe app or OAuth return paths are accepted. Requests share the credential IP limit (10/minute) and a normalized-email limit (3/15 minutes).
+
 `commonplace login-link <email> --send` emails the sign-in link to the account's address and prints only `login link sent to <address>`; the link itself is never printed. Without `--send` the link is printed as before. The link uses `--base-url`, else `COMMONPLACE_APP_URL`, else `COMMONPLACE_BASE_URL`.
 
 Mail is off until `COMMONPLACE_SMTP_HOST` and `COMMONPLACE_SMTP_FROM` are set. With mail off, `--send` exits with `mail not configured` and creates no link. If sending fails, the new link is deleted.
@@ -34,7 +38,7 @@ Claude Code: [local setup and repeatable fresh-install check](../docs/commonplac
 
 ## Hosted plans
 
-Set `COMMONPLACE_PLANS=on` to enable hosted plans. New social sign-ups receive Free:
+Set `COMMONPLACE_PLANS=on` to enable hosted plans. New email and social sign-ups receive Free:
 250 MB storage per account and 10 minutes of server voice transcription per UTC day.
 The chat-sync interval hook is every 15 minutes for Free and live for Paid; sync is not built here.
 Paid has *unlimited*\*\* storage and transcription and a server-load throttle hook.

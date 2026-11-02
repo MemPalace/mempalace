@@ -12,14 +12,14 @@ const appSource = (await read("app.js")).replace(/^import .*;\n/gm, "");
 const providers = [
   ["google", "Google"], ["github", "GitHub"], ["apple", "Apple"], ["x", "X"], ["discord", "Discord"],
 ].map(([id, name]) => ({ id, name, url: `https://app.example/app/auth/${id}` }));
-const tokenForm = '<form data-form="login"><input name="token" aria-label="Token" autocomplete="off" required><button class="blockbtn">Sign in</button></form>';
+const emailForm = '<form data-form="email-login" action="/app/auth/email" method="post"><input type="hidden" name="next" value=""><input name="email" type="email" aria-label="Email" placeholder="Email" autocomplete="email" maxlength="254" required><button class="blockbtn">Email a sign-in link</button></form>';
 const brand = '<a class="brand-home" href="/app/" aria-label="Commonplace"><img class="brand-v2" src="/app/brand/logo-small-dark.svg" alt="Commonplace"></a>';
 
-test("no providers preserves the token form without a nav or message", () => {
-  assert.equal(signinView({}), `<main class="signin">${brand}<h1>Sign in</h1>${tokenForm}</main>`);
+test("no providers preserves the email form without a nav or message", () => {
+  assert.equal(signinView({}), `<main class="signin">${brand}<h1>Sign in</h1>${emailForm}</main>`);
 });
 
-test("provider buttons precede the token form and use the supplied marks", () => {
+test("provider buttons precede the email form and use the supplied marks", () => {
   const html = signinView({ providers });
   assert.equal((html.match(/<a class="provider"/g) || []).length, 5);
   assert.equal((html.match(/<svg [^>]*aria-hidden="true"/g) || []).length, 5);
@@ -30,7 +30,7 @@ test("provider buttons precede the token form and use the supplied marks", () =>
   for (const color of ["#EA4335", "#4285F4", "#FBBC05", "#34A853"]) assert.ok(html.includes(`fill="${color}"`));
   const buttons = [...html.matchAll(/<a class="provider" href="([^"]+)">.*?<span>Continue with (.*?)<\/span><\/a>/g)];
   assert.deepEqual(buttons.map((m) => [m[1], m[2]]), providers.map((p) => [p.url, p.name]));
-  assert.ok(html.indexOf("</nav>") < html.indexOf(tokenForm));
+  assert.ok(html.indexOf("</nav>") < html.indexOf(emailForm));
   assert.ok(html.includes(brand));
   assert.doesNotMatch(html.replace(brand, ""), /\sstyle=|xmlns=|<script|<img|\son\w+=/);
 });
@@ -123,7 +123,7 @@ test("boot treats empty and unrecognized callback codes as failed", async () => 
   }
 });
 
-test("provider request failure leaves token sign-in usable and is cached", async () => {
+test("provider request failure leaves email sign-in usable and is cached", async () => {
   const page = app({ loadProviders: () => { throw new Error("Unavailable"); } });
   await settle();
   assert.equal(page.root.innerHTML, signinView({}));

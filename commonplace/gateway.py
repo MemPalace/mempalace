@@ -1046,6 +1046,11 @@ def _session_write_allowed(gateway, handler):
     )
     if len(media) != 1 or media[0].split(";", 1)[0].strip().lower() != expected:
         return False
+    return _same_origin_allowed(gateway, handler)
+
+
+def _same_origin_allowed(gateway, handler):
+    """Validate browser Origin without imposing a request content type."""
     origins = handler.headers.get_all("Origin", [])
     if not origins:
         return True

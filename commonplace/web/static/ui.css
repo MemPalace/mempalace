@@ -48,6 +48,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 1px
 .setting-row button[aria-pressed="true"] { color: var(--strong); box-shadow: inset 0 0 0 1px var(--muted); }
 .signin .brand-v2 { margin-bottom: 40px; }
 .signin form .blockbtn { height: auto; min-height: 40px; }
+.signin form .email-confirm { width: 100%; min-height: 44px; }
 .signin .provider:hover { filter: none; background: var(--surface); }
 .mtabs a[aria-current] { background: none; color: var(--strong); box-shadow: inset 0 2px 0 var(--strong); }
 @keyframes spin {

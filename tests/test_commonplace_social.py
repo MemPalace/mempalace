@@ -392,11 +392,12 @@ def test_next_rejects_other_and_unsafe_paths(make_signin, remote, next_path):
     refused(finish(surface, flow, error="access_denied"), "cancelled")
 
 
-@pytest.mark.parametrize("signup", ["closed", " CLOSED ", "maybe"])
+@pytest.mark.parametrize("signup", [None, "", "closed", " CLOSED ", "maybe"])
 def test_closed_signup_refuses_unknown_email_without_creating_anything(
     make_signin, remote, monkeypatch, caplog, signup
 ):
-    monkeypatch.setenv("COMMONPLACE_SIGNUP", signup)
+    if signup is not None:
+        monkeypatch.setenv("COMMONPLACE_SIGNUP", signup)
     surface = make_signin()
     social.install(surface.gateway)
     remote.claims["email"] = "new@example.com"
@@ -419,7 +420,7 @@ def test_closed_signup_refuses_unknown_email_without_creating_anything(
         assert not caplog.records
 
 
-@pytest.mark.parametrize("signup", [None, "", " OPEN "])
+@pytest.mark.parametrize("signup", ["open", " OPEN "])
 def test_open_signup_creates_user_personal_workspace_identity_and_session(
     make_signin, remote, monkeypatch, signup
 ):

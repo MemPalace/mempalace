@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from .. import plans
 from ..control_db import ControlError
 from ..oauth.store import iso
@@ -23,6 +25,11 @@ CREATE INDEX IF NOT EXISTS user_identities_user ON user_identities(user_id);
 def ensure_schema(db) -> None:
     with db._lock:
         db._conn.executescript(SCHEMA)
+
+
+def signup_enabled() -> bool:
+    """New accounts require an explicit opt-in; sign-in remains available."""
+    return os.environ.get("COMMONPLACE_SIGNUP", "").strip().lower() == "open"
 
 
 def resolve(db, provider: str, profile: Profile, *, signup: bool) -> str:
