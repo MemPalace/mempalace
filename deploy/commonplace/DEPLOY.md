@@ -14,7 +14,7 @@ Choose an operator directory and an app checkout beneath it:
   compose.yml          # operator-owned configuration
   deploy.sh            # optional operator-owned deployment wrapper
   data/                # persistent data, owned by UID/GID 10001
-  backups/             # completed backup snapshots
+  backups/             # temporary private staging for nightly upload
   app/                 # release source, replaceable independently of configuration
 ```
 
@@ -88,10 +88,16 @@ refused. A static test does not prove TLS, container startup or recovery.
 
 ## Backups
 
-The host's backup scheduler calls executable `app/backup-hook.sh` with an
-existing absolute backup directory before its own off-host backup step.
-The hook does not configure or invoke restic. Keep credentials, scheduling
-and retention policy in the host's private configuration.
+Use [nightly backups and scratch restore](../../docs/backups.md) to configure
+`app/nightly-backup.sh`: consistent offline snapshots, encrypted off-host
+restic storage, 30-day retention and failure notification. Keep credentials
+and scheduler configuration outside the checkout. The older 30-daily / 12-weekly
+policy is superseded.
+
+For integration into another host backup job, executable `app/backup-hook.sh`
+still accepts an existing absolute staging directory and only creates a
+snapshot. That hook does not configure or invoke restic; its caller must
+upload, apply retention, remove local staging and alert on failure.
 
 By default the hook reads `.env` and `compose.yml` from the parent of its
 source checkout. Override that directory with `COMMONPLACE_DEPLOY_DIR`,
@@ -126,9 +132,11 @@ the full configuration and reload Caddy. Check health, sign-in and MCP.
 A wrapper that always rebuilds is unsuitable for image rollback. Keep the
 backup hook aligned with the selected image before the next scheduled run.
 
-For data recovery, restore to a separate directory and inspect the backup's
-manifest. Stop Commonplace, assemble the complete workspace/control DB
-layout, preserve IDs and verbatim data, and set ownership to `10001:10001`.
+For data recovery, retrieve a selected snapshot into a separate directory, then
+run `commonplace restore <snapshot_dir> <new_data_dir>` to verify its manifest,
+hashes and SQLite integrity before publishing a complete tree. Follow the
+scratch restore procedure linked above first. Stop Commonplace, preserve
+IDs and verbatim data, and set ownership to `10001:10001`.
 Retain the previous data directory, switch to the restored sibling and
 start its matching pinned image. Never run `init` against recovered data.
 Verify health, search, cards and a new backup.

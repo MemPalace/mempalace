@@ -76,4 +76,7 @@ The canary suite (`tests/test_commonplace_canary.py`) seeds forbidden wings and 
 
 Opt-in compact workspace storage uses a verified offline backfill and rollback. See [compact store switching](../docs/compact-store-switch.md) for backup requirements, commands and retention.
 
+Operators: [nightly backups and scratch restore](../docs/backups.md) covers
+consistent snapshots, encrypted off-host storage, 30-day retention and alerts.
+
 Agents create and claim their own board cards with every client preset. Child-created cards need direct-parent or signed-in-owner approval; orchestrators can create assigned child cards directly. See [the board API](../docs/boards/API.md) for `task_approve`, `task_heartbeat`, expiry, review requirements, and space creation.

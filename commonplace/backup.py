@@ -211,6 +211,122 @@ def _snapshot(source: Path, target: Path) -> None:
     target.chmod(0o600)
 
 
+def _file_entry(path: Path, root: Path) -> dict:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "size": path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def verify_backup(backup_dir) -> dict:
+    """Check a snapshot's complete file inventory, hashes and SQLite integrity.
+
+    The manifest detects damage, not malicious replacement: trust the encrypted
+    repository and its access controls. No database is opened for writing.
+    """
+    root = Path(backup_dir).expanduser().absolute()
+    if root.is_symlink() or not root.is_dir():
+        raise BackupError("backup must be an existing directory, without a symlink")
+    root = root.resolve()
+    manifest_path = root / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise BackupError("backup has no regular manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise BackupError("invalid backup manifest") from exc
+    if not isinstance(manifest, dict) or manifest.get("version") != 1:
+        raise BackupError("unsupported backup manifest")
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise BackupError("invalid backup file inventory")
+    expected = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise BackupError("invalid backup file entry")
+        name = entry.get("path")
+        if (
+            not isinstance(name, str)
+            or not name
+            or "\\" in name
+            or Path(name).is_absolute()
+            or any(part in ("", ".", "..") for part in name.split("/"))
+            or name in expected
+            or type(entry.get("size")) is not int
+            or entry["size"] < 0
+            or not isinstance(entry.get("sha256"), str)
+        ):
+            raise BackupError("invalid backup file entry")
+        expected[name] = entry
+    files, _ = _inventory(root)
+    actual = {path.relative_to(root).as_posix(): path for path in files}
+    if expected.keys() != actual.keys() or "control.sqlite3" not in actual:
+        raise BackupError("backup file inventory does not match manifest")
+    for name, path in actual.items():
+        if _file_entry(path, root) != expected[name]:
+            raise BackupError(f"backup size or hash mismatch: {name}")
+        if _is_sqlite(path):
+            if any(name + suffix in actual for suffix in ("-wal", "-shm", "-journal")):
+                raise BackupError(f"backup contains SQLite sidecars: {name}")
+            # Published snapshots have no WAL; immutable avoids creating SHM
+            # files or otherwise modifying a snapshot being checked.
+            conn = sqlite3.connect(path.as_uri() + "?immutable=1", uri=True)
+            try:
+                if conn.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                    raise BackupError(f"database integrity check failed: {name}")
+            finally:
+                conn.close()
+    if not _is_sqlite(actual["control.sqlite3"]):
+        raise BackupError("backup has no valid control.sqlite3")
+    return manifest
+
+
+def restore(backup_dir, dest_dir) -> dict:
+    """Verify and atomically restore into a new, offline scratch directory.
+
+    Existing data is never overwritten. The returned duration covers validation,
+    copying and validation of the restored files, not off-host retrieval.
+    """
+    started = time.monotonic()
+    source = Path(backup_dir).expanduser().absolute()
+    manifest = verify_backup(source)
+    source = source.resolve()
+    destination = Path(dest_dir).expanduser().absolute()
+    if destination.is_symlink() or destination.exists():
+        raise BackupError("restore destination already exists")
+    destination = destination.resolve()
+    if _inside(destination, source) or _inside(source, destination):
+        raise BackupError("restore destination must be outside the backup directory")
+    if not destination.parent.is_dir():
+        raise BackupError("restore destination parent must exist")
+    partial = Path(tempfile.mkdtemp(prefix=f".{destination.name}.partial-", dir=destination.parent))
+    try:
+        files, directories = _inventory(source)
+        for directory in directories:
+            (partial / directory.relative_to(source)).mkdir(mode=0o700)
+        for path in [*files, source / "manifest.json"]:
+            target = partial / path.relative_to(source)
+            shutil.copyfile(path, target)
+            target.chmod(0o600)
+        verify_backup(partial)
+        if destination.exists() or destination.is_symlink():
+            raise BackupError("restore destination already exists")
+        partial.rename(destination)
+    finally:
+        if partial.exists():
+            shutil.rmtree(partial)
+    return {
+        "files": len(manifest["files"]),
+        "bytes": sum(entry["size"] for entry in manifest["files"]),
+        "elapsed_seconds": round(time.monotonic() - started, 6),
+    }
+
+
 def backup(data_dir, dest_dir) -> dict:
     """Publish a complete backup at a new destination and return its manifest.
 
@@ -263,17 +379,7 @@ def backup(data_dir, dest_dir) -> dict:
                 else:
                     shutil.copyfile(path, target)
                     target.chmod(0o600)
-                digest = hashlib.sha256()
-                with target.open("rb") as stream:
-                    for block in iter(lambda: stream.read(1024 * 1024), b""):
-                        digest.update(block)
-                entries.append(
-                    {
-                        "path": relative.as_posix(),
-                        "size": target.stat().st_size,
-                        "sha256": digest.hexdigest(),
-                    }
-                )
+                entries.append(_file_entry(target, partial))
             _verify_offline(source)
             manifest = {
                 "version": 1,

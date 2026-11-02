@@ -812,6 +812,13 @@ def cmd_backup(args) -> int:
     return 0
 
 
+def cmd_restore(args) -> int:
+    from .backup import restore
+
+    print(json.dumps(restore(args.backup_dir, args.dest_dir), sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="commonplace")
     p.add_argument("--data", help=f"data directory (default ${DATA_ENV} or ~/.commonplace)")
@@ -931,6 +938,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("backup")
     s.add_argument("dest_dir")
     s.set_defaults(func=cmd_backup)
+    s = sub.add_parser("restore", help="verify and restore a backup into a new directory")
+    s.add_argument("backup_dir")
+    s.add_argument("dest_dir")
+    s.set_defaults(func=cmd_restore)
     return p
 
 
@@ -959,7 +970,7 @@ def main(argv=None) -> int:
 
         errors += (HandoffDBError, SettingsError, ThreadNotFound, ManualHandoffError, T3Error)
     try:
-        if args.command in {"connect", "backup"} or (
+        if args.command in {"connect", "backup", "restore"} or (
             args.command == "workspace" and args.action in {"store", "prune-stores"}
         ):
             return args.func(args)
