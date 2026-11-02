@@ -66,6 +66,9 @@ from .timeutil import utc_now_iso
 
 MAX_CONTENT_CHARS = 30000
 MAX_OUTPUT_TOKENS = 1500
+# max_completion_tokens also counts reasoning tokens, which can use up a small
+# budget before any visible output. OpenAI recommends reserving at least this.
+MAX_COMPLETION_TOKENS = 25000
 HTTP_TIMEOUT_S = 60
 
 PROMPT_TEMPLATE = """You are reading content filed in a memory palace. Generate a
@@ -112,6 +115,7 @@ class LLMConfig:
         self.endpoint = (endpoint or os.environ.get("MEMPALACE_LLM_ENDPOINT", "")).rstrip("/")
         self.key = key or os.environ.get("MEMPALACE_LLM_KEY", "")
         self.model = model or os.environ.get("MEMPALACE_LLM_MODEL", "")
+        self.token_limit = {"max_tokens": MAX_OUTPUT_TOKENS}
         if accept_external is None:
             accept_external = external_use_accepted_by_env()
         self.accept_external = bool(accept_external)
@@ -170,7 +174,7 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
 
     body = {
         "model": cfg.model,
-        "max_tokens": MAX_OUTPUT_TOKENS,
+        **cfg.token_limit,
         "messages": [{"role": "user", "content": prompt}],
     }
     headers = {"Authorization": f"Bearer {cfg.key}"} if cfg.key else {}
@@ -185,6 +189,17 @@ def _call_llm(cfg: LLMConfig, source_file: str, wing: str, room: str, content: s
                 raise ValueError("LLM reply is not a closet object")
             return parsed, payload.get("usage")
         except Exception as e:
+            # OpenAI's reasoning models reject max_tokens and name its
+            # replacement. Keep it for the rest of the run.
+            if (
+                getattr(e, "status", None) == 400
+                and "max_completion_tokens" in str(e)
+                and "max_tokens" in body
+            ):
+                del body["max_tokens"]
+                cfg.token_limit = {"max_completion_tokens": MAX_COMPLETION_TOKENS}
+                body.update(cfg.token_limit)
+                continue
             # Retry a reply with no usable closet JSON, a malformed response,
             # or a 429/503; give up on everything else.
             retry = (
