@@ -9,6 +9,7 @@ from mempalace.palace import (
     get_collection,
 )
 from mempalace.searcher import (
+    _MIN_RERANK_POOL,
     _candidate_pool_limits,
     _dedupe_rendered_hits,
     _enrich_closet_hits,
@@ -264,7 +265,8 @@ def test_search_promotes_distinct_results_from_wider_pool_and_fetches_source_onc
     assert len(rendered_keys) == 5
     assert [hit["drawer_id"] for hit in hits] == [f"same-{index}" for index in range(5)]
     assert [hit["text"] for hit in hits] == repeated_documents
-    assert drawers_col.query.call_args.kwargs["n_results"] == 20
+    # The wider-pool strategy queries the floored rerank pool (#2175).
+    assert drawers_col.query.call_args.kwargs["n_results"] == _MIN_RERANK_POOL
     assert drawers_col.get.call_count == 1
     assert sum(hit["source_path"] == repeated_source for hit in hits) == 5
 
@@ -475,18 +477,20 @@ def test_dedupe_keeps_distinct_chunks_of_one_logical_drawer():
 
 
 def test_candidate_pool_limits_widen_only_default_vector_strategy():
+    # n_results=20 is above the rerank-pool floor, so this asserts the
+    # widening itself (base 60 -> 80) rather than the floor.
     assert _candidate_pool_limits(
         "vector",
-        5,
+        20,
     ) == (
-        20,
-        20,
+        80,
+        80,
     )
 
     assert _candidate_pool_limits(
         "union",
-        5,
+        20,
     ) == (
-        15,
-        5,
+        60,
+        20,
     )
