@@ -1777,8 +1777,59 @@ def test_quarantine_stale_hnsw_leaves_healthy_segment_with_drift_alone(tmp_path)
     assert seg.exists()
 
 
+def test_quarantine_stale_hnsw_orphan_dir_falls_back_to_sqlite_mtime(tmp_path, caplog):
+    """A HNSW dir with no segments row (orphaned, production case 9a0d0fab)
+    resolves no collection, so the two-hop baseline is NULL — the scan must
+    fall back to the shared sqlite mtime exactly as before the baseline
+    existed, never treat NULL as 'fresh forever'."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 7200,
+        sqlite_mtime=now,
+        meta_bytes=_HEALTHY_META,
+    )
+    con = sqlite3.connect(palace / "chroma.sqlite3")
+    try:
+        con.execute("CREATE TABLE segments (id TEXT, type TEXT, scope TEXT, collection TEXT)")
+        con.execute(
+            "CREATE TABLE embeddings (id TEXT, segment_id TEXT, embedding_id TEXT,"
+            " seq_id INTEGER, created_at TEXT)"
+        )
+        # A different collection's segments; nothing references seg.name.
+        con.execute(
+            "INSERT INTO segments VALUES ('vec-other', 'urn:chroma:segment/vector/hnsw-local-persisted',"
+            " 'VECTOR', 'coll-other')"
+        )
+        con.execute(
+            "INSERT INTO segments VALUES ('meta-other', 'urn:chroma:segment/metadata/local-persisted',"
+            " 'METADATA', 'coll-other')"
+        )
+        con.execute(
+            "INSERT INTO embeddings VALUES ('e1', 'meta-other', 'emb-1', 1, ?)",
+            (datetime.datetime.fromtimestamp(now - 60, tz=datetime.timezone.utc).isoformat(),),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    with caplog.at_level(logging.INFO, logger="mempalace.backends.chroma"):
+        moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert moved == []  # healthy metadata -> left in place
+    assert any("mtime gap" in r.message for r in caplog.records), (
+        "orphan dir did not fall back to the shared sqlite mtime baseline"
+    )
+
+
 def _add_segment_write_history(palace, seg_name, created_at):
-    """Give the fixture palace a segments+embeddings schema with one write."""
+    """Give the fixture palace a segments+embeddings schema with one write.
+
+    Models chroma's real keying (verified against a production chroma.sqlite3,
+    2026-11-02): embeddings rows belong to the collection's METADATA segment;
+    the HNSW dir name is the VECTOR segment's id and never appears in
+    embeddings.segment_id.
+    """
     con = sqlite3.connect(palace / "chroma.sqlite3")
     try:
         con.execute("CREATE TABLE segments (id TEXT, type TEXT, scope TEXT, collection TEXT)")
@@ -1792,8 +1843,39 @@ def _add_segment_write_history(palace, seg_name, created_at):
             (seg_name,),
         )
         con.execute(
-            "INSERT INTO embeddings VALUES ('e1', ?, 'emb-1', 1, ?)",
-            (seg_name, created_at),
+            "INSERT INTO segments VALUES ('meta-1', 'urn:chroma:segment/metadata/local-persisted',"
+            " 'METADATA', 'coll-1')"
+        )
+        con.execute(
+            "INSERT INTO embeddings VALUES ('e1', 'meta-1', 'emb-1', 1, ?)",
+            (created_at,),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _add_other_collection_fresh_write(palace, created_at):
+    """A second collection whose METADATA segment was written just now.
+
+    Guards the collection scoping: coll-2's freshness must not bleed into
+    coll-1's baseline (an unscoped MAX over all METADATA segments is the
+    production bug in modified form — every idle wing looks fresh whenever
+    any wing is written).
+    """
+    con = sqlite3.connect(palace / "chroma.sqlite3")
+    try:
+        con.execute(
+            "INSERT INTO segments VALUES ('vec-2', 'urn:chroma:segment/vector/hnsw-local-persisted',"
+            " 'VECTOR', 'coll-2')"
+        )
+        con.execute(
+            "INSERT INTO segments VALUES ('meta-2', 'urn:chroma:segment/metadata/local-persisted',"
+            " 'METADATA', 'coll-2')"
+        )
+        con.execute(
+            "INSERT INTO embeddings VALUES ('e2', 'meta-2', 'emb-2', 1, ?)",
+            (created_at,),
         )
         con.commit()
     finally:
@@ -1818,7 +1900,12 @@ def test_quarantine_stale_hnsw_skips_idle_segment_fresh_against_own_writes(tmp_p
         sqlite_mtime=now,
         meta_bytes=_HEALTHY_META,
     )
-    _add_segment_write_history(palace, seg.name, idle_write.isoformat())
+    # Naive 19-char UTC — the exact shape every production created_at row
+    # carries (CURRENT_TIMESTAMP default), exercising the naive→UTC branch.
+    _add_segment_write_history(palace, seg.name, idle_write.strftime("%Y-%m-%d %H:%M:%S"))
+    _add_other_collection_fresh_write(
+        palace, datetime.datetime.fromtimestamp(now - 60, tz=datetime.timezone.utc).isoformat()
+    )
 
     with caplog.at_level(logging.INFO, logger="mempalace.backends.chroma"):
         moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)

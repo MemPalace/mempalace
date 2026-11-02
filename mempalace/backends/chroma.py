@@ -704,24 +704,40 @@ def _segment_is_held(seg_dir: str) -> bool:
         holder_pid,
     )
     return True
+
+
 def _segment_last_write_epoch(db_path: str, seg_id: str) -> Optional[float]:
-    """Newest ``embeddings.created_at`` for one segment, as epoch seconds.
+    """Newest ``embeddings.created_at`` for one HNSW segment, as epoch seconds.
 
     Chroma flushes HNSW segment files asynchronously and only above its sync
     threshold, so a segment's mtime says when ITS data was last persisted —
     not when the palace was last written. The shared ``chroma.sqlite3`` mtime
     moves with *every* collection's writes, which made long-idle collections
-    look perpetually stale against it. The honest baseline for "is this
-    segment lagging its own writes" is the newest ``embeddings`` row
-    attributed to that segment; the query drives the
-    ``UNIQUE(segment_id, embedding_id)`` index by its leading column.
+    look perpetually stale against it.
+
+    Chroma's keying (verified against a production chroma.sqlite3,
+    2026-11-02): ``embeddings`` rows belong to the collection's METADATA
+    segment — the HNSW dir name is the VECTOR segment's id and never appears
+    in ``embeddings.segment_id``. The baseline therefore resolves the VECTOR
+    segment's collection, then reads the newest write across that
+    collection's METADATA segments (two hops).
+
+    Cost note: chroma 1.5.9 has no (segment_id, created_at) index, so the
+    MAX reads the collection's embeddings rows — on the order of tens of
+    milliseconds per full scan on a 135k-row production palace (warm-cache
+    measurements vary by plan and cache state; treat any sub-100ms figure
+    as machine-specific). The scan re-arms on palace disk change, so this
+    re-runs during runtime after writes, not only at server start. A
+    collection whose METADATA segment has no embeddings rows yet resolves
+    MAX to NULL and falls back to the shared sqlite mtime like an orphan.
 
     Reads go through :func:`open_palace_reader` — the one door for palace
     sqlite access — so a per-call close cannot drop Chroma's file locks.
-    Returns ``None`` on any sqlite error, missing schema, or unparseable
-    value; callers fall back to the shared-sqlite mtime (the previous
-    behavior). ``created_at`` is the schema's naive-UTC ``CURRENT_TIMESTAMP``
-    default; parsed as UTC rather than guessed.
+    Returns ``None`` on any sqlite error, missing schema, unparseable value,
+    or an orphaned dir with no ``segments`` row; callers fall back to the
+    shared-sqlite mtime (the previous behavior). ``created_at`` is the
+    schema's naive-UTC ``CURRENT_TIMESTAMP`` default; parsed as UTC rather
+    than guessed.
     """
     try:
         con = open_palace_reader(db_path, timeout=5)
@@ -729,7 +745,12 @@ def _segment_last_write_epoch(db_path: str, seg_id: str) -> Optional[float]:
         return None
     try:
         row = con.execute(
-            "SELECT MAX(e.created_at) FROM embeddings e WHERE e.segment_id = ?",
+            "SELECT MAX(e.created_at) FROM embeddings e WHERE e.segment_id IN ("
+            "  SELECT s2.id FROM segments s2"
+            "  WHERE s2.scope = 'METADATA'"
+            "    AND s2.collection = ("
+            "      SELECT s1.collection FROM segments s1"
+            "      WHERE s1.id = ? AND s1.scope = 'VECTOR'))",
             (seg_id,),
         ).fetchone()
     except sqlite3.Error:
