@@ -24,6 +24,8 @@ from pathlib import Path
 import numpy as np
 import zstandard as zstd
 
+from mempalace.sqlite_crypto import connect
+
 from ..stored_text import (
     FLAG,
     KEYWORD_ONLY,
@@ -1258,7 +1260,7 @@ class CompactCollection(SQLiteExactCollection):
         ):
             with self._cursor() as cur:
                 snapshot = self._collection_snapshot(cur)
-            stage = sqlite3.connect(os.path.join(directory, "vectors.sqlite3"))
+            stage = connect(os.path.join(directory, "vectors.sqlite3"))
             try:
                 stage.execute(
                     "CREATE TABLE staged(rowid INTEGER PRIMARY KEY,embedding BLOB,scale BLOB,dim INTEGER)"
@@ -1494,7 +1496,7 @@ class CompactBackend(SQLiteExactBackend):
             if not db_path.is_file():
                 raise PalaceNotFoundError("compact palace database does not exist")
             try:
-                conn = sqlite3.connect(db_path.as_uri() + "?mode=rw", uri=True)
+                conn = connect(db_path.as_uri() + "?mode=rw", uri=True)
             except sqlite3.OperationalError as exc:
                 raise BackendError("could not open compact palace for repair") from exc
             try:

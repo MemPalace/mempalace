@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -9,6 +10,8 @@ from pathlib import Path
 
 POINTER = ".store-pointer.json"
 POINTER_PREVIOUS = ".store-pointer.prev.json"
+INVENTORIES = ".store-retired-files.json"
+PUBLICATION = ".store-publication.json"
 POINTER_REPAIR = (
     "Invalid or missing workspace generation pointer; stop the gateway and verify "
     f"{POINTER_PREVIOUS} before restoring {POINTER}"
@@ -27,6 +30,70 @@ def read_json(path, default=None):
     if not isinstance(value, dict):
         raise ValueError("Workspace store configuration must be an object")
     return value
+
+
+def evidence_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def retired_files(root, item):
+    """Read structural evidence only for maintenance, never runtime resolution."""
+    expected = item.get("expected_files")
+    if "inventory" in item:
+        try:
+            expected = read_json(root / INVENTORIES)[item["inventory"]]
+            if not isinstance(expected, list) or evidence_digest(expected) != item["inventory"]:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, OSError):
+            raise ValueError(
+                f"Invalid or missing retired generation inventory in {INVENTORIES}; "
+                "preserve generations and repair it from verified evidence"
+            ) from None
+    if expected is not None and (
+        not isinstance(expected, list)
+        or any(
+            not isinstance(name, str) or Path(name).is_absolute() or ".." in Path(name).parts
+            for name in expected
+        )
+    ):
+        raise ValueError("Invalid retired generation file inventory")
+    return expected
+
+
+def publication_for_adoption(root, state, previous):
+    """A pointer-loss hint needs a complete, checked publication and history."""
+    try:
+        if state.get("state") not in ("copying", "published"):
+            return None
+        receipt = read_json(root / PUBLICATION)
+        pointer = receipt["pointer"]
+        validate_pointer(root, pointer)
+        validate_pointer(root, previous)
+        active = pointer["active"]
+        directory = generation_path(root, active)
+        marker = read_json(directory / ".store-comparison.json")
+        retained = pointer["retained"]
+        if (
+            directory == root
+            or active != state.get("staging")
+            or state.get("state") == "published"
+            and state.get("pointer") != pointer
+            or evidence_digest(pointer) != receipt["digest"]
+            or receipt["store"] != settings_for(directory).get("store", "v1")
+            or not retained
+            or marker["previous"] != retained[-1]["name"]
+            or not (
+                pointer == previous
+                or retained[:-1] == previous.get("retained", [])
+                and retained[-1]["name"] == previous["active"]
+            )
+        ):
+            return None
+        for item in retained:
+            retired_files(root, item)
+        return pointer
+    except (ValueError, KeyError, TypeError, OSError):
+        return None
 
 
 def workspace_root(data_dir, workspace_id):
@@ -68,6 +135,7 @@ def resolve_workspace(root):
 
 def previous_without_pointer_repair(root):
     choices = []
+    state = {}
     try:
         state = read_json(root / STATE)
         published = state.get("pointer", {})
@@ -85,6 +153,7 @@ def previous_without_pointer_repair(root):
         if not recoverable or {"retained": [], **previous} == {"retained": [], **published}:
             choices.append(f"restore {POINTER_PREVIOUS} as {POINTER} to recover its history")
     except (ValueError, OSError):
+        previous = None
         if not recoverable:
             choices.append(
                 f"repair {POINTER_PREVIOUS} from verified evidence before restoring {POINTER}"
@@ -96,6 +165,12 @@ def previous_without_pointer_repair(root):
         )
     elif not any(root.parent.glob(root.name + ".generation-*")):
         choices.append(f"delete {POINTER_PREVIOUS} to accept the original workspace root")
+    candidate = publication_for_adoption(root, state, previous)
+    if candidate is not None:
+        choices.append(
+            f"adopt {candidate['active']} by atomically restoring the full pointer object "
+            f"from {PUBLICATION} as {POINTER}, then rerun workspace prune-stores"
+        )
     return (
         f"Missing workspace generation pointer: {POINTER_PREVIOUS} exists without {POINTER}; "
         "verify the selected data, then " + ", or ".join(choices)

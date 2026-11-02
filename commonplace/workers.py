@@ -27,6 +27,9 @@ from typing import Callable, Optional, Protocol
 _PASSED_ENV = frozenset(
     {
         "PATH",
+        "COMMONPLACE_KEY_STORE",
+        "COMMONPLACE_WRAPPING_KEY_FILE",
+        "COMMONPLACE_KEY_SLOT",
         "LANG",
         "LANGUAGE",
         "LC_ALL",

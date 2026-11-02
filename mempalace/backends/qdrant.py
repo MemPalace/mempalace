@@ -22,7 +22,13 @@ from urllib import error as urlerror, parse as urlparse, request as urlrequest
 import numpy as np
 
 from ..lexical import bm25_scores, tokenize
-from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
+from ..stored_text import (
+    decode_record,
+    decode_value,
+    encode_filter,
+    index_text,
+    prepare_stored_write,
+)
 from ..timeutil import utc_now_iso as _utcnow
 from ..version import __version__
 from ._filters import matches_where, matches_where_document, validate_where
@@ -58,6 +64,7 @@ _DEFAULT_URL = "http://localhost:6333"
 _MARKER_FILENAME = "qdrant_backend.json"
 _PAYLOAD_ID = "mempalace_id"
 _PAYLOAD_DOCUMENT = "document"
+_PAYLOAD_INDEX_TEXT = "index_text"
 _PAYLOAD_METADATA = "metadata"
 _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
 # Page size for Qdrant's /points/scroll cursor. 4096 (up from the original
@@ -494,7 +501,7 @@ def _text_any_filter(query: str) -> Optional[dict]:
     tokens = tokenize(query)
     if not tokens:
         return None
-    return {"must": [{"key": _PAYLOAD_DOCUMENT, "match": {"text_any": " ".join(tokens)}}]}
+    return {"must": [{"key": _PAYLOAD_INDEX_TEXT, "match": {"text_any": " ".join(tokens)}}]}
 
 
 class QdrantCollection(BaseCollection):
@@ -517,6 +524,7 @@ class QdrantCollection(BaseCollection):
         self._lock = threading.RLock()
         self._closed = False
         self._known_dimension: Optional[int] = None
+        self._known_index_text: Optional[bool] = None
 
     def _ensure_open(self) -> None:
         if self._closed or self._backend._closed:
@@ -569,8 +577,9 @@ class QdrantCollection(BaseCollection):
             if not self._remote_exists():
                 self._client.create_collection(self._remote_collection, dimension)
                 self._client.create_payload_index(
-                    self._remote_collection, _PAYLOAD_DOCUMENT, "text"
+                    self._remote_collection, _PAYLOAD_INDEX_TEXT, "text"
                 )
+                self._known_index_text = True
                 self._known_dimension = dimension
                 return
             remote_dim = self._remote_dimension()
@@ -580,6 +589,22 @@ class QdrantCollection(BaseCollection):
                     f"embedding dimension {remote_dim}, got {dimension}"
                 )
             self._known_dimension = remote_dim or dimension
+
+    def _has_index_text_index(self) -> bool:
+        self._ensure_open()
+        if self._known_index_text is not None:
+            return self._known_index_text
+        if not self._remote_exists():
+            return False
+        try:
+            info = self._client.get_collection_info(self._remote_collection)
+        except BackendError:
+            logger.debug("Qdrant collection inspection failed; using lexical scan", exc_info=True)
+            return False
+        result = info.get("result") or info
+        schema = (result.get("payload_schema") or {}).get(_PAYLOAD_INDEX_TEXT) or {}
+        self._known_index_text = schema.get("data_type") == "text"
+        return self._known_index_text
 
     def _scroll_all(
         self,
@@ -676,6 +701,7 @@ class QdrantCollection(BaseCollection):
                     "payload": {
                         _PAYLOAD_ID: str(doc_id),
                         _PAYLOAD_DOCUMENT: str(doc),
+                        _PAYLOAD_INDEX_TEXT: index_text(str(doc), meta),
                         _PAYLOAD_METADATA: jsonable_metadata(meta),
                         "updated_at": _utcnow(),
                     },
@@ -943,7 +969,9 @@ class QdrantCollection(BaseCollection):
         validate_where(where)
         q_filter = None if _requires_local_filter(where) else _qdrant_filter(where)
         rows = []
-        text_filter = _text_any_filter(query)
+        # Legacy collections may have no projection on their existing points.
+        # Do not add an index or filter out those points; score a sanitized scan.
+        text_filter = _text_any_filter(query) if self._has_index_text_index() else None
         text_filter_success = False
         if text_filter:
             try:
@@ -960,7 +988,10 @@ class QdrantCollection(BaseCollection):
         if not text_filter_success:
             rows = self._scroll_all(qdrant_filter=q_filter, with_vector=False)
         rows = [row for row in rows if matches_where(row["metadata"], where)]
-        scores = bm25_scores(query, [row["document"] for row in rows])
+        scores = bm25_scores(
+            query,
+            [index_text(row["document"], row["metadata"], stored_form=False) for row in rows],
+        )
         hits = [
             LexicalHit(
                 id=row["id"],

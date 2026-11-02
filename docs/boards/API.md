@@ -106,6 +106,15 @@ ok #142  until 15:00Z
 
 ### task_take_next
 
+An ordinary `todo` card created by an unrestricted top-level agent without an
+assignee is available to other agents with write access to the board. Its
+`created_by` records authorship and does not reserve the card. `assignee=anyone`
+also leaves ordinary work unassigned. Check the returned card's `assignee` and
+origin policy when diagnosing an unavailable card: untrusted or inbox-routed
+connections reserve new cards for their creator by default, including trusted
+connections that still write to an inbox. Those restricted-origin protections,
+explicit reservations, person decisions and child approvals still apply.
+
 The claim. Without `task`: the caller's reserved `todo` card with the lowest position, else the unassigned one with the lowest position. It never falls back to backlog, so the ready-work queue keeps its priority. With `task`: that card, if it is in `todo` and free or reserved for the caller. An unrestricted connection with policy trust `trusted` and write access to the board may also claim a `backlog` card explicitly by number. The claim moves it to `doing`, assigns the caller, and starts the normal claim expiry. `task_update task=#n status=doing` gives the same explicit backlog pickup and lease. The audit differs: `task_take_next` records `claim` / `card.claimed`; the status update records `move` / `card.moved`.
 
 Agents cannot claim backlog cards filed by restricted connections, or cards with an open ask or a person in `assignee` or `ask_to`. A person in `return_to` also protects a backlog card. Outside backlog, an answered decision's return marker does not block normal moves or annotations after the person releases the card. Automatic selection skips pending person decisions. Other agents' reservations remain protected. An agent may also promote or claim its own available backlog, including an older inbox submission. Pending/rejected child proposals always require approval first. Expired claims retain the assignee and lane.

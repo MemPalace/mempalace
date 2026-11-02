@@ -15,6 +15,7 @@ from time import monotonic
 from commonplace import events
 from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
+from mempalace.sqlite_crypto import connect, driver, encryption_settings, row_factory
 
 from .store import bump, migrate, now
 
@@ -49,11 +50,11 @@ def deadline(timeout):
         _deadline.reset(token)
 
 
-class _DeadlineConnection(sqlite3.Connection):
+class _DeadlineMixin:
     """Refresh lock waits before each statement; interrupt long SQLite work."""
 
     def _refresh(self):
-        milliseconds = int(remaining(self.wait_limit) * 1000)
+        milliseconds = int(remaining(getattr(self, "wait_limit", 0.1)) * 1000)
         super().execute(f"PRAGMA busy_timeout={milliseconds}")
 
     def execute(self, *args, **kwargs):
@@ -68,6 +69,10 @@ class _DeadlineConnection(sqlite3.Connection):
         # Cleanup must still run after expiry, including an interrupted writer.
         self.set_progress_handler(None, 0)
         return super().rollback()
+
+
+class _DeadlineConnection(_DeadlineMixin, sqlite3.Connection):
+    pass
 
 
 @contextmanager
@@ -91,14 +96,21 @@ class StoreLost(ToolError):
 @contextmanager
 def connection(path, *, write=False, timeout=0.1):
     bounded = _deadline.get() is not None
-    conn = sqlite3.connect(
+    factory = _DeadlineConnection if bounded else sqlite3.Connection
+    if encryption_settings(Path(path)) is not None:
+
+        class CipherDeadlineConnection(_DeadlineMixin, driver().Connection):
+            pass
+
+        factory = CipherDeadlineConnection if bounded else driver().Connection
+    conn = connect(
         Path(path).resolve().as_uri() + ("?mode=rw" if write else "?mode=ro"),
         uri=True,
         timeout=max(0, remaining(timeout)),
         isolation_level=None,
-        factory=_DeadlineConnection if bounded else sqlite3.Connection,
+        factory=factory,
     )
-    conn.row_factory = sqlite3.Row
+    conn.row_factory = row_factory
     if bounded:
         conn.wait_limit = timeout
         end = _deadline.get()

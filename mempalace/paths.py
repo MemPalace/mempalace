@@ -97,8 +97,10 @@ def knowledge_graph_has_rows(path: str) -> bool:
         return False
     import sqlite3
 
+    from mempalace.sqlite_crypto import connect
+
     try:
-        conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        conn = connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
     except sqlite3.Error:
         return True
     try:

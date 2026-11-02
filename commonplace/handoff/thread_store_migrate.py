@@ -6,10 +6,11 @@ Any mismatch rolls back every copied row, keeping the original file intact.
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
+
+from mempalace.sqlite_crypto import connect, row_factory
 
 from .thread_frames import sql_string, string
 from .thread_store import ThreadStore, canonical_sha256
@@ -39,13 +40,13 @@ def read_store(path, *, compact=False):
     cls = ThreadStoreV2 if compact else ThreadStore
     store = cls.__new__(cls)
     store._lock = threading.RLock()
-    store._conn = sqlite3.connect(
+    store._conn = connect(
         Path(path).resolve().as_uri() + "?mode=ro",
         uri=True,
         isolation_level=None,
         check_same_thread=False,
     )
-    store._conn.row_factory = sqlite3.Row
+    store._conn.row_factory = row_factory
     try:
         store._conn.execute("BEGIN")
         store._fts_enabled = bool(
@@ -198,8 +199,8 @@ def migrate_v1(source: str, destination: str | None = None) -> int:
         raise ValueError("Migration needs a separate v2 file")
     old = ThreadStore.__new__(ThreadStore)
     old._lock = threading.RLock()
-    old._conn = sqlite3.connect(source_path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
-    old._conn.row_factory = sqlite3.Row
+    old._conn = connect(source_path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
+    old._conn.row_factory = row_factory
     try:
         old._conn.execute("BEGIN")
         new = ThreadStoreV2(str(target))

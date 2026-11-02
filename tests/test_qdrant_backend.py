@@ -109,7 +109,12 @@ class _FakeQdrantClient:
                             "distance": "Cosine",
                         }
                     }
-                }
+                },
+                "payload_schema": {
+                    field: {"data_type": schema}
+                    for name, field, schema in self.created_indexes
+                    if name == collection
+                },
             }
         }
 
@@ -269,7 +274,7 @@ def test_qdrant_add_query_filters_lexical_and_marker(tmp_path, fake_qdrant):
 
     hits = col.lexical_search(query="rareterm backend", n_results=2, where={"wing": "project"}).hits
     assert [hit.id for hit in hits] == ["b", "a"]
-    assert fake_qdrant.instances[0].created_indexes[0][1:] == ("document", "text")
+    assert fake_qdrant.instances[0].created_indexes[0][1:] == ("index_text", "text")
 
     backend.close_palace(str(tmp_path))
     with pytest.raises(Exception):

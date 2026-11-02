@@ -17,6 +17,8 @@ from pathlib import Path
 
 import zstandard as zstd
 
+from mempalace.sqlite_crypto import connect, row_factory
+
 from . import thread_frames as frames
 from .models import THREADS_WING, RecallHit, ThreadMessage
 from .thread_store import (
@@ -66,10 +68,8 @@ class ThreadStoreV2(V1ThreadStore):
                 os.chmod(file_path, 0o600)
             finally:
                 os.close(descriptor)
-        self._conn = sqlite3.connect(
-            path, check_same_thread=False, isolation_level=None, timeout=30
-        )
-        self._conn.row_factory = sqlite3.Row
+        self._conn = connect(path, check_same_thread=False, isolation_level=None, timeout=30)
+        self._conn.row_factory = row_factory
         try:
             self._initialize()
         except BaseException:

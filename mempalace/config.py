@@ -362,14 +362,16 @@ def connect_sqlite_read(
     under a live writer, so it is not a substitute. Everything else keeps the
     read-only connection it had.
     """
-    import sqlite3
+    from .sqlite_crypto import connect, encryption_settings
 
     kwargs = {} if timeout is None else {"timeout": timeout}
     if not check_same_thread:
         kwargs["check_same_thread"] = False
+    if encryption_settings(Path(db_path)) is not None:
+        return connect(sqlite_read_uri(db_path), uri=True, **kwargs)
     if _is_wal_without_sidecars(db_path):
-        return sqlite3.connect(os.fspath(db_path), **kwargs)
-    return sqlite3.connect(sqlite_read_uri(db_path), uri=True, **kwargs)
+        return connect(os.fspath(db_path), **kwargs)
+    return connect(sqlite_read_uri(db_path), uri=True, **kwargs)
 
 
 @lru_cache(maxsize=1)

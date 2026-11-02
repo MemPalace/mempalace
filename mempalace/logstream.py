@@ -36,13 +36,14 @@ import os
 import random
 import re
 import secrets
-import sqlite3
 import threading
 import time
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Optional
+
+from mempalace.sqlite_crypto import connect, row_factory
 
 from . import paths
 from .config import sanitize_iso_temporal, strip_lone_surrogates
@@ -593,9 +594,9 @@ class Logstream:
 
     def _conn(self):
         if self._connection is None:
-            self._connection = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+            self._connection = connect(self.db_path, timeout=10, check_same_thread=False)
             self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.row_factory = sqlite3.Row
+            self._connection.row_factory = row_factory
         return self._connection
 
     def close(self):

@@ -2,10 +2,13 @@
 
 import json
 import logging
+import os
 import shlex
 import sqlite3
+import stat
 import sys
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
@@ -30,6 +33,139 @@ from mempalace.backends import ChromaBackend, CompactBackend
 
 WORKSPACE = "ws_fixture"
 REAL_EMBEDDER = switch._embedder
+
+
+def _maintenance_tree_snapshot(root):
+    result = {}
+    for path in [root, *root.rglob("*")]:
+        mode = path.lstat().st_mode
+        content = (
+            os.readlink(path)
+            if stat.S_ISLNK(mode)
+            else path.read_bytes()
+            if stat.S_ISREG(mode)
+            else None
+        )
+        result[path.relative_to(root).as_posix()] = (mode, content)
+    return result
+
+
+@pytest.mark.parametrize("operation", ["switch", "prune", "report"])
+@pytest.mark.parametrize("pointer_state", ["valid", "missing", "invalid"])
+@pytest.mark.parametrize(
+    "location,damage",
+    [
+        *[
+            (name, "encrypted")
+            for name in (
+                "root",
+                "active",
+                "retained",
+                "staging",
+                "source-palace",
+                "probe",
+                "rollback-probe",
+                "probe.source-palace",
+                "rollback-probe.source-palace",
+            )
+        ],
+        ("root", "null_encryption"),
+        ("staging", "empty_encryption"),
+        ("retained", "invalid_json"),
+        ("probe", "invalid_object"),
+        ("staging", "stat_denied"),
+        ("source-palace", "read_denied"),
+        ("root", "settings_symlink"),
+        ("rollback-probe", "dangling_settings_symlink"),
+        ("active", "directory_symlink"),
+        ("probe.source-palace", "directory_symlink"),
+    ],
+)
+def test_maintenance_metadata_preflight_refuses_without_mutation(
+    tmp_path, monkeypatch, operation, pointer_state, location, damage
+):
+    data = tmp_path / "data"
+    root = workspace_root(data, WORKSPACE)
+    active, retained, staging = [
+        root.with_name(root.name + ".generation-" + char * 24) for char in "abc"
+    ]
+    directories = {"root": root, "active": active, "retained": retained, "staging": staging}
+    directories.update(
+        {path.name[len(staging.name) + 1 :]: path for path in switch._staging_paths(staging)[1:]}
+    )
+    for directory in directories.values():
+        directory.mkdir(parents=True, mode=0o750)
+        (directory / SETTINGS).write_text('{"store":"compact"}')
+        (directory / "payload").write_bytes(b"verbatim untouched\x00")
+        (directory / "payload").chmod(0o640)
+    pointer = {
+        "active": active.name,
+        "retained": [{"name": retained.name, "retired_at": 0}],
+    }
+    (root / POINTER_PREVIOUS).write_text(json.dumps(pointer))
+    if pointer_state != "missing":
+        (root / POINTER).write_text(json.dumps(pointer) if pointer_state == "valid" else "{}")
+    (root / switch.STATE).write_text(json.dumps({"state": "copying", "staging": staging.name}))
+    config = directories[location] / SETTINGS
+    if damage in ("encrypted", "null_encryption", "empty_encryption"):
+        info = {
+            "version": 1,
+            "cipher": "sqlcipher",
+            "workspace_id": WORKSPACE,
+            "key_id": "a" * 32,
+            "database_paths": [],
+        }
+        value = info if damage == "encrypted" else None if damage == "null_encryption" else {}
+        config.write_text(json.dumps({"store": "compact", "encryption": value}))
+    elif damage in ("invalid_json", "invalid_object"):
+        config.write_text("{" if damage == "invalid_json" else "[]")
+    elif damage in ("settings_symlink", "dangling_settings_symlink"):
+        external = tmp_path / "external-settings.json"
+        config.rename(external)
+        config.symlink_to(external if damage == "settings_symlink" else tmp_path / "missing")
+    elif damage == "directory_symlink":
+        directory = directories[location]
+        external = tmp_path / "external-directory"
+        directory.rename(external)
+        directory.symlink_to(external, target_is_directory=True)
+    # The existing lock file is outside generation maintenance and stays intact.
+    with data_lock(data, exclusive=True):
+        pass
+    before = _maintenance_tree_snapshot(tmp_path)
+    monkeypatch.setattr(switch, "_verify_offline", lambda directory: None)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("maintenance ran before metadata validation")
+
+    for name in (
+        "_prepare_generations",
+        "_recover_publication",
+        "_cleanup_recorded_staging",
+        "_cleanup_unpublished",
+        "_remove_staging",
+        "_seal_retired",
+        "_finish_deletion",
+        "_write_state",
+        "_write_pointer",
+    ):
+        monkeypatch.setattr(switch, name, forbidden)
+    with monkeypatch.context() as denied:
+        if damage in ("stat_denied", "read_denied"):
+            method = "lstat" if damage == "stat_denied" else "read_text"
+            original = getattr(Path, method)
+
+            def unavailable(path, *args, **kwargs):
+                if path == config:
+                    raise PermissionError("synthetic metadata access denied")
+                return original(path, *args, **kwargs)
+
+            denied.setattr(Path, method, unavailable)
+        with pytest.raises(ValueError, match="Encrypted|metadata|settings|symlink|Expecting"):
+            if operation == "switch":
+                switch.switch_workspace(data, WORKSPACE, "v1")
+            else:
+                switch.prune_generations(data, WORKSPACE, report_only=operation == "report")
+    assert _maintenance_tree_snapshot(tmp_path) == before
 
 
 @pytest.fixture
@@ -1235,7 +1371,7 @@ def test_unrecorded_partial_deletion_is_named_and_saved_for_stat_only_doctor(
     switch.switch_workspace(data, WORKSPACE, "compact")
     if legacy:
         pointer = read_json(root / POINTER)
-        pointer["retained"][0].pop("expected_files")
+        pointer["retained"][0].pop("inventory")
         switch._write_pointer(root, pointer)
     (root / missing).unlink()
     retired_at = read_json(root / POINTER)["retained"][0]["retired_at"]
@@ -1333,7 +1469,7 @@ def test_legacy_optional_layouts_are_healthy_and_prunable(
         (root / "palace" / "chroma.sqlite3").unlink()
     pointer = read_json(root / POINTER)
     entry = pointer["retained"][0]
-    entry.pop("expected_files")
+    entry.pop("inventory")
     entry["digest"] = switch._retirement_digest(root)
     switch._write_pointer(root, pointer)
     if old_finding:
@@ -1391,6 +1527,297 @@ def test_report_only_hashes_expired_generations_and_doctor_never_hashes(workspac
     monkeypatch.setattr(switch.time, "time", lambda: retired_at + 40 * 86400)
     switch.doctor_workspace(data, WORKSPACE)
     assert calls == [root]
+
+
+@pytest.mark.parametrize("matches_retirement", [True, False])
+def test_legacy_compact_threads_with_empty_palace_are_unverified(
+    workspace, monkeypatch, capsys, matches_retirement
+):
+    from commonplace.cli import main
+    from commonplace.control_db import ControlDB
+
+    data, root, _ = workspace
+    with closing(ControlDB(str(data / "control.sqlite3"))) as db:
+        db.create_user("owner@example.test")
+        wid = db.create_workspace("fixture", "owner@example.test")
+    root.rename(root.with_name(wid))
+    root = root.with_name(wid)
+    switch.switch_workspace(data, wid, "compact")
+    compact = workspace_path(data, wid)
+    switch.switch_workspace(data, wid, "v1")
+    (compact / "palace" / "compact.sqlite3").unlink()
+    pointer = read_json(root / POINTER)
+    entry = pointer["retained"][-1]
+    entry.pop("inventory")
+    if matches_retirement:
+        entry["digest"] = switch._retirement_digest(compact)
+    switch._write_pointer(root, pointer)
+    with monkeypatch.context() as context:
+        context.setattr(
+            switch, "_retirement_digest", lambda *a, **kw: pytest.fail("Doctor hashed data")
+        )
+        assert main(["--data", str(data), "doctor", "--workspace", "fixture"]) == 0
+    doctor = json.loads(capsys.readouterr().out)
+    assert doctor["retired_findings"] == []
+    assert doctor["retained_generations"][-1]["verification"] == (
+        "unverified (legacy entry; prune checks it)"
+    )
+    now = entry["retired_at"] + 40 * 86400
+    if matches_retirement:
+        switch.prune_generations(data, wid, now=now)
+        assert not compact.exists()
+    else:
+        with pytest.raises(ValueError, match="changed since retirement|newer writes"):
+            switch.prune_generations(data, wid, now=now)
+        assert compact.exists()
+
+
+@pytest.mark.parametrize("digest_state", ["missing", None, ""])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_prune_refuses_retired_generation_without_fingerprint(workspace, digest_state, legacy):
+    data, root, _ = workspace
+    switch.switch_workspace(data, WORKSPACE, "compact")
+    active = workspace_path(data, WORKSPACE)
+    pointer = read_json(root / POINTER)
+    item = pointer["retained"][-1]
+    retained = switch.generation_path(root, item["name"])
+    before = switch._retirement_digest(retained)
+    if digest_state == "missing":
+        item.pop("digest")
+    else:
+        item["digest"] = digest_state
+    if legacy:
+        item.pop("inventory")
+    switch._write_pointer(root, pointer)
+    assert read_json(root / switch.STATE)["sealing"] == "complete"
+    with pytest.raises(ValueError, match="changed since retirement"):
+        switch.prune_generations(data, WORKSPACE, now=item["retired_at"] + 40 * 86400)
+    assert retained.is_dir() and active.is_dir()
+    assert switch._retirement_digest(retained) == before
+    assert read_json(root / POINTER)["retained"] == pointer["retained"]
+    assert read_json(root / switch.STATE)["state"] != "deleting"
+
+
+def test_expiring_prune_hashes_each_generation_once(workspace, monkeypatch):
+    data, root, _ = workspace
+    switch.switch_workspace(data, WORKSPACE, "compact")
+    compact = workspace_path(data, WORKSPACE)
+    switch.switch_workspace(data, WORKSPACE, "v1")
+    active = workspace_path(data, WORKSPACE)
+    calls = []
+    digest = switch._retirement_digest
+
+    def observe(directory, **kwargs):
+        calls.append(directory)
+        return digest(directory, **kwargs)
+
+    monkeypatch.setattr(switch, "_retirement_digest", observe)
+    now = read_json(root / POINTER)["retained"][-1]["retired_at"] + 40 * 86400
+    switch.prune_generations(data, WORKSPACE, now=now)
+    assert calls == [root, compact]
+    assert workspace_path(data, WORKSPACE) == active
+
+
+def test_retirement_inventory_stays_off_runtime_path(workspace, monkeypatch):
+    from commonplace import workspace_store as ws
+
+    data, root, _ = workspace
+    switch.switch_workspace(data, WORKSPACE, "compact")
+    pointer = read_json(root / POINTER)
+    item = pointer["retained"][0]
+    expected = ws.retired_files(root, item)
+    assert expected and "expected_files" not in item
+    assert read_json(root / POINTER_PREVIOUS) == pointer
+    reads = []
+    read = ws.read_json
+
+    def observe(path, *args, **kwargs):
+        reads.append(path.name)
+        return read(path, *args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(ws, "read_json", observe)
+        context.setattr(
+            ws, "evidence_digest", lambda *args: pytest.fail("Resolver hashed evidence")
+        )
+        for _ in range(100):
+            assert workspace_path(data, WORKSPACE).name == pointer["active"]
+    assert reads == [POINTER] * 100
+
+
+def test_existing_inline_inventory_pointer_remains_prunable(workspace):
+    from commonplace.workspace_store import retired_files
+
+    data, root, _ = workspace
+    switch.switch_workspace(data, WORKSPACE, "compact")
+    active = workspace_path(data, WORKSPACE)
+    pointer = read_json(root / POINTER)
+    item = pointer["retained"][0]
+    item["expected_files"] = retired_files(root, item)
+    item.pop("inventory")
+    switch._write_pointer(root, pointer)
+    (root / switch.INVENTORIES).unlink()
+    assert switch.doctor_workspace(data, WORKSPACE)["retired_findings"] == []
+    switch.switch_workspace(data, WORKSPACE, "v1")
+    active = workspace_path(data, WORKSPACE)
+    now = read_json(root / POINTER)["retained"][-1]["retired_at"] + 40 * 86400
+    switch.prune_generations(data, WORKSPACE, now=now)
+    assert workspace_path(data, WORKSPACE) == active
+    assert switch._generation_gone(root, root)
+
+
+@pytest.mark.parametrize("damage", ["missing", "invalid_json", "missing_entry", "changed_files"])
+def test_corrupt_inventory_refuses_prune_without_deleting_data(workspace, damage):
+    data, root, _ = workspace
+    switch.switch_workspace(data, WORKSPACE, "compact")
+    active = workspace_path(data, WORKSPACE)
+    item = read_json(root / POINTER)["retained"][0]
+    path = root / switch.INVENTORIES
+    if damage == "missing":
+        path.unlink()
+    elif damage == "invalid_json":
+        path.write_text("{")
+    elif damage == "missing_entry":
+        path.write_text("{}")
+    else:
+        path.write_text(json.dumps({item["inventory"]: []}))
+    before = _generation_bytes(root, active)
+    with pytest.raises(ValueError, match="retired generation inventory"):
+        switch.prune_generations(data, WORKSPACE, now=item["retired_at"] + 40 * 86400)
+    with pytest.raises(ValueError, match="retired generation inventory"):
+        switch.switch_workspace(data, WORKSPACE, "v1")
+    assert _generation_bytes(root, active) == before
+    assert workspace_path(data, WORKSPACE) == active
+
+
+@pytest.mark.parametrize("failure", ["inventory", "pointer"])
+def test_inventory_publication_failure_preserves_current_writes(workspace, monkeypatch, failure):
+    data, root, _ = workspace
+    switch.switch_workspace(data, WORKSPACE, "compact")
+    active = workspace_path(data, WORKSPACE)
+    added = _write_after_publication(active)
+    os.utime(active / "threads.v2.sqlite3", None)
+    pointer = read_json(root / POINTER)
+    write = switch.atomic_write_json
+
+    def interrupt(path, value, **kwargs):
+        if path.name == switch.INVENTORIES or (
+            failure == "pointer" and path.name == POINTER and value["active"] != active.name
+        ):
+            if failure == "inventory":
+                raise OSError("injected inventory failure")
+            if path.name == POINTER:
+                raise OSError("injected pointer failure")
+        return write(path, value, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(switch, "atomic_write_json", interrupt)
+        with pytest.raises(OSError, match="injected"):
+            switch.switch_workspace(data, WORKSPACE, "v1")
+    assert read_json(root / POINTER) == read_json(root / POINTER_PREVIOUS) == pointer
+    assert workspace_path(data, WORKSPACE) == active
+    with closing(open_threads(active)) as store:
+        assert store.messages(added.id)[0].text == "post-publication verbatim"
+    switch.switch_workspace(data, WORKSPACE, "v1")
+    with closing(open_threads(workspace_path(data, WORKSPACE))) as store:
+        assert store.messages(added.id)[0].text == "post-publication verbatim"
+
+
+def test_publication_receipt_failure_preserves_committed_generation(workspace, monkeypatch):
+    data, root, _ = workspace
+    write = switch.atomic_write_json
+
+    def interrupt(path, value, **kwargs):
+        if path.name == switch.PUBLICATION:
+            raise OSError("injected receipt failure")
+        return write(path, value, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(switch, "atomic_write_json", interrupt)
+        with pytest.raises(OSError, match="receipt failure"):
+            switch.switch_workspace(data, WORKSPACE, "compact")
+    active = workspace_path(data, WORKSPACE)
+    added = _write_after_publication(active)
+    assert read_json(root / switch.STATE)["state"] == "copying"
+    switch.prune_generations(data, WORKSPACE)
+    assert workspace_path(data, WORKSPACE) == active
+    assert read_json(root / switch.PUBLICATION)["pointer"] == read_json(root / POINTER)
+    with closing(open_threads(active)) as store:
+        assert store.messages(added.id)[0].text == "post-publication verbatim"
+
+
+@pytest.mark.parametrize(
+    "damage", [None, "receipt", "missing_receipt", "history", "marker", "inventory", "state"]
+)
+def test_pointer_loss_offers_adoption_only_with_intact_evidence(workspace, damage):
+    data, root, original = workspace
+
+    def interrupt(step):
+        if step == "pointer":
+            raise RuntimeError("interrupted after pointer")
+
+    with pytest.raises(RuntimeError, match="after pointer"):
+        switch.switch_workspace(data, WORKSPACE, "compact", checkpoint=interrupt)
+    active = workspace_path(data, WORKSPACE)
+    added = _write_after_publication(active)
+    if damage is None:
+        os.utime(active / "threads.v2.sqlite3", None)
+        backend = CompactBackend()
+        try:
+            open_collection(backend, active / "palace", "mempalace_drawers", create=True).add(
+                ids=["post-publication"],
+                documents=["verbatim palace write after publication"],
+                metadatas=[{"wing": "test"}],
+                embeddings=[[0.5, 1.0, 0.7]],
+            )
+        finally:
+            backend.close()
+        with closing(sqlite3.connect(active / "boards.sqlite3")) as conn, conn:
+            conn.execute("INSERT INTO fixture VALUES ('later','board write after publication')")
+    receipt = read_json(root / switch.PUBLICATION)
+    (root / POINTER).unlink()
+    if damage == "receipt":
+        receipt["pointer"]["retained"] = []
+        (root / switch.PUBLICATION).write_text(json.dumps(receipt))
+    elif damage == "history":
+        (root / POINTER_PREVIOUS).write_text(json.dumps({"active": active.name}))
+    elif damage == "missing_receipt":
+        (root / switch.PUBLICATION).unlink()
+    elif damage == "marker":
+        (active / ".store-comparison.json").write_text("{}")
+    elif damage == "inventory":
+        (root / switch.INVENTORIES).unlink()
+    elif damage == "state":
+        (root / switch.STATE).write_text("{")
+    before = _generation_bytes(root, active)
+    with pytest.raises(ValueError) as error:
+        workspace_path(data, WORKSPACE)
+    hint = str(error.value)
+    assert (f"adopt {active.name}" in hint) == (damage is None)
+    assert _generation_bytes(root, active) == before
+    if damage is not None:
+        return
+    assert f"restore {POINTER_PREVIOUS} as {POINTER}" in hint
+    switch.atomic_write_json(root / POINTER, receipt["pointer"], follow_symlinks=False)
+    switch.prune_generations(data, WORKSPACE)
+    assert workspace_path(data, WORKSPACE) == active
+    switch.switch_workspace(data, WORKSPACE, "v1")
+    with closing(open_threads(workspace_path(data, WORKSPACE))) as store:
+        assert store.messages(original.id)[1].text == "second"
+        assert store.messages(added.id)[0].text == "post-publication verbatim"
+    restored = workspace_path(data, WORKSPACE)
+    backend = ChromaBackend()
+    try:
+        result = open_collection(backend, restored / "palace", "mempalace_drawers").get(
+            ids=["post-publication"], include=["documents"]
+        )
+        assert result.documents == ["verbatim palace write after publication"]
+    finally:
+        backend.close()
+    with closing(sqlite3.connect(restored / "boards.sqlite3")) as conn:
+        assert conn.execute("SELECT content FROM fixture WHERE id='later'").fetchone() == (
+            "board write after publication",
+        )
 
 
 def test_last_prune_findings_survive_a_store_switch(workspace, monkeypatch):

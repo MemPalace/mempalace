@@ -106,6 +106,15 @@ deleted during pending publication therefore needs operator action first. Restor
 prev also works if it matches the recorded publication; a stale prev is not offered
 as that recovery route. Deleting prev without a recorded publication while sibling
 generations exist would discard history without resolving the pointer.
+New publications also save the complete pointer and its checksum in
+`.store-publication.json` immediately after writing the main pointer. If that
+pointer is later lost, the repair hint additionally offers `adopt <generation>`
+when this receipt, the generation marker, retained history and inventories are
+intact. Stop the gateway and verify the selected data, then atomically restore
+the receipt's full `pointer` object as `.store-pointer.json` and rerun maintenance.
+This preserves writes made after publication and leaves rollback available.
+A missing or damaged receipt never enables this route; older publications keep
+their existing recovery choices. The hint does not automatically select a store.
 Completed retained generations are preserved. With a valid pointer, cleanup
 preserves and reports unlisted generations carrying `.store-comparison.json`;
 named retained generations follow the fourteen-day and fingerprint checks.
@@ -145,12 +154,20 @@ files are named `incomplete (interrupted deletion)`. Otherwise a changed fingerp
 with newer writes is named `newer writes`; other mismatches are named
 `changed since retirement`. A refused prune records the generation, kind and time
 so doctor can show the cause without rehashing retained data.
-New retirement entries include a relative file inventory for structural checks;
-older entries use the known thread and palace layouts plus saved prune findings.
+New retirement entries reference a checksum-checked relative file inventory in
+the adjacent `.store-retired-files.json` file. The inventory is written atomically
+before publishing its pointer reference. Runtime resolution reads only the pointer;
+maintenance reads the inventory and refuses cleanup when referenced evidence is
+missing or damaged. Older inline `expected_files` inventories remain supported.
+Entries without an inventory use the known thread and palace layouts plus saved
+prune findings.
 Legacy layouts permit an absent thread database. Prune uses their stored content
 fingerprint as its authority: a match is healthy. When doctor cannot identify a
 legacy layout, it reports `unverified (legacy entry; prune checks it)` as information
 with exit 0; missing required files still identify an incomplete generation.
+Legacy compact layouts with threads but no palace database are also unverified;
+doctor cannot distinguish an originally empty palace from a deleted database.
+Prune still requires the stored fingerprint to match before deleting them.
 Missing `retained` and `retained: []` are equivalent.
 Recovery can finish an interrupted publication when its pointer carries forward
 the previous copy's complete retained history. A partial pointer cannot bypass
@@ -235,7 +252,8 @@ directory with the matching control database and workspace id. Restore the
 backed-up active generation's contents into `workspaces/<id>` there, preserving
 `workspace.json`, palace files, threads and sidecars. A single-generation restore
 uses that directory directly and needs no generation pointer; a full data-tree
-restore must preserve both the pointer and every generation it names. Verify
+restore must preserve the pointers, retirement inventories and every generation
+they name. Keep publication receipts for pointer-loss recovery too. Verify
 the backup manifest and run `commonplace --data <restored-data> doctor` before
 starting the gateway against the restored tree. Keep the previous data tree
 intact for recovery and its normal retention period.

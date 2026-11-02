@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from commonplace.extensions import ToolError
+from mempalace.sqlite_crypto import connect, row_factory
 
 from .display import need_for
 
@@ -323,10 +323,10 @@ class BoardStore:
     @contextmanager
     def connection(self):
         target = self.path if self.create else Path(self.path).resolve().as_uri() + "?mode=rw"
-        conn = sqlite3.connect(
+        conn = connect(
             target, uri=not self.create, timeout=10 if self.create else 0.2, isolation_level=None
         )
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = row_factory
         conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn

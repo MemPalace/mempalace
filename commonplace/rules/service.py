@@ -3,7 +3,6 @@
 import hashlib
 import logging
 import re
-import sqlite3
 from contextlib import closing, contextmanager
 from pathlib import Path
 
@@ -11,6 +10,7 @@ from commonplace import events
 from commonplace.boards.service import normalize_repo, validate_text
 from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
+from mempalace.sqlite_crypto import connect
 
 from . import checks, render
 from .store import RuleStore, bump, now, rules_sequence, sequence
@@ -197,7 +197,7 @@ class RuleService:
         path = Path(self.ctx.workspace_dir()) / "boards.sqlite3"
         if not path.is_file():
             return False
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
+        with closing(connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
             row = conn.execute("SELECT wing FROM boards WHERE slug=?", (slug,)).fetchone()
         return row is not None and self.principal.policy.can_read_wing(row[0])
 

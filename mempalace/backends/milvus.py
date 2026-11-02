@@ -23,7 +23,8 @@ from ..config import (
     DEFAULT_MILVUS_CONSISTENCY_LEVEL,
     normalize_milvus_consistency_level,
 )
-from ..stored_text import decode_record, encode_filter, prepare_stored_write
+from ..lexical import bm25_scores
+from ..stored_text import decode_record, encode_filter, index_text, prepare_stored_write
 from ._remote_common import (
     RemoteMarkerMixin,
     as_vector_array,
@@ -57,6 +58,7 @@ _MARKER_FILENAME = "milvus_backend.json"
 _MAX_QUERY_WINDOW = 16384
 FIELD_ID = "id"
 FIELD_DOCUMENT = "document"
+FIELD_INDEX_TEXT = "index_text"
 FIELD_METADATA = "metadata"
 FIELD_VECTOR = "vector"
 FIELD_SPARSE = "sparse"
@@ -65,6 +67,7 @@ DRAWER_ID_MAX_LENGTH = 512
 RESERVED_FIELDS = {
     FIELD_ID,
     FIELD_DOCUMENT,
+    FIELD_INDEX_TEXT,
     FIELD_METADATA,
     FIELD_VECTOR,
     FIELD_SPARSE,
@@ -298,6 +301,7 @@ class MilvusCollection(BaseCollection):
         self._closed = False
         self._known_dimension: Optional[int] = None
         self._known_native_lexical: Optional[bool] = None
+        self._known_index_text: Optional[bool] = None
 
     def _ensure_open(self) -> None:
         if self._closed or self._backend._closed:
@@ -372,6 +376,7 @@ class MilvusCollection(BaseCollection):
                 self._backend._load_remote_collection(self._client, self._remote_collection)
                 self._known_dimension = dimension
                 self._known_native_lexical = True
+                self._known_index_text = True
                 self._backend._write_marker(self._palace, self._config)
                 return
             remote_dim = self._remote_dimension()
@@ -395,10 +400,16 @@ class MilvusCollection(BaseCollection):
             self._known_native_lexical = False
             return False
         fields = []
+        functions = []
         if isinstance(info, dict):
             fields = info.get("fields") or (info.get("schema") or {}).get("fields") or []
-        self._known_native_lexical = any(
-            (field.get("name") or field.get("field_name")) == FIELD_SPARSE for field in fields
+            functions = info.get("functions") or (info.get("schema") or {}).get("functions") or []
+        names = {field.get("name") or field.get("field_name") for field in fields}
+        self._known_index_text = FIELD_INDEX_TEXT in names
+        self._known_native_lexical = {FIELD_INDEX_TEXT, FIELD_SPARSE} <= names and any(
+            function.get("input_field_names") == [FIELD_INDEX_TEXT]
+            and function.get("output_field_names") == [FIELD_SPARSE]
+            for function in functions
         )
         return self._known_native_lexical
 
@@ -461,6 +472,11 @@ class MilvusCollection(BaseCollection):
             metadatas or [{} for _ in ids],
         )
         rows = []
+        # Legacy schemas keep their existing fields and indexes. Only new
+        # schemas require the separate analyzer input on writes.
+        if self._remote_exists():
+            self._has_native_lexical()
+        use_index_text = self._known_index_text is not False
         for idx, (doc_id, document, metadata, vector) in enumerate(
             zip(ids, documents, metadatas, vectors)
         ):
@@ -481,6 +497,8 @@ class MilvusCollection(BaseCollection):
                 FIELD_METADATA: jsonable_metadata(metadata, reserved=RESERVED_FIELDS),
                 FIELD_VECTOR: vector,
             }
+            if use_index_text:
+                row[FIELD_INDEX_TEXT] = index_text(document, metadata)
             row.update(row[FIELD_METADATA])
             rows.append(row)
         return rows, dimension
@@ -759,9 +777,23 @@ class MilvusCollection(BaseCollection):
                 raise CollectionNotInitializedError(self._collection_name)
             return LexicalResult(hits=[])
         if not self._has_native_lexical():
-            raise BackendError(
-                "milvus lexical search requires a collection created with native BM25 support"
+            # Old BM25 functions analyze the stored original. Preserve their
+            # schema and score projected text without using that sparse index.
+            rows = self._collect_by_filter(
+                filter_expr=filter_expr,
+                output_fields=[FIELD_ID, FIELD_DOCUMENT, FIELD_METADATA],
             )
+            records = [self._record(row) for row in rows]
+            scores = bm25_scores(
+                query, [index_text(doc, meta, stored_form=False) for doc, meta in records]
+            )
+            hits = [
+                LexicalHit(id=str(row[FIELD_ID]), document=doc, metadata=meta, score=score)
+                for row, (doc, meta), score in zip(rows, records, scores)
+                if score > 0
+            ]
+            hits.sort(key=lambda hit: hit.score, reverse=True)
+            return LexicalResult(hits=hits[:n_results])
         return self._native_lexical_search(
             query=query,
             n_results=n_results,
@@ -1059,6 +1091,11 @@ class MilvusBackend(RemoteMarkerMixin, BaseBackend):
             field_name=FIELD_DOCUMENT,
             datatype=DataType.VARCHAR,
             max_length=DOCUMENT_MAX_LENGTH,
+        )
+        schema.add_field(
+            field_name=FIELD_INDEX_TEXT,
+            datatype=DataType.VARCHAR,
+            max_length=DOCUMENT_MAX_LENGTH,
             enable_analyzer=True,
             enable_match=True,
         )
@@ -1074,7 +1111,7 @@ class MilvusBackend(RemoteMarkerMixin, BaseBackend):
         schema.add_function(
             Function(
                 name="document_bm25",
-                input_field_names=[FIELD_DOCUMENT],
+                input_field_names=[FIELD_INDEX_TEXT],
                 output_field_names=[FIELD_SPARSE],
                 function_type=FunctionType.BM25,
             )

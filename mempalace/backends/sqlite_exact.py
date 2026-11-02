@@ -22,6 +22,8 @@ from typing import Any, Optional
 
 import numpy as np
 
+from mempalace.sqlite_crypto import connect, row_factory
+
 from ..lexical import bm25_scores, tokenize
 from ..stored_text import (
     decode_record,
@@ -277,7 +279,7 @@ def sqlite_wing_room_counts(
         return None
     try:
         db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
+        conn = connect(db_uri, uri=True)
         try:
             conn.execute("PRAGMA busy_timeout=2000")
             row = conn.execute(
@@ -339,7 +341,7 @@ def sqlite_wing_source_counts(
         return None
     try:
         db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
+        conn = connect(db_uri, uri=True)
         try:
             conn.execute("PRAGMA busy_timeout=2000")
             row = conn.execute(
@@ -385,7 +387,7 @@ def sqlite_room_wing_hall_counts(
         return None
     try:
         db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True)
+        conn = connect(db_uri, uri=True)
         try:
             conn.execute("PRAGMA busy_timeout=2000")
             row = conn.execute(
@@ -1727,7 +1729,7 @@ class SQLiteExactBackend(BaseBackend):
             # only until a writer creates sidecars this connection would miss.
             db_uri = f"{db_uri}?mode=ro&immutable=1"
             immutable = True
-        return sqlite3.connect(db_uri, uri=True, check_same_thread=False), immutable
+        return connect(db_uri, uri=True, check_same_thread=False), immutable
 
     def _retire_read_only_handle(self, palace_path: str, handle: _SQLiteExactHandle) -> None:
         """Drop a cached read-only handle so the next open re-evaluates WAL state."""
@@ -1797,10 +1799,10 @@ class SQLiteExactBackend(BaseBackend):
                 signature = self._database_signature(db_path)
                 conn, immutable = self._connect_read_only(db_path)
             else:
-                conn = sqlite3.connect(db_path, check_same_thread=False)
+                conn = connect(db_path, check_same_thread=False)
                 immutable = False
             try:
-                conn.row_factory = sqlite3.Row
+                conn.row_factory = row_factory
                 lock = threading.RLock()
                 handle = _SQLiteExactHandle(
                     conn,
@@ -2147,7 +2149,7 @@ class SQLiteExactBackend(BaseBackend):
 
         Verifies the SQLite magic header rather than file presence alone, for
         the same reason as :py:meth:`mempalace.backends.chroma.ChromaBackend.detect`:
-        bare ``sqlite3.connect()`` against a missing path leaves a 0-byte file
+        bare ``connect()`` against a missing path leaves a 0-byte file
         behind because the SQLite header is written on the first statement,
         not on connection. The 16-byte ``SQLite format 3\\x00`` magic prefix
         accepts every real palace while rejecting empty / garbage files.

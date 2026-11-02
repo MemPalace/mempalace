@@ -47,6 +47,8 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterator, Optional
 
+from mempalace.sqlite_crypto import connect
+
 from . import paths
 from .dynamics import initialize_dynamics_fields
 from .fsio import (
@@ -187,12 +189,12 @@ def _connect(path: str, *, readonly: bool) -> sqlite3.Connection:
     """
     if readonly:
         uri = Path(os.path.abspath(path)).as_uri() + "?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None)
+        conn = connect(uri, uri=True, timeout=30, isolation_level=None)
     else:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         if not os.path.exists(path):
             os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
-        conn = sqlite3.connect(path, timeout=30, isolation_level=None)
+        conn = connect(path, timeout=30, isolation_level=None)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_DDL)
     conn.execute("PRAGMA busy_timeout=30000")

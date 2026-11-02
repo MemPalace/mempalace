@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from mempalace.sqlite_crypto import connect, row_factory
+
 from .models import CHUNK_MAX_CHARS, THREADS_WING, RecallHit, StoredThread, ThreadMessage
 
 MIRROR_PROGRESS_SQL = """
@@ -150,10 +152,8 @@ class ThreadStore:
             finally:
                 os.close(descriptor)
 
-        self._conn = sqlite3.connect(
-            path, check_same_thread=False, isolation_level=None, timeout=30
-        )
-        self._conn.row_factory = sqlite3.Row
+        self._conn = connect(path, check_same_thread=False, isolation_level=None, timeout=30)
+        self._conn.row_factory = row_factory
         try:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=FULL")

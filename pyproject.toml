@@ -73,6 +73,12 @@ rust_exact = "mempalace.backends.rust_exact:RustExactBackend"
 [project.entry-points."mempalace.sources"]
 
 [project.optional-dependencies]
+# Prebuilt SQLCipher driver is currently verified on Linux x86-64 only.
+# Other systems must provide a SQLCipher-linked sqlcipher3 driver explicitly.
+sqlcipher = [
+    "sqlcipher3-binary==0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cryptography>=42",
+]
 voice = ["useful-moonshine-onnx>=20251121,<20260101", "faster-whisper>=1.2.1"]
 # Sign in with Apple signs its client secret with ES256.
 commonplace = ["cryptography>=42"]

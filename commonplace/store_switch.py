@@ -16,6 +16,7 @@ import secrets
 import shlex
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -29,16 +30,20 @@ from mempalace.fsio import atomic_write_json, atomic_write_text, fsync_directory
 from .backup import BackupError, _snapshot, _verify_offline, data_lock
 from .workspace_store import (
     DEFAULT_MAX_RECORDS,
+    INVENTORIES,
     POINTER,
     POINTER_PREVIOUS,
     POINTER_REPAIR,
+    PUBLICATION,
     RECEIPT,
     SETTINGS,
     STATE,
+    evidence_digest,
     generation_path,
     migration_limit,
     read_json,
     resolve_workspace,
+    retired_files,
     settings_for,
     thread_path,
     validate_pointer,
@@ -48,7 +53,9 @@ from .workspace_store import (
 
 RETENTION_SECONDS = 14 * 24 * 60 * 60
 BACKUP_STDERR = ".store-backup.stderr.log"
-_ADMIN_FILES = frozenset({POINTER, POINTER_PREVIOUS, RECEIPT, STATE, BACKUP_STDERR})
+_ADMIN_FILES = frozenset(
+    {POINTER, POINTER_PREVIOUS, INVENTORIES, PUBLICATION, RECEIPT, STATE, BACKUP_STDERR}
+)
 logger = logging.getLogger(__name__)
 
 
@@ -62,12 +69,25 @@ def _write_state(root, state):
 def _write_pointer(root, pointer, *, store=None, checkpoint=lambda step: None):
     atomic_write_json(root / POINTER, pointer, follow_symlinks=False)
     if store is not None:
+        atomic_write_json(
+            root / PUBLICATION,
+            {"pointer": pointer, "digest": evidence_digest(pointer), "store": store},
+            follow_symlinks=False,
+        )
         checkpoint("pointer")
         _record_published(root, pointer, store)
         checkpoint("publish_state")
     atomic_write_json(root / POINTER_PREVIOUS, pointer, follow_symlinks=False)
     if store is not None:
         checkpoint("pointer_mirrored")
+
+
+def _write_inventory(root, files):
+    inventories = read_json(root / INVENTORIES)
+    digest = evidence_digest(files)
+    inventories[digest] = files
+    atomic_write_json(root / INVENTORIES, inventories, follow_symlinks=False)
+    return digest
 
 
 def _record_published(root, pointer, store):
@@ -146,6 +166,8 @@ def _recover_publication(root):
     if conflict:
         raise ValueError(conflict)
     if candidate is not None:
+        for item in candidate.get("retained", []):
+            retired_files(root, item)
         previous, parsed = _read_previous_pointer(root)
         if (
             parsed
@@ -304,6 +326,43 @@ def _staging_paths(staging):
     ]
 
 
+def _preflight_maintenance_metadata(root):
+    """Inspect every maintenance target without resolving or repairing pointers."""
+    try:
+        generation_path(root, root.name)
+        directories = {root}
+        pattern = re.compile(re.escape(root.name) + r"\.generation-[0-9a-f]{24}")
+        for path in root.parent.iterdir():
+            match = pattern.match(path.name)
+            if match:
+                staging = generation_path(root, match.group())
+                if path in _staging_paths(staging):
+                    directories.add(path)
+        for directory in sorted(directories):
+            try:
+                mode = directory.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(mode):
+                raise ValueError("Workspace maintenance requires directories without symlinks")
+            config = directory / SETTINGS
+            try:
+                mode = config.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(mode):
+                raise ValueError("Workspace settings must be regular files without symlinks")
+            settings = json.loads(config.read_text(encoding="utf-8"))
+            if not isinstance(settings, dict):
+                raise ValueError("Invalid workspace maintenance settings")
+            if "encryption" in settings:
+                raise ValueError(
+                    "Encrypted workspace maintenance requires a verified recovery plan"
+                )
+    except OSError:
+        raise ValueError("Workspace maintenance metadata is unavailable") from None
+
+
 def _remove_staging(staging):
     for path in _staging_paths(staging):
         if path.is_symlink():
@@ -369,6 +428,8 @@ def _prepare_generations(root):
     except (ValueError, KeyError, TypeError):
         _cleanup_recorded_staging(root)
         raise ValueError(POINTER_REPAIR) from None
+    for item in pointer.get("retained", []):
+        retired_files(root, item)
     _refresh_previous_pointer(root, pointer)
     _cleanup_unpublished(root, pointer)
     return pointer
@@ -487,19 +548,16 @@ def _legacy_required_file(directory):
     ).exists()
     if compact == chroma:
         return None
+    if compact and not (directory / "palace" / "compact.sqlite3").exists():
+        return None
     return "palace/compact.sqlite3" if compact else "palace/chroma.sqlite3"
 
 
-def _missing_retired_files(directory, item):
-    expected = item.get("expected_files")
+def _missing_retired_files(root, directory, item):
+    expected = retired_files(root, item)
     if expected is None:
         required = _legacy_required_file(directory)
         expected = [required] if required else []
-    if not isinstance(expected, list) or any(
-        not isinstance(name, str) or Path(name).is_absolute() or ".." in Path(name).parts
-        for name in expected
-    ):
-        raise ValueError("Invalid retired generation file inventory")
     return [
         name
         for name in expected
@@ -507,13 +565,15 @@ def _missing_retired_files(directory, item):
     ]
 
 
-def _retired_kind(root, item):
+def _retired_kind(root, item, *, current=None):
     directory = generation_path(root, item["name"])
     digest = item.get("digest")
-    current = _retirement_digest(directory) if digest else None
-    if "expected_files" not in item and digest and current == digest:
+    if current is None and digest:
+        current = _retirement_digest(directory)
+    expected = retired_files(root, item)
+    if expected is None and digest and current == digest:
         return None
-    if _missing_retired_files(directory, item):
+    if _missing_retired_files(root, directory, item):
         return "incomplete (interrupted deletion)"
     changed = bool(digest) and current != digest
     newer = newest_write(directory) > int(item["retired_at"] * 1_000_000_000)
@@ -566,7 +626,7 @@ def _retired_findings(root, pointer, state, *, inspect_expired=False, now=None):
         directory = generation_path(root, name)
         if name == pending or _generation_gone(root, directory):
             continue
-        missing = _missing_retired_files(directory, item)
+        missing = _missing_retired_files(root, directory, item)
         if (
             inspect_expired
             and (time.time() if now is None else now) - item["retired_at"] >= RETENTION_SECONDS
@@ -576,7 +636,7 @@ def _retired_findings(root, pointer, state, *, inspect_expired=False, now=None):
             kind = "incomplete (interrupted deletion)"
         else:
             kind = known.get(name)
-            if "expected_files" not in item and kind == "incomplete (interrupted deletion)":
+            if retired_files(root, item) is None and kind == "incomplete (interrupted deletion)":
                 kind = None
             if kind is None and newest_write(directory) > int(item["retired_at"] * 1_000_000_000):
                 kind = "changed since retirement"
@@ -608,7 +668,7 @@ def _remove_retired_directory(root, directory):
         fsync_directory(directory.parent)
 
 
-def _finish_deletion(root, pointer, state):
+def _finish_deletion(root, pointer, state, *, remaining=None):
     deletion = state["deletion"]
     item, recorded = deletion["entry"], deletion["pointer"]
     name = item["name"]
@@ -624,8 +684,9 @@ def _finish_deletion(root, pointer, state):
             f"Recorded deletion of {name} conflicts with the current pointer; preserve both"
         )
     directory = generation_path(root, name)
-    remaining = {}
-    _retirement_digest(directory, entries=remaining)
+    if remaining is None:
+        remaining = {}
+        _retirement_digest(directory, entries=remaining)
     changed = sorted(
         path for path, value in remaining.items() if deletion["files"].get(path) != value
     )
@@ -649,20 +710,14 @@ def _finish_deletion(root, pointer, state):
     return pointer
 
 
-def _start_deletion(root, pointer, item):
-    directory = generation_path(root, item["name"])
-    files = {}
-    if _retirement_digest(directory, entries=files) != item["digest"]:
-        kind = _retired_kind(root, item) or "changed since retirement"
-        _save_prune_findings(root, [{"generation": item["name"], "kind": kind, "at": time.time()}])
-        raise ValueError(_retired_repair(item["name"], kind))
+def _start_deletion(root, pointer, item, files):
     state = {
         "state": "deleting",
         "store": settings_for(generation_path(root, pointer["active"])).get("store", "v1"),
         "deletion": {"entry": item, "pointer": pointer, "files": files},
     }
     _write_state(root, state)
-    return _finish_deletion(root, pointer, state)
+    return _finish_deletion(root, pointer, state, remaining=files)
 
 
 def _only_gone_retained_entries(root, pointer, previous):
@@ -1205,6 +1260,7 @@ def switch_workspace(
         root = workspace_root(data_dir, workspace_id)
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         _verify_offline(data_dir)
+        _preflight_maintenance_metadata(root)
         state = _backfill_state(root)
         if state.get("state") == "deleting":
             raise ValueError(_deletion_repair(state["deletion"]["entry"]["name"], recorded=True))
@@ -1268,7 +1324,7 @@ def switch_workspace(
                         "name": source.name,
                         "retired_at": time.time(),
                         "digest": digest,
-                        "expected_files": sorted(expected_files),
+                        "inventory": _write_inventory(root, sorted(expected_files)),
                     }
                 ]
                 published = {"active": name, "retained": retained}
@@ -1293,6 +1349,7 @@ def prune_generations(data_dir, workspace_id, *, now=None, authorize=None, repor
             workspace_id = authorize(workspace_id)
         root = workspace_root(data_dir, workspace_id)
         _verify_offline(Path(data_dir).resolve())
+        _preflight_maintenance_metadata(root)
         if report_only:
             return _prune_report(root, now=now)
         try:
@@ -1321,11 +1378,13 @@ def prune_generations(data_dir, workspace_id, *, now=None, authorize=None, repor
                 continue
             if (time.time() if now is None else now) - item["retired_at"] < RETENTION_SECONDS:
                 continue
-            kind = _retired_kind(root, item)
+            files = {}
+            current = _retirement_digest(path, entries=files)
+            kind = _retired_kind(root, item, current=current)
             if kind:
                 refused.append({"generation": path.name, "kind": kind, "at": time.time()})
                 continue
-            pointer = _start_deletion(root, pointer, item)
+            pointer = _start_deletion(root, pointer, item, files)
         _save_prune_findings(root, refused)
         if refused:
             raise ValueError(
@@ -1379,7 +1438,7 @@ def doctor_workspace(data_dir, workspace_id):
     if emptied_root:
         repair = repair or _emptied_root_repair(emptied_root)
     retained = []
-    for item in read_json(root / POINTER).get("retained", []):
+    for item in pointer.get("retained", []):
         path = generation_path(root, item["name"])
         retained.append(
             {
@@ -1388,7 +1447,7 @@ def doctor_workspace(data_dir, workspace_id):
                 "newer_writes": newest_write(path) > int(item["retired_at"] * 1_000_000_000),
                 "verification": (
                     "unverified (legacy entry; prune checks it)"
-                    if "expected_files" not in item and _legacy_required_file(path) is None
+                    if retired_files(root, item) is None and _legacy_required_file(path) is None
                     else None
                 ),
             }

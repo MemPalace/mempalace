@@ -45,6 +45,8 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+from mempalace.sqlite_crypto import connect, row_factory
+
 from . import fact_provenance, paths, provenance
 from .config import DEFAULT_SINGLE_VALUED_PREDICATES, sanitize_iso_temporal
 from .ids import make_triple_id
@@ -88,8 +90,8 @@ def open_graph(path: str, read: bool = False) -> "KnowledgeGraph":
 
 
 def _read_only(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+    conn = connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    conn.row_factory = row_factory
     return conn
 
 
@@ -1022,9 +1024,9 @@ class KnowledgeGraph:
 
     def _conn(self):
         if self._connection is None:
-            self._connection = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
+            self._connection = connect(self.db_path, timeout=10, check_same_thread=False)
             self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.row_factory = sqlite3.Row
+            self._connection.row_factory = row_factory
         return self._connection
 
     def close(self):

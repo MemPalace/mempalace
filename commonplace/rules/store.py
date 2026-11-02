@@ -2,11 +2,12 @@
 
 import hashlib
 import secrets
-import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from mempalace.sqlite_crypto import connect, row_factory
 
 
 def now():
@@ -96,8 +97,8 @@ class RuleStore:
 
     @contextmanager
     def connection(self):
-        conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
+        conn = connect(self.path, timeout=10, isolation_level=None)
+        conn.row_factory = row_factory
         conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
