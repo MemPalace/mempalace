@@ -843,6 +843,7 @@ class OpenAICompatEmbeddingFunction:
             headers["Authorization"] = f"Bearer {self._api_key}"
 
         out: list = []
+        expected_width = None
         texts = as_text_batch(input)
         for start in range(0, len(texts), _EF_API_BATCH):
             batch = texts[start : start + _EF_API_BATCH]
@@ -857,7 +858,14 @@ class OpenAICompatEmbeddingFunction:
                     f"server is reachable and MEMPALACE_EMBEDDING_API_URL / embedding_api_url "
                     f"is correct."
                 ) from e
-            out.extend(self._vectors_from_response(data, len(batch)))
+            vectors = self._vectors_from_response(data, len(batch))
+            width = len(vectors[0])
+            if expected_width is not None and width != expected_width:
+                raise EmbeddingAPIError(
+                    f"Embedding API at {self._url} changed vector dimensions between batches"
+                )
+            expected_width = width
+            out.extend(vectors)
         return out
 
     def _vectors_from_response(self, data, n: int) -> list:
@@ -907,19 +915,30 @@ class OpenAICompatEmbeddingFunction:
                 f"'index' values; cannot align embeddings with inputs"
             )
         try:
-            arr = np.asarray([r["embedding"] for r in rows], dtype=np.float32)
-        except (KeyError, TypeError, ValueError) as e:
+            raw = np.asarray([r["embedding"] for r in rows], dtype=np.float64)
+        except (KeyError, TypeError, ValueError, OverflowError) as e:
             raise EmbeddingAPIError(
                 f"Embedding API at {self._url} returned malformed embeddings: {e}"
             ) from e
-        if arr.ndim != 2:
+        if raw.ndim != 2 or raw.shape[1] == 0:
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned non-vector embeddings (shape {arr.shape})"
+                f"Embedding API at {self._url} returned non-vector embeddings (shape {raw.shape})"
+            )
+        if not np.isfinite(raw).all():
+            raise EmbeddingAPIError(f"Embedding API at {self._url} returned non-finite embeddings")
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            arr = raw.astype(np.float32)
+        if not np.isfinite(arr).all() or np.any((raw != 0) & (arr == 0)):
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned embeddings outside the float32 range"
             )
         # L2-normalize so cosine == dot product (collection uses
-        # hnsw:space=cosine), matching EmbeddinggemmaONNX above.
-        norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
-        return (arr / norms).tolist()
+        # hnsw:space=cosine). Float64 norms cover the finite float32 range;
+        # an exact zero row stays zero rather than dividing by zero.
+        norms = np.linalg.norm(arr.astype(np.float64), axis=1, keepdims=True)
+        if not np.isfinite(norms).all():
+            raise EmbeddingAPIError(f"Embedding API at {self._url} returned invalid vector norms")
+        return (arr / np.where(norms == 0, 1.0, norms)).astype(np.float32).tolist()
 
 
 _KNOWN_EMBEDDING_MODELS = frozenset(
