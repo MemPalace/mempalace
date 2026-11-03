@@ -63,6 +63,30 @@ def test_milvus_measurement_config_does_not_restate_the_package_gate():
     assert any(pattern.endswith("mempalace/backends/milvus.py") for pattern in config.run_include)
 
 
+def test_default_coverage_config_omits_turso_and_uses_pyproject_gate():
+    warnings: list[str] = []
+    config = read_coverage_config(
+        str(_REPO_ROOT / "pyproject.toml"),
+        warn=warnings.append,
+    )
+    assert warnings == []
+    assert config.fail_under == 85
+    assert config.precision == 2
+    assert any(pattern.endswith("mempalace/backends/turso.py") for pattern in config.run_omit)
+
+
+def test_turso_measurement_config_does_not_restate_the_package_gate():
+    warnings: list[str] = []
+    config = read_coverage_config(
+        str(_REPO_ROOT / ".github" / "coverage-turso.toml"),
+        warn=warnings.append,
+    )
+    assert warnings == []
+    assert config.fail_under == 0
+    assert not config.source
+    assert any(pattern.endswith("mempalace/backends/turso.py") for pattern in config.run_include)
+
+
 def test_ci_reads_the_pyproject_gate_instead_of_hardcoding_it():
     workflow = (_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     code_lines = [line for line in workflow.splitlines() if not line.lstrip().startswith("#")]
@@ -72,6 +96,17 @@ def test_ci_reads_the_pyproject_gate_instead_of_hardcoding_it():
     assert "--cov-config=.github/coverage-milvus.toml" in workflow
     milvus_job = workflow.split("test-milvus:", 1)[1].split("\n  lint:", 1)[0]
     assert "\n          --cov\n" in milvus_job
+
+
+def test_ci_turso_job_installs_extra_and_measures_turso_module():
+    workflow = (_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    code_lines = [line for line in workflow.splitlines() if not line.lstrip().startswith("#")]
+    assert not any("--cov-fail-under" in line for line in code_lines)
+    assert re.search(r"fail_under\s*[=:]\s*\d+", workflow) is None
+    assert 'pip install -e ".[dev,turso]"' in workflow
+    assert "--cov-config=.github/coverage-turso.toml" in workflow
+    turso_job = workflow.split("test-turso:", 1)[1].split("\n  lint:", 1)[0]
+    assert "\n          --cov\n" in turso_job
 
 
 def test_windows_hook_applies_pyproject_windows_gate():

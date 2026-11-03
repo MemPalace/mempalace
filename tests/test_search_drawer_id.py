@@ -2,6 +2,8 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from mempalace.backends import LexicalHit, LexicalResult
 from mempalace.searcher import (
     _aligned_query_ids,
@@ -140,6 +142,35 @@ def test_filtered_query_fallback_keeps_ids_aligned_with_filtered_hits():
     assert result["documents"] == [["keep document"]]
     assert result["metadatas"][0][0]["source_file"] == "keep.md"
     assert result["distances"] == [[0.1]]
+
+
+def test_filtered_query_fallback_rejects_unknown_errors_without_retry():
+    """Only the known ChromaDB "Error finding id" failure retries unfiltered.
+
+    A Turso (or any other backend's) driver, filter, or index error must
+    propagate: an unfiltered retry would silently swap scoped results for a
+    globally ranked, truncated set.
+    """
+    drawers_col = MagicMock()
+    drawers_col.query.side_effect = RuntimeError("turso FTS index unavailable")
+
+    query_kwargs = {
+        "query_texts": ["needle"],
+        "n_results": 6,
+        "include": ["documents", "metadatas", "distances"],
+        "where": {"wing": "keep"},
+    }
+
+    with pytest.raises(RuntimeError, match="turso FTS index unavailable"):
+        _query_drawers_with_filter_fallback(
+            drawers_col,
+            query_kwargs,
+            "needle",
+            2,
+            "keep",
+            None,
+        )
+    assert drawers_col.query.call_count == 1
 
 
 def test_vector_drawer_id_round_trips_to_complete_chunked_drawer(
