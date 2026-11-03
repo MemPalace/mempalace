@@ -268,17 +268,32 @@ def test_explicit_parent_refuses_foreign_cards_and_top_level_callers(hub, env): 
             {"title": "Refused", "parent": invalid},
         )
         assert status == 400 and "parent" in payload["error"]
-    for caller in (token, cookie):
-        assert (
-            api(
-                hub,
-                caller,
-                "POST",
-                "/api/boards/work/cards",
-                {"title": "Refused", "parent": parent["number"]},
-            )[0]
-            == 400
-        )
+    assert (
+        api(
+            hub,
+            cookie,
+            "POST",
+            "/api/boards/work/cards",
+            {"title": "Refused", "parent": parent["number"]},
+        )[0]
+        == 400
+    )
+    status, linked = api(
+        hub,
+        token,
+        "POST",
+        "/api/boards/work/cards",
+        {"title": "Top-level child", "parent": parent["number"]},
+    )
+    assert status == 201 and linked["parent"] == parent["number"]
+    status, payload = api(
+        hub,
+        token,
+        "POST",
+        "/api/boards/work/cards",
+        {"title": "Refused", "parent": foreign["number"]},
+    )
+    assert status == 400 and "top-level actor" in payload["error"]
     ok, output = mcp(
         hub, sub_token, "task_add", title="Refused", board="work", parent=foreign["number"]
     )

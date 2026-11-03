@@ -198,6 +198,18 @@ def _trusted_agent(principal):
     )
 
 
+def _can_coordinate(principal, wing):
+    return (
+        not _restricted(principal)
+        and principal.policy.has_scope("memory:read")
+        and principal.policy.has_scope("memory:write")
+        and principal.policy.tool_visible("space_read")
+        and principal.policy.tool_visible("space_post")
+        and principal.policy.can_read_wing(wing)
+        and principal.policy.can_write_wing(wing)
+    )
+
+
 def _waiting_on_person(row):
     return (
         bool(row["ask"])
@@ -337,6 +349,77 @@ class BoardService:
     def _own_card(self, row):
         return owns_card(row, self.principal.actor)
 
+    def _top_level_taker(self):
+        p = self.principal
+        return not p.person and p.parent_connection_id is None
+
+    def _creator_connection(self, row):
+        try:
+            actor = row["created_by"]
+            if not actor.startswith("conn:") or row["stamp_connection"] != actor[5:]:
+                return None
+            connection = self.ctx.db.connection(actor[5:], self.principal.workspace_id)
+            if (
+                connection["name"] != row["stamp_connection"]
+                or connection["user_id"] != row["stamp_user"]
+                or connection["created_at"] > row["created_at"]
+            ):
+                return None
+            return connection
+        except (ControlError, ValueError, TypeError):
+            return None
+
+    def _top_level_origin(self, row):
+        try:
+            if row["agent_parent"] is not None or row["status"] not in ("todo", "doing", "review"):
+                return False
+            connection = self._creator_connection(row)
+            if connection is None or connection["parent_id"] is not None:
+                return False
+            creator = self.ctx.db.authenticate_connection(connection["id"])
+            return bool(
+                creator is not None
+                and creator.policy.has_scope("memory:write")
+                and creator.policy.can_read_wing(row["board_wing"])
+            )
+        except (ControlError, ValueError, TypeError):
+            return False
+
+    def _owning_top_level(self, row, q):
+        try:
+            if q.person or q.parent_connection_id is not None:
+                return False
+            creator = self._creator_connection(row)
+            if creator is None or creator["id"] == q.connection_id:
+                return False
+            # top_level_connection does not check revocation. q is always a live
+            # principal (caller or authenticated approver), so revoked roots cannot match.
+            return (
+                self.ctx.db.top_level_connection(creator["id"], self.principal.workspace_id)["id"]
+                == q.connection_id
+            )
+        except (ControlError, ValueError, TypeError):
+            return False
+
+    def _coordinates(self, q, row):
+        try:
+            return (
+                not q.person
+                and row["created_by"] != q.actor
+                and row["board_coordinator"] == q.actor
+                and _can_coordinate(q, row["board_wing"])
+            )
+        except (ControlError, ValueError, TypeError):
+            return False
+
+    def _top_level_actor(self, actor):
+        try:
+            return actor.startswith("conn:") and (
+                self.ctx.db.connection(actor[5:], self.principal.workspace_id)["parent_id"] is None
+            )
+        except (ControlError, ValueError, TypeError):
+            return False
+
     def _origin_released(self, row):
         actor = row["approved_by"]
         if not actor or row["proposal_status"] == "rejected":
@@ -353,12 +436,17 @@ class BoardService:
             connection = self.ctx.db.connection(actor[5:], self.principal.workspace_id)
             approver = self.ctx.db.authenticate_connection(connection["id"])
             return bool(
-                approver
-                and _trusted_agent(approver)
+                approver is not None
+                and approver.actor == actor
                 and approver.policy.has_scope("memory:write")
                 and approver.policy.can_read_wing(row["board_wing"])
+                and (
+                    _trusted_agent(approver)
+                    or self._coordinates(approver, row)
+                    or self._owning_top_level(row, approver)
+                )
             )
-        except ControlError:
+        except (ControlError, ValueError, TypeError):
             return False
 
     def _available_origin(self, row):
@@ -375,14 +463,31 @@ class BoardService:
             or self._origin_released(row)
         )
 
-    def _write(self, board, *, submission=False, row=None):
+    def _claimable_origin(self, row):
+        return self._available_origin(row) or (
+            self._top_level_taker() and self._top_level_origin(row)
+        )
+
+    def _write(self, board, *, submission=False, row=None, claiming=False):
         p = self.principal
         if not p.policy.has_scope("memory:write") or not p.policy.can_read_wing(board["wing"]):
             raise ToolError("no: this connection cannot change this board")
-        if not submission and row is not None and not self._available_origin(row):
-            raise ToolError("no: restricted-origin work needs parent or workspace owner release")
+        if not submission and row is not None:
+            available = (
+                self._claimable_origin(row)
+                if claiming or self._own_card(row)
+                else self._available_origin(row)
+            )
+            if not available:
+                raise ToolError(
+                    "no: restricted-origin work needs parent or workspace owner release"
+                )
         # Board ownership is independent of memory write destinations and trust.
         if submission or self._own_card(row):
+            return
+        if claiming and self._top_level_taker() and row["status"] == "todo":
+            # Work-claim authority is coordination, not memory-write trust
+            # (owner decision 3 Nov 14:17).
             return
         if _restricted(p):
             if submission:
@@ -682,15 +787,7 @@ class BoardService:
                     if c["auth"] == "pat"
                 ]
                 if not any(
-                    p is not None
-                    and p.actor == actor
-                    and not _restricted(p)
-                    and p.policy.has_scope("memory:read")
-                    and p.policy.has_scope("memory:write")
-                    and p.policy.tool_visible("space_read")
-                    and p.policy.tool_visible("space_post")
-                    and p.policy.can_read_wing(b["wing"])
-                    and p.policy.can_write_wing(b["wing"])
+                    p is not None and p.actor == actor and _can_coordinate(p, b["wing"])
                     for p in candidates
                 ):
                     raise ToolError(
@@ -934,7 +1031,9 @@ class BoardService:
                 root = p.actor
         if parent is not None:
             if root is None:
-                raise ParentError("no: only a sub-actor can specify a parent card")
+                if p.person:
+                    raise ParentError("no: only a sub-actor can specify a parent card")
+                root = p.actor
             try:
                 number = task_number(parent)
                 if number >= 2**63:
@@ -1029,7 +1128,12 @@ class BoardService:
             except ControlError:
                 pass
         if not p.person and _restricted(p) and assignee not in (None, p.actor) and child is None:
-            raise ToolError("no: assign cards only to yourself or your direct child")
+            if p.parent_connection_id is not None:
+                raise ToolError("no: assign cards only to yourself or your direct child")
+            if not self._top_level_actor(assignee):
+                raise ToolError(
+                    "no: assign cards only to yourself, your direct child or a top-level agent"
+                )
         if child is not None and (
             not child.policy.has_scope("memory:write")
             or not child.policy.can_read_wing(board["wing"])
@@ -1176,9 +1280,12 @@ class BoardService:
                     row["created_by"].removeprefix("conn:"), p.workspace_id
                 )
                 parent = creator["parent_id"] == p.connection_id
-            if not (owner or parent):
+            coordinator = self._coordinates(p, row)
+            root = self._owning_top_level(row, p)
+            if not (owner or parent or coordinator or root):
                 raise ToolError(
-                    "no: only the direct parent or signed-in workspace owner may approve proposals"
+                    "no: only the direct parent, its top-level agent, the board coordinator or "
+                    "the signed-in workspace owner may approve proposals"
                 )
             if row["proposal_status"] != "pending" and not (
                 owner and row["proposal_status"] == "rejected"
@@ -1191,7 +1298,14 @@ class BoardService:
                 {
                     "proposal_status": "approved" if approve else "rejected",
                     "approved_by": p.actor
-                    if approve and (owner or row["restricted_origin"] == 0 or _trusted_agent(p))
+                    if approve
+                    and (
+                        owner
+                        or row["restricted_origin"] == 0
+                        or _trusted_agent(p)
+                        or coordinator
+                        or root
+                    )
                     else None,
                     "status": status,
                 },
@@ -1243,6 +1357,8 @@ class BoardService:
         )
 
     def task_take_next(self, board=None, task=None):
+        top = self._top_level_taker()
+        narrow = _restricted(self.principal) and not top
         with self.transaction() as conn:
             if task is not None:
                 row, b = self._get(conn, task)
@@ -1257,8 +1373,10 @@ class BoardService:
                     "SELECT id FROM tasks WHERE board_id=? AND status='todo' "
                     "AND (assignee IS NULL OR assignee=?) "
                     "AND (? OR coalesce(restricted_origin,1)=0 OR created_by=? OR assignee=? "
-                    "OR coalesce(approved_by,'')!='') "
-                    + ("AND (created_by=? OR assignee=?) " if _restricted(self.principal) else "")
+                    "OR coalesce(approved_by,'')!=''"
+                    + (" OR (agent_parent IS NULL AND created_by LIKE 'conn:%')" if top else "")
+                    + ") "
+                    + ("AND (created_by=? OR assignee=?) " if narrow else "")
                     + (
                         ""
                         if self.principal.person
@@ -1271,16 +1389,12 @@ class BoardService:
                         self.principal.person and self.principal.role == "owner",
                         self.principal.actor,
                         self.principal.actor,
-                        *(
-                            (self.principal.actor, self.principal.actor)
-                            if _restricted(self.principal)
-                            else ()
-                        ),
+                        *((self.principal.actor, self.principal.actor) if narrow else ()),
                     ),
                 )
                 for found in candidates:
                     candidate = task_row(conn, found["id"])
-                    if self._available_origin(candidate):
+                    if self._claimable_origin(candidate):
                         row = candidate
                         break
                 if row is None:
@@ -1290,13 +1404,13 @@ class BoardService:
             )
             if (
                 not available
-                or not self._available_origin(row)
+                or not self._claimable_origin(row)
                 or row["proposal_status"] in ("pending", "rejected")
                 or row["assignee"] not in (None, self.principal.actor)
                 or (not self.principal.person and _waiting_on_person(row))
             ):
                 raise ToolError("no: card is not available to take")
-            self._write(b, row=row)
+            self._write(b, row=row, claiming=True)
             self._set(
                 conn,
                 row,

@@ -88,7 +88,7 @@ def task_number(ref) -> int:
 def task_row(conn, ref):
     row = conn.execute(
         "SELECT t.*, b.slug AS board, b.wing AS board_wing, "
-        "b.claim_minutes, b.done_needs_review FROM tasks t "
+        "b.claim_minutes, b.done_needs_review, b.coordinator AS board_coordinator FROM tasks t "
         "JOIN boards b ON b.id=t.board_id WHERE t.id=?",
         (task_number(ref),),
     ).fetchone()

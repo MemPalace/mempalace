@@ -159,8 +159,9 @@ def test_rejection_owner_fallback_and_nested_parent(hub):
     child_id, _, child = actor(hub, "child", parent=root_id)
     _, _, nested = actor(hub, "nested", parent=child_id)
     proposal = nested.task_add(title="Nested proposal")
+    _, _, unrelated = actor(hub, "unrelated-root")
     with pytest.raises(ToolError, match="direct parent"):
-        root.task_approve(proposal["number"])
+        unrelated.task_approve(proposal["number"])
     rejected = child.task_approve(proposal["number"], approve=False)
     assert rejected["proposal_status"] == "rejected"
     for status in ("todo", "doing", "done"):
@@ -171,6 +172,8 @@ def test_rejection_owner_fallback_and_nested_parent(hub):
     assert person.task_approve(proposal["number"])["proposal_status"] == "approved"
     assert nested.task_update(proposal["number"], status="doing")["status"] == "doing"
     assert nested.task_update(proposal["number"], status="done")["status"] == "done"
+    proposal = nested.task_add(title="Root release")
+    assert root.task_approve(proposal["number"])["approved_by"] == root.principal.actor
 
 
 def test_heartbeat_expiry_keeps_assignment_and_records_once(hub):
@@ -388,7 +391,6 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     assert not mcp(hub, other_token, "task_take_next", task=number)[0]
     creator.task_take_next(task=number)
     creator.task_handoff(number, to="anyone", note="Ready for the shared queue")
-    assert other.task_take_next() is None
     assert not mcp(hub, other_token, "task_update", task=number, status="doing")[0]
     assert not mcp(hub, token, "task_update", task=number, approved_by="owner")[0]
     member = hub.db.create_user("member@example.com")
@@ -397,9 +399,41 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     with pytest.raises(ToolError, match="owner release"):
         person.task_update(number, status="doing")
     assert creator.task_show(number)["approved_by"] is None
+    queued = other.task_take_next()
+    assert queued is not None
+    assert queued["number"] == number
+    # Child-created work still needs a releasing authority; an intermediate
+    # restricted parent may approve its child's own work without releasing it.
+    top_id, _, _ = actor(hub, "top")
+    from commonplace.policy import Policy
+
+    def restricted_child(name, parent):
+        cid, token = hub.db.create_token(
+            workspace_ref=hub.workspace,
+            user_ref=hub.admin,
+            name=name,
+            client="chatgpt",
+            actor=hub.admin,
+            parent=parent,
+            policy=Policy.build(trust="untrusted", read_wings=["shared"], write_wing="inbox"),
+        )
+        return cid, service(hub, hub.db.authenticate_token(token))
+
+    mid_id, mid = restricted_child("mid", top_id)
+    _, child = restricted_child("inbox-child", mid_id)
+    proposal = child.task_add(title="Restricted child work")
+    number = proposal["number"]
+    assert mid.task_approve(number)["approved_by"] is None
+    child.task_take_next(task=number)
+    child.task_handoff(number, to="anyone", note="Ready for approval")
+    assert not mcp(hub, other_token, "task_take_next", task=number)[0]
+    assert not mcp(hub, other_token, "task_update", task=number, status="doing")[0]
+    assert other.task_take_next() is None
+    with pytest.raises(ToolError, match="owner release"):
+        person.task_update(number, status="doing")
     owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
     owner.task_handoff(number, to="anyone", note="Approved for the shared queue")
-    assert creator.task_show(number)["approved_by"] == owner.principal.actor
+    assert child.task_show(number)["approved_by"] == owner.principal.actor
     assert other.task_take_next()["number"] == number
 
 

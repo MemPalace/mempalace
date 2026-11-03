@@ -66,7 +66,8 @@ def fresh(hub):
     "trust,wing", [("untrusted", "inbox"), ("standard", "shared"), ("trusted", "inbox")]
 )
 def test_parent_approval_does_not_release_restricted_origin(fresh, trust, wing):
-    parent = fresh.connect("parent", trust=trust, write_wing=wing)
+    top = fresh.connect("top")
+    parent = fresh.connect("parent", parent=top.id, trust=trust, write_wing=wing)
     child = fresh.connect("child", parent=parent.id, trust="untrusted", write_wing="inbox")
     receiver = fresh.connect("receiver")
     proposal = child.work.task_add(board="work", title="Child follow-up")
@@ -100,7 +101,8 @@ def test_authorized_approval_releases_restricted_work(fresh, approver):
 @pytest.mark.parametrize("kind", ["untrusted", "inbox", "revoked", "missing", "foreign"])
 @pytest.mark.parametrize("route", ["take", "move", "finish", "queue"])
 def test_legacy_approval_marker_cannot_release_or_block_safe_queue(hub, fresh, kind, route):
-    creator = fresh.connect("creator", trust="untrusted", write_wing="inbox")
+    top = fresh.connect("top")
+    creator = fresh.connect("creator", parent=top.id, trust="untrusted", write_wing="inbox")
     receiver = fresh.connect("receiver")
     if kind == "missing":
         approver = "conn:missing"
@@ -116,7 +118,9 @@ def test_legacy_approval_marker_cannot_release_or_block_safe_queue(hub, fresh, k
         approver = old.principal.actor
         if kind == "revoked":
             hub.db.revoke(old.id, actor=fresh.user, workspace_ref=fresh.workspace)
-    legacy = creator.work.task_add(board="work", title="Legacy restricted work", claim=True)
+    legacy = creator.work.task_add(board="work", title="Legacy restricted work")
+    fresh.owner.task_approve(legacy["number"])
+    creator.work.task_take_next(task=legacy["number"])
     creator.work.task_handoff(legacy["number"], receiver.principal.actor, "Continue this work")
     # Simulate an existing marker from an older server, never a live data repair.
     with creator.work.store.transaction() as conn:
@@ -148,10 +152,14 @@ def test_legacy_person_release_requires_an_active_workspace_owner(hub, fresh, ki
         )
     elif kind == "disabled":
         hub.db._conn.execute("UPDATE users SET disabled_at='2000' WHERE id=?", (previous,))
-    creator = fresh.connect("creator", trust="untrusted", write_wing="inbox")
+    top = fresh.connect("top")
+    creator = fresh.connect("creator", parent=top.id, trust="untrusted", write_wing="inbox")
     receiver = fresh.connect("receiver")
-    legacy = creator.work.task_add(board="work", title="Old release", claim=True)
+    legacy = creator.work.task_add(board="work", title="Old release")
+    fresh.owner.task_approve(legacy["number"])
+    creator.work.task_take_next(task=legacy["number"])
     creator.work.task_handoff(legacy["number"], receiver.principal.actor, "Continue this work")
+    # Test-only historical person marker; never a live data repair.
     with creator.work.store.transaction() as conn:
         conn.execute(
             "UPDATE tasks SET approved_by=? WHERE id=?", (f"user:{previous}", legacy["number"])

@@ -156,6 +156,27 @@ def test_default_inbox_reservation_requires_owner_release_for_other_agents(hub, 
     )[0]
     released = show(hub, creator, number)
     assert released["status"] == "todo" and released["assignee"] is None
+    ok, reply = mcp(hub, fresh.second.token, "task_update", task=number, status="doing")
+    assert not ok, reply
+    assert show(hub, creator, number) == released
+    assert mcp(hub, fresh.second.token, "task_take_next", task=number)[0]
+    # Owner-release protection stays on child-created work approved by a
+    # restricted intermediate parent, rather than a top-level creator.
+    mid = fresh.connect(
+        "mid", client="chatgpt", parent=fresh.first.principal.connection_id, trust="untrusted"
+    )
+    child = fresh.connect(
+        "inbox-child", client="chatgpt", parent=mid.principal.connection_id, trust=trust
+    )
+    proposal = add(hub, child)
+    number = proposal["number"]
+    assert mcp(hub, mid.token, "task_approve", task=number)[0]
+    assert show(hub, child, number)["approved_by"] is None
+    assert mcp(hub, child.token, "task_take_next", task=number)[0]
+    assert mcp(
+        hub, child.token, "task_handoff", task=number, to="anyone", note="Ready for approval."
+    )[0]
+    released = show(hub, child, number)
     refused_claims(hub, fresh.second, released)
     status, approved = api(
         hub,

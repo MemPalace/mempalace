@@ -199,8 +199,8 @@ def test_agents_keep_space_creation_authority_and_child_approval(signup):
     assert api(client, None, path + "/approve", "POST", {}, token=child)[0] == 403
     status, approved = api(client, None, path + "/approve", "POST", {}, token=parent)
     assert status == 200 and approved["proposal_status"] == "approved"
-    # A restricted parent approves child work without releasing its origin.
-    assert approved["approved_by"] is None
+    # The owning top-level agent releases its child's work (owner decision 3 Nov 14:17).
+    assert approved["approved_by"] == "conn:parent"
     status, claimed = api(
         client,
         None,
