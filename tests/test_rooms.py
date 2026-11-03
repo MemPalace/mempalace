@@ -609,8 +609,9 @@ def test_rekey_closets_leaves_a_source_whose_drawers_only_partly_moved():
     assert closets.rows["k"]["meta"]["room"] == "technical"
 
 
+@pytest.mark.parametrize("wing", ["w", "-Users-fixture-Documents-project"])
 def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, wing
 ):
     """Killed after the drawer phase: the retry has no drawer to move but must
     still move the closets, from the decisions the first run recorded."""
@@ -620,17 +621,19 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
     from mempalace.rooms import pending_apply_path
 
     cfg = MempalaceConfig(palace_path=str(tmp_path))
-    save_room_set(cfg, _room_set())
+    approved = _room_set()
+    approved.wing = wing
+    room_path = save_room_set(cfg, approved)
     rows = [
         {
             "id": "a",
-            "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+            "meta": {"wing": wing, "room": "technical", "source_file": "s1"},
             "doc": "cut the release",
             "emb": [1.0, 0.0],
         },
         {
             "id": "b",
-            "meta": {"wing": "w", "room": "technical", "source_file": "s2"},
+            "meta": {"wing": wing, "room": "technical", "source_file": "s2"},
             "doc": "fix the bug",
             "emb": [0.0, 1.0],
         },
@@ -638,8 +641,8 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
     col = FakeCollection(rows)
     closets = FakeCollection(
         [
-            {"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}},
-            {"id": "k2", "meta": {"wing": "w", "room": "technical", "source_file": "s2"}},
+            {"id": "k1", "meta": {"wing": wing, "room": "technical", "source_file": "s1"}},
+            {"id": "k2", "meta": {"wing": wing, "room": "technical", "source_file": "s2"}},
         ]
     )
     monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
@@ -653,12 +656,16 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(closets, "update", dies)
-    ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing=wing, threshold=0.75, yes=True)
     with pytest.raises(KeyboardInterrupt):
         cli.cmd_rooms(ns)
     assert col.rows["a"]["meta"]["room"] == "releases"  # drawer phase finished
     assert closets.rows["k1"]["meta"]["room"] == "technical"  # closet phase did not
-    assert os.path.isfile(pending_apply_path(cfg, "w"))
+    marker = pending_apply_path(cfg, wing)
+    assert os.path.isfile(marker)
+    if wing.startswith("-"):
+        os.rename(room_path, tmp_path / "rooms" / f"{wing}.json")
+        os.rename(marker, tmp_path / "rooms" / f"{wing}.apply-pending.json")
 
     monkeypatch.setattr(closets, "update", real_update)
     capsys.readouterr()
@@ -667,7 +674,8 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
     assert "Resuming an interrupted apply" in out and "2 closets followed" in out
     assert closets.rows["k1"]["meta"]["room"] == "releases"
     assert closets.rows["k2"]["meta"]["room"] == "bug-fixes"
-    assert not os.path.exists(pending_apply_path(cfg, "w"))
+    assert not os.path.exists(pending_apply_path(cfg, wing))
+    assert all(row["meta"]["wing"] == wing for row in col.rows.values())
 
     # A completed apply re-run is a no-op.
     cli.cmd_rooms(ns)
