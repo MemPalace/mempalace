@@ -71,6 +71,39 @@ def test_layer0_strips_whitespace(tmp_path):
     assert text == "Hello world"
 
 
+@pytest.fixture(params=["cp950", "cp1252"])
+def windows_locale_open(request, monkeypatch):
+    """Make an encoding-less text ``open()`` in layers decode like a Windows machine."""
+    import builtins
+
+    import mempalace.layers as layers_module
+
+    real_open = builtins.open
+
+    def open_(file, mode="r", buffering=-1, encoding=None, *args, **kwargs):
+        if "b" not in mode and encoding is None:
+            encoding = request.param
+        return real_open(file, mode, buffering, encoding, *args, **kwargs)
+
+    monkeypatch.setattr(layers_module, "open", open_, raising=False)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["I am Atlas, assistant for Zoë and José.", "我是小助手，替王小明記事。"],
+)
+def test_layer0_reads_utf8_identity_under_windows_locale(tmp_path, windows_locale_open, identity):
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    assert Layer0(identity_path=str(identity_file)).render() == identity
+
+
+def test_layer0_drops_utf8_bom(tmp_path):
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_bytes("\ufeffI am Atlas.".encode("utf-8"))
+    assert Layer0(identity_path=str(identity_file)).render() == "I am Atlas."
+
+
 def test_layer0_default_path():
     layer = Layer0()
     expected = os.path.expanduser("~/.mempalace/identity.txt")
