@@ -801,6 +801,119 @@ def test_open_then_search_during_external_commits_has_no_closed_errors(tmp_path,
     assert external.exitcode == 0
 
 
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "compact"])
+@pytest.mark.parametrize("writer_starts", [True, False], ids=["writer-starts", "writer-closes"])
+def test_read_only_open_recovers_when_writer_crosses_sidecar_probes(
+    tmp_path, monkeypatch, backend_name, writer_starts
+):
+    """The two real file probes can straddle a complete writer lifecycle change."""
+    from mempalace.backends import get_backend_class
+
+    backend_type = get_backend_class(backend_name)
+    writer_backend, reader_backend = backend_type(), backend_type()
+    path = str(tmp_path)
+    writer = writer_backend.get_collection(path, "records", create=True)
+    writer.add(ids=["a"], documents=["alpha"], embeddings=[[1.0, 0.0]])
+    if writer_starts:
+        writer_backend.close_palace(path)
+    else:
+        writer.add(ids=["b"], documents=["beta"], embeddings=[[0.0, 1.0]])
+
+    db_path = reader_backend._db_path(path)
+    wal, shm = f"{db_path}-wal", f"{db_path}-shm"
+    real_isfile = os.path.isfile
+    assert (real_isfile(wal), real_isfile(shm)) == (not writer_starts, not writer_starts)
+    observations = []
+
+    def isfile_across_writer_change(filename):
+        exists = real_isfile(filename)
+        if os.fspath(filename) == wal and not observations:
+            # Preserve the real result, then let another connection change both files
+            # before the reader probes -shm. No synthetic sidecar or Boolean result.
+            observations.append(exists)
+            if writer_starts:
+                later = writer_backend.get_collection(path, "records")
+                later.add(ids=["b"], documents=["beta"], embeddings=[[0.0, 1.0]])
+            else:
+                writer_backend.close_palace(path)
+            assert (real_isfile(wal), real_isfile(shm)) == (writer_starts, writer_starts)
+        return exists
+
+    monkeypatch.setattr(sqlite_exact_module.os.path, "isfile", isfile_across_writer_change)
+    errors = []
+    try:
+        try:
+            reader = reader_backend.get_collection(path, "records", options={"read_only": True})
+        except BackendError as exc:
+            errors.append(str(exc))
+        assert observations == [not writer_starts], "The real writer interleaving must occur"
+        assert not errors, f"Coherent sidecars after writer transition were rejected: {errors}"
+        assert reader._handle.immutable is not writer_starts
+        assert reader.get(ids=["b"]).documents == ["beta"]
+        assert reader.query(query_embeddings=[[0.0, 1.0]], n_results=1).ids == [["b"]]
+    finally:
+        reader_backend.close()
+        writer_backend.close()
+
+
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "compact"])
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_read_only_open_still_rejects_persistent_incomplete_sidecars(
+    tmp_path, monkeypatch, backend_name, suffix
+):
+    from mempalace.backends import get_backend_class
+
+    backend = get_backend_class(backend_name)()
+    backend.get_collection(str(tmp_path), "records", create=True)
+    db_path = backend._db_path(str(tmp_path))
+    backend.close()
+    lone = tmp_path / (os.path.basename(db_path) + suffix)
+    lone.write_bytes(b"incomplete sidecar")
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
+    original_state = SQLiteExactBackend._wal_sidecar_state
+    probes = []
+
+    def bounded_state(path):
+        probes.append(path)
+        assert len(probes) <= 3, "Incomplete-sidecar retries must remain bounded"
+        return original_state(path)
+
+    def forbidden_connect(*args, **kwargs):
+        pytest.fail("An incomplete pair must be rejected before any SQLite connection")
+
+    monkeypatch.setattr(SQLiteExactBackend, "_wal_sidecar_state", staticmethod(bounded_state))
+    monkeypatch.setattr(sqlite_exact_module, "connect", forbidden_connect)
+    with pytest.raises(BackendError, match="incomplete WAL sidecar set"):
+        backend._connect_read_only(db_path)
+    assert len(probes) == 3
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
+
+
+@pytest.mark.parametrize("active_writer", [True, False])
+def test_read_only_open_does_not_wait_for_coherent_sidecars(tmp_path, monkeypatch, active_writer):
+    backend, writer = _collection(tmp_path)
+    writer.add(ids=["a"], documents=["alpha"], embeddings=[[1.0, 0.0]])
+    db_path = backend._db_path(str(tmp_path))
+    if not active_writer:
+        backend.close_palace(str(tmp_path))
+
+    def unexpected_sleep(seconds):
+        pytest.fail("A coherent sidecar observation must not wait")
+
+    monkeypatch.setattr(sqlite_exact_module.time, "sleep", unexpected_sleep)
+    try:
+        conn, immutable = backend._connect_read_only(db_path)
+        try:
+            assert immutable is not active_writer
+            assert conn.execute("SELECT document FROM documents").fetchall() == [("alpha",)]
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                conn.execute("DELETE FROM documents")
+        finally:
+            conn.close()
+    finally:
+        backend.close()
+
+
 def test_sqlite_exact_read_only_open_skips_schema_init_and_refuses_writes(tmp_path):
     backend, col = _collection(tmp_path)
     palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))

@@ -17,6 +17,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1708,8 +1709,15 @@ class SQLiteExactBackend(BaseBackend):
         Returns ``(connection, immutable)``. ``immutable`` is True when the
         database was clean (no WAL) and was opened with ``immutable=1``.
         """
-        wal_exists, shm_exists = SQLiteExactBackend._wal_sidecar_state(db_path)
-        if wal_exists != shm_exists:
+        # A writer can create/remove both files between the two stat calls.
+        # Briefly recheck a mismatch, but never open a persistently torn pair.
+        for attempt in range(3):
+            wal_exists, shm_exists = SQLiteExactBackend._wal_sidecar_state(db_path)
+            if wal_exists == shm_exists:
+                break
+            if attempt < 2:
+                time.sleep(0.005)
+        else:
             raise BackendError(
                 "sqlite_exact read-only open found an incomplete WAL sidecar set; "
                 "open the palace after its writer exits cleanly or restore both "
