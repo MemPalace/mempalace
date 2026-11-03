@@ -1944,6 +1944,86 @@ def test_quarantine_stale_hnsw_still_trips_segment_lagging_its_own_writes(tmp_pa
     )
 
 
+def test_quarantine_stale_hnsw_catches_torn_pickle_after_unobserved_mutation(tmp_path):
+    """A delete/update does not advance MAX(created_at), so the flush that
+    applies it leaves the HNSW files NEWER than the own-write baseline. A
+    pickle torn during that flush must still reach the integrity gate and be
+    quarantined — the early-continue must not suppress the gate on a baseline
+    that cannot observe the mutation (review P2 on #2891)."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 60,
+        sqlite_mtime=now,
+        meta_bytes=_CORRUPT_META,
+    )
+    _add_segment_write_history(
+        palace,
+        seg.name,
+        datetime.datetime.fromtimestamp(now - 7200, tz=datetime.timezone.utc).isoformat(),
+    )
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert len(moved) == 1
+    assert ".drift-" in moved[0]
+    assert not seg.exists()
+
+
+def test_unvouched_flush_sniff_runs_once_per_flush_version(tmp_path, caplog):
+    """The unvouched-flush sniff is bounded: a healthy segment is sniffed
+    once per flush version, not on every re-armed scan — otherwise every
+    flushed-idle wing would log on every open, the #2887 spam this PR
+    removes."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 60,
+        sqlite_mtime=now,
+        meta_bytes=_HEALTHY_META,
+    )
+    _add_segment_write_history(
+        palace,
+        seg.name,
+        datetime.datetime.fromtimestamp(now - 7200, tz=datetime.timezone.utc).isoformat(),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="mempalace.backends.chroma"):
+        first = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+        second = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert first == [] and second == []
+    assert seg.exists()
+    sniffed = [r for r in caplog.records if "newer than the segment's last" in r.message]
+    assert len(sniffed) == 1, "unvouched-flush sniff did not bound to one per flush version"
+
+
+def test_unvouched_flush_does_not_widen_pickle_absent_exposure(tmp_path):
+    """Pickle-absent segments keep the pre-fix behavior even with an
+    unvouched flush: the sniff reads them as interrupted persists (#1274)
+    while chromadb >= 1.5 Rust backends legitimately write no pickle
+    (#2333/#2571) — routing them into the gate here would quarantine
+    healthy segments."""
+    now = 1_700_000_000.0
+    palace, seg = _make_palace_with_segment(
+        tmp_path,
+        hnsw_mtime=now - 60,
+        sqlite_mtime=now,
+        meta_bytes=None,
+    )
+    (seg / "link_lists.bin").write_bytes(b"\x01" * 128)
+    _add_segment_write_history(
+        palace,
+        seg.name,
+        datetime.datetime.fromtimestamp(now - 7200, tz=datetime.timezone.utc).isoformat(),
+    )
+
+    moved = quarantine_stale_hnsw(str(palace), stale_seconds=3600.0)
+
+    assert moved == []
+    assert seg.exists()
+
+
 def test_quarantine_stale_hnsw_leaves_empty_segment_without_metadata_alone(tmp_path):
     """Missing metadata is okay only when the segment has no meaningful data yet."""
 

@@ -731,6 +731,13 @@ def _segment_last_write_epoch(db_path: str, seg_id: str) -> Optional[float]:
     collection whose METADATA segment has no embeddings rows yet resolves
     MAX to NULL and falls back to the shared sqlite mtime like an orphan.
 
+    ``created_at`` observes INSERTIONS only: a delete removes the newest row
+    (dropping MAX to an older one) and an update rewrites state without
+    touching it, so a flush applied after either leaves the HNSW files newer
+    than this value. The caller must not let that unvouched flush suppress
+    the integrity gate — see the flush_unvouched path in
+    :func:`quarantine_stale_hnsw`.
+
     Reads go through :func:`open_palace_reader` — the one door for palace
     sqlite access — so a per-call close cannot drop Chroma's file locks.
     Returns ``None`` on any sqlite error, missing schema, unparseable value,
@@ -766,6 +773,15 @@ def _segment_last_write_epoch(db_path: str, seg_id: str) -> Optional[float]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=_dt.timezone.utc)
     return parsed.timestamp()
+
+
+# Segments whose current flush version (data_level0.bin mtime) already passed
+# the unvouched-flush sniff in quarantine_stale_hnsw. Keyed by (palace path,
+# segment dir name), valued by the mtime sniffed; a re-flush re-arms it.
+# Process-local like ChromaBackend._quarantined_paths: a restart re-sniffs
+# once, and concurrent scans are safe because the sniff is a read-only
+# idempotent check (worst case: one duplicate DEBUG line).
+_UNVOUCHED_FLUSH_SNIFFED: dict[tuple[str, str], float] = {}
 
 
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
@@ -832,21 +848,50 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
 
         # Baseline staleness against this segment's own last write, not the
         # shared sqlite mtime — see _segment_last_write_epoch.
-        baseline = _segment_last_write_epoch(db_path, name)
-        if baseline is None:
-            baseline = sqlite_mtime
-        if not payload_corrupt and not header_corrupt and baseline - hnsw_mtime < stale_seconds:
+        own_write = _segment_last_write_epoch(db_path, name)
+        baseline = own_write if own_write is not None else sqlite_mtime
+        gap = baseline - hnsw_mtime
+
+        # The own-write baseline observes insertions only: a delete or update
+        # leaves MAX(created_at) behind, so a flush newer than the baseline is
+        # vouched for by nothing and must not be skipped unexamined. Sniff it
+        # once per flush version, pickle-present only — the sniff reads
+        # pickle-absent dirs as interrupted persists, while Rust backends
+        # legitimately write no pickle.
+        flush_unvouched = (
+            own_write is not None
+            and hnsw_mtime > baseline
+            and os.path.isfile(os.path.join(seg_dir, "index_metadata.pickle"))
+            and _UNVOUCHED_FLUSH_SNIFFED.get((palace_path, name)) != hnsw_mtime
+        )
+
+        if (
+            not payload_corrupt
+            and not header_corrupt
+            and gap < stale_seconds
+            and not flush_unvouched
+        ):
             continue
 
         # Stage 2: integrity gate. Mtime drift alone is not corruption because
         # Chroma flushes HNSW asynchronously. A healthy metadata file proves the
         # ordinary stale-by-mtime case is just flush lag.
         if not payload_corrupt and not header_corrupt and _segment_appears_healthy(seg_dir):
+            if flush_unvouched:
+                _UNVOUCHED_FLUSH_SNIFFED[(palace_path, name)] = hnsw_mtime
+                logger.debug(
+                    "HNSW flush on %s is newer than the segment's last "
+                    "recorded write (deletes/updates do not advance the "
+                    "own-write baseline); integrity sniff passed. Leaving "
+                    "in place.",
+                    seg_dir,
+                )
+                continue
             logger.info(
                 "HNSW mtime gap %.0fs on %s exceeds threshold but segment "
                 "metadata and payload size are intact — flush-lag, not "
                 "corruption. Leaving in place.",
-                baseline - hnsw_mtime,
+                gap,
                 seg_dir,
             )
             continue
@@ -868,11 +913,14 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
                 f"link_lists.bin/data_level0.bin ratio {payload_ratio:.1f}x "
                 f"exceeds {_HNSW_LINK_TO_DATA_MAX_RATIO:.1f}x"
             )
-        else:
+        elif flush_unvouched:
             reason = (
-                f"last write {baseline - hnsw_mtime:.0f}s newer than HNSW "
-                "and integrity check failed"
+                "integrity check failed on a flush newer than the segment's "
+                "last recorded write (deletes/updates are invisible to the "
+                "own-write baseline)"
             )
+        else:
+            reason = f"last write {gap:.0f}s newer than HNSW and integrity check failed"
 
         try:
             os.rename(seg_dir, target)
