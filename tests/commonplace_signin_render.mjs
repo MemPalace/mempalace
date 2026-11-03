@@ -15,8 +15,10 @@ const providers = [
 const emailForm = '<form data-form="email-login" action="/app/auth/email" method="post"><input type="hidden" name="next" value=""><input name="email" type="email" aria-label="Email" placeholder="Email" autocomplete="email" maxlength="254" required><button class="blockbtn">Email a sign-in link</button></form>';
 const brand = '<a class="brand-home" href="/app/" aria-label="Commonplace"><img class="brand-v2" src="/app/brand/logo-small-dark.svg" alt="Commonplace"></a>';
 
-test("no providers preserves the email form without a nav or message", () => {
-  assert.equal(signinView({}), `<main class="signin">${brand}<h1>Sign in</h1>${emailForm}</main>`);
+const legal = '<nav class="legal-links" aria-label="Legal"><a href="https://cmmn.dev/privacy">Privacy</a><a href="https://cmmn.dev/terms">Terms</a></nav>';
+
+test("no providers preserves the email form and legal navigation without a message", () => {
+  assert.equal(signinView({}), `<main class="signin">${brand}<h1>Sign in</h1>${emailForm}${legal}</main>`);
 });
 
 test("provider buttons precede the email form and use the supplied marks", () => {
@@ -41,7 +43,7 @@ test("provider names, URLs, messages and destinations cannot inject markup", () 
   const html = signinView({ providers: [{ id: attack, name: attack, url: `https://app.example/${attack}` }], error: attack, next });
   assert.ok(html.includes(`<span>Continue with ${escape(attack)}</span>`));
   assert.ok(html.includes(`href="${escape(`https://app.example/${attack}?next=${encodeURIComponent(next)}`)}"`));
-  assert.ok(html.endsWith(`<div class="message" role="status">${escape(attack)}</div></main>`));
+  assert.ok(html.endsWith(`<div class="message" role="status">${escape(attack)}</div>${legal}</main>`));
   assert.doesNotMatch(html, /<script|<svg|\sstyle=/);
 });
 

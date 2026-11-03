@@ -18,6 +18,7 @@ body:has(.signin) { overflow-y: auto; }
 .signin form { display: flex; gap: 6px; }
 .signin input { flex: 1; width: 100px; min-height: 40px; }
 .signin .message { margin-top: 16px; }
+.signin .legal-links { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: 24px; font-size: 14px; }
 .speak[data-active="true"] { color: var(--strong); box-shadow: inset 0 0 0 1px var(--strong); }
 .digest-captions { padding: 16px 20px; margin-bottom: var(--gap); border-left: 2px solid var(--line-2); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 22px; background: var(--side); }
 #content { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; padding: 20px 24px 24px; gap: var(--gap); }

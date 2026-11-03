@@ -8,10 +8,10 @@
 //
 // 1. Names: no "c" next to "p" in anything we publish (the protocol name MCP aside).
 // 2. Links: every local href/src and #anchor resolves, and so does every short link.
-// 3. Requests: each page, at desktop and phone width, with every tab and row clicked,
+// 3. Requests: each page, at desktop, tablet and phone widths, with every tab and row clicked,
 //    makes zero requests to any host but its own (milestone W's done test).
 // 4. nginx: when an nginx binary is found ($NGINX_BIN or PATH), commonplace.run serves
-//    the pages, www redirects, and cmmn.dev short links redirect.
+//    the pages, legal pages stay on each host, and cmmn.dev short links redirect.
 
 import { createServer, request } from "node:http";
 import { readFileSync, readdirSync, statSync, existsSync, mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
@@ -26,7 +26,8 @@ const shotsIdx = process.argv.indexOf("--shots");
 const shotsDir = shotsIdx > 0 ? resolve(process.argv[shotsIdx + 1]) : null;
 const originIdx = process.argv.indexOf("--origin");
 const liveOrigin = originIdx > 0 ? process.argv[originIdx + 1].replace(/\/$/, "") : null;
-const pages = ["/", "/connect/"];
+const legalPages = ["/privacy", "/terms", "/privacy/nl", "/terms/nl"];
+const pages = ["/", "/connect/", ...legalPages];
 const failures = [];
 const fail = (msg) => { failures.push(msg); console.log(`  FAIL ${msg}`); };
 const ok = (msg) => console.log(`  ok   ${msg}`);
@@ -54,7 +55,7 @@ function checkLocal(fromFile, ref) {
   const [path, hash] = ref.split("#");
   let target = fromFile;
   if (path) {
-    target = resolve(dirname(fromFile), path);
+    target = path.startsWith("/") ? join(pub, path) : resolve(dirname(fromFile), path);
     if (existsSync(target) && statSync(target).isDirectory()) target = join(target, "index.html");
     if (!existsSync(target)) return `${relative(here, fromFile)} → ${ref}: no such file`;
   }
@@ -168,7 +169,7 @@ if (!chrome) {
     return problems;
   })()`;
 
-  for (const [label, width, height, mobile] of [["desktop", 1440, 900, false], ["phone", 390, 844, true]]) {
+  for (const [label, width, height, mobile] of [["desktop", 1440, 900, false], ["tablet", 768, 1024, false], ["phone", 390, 844, true]]) {
     await send("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: mobile ? 2 : 1, mobile });
     for (const path of pages) {
       seen.length = 0; errors.length = 0;
@@ -176,6 +177,8 @@ if (!chrome) {
       await send("Page.navigate", { url: origin + path });
       await loaded;
       await sleep(300);
+      const overflow = await send("Runtime.evaluate", { expression: "document.documentElement.scrollWidth > innerWidth", returnByValue: true });
+      if (overflow.result?.result?.value) fail(`${label} ${path}: horizontal page overflow`);
       const run = await send("Runtime.evaluate", { expression: exercise, awaitPromise: true, returnByValue: true });
       const ex = run.result?.exceptionDetails;
       if (ex) fail(`${label} ${path}: exercise script threw: ${ex.exception?.description || ex.text}`);
@@ -231,6 +234,11 @@ http { access_log off; ${temps}
     ["commonplace.run", "/site.css", 200],
     ["commonplace.run", "/nope", 404],
     ["commonplace.run", "/healthz", 200],
+    ...["commonplace.run", "cmmn.dev"].flatMap((host) => [
+      ...legalPages.flatMap((path) => [[host, path, 200], [host, `${path}/`, 200]]),
+      [host, "/legal.css", 200],
+      [host, "/favicon.svg", 200],
+    ]),
     ["www.commonplace.run", "/connect/", 301, "https://commonplace.run/connect/"],
     ["cmmn.dev", "/", 302, "https://commonplace.run/"],
     ["cmmn.dev", "/unknown", 302, "https://commonplace.run/"],
@@ -239,9 +247,9 @@ http { access_log off; ${temps}
   for (const [host, path, status, location] of expect) {
     const r = await get(host, path);
     const csp = r.headers["content-security-policy"] || "";
-    if (r.statusCode !== status || (location && r.headers.location !== location)) {
+    if (r.statusCode !== status || (location && r.headers.location !== location) || (status === 200 && r.headers.location)) {
       fail(`${host}${path}: got ${r.statusCode} ${r.headers.location || ""}, want ${status} ${location || ""}`);
-    } else if (status === 200 && path.endsWith("/") && !csp.includes("default-src 'self'")) {
+    } else if (status === 200 && path.endsWith("/") && !/default-src '(self|none)'/.test(csp)) {
       fail(`${host}${path}: missing Content-Security-Policy`);
     } else if (status === 200 && r.headers["referrer-policy"] !== "no-referrer") {
       fail(`${host}${path}: missing Referrer-Policy`);

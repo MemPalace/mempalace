@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacybeleid · Commonplace</title>
+<meta name="description" content="Privacybeleid — Commonplace, cmmn.dev.">
+<meta name="theme-color" content="#0b0c0b">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/legal.css">
+<link rel="alternate" hreflang="en" href="/privacy">
+<link rel="alternate" hreflang="nl" href="/privacy/nl">
+</head>
+<body class="legal">
+<a class="skip" href="#content">Naar de inhoud</a>
+<header class="legal-header">
+  <a class="legal-brand" href="https://commonplace.run/" aria-label="Commonplace home"><svg viewBox="0 0 28 28" aria-hidden="true"><path fill="currentColor" d="M0 0h13v13H0zM15 0h13v13H15zM0 15h13v13H0z"/></svg>Commonplace</a>
+  <nav aria-label="Juridisch"><a href="/privacy/nl">Privacy</a><a href="/terms/nl">Voorwaarden</a></nav>
+</header>
+<main id="content">
+  <div class="legal-title">
+    <p class="eyebrow">Gehoste dienst · cmmn.dev</p>
+    <h1>Privacybeleid</h1>
+    <p class="updated">Laatst bijgewerkt: <time datetime="2026-11-03">3 november 2026</time></p>
+    <nav class="languages" aria-label="Taal"><a href="/privacy" lang="en" hreflang="en">English</a><a href="/privacy/nl" lang="nl" hreflang="nl" aria-current="page">Nederlands</a></nav>
+  </div>
+  <nav class="contents" aria-label="Op deze pagina"><h2>Op deze pagina</h2><ol>
+<li><a href="#section-1">Wie is verantwoordelijk</a></li>
+<li><a href="#section-2">Welke gegevens we verzamelen</a></li>
+<li><a href="#section-3">Waar je gegevens worden opgeslagen</a></li>
+<li><a href="#section-4">Derden</a></li>
+<li><a href="#section-5">Google-gebruikersgegevens</a></li>
+<li><a href="#section-6">Inloggen met Apple</a></li>
+<li><a href="#section-7">Inloggen met X</a></li>
+<li><a href="#section-8">Waarom we je gegevens mogen gebruiken (rechtsgrond)</a></li>
+<li><a href="#section-9">Hoe lang we gegevens bewaren</a></li>
+<li><a href="#section-10">Je rechten</a></li>
+<li><a href="#section-11">Leeftijd</a></li>
+<li><a href="#section-12">Beveiliging</a></li>
+<li><a href="#section-13">Wijzigingen</a></li>
+<li><a href="#section-14">Contact</a></li>
+  </ol></nav>
+  <article aria-label="Privacybeleid">
+<p>Dit beleid legt uit welke gegevens de gehoste Commonplace-dienst op cmmn.dev en app.cmmn.dev ("cmmn", "wij") verzamelt, waarom en wat je ermee kunt doen. Het geldt alleen voor de gehoste dienst. Als je Commonplace zelf draait, ben je de beheerder van je eigen installatie en geldt dit beleid daarvoor niet.</p>
+<h2 id="section-1">Wie is verantwoordelijk</h2>
+<p>De verwerkingsverantwoordelijke volgens de Algemene verordening gegevensbescherming (AVG) is:</p>
+<p><strong>Verwerkingsverantwoordelijke:</strong> Jeffrey Endeman</p>
+<p><a href="mailto:privacy@cmmn.dev">privacy@cmmn.dev</a></p>
+<p>Schrijf naar privacy@cmmn.dev voor vragen of verzoeken over je gegevens.</p>
+<h2 id="section-2">Welke gegevens we verzamelen</h2>
+<h3>Je account</h3>
+<p>Wanneer je inlogt, bewaren we:</p>
+<ul>
+  <li>je e-mailadres</li>
+  <li>je weergavenaam, als de inlogprovider die doorgeeft</li>
+  <li>een interne gebruikers-id en de datum waarop je account is aangemaakt</li>
+  <li>welke inlogprovider je hebt gebruikt, met je account-id bij die provider en de datums waarop je daarmee voor het eerst en het laatst inlogde</li>
+  <li>je abonnement (gratis) en, als je er gebruik van maakt, een dagelijkse gebruiksteller voor functies met limieten</li>
+</ul>
+<p>Bij het aanmaken van je account maken we een persoonlijke werkruimte voor je aan.</p>
+<h3>Inloggen met Google, GitHub, Discord, Apple of X</h3>
+<p>We gebruiken deze providers alleen om vast te stellen wie je bent. We vragen de kleinste set rechten waarmee we een geverifieerd e-mailadres kunnen krijgen:</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Sign-in providers / Inlogproviders">
+<table>
+<thead><tr><th scope="col">Provider</th><th scope="col">Wat we vragen</th><th scope="col">Wat we bewaren</th></tr></thead>
+<tbody>
+<tr><td>Google</td><td><code>openid email profile</code></td><td>account-id, geverifieerd e-mailadres, naam</td></tr>
+<tr><td>GitHub</td><td><code>read:user user:email</code></td><td>account-id, primair geverifieerd e-mailadres, naam of gebruikersnaam</td></tr>
+<tr><td>Discord</td><td><code>identify email</code></td><td>account-id, geverifieerd e-mailadres, weergavenaam of gebruikersnaam</td></tr>
+<tr><td>Apple</td><td><code>name email</code></td><td>account-id, e-mailadres (dit kan een Apple-relayadres zijn als je "Verberg mijn e-mailadres" kiest), naam (Apple stuurt die alleen de eerste keer)</td></tr>
+<tr><td>X</td><td><code>tweet.read users.read users.email</code></td><td>account-id, bevestigd e-mailadres, naam</td></tr>
+</tbody>
+</table>
+</div>
+<p>X vereist <code>tweet.read</code> voordat we je basisprofiel mogen lezen. We lezen of bewaren je berichten niet en plaatsen geen berichten.</p>
+<p>Het toegangstoken van een provider gebruiken we eenmalig tijdens het inloggen om het bovenstaande profiel op te halen. We bewaren het niet en handelen niet namens jou bij de provider. We bewaren geen profielfoto's, volgerslijsten, repositories, servers of andere providergegevens.</p>
+<p>Als een provider meerdere geverifieerde e-mailadressen doorgeeft (GitHub kan dat doen), gebruiken we die alleen om een bestaand cmmn-account met hetzelfde adres te vinden. We bewaren één adres.</p>
+<p>We koppelen een nieuwe provider alleen aan een bestaand account via een overeenkomend, geverifieerd e-mailadres.</p>
+<h3>Inloglinks per e-mail</h3>
+<p>We kunnen een eenmalige inloglink naar je e-mailadres sturen. De link werkt één keer en verloopt na 15 minuten. Deze e-mails worden vanaf onze eigen mailserver verstuurd.</p>
+<h3>Wat jij en je agents opslaan</h3>
+<p>Commonplace bewaart wat jij en de AI-agents die je verbindt kiezen om op te slaan:</p>
+<ul>
+  <li>herinneringen (tekst, notities, feiten en hun links en labels)</li>
+  <li>borden, kaarten, reacties en berichten in ruimtes</li>
+  <li>regels en instellingen</li>
+  <li>gespreksthreads, als je sessieopslag of contextoverdracht voor een agent inschakelt; sessieopslag staat standaard uit</li>
+</ul>
+<p>Jij bepaalt wat erin komt. Sla geen gevoelige gegevens van anderen of geheimen zoals wachtwoorden en API-sleutels op. Commonplace markeert tekst die op een geheim of gezondheidsinformatie lijkt zodat je die kunt controleren, maar verwijdert die tekst niet.</p>
+<p>We gebruiken je inhoud niet om AI-modellen te trainen, verkopen die niet en tonen geen advertenties. Het doorzoeken van je herinneringen gebeurt op onze server met een lokaal model. De agents die je verbindt (bijvoorbeeld Claude, Codex, Cursor of Grok) lezen en schrijven je inhoud wel: wat zij daarmee doen, valt onder hun eigen voorwaarden en privacybeleid.</p>
+<h3>Agentverbindingen en tokens</h3>
+<p>Wanneer je een agent verbindt, bewaren we de verbinding: de naam, het clienttype, de rechten, wie deze heeft aangemaakt en wanneer deze is aangemaakt, voor het laatst is gebruikt, verloopt en wordt ingetrokken. Toegangstokens worden één keer getoond; we bewaren alleen een eenrichtingshash van elk token. Persoonlijke toegangstokens verlopen standaard na 365 dagen. Inloggen van agents via OAuth gebruikt toegangstokens die één uur geldig zijn en vernieuwingstokens die 90 dagen geldig zijn. Voor OAuth bewaren we ook de naam en doorstuuradressen die de agent-app registreert.</p>
+<h3>Webhooks</h3>
+<p>Als je een webhook instelt, bewaren we het adres en sturen we ondertekende meldingen met id's en een vaste set metadata, zonder de tekst van je herinneringen.</p>
+<h3>Cookies en browseropslag</h3>
+<p>We gebruiken alleen cookies die nodig zijn om de dienst te laten werken. Geen cookies voor analyse, advertenties of tracking.</p>
+<div class="table-scroll" tabindex="0" role="region" aria-label="Cookies">
+<table>
+<thead><tr><th scope="col">Naam</th><th scope="col">Doel</th><th scope="col">Geldigheidsduur</th></tr></thead>
+<tbody>
+<tr><td><code>cmmn_session</code></td><td>houdt je ingelogd (gedeeld tussen cmmn.dev en app.cmmn.dev)</td><td>30 dagen</td></tr>
+<tr><td><code>cmmn_signin</code></td><td>beschermt een lopende inlogpoging tegen vervalsing</td><td>10 minuten</td></tr>
+<tr><td><code>cmmn_via</code></td><td>onthoudt welke inlogknop je het laatst hebt gebruikt</td><td>400 dagen</td></tr>
+</tbody>
+</table>
+</div>
+<p>We bewaren alleen een eenrichtingshash van je sessie-id. Uitloggen beëindigt de sessie aan onze kant.</p>
+<p>De app gebruikt ook de lokale opslag van je browser voor kleine interfacevoorkeuren (bijvoorbeeld welke tips je al hebt gezien en instellingen voor spraakinvoer). Die gegevens blijven in je browser.</p>
+<h3>Logboeken en beveiligingsregistraties</h3>
+<ul>
+  <li><strong>Appverzoeken:</strong> de app logt geen verzoekadressen, URL's of headers.</li>
+  <li><strong>Verzoeklimieten:</strong> je IP-adres wordt kort in het werkgeheugen gehouden om misbruik te beperken. Het wordt niet naar schijf geschreven.</li>
+  <li><strong>Auditlogboek:</strong> we registreren beveiligingsgebeurtenissen zoals het aanmaken van accounts, inloggen, koppelen van providers, tokenwijzigingen en geweigerde acties. Registraties bevatten id's, de actie, het resultaat en de providernaam. Ze bevatten niet de tekst van je herinneringen of je e-mailadres. Het auditlogboek is alleen aan te vullen.</li>
+  <li><strong>Foutlogboeken:</strong> operationele fouten kunnen worden gelogd om problemen met de dienst te onderzoeken en op te lossen.</li>
+  <li><strong>Maillogboeken:</strong> onze mailserver logt het adres van de ontvanger en de bezorgstatus van verstuurde e-mails. Er is momenteel geen vaste bewaartermijn voor maillogboeken ingesteld.</li>
+</ul>
+<h2 id="section-3">Waar je gegevens worden opgeslagen</h2>
+<p>De dienst draait op een eigen gehuurde server van Hetzner Online GmbH in een datacentrum in Falkenstein, Duitsland (EU). Het volume voor de blijvend opgeslagen dienstgegevens is versleuteld. We bewaren back-ups afzonderlijk onder ons beheer. Inloggen met een provider en het verbinden van agents of webhooks betrekt die partijen erbij; zij kunnen gegevens buiten de Europese Economische Ruimte verwerken (zie "Derden").</p>
+<p>De server kan de gegevens in je account lezen om ze voor je te kunnen doorzoeken.</p>
+<h2 id="section-4">Derden</h2>
+<p>We verkopen je gegevens niet. Gegevens bereiken deze partijen alleen zoals hieronder beschreven:</p>
+<ul>
+  <li><strong>Hetzner Online GmbH</strong> (Duitsland): levert de serverinfrastructuur.</li>
+  <li><strong>Google, GitHub, Discord, Apple, X:</strong> alleen als je ervoor kiest daarmee in te loggen. Ze krijgen te weten dat je bij cmmn bent ingelogd en wij ontvangen de hierboven genoemde gegevens. Hun eigen privacybeleid geldt voor je account bij hen. Sommige van deze bedrijven zijn buiten de EU gevestigd.</li>
+  <li><strong>Je e-mailprovider:</strong> ontvangt de e-mails die we je sturen.</li>
+  <li><strong>De agents en webhookadressen die je verbindt:</strong> ontvangen de inhoud waartoe jij ze toegang geeft.</li>
+</ul>
+<h2 id="section-5">Google-gebruikersgegevens</h2>
+<p>Het gebruik en de doorgifte door cmmn van informatie die via Google-API's is ontvangen aan andere apps, voldoen aan de <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, inclusief de Limited Use-vereisten.</p>
+<p>In de praktijk gebruiken we je Google-account-id, e-mailadres en naam alleen om je in te loggen en je naam in de app te tonen. We gebruiken Google-gegevens niet voor advertenties, verkopen ze niet, laten ze niet door mensen lezen en gebruiken ze niet om AI-modellen te trainen.</p>
+<h2 id="section-6">Inloggen met Apple</h2>
+<p>Als je "Verberg mijn e-mailadres" kiest, ontvangen we een Apple-relayadres en zien we je echte adres niet. Je kunt het gebruik van Inloggen met Apple voor cmmn op elk moment stoppen in je Apple Account-instellingen.</p>
+<h2 id="section-7">Inloggen met X</h2>
+<p>We gebruiken gegevens van X alleen om je in te loggen, zoals hierboven beschreven. We plaatsen geen berichten, lezen je berichten niet en delen X-gegevens met niemand. Als je cmmn uit je gekoppelde apps bij X verwijdert, kun je niet meer met X inloggen. Je kunt ons vragen de X-koppeling uit je account te verwijderen.</p>
+<h2 id="section-8">Waarom we je gegevens mogen gebruiken (rechtsgrond)</h2>
+<ul>
+  <li><strong>Om de dienst te leveren waarvoor je je hebt aangemeld</strong> (account, inloggen, je inhoud opslaan en beschikbaar stellen, agentverbindingen): uitvoering van een overeenkomst, AVG art. 6 lid 1 onder b.</li>
+  <li><strong>Om de dienst veilig en werkend te houden</strong> (auditlogboek, verzoeklimieten, back-ups, foutlogboeken, inloglimieten): ons gerechtvaardigd belang bij een veilige en betrouwbare dienst, art. 6 lid 1 onder f.</li>
+  <li><strong>Om aan wettelijke verplichtingen te voldoen</strong>, waar die gelden: art. 6 lid 1 onder c.</li>
+</ul>
+<h2 id="section-9">Hoe lang we gegevens bewaren</h2>
+<ul>
+  <li><strong>Accountgegevens en inhoud:</strong> zolang je account bestaat. Als je een herinnering verwijdert, wordt die uit de actieve geheugenopslag en zoekindex verwijderd. Dit wist geen onafhankelijke kopieën in andere inhoud, geschiedenis of back-ups.</li>
+  <li><strong>Geldigheid bij inloggen:</strong> sessies werken 30 dagen, inloglinks 15 minuten en inlogpogingen 10 minuten. Dit zijn geldigheidstermijnen, geen garanties dat elk verlopen databaserecord meteen wordt gewist. Verlopen sessies en oude linkregistraties worden nog niet automatisch opgeschoond; verlopen e-mailverzoeken en inlogpogingen bij providers worden tijdens latere inlogacties opgeschoond.</li>
+  <li><strong>Dagelijkse inlogtellers per provider:</strong> tellers ouder dan 40 dagen worden tijdens latere inlogacties verwijderd. Deze tellers zijn per provider en dag, niet per persoon. Tellers voor functiegebruik kunnen aan je account zijn gekoppeld.</li>
+  <li><strong>Back-ups:</strong> ons beleid voor de bewaartermijn van back-ups is 30 dagen. Verwijderde gegevens kunnen in back-ups blijven staan totdat die verlopen.</li>
+  <li><strong>Auditlogboek:</strong> bewaard voor beveiliging. Identificatoren in deze registraties kunnen nog aan een persoon gekoppeld zijn; verwijdering van een account garandeert niet dat de resterende registraties anoniem zijn.</li>
+  <li><strong>Account verwijderen:</strong> we verwijderen je account en persoonlijke werkruimte binnen 30 dagen na je verzoek. Je kunt je account niet zelf verwijderen; de beheerder behandelt verzoeken.</li>
+</ul>
+<h2 id="section-10">Je rechten</h2>
+<p>Op grond van de AVG kun je ons vragen om:</p>
+<ul>
+  <li>je een kopie van je gegevens te geven (inzage en overdraagbaarheid)</li>
+  <li>ze te corrigeren</li>
+  <li>ze te verwijderen</li>
+  <li>het gebruik ervan te beperken, of bezwaar te maken tegen dat gebruik</li>
+</ul>
+<p>Mail privacy@cmmn.dev vanaf het adres van je account. We antwoorden binnen één maand. Je kunt ook zelf afzonderlijke herinneringen, kaarten en verbindingen verwijderen in de app of via je agents. We verstrekken exports van accountgegevens op verzoek.</p>
+<p>Je hebt het recht een klacht in te dienen bij een toezichthouder voor gegevensbescherming. In Nederland is dat de Autoriteit Persoonsgegevens (autoriteitpersoonsgegevens.nl).</p>
+<h2 id="section-11">Leeftijd</h2>
+<p>cmmn is niet bedoeld voor kinderen. Je moet minimaal 16 jaar zijn om de dienst te gebruiken.</p>
+<h2 id="section-12">Beveiliging</h2>
+<p>We gebruiken overal HTTPS, bewaren alleen hashes van tokens en sessie-id's, versleutelen het volume voor blijvende gegevensopslag en beperken wat elke agentverbinding mag doen. Geen enkel systeem is volmaakt veilig. Als we een datalek ontdekken dat gevolgen heeft voor je gegevens, informeren we jou en de autoriteiten zoals de wet dat vereist.</p>
+<h2 id="section-13">Wijzigingen</h2>
+<p>We kunnen dit beleid bijwerken. We passen de datum bovenaan aan. Bij belangrijke wijzigingen informeren we ingelogde gebruikers in de app of per e-mail voordat de wijzigingen ingaan.</p>
+<h2 id="section-14">Contact</h2>
+<p><a href="mailto:privacy@cmmn.dev">privacy@cmmn.dev</a></p>
+  </article>
+</main>
+<footer class="legal-footer"><span>Commonplace</span><nav aria-label="Juridische links"><a href="/privacy/nl">Privacy</a><a href="/terms/nl">Voorwaarden</a><a href="mailto:privacy@cmmn.dev">privacy@cmmn.dev</a></nav></footer>
+</body>
+</html>

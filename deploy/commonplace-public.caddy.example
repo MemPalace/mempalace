@@ -18,12 +18,23 @@
 	}
 }
 
+(commonplace_legal) {
+	@legal path /privacy /privacy/ /privacy/nl /privacy/nl/ /terms /terms/ /terms/nl /terms/nl/ /legal.css /favicon.svg
+	handle @legal {
+		root * /path/to/commonplace/app/landing/public
+		try_files {path}/index.html {path} =404
+		header Content-Security-Policy "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		file_server
+	}
+}
+
 # Website.
 commonplace.run, www.commonplace.run {
 	bind 192.0.2.30 2001:db8::30
 	import commonplace_headers
 	@www host www.commonplace.run
 	redir @www https://commonplace.run{uri} 308
+	import commonplace_legal
 	root * /path/to/commonplace/app/landing/public
 	header Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
 	file_server
@@ -46,6 +57,7 @@ app.cmmn.dev {
 cmmn.dev {
 	bind 192.0.2.30 2001:db8::30
 	import commonplace_headers
+	import commonplace_legal
 	@agent path /mcp /oauth/* /.well-known/* /s/* /health /healthz
 	handle @agent {
 		import commonplace_gateway
