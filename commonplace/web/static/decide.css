@@ -35,7 +35,7 @@
 .decide-dot.ring { width: 10px; height: 10px; background: none; box-shadow: inset 0 0 0 2px var(--person); }
 
 /* The card, with the next question peeking out under it. */
-.decide-stage { flex: 1; min-height: 0; position: relative; margin: 16px 16px 0; }
+.decide-stage { flex: 1; min-height: 0; position: relative; margin: 16px 16px 0; overflow-x: clip; }
 .decide-card {
   position: absolute; inset: 0 0 8px; z-index: 1; display: flex; flex-direction: column; gap: 16px;
   padding: 18px; background: var(--surface); border: 1px solid var(--line-2); overflow: hidden;
@@ -68,10 +68,11 @@
 
 /* Swipe feedback: stamp, coloured frame, lit button and the track. */
 .decide-card[data-swipe="on"] { touch-action: pan-y; transform-origin: 50% 130%; }
+.decide-card[data-swipe="on"] .decide-body { touch-action: pan-y; }
 .decide-card.dragging { user-select: none; -webkit-user-select: none; }
-.stamp { position: absolute; top: 30%; z-index: 2; padding: 4px 12px; font-size: 22px; line-height: 30px; font-weight: 800; opacity: 0; pointer-events: none; }
-.stamp.yes { left: 18px; color: var(--ok); box-shadow: inset 0 0 0 2px var(--ok); transform: rotate(-8deg); }
-.stamp.no { right: 18px; color: var(--strong); box-shadow: inset 0 0 0 2px var(--strong); transform: rotate(8deg); }
+.decide-card > .stamp { position: absolute; top: 30%; z-index: 2; padding: 4px 12px; font-size: 22px; line-height: 30px; font-weight: 800; opacity: 0; pointer-events: none; }
+.decide-card > .stamp.yes { left: 18px; color: var(--ok); box-shadow: inset 0 0 0 2px var(--ok); transform: rotate(-8deg); }
+.decide-card > .stamp.no { right: 18px; color: var(--strong); box-shadow: inset 0 0 0 2px var(--strong); transform: rotate(8deg); }
 .decide-card[data-drag="yes"] .stamp.yes, .decide-card[data-drag="no"] .stamp.no { opacity: var(--stamp, 0); }
 .decide-card[data-drag="yes"] { outline: 2px solid var(--ok); outline-offset: -1px; }
 .decide-card[data-drag="no"] { outline: 2px solid var(--strong); outline-offset: -1px; }

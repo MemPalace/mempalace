@@ -71,6 +71,15 @@ assert.equal(waitingCount(payload.rules), 3);
 assert.equal(waitingCount([rule(6, { pending: 1 })]), 1);
 assert.equal(waitingCount([]), 0);
 const html = rulesView(payload);
+const pendingFromHTML = (markup, required = true) => {
+  const match = markup.match(/<p\b([^>]*\bdata-rule-pending\b[^>]*)>([^<]*)<\/p>/);
+  if (!required && !match) return null;
+  assert.ok(match, "Rules must render a pending-list status node");
+  assert.match(match[1], /role="status"/);
+  assert.equal(match[2], "Rule list refresh pending");
+  return { hidden: /\bhidden\b/.test(match[1]), textContent: match[2] };
+};
+assert.equal(pendingFromHTML(html).hidden, true, "A freshly rendered list is current");
 assert.ok(html.includes("All agents") && html.includes("conn:writer") && html.includes("conn:reader"));
 assert.equal((html.match(/class="rule-tile"/g) || []).length, 3);
 assert.ok(html.indexOf('data-rule-agent="conn:writer"') < html.indexOf('data-rule-agent="*"'));
@@ -240,6 +249,7 @@ console.log("Rules delayed clarify snapshot checks passed");
   try {
     const editor = (mode = "edit") => {
       const listeners = {}, writes = [], errors = [], controls = {}, comparison = { innerHTML: "" };
+      let marker = pendingFromHTML(rulesView(payload));
       const save = { disabled: false }, cancel = { disabled: false };
       let mounted = mode === "new", markup = "", refreshes = 0, focused = false;
       for (const [name, value] of Object.entries({ text: first.text, summary: "", kind: "instruction", scope: "global", scope_ref: "" })) controls[name] = { value, focus() { focused = true; } };
@@ -254,14 +264,15 @@ console.log("Rules delayed clarify snapshot checks passed");
       const body = { set innerHTML(value) { markup = value; mounted = true; } };
       const ui = rulesHandlers({
         addEventListener: (name, fn) => { listeners[name] = fn; },
-        querySelector: (selector) => mounted && selector.includes(mode === "edit" ? 'form[data-rule-form="edit"]' : '.rule-new:not([hidden])') ? form : null,
+        querySelector: (selector) => selector === "[data-rule-pending]" ? marker : mounted && selector.includes(mode === "edit" ? 'form[data-rule-form="edit"]' : '.rule-new:not([hidden])') ? form : null,
       }, (path, options) => {
         const request = deferred(); writes.push({ path, options, ...request }); return request.promise;
-      }, async () => { refreshes++; mounted = false; ui.update(payload); }, (message) => errors.push(message));
+      }, async () => { refreshes++; mounted = false; ui.update(payload); marker = pendingFromHTML(rulesView(payload)); }, (message) => errors.push(message));
       ui.update(payload);
       const click = (action) => listeners.click({ target: { closest: () => ({ dataset: { ruleAction: action }, closest: (selector) => selector === "[data-rule-id]" ? row : null }) } });
       const submit = () => listeners.submit({ target: form, preventDefault() {} });
       return { ui, form, row, controls, comparison, writes, errors, save, cancel, click, submit,
+        get marker() { return marker; },
         get mounted() { return mounted; }, get markup() { return markup; }, get refreshes() { return refreshes; }, get focused() { return focused; } };
     };
     const draft = { text: '  My <draft> "& 日本語\n\t', summary: '  My <summary> &\n  ', kind: "style", scope: "repo", scope_ref: '  example.test/<draft> &  ' };
@@ -282,12 +293,16 @@ console.log("Rules delayed clarify snapshot checks passed");
       values.scope_ref += "later ref";
       for (const [key, value] of Object.entries(values)) edit.controls[key].value = value;
       const current = rule(1, { version: 4, text: '<current> "& 日本語\n  ', agent: "conn:<target>", status: "edited", kind: "<kind>", scope: "repo", scope_ref: '<scope> "&', summary: '<summary> "&\n ' });
-      edit.ui.stale = true;
+      assert.equal(edit.ui.stale, false);
+      const initialMarker = edit.marker;
+      edit.errors.push("Unrelated failed Rules read");
       edit.writes[0].reject(new ApiError(409, { error: "rule changed", current }));
       await submitting; // Includes mutate's finally and refreshIfStale.
       assert.equal(edit.refreshes, 0);
       assert.equal(edit.mounted, true);
       assert.equal(edit.ui.stale, true);
+      assert.equal(edit.marker.hidden, false, "A real edit conflict needs a full list refresh");
+      assert.equal(edit.errors.at(-1), "Unrelated failed Rules read", "Conflict must preserve the separate read error");
       assert.equal(edit.ui.force, false);
       assert.equal(edit.save.disabled, false);
       assert.equal(edit.cancel.disabled, false);
@@ -317,6 +332,8 @@ console.log("Rules delayed clarify snapshot checks passed");
         assert.equal(edit.mounted, false);
       } else await edit.click("cancel-edit");
       assert.equal(edit.refreshes, 1);
+      assert.notEqual(edit.marker, initialMarker, "Full render creates a fresh status node");
+      assert.equal(edit.marker.hidden, true, "Save and Cancel each finish with a current list");
     }
     for (const mode of ["edit", "new"]) {
       for (const error of [
@@ -388,7 +405,12 @@ const shellSource = await read("app.js");
 const refreshSource = shellSource.slice(shellSource.indexOf("async function refresh("), shellSource.indexOf("async function route()"));
 const shellState = { me: {}, screen: 1, refreshRequest: 0, base: "#/rules", route: "#/rules" };
 const shellCalls = [], updates = [], badgeCounts = [], shellErrors = [], shellErrorCalls = [];
-const content = { innerHTML: "", children: [{}] };
+let shellMarker = null, shellHTML = "";
+const content = {
+  get innerHTML() { return shellHTML; },
+  set innerHTML(value) { shellHTML = value; shellMarker = pendingFromHTML(value, false); },
+  children: [{}],
+};
 let shellPayload = { ...payload, can_edit: false };
 const noWork = () => {};
 let headerActions = "", shellBusy = true, shellRefresh, shellWrite = async () => {};
@@ -401,7 +423,7 @@ const queueShellRead = () => {
 const shellHandlers = {};
 const shellUI = rulesHandlers({
   addEventListener: (type, fn) => { shellHandlers[type] = fn; },
-  querySelector: (selector) => shellBusy && (shellBusy === true || selector.includes(shellBusy)) ? {} : null,
+  querySelector: (selector) => selector === "[data-rule-pending]" ? shellMarker : shellBusy && (shellBusy === true || selector.includes(shellBusy)) ? {} : null,
 }, (...args) => shellWrite(...args), () => shellRefresh(), (error) => shellErrors.push(error));
 const updateShellUI = shellUI.update;
 shellUI.update = (...args) => { updates.push(args); updateShellUI(...args); };
@@ -417,7 +439,7 @@ const shellDeps = {
     if (path === "/api/rules/count") return { waiting: 7, seq: 12 };
     return { boards: [] };
   },
-  root: { querySelector: () => content },
+  root: { querySelector: (selector) => selector === "#content" ? content : selector === "[data-rule-pending]" ? shellMarker : null },
   rulesUI: shellUI,
   rulesView,
   navigation: () => badgeCounts.push(shellState.rulesWaiting),
@@ -426,6 +448,7 @@ const shellDeps = {
 };
 shellRefresh = new Function(...Object.keys(shellDeps), `${refreshSource}; return refresh;`)(...Object.values(shellDeps));
 assert.equal(await shellRefresh(), true);
+assert.equal(shellMarker.hidden, true);
 assert.deepEqual(updates.at(-1)[1], { owner: false });
 assert.ok(!content.innerHTML.includes("New rule") && !content.innerHTML.includes("Ask an agent"));
 assert.ok(content.innerHTML.includes("Copy prompt"));
@@ -438,12 +461,14 @@ for (const kind of ["rule.changed", "rule.suggestion"]) {
   assert.deepEqual(updates.at(-1)[1], { owner: false });
   assert.equal(content.innerHTML, busyHTML);
   assert.equal(shellDeps.rulesUI.stale, true);
+  assert.equal(shellMarker.hidden, false, "The actual background refresh must disclose its deferred list");
   assert.equal(badgeCounts.at(-1), 4);
 }
 shellBusy = false;
 await shellHandlers.toggle({ target: { matches: () => true, open: false } });
 assert.deepEqual(updates.at(-1)[1], { owner: true });
 assert.equal(shellDeps.rulesUI.stale, false);
+assert.equal(shellMarker.hidden, true);
 assert.notEqual(content.innerHTML, busyHTML);
 assert.ok(headerActions.includes('data-rule-action="new"'));
 // A finished write renders even when a background refresh overtakes its own
@@ -458,6 +483,7 @@ await Promise.all([own, overtaking]);
 assert.equal(updates.length, beforeRace + 1);
 assert.equal(shellUI.force, false);
 assert.equal(shellUI.stale, false);
+assert.equal(shellMarker.hidden, true, "An overtaking successful forced read recreates a hidden marker");
 const afterRace = content.innerHTML;
 shellPayload = { ...shellPayload, waiting: 3 };
 assert.equal(await shellRefresh({ background: true, events: [{ kind: "rule.changed" }] }), true);

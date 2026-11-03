@@ -504,7 +504,11 @@ async function refresh({ background = false, events = [] } = {}) {
       if (!background || rulesUI.force || !rulesUI.busy()) {
         rulesUI.update(rules, { owner: rules.can_edit });
         root.querySelector("#content").innerHTML = rulesView(rules, { owner: rules.can_edit });
-      } else rulesUI.stale = true;
+      } else {
+        rulesUI.stale = true;
+        const marker = root.querySelector("[data-rule-pending]");
+        if (marker) marker.hidden = false;
+      }
       title("Rules", rules.can_edit ? `<button type="button" class="blockbtn" data-rule-action="new" aria-controls="rule-new" aria-expanded="${!!root.querySelector('.rule-new:not([hidden])')}">New rule</button>` : "");
     } else if (state.base.startsWith("#/memory")) {
       const changed = events.some((event) => event.kind.startsWith("memory."));

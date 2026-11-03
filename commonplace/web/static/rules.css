@@ -1,5 +1,6 @@
 /* Rules use the shared square tiles, chips and controls. */
 .rules-view { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: var(--gap); }
+.rules-view > [data-rule-pending] { position: sticky; top: 0; z-index: 1; flex-shrink: 0; background: var(--bg); }
 .rule-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr)); gap: var(--gap); align-items: start; }
 .rule-tile { min-width: 0; background: none; box-shadow: inset 0 0 0 1px var(--line); }
 .rule-tile > header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 18px; }

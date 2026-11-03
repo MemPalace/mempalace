@@ -465,6 +465,85 @@ assert.equal(swipeAllowed("pen", 1000, 0), true);
 assert.equal(swipeAllowed("touch", 299, 300), false);
 assert.equal(SWIPE.arm, 300);
 
+// A background queue update must preserve a contact before its axis is locked.
+const shellSource = await read("app.js");
+const paintSource = shellSource.slice(shellSource.indexOf("function paintQueue()"), shellSource.indexOf("// The hold counts down"));
+function contactFixture(armedAt = 0) {
+  const listeners = new Map(), classes = new Set(), properties = new Map();
+  const commits = [], timers = [];
+  let settled = 0;
+  const node = {
+    offsetWidth: 400, dataset: {},
+    classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name) },
+    style: { setProperty: (name, value) => properties.set(name, value), removeProperty: (name) => properties.delete(name) },
+    addEventListener: (name, fn) => listeners.set(name, fn),
+    removeEventListener: (name) => listeners.delete(name),
+    setPointerCapture: () => {},
+  };
+  const emit = (name, fields = {}) => listeners.get(name)?.({
+    pointerId: 1, pointerType: "touch", isPrimary: true, clientX: 100, clientY: 100, timeStamp: 0, ...fields,
+  });
+  swipe.bindSwipe(node, null, { armedAt, onCommit: (side) => commits.push(side), onSettle: () => settled++, labels: {} });
+  const nativeTimeout = globalThis.setTimeout;
+  return {
+    node, emit, classes, properties, commits,
+    get settled() { return settled; },
+    withTimers(fn) {
+      globalThis.setTimeout = (callback) => { timers.push(callback); return timers.length; };
+      try { fn(); while (timers.length) timers.shift()(); }
+      finally { globalThis.setTimeout = nativeTimeout; }
+    },
+  };
+}
+const touching = contactFixture();
+touching.emit("pointerdown");
+const queueState = { queue: {}, queueDirty: false, drafts: new Map() };
+let guarded = 0;
+const content = {
+  querySelector: (selector) => selector === ".decide-card.dragging" && touching.classes.has("dragging") ? touching.node : null,
+};
+Object.defineProperty(content, "innerHTML", { set() { assert.fail("Actual queue repaint replaced the card during an accepted contact"); } });
+const paintActualQueue = new Function("root", "state", "queueArm", "focusMark", "renderDecide", `${paintSource}; return paintQueue;`)(
+  { querySelector: () => content }, queueState, () => guarded++, () => null, () => "replacement card",
+);
+paintActualQueue();
+assert.equal(queueState.queueDirty, true);
+assert.equal(guarded, 1);
+touching.emit("pointermove", { clientX: 180, timeStamp: 50 });
+assert.equal(touching.node.dataset.drag, "yes");
+assert.ok(Number(touching.properties.get("--stamp")) > 0);
+paintActualQueue();
+assert.equal(guarded, 2);
+touching.withTimers(() => touching.emit("pointercancel", { clientX: 180, timeStamp: 60 }));
+assert.equal(touching.classes.has("dragging"), false);
+assert.equal(touching.settled, 1);
+assert.deepEqual(touching.commits, []);
+
+const scrolling = contactFixture();
+scrolling.emit("pointerdown");
+scrolling.emit("pointermove", { clientX: 101, clientY: 120 });
+assert.equal(scrolling.classes.has("dragging"), false);
+assert.equal(scrolling.settled, 1, "Vertical intent must release a deferred queue repaint");
+scrolling.emit("pointerup", { clientX: 250 });
+assert.deepEqual(scrolling.commits, []);
+for (const ending of ["pointerup", "pointercancel"]) {
+  const tap = contactFixture();
+  tap.emit("pointerdown");
+  tap.emit("pointermove", { clientX: 104 });
+  tap.emit(ending, { clientX: 104 });
+  assert.equal(tap.classes.has("dragging"), false);
+  assert.equal(tap.settled, 1, "Subthreshold contact must release a deferred queue repaint");
+  assert.deepEqual(tap.commits, []);
+}
+for (const fields of [{ pointerType: "mouse" }, { isPrimary: false }]) {
+  const ignored = contactFixture();
+  ignored.emit("pointerdown", fields);
+  assert.equal(ignored.classes.has("dragging"), false);
+}
+const unarmed = contactFixture(Infinity);
+unarmed.emit("pointerdown");
+assert.equal(unarmed.classes.has("dragging"), false);
+
 const css = await read("decide.css");
 assert.doesNotMatch(css, /#[0-9a-fA-F]{3,8}\b/);
 assert.match(css, /min-height: 56px/);

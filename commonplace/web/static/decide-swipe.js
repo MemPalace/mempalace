@@ -68,14 +68,16 @@ export function bindSwipe(card, dock, { armedAt, onCommit, onSettle, labels }) {
     start = { x: event.clientX, y: event.clientY, id: event.pointerId };
     axis = null;
     samples = [{ x: event.clientX, t: event.timeStamp }];
+    // Protect the card from queue repaints while the contact's direction is pending.
+    card.classList.add("dragging");
   });
   card.addEventListener("pointermove", (event) => {
     if (!start || event.pointerId !== start.id) return;
     const dx = event.clientX - start.x, dy = event.clientY - start.y;
     if (!axis) {
       axis = swipeAxis(dx, dy);
-      if (axis === "y") { start = null; return; }
-      if (axis === "x") { card.setPointerCapture?.(event.pointerId); card.classList.add("dragging"); }
+      if (axis === "y") { start = null; card.classList.remove("dragging"); onSettle?.(); return; }
+      if (axis === "x") card.setPointerCapture?.(event.pointerId);
     }
     if (axis !== "x") return;
     samples.push({ x: event.clientX, t: event.timeStamp });
@@ -88,7 +90,7 @@ export function bindSwipe(card, dock, { armedAt, onCommit, onSettle, labels }) {
     const was = axis;
     start = null; axis = null;
     card.classList.remove("dragging");
-    if (was !== "x") return;
+    if (was !== "x") { onSettle?.(); return; }
     // A drag is not a tap: keep the title link from opening on release.
     const swallow = (click) => { click.preventDefault(); click.stopPropagation(); };
     card.addEventListener("click", swallow, { capture: true, once: true });
