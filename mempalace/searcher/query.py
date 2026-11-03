@@ -42,19 +42,29 @@ def _query_drawers_with_filter_fallback(
     drawers_col, dkwargs, query, n_results, wing, room, source_file=None
 ):
     """Run the filtered drawer query, falling back to an unfiltered query plus a
-    Python-side post-filter when ChromaDB raises on the filtered query.
+    Python-side post-filter on the one known legacy ChromaDB failure.
 
     A ChromaDB HNSW/SQLite index mismatch makes filtered queries fail with
     "Error finding id" even when unfiltered search works fine — it happens when
     drawers are ingested via two different paths (e.g. bulk import vs MCP tool
     calls), leaving the vector index inconsistent with the metadata store. We
     retry unfiltered (over-fetching) and re-apply the wing/room/source_file filter in Python.
+
+    Only that failure retries: the error text must carry the ChromaDB
+    signature. Any other filtered-query error — a Turso (or any other
+    backend's) driver, filter, or index failure — propagates without an
+    unfiltered retry, which would silently swap scoped results for a
+    globally ranked, truncated set.
     """
     where = dkwargs.get("where")
     try:
         return drawers_col.query(**dkwargs)
     except Exception as filter_err:
-        if not where or _model_error_class(filter_err) is not None:
+        if (
+            not where
+            or _model_error_class(filter_err) is not None
+            or "Error finding id" not in str(filter_err)
+        ):
             raise
         logger.warning(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
