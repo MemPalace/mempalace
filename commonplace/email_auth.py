@@ -33,7 +33,8 @@ _EMAIL = re.compile(
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+"
 )
 _CONFIRMATION = b"""<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8"><meta name="referrer" content="strict-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign in - Commonplace</title><link rel="stylesheet" href="/app/app.css">
 <link rel="stylesheet" href="/app/ui.css">
 </head><body><main class="signin"><a class="brand-home" href="/app/" aria-label="Commonplace">
@@ -259,7 +260,8 @@ class EmailAuth:
             200,
             _CONFIRMATION,
             media="text/html; charset=utf-8",
-            # Keep the token out of Referer while preserving a normal form Origin.
+            # The early document meta preserves this policy if a proxy replaces the header:
+            # keep the token out of Referer while preserving a normal form Origin.
             referrer_policy="strict-origin",
             headers=(
                 (
