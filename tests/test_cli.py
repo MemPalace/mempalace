@@ -836,6 +836,8 @@ def test_cmd_mine_projects_mode(mock_config_cls):
             respect_gitignore=True,
             include_ignored=[],
             max_chunks_per_file=None,
+            include_extensions=[],
+            exclude_extensions=[],
         )
 
 
