@@ -299,6 +299,34 @@ def test_raises_on_non_contiguous_indices(monkeypatch):
         ef(["a", "b"])
 
 
+@pytest.mark.parametrize(
+    "indices",
+    [
+        (None, 1),
+        (0, None),
+        ("opaque-response-marker", 1),
+        ([], 1),
+        ({"opaque-response-marker": "ignored"}, 1),
+        (None, None),
+    ],
+    ids=["leading-null", "trailing-null", "string", "list", "object", "two-nulls"],
+)
+def test_malformed_index_types_raise_masked_embedding_error(monkeypatch, indices):
+    rows = [{"index": index, "embedding": [1.0, 0.0]} for index in indices]
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _responding({"data": rows}))
+    ef = embedding.OpenAICompatEmbeddingFunction(SECRET_URL, "m")
+
+    with pytest.raises(embedding.EmbeddingAPIError, match="cannot align embeddings") as raised:
+        ef(["a", "b"])
+
+    message = str(raised.value)
+    _assert_masked(message)
+    assert "opaque-response-marker" not in message
+    result = embedding.model_error_result(raised.value)
+    assert result["error_class"] == "EmbeddingAPIError"
+    _assert_masked(result["details"])
+
+
 def test_raises_on_http_protocol_exception(monkeypatch):
     # BadStatusLine / IncompleteRead — common with local/overloaded servers.
     from http.client import HTTPException

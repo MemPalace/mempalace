@@ -905,6 +905,11 @@ class OpenAICompatEmbeddingFunction:
         try:
             rows = sorted(rows, key=lambda d: d.get("index", -1))
             indices = [r.get("index") for r in rows]
+        except TypeError as e:
+            raise EmbeddingAPIError(
+                f"Embedding API at {self._url} returned malformed 'index' values; "
+                f"cannot align embeddings with inputs"
+            ) from e
         except AttributeError as e:
             raise EmbeddingAPIError(
                 f"Embedding API at {self._url} returned non-object rows: {e}"
