@@ -100,6 +100,129 @@ def _poll_log_contains(log_path: Path, needle: str, timeout: float = 5.0) -> boo
     return False
 
 
+def _proc_table() -> tuple[dict[int, str], dict[int, int], dict[int, list[int]]]:
+    """Scan /proc for live PIDs: pid -> cmdline, pid -> ppid, ppid -> children.
+
+    Returned as empty dicts when /proc is unavailable (macOS dev box); the
+    callers then treat the process tree as empty, which is a no-op for the
+    Linux-specific reap.
+    """
+    procs: dict[int, str] = {}
+    ppids: dict[int, int] = {}
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return procs, ppids, {}
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        cmdline = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+        if not cmdline:
+            continue
+        procs[pid] = cmdline
+        try:
+            with open(f"/proc/{pid}/status") as fh:
+                for line in fh:
+                    if line.startswith("PPid:"):
+                        ppids[pid] = int(line.split()[1])
+                        break
+        except (OSError, ValueError):
+            pass
+    children: dict[int, list[int]] = {}
+    for pid, ppid in ppids.items():
+        children.setdefault(ppid, []).append(pid)
+    return procs, ppids, children
+
+
+def _stub_process_tree(stub: Path) -> dict[int, str]:
+    """The stub's live tree: anchored on the stub itself, expanded to
+    descendants (``sleep`` children) and up the parent chain (the detached
+    subshell that owns the stub). Returns an empty dict when the stub has
+    already been reaped or /proc isn't available."""
+    procs, ppids, children = _proc_table()
+    if not procs:
+        return {}
+    needle = stub.as_posix().encode("utf-8")
+    anchors = {pid for pid, cl in procs.items() if needle in cl.encode("utf-8")}
+    if not anchors:
+        return {}
+    tree: set[int] = set()
+    for start in anchors:
+        stack = [start]
+        while stack:
+            pid = stack.pop()
+            if pid in tree or pid not in procs:
+                continue
+            tree.add(pid)
+            stack.extend(children.get(pid, []))
+        cur, seen = start, {start}
+        for _ in range(6):  # bounded; the subshell's parent is init here
+            parent = ppids.get(cur, 0)
+            if parent <= 1 or parent in seen or parent not in procs:
+                break
+            seen.add(parent)
+            tree.add(parent)
+            cur = parent
+    return {pid: procs[pid] for pid in sorted(tree)}
+
+
+def _kill_tree(tree: dict[int, str]) -> None:
+    """SIGTERM then SIGKILL every PID in the tree (children first), and
+    reap them if we are their parent (init collects the rest for detached
+    orphans)."""
+    import signal
+
+    for pid in sorted(tree, reverse=True):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                break
+        try:
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+
+
+def _reap_stub_shell_processes(stub: Path, deadline: float) -> list[str]:
+    """Bound the lifetime of the hook's detached background shell in a test.
+
+    ``test_save_hook_returns_before_slow_version_probe`` proves the hook
+    returns while the probe (and the mine, via the same stub) is still
+    running — so at test end the detached subshell and its ``sleep``
+    children are alive, orphaned (reparented to init), and would
+    otherwise outlive the test by ~6 s, still writing into the finished
+    test's ``tmp_path`` state dir (upstream issue #2921). This helper
+    reaps them: it waits up to ``deadline`` seconds for the stub's
+    process tree to exit on its own, then kills any stragglers
+    (TERM → KILL) and returns the command lines still alive after the
+    final pass — an empty list means the background work was fully
+    reaped. No-op when the stub has already exited or when running
+    without /proc (macOS).
+    """
+    import time
+
+    deadline_ts = time.monotonic() + max(deadline, 0.0)
+    last = _stub_process_tree(stub)
+    while last and time.monotonic() < deadline_ts:
+        time.sleep(0.1)
+        last = _stub_process_tree(stub)
+    if not last:
+        return []
+    _kill_tree(last)
+    # Give stragglers ~2 s to actually die between escalating passes.
+    for _ in range(20):
+        time.sleep(0.1)
+        last = _stub_process_tree(stub)
+        if not last:
+            return []
+    _kill_tree(last)  # final escalating pass
+    return sorted(last.values())
+
+
 def _stop_payload(**overrides) -> dict:
     base = {
         "executionNum": 1,
@@ -528,10 +651,17 @@ def test_save_hook_returns_before_slow_version_probe(tmp_path: Path) -> None:
     """The hook must return immediately even if `--version` is slow.
 
     Proves the probe was moved off the foreground. We point
-    MEMPAL_PYTHON at a stub that sleeps for 3s on any `-m mempalace`
+    MEMPAL_PYTHON at a stub that sleeps for 3s on any ``-m mempalace``
     invocation. If the probe still ran in the foreground the hook
     would block ~3s; with the probe backgrounded it returns in well
     under a second.
+
+    Because the hook returns while the stub (probe + mine, ~6s of sleep)
+    is still running, the detached background subshell is alive when the
+    test ends — by design of what we assert. Teardown (mempalace
+    upstream issue #2921) reaps that subshell + stub + sleep so nothing
+    is orphaned past the test, and nothing keeps writing into the
+    finished test's tmp_path state dir.
     """
     import time
 
@@ -568,6 +698,17 @@ def test_save_hook_returns_before_slow_version_probe(tmp_path: Path) -> None:
         f"save hook took {elapsed:.2f}s with a 3s --version probe; the probe "
         f"is still running in the foreground instead of the background subshell."
     )
+    # Teardown — issue #2921: the hook returned while its background
+    # subshell (stub: 3s probe + 3s mine) was still running, so those
+    # processes are alive right now and would otherwise be orphaned to
+    # init for ~6 more seconds. Wait briefly for natural exit, kill any
+    # stragglers, and prove none survive teardown.
+    if os.name != "nt":
+        leftovers = _reap_stub_shell_processes(stub, deadline=1.0)
+        assert not leftovers, (
+            "save-hook background processes survived test teardown and had "
+            f"to be killed: {leftovers}"
+        )
 
 
 def test_save_hook_counter_write_is_atomic(tmp_path: Path) -> None:
