@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+- HNSW staleness is baselined against each segment's own last write: embeddings rows are keyed to the collection's METADATA segment (never the HNSW dir's VECTOR segment id), so the staleness scan resolves the collection two-hop instead of silently falling back to the shared sqlite mtime for every production segment (#2891)
+- A flush newer than a segment's own-write baseline (the delete/update signature — those mutations do not advance `MAX(embeddings.created_at)`) no longer suppresses the HNSW integrity gate: the segment's pickle gets one sniff per flush version, bounded so flushed-idle wings do not log on every scan (#2891, review P2)
+
 ---
 
 ## [3.12.0] — 2026-10-31
@@ -149,15 +153,15 @@ requires Python 3.10.
   `transforms`, a conversation is filed under every file that holds it (files
   once skipped as duplicates get their own drawers), and non-UTF-8 sources
   keep their exact bytes.
-- **Hallways move from `hallways.json` into `hallways.sqlite3`.** Both sit
+- **Hallways move from hallways.json into `hallways.sqlite3`.** Both sit
   beside the palace directory. The first hallway write after the upgrade,
-  usually the next mine, imports `hallways.json` in one transaction and then
+  usually the next mine, imports hallways.json in one transaction and then
   renames it to `hallways.json.imported-<stamp>-<random>`; nothing is
   deleted. Until that write, hallways are read from the JSON as before. On a
   palace with 830,000 hallways the import took 25 to 35 s, once. A
-  `hallways.json` that does not parse is moved aside and the write is
+  hallways.json that does not parse is moved aside and the write is
   refused, as a save over it was before. A MemPalace older than 3.12 that
-  mines into the same palace keeps writing `hallways.json`, which this
+  mines into the same palace keeps writing hallways.json, which this
   version no longer reads, so upgrade every install that shares a palace.
   Hallways are derived from drawers: after a downgrade,
   `mempalace hallways --rebuild` writes them again.
@@ -294,7 +298,7 @@ requires Python 3.10.
   Python before.
 - **`mempalace_update_drawer` keeps the text it replaces.** Before an
   overwrite, the previous verbatim text and metadata are appended to
-  `drawer_revisions.jsonl` in the palace directory, and the update is refused
+  drawer_revisions.jsonl in the palace directory, and the update is refused
   if that append fails. Partial OS writes are completed before the revision
   is acknowledged; a write that cannot finish or be synced leaves the
   original drawer intact. Closets are purged only after the new text is
@@ -343,7 +347,7 @@ requires Python 3.10.
   request raises.
 - **State files are written through a fresh temporary file.** The writers of
   the room, tunnel, wing-split and `kg normalize` plans, the logstream watch
-  cursor, `replica.json` and `mesh_state.json` used a fixed `.tmp` name (a
+  cursor, replica.json and `mesh_state.json` used a fixed `.tmp` name (a
   pid-numbered one for `mesh_state.json`) opened without `O_EXCL`, so a file
   or link planted at that name was reused and a planted link was written
   through. `serverinfo.json` and
@@ -389,7 +393,7 @@ requires Python 3.10.
   open of an existing palace re-keys the rows that drifted, once (about 3 s
   for 3,000 rows).
 - **A mine no longer reads and rewrites every hallway of the palace.** Each
-  mine loaded the whole `hallways.json`, replaced its own wing's records and
+  mine loaded the whole hallways.json, replaced its own wing's records and
   wrote the whole file back. Most of that time was spent decoding and
   encoding JSON while holding the GIL, so an HTTP hub serving the mine
   answered nothing else meanwhile. Hallways are now rows in
@@ -523,7 +527,7 @@ requires Python 3.10.
   Only a successful probe is cached now, and the first failure for a model is
   logged as a warning.
 - MemPalace's own project files are handled under every name the miner
-  reads. A project using `mempalace.yml` or the legacy `mempal.yaml` no longer
+  reads. A project using `mempalace.yml` or the legacy mempal.yaml no longer
   has that file sampled by entity and corpus-origin detection on a re-run of
   `init`, and `init` adds the config file the project actually uses to
   `.gitignore` instead of always `mempalace.yaml`. The skip lists now come
@@ -681,7 +685,7 @@ requires Python 3.10.
   failures as warnings (without the text), and waits for a mine holding the
   lock instead of dropping the turn. The provider's own
   `mempalace_diary_write` tool now files diary drawers, its
-  `mempalace_diary_read` tool lists entries still in an old `diary.jsonl`
+  `mempalace_diary_read` tool lists entries still in an old diary.jsonl
   before them, and `import_legacy: true` files those entries as drawers once
   and renames the file to `diary.jsonl.imported`.
 - `mempalace --palace PATH serve` serves that palace; the `serve`
@@ -744,7 +748,7 @@ requires Python 3.10.
   other words or particles while mixed-script names retain word boundaries on
   their non-CJK edges; entity extraction gates English frequency filtering on
   `entity_languages`, adds `pt-br` and generic code-term stopwords, and honors
-  `entity_stopwords.json`.
+  entity_stopwords.json.
 - Conversation mining and hybrid search tie-breaking compare transcript
   timestamps by UTC instant rather than text order across mixed offsets, and
   `mined.py` normalizes JSON-`null` version metadata without raising `TypeError`.
