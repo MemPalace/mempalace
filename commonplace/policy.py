@@ -27,6 +27,7 @@ from mempalace.tool_capabilities import TOOL_CAPABILITIES
 SCOPES = (
     "memory:read",
     "memory:write",
+    "memory:import",
     "memory:delete",
     "skills:read",
     "kg:read",

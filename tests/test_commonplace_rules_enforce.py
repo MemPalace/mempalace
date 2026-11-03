@@ -383,8 +383,24 @@ def test_every_checked_mcp_tool_rejects_before_dispatch(env, name, monkeypatch):
         monkeypatch.setitem(
             extensions.REGISTRY, name, replace(extensions.get(name), available=None)
         )
+    if name == "facts_import":
+        policy = json.loads(env.principal.policy.to_json())
+        policy["scopes"].append("memory:import")
+        grant_principal = replace(env.principal, policy=Policy.from_json(json.dumps(policy)))
+        assert grant_principal.actor == env.principal.actor == "conn:builder"
+        assert grant_principal.connection_id == env.principal.connection_id
+        monkeypatch.setitem(
+            extensions.REGISTRY, name, replace(extensions.get(name), available=None)
+        )
+
+        def unexpected_dispatch(*_args, **_kwargs):
+            raise AssertionError("facts_import dispatched before the rules freshness check")
+
+        monkeypatch.setattr(env.gateway.mediator, "_local_call", unexpected_dispatch)
     before = events.latest_seq(env.db, env.workspace)
-    response = call(env, name)
+    response = (
+        call(env, name, principal=grant_principal) if name == "facts_import" else call(env, name)
+    )
     assert text(response) == enforce.MESSAGES["missing"]
     assert response["result"]["isError"]
     assert events.latest_seq(env.db, env.workspace) == before

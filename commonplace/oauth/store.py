@@ -23,7 +23,8 @@ ACCESS_SECONDS = 3600
 REFRESH_SECONDS = 90 * 86400
 CODE_SECONDS = 300
 REQUEST_SECONDS = 600
-SCOPES = ("memory:read", "memory:write")
+SCOPES = ("memory:read", "memory:write", "memory:import")
+OAUTH_DEFAULT_SCOPES = ("memory:read", "memory:write")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -113,7 +114,7 @@ def resource(parameters: dict) -> str:
 
 
 def scope(value: str | None) -> str:
-    requested = SCOPES if value is None else value.split()
+    requested = OAUTH_DEFAULT_SCOPES if value is None else value.split()
     if not requested or set(requested) - set(SCOPES):
         raise OAuthError("invalid_scope")
     return " ".join(sorted(set(requested)))

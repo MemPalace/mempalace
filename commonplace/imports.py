@@ -7,10 +7,11 @@ import logging
 import threading
 from collections import Counter
 
-from . import plans
+from . import import_grant, ingest_cadence, plans
+from .capture import PRIVATE_WING
 from .handoff.api import _object, _read_json, _RequestError, _text
 from .handoff.models import THREADS_WING
-from .handoff.thread_store import ThreadConflict, ThreadStorageLimit
+from .handoff.thread_store import ThreadConflict, ThreadStorageLimit, canonical_sha256
 from .http_util import log_failure
 from .import_parts import append_part
 from .import_sources import SOURCES, parse_import
@@ -21,8 +22,19 @@ MAX_THREADS = 50
 
 
 def register(ctx):
+    ingest_cadence.ensure_schema(ctx.control_db)
     # Serialize imports so simultaneous batches cannot spend the same quota.
     lock = threading.Lock()
+
+    def import_batch(principal, source, threads, *, path):
+        with lock:
+            return run_batch(ctx, principal, source, threads, path=path)
+
+    def admit(principal, digest) -> int:
+        return grant_admit(ctx, principal, digest)
+
+    ctx.import_batch = import_batch
+    ctx.grant_admit = admit
 
     def handle(handler):
         handler._handoff_body_read = False
@@ -31,7 +43,12 @@ def register(ctx):
             if principal is None:
                 raise _RequestError(401, "Sign in")
             policy = principal.policy
-            if not (
+            path = "acl"
+            if policy.has_scope(import_grant.IMPORT_SCOPE):
+                if not import_grant.grant_path(ctx.control_db, principal):
+                    raise _RequestError(403, import_grant.INELIGIBLE_TEXT)
+                path = "grant"
+            elif not (
                 policy.has_scope("memory:read")
                 and policy.has_scope("memory:write")
                 and policy.has_scope("threads:read")
@@ -49,8 +66,12 @@ def register(ctx):
             threads = data.get("threads")
             if not isinstance(threads, list) or not 1 <= len(threads) <= MAX_THREADS:
                 raise _RequestError(400, f"Send between 1 and {MAX_THREADS} threads")
-            with lock:
-                result = _batch(ctx, principal, source, threads)
+            if path == "grant":
+                digest = import_grant.request_digest("http:/api/import", data)
+                wait = grant_admit(ctx, principal, digest)
+                if wait > 0:
+                    raise _RequestError(429, f"Import not due; retry in {wait} seconds")
+            result = import_batch(principal, source, threads, path=path)
             status = 200
         except _RequestError as error:
             status, result = error.status, {"error": error.message}
@@ -65,10 +86,25 @@ def register(ctx):
     ctx.gateway.add_route("POST", "/api/import", handle)
 
 
-def _batch(ctx, principal, source, threads):
+def grant_admit(ctx, principal, digest) -> int:
+    return ingest_cadence.admit(
+        ctx.control_db,
+        account_id=principal.user_id,
+        connection_id=principal.connection_id,
+        request_sha256=digest,
+        interval=ingest_cadence.interval_for(ctx.control_db, principal.user_id),
+        now=plans._now(),
+    )
+
+
+def run_batch(ctx, principal, source, threads, *, path="acl"):
+    if path not in ("acl", "grant"):
+        raise ValueError("Unknown import path")
     directory = workspace_path(ctx.data_dir, principal.workspace_id)
     account = plans.workspace_account(ctx.control_db, principal.workspace_id)
     plan = plans.get_plan(ctx.control_db, account) if plans.enabled() and account else None
+    if path == "grant" and plans.enabled():
+        plan = plan or plans.FREE
     limit = plan.storage_bytes if plan else None
     results = []
     for index, item in enumerate(threads):
@@ -90,17 +126,21 @@ def _batch(ctx, principal, source, threads):
                 if used + 1024 * 1024 > limit:
                     raise ThreadStorageLimit()
             store = ctx.store_for(principal.workspace_id)
-            source_id = f"import:{source}:{thread_id}"
-            existing = store.by_source(principal.workspace_id, source_id)
+            source_id = (
+                import_grant.grant_id(principal.user_id, source, thread_id)
+                if path == "grant"
+                else f"import:{source}:{thread_id}"
+            )
+            existing = store.by_source(principal.workspace_id, source_id) if path == "acl" else None
             maximum = None
             if limit is not None:
-                path = thread_path(directory)
+                thread_file = thread_path(directory)
                 own_bytes = sum(
                     candidate.stat().st_size
                     for candidate in (
-                        path,
-                        path.with_name(path.name + "-wal"),
-                        path.with_name(path.name + "-shm"),
+                        thread_file,
+                        thread_file.with_name(thread_file.name + "-wal"),
+                        thread_file.with_name(thread_file.name + "-shm"),
                     )
                     if candidate.exists()
                 )
@@ -123,34 +163,85 @@ def _batch(ctx, principal, source, threads):
                     )
                     return limit - (plans.StorageMeter._walk(directory) - own)
 
-                row.update(
-                    append_part(
-                        store,
-                        principal.workspace_id,
-                        source,
-                        thread_id,
-                        fmt,
-                        transcript,
-                        item["part"],
-                        actor=principal.actor,
-                        maximum=allowance,
-                    )
+                placement = (
+                    {"source_id": source_id, "wing": PRIVATE_WING} if path == "grant" else {}
                 )
+                part_result = append_part(
+                    store,
+                    principal.workspace_id,
+                    source,
+                    thread_id,
+                    fmt,
+                    transcript,
+                    item["part"],
+                    actor=principal.actor,
+                    maximum=allowance,
+                    **placement,
+                )
+                if path == "grant":
+                    row.update(
+                        {
+                            key: part_result[key]
+                            for key in (
+                                "unit",
+                                "format",
+                                "part",
+                                "source_bytes",
+                                "messages",
+                                "offset",
+                                "prefix_sha256",
+                                "next_index",
+                                "session_state",
+                            )
+                        }
+                    )
+                    row["status"] = "accepted"
+                else:
+                    row.update(part_result)
                 results.append(row)
                 continue
-            stored = store.store(
-                principal.workspace_id,
-                source_id,
-                messages,
-                actor=principal.actor,
-                max_storage_bytes=maximum,
-            )
-            row.update(
-                status="duplicate" if existing else "imported",
-                stored_thread_id=stored.id,
-                messages=stored.message_count - 1,
-                source_bytes=len(transcript.encode("utf-8")),
-            )
+            if path == "grant":
+                with store._transaction():
+                    # Refuse uniformly before store.store can look up a source
+                    # or compare a digest, including an already covered request.
+                    store._check_storage_budget(maximum, messages)
+                    try:
+                        store.store(
+                            principal.workspace_id,
+                            source_id,
+                            messages,
+                            actor=principal.actor,
+                            max_storage_bytes=maximum,
+                            wing=PRIVATE_WING,
+                        )
+                    except ThreadConflict:
+                        store.store(
+                            principal.workspace_id,
+                            f"{source_id}#sha256:{canonical_sha256(messages)}",
+                            messages,
+                            actor=principal.actor,
+                            max_storage_bytes=maximum,
+                            wing=PRIVATE_WING,
+                        )
+                row.update(
+                    status="accepted",
+                    messages=len(messages) - 1,
+                    source_bytes=len(transcript.encode("utf-8")),
+                )
+            else:
+                stored = store.store(
+                    principal.workspace_id,
+                    source_id,
+                    messages,
+                    actor=principal.actor,
+                    max_storage_bytes=maximum,
+                )
+                row.update(
+                    status="duplicate" if existing else "imported",
+                    stored_thread_id=stored.id,
+                    messages=stored.message_count - 1,
+                    source_bytes=len(transcript.encode("utf-8")),
+                )
             if source == "grok-bot" and fmt in ("auto", "grok-facts"):
                 row["facts"] = len(messages) - 1
                 row["source_counts"] = dict(
@@ -161,7 +252,11 @@ def _batch(ctx, principal, source, threads):
             ctx.gateway.storage_meter.audit_limit(ctx.control_db, principal)
         except ThreadConflict:
             row.update(
-                error="Thread already imported with different content; original kept",
+                error=(
+                    "Part does not continue this import; resend from the start or the last accepted part"
+                    if path == "grant" and multipart
+                    else "Thread already imported with different content; original kept"
+                ),
                 code="conflict",
             )
         except _RequestError as error:
@@ -179,6 +274,17 @@ def _batch(ctx, principal, source, threads):
             )
         results.append(row)
     errors = sum(row["status"] == "error" for row in results)
+    if path == "grant":
+        return {
+            "source": source,
+            "status": "completed_with_errors" if errors else "completed",
+            "processed": len(results),
+            "total": len(threads),
+            "accepted": sum(row["status"] == "accepted" for row in results),
+            "errors": errors,
+            "facts": sum(row.get("facts", 0) for row in results),
+            "results": results,
+        }
     return {
         "source": source,
         "status": "completed_with_errors" if errors else "completed",

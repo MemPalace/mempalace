@@ -1,6 +1,7 @@
 import { api, escape as e, elapsed } from "./api.js";
 
 const clients = [["claude-code", "Claude Code"], ["codex", "Codex"], ["cursor", "Cursor"], ["generic", "Generic MCP / Grok"]];
+const importConsent = "Import your past AI conversations and memory files into this workspace, word for word. This import permission cannot read stored threads or change existing memories, rules or settings. Sending exactly the same import again adds no duplicates.";
 const options = (selected) => clients.map(([id, name]) => `<option value="${id}" ${id === selected ? "selected" : ""}>${name}</option>`).join("");
 const active = (c) => c.auth === "pat" && !c.revoked_at;
 const parents = (rows) => '<option value="">Top-level agent</option>' + rows.filter((c) => active(c) && (!c.expires_at || Date.parse(c.expires_at) > Date.now())).map((c) => `<option value="${e(c.id)}">${e(c.name)}</option>`).join("");
@@ -11,7 +12,7 @@ function agentRows(rows) {
 
 export function agentsView(payload) {
   const rows = payload.connections || [];
-  return `<section class="settings-section agents-settings"><h2>Agents</h2><div data-agent-reveal></div><form class="agent-form" data-form="agent"><label>Name<input name="name" required maxlength="120" autocomplete="off"></label><label>Client<select name="client">${options("claude-code")}</select></label><details><summary>Restrict access or set a parent</summary><label>Read wings (comma separated)<input name="read_wings" autocomplete="off"></label><label>Parent<select name="parent">${parents(rows)}</select></label></details><button class="blockbtn" data-agent-mutation>Create token</button></form><div data-agent-list>${agentRows(rows)}</div></section>`;
+  return `<section class="settings-section agents-settings"><h2>Agents</h2><div data-agent-reveal></div><form class="agent-form" data-form="agent"><label>Name<input name="name" required maxlength="120" autocomplete="off"></label><label>Client<select name="client">${options("claude-code")}</select></label><label style="flex-basis:100%;flex-direction:row;align-items:start"><input type="checkbox" name="import" style="width:18px;height:18px;min-height:0;flex-shrink:0">${e(importConsent)}</label><details><summary>Restrict access or set a parent</summary><label>Read wings (comma separated)<input name="read_wings" autocomplete="off"></label><label>Parent<select name="parent">${parents(rows)}</select></label></details><button class="blockbtn" data-agent-mutation>Create token</button></form><div data-agent-list>${agentRows(rows)}</div></section>`;
 }
 
 export function clientConfig(client, url, token) {
@@ -59,6 +60,7 @@ async function mutation(section, run) {
 
 export async function createAgent(form) {
   const section = form.closest(".agents-settings"), data = Object.fromEntries(new FormData(form));
+  data.import = form.elements.namedItem("import").checked;
   if (!data.parent) delete data.parent;
   if (data.read_wings.trim()) data.read_wings = data.read_wings.split(",").map((wing) => wing.trim());
   else delete data.read_wings;

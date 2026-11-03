@@ -11,6 +11,7 @@ import json
 import re
 from dataclasses import replace
 from io import StringIO
+from typing import Optional
 
 from .handoff.models import ThreadMessage
 from .handoff.thread_store import ThreadConflict
@@ -122,7 +123,20 @@ def _state(previous, identity):
     return digest, offset, recognized, parts, complete
 
 
-def append_part(store, workspace, source, thread_id, fmt, text, part, *, actor, maximum):
+def append_part(
+    store,
+    workspace,
+    source,
+    thread_id,
+    fmt,
+    text,
+    part,
+    *,
+    actor,
+    maximum,
+    source_id: Optional[str] = None,
+    wing: Optional[str] = None,
+):
     if source not in ("claude-code", "codex", "t3") or fmt not in ("claude-code", "codex"):
         raise ValueError("Parts require an explicit native format")
     if source != "t3" and fmt != source:
@@ -141,8 +155,9 @@ def append_part(store, workspace, source, thread_id, fmt, text, part, *, actor, 
         "session_bytes": part["session_bytes"],
         "session_sha256": part["session_sha256"],
     }
+    source_id = f"import:{source}:{thread_id}" if source_id is None else source_id
     with store._transaction():
-        stored = store.by_source(workspace, f"import:{source}:{thread_id}")
+        stored = store.by_source(workspace, source_id)
         previous = store.messages(stored.id) if stored else []
         digest, offset, seen, saved, complete = _state(previous, identity)
         work = {"previous_rows": len(previous), "previous_source_bytes": offset, "readback_rows": 0}
@@ -190,10 +205,11 @@ def append_part(store, workspace, source, thread_id, fmt, text, part, *, actor, 
             else:
                 stored = store.store(
                     workspace,
-                    f"import:{source}:{thread_id}",
+                    source_id,
                     combined,
                     actor=actor,
                     max_storage_bytes=maximum,
+                    **({"wing": wing} if wing is not None else {}),
                 )
             # Both formats must reconstruct the exact common prefix before the
             # outer transaction commits. Readback failure rolls back every row.

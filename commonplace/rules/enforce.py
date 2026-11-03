@@ -14,7 +14,7 @@ from .store import rules_sequence
 CHECKED_WRITES = frozenset(
     "task_add task_update task_comment task_take_next task_handoff ask space_post "
     "board_add memory_save memory_link fact_save handoff_start decide board_set rules_publish "
-    "task_approve".split()
+    "task_approve facts_import".split()
 )
 
 # Explicit names make a newly exposed write fail the public-surface contract.

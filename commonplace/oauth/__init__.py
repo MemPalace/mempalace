@@ -17,7 +17,7 @@ from html import escape
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlsplit
 
-from .. import sessions, urls
+from .. import import_grant, sessions, urls
 from . import store
 from .http import OAuthError, body, callback, query, redirect, send, send_error, send_json
 from .store import OAuthAuthenticator
@@ -138,7 +138,7 @@ def _register(db, data: dict) -> dict:
         "token_endpoint_auth_method": "none",
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
-        "scope": " ".join(store.SCOPES),
+        "scope": " ".join(store.OAUTH_DEFAULT_SCOPES),
     }
 
 
@@ -221,9 +221,18 @@ def _show_authorize(gateway, h, *, status=200):
     action = escape(authorize_path, quote=True)
     if principal:
         workspace = gateway.db.workspace(principal.workspace_id)["name"]
+        consent = ""
+        if import_grant.IMPORT_SCOPE in parameters["scope"].split():
+            if import_grant.eligible(gateway.db, principal.user_id, principal.workspace_id):
+                consent = (
+                    '<label><input type="checkbox" name="grant_import" value="1"> '
+                    f"{escape(import_grant.SCOPE_TEXT)}</label>"
+                )
+            else:
+                consent = f"<p>{escape(import_grant.OWNER_ONLY_TEXT)}</p>"
         content = (
             f"<h1>{escape(client['client_name'])}</h1><p>{escape(workspace)}</p>"
-            f'<form method="post" action="{action}">{hidden}'
+            f'<form method="post" action="{action}">{hidden}{consent}'
             '<button name="decision" value="allow">Allow</button>'
             '<button name="decision" value="deny">Deny</button></form>'
         )
@@ -292,11 +301,27 @@ def _submit_authorize(gateway, h):
             )
             if error_url:
                 location = error_url
+            elif import_grant.IMPORT_SCOPE in parameters["scope"].split() and not {
+                "memory:read",
+                "memory:write",
+            }.issubset(parameters["scope"].split()):
+                location = _response(parameters, error="invalid_scope")
             elif data["decision"] == "deny":
                 location = _response(parameters, error="access_denied")
             else:
-                code = store.create_code(conn, client, principal, parameters)
-                location = _response(parameters, code=code)
+                granted = parameters["scope"].split()
+                if import_grant.IMPORT_SCOPE in granted and not (
+                    data.get("grant_import") == "1"
+                    and import_grant.eligible(db, principal.user_id, principal.workspace_id)
+                ):
+                    granted.remove(import_grant.IMPORT_SCOPE)
+                if not granted:
+                    location = _response(parameters, error="invalid_scope")
+                else:
+                    code = store.create_code(
+                        conn, client, principal, dict(parameters, scope=" ".join(granted))
+                    )
+                    location = _response(parameters, code=code)
             login = False
     if login:
         session = sessions.redeem_login_link(db, data["login_token"])
@@ -319,7 +344,7 @@ def _protected_metadata():
     return {
         "resource": urls.mcp_url(),
         "authorization_servers": [urls.AGENT_URL],
-        "scopes_supported": list(store.SCOPES),
+        "scopes_supported": list(store.OAUTH_DEFAULT_SCOPES),
         "bearer_methods_supported": ["header"],
         "resource_name": "Commonplace",
     }

@@ -1,6 +1,6 @@
 """Human-managed agent tokens, sharing the existing connection authority."""
 
-from commonplace import urls
+from commonplace import import_grant, urls
 from commonplace.control_db import ControlError
 from commonplace.extensions import ToolError
 from commonplace.http_util import path_parts, read_json, require_principal, send_json
@@ -66,12 +66,21 @@ def install(gateway):
             except ValueError:
                 return
             if (
-                set(data) - {"name", "client", "parent", "read_wings"}
+                set(data) - {"name", "client", "parent", "read_wings", "import"}
                 or not isinstance(data.get("name"), str)
                 or not isinstance(data.get("client", "generic"), str)
                 or ("parent" in data and not isinstance(data["parent"], str))
             ):
                 send_json(h, 400, {"error": "Use an agent name, client and optional parent"})
+                return
+            if "import" in data and type(data["import"]) is not bool:
+                send_json(h, 400, {"error": "Import consent must be a boolean"})
+                return
+            grant_import = data.get("import", False)
+            if grant_import and not import_grant.eligible(
+                gateway.db, principal.user_id, principal.workspace_id
+            ):
+                send_json(h, 403, {"error": import_grant.OWNER_ONLY_TEXT})
                 return
             try:
                 read_wings = _read_wings(gateway, principal, data)
@@ -99,6 +108,9 @@ def install(gateway):
                     expires_days=TOKEN_DAYS,
                     policy=Policy.build(
                         profile="slim",
+                        scopes=("memory:read", "memory:write", import_grant.IMPORT_SCOPE)
+                        if grant_import
+                        else None,
                         read_wings=read_wings,
                         write_wing="inbox",
                         trust="untrusted",

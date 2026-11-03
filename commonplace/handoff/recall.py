@@ -22,6 +22,7 @@ from typing import Callable, Optional
 from .models import RecallHit, StoredThread, ThreadMessage
 
 MAX_RANGE = 200  # messages per thread_get
+_GRANT_PREFIX = "import-private:"
 _THREAD_ID = re.compile(r"thr_[0-9a-fA-F]+")
 _logger = logging.getLogger(__name__)
 
@@ -43,11 +44,19 @@ def thread_provenance(stored: StoredThread) -> dict:
     }
 
 
+def _filer_matches(principal, stored: StoredThread) -> bool:
+    if not stored.source_thread_id.startswith(_GRANT_PREFIX):
+        return True
+    parts = stored.source_thread_id.split(":", 2)
+    return len(parts) == 3 and parts[1] != "" and parts[1] == principal.user_id
+
+
 def _readable(principal, stored: StoredThread) -> bool:
     return (
         principal.policy.has_scope("threads:read")
         and stored.workspace_id == principal.workspace_id
         and principal.policy.can_read_wing(stored.wing)
+        and _filer_matches(principal, stored)
     )
 
 
