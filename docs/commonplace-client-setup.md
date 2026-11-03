@@ -1,5 +1,8 @@
 # Local Claude Code setup
 
+To connect to an existing Commonplace account, follow
+[Connect an agent to your account](agent-connections.md).
+
 Requires Python 3.10+, [uv](https://docs.astral.sh/uv/) and Claude Code already installed.
 From a checkout, install and create a local workspace:
 

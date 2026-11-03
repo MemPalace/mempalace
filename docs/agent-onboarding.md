@@ -1,5 +1,8 @@
 # Agent onboarding
 
+[Create an agent connection](agent-connections.md) in Settings to get your own
+connection token.
+
 Commonplace is the single source of effective rules and saved memory for connected
 agents. With the package installed and your connection token in `COMMONPLACE_TOKEN`, run:
 
