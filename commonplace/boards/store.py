@@ -153,10 +153,14 @@ def card(conn, row, principal=None) -> dict:
     )
     result["can_approve"] = bool(
         principal
-        and row["proposal_status"] == "pending"
+        and row["status"] == "backlog"
         and (
-            (principal.person and principal.role == "owner")
-            or row["proposed_to"] == principal.actor
+            (
+                row["proposal_status"] in ("pending", "rejected")
+                and principal.person
+                and principal.role == "owner"
+            )
+            or (row["proposal_status"] == "pending" and row["proposed_to"] == principal.actor)
         )
     )
     if row["parent_number"] is None:

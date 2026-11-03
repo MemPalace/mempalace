@@ -1514,6 +1514,8 @@ def test_board_autocreate_write_scope_and_reserved_card(hub, env):
     )
     assert mcp(hub, limited, "task_add", board="work", title="Own work")[0]
     assert not mcp(hub, limited, "task_add", board="no-auto", title="Denied")[0]
+    # Reservations require an active workspace connection.
+    hub.owner_token("someone-else")
     card = owner.task_add(title="Reserved", board="work", assignee="someone-else")
     assert not mcp(hub, token, "task_take_next", task=card["number"])[0]
     worker = service(hub, agent)

@@ -54,7 +54,7 @@ backlog │ todo │ doing │ review │ done
 
 The full table of who may make each move is in [API.md](API.md#move-rules). Three rules carry the design:
 
-- **Every agent can create, claim and maintain its own cards.** Pending/rejected child proposals require `task_approve` by their direct parent or a signed-in owner. Other holders and person decisions stay protected. Trusted unrestricted writers retain shared backlog pickup; memory inbox routing never forces a top-level card into backlog.
+- **Every agent can create, claim and maintain its own cards.** Pending child proposals require `task_approve` by their direct parent or a signed-in owner; only a signed-in owner can recover or dismiss a rejection. Parent work approval does not release restricted origin unless the parent is trusted and unrestricted. Other holders and person decisions stay protected. Trusted unrestricted writers retain shared backlog pickup; memory inbox routing never forces a top-level card into backlog.
 - **Only the holder changes a `doing` card.** Others can comment.
 - **Cards are never deleted.** Closing one with a reason is a move to `done`. The event log is append-only (enforced by triggers in `schema.sql`).
 
