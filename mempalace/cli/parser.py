@@ -219,6 +219,28 @@ def main():
         help="Always scan these project-relative paths even if ignored; repeat or pass comma-separated paths",
     )
     p_mine.add_argument(
+        "--include-extension",
+        action="append",
+        default=[],
+        metavar="EXT",
+        help=(
+            "Also mine files with this extension (added to the built-in list "
+            "and to include_extensions in config.json / mempalace.yaml); "
+            "repeat or pass comma-separated suffixes, e.g. --include-extension .mdx"
+        ),
+    )
+    p_mine.add_argument(
+        "--exclude-extension",
+        action="append",
+        default=[],
+        metavar="EXT",
+        help=(
+            "Skip files with this extension even though the built-in list "
+            "allows it (beats include_extensions in config.json / "
+            "mempalace.yaml); repeat or pass comma-separated suffixes"
+        ),
+    )
+    p_mine.add_argument(
         "--agent",
         default="mempalace",
         help="Your name — recorded on every drawer (default: mempalace)",
