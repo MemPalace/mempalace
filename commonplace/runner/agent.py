@@ -99,7 +99,7 @@ def _projects(config):
             _require(f"{label}:{topic}" in config["binding_acks"], "binding_ack required")
 
 
-def _load(config_path):
+def _read(config_path) -> dict:
     path = Path(config_path).expanduser()
     info = path.stat()
     if os.name == "posix":
@@ -107,8 +107,12 @@ def _load(config_path):
             stat.S_IMODE(info.st_mode) == 0o600 and info.st_uid == os.getuid(),
             "config must be owner-written with mode 0600",
         )
-    config = json.loads(path.read_text(encoding="utf-8"))
-    _require(isinstance(config, dict) and config.keys() == _CONFIG_KEYS)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load(config_path):
+    config = _read(config_path)
+    _require(isinstance(config, dict) and config.keys() - {"chat"} == _CONFIG_KEYS)
     _url(config["hub_url"])
     _url(config["t3_mcp_endpoint"])
     for key in ("token_env", "t3_grant_env"):
@@ -132,6 +136,10 @@ def _load(config_path):
         isinstance(config["journal_dir"], str) and config["journal_dir"], "invalid journal_dir"
     )
     _projects(config)
+    if "chat" in config:
+        from . import chat_agent
+
+        config["chat"] = chat_agent.validate_chat(config["chat"])
     return config
 
 
@@ -225,12 +233,12 @@ class _Hub:
     def delay(self):
         return min(self.poll * 2 ** min(self.failures, 5), 300)
 
-    def post(self, route, body):
+    def post(self, route, body, *, prefix="/api/runner/"):
         status = None
         try:
             request = Request(
-                self.url + "/api/runner/" + route,
-                data=json.dumps(body).encode("utf-8"),
+                self.url + prefix + route,
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                 headers={
                     "Authorization": "Bearer " + self.token,
                     "Content-Type": "application/json",
@@ -260,7 +268,7 @@ class _Hub:
                 else "refused"
                 if status == 404
                 else "fenced"
-                if status == 409 and route in {"starting", "result"}
+                if status == 409 and route in {"starting", "result", "answer", "fail"}
                 else "transient"
             )
         except (
@@ -439,14 +447,26 @@ def run(config_path, once) -> int:
 
 
 def check(config_path) -> int:
+    from . import chat_agent
+
     try:
-        config = _load(config_path)
-        if os.environ.get(config["token_env"]) and os.environ.get(config["t3_grant_env"]):
+        config = _read(config_path)
+        chat_only = isinstance(config, dict) and config.keys() == chat_agent.CONFIG_KEYS
+        config = chat_agent.load(config_path) if chat_only else _load(config_path)
+        if (
+            not chat_only
+            and os.environ.get(config["token_env"])
+            and os.environ.get(config["t3_grant_env"])
+        ):
             _environment(config)
+        chat_lines = chat_agent.check_lines(config) if "chat" in config else []
     except (OSError, ValueError, ClientError, TypeError, KeyError) as exc:
         return _config_failure(exc)
-    print("launch shape uncaptured (D2 open); attestation is not verification")
-    print("workspace strategy root (unverified, D2); started agents share the project checkout")
-    for label in config["projects"]:
-        print(f"project {label}: shared checkout acknowledged; one agent per project per hour")
+    if not chat_only:
+        print("launch shape uncaptured (D2 open); attestation is not verification")
+        print("workspace strategy root (unverified, D2); started agents share the project checkout")
+        for label in config["projects"]:
+            print(f"project {label}: shared checkout acknowledged; one agent per project per hour")
+    for line in chat_lines:
+        print(line)
     return 0

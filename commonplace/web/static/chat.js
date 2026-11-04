@@ -3,6 +3,8 @@ export const CHAT_COPY = Object.freeze({
   noProjects: "Choose a project to chat with its orchestrator.", empty: "Send a message to your project's orchestrator.",
   placeholder: "Message the orchestrator…", send: "Send", basic: "Basic replies (no model)",
   model: "Answers by {provider}/{model}", statusPrivate: "status private", decisions: "Decisions",
+  runnerAnswer: "via your {cli} login", runnerMode: "Answers via your {cli} login",
+  runnerUsage: "{used}/{cap} today", runnerError: "Last error: {code}",
   noOrchestratorOwner: "This project's orchestrator isn't connected yet. Use Connect above.",
   noOrchestratorMember: "This project's orchestrator isn't connected yet. Ask the workspace owner to connect it.",
 });
@@ -19,15 +21,32 @@ export function chatHTML(page, me, e) {
   }
   return (page.messages || []).map((message) => `<li class="chat-message">
     <article><div class="chat-stamp">${marked(message.actor === `user:${me?.user}` ? "You" : message.actor, e)} <time datetime="${e(message.at)}">${e(message.at)}</time></div><p>${marked(message.text, e)}</p></article>
-    ${(replies.get(message.id) || []).sort((a, b) => a.id - b.id).map((reply) => `<article class="chat-reply"><div class="chat-stamp">Orchestrator${reply.model ? ` · ${marked(reply.model, e)}` : ""}</div><p>${marked(reply.text, e)}</p>${cardLink(reply.task, e)}</article>`).join("")}
+    ${(replies.get(message.id) || []).sort((a, b) => a.id - b.id).map((reply) => {
+      let stamp = `Orchestrator${reply.model ? ` · ${marked(reply.model, e)}` : ""}`;
+      if (reply.model?.startsWith("runner:")) {
+        const login = reply.model.slice("runner:".length), separator = login.indexOf("/");
+        const cli = separator < 0 ? login : login.slice(0, separator);
+        const model = separator < 0 ? "" : login.slice(separator + 1);
+        stamp = e(`${CHAT_COPY.runnerAnswer.replace("{cli}", () => cli)}${model ? ` · ${model}` : ""}`);
+      }
+      return `<article class="chat-reply"><div class="chat-stamp">${stamp}</div><p>${marked(reply.text, e)}</p>${cardLink(reply.task, e)}</article>`;
+    }).join("")}
     ${(page.linked || []).filter((card) => card.message_id === message.id).map((card) => cardLink(card.number, e)).join(" ")}
   </li>`).join("") || `<li class="chat-hint">${e(CHAT_COPY.empty)}</li>`;
 }
 
 export function statusHTML(status, e) {
   const agent = status.orchestrator, front = status.front;
+  let mode = front?.mode === "model" ? `Answers by ${front.model}` : front?.mode === "off" ? "Front replies off" : CHAT_COPY.basic;
+  if (front?.mode === "runner") {
+    mode = CHAT_COPY.runnerMode.replace("{cli}", () => front.runner?.cli || "CLI");
+    mode += ` · ${CHAT_COPY.runnerUsage.replace("{used}", front.runner.used_today).replace("{cap}", front.runner.daily_cap)}`;
+  }
+  if ((front?.mode === "runner" || front?.mode === "basic") && front.runner?.last_error) {
+    mode += ` · ${CHAT_COPY.runnerError.replace("{code}", () => front.runner.last_error)}`;
+  }
   return `${agent ? `<span>${marked(agent.name, e)} · ${marked(agent.visible ? agent.status : CHAT_COPY.statusPrivate, e)}</span>${agent.visible && agent.console === "#/console" ? ' <a href="#/console">Console</a>' : ""}` : ""}
-    ${front ? `<span>${e(front.mode === "model" ? `Answers by ${front.model}` : front.mode === "off" ? "Front replies off" : CHAT_COPY.basic)}</span>` : ""}
+    ${front ? `<span>${e(mode)}</span>` : ""}
     ${status.needs_you > 0 ? `<a href="#/decide">${e(CHAT_COPY.decisions)} (${e(status.needs_you)})</a>` : ""}
     ${(status.starts || []).map((job) => `<span>${cardLink(job.task, e)} · ${marked(job.state, e)}${job.machine_label ? ` · ${marked(job.machine_label, e)}` : ""}</span>`).join("")}`;
 }

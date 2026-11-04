@@ -484,6 +484,30 @@ Webhook authentication may reference an operator-defined environment variable,
 for example `env:COMMONPLACE_WEBHOOK_AUTH_COORDINATOR`. Set the variable only
 in the server environment; the database stores the reference, not its value.
 
+## Runner chat routes
+
+The hub never calls a model for runner answers; it relays redacted context to the poster's own runner, which runs the poster's own CLI.
+
+These machine-only routes use the enrolled machine's bearer credential, not a
+worker token, agent token or person session. Only enabled, non-revoked machines
+may lease their enroller's jobs in their own workspace; binding attestation is
+not required. Requests must be JSON objects with no query string or unknown keys.
+
+| Method | Route | Body / result |
+|---|---|---|
+| POST | `/api/runner/chat/lease` | `{clis, context?, relay_always?}`; `clis` lists 1–8 CLI labels, `context` defaults to `"minimal"` (`"full"` is opt-in), `relay_always` defaults to false. Marks the machine online. 204 if no job; 200 with `{job, lease_token, cli, model, system, prompt, max_chars, expires_in}`. |
+| POST | `/api/runner/chat/answer` | `{job, lease_token, text, cli, model}`; 200 with `{job, state: "done"}` after redaction and private reply storage. |
+| POST | `/api/runner/chat/fail` | `{job, lease_token, code}`; code is `cli_failed`, `cli_timeout`, `cli_not_configured` or `bad_output`. 200 with `{job, state: "failed", code}`. |
+
+Answer and fail require the current job's unexpired lease token and leasing
+machine; a stale, duplicate or mismatched submission gets 409. Answer text must
+be non-empty and at most 16,384 UTF-8 bytes. Bodies are limited to 20,480 bytes.
+Unauthenticated requests get 401; non-machine credentials get 404 (a person
+write may get 403 from the gateway). Disabled machines get 404, revoked tokens
+may get 401. Invalid bodies get 400, oversized bodies 413 and wrong content types
+415. These routes carry chat content; card-runner actions carry no user content.
+See [runner setup](../runner.md#chat-answers) for context, egress and limits.
+
 ## Project routes
 
 These routes require a signed-in person session; agent tokens are refused.

@@ -6,7 +6,7 @@ a signed-in person session; agents continue to use `space_read` and `space_post`
 The view shows the conversation, linked cards, permitted orchestrator status,
 linked start jobs and the Decisions count. Private status stays private.
 
-## Basic and model modes
+## Basic, runner and model modes
 
 **Basic mode is the default** (`provider: "none"`). Each post gets an immediate,
 deterministic receipt describing routing, orchestrator availability and, for a
@@ -14,13 +14,29 @@ work request, the card fallback. It makes no model request and is not a
 conversational model. Waking the orchestrator uses its existing `space_message`
 webhook; without a matching hook it sees the message on its next check.
 
+**Runner mode is opt-in on your own enrolled machine.** With front answers
+enabled and `provider: "none"`, run `commonplace runner chat` using your own
+CLI and login; no server model key is needed. Only the enroller's own messages
+are eligible. The receipt appears first, then a private answer labelled
+`via your {cli} login · {model}`. Status shows `Answers via your {cli} login`,
+usage such as `12/200 today`, and the latest error code. With no eligible runner,
+the basic receipt remains. See [runner setup](runner.md#chat-answers) for both
+config shapes, tools acknowledgements, egress and limits.
+
+The project's `main` model choice selects the runner's CLI and model; otherwise
+its local defaults apply. The relay steps aside for a main orchestrator that is
+connected, wakeable and used within 10 minutes, unless the machine opts into
+`relay_always: true`. An explicit server provider takes precedence with no
+runner fallback. A private runner answer never counts as an orchestrator claim;
+the existing card fallback still applies.
+
 **Model mode is opt-in per workspace.** An owner configures a provider and model;
 a short text answer follows the receipt in the background. The header identifies
 the provider/model. There are no model tools or automatic provider fallbacks.
 If a model call fails or reaches a limit, the receipt remains; Settings shows
 usage and a `last_error` code. Provider error bodies are never shown.
 
-In both modes the person's original message reaches the orchestrator through
+In all modes the person's original message reaches the orchestrator through
 space chat. The front agent does not do the work, start agents, assign or claim
 cards, or make decisions. Its only board action is the fallback below.
 
@@ -60,7 +76,7 @@ recovery. A coordinator creating its own card during the final filing check can
 still race the fallback and leave two linked cards; the coordinator should close
 the duplicate. Filing a card does not start work automatically.
 
-Work detection is deterministic in both modes: short greetings and
+Work detection is deterministic in all modes: short greetings and
 acknowledgements, punctuation-only messages and recognised status questions are
 excluded. Other messages count as work requests. It errs toward filing, so
 chit-chat can occasionally become a card.
@@ -75,8 +91,9 @@ workspace owner can change settings with `PUT /api/chat-settings`, using
 The front settings are `enabled`, `provider`, `model`, `base_url`, `key_ref`,
 `daily_limit` and `user_daily_limit`:
 
-- `none` keeps basic replies. Disabling model answers does not disable the
-  work-request fallback.
+- `none` keeps basic receipts and permits opt-in runner answers. `runner` is a
+  status mode, not a configurable provider. Disabling front answers stops runner
+  answers too, but does not disable the work-request fallback.
 - `openai_compatible` requires an explicit endpoint and model. A local endpoint
   can run without a key. The endpoint must pass the webhook URL policy, contain
   no query, fragment or user credentials, and must not end in `/v1`; the client
@@ -119,9 +136,9 @@ These limits apply to model answers, not the basic receipt or card fallback.
 
 ## Privacy and verbatim storage
 
-Front-agent receipts, model answers and fallback notices are private to the
-poster. The underlying space conversation and linked cards retain their normal
-board permissions; they are not made private by those replies.
+Front-agent receipts, runner answers, model answers and fallback notices are
+private to the poster. The underlying space conversation and linked cards retain
+their normal board permissions; they are not made private by those replies.
 
 When model mode is enabled, the configured provider receives redacted recent
 chat (including the new message), visible open-card titles/status/assignees,
@@ -129,6 +146,15 @@ project and orchestrator names/status, the poster's linked start-job context and
 the fixed front-agent prompt. This includes members' messages. Choosing a remote
 provider sends that context outside the server; a local endpoint can keep it
 local. Basic mode sends no context to a model provider.
+
+In runner mode the hub relays redacted context only to the poster's own runner;
+that runner sends it to the configured CLI's provider under the poster's login.
+Default `context: "minimal"` includes the new message, project name and up to 15
+trusted card titles with status. Local `context: "full"` also includes recent
+chat from everyone, up to 15 visible card titles and assignees, start jobs and the
+decisions count. The hub never calls a model for these answers. The relay has a
+separate cap of 200 jobs per user per workspace per UTC day; CLI subscription
+limits apply too.
 
 Redaction is applied to model input, stored front-agent replies and the Chat
 display. It does not rewrite the person's stored message: space storage,

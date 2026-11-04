@@ -852,6 +852,11 @@ def cmd_restore(args) -> int:
 
 
 def cmd_runner(args) -> int:
+    if args.action == "chat":
+        from .runner import chat_agent
+
+        return chat_agent.run(args.config, args.once)
+
     from .runner.agent import check, run
 
     if args.action == "check":
@@ -867,10 +872,10 @@ def build_parser() -> argparse.ArgumentParser:
     _client_parsers(sub)
 
     runner = sub.add_parser("runner").add_subparsers(dest="action", required=True)
-    for action in ("check", "run"):
+    for action in ("check", "run", "chat"):
         s = runner.add_parser(action)
         s.add_argument("--config", required=True)
-        if action == "run":
+        if action in ("run", "chat"):
             s.add_argument("--once", action="store_true")
         s.set_defaults(func=cmd_runner)
 

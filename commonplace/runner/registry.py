@@ -12,6 +12,7 @@ MACHINE_ID = re.compile(r"mach_[0-9a-f]{16}")
 LABEL = re.compile(r"[a-z0-9][a-z0-9._-]{0,39}")
 PROJECT = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 TOPIC = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}")
+CHAT_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}")
 PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 MODES = ("approval-required", "auto-accept-edits", "auto", "full-access")
 WORKER_TOOLS = (

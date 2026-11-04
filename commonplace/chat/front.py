@@ -132,6 +132,14 @@ def on_event(gateway, event: dict) -> None:
             redacted=tuple(kinds),
             model=None,
         )
+        if (
+            front.enabled
+            and front.provider == "none"
+            and getattr(gateway, "runner_installed", False)
+        ):
+            from commonplace.runner import chat_relay
+
+            chat_relay.enqueue(gateway, principal, board, message_id, time.time())
 
     except Exception as exc:
         log_failure(logger, "chat front event failed", exc)

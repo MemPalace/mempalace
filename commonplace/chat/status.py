@@ -1,5 +1,7 @@
 """Permission-aware projection of project chat status."""
 
+import time
+
 from commonplace import redact
 from commonplace.boards.service import BoardService
 from commonplace.chat import front, settings
@@ -46,6 +48,23 @@ def snapshot(gateway, principal, board: str) -> dict:
     }
     config = settings.front(gateway.db, principal.workspace_id)
     mode = "off" if not config.enabled else "basic" if config.provider == "none" else "model"
+    model = f"{config.provider}/{config.model}" if mode == "model" else None
+    runner = None
+    if config.enabled and config.provider == "none" and getattr(gateway, "runner_installed", False):
+        from commonplace.projects import models
+        from commonplace.runner import chat_relay
+
+        choice = models.resolve(gateway.db, principal.workspace_id, board, "main")
+        runner = chat_relay.caller_state(
+            gateway.db,
+            principal.workspace_id,
+            principal.user_id,
+            time.time(),
+            choice.provider if choice else None,
+        )
+        if runner["online"] and not chat_relay.main_active(gateway, principal, board, time.time()):
+            mode = "runner"
+            model = f"{choice.provider}/{choice.model}" if choice else None
     return {
         "board": board,
         "orchestrator": orchestrator.public() if orchestrator is not None else None,
@@ -53,6 +72,7 @@ def snapshot(gateway, principal, board: str) -> dict:
         "needs_you": len(needs_you),
         "front": {
             "mode": mode,
-            "model": f"{config.provider}/{config.model}" if mode == "model" else None,
+            "model": model,
+            "runner": runner,
         },
     }
