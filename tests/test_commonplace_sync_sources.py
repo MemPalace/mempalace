@@ -2,7 +2,8 @@
 
 import json
 import os
-import time
+
+import pytest
 
 from tests.commonplace_sync_fixtures import (
     actors,
@@ -16,8 +17,10 @@ from tests.commonplace_sync_fixtures import (
 )
 
 
-def test_memory_versions_ride_window_onboard_skipped(hub):
+@pytest.mark.parametrize("start", [0, 12 * 3600 - 60], ids=["noon", "utc-midnight"])
+def test_memory_versions_ride_window_onboard_skipped(hub, start):
     h = hub()
+    h.at(start)
     p, token, grant = actors(h)
     root = h.home.parent / "notes"
     root.mkdir()
@@ -27,7 +30,9 @@ def test_memory_versions_ride_window_onboard_skipped(hub):
     text = "  synthetic notes café 🦉\r\nKeep  every word.\t"
     note = root / "note.md"
     note.write_text(text, newline="")
-    os.utime(note, (time.time() - 120, time.time() - 120))
+    # File stability must use the same clock as the sync scanner.
+    stable_at = h.now.timestamp() - 120
+    os.utime(note, (stable_at, stable_at))
     E = h.env_file(token, grant)
     rc = h.cli(
         [
@@ -68,15 +73,16 @@ def test_memory_versions_ride_window_onboard_skipped(hub):
         )
     )
     for path in root.iterdir():
-        os.utime(path, (time.time() - 120, time.time() - 120))
+        os.utime(path, (stable_at, stable_at))
     assert h.cli(["sync", "run", "--once"]) == 0
     rows = [r for r in h.imports(p) if r["source"] == "native-memory"]
     assert len(rows) == 1
     assert h.read(p, rows[0]["stored_thread_id"]) == text.encode()
     changed = text + "\nnew version"
     note.write_text(changed, newline="")
-    os.utime(note, (time.time() - 120, time.time() - 120))
-    h.at(901)
+    h.at(start + 901)
+    stable_at = h.now.timestamp() - 120
+    os.utime(note, (stable_at, stable_at))
     assert h.cli(["sync", "run", "--once"]) == 0
     rows = [r for r in h.imports(p) if r["source"] == "native-memory"]
     assert len(rows) == 2
