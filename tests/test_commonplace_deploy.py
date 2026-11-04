@@ -698,3 +698,39 @@ def test_deploy_sh_missing_execution_time(tmp_path):
     result, calls = run_deploy(tmp_path, execution="printf ''")
     assert_deploy_failure(result, calls, "backup", ["id"] + ["systemctl"] * 8)
     assert "missing execution time" in result.stderr
+
+
+def test_deploy_env_example_matches_allowlist():
+    example = DEPLOY_SH.with_name("deploy.env.example")
+    assert example.is_file()
+    allowlist = re.search(r"case \$key in\n\s+([A-Z_|]+)\) ;;", DEPLOY_SH.read_text())[1]
+    keys = re.findall(r"^([A-Z_]+)=", example.read_text(), re.MULTILINE)
+    assert len(keys) == len(set(keys))
+    assert set(keys) == set(allowlist.split("|"))
+
+
+def test_deploy_missing_source_names_key(tmp_path):
+    result, calls = run_deploy(tmp_path, unset=["COMMONPLACE_SOURCE_DIR"])
+    assert (
+        "COMMONPLACE_SOURCE_DIR is required (absolute path), see deploy.env.example"
+        in result.stderr
+    )
+    assert_deploy_failure(result, calls, "config", ["id"])
+
+
+def test_deploy_relative_data_names_key(tmp_path):
+    result, calls = run_deploy(tmp_path, env={"COMMONPLACE_DATA_DIR": "relative/data"})
+    assert "COMMONPLACE_DATA_DIR must be an absolute path, see deploy.env.example" in result.stderr
+    assert_deploy_failure(result, calls, "config", ["id"])
+
+
+def test_deploy_reports_both_missing_paths(tmp_path):
+    keys = ["COMMONPLACE_SOURCE_DIR", "COMMONPLACE_DATA_DIR"]
+    result, calls = run_deploy(tmp_path, unset=keys)
+    assert all(
+        f"{key} is required (absolute path), see deploy.env.example" in result.stderr
+        for key in keys
+    )
+    assert result.returncode == 1
+    assert result.stderr.count("\n") == 2
+    assert [call[0] for call in calls] == ["id"]

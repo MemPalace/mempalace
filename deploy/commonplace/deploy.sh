@@ -50,6 +50,38 @@ main() {
             fi
         done < "$config"
     fi
+    COMPOSE_FILE=${COMPOSE_FILE:-$COMMONPLACE_ROOT/compose.yml}
+    COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-$COMMONPLACE_ROOT/.env}
+    # Read the Compose input as literal data too; exported settings win.
+    if [[ -f $COMPOSE_ENV_FILE ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            [[ $line =~ ^COMMONPLACE_(SOURCE_DIR|ENV_FILE|DATA_DIR)= ]] || continue
+            key=${line%%=*}
+            value=${line#*=}
+            if [[ ! -v $key ]]; then
+                validate_literal_path "$key" "$value"
+                export "$key=$value"
+            fi
+        done < "$COMPOSE_ENV_FILE"
+    fi
+    local config_errors=0
+    for key in DEPLOY_BACKUP_UNIT DEPLOY_BACKUP_CHECK_CMD DEPLOY_BACKUP_LATEST_CMD COMMONPLACE_ROOT COMPOSE_FILE COMPOSE_ENV_FILE COMMONPLACE_SOURCE_DIR COMMONPLACE_ENV_FILE COMMONPLACE_DATA_DIR; do
+        if [[ -z ${!key:-} ]]; then
+            case $key in
+                DEPLOY_*) value='is required' ;;
+                *) value='is required (absolute path)' ;;
+            esac
+        else
+            case $key in
+                DEPLOY_*) continue ;;
+                *) [[ ${!key} == /* ]] && continue
+                   value='must be an absolute path' ;;
+            esac
+        fi
+        printf '[deploy] ERROR: config: %s %s, see deploy.env.example\n' "$key" "$value" >&2
+        config_errors=1
+    done
+    (( config_errors == 0 )) || exit 1
     [[ ${DEPLOY_BACKUP_UNIT:-} =~ ^[A-Za-z0-9@:_.-]+\.service$ ]] || die config 'invalid DEPLOY_BACKUP_UNIT'
     DEPLOY_BACKUP_TIMEOUT=${DEPLOY_BACKUP_TIMEOUT:-3600}
     [[ $DEPLOY_BACKUP_TIMEOUT =~ ^[1-9][0-9]{0,5}$ ]] || die config 'invalid DEPLOY_BACKUP_TIMEOUT'
@@ -62,27 +94,12 @@ main() {
     [[ $APP_PORT =~ ^[0-9]{1,5}$ ]] || die config 'invalid APP_PORT'
     (( 10#$APP_PORT >= 1 && 10#$APP_PORT <= 65535 )) || die config 'invalid APP_PORT'
     APP_PORT=$((10#$APP_PORT))
-    COMPOSE_FILE=${COMPOSE_FILE:-$COMMONPLACE_ROOT/compose.yml}
-    COMPOSE_ENV_FILE=${COMPOSE_ENV_FILE:-$COMMONPLACE_ROOT/.env}
     for key in jq flock curl systemctl docker date timeout; do
         command -v "$key" >/dev/null || die preflight "missing $key"
     done
     [[ -f $COMPOSE_FILE && -f $COMPOSE_ENV_FILE ]] || die config 'compose and environment files must exist'
     { exec 9>"$COMMONPLACE_ROOT/.deploy.lock"; } 2>/dev/null || die lock 'cannot open deploy lock'
     flock -n 9 || die lock 'another deploy is running'
-    # Read the Compose input as literal data too; exported settings win.
-    while IFS= read -r line || [[ -n $line ]]; do
-        [[ $line =~ ^COMMONPLACE_(SOURCE_DIR|ENV_FILE|DATA_DIR)= ]] || continue
-        key=${line%%=*}
-        value=${line#*=}
-        if [[ ! -v $key ]]; then
-            validate_literal_path "$key" "$value"
-            export "$key=$value"
-        fi
-    done < "$COMPOSE_ENV_FILE"
-    for key in COMMONPLACE_ROOT COMPOSE_FILE COMPOSE_ENV_FILE COMMONPLACE_SOURCE_DIR COMMONPLACE_ENV_FILE COMMONPLACE_DATA_DIR; do
-        [[ ${!key:-} == /* ]] || die config "$key must be an absolute path"
-    done
     [[ $(systemctl show -p LoadState --value "$DEPLOY_BACKUP_UNIT") == loaded ]] || die config 'unit is not loaded'
     [[ $(systemctl show -p Type --value "$DEPLOY_BACKUP_UNIT") == oneshot ]] || die config 'unit must be oneshot'
     [[ $(systemctl show -p RemainAfterExit --value "$DEPLOY_BACKUP_UNIT") == no ]] || die config 'unit must have RemainAfterExit=no'

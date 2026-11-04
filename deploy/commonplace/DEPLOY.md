@@ -26,7 +26,8 @@ clients will use. Do not commit the filled-in files. The corresponding
 `deploy/compose.host.yml`, `deploy/commonplace.env`, `deploy/deploy.local.sh`,
 and local Caddy copies are ignored when used for local testing.
 
-Use the tracked `app/deploy/commonplace/deploy.sh` for updates as described below.
+Install the reviewed `app/deploy/commonplace/deploy.sh` as `/srv/commonplace/deploy.sh`
+for updates as described below.
 
 A deployment wrapper must pass the same external env and Compose paths on
 both validation and deployment. `COMPOSE_FILE` must identify the
@@ -144,7 +145,20 @@ bash -n backup-hook.sh deploy/commonplace/deploy.sh
 
 ## Deploy
 
-Run `app/deploy/commonplace/deploy.sh` as root after staging the release.
+Before running, stage the reviewed release and pin its build context and image tag
+in the operator-owned `compose.yml`. The script does not pull source or remove
+placeholders; prepare all deployment values yourself.
+
+Copy the complete [deploy.env.example](deploy.env.example) and edit the installed
+file for your deployment (example operator directory `/srv/commonplace`):
+
+```bash
+sudo install -o root -g root -m 600 app/deploy/commonplace/deploy.env.example /srv/commonplace/deploy.env
+sudoedit /srv/commonplace/deploy.env
+sudo /srv/commonplace/deploy.sh
+```
+
+Run the installed script as root after staging and pinning the release.
 There is no skip option. Install jq on the host (`apt install jq`); bash,
 GNU date, timeout, flock, curl, systemctl and docker compose are also required.
 
@@ -160,17 +174,8 @@ and `COMMONPLACE_DATA_DIR`.
 Command values split on whitespace into an executable and arguments; shell
 quoting, pipelines and glob patterns are not interpreted.
 
-Example private `deploy.env` (replace placeholders):
-
-```text
-DEPLOY_BACKUP_UNIT=<host>-backup.service
-DEPLOY_BACKUP_CHECK_CMD=/usr/local/sbin/<host>-backup --check
-DEPLOY_BACKUP_LATEST_CMD=/usr/local/sbin/<host>-backup --latest-json
-DEPLOY_BACKUP_MAX_AGE=7200
-DEPLOY_BACKUP_TIMEOUT=3600
-```
-
-The three backup settings are required. The latest command must filter to
+The three backup settings and the three `COMMONPLACE_*` path settings are required.
+The paths may also come from the Compose environment file. The latest command must filter to
 this deployment's host/tag and return one JSON object with a 64-character
 lowercase hexadecimal `id` and an RFC3339 `time`, or `null` if none exists.
 Both commands must return nonzero on failure. Keep the configuration root-owned
@@ -182,7 +187,7 @@ This script uses the operator-owned `$COMMONPLACE_ROOT/compose.yml` and
 three path settings below from that env file as literal KEY=VALUE data
 (environment overrides file values), before starting the backup. File path values
 must have no whitespace, quotes, expansions, backslashes or inline comments.
-The Compose environment must still define the absolute `COMMONPLACE_SOURCE_DIR`,
+The deployment configuration must define the absolute `COMMONPLACE_SOURCE_DIR`,
 `COMMONPLACE_ENV_FILE` and `COMMONPLACE_DATA_DIR` paths required by the example.
 Keep these aligned with the backup unit's configuration.
 
