@@ -648,6 +648,7 @@ class AnthropicProvider(LLMProvider):
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         timeout: int = 120,
+        temperature: Optional[float] = None,
         **_: object,
     ):
         if api_key:
@@ -664,6 +665,7 @@ class AnthropicProvider(LLMProvider):
             timeout=timeout,
             api_key_source=source,
         )
+        self.temperature = temperature
 
     def check_available(self) -> tuple[bool, str]:
         if not self.api_key:
@@ -688,10 +690,13 @@ class AnthropicProvider(LLMProvider):
         body = {
             "model": self.model,
             "max_tokens": 2048,
-            "temperature": 0.1,
             "system": sys_prompt,
             "messages": [{"role": "user", "content": user}],
         }
+        # Current Claude models reject `temperature` outright; only send it when
+        # the caller opts in, for older models that still accept it (issue #2941).
+        if self.temperature is not None:
+            body["temperature"] = self.temperature
         headers = {
             "X-API-Key": self.api_key,
             "anthropic-version": self.API_VERSION,

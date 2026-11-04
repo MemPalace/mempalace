@@ -633,6 +633,41 @@ def test_anthropic_no_key_raises_on_classify(monkeypatch):
         p.classify("s", "u")
 
 
+def test_anthropic_omits_temperature_by_default():
+    """Current Claude models reject `temperature`; it must not be sent unless opted in (#2941)."""
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["body"] = json.loads(req.data)
+        return _mock_anthropic_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = AnthropicProvider(model="claude-sonnet-5-5", api_key="sk-ant-abc")
+        p.external_use_accepted = True
+        p.classify("s", "u")
+
+    body = captured["body"]
+    assert body["model"] == "claude-sonnet-5-5"
+    assert body["max_tokens"] == 2048
+    assert "temperature" not in body
+
+
+def test_anthropic_sends_temperature_when_explicitly_set():
+    """Older Claude models still accept a temperature; an explicit opt-in must reach the wire."""
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["body"] = json.loads(req.data)
+        return _mock_anthropic_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = AnthropicProvider(model="claude-sonnet-4-5", api_key="sk-ant-abc", temperature=0.1)
+        p.external_use_accepted = True
+        p.classify("s", "u")
+
+    assert captured["body"]["temperature"] == 0.1
+
+
 # ── is_external_service property (issue #24 — privacy warning support) ──
 #
 # `is_external_service` is True when this provider's endpoint sends data
