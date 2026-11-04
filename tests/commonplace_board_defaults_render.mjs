@@ -13,7 +13,7 @@ runInNewContext(slice('function navigation()', 'function showError') + '\nnaviga
 assert.ok(nav.innerHTML.includes('href="#/board/fresh-space"'));
 assert.ok(nav.innerHTML.includes('data-action="new-board">New space'));
 assert.ok(!nav.innerHTML.includes('href="#/space/fresh-space"'));
-runInNewContext(slice('function reviewForm()', 'function handoffForm()') + '\nreviewForm();', context);
+runInNewContext(slice('function reviewForm()', 'function handoffForm(') + '\nreviewForm();', context);
 assert.equal(panel.hidden, false);
 assert.ok(panel.innerHTML.includes('name="question" minlength="24" required'));
 assert.ok(panel.innerHTML.includes('name="context" minlength="20" required'));
@@ -28,10 +28,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(requests[0].options.body)), { name: '
 assert.equal(location.hash, '#/board/release-planning');
 assert.equal(panel.hidden, true);
 // Proposal decisions use the public API and the version shown, never a database write.
-const approveStart = 'else if (action === "approve-proposal"';
-const approve = slice(approveStart, 'else if (action === "children-toggle")');
-const approveBody = approve.slice(approve.indexOf('await mutate'), approve.lastIndexOf(';') + 1);
-await runInNewContext(`(async () => { ${approveBody} })()`, { state, action: 'approve-proposal', mutate: async (_key, work) => work(), api: async (url, options) => requests.push({ url, options }) });
+await runInNewContext(slice('async function approveProposal(', 'function clearDecisionDraft(') + '\napproveProposal(state.card.number, state.card.version, true);', { state, mutate: async (_key, work) => work(), api: async (url, options) => requests.push({ url, options }) });
 assert.equal(requests[1].url, '/api/cards/3/approve');
 assert.equal(requests[1].options.body.approve, true);
 assert.equal(requests[1].options.body.version, 1);

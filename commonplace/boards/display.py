@@ -21,7 +21,22 @@ def stale_before(at=None) -> str:
     return (at - timedelta(minutes=STALE_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def need(card, *, me=None, owner=False, now=None) -> str:
+def merge_ready(card, cutoff) -> bool:
+    """A fresh, explicit holder report; legacy or incomplete reports fail closed."""
+    head = card.get("pr_head")
+    return bool(
+        card["status"] in ("doing", "review")
+        and card.get("pr_url")
+        and card.get("pr_state") == "open"
+        and isinstance(head, str)
+        and re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", head)
+        and card.get("checks") == "passing"
+        and card.get("pr_reported_at")
+        and card["pr_reported_at"] > cutoff
+    )
+
+
+def need(card, *, me=None, owner=False, now=None, person_release: bool | None = None) -> str:
     """One of ``NEEDS`` for a public card dict, seen by actor ``me``.
 
     An ask with no recipient goes to the workspace owner. A question to someone
@@ -31,13 +46,18 @@ def need(card, *, me=None, owner=False, now=None) -> str:
     if status == "done":
         return "done"
     if card.get("proposal_status") == "pending":
-        return "you" if owner or card.get("proposed_to") == me else "plan"
+        return (
+            "you"
+            if card.get("proposed_to") == me or (owner and person_release is not False)
+            else "plan"
+        )
     ask_to = card.get("ask_to")
     if card.get("ask") and (ask_to == me if ask_to else owner):
         return "you"
     if "plan" in (card.get("labels") or ()) or (status == "review" and not card.get("ask")):
         return "plan"
-    if card.get("pr_url") and card.get("checks") == "passing":
+    cutoff = stale_before(now)
+    if merge_ready(card, cutoff):
         return "merge"
     if card.get("checks") == "pending":
         return "checks"
@@ -45,12 +65,12 @@ def need(card, *, me=None, owner=False, now=None) -> str:
         at = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
         if card["claim_until"] <= at:
             return "expired"
-    if status == "doing" and (card.get("heartbeat_at") or card["updated_at"]) >= stale_before(now):
+    if status == "doing" and (card.get("heartbeat_at") or card["updated_at"]) >= cutoff:
         return "working"
     return "idle"
 
 
-def need_for(card, principal, now=None) -> str:
+def need_for(card, principal, now=None, *, person_release: bool | None = None) -> str:
     """``need`` as ``principal`` sees it: only a signed-in person is ever ``you``."""
     person = bool(principal and principal.person)
     return need(
@@ -60,6 +80,7 @@ def need_for(card, principal, now=None) -> str:
         else None,
         owner=person and principal.role == "owner",
         now=now,
+        person_release=person_release,
     )
 
 

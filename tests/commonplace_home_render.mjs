@@ -10,15 +10,15 @@ const rows = {
   taskRow: (card, context) => `<div class="trow">#${card.number}${context}</div>`,
 };
 const at = new Date(Date.now() - 3 * 3600000).toISOString();
-const card = (number, fields) => ({ number, board: "work", title: `Card ${number}`, status: "doing", need: "working", updated_at: at, ...fields });
-const ask = card(1, { title: "Ship <script>alert(1)</script>?", status: "review", need: "you", ask: "Which one?\nSecond line stays in the card.", ask_options: ["A", "B"] });
-const plan = card(2, { status: "review", need: "plan" });
-const merge = card(3, { need: "merge", branch: "feat/x", pr_number: 19, pr_url: "https://github.com/140er/mempalace/pull/19" });
-const stale = card(4, { board: "lab", need: "idle" });
+const card = (number, fields) => ({ number, version: 3, board: "work", title: `Card ${number}`, status: "doing", need: "working", updated_at: at, ...fields });
+const ask = card(1, { title: "Ship <script>alert(1)</script>?", status: "review", need: "you", ask: "Which one?\nSecond line stays in the card.", ask_options: ["A", "B"], why: "Worker asks you: Which one?", actions: ["answer"] });
+const plan = card(2, { status: "review", need: "plan", why: "Worker asks you: Approve <this> plan?", actions: ["answer"] });
+const merge = card(3, { status: "review", need: "merge", ask: "Ship?", ask_options: ["Merge", "Wait"], branch: "feat/x", pr_number: 19, pr_url: "https://example.test/o/r/pull/19", why: "Worker asks you to merge PR #19 (checks passed on aaaaaaa): Ship?", actions: ["answer", "open_pr"] });
+const stale = card(4, { board: "lab", need: "idle", why: "Worker has a claim that ran out, and it has no available supervisor.", actions: ["requeue", "reassign", "park"] });
 const working = card(5, { board: "lab", need: "working" });
-const backlog = card(6, { status: "backlog", need: "idle" });
+const backlog = card(6, { status: "backlog", need: "idle", why: "asks: this prefix is prose, not routing.", actions: ["approve", "reject"] });
 const quiet = card(7, { board: "quiet", status: "todo", need: "idle" });
-const needs = { asks: [plan, ask], done_review: [], backlog_from_agents: [backlog], ready_to_merge: [merge], stale: [stale], count: 5 };
+const needs = { asks: [plan, ask, merge], done_review: [], backlog_from_agents: [backlog], ready_to_merge: [merge], stale: [stale], count: 5 };
 const boards = [
   { slug: "work", name: "Work <b>", counts: { todo: 0, doing: 1, review: 2 } },
   { slug: "lab", name: "Lab", counts: { doing: 2 } },
@@ -32,22 +32,32 @@ assert.ok(at_('class="needbox waiting"') >= 0 && at_('class="needbox') < at_('cl
 assert.match(html, /<h2 id="needbox-title"><b class="n">5<\/b> things need you<\/h2><div class="need-actions"><a class="opt go answer" href="#\/decide">Answer<\/a><button class="opt speak" data-action="speak-digest"/);
 assert.ok(html.includes('id="digest-captions"'));
 
-// One line per item, ordered like the spoken digest; reasons from need and queue.
+// The server's sentence is the whole reason; routing comes from buckets, not prose.
 assert.deepEqual(needItems(needs).map((i) => [i.card.number, i.reason]), [
-  [1, "asks: Which one?"], [2, "plan to approve"], [3, "ready to merge"], [4, "claim went stale"], [6, "filed by an agent"],
+  [1, ask.why], [2, plan.why], [3, merge.why], [4, stale.why], [6, backlog.why],
 ]);
-assert.ok(html.includes('<a class="tt" href="#/decide/1">Ship &lt;script&gt;alert(1)&lt;/script&gt;?</a><span class="why">asks: Which one?</span>'));
-assert.ok(html.includes('<a class="tt" href="#/card/2">'));
+assert.ok(html.includes('<a class="tt" href="#/decide/1">Ship &lt;script&gt;alert(1)&lt;/script&gt;?</a><span class="why">Worker asks you: Which one?</span>'));
+assert.ok(html.includes('<a class="tt" href="#/decide/2">'));
+assert.ok(html.includes('<a class="tt" href="#/card/6">'));
+assert.ok(html.includes('<span class="why">Worker asks you: Approve &lt;this&gt; plan?</span>'));
 assert.ok(!html.includes("<script>") && !html.includes("Second line"));
 assert.ok(html.includes('class="nline sel" data-row="1"'));
 // The ask is answered in its card, its one clickable place; Home never repeats the choices.
 assert.ok(!html.includes('data-action="decide"') && !html.includes("data-form=\"reply\""));
+const line = (number) => html.slice(html.indexOf(`data-key="${number}"`), html.indexOf("</li>", html.indexOf(`data-key="${number}"`)));
+for (const [number, actions] of [[4, ["requeue", "reassign", "park"]], [6, ["approve", "reject"]]]) {
+  for (const action of actions) assert.ok(line(number).includes(`data-action="need-${action}" data-card="${number}" data-version="3"`));
+}
+assert.match(line(1), /class="opt" href="#\/decide\/1">Answer<\/a>/);
+assert.match(line(3), /class="opt" href="#\/decide\/3">Answer<\/a>/);
+assert.match(line(3), /href="https:\/\/example.test\/o\/r\/pull\/19" target="_blank" rel="noopener noreferrer">Open PR<\/a>/);
+assert.doesNotMatch(line(1), /need-(?:approve|reject|park|accept)/);
 
 // Spaces: the worst state among open cards, else quiet, two facts, one Open.
 const tile = (slug) => html.slice(at_(`data-key="space-${slug}"`), html.indexOf("</article>", at_(`data-key="space-${slug}"`)));
 assert.match(tile("work"), /<h3>Work &lt;b&gt;<\/h3><a class="opt" href="#\/board\/work">Open<\/a>/);
 assert.match(tile("work"), /class="pill you">.*Needs you<\/span><span>3 open<\/span><span><span class="hot">4 waiting<\/span>/);
-assert.match(tile("lab"), /class="pill stale">.*Stale<\/span><span>2 open<\/span><span><span class="hot">1 waiting/);
+assert.match(tile("lab"), /class="pill stale">.*Stuck<\/span><span>2 open<\/span><span><span class="hot">1 waiting/);
 assert.match(tile("quiet"), /class="pill quiet"><i class="status-dot idle".*Quiet<\/span><span>1 open<\/span><span>0 doing<\/span>/);
 assert.equal(tile("quiet").match(/<a /g).length, 1);
 
@@ -58,8 +68,9 @@ const row = (n) => table.slice(table.indexOf(`data-key="task-${n}"`), table.inde
 assert.match(row(1), /<a class="opt" href="#\/card\/1">Answer<\/a>/);
 assert.match(row(2), /<a class="opt" href="#\/card\/2">Approve<\/a>/);
 assert.match(row(3), /<span class="sub"><span>feat\/x<\/span><span>PR #19<\/span><\/span>/);
-assert.match(row(3), /href="https:\/\/github.com\/140er\/mempalace\/pull\/19" target="_blank" rel="noopener noreferrer">Merge<\/a>/);
-assert.match(row(4), /<button class="opt" data-action="move" data-card="4" data-status="todo">Retake<\/button>/);
+assert.match(row(3), /href="https:\/\/example.test\/o\/r\/pull\/19" target="_blank" rel="noopener noreferrer">Merge<\/a>/);
+assert.doesNotMatch(html, /Retake/);
+assert.match(row(4), /<a class="opt" href="#\/card\/4">Unblock<\/a>/);
 assert.match(row(4), />Lab<\/a>/);
 assert.match(row(4), /<time data-elapsed="[^"]+" datetime="[^"]+">3h<\/time>/);
 for (const n of [5, 7]) assert.doesNotMatch(row(n), /class="opt"/);
@@ -73,10 +84,31 @@ assert.ok(html.includes('<article class="trow-card sel" data-row="1" data-key="s
 const empty = homeView({ needs: { count: 0 }, boards: [], open: [], speak: false }, rows);
 assert.ok(empty.includes('<section class="needbox " aria-labelledby="needbox-title"><header><h2 id="needbox-title">Nothing needs you</h2></header>'));
 assert.ok(empty.includes("No open tasks") && !empty.includes("<table>") && !empty.includes("speak-digest") && !empty.includes('href="#/decide"'));
-const mergeOnly = homeView({ needs: { ready_to_merge: [merge], count: 1 }, boards, open: [merge], speak: true }, rows);
-assert.ok(mergeOnly.includes("speak-digest") && !mergeOnly.includes('href="#/decide"'));
+const mergeOnly = homeView({ needs: { asks: [merge], ready_to_merge: [merge], count: 1 }, boards, open: [merge], speak: true }, rows);
+assert.ok(mergeOnly.includes("speak-digest") && mergeOnly.includes('href="#/decide"'));
+assert.ok(mergeOnly.includes('<b class="n">1</b> thing needs you'));
 const one = homeView({ needs: { asks: [ask] }, boards, open: [ask] }, rows);
 assert.ok(one.includes("<b class=\"n\">1</b> thing needs you"));
+
+// Completion review stays in the card even when its prose resembles an ask.
+const done = card(8, { status: "review", need: "you", why: "asks: accept this completed work.", actions: ["accept", "answer"] });
+const completion = homeView({ needs: { done_review: [done] } }, rows);
+assert.ok(completion.includes('<a class="tt" href="#/card/8">'));
+assert.ok(completion.includes('data-action="need-accept" data-card="8" data-version="3"'));
+assert.match(completion, /class="opt" href="#\/card\/8">Answer<\/a>/);
+const readOnly = homeView({ needs: { stale: [{ ...stale, actions: [] }] } }, rows);
+assert.doesNotMatch(readOnly, /data-action="need-/);
+
+// Older servers omit why/actions; keep their reason and safe card actions.
+const legacyAsk = { ...ask }, legacyStale = { ...stale };
+delete legacyAsk.why; delete legacyAsk.actions;
+delete legacyStale.why; delete legacyStale.actions;
+assert.deepEqual(needItems({ asks: [legacyAsk], stale: [legacyStale] }).map((i) => i.reason), ["asks: Which one?", "stopped checking in and has no available supervisor"]);
+const legacy = homeView({ needs: { asks: [legacyAsk], stale: [legacyStale] }, open: [legacyStale] }, rows);
+assert.ok(legacy.includes('href="#/decide/1"') && legacy.includes('href="#/card/4">Unblock'));
+assert.doesNotMatch(legacy, /Retake|data-action="need-/);
+const notReady = homeView({ needs: { ready_to_merge: [card(9, { need: "working" })] }, open: [card(9, { need: "working" })] }, rows);
+assert.doesNotMatch(notReady, /[Rr]eady to merge/);
 
 // Legacy or number-only PR metadata still opens the full repository PR URL.
 for (const fields of [

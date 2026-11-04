@@ -23,6 +23,9 @@ TASK_COLUMNS = {
     "pr_number": "INTEGER",
     "pr_repo": "TEXT",
     "checks": "TEXT",
+    "pr_state": "TEXT CHECK (pr_state IN ('open', 'merged', 'closed'))",
+    "pr_head": "TEXT",
+    "pr_reported_at": "TEXT",
     "status_line": "TEXT",
     "heartbeat_at": "TEXT",
     "labels": "TEXT",
@@ -118,7 +121,7 @@ def owns_card(row, actor):
     )
 
 
-def card(conn, row, principal=None) -> dict:
+def card(conn, row, principal=None, *, release=None) -> dict:
     """The public card shape, deliberately independent of SQLite's schema."""
     result = {
         "number": row["id"],
@@ -147,7 +150,13 @@ def card(conn, row, principal=None) -> dict:
         "updated_at": row["updated_at"],
         "position": row["position"],
     }
-    result["need"] = need_for(result, principal)
+    person_owner = bool(principal and principal.person and principal.role == "owner")
+    person_release = (
+        release(row)
+        if release is not None and person_owner and row["proposal_status"] == "pending"
+        else None
+    )
+    result["need"] = need_for(result, principal, person_release=person_release)
     result["claim_expired"] = bool(
         row["status"] == "doing" and row["claim_until"] and row["claim_until"] <= now()
     )
@@ -169,13 +178,23 @@ def card(conn, row, principal=None) -> dict:
             "SELECT * FROM tasks WHERE board_id=? AND parent_number=? ORDER BY position,id",
             (row["board_id"], row["id"]),
         ):
-            fields = {**dict(child), "labels": json.loads(child["labels"] or "[]")}
+            child = {
+                **dict(child),
+                "board_wing": row["board_wing"],
+                "board_coordinator": row["board_coordinator"],
+            }
+            fields = {**child, "labels": json.loads(child["labels"] or "[]")}
+            person_release = (
+                release(child)
+                if release is not None and person_owner and child["proposal_status"] == "pending"
+                else None
+            )
             children.append(
                 {
                     "number": child["id"],
                     "title": child["title"],
                     "status": child["status"],
-                    "need": need_for(fields, principal),
+                    "need": need_for(fields, principal, person_release=person_release),
                 }
             )
         if children:

@@ -81,3 +81,12 @@ def test_home_renders_three_sections_from_a_seeded_payload():
         pytest.skip("node is needed for the Home render check")
     script = Path(__file__).with_name("commonplace_home_render.mjs")
     subprocess.run([node, str(script)], check=True, timeout=10)
+
+
+def test_needs_actions_behaviour():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is needed for the needs-actions behaviour check")
+    script = Path(__file__).with_name("commonplace_needs_actions.mjs")
+    result = subprocess.run([node, str(script)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr

@@ -31,6 +31,7 @@ When replacing your complete own rule set, call `rules_publish` with `replace=tr
 ## While working
 
 - Report progress with `task_update task=#n status_line="<what you are doing now>"` at every real step. Call `task_heartbeat task=#n` at least every 20 minutes, including while waiting on checks. Holder writes renew the 30-minute claim. Expiry keeps the assignee and `doing` lane, with an explicit `expired` indication; heartbeat to resume.
+- If you supervise agents, `task_list mine=true` lists their stuck claims; resume the agent or `ask` the owner.
 - Record the work: `task_update task=#n repo=… branch=… pr=<url>` as soon as they exist.
 - After each push to the PR: `python -m commonplace.callstack --base origin/<base branch> --card <n> --hub <hub URL>` so the reviewer sees the change as a call tree. There is no default hub: pass `--hub` or set `COMMONPLACE_URL`; the token comes from `COMMONPLACE_TOKEN` (or `--token`) and is sent to that hub only, never through a redirect.
 - Longer notes for the next agent: `task_comment task=#n text=…`.
@@ -86,11 +87,13 @@ The hub only stores and wakes. Replies posted with `space_post` do not trigger w
 ## Decisions
 
 `needs_me`: asks and done reviews addressed to the token's user (or with no target),
-plus pending proposals and legacy restricted backlog, PRs ready to merge and stale agent claims across readable
-boards. Owner-role connections retain access at any trust level. Trusted,
-unrestricted member agents may also read it without write access. `board_set` remains
-owner-only. `decide task=#n choice=…` answers an ask under the existing owner rules;
-an agent never answers its own ask.
+merge asks backed by a fresh open-PR head report, and pending proposals only a person can release.
+Stuck claims go to each available direct parent, top-level agent or owner-appointed board coordinator;
+the person owner sees them only when none is live and able to read, write and ask for help.
+An agent sees only claims it supervises, with notification only: resume the holder or ask the owner.
+Owner-role connections retain access at any trust level. Trusted, unrestricted member agents may
+also read it without write access. `board_set` remains owner-only. `decide task=#n choice=…`
+answers an ask under the existing owner rules; an agent never answers its own ask.
 
 ## When the server is unreachable
 

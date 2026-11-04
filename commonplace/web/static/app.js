@@ -137,6 +137,15 @@ function remember() {
   };
 }
 function restore(saved) {
+  root.querySelectorAll('[data-draft^="then-"]').forEach((input) => {
+    const number = input.dataset.draft.slice(5);
+    const version = input.closest("[data-version]")?.dataset.version;
+    if (String(state.drafts.get(`then-version-${number}`)) !== version) {
+      state.drafts.delete(`then-${number}`);
+      state.drafts.delete(`then-version-${number}`);
+      input.value = "return";
+    }
+  });
   root.querySelectorAll("[data-draft]").forEach((input) => {
     if (state.drafts.has(input.dataset.draft)) input.value = state.drafts.get(input.dataset.draft);
   });
@@ -399,10 +408,10 @@ function reviewForm() {
   const panel = root.querySelector("#card-panel"); panel.hidden = false;
   panel.innerHTML = `<form class="form-tile" data-form="review"><h2>Ask for a decision</h2><label>Question<textarea name="question" minlength="24" required></textarea></label><label>Context<textarea name="context" minlength="20" required>${e(state.card.status_line || state.card.body)}</textarea></label><label>Options (one per line)<textarea name="options" required></textarea></label><button class="blockbtn">Ask</button><button type="button" class="opt" data-action="retry">Cancel</button></form>`;
 }
-function handoffForm() {
+function handoffForm(card, prefill = {}) {
   voice.stop();
-  const panel = root.querySelector("#card-panel");
-  panel.innerHTML = `<form class="form-tile" data-form="handoff"><h2>Hand off #${state.card.number}</h2><label>To<input name="to" required></label><label>Note<textarea name="note" required></textarea></label><label>Context<textarea name="context">${e(state.card.status_line || state.card.body)}</textarea></label><label>Options<input name="options"></label><button class="blockbtn">Hand off</button><button class="opt" type="button" data-action="retry">Cancel</button></form>`;
+  const panel = root.querySelector("#card-panel"); panel.hidden = false;
+  panel.innerHTML = `<form class="form-tile" data-form="handoff" data-card="${card.number}"${prefill.connectionsOnly ? ' data-connections-only="true"' : ""}><input type="hidden" name="version" value="${e(card.version)}"><h2>Hand off #${card.number}</h2><label>To<input name="to" value="${e(prefill.to || "")}"${prefill.connectionsOnly ? ' pattern="conn:.+" title="Use conn: followed by the agent name"' : ""} required></label><label>Note<textarea name="note" required></textarea></label><label>Context<textarea name="context">${e(card.status_line || card.body)}</textarea></label><label>Options<input name="options"></label><button class="blockbtn">Hand off</button><button class="opt" type="button" data-action="retry">Cancel</button></form>`;
 }
 async function settingsView(epoch) {
   title("Settings");
@@ -698,7 +707,7 @@ async function sendDecide(effect, keepalive) {
   const { number, body } = effect;
   try {
     const card = await api(`/api/cards/${number}/decide`, { method: "POST", body, keepalive: Boolean(keepalive) });
-    state.drafts.delete(`reply-${number}`);
+    clearDecisionDraft(number);
     if (state.base !== "#/decide" || !state.queue) {
       // Sent on the way out: the session is gone, so keep the waiting state for the next visit here.
       const asked = askedRead();
@@ -779,13 +788,26 @@ async function mutate(key, action) {
     root.querySelectorAll(`button[data-card="${key.replace("card-", "")}"], [data-card="${key.replace("card-", "")}"] button`).forEach((b) => { b.disabled = false; });
   }
 }
+async function approveProposal(number, version, approve) {
+  await mutate(`card-${number}`, () => api(`/api/cards/${number}/approve`, { method: "POST", body: { approve, version } }));
+}
+function clearDecisionDraft(number) {
+  for (const key of [`reply-${number}`, `then-${number}`, `then-version-${number}`]) state.drafts.delete(key);
+  root.querySelectorAll(`[data-draft="reply-${number}"]`).forEach((input) => { input.value = ""; });
+  root.querySelectorAll(`[data-draft="then-${number}"]`).forEach((input) => { input.value = "return"; });
+}
+function decisionThen(number, version) {
+  if (String(state.drafts.get(`then-version-${number}`)) === String(version)) return state.drafts.get(`then-${number}`) || "return";
+  state.drafts.delete(`then-${number}`);
+  state.drafts.delete(`then-version-${number}`);
+  return "return";
+}
 async function decide(number, payload, from) {
   // The version the person saw: if the card was re-asked since, the server answers 409.
   const version = Number(from.closest("[data-version]")?.dataset.version);
   await mutate(`card-${number}`, async () => {
     await api(`/api/cards/${number}/decide`, { method: "POST", body: { ...payload, version } });
-    state.drafts.delete(`reply-${number}`);
-    root.querySelectorAll(`[data-draft="reply-${number}"]`).forEach((input) => { input.value = ""; });
+    clearDecisionDraft(number);
   });
 }
 async function move(number, status, extra = {}) {
@@ -802,6 +824,7 @@ root.addEventListener("input", (event) => {
   if (event.target.dataset.draft) {
     const key = event.target.dataset.draft;
     state.drafts.set(key, event.target.value);
+    if (/^then-\d+$/.test(key)) state.drafts.set(`then-version-${key.slice(5)}`, event.target.closest("[data-version]")?.dataset.version);
     root.querySelectorAll(`[data-draft="${CSS.escape(key)}"]`).forEach((input) => { if (input !== event.target) input.value = event.target.value; });
   }
 });
@@ -843,14 +866,25 @@ root.addEventListener("click", async (event) => {
   try {
     if (action.startsWith("agent-")) await agentAction(b);
     else if (action === "speak-digest") await speech.toggle();
+    else if (action === "need-accept") {
+      state.drafts.set(`then-${number}`, "done");
+      state.drafts.set(`then-version-${number}`, Number(b.dataset.version));
+      root.querySelectorAll(`[data-draft="then-${number}"]`).forEach((input) => { input.value = "done"; });
+      location.hash = `#/card/${number}`;
+    } else if (action === "need-approve" || action === "need-reject") await approveProposal(number, Number(b.dataset.version), action === "need-approve");
+    else if (action === "need-requeue" || action === "need-reassign") {
+      const card = { ...findCard(number), number, version: Number(b.dataset.version) };
+      handoffForm(card, { to: action === "need-requeue" ? "anyone" : "", connectionsOnly: action === "need-reassign" });
+    } else if (action === "need-park") await mutate(`card-${number}`, () => api(`/api/cards/${number}`, { method: "PATCH", body: { version: Number(b.dataset.version), status: "backlog" } }));
     else if (action === "decide") {
       const reply = state.drafts.get(`reply-${number}`);
-      await decide(number, { choice: b.dataset.choice, ...(reply ? { reply } : {}), then: state.drafts.get(`then-${number}`) || "return" }, b);
+      const version = Number(b.closest("[data-version]")?.dataset.version);
+      await decide(number, { choice: b.dataset.choice, ...(reply ? { reply } : {}), then: decisionThen(number, version) }, b);
     } else if (action === "move") await move(number, b.dataset.status);
     else if (action === "panel-move") {
       const status = root.querySelector("#card-status").value;
       if (status === "review") reviewForm(); else await move(state.card.number, status);
-    } else if (action === "approve-proposal" || action === "reject-proposal") await mutate(`card-${state.card.number}`, () => api(`/api/cards/${state.card.number}/approve`, { method: "POST", body: { approve: action === "approve-proposal", version: state.card.version } }));
+    } else if (action === "approve-proposal" || action === "reject-proposal") await approveProposal(state.card.number, state.card.version, action === "approve-proposal");
     else if (action === "children-toggle") {
       const card = findCard(number);
       if (!card) return;
@@ -882,7 +916,7 @@ root.addEventListener("click", async (event) => {
       else root.querySelector("#card-panel").hidden = true;
     } else if (action === "new-card") newCardForm();
     else if (action === "edit-card") newCardForm(state.card);
-    else if (action === "handoff") handoffForm();
+    else if (action === "handoff") handoffForm(state.card);
     else if (action === "new-board") {
       const panel = root.querySelector("#card-panel"); panel.hidden = false;
       panel.innerHTML = '<form class="form-tile" data-form="board"><h2>New space</h2><label>Name<input name="name" required maxlength="1000"></label><button class="blockbtn">Create</button><button type="button" class="opt" data-action="close-panel">Cancel</button></form>';
@@ -908,11 +942,18 @@ root.addEventListener("submit", async (event) => {
   if (form.dataset.form === "queue-reply") {
     const cardNumber = Number(form.dataset.card);
     const reply = queueDraft(cardNumber);
+    if (!reply.trim()) { showError("Enter a reply."); return; }
     state.drafts.set(`reply-${cardNumber}`, reply);
     queueApply({ type: "reply", reply });
     return;
   }
   const payload = data(form), kind = form.dataset.form;
+  if (kind === "reply" && !payload.reply?.trim()) { showError("Enter a reply."); return; }
+  if (kind === "handoff" && (!payload.note?.trim() || !payload.to?.trim())) { showError("Enter a recipient and a note."); return; }
+  if (kind === "handoff" && form.dataset.connectionsOnly === "true" && !/^conn:\S+$/.test(payload.to)) {
+    showError("Choose an agent using conn: followed by its name.");
+    return;
+  }
   const formKey = `form-${kind}-${form.dataset.card || ""}`;
   if (state.pending.has(formKey)) return;
   const submit = form.querySelector('button:not([type="button"])');
@@ -941,7 +982,7 @@ root.addEventListener("submit", async (event) => {
     });
     else if (kind === "edit-card") await mutate(`card-${state.card.number}`, () => api(`/api/cards/${state.card.number}`, { method: "PATCH", body: { ...payload, version: state.card.version } }));
     else if (kind === "review") await move(state.card.number, "review", { ...payload, options: payload.options.split("\n").map((v) => v.trim()).filter(Boolean) });
-    else if (kind === "handoff") await mutate(`card-${state.card.number}`, () => api(`/api/cards/${state.card.number}/handoff`, { method: "POST", body: { ...payload, options: payload.options.split(",").map((s) => s.trim()).filter(Boolean) } }));
+    else if (kind === "handoff") await mutate(`card-${Number(form.dataset.card)}`, () => api(`/api/cards/${Number(form.dataset.card)}/handoff`, { method: "POST", body: { ...payload, version: Number(payload.version), options: payload.options.split(",").map((s) => s.trim()).filter(Boolean) } }));
     else if (kind === "board") await mutate("new-board", async () => {
       const slug = payload.name.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 100) || `space-${Date.now().toString(36)}`;
       await api("/api/boards", { method: "POST", body: { ...payload, slug } }); location.hash = `#/board/${enc(slug)}`;

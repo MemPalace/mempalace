@@ -7,7 +7,7 @@ const enc = encodeURIComponent;
 const BUCKETS = ["asks", "done_review", "backlog_from_agents", "ready_to_merge", "stale"];
 // The server's need order, with a stale claim slotted in after "ready to merge".
 const ORDER = ["you", "plan", "merge", "stale", "checks", "expired", "working", "idle", "done"];
-const LABELS = { you: "Needs you", plan: "Plan to approve", merge: "Ready to merge", stale: "Stale", checks: "Checks running", working: "Working", expired: "Expired", idle: "Idle", done: "Done", quiet: "Quiet" };
+const LABELS = { you: "Needs you", plan: "Plan to approve", merge: "Ready to merge", stale: "Stuck", checks: "Checks running", working: "Working", expired: "Expired", idle: "Idle", done: "Done", quiet: "Quiet" };
 const rank = (state) => (ORDER.includes(state) ? ORDER.indexOf(state) : ORDER.indexOf("idle"));
 const staleSet = (needs) => new Set((needs.stale || []).map((c) => c.number));
 const stateOf = (card, stale) => (stale.has(card.number) && rank(card.need) > rank("stale") ? "stale" : card.need);
@@ -20,17 +20,18 @@ export function needItems(needs) {
     if (!byNumber.has(card.number)) byNumber.set(card.number, { card, buckets: new Set() });
     byNumber.get(card.number).buckets.add(key);
   }
-  const asked = ({ card, buckets }) => Boolean(card.ask) && (buckets.has("asks") || buckets.has("done_review"));
+  const asked = ({ buckets }) => buckets.has("asks") || buckets.has("done_review");
   const key = (item) => (asked(item) ? 0 : Math.max(0, ["you", "plan", "merge", "checks", "expired", "working", "idle", "done"].indexOf(item.card.need)));
   return [...byNumber.values()]
     .sort((a, b) => key(a) - key(b) || a.card.number - b.card.number)
-    .map((item) => ({ card: item.card, reason: reason(item, asked(item)) }));
+    .map((item) => ({ ...item, reason: reason(item, asked(item)) }));
 }
 function reason({ card, buckets }, asked) {
-  if (asked) return `asks: ${card.ask.split("\n")[0]}`;
+  if (card.why != null) return card.why;
+  if (asked && card.ask) return `asks: ${card.ask.split("\n")[0]}`;
   if (card.need === "plan") return "plan to approve";
-  if (card.need === "merge" || buckets.has("ready_to_merge")) return "ready to merge";
-  if (buckets.has("stale")) return "claim went stale";
+  if (card.need === "merge") return "ready to merge";
+  if (buckets.has("stale")) return "stopped checking in and has no available supervisor";
   if (buckets.has("backlog_from_agents")) return "filed by an agent";
   return LABELS[card.need] || "";
 }
@@ -44,8 +45,21 @@ function action(card, state) {
     const href = pullRequestUrl(card);
     return href ? `<a class="opt" href="${e(href)}" target="_blank" rel="noopener noreferrer">Merge</a>` : open("Merge");
   }
-  if (state === "stale") return `<button class="opt" data-action="move" data-card="${card.number}" data-status="todo">Retake</button>`;
+  if (state === "stale") return open("Unblock");
   return "";
+}
+
+function needActions(card, buckets) {
+  const labels = { accept: "Accept", approve: "Approve", reject: "Reject", requeue: "Requeue", reassign: "Reassign", park: "Park" };
+  const actions = (card.actions || []).map((action) => {
+    if (action === "answer") return `<a class="opt" href="${askedLink(card, buckets)}">Answer</a>`;
+    if (action === "open_pr") {
+      const href = pullRequestUrl(card);
+      return href ? `<a class="opt" href="${e(href)}" target="_blank" rel="noopener noreferrer">Open PR</a>` : "";
+    }
+    return labels[action] ? `<button class="opt" data-action="need-${action}" data-card="${card.number}" data-version="${e(card.version)}">${labels[action]}</button>` : "";
+  }).join("");
+  return actions ? `<div class="opts" style="grid-column:2 / -1;flex-wrap:wrap">${actions}</div>` : "";
 }
 
 function needBox(items, selected, speak, dot, answer) {
@@ -54,10 +68,10 @@ function needBox(items, selected, speak, dot, answer) {
   const speakBtn = speak ? '<button class="opt speak" data-action="speak-digest" aria-controls="digest-captions">Speak</button>' : "";
   const answerBtn = answer ? '<a class="opt go answer" href="#/decide">Answer</a>' : "";
   const actions = answerBtn || speakBtn ? `<div class="need-actions">${answerBtn}${speakBtn}</div>` : "";
-  return `<section class="needbox ${count ? "waiting" : ""}" aria-labelledby="needbox-title"><header><h2 id="needbox-title">${heading}</h2>${actions}</header><div id="digest-captions" class="digest-captions" role="region" aria-label="Spoken digest" hidden></div>${count ? `<ol>${items.map(({ card, reason: why }) => `<li class="nline ${card.number === selected ? "sel" : ""}" data-row="${card.number}" data-key="${card.number}" tabindex="-1">${dot(card)}<a class="tt" href="${askedLink(card, why)}">${e(card.title)}</a><span class="why">${e(why)}</span></li>`).join("")}</ol>` : ""}</section>`;
+  return `<section class="needbox ${count ? "waiting" : ""}" aria-labelledby="needbox-title"><header><h2 id="needbox-title">${heading}</h2>${actions}</header><div id="digest-captions" class="digest-captions" role="region" aria-label="Spoken digest" hidden></div>${count ? `<ol>${items.map(({ card, buckets, reason: why }) => `<li class="nline ${card.number === selected ? "sel" : ""}" data-row="${card.number}" data-key="${card.number}" tabindex="-1">${dot(card)}<a class="tt" href="${askedLink(card, buckets)}">${e(card.title)}</a><span class="why">${e(why)}</span>${needActions(card, buckets)}</li>`).join("")}</ol>` : ""}</section>`;
 }
-function askedLink(card, why) {
-  return why.startsWith("asks: ") ? `#/decide/${card.number}` : `#/card/${card.number}`;
+function askedLink(card, buckets) {
+  return buckets.has("asks") && !buckets.has("done_review") ? `#/decide/${card.number}` : `#/card/${card.number}`;
 }
 
 function spaces(boards, open, items, stale, dot) {

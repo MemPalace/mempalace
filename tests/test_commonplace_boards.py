@@ -21,7 +21,7 @@ from tests._commonplace_helpers import (
 )
 
 CARD_KEYS = set(
-    "review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id".split()
+    "review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number pr_state pr_head pr_reported_at checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id".split()
 )
 
 
@@ -545,7 +545,10 @@ def test_restricted_origin_backlog_requires_person_release(hub, env, origin, ope
     assert not mcp(hub, trusted_token, name, task=number, **args)[0]
     assert owner.task_show(number) == before
     assert events.after(hub.db, hub.workspace) == emitted
-    assert number in {c["number"] for c in owner.needs_me()["backlog_from_agents"]}
+    assert all(
+        number not in {c["number"] for c in owner.needs_me()[bucket]}
+        for bucket in ("asks", "done_review", "backlog_from_agents", "ready_to_merge", "stale")
+    )
     _token, standard, picker = board_agent(hub, trust="standard")
     assert picker.task_take_next(board="work") is None
     assert worker.task_take_next(board="work") is None
@@ -895,7 +898,7 @@ def test_needs_me_keeps_owner_access_and_adds_trusted_members(
     assert asked["number"] in {item["number"] for item in owner.needs_me()["asks"]}
 
 
-def test_needs_me_member_filters_asks_by_user_and_other_buckets_by_wing(hub, env):
+def test_needs_me_member_filters_asks_by_user_and_other_buckets_by_wing(hub, env, monkeypatch):
     _token, agent, _person, _cookie, owner = env
     worker = service(hub, agent)
     _token, member, reader = board_agent(hub, member=True, scopes=["memory:read"])
@@ -917,30 +920,31 @@ def test_needs_me_member_filters_asks_by_user_and_other_buckets_by_wing(hub, env
         context=REVIEW_CONTEXT,
         options=REVIEW_OPTIONS,
     )
-    backlog = worker.task_add(board="work", title="Agent backlog", status="backlog")
+    worker.task_add(board="work", title="Agent backlog", status="backlog")
     ready = worker.task_add(board="work", title="Ready and stale")
     worker.task_take_next(task=ready["number"])
-    worker.task_update(ready["number"], pr=8, checks="passing")
+    ready = worker.task_update(ready["number"], pr=8, checks="passing")
     with owner.store.transaction() as conn:
         conn.execute("UPDATE tasks SET review_kind='completion' WHERE id=?", (done["number"],))
         conn.execute(
             "UPDATE tasks SET ask_to=? WHERE id IN (?,?)",
             (f"user:{member.user_id}", addressed["number"], done["number"]),
         )
-        conn.execute(
-            "UPDATE tasks SET heartbeat_at='2000-01-01T00:00:00Z' WHERE id=?", (ready["number"],)
-        )
     owner.board_add(slug="hidden", wing="private.hidden")
     worker.task_add(board="hidden", title="Hidden backlog", status="backlog")
+    from tests.test_commonplace_needs_me_human_only import clock
+
+    clock(monkeypatch, ready["claim_until"])
     result = reader.needs_me()
     assert {key: {c["number"] for c in result[key]} for key in result if key != "count"} == {
         "asks": {addressed["number"]},
         "done_review": {done["number"]},
-        "backlog_from_agents": {backlog["number"]},
-        "ready_to_merge": {ready["number"]},
-        "stale": {ready["number"]},
+        "backlog_from_agents": set(),
+        "ready_to_merge": set(),
+        "stale": set(),
     }
-    assert result["count"] == 4
+    assert result["count"] == 2
+    assert all(item["actions"] == [] for key in ("asks", "done_review") for item in result[key])
 
 
 @pytest.mark.parametrize("scopes", [[], ["memory:write"], ["memory:read"]])
@@ -1244,8 +1248,8 @@ def test_inbox_agent_can_create_and_claim_without_triage(hub, env, trust):
     assert owner.task_show(created["number"])["status"] == "done"
 
 
-def test_needs_me_buckets_and_owner_only(hub, env):
-    token, agent, person, _cookie, owner = env
+def test_needs_me_buckets_and_owner_only(hub, env, monkeypatch):
+    token, agent, person, cookie, owner = env
     worker = service(hub, agent)
     ask = worker.ask(
         "Choose? Which approach should we take?",
@@ -1259,23 +1263,50 @@ def test_needs_me_buckets_and_owner_only(hub, env):
     worker.task_take_next(task=done["number"])
     done = worker.task_update(done["number"], status="done")
     assert "ready to accept?" in done["ask"] and len(done["ask_options"]) == 2
-    backlog = worker.task_add(title="Triage", board="work", status="backlog")
+    worker.task_add(title="Triage", board="work", status="backlog")
     ready = worker.task_add(title="Ready", board="work")
     worker.task_take_next(task=ready["number"])
     ready = worker.task_update(ready["number"], pr=42, checks="passing")
+    # Park the legacy ready card before the shared clock can classify it as stuck.
+    assert (
+        api(
+            hub,
+            cookie,
+            "PATCH",
+            f"/api/cards/{ready['number']}",
+            {"version": ready["version"], "status": "backlog"},
+        )[0]
+        == 200
+    )
+    merge = worker.task_add(title="Merge ask", board="work")
+    worker.task_take_next(task=merge["number"])
+    worker.task_update(merge["number"], pr=43, checks="passing", pr_state="open", pr_head="a" * 40)
+    worker.task_handoff(
+        merge["number"],
+        to="owner",
+        note=REVIEW_QUESTION,
+        context=REVIEW_CONTEXT,
+        options=REVIEW_OPTIONS,
+    )
+    stuck = worker.task_add(title="Stuck work", board="work")
+    stuck = worker.task_take_next(task=stuck["number"])
+    from tests.test_commonplace_needs_me_human_only import clock
+
     with owner.store.transaction() as conn:
         conn.execute(
-            "UPDATE tasks SET heartbeat_at='2000-01-01T00:00:00Z' WHERE id=?", (ready["number"],)
+            "UPDATE tasks SET claim_until='2000-01-01T00:00:00Z' WHERE id=?", (stuck["number"],)
         )
+    stuck = owner.task_show(stuck["number"])
+    clock(monkeypatch, stuck["claim_until"])
     result = needs_me(owner.store, person)
-    assert {c["number"] for c in result["asks"]} == {ask["number"]}
+    assert {c["number"] for c in result["asks"]} == {ask["number"], merge["number"]}
     assert {c["number"] for c in result["done_review"]} == {done["number"]}
-    assert {c["number"] for c in result["backlog_from_agents"]} == {backlog["number"]}
-    assert {c["number"] for c in result["ready_to_merge"]} == {ready["number"]}
-    assert {c["number"] for c in result["stale"]} == {ready["number"]}
+    assert result["backlog_from_agents"] == []
+    assert {c["number"] for c in result["ready_to_merge"]} == {merge["number"]}
+    assert {c["number"] for c in result["stale"]} == {stuck["number"]}
     assert result["count"] == 4
     assert all(
-        set(c) == CARD_KEYS
+        set(c) == CARD_KEYS | {"why", "actions"}
         for bucket in result.values()
         if isinstance(bucket, list)
         for c in bucket

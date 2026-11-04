@@ -120,9 +120,9 @@ def test_endpoint_and_mcp_scoped_verbatim(hub, env):  # noqa: F811
         "digest-reader", profile="full", scopes=["memory:read"], read_wings=["shared"]
     )
     expected = worker.needs_me(format="digest")
-    assert expected["count"] == 4  # Includes the secret for the unrestricted owner.
+    assert expected["count"] == 2  # Includes the secret for the unrestricted owner.
     status, payload = api(hub, scoped, "GET", "/api/needs-me/digest")
-    assert status == 200 and payload["count"] == 3
+    assert status == 200 and payload["count"] == 1
     assert payload["items"][0] == item(asked["number"], title, need="idle")
     assert "SECRET CANARY" not in json.dumps(payload)
     assert "Another person's question" not in json.dumps(payload)
