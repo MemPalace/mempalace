@@ -573,9 +573,12 @@ fresh_backend.close()
 assert key in _inproc_sqlite._anchors or key in _inproc_sqlite._holders
 orphan_collection = orphan = None
 gc.collect()
-chroma._drain_pending_guard_releases(palace_path=path)
-assert key not in _inproc_sqlite._anchors
-assert key not in _inproc_sqlite._holders
+# The worker removes pending entries before releasing guards under this lock.
+# Wait for an in-flight release even when the pending set is already empty.
+with _inproc_sqlite.palace_db_lock(key):
+    chroma._drain_pending_guard_releases(palace_path=path)
+    assert key not in _inproc_sqlite._anchors
+    assert key not in _inproc_sqlite._holders
 backend.close()
 """,
     )
