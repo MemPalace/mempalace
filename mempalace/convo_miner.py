@@ -830,29 +830,34 @@ def mine_convos(
     MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
     governs both this path and the project-file miner in `miner.py`.
     """
-    if dry_run:
-        return _mine_convos_impl(
-            convo_dir,
-            palace_path,
-            wing=wing,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            extract_mode=extract_mode,
-            include_subagents=include_subagents,
-        )
+    from .miner import _cleanup_mine_pid_file
 
-    with mine_palace_lock(palace_path):
-        return _mine_convos_impl(
-            convo_dir,
-            palace_path,
-            wing=wing,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            extract_mode=extract_mode,
-            include_subagents=include_subagents,
-        )
+    try:
+        if dry_run:
+            return _mine_convos_impl(
+                convo_dir,
+                palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                extract_mode=extract_mode,
+                include_subagents=include_subagents,
+            )
+
+        with mine_palace_lock(palace_path):
+            return _mine_convos_impl(
+                convo_dir,
+                palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                extract_mode=extract_mode,
+                include_subagents=include_subagents,
+            )
+    finally:
+        _cleanup_mine_pid_file()
 
 
 def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None):

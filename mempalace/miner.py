@@ -2038,36 +2038,39 @@ def mine(
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
     """
-    if dry_run:
-        return _mine_impl(
-            project_dir,
-            palace_path,
-            wing_override=wing_override,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            files=files,
-            max_chunks_per_file=max_chunks_per_file,
-        )
+    try:
+        if dry_run:
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+                max_chunks_per_file=max_chunks_per_file,
+            )
 
-    # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
-    # message and exit non-zero. In-process callers (tests, library users) that
-    # expect to coexist with another writer should handle the exception.
-    with mine_palace_lock(palace_path):
-        return _mine_impl(
-            project_dir,
-            palace_path,
-            wing_override=wing_override,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            files=files,
-            max_chunks_per_file=max_chunks_per_file,
-        )
+        # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
+        # message and exit non-zero. In-process callers (tests, library users) that
+        # expect to coexist with another writer should handle the exception.
+        with mine_palace_lock(palace_path):
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+                max_chunks_per_file=max_chunks_per_file,
+            )
+    finally:
+        _cleanup_mine_pid_file()
 
 
 def _mine_impl(
@@ -2393,6 +2396,109 @@ def _cleanup_mine_pid_file() -> None:
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
         pass
+
+
+_HOOK_MINE_EXIT_GRACE_SECONDS = 60.0
+_HOOK_MINE_EXIT_GRACE_ENV = "MEMPALACE_HOOK_MINE_EXIT_GRACE_SECONDS"
+_ACTIVE_EXIT_WATCHDOG = None
+
+
+class _HookMineExitWatchdog:
+    """Handle for a daemon watchdog thread waiting on interpreter shutdown."""
+
+    def __init__(self, thread, cancelled) -> None:
+        self.thread = thread
+        self._cancelled = cancelled
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+
+def _hook_mine_exit_grace_seconds() -> float:
+    raw = os.environ.get(_HOOK_MINE_EXIT_GRACE_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return float(_HOOK_MINE_EXIT_GRACE_SECONDS)
+
+
+def _arm_hook_mine_exit_watchdog(exit_code: int = 0) -> Optional[_HookMineExitWatchdog]:
+    """Bound interpreter shutdown for hook-spawned mine subprocesses.
+
+    Hook-spawned mines inherit ``MEMPALACE_MINE_PID_FILE`` in their
+    environment. Once the mine body returns or raises, non-daemon worker
+    threads or ``atexit`` callbacks inside native runtime dependencies can
+    stall ``Py_FinalizeEx`` indefinitely while holding the per-target PID
+    slot. Clearing the PID slot immediately and arming a shutdown-triggered
+    daemon watchdog leaves normal runs and in-process callers untouched while
+    guaranteeing wedged shutdowns log thread stacks and exit with ``exit_code``.
+
+    Manual ``mempalace mine`` invocations do not set ``MEMPALACE_MINE_PID_FILE``
+    and return ``None`` without starting a thread.
+    """
+    global _ACTIVE_EXIT_WATCHDOG
+
+    if not os.environ.get("MEMPALACE_MINE_PID_FILE"):
+        return None
+
+    _cleanup_mine_pid_file()
+
+    if _ACTIVE_EXIT_WATCHDOG is not None:
+        _ACTIVE_EXIT_WATCHDOG.cancel()
+
+    import atexit
+    import faulthandler
+    import threading
+
+    grace = _hook_mine_exit_grace_seconds()
+    code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else 1
+    shutdown_started = threading.Event()
+    cancelled = threading.Event()
+
+    def _mark_shutting_down() -> None:
+        shutdown_started.set()
+
+    register_threading_atexit = getattr(threading, "_register_atexit", None)
+    if callable(register_threading_atexit):
+        try:
+            register_threading_atexit(_mark_shutting_down)
+        except RuntimeError:
+            shutdown_started.set()
+    atexit.register(_mark_shutting_down)
+
+    def _watchdog_worker() -> None:
+        shutdown_started.wait()
+        if cancelled.wait(timeout=grace):
+            return
+        _cleanup_mine_pid_file()
+        try:
+            sys.stderr.write(
+                f"\n[mempalace] Hook mine shutdown exceeded {grace:g}s grace period; "
+                f"dumping thread stacks and forcing exit ({code}).\n"
+            )
+            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        except Exception:
+            pass
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(code)
+
+    worker = threading.Thread(
+        target=_watchdog_worker,
+        name="mempalace-hook-mine-exit-watchdog",
+        daemon=True,
+    )
+    worker.start()
+    handle = _HookMineExitWatchdog(worker, cancelled)
+    _ACTIVE_EXIT_WATCHDOG = handle
+    return handle
 
 
 def _compute_topic_tunnels_for_wing(wing: str, config=None) -> int:
