@@ -633,6 +633,42 @@ def test_anthropic_no_key_raises_on_classify(monkeypatch):
         p.classify("s", "u")
 
 
+def test_anthropic_max_tokens_defaults_and_override():
+    """The request must carry the configured budget, not a fixed 2048 (#2940)."""
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["body"] = json.loads(req.data)
+        return _mock_anthropic_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = AnthropicProvider(model="claude-sonnet-4-5", api_key="sk-ant")
+        p.external_use_accepted = True
+        p.classify("s", "u")
+    assert captured["body"]["max_tokens"] == 2048
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = AnthropicProvider(model="claude-sonnet-4-5", api_key="sk-ant", max_tokens=16000)
+        p.external_use_accepted = True
+        p.classify("s", "u")
+    assert captured["body"]["max_tokens"] == 16000
+
+
+def test_anthropic_max_tokens_stop_reason_raises_a_clear_error():
+    """A truncated answer should say the budget was hit, not surface as broken JSON (#2940)."""
+    mock = MagicMock()
+    payload = {"content": [{"type": "text", "text": '{"a": 1'}], "stop_reason": "max_tokens"}
+    mock.read.return_value = json.dumps(payload).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        p = AnthropicProvider(model="claude-sonnet-4-5", api_key="sk-ant")
+        p.external_use_accepted = True
+        with pytest.raises(LLMError, match="truncated"):
+            p.classify("s", "u")
+
+
 # ── is_external_service property (issue #24 — privacy warning support) ──
 #
 # `is_external_service` is True when this provider's endpoint sends data
