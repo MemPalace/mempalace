@@ -347,7 +347,8 @@ def test_121st_write_waits_for_oldest_slot_then_recovers(setup):
     # A new process cannot evade the budget through an empty in-memory bucket.
     session = sync_daemon._Session(config, state, plans._now, Hub())
     assert not session._budget(TOKEN_ENV["claude-code"])
-    assert state.next_due(session.key) == now[0] + 3600
+    assert state.next_due(session.key + ":writes:" + TOKEN_ENV["claude-code"]) == now[0] + 3600
+    assert state.next_due(session.key) == 0
     assert not state.feeds
     now[0] += 3600
     assert session._budget(TOKEN_ENV["claude-code"])

@@ -240,14 +240,14 @@ class _Session:
             if used < BACKFILL_WRITES:
                 extra_due = self.state.next_due(self.bkey + "-next")
                 if extra_due > now and not retry:
-                    self.state.defer(self.key, min(due, extra_due))
+                    self.state.defer(key, min(due, extra_due))
                     return False
                 self.state.defer(self.bkey, used + 1)
                 if not retry:
                     self.state.defer(self.bkey + "-next", now + LIVE_TICK_SECONDS)
                 return True
             self.backfill = False
-        self.state.defer(self.key, due)
+        self.state.defer(key, due)
         return False
 
     def cycle(self, *, once=False):
@@ -280,18 +280,24 @@ class _Session:
                 return failed
             if not once and self.state.next_due(self.key) > self.now():
                 return failed
-            op = ops[0]
-            try:
-                body = self.sources.body(op)
-            except self.sources.SliceConflict:
-                self._status(op, "conflict")
-                failed = 1
-                continue
-            env_name = TOKEN_ENV[op.source]
-            token = self.tokens.get(env_name)
-            if not token:
-                raise ConfigError("Missing sync token environment variable")
-            if not self._budget(env_name):
+            blocked = set()
+            for op in ops:
+                env_name = TOKEN_ENV[op.source]
+                if env_name in blocked:
+                    continue
+                token = self.tokens.get(env_name)
+                if not token:
+                    raise ConfigError("Missing sync token environment variable")
+                try:
+                    body = self.sources.body(op)
+                except self.sources.SliceConflict:
+                    self._status(op, "conflict")
+                    failed = 1
+                    continue
+                if self._budget(env_name):
+                    break
+                blocked.add(env_name)
+            else:
                 return failed
             self.state.outbox_attempt(op.op_id)
             route = "/api/capture" if op.kind == "capture" else "/api/import"
@@ -299,7 +305,7 @@ class _Session:
                 status, payload = self.transport(self.target, token, "POST", route, body)
                 if status == 400 and op.kind == "capture" and "client_op_id" in body:
                     if not self._budget(env_name, retry=True):
-                        return failed
+                        continue
                     legacy = {k: v for k, v in body.items() if k != "client_op_id"}
                     status, payload = self.transport(self.target, token, "POST", route, legacy)
             except (OSError, http.client.HTTPException, ValueError):
@@ -394,7 +400,14 @@ def run(config, state, *, clock, sleep, transport, once=False, stop=None) -> int
                     min(
                         (
                             due
-                            for due in (session.next_poll, state.next_due(session.key))
+                            for due in (
+                                session.next_poll,
+                                state.next_due(session.key),
+                                *(
+                                    state.next_due(session.key + ":writes:" + env_name)
+                                    for env_name in session.tokens
+                                ),
+                            )
                             if due > session.now()
                         ),
                         default=session.now() + LIVE_TICK_SECONDS,

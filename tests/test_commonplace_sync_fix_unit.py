@@ -89,6 +89,51 @@ def run(local, hub, *, continuous=False):
     )
 
 
+@pytest.mark.parametrize("once", [False, True], ids=["continuous", "once"])
+def test_exhausted_token_does_not_block_import_or_codex(local, once):
+    config, state, root = local
+    for sid in ("a-blocked", "b-blocked"):
+        (root / f"{sid}.jsonl").write_bytes(record(sid))
+    codex = root.parent / "codex"
+    codex.mkdir()
+    (codex / "session.jsonl").write_text(
+        json.dumps({"type": "session_meta", "payload": {"id": "codex-session"}}) + "\n"
+    )
+    config["sources"].append({"source": "codex", "root": str(codex)})
+    notes = root.parent / "notes"
+    notes.mkdir()
+    note = notes / "memory.md"
+    note.write_text("Synthetic verbatim memory.\n")
+    os.utime(note, (NOW - 120, NOW - 120))
+    config["memories"] = [{"label": "notes", "root": str(notes)}]
+    config["tokens"] = {env: "synthetic-" + source for source, env in TOKEN_ENV.items()}
+    hub = Hub()
+
+    def transport(target, token, method, route, body=None):
+        if method == "POST":
+            assert token == config["tokens"][TOKEN_ENV[body["source"]]]
+        return hub(target, token, method, route, body)
+
+    active = sync_daemon._Session(config, state, lambda: NOW, transport)
+    # Exercise steady-state exhaustion, without the first-sync backfill allowance.
+    state.defer(active.bkey + "-done", NOW)
+    for _ in range(sync_daemon.WRITE_BUDGET[0]):
+        assert active._budget(TOKEN_ENV["claude-code"])
+    assert active.cycle(once=once) == 0
+    assert [body["source"] for body in hub.posts] == ["codex", "native-memory"]  # RED
+    pending = state.outbox_pending()
+    assert [op.native_id for op in pending] == ["a-blocked", "b-blocked"]
+    assert all(op.attempts == 0 for op in pending)
+    assert state.next_due(active.key) == 0
+
+    # Reopening the session preserves the budget and the order within its token.
+    state.defer(active.key + ":writes:" + TOKEN_ENV["claude-code"] + ":0", NOW)
+    active = sync_daemon._Session(config, state, lambda: NOW, transport)
+    assert active.cycle(once=once) == 0
+    assert hub.posts[-1]["thread_id"] == "a-blocked"
+    assert [op.native_id for op in state.outbox_pending()] == ["b-blocked"]
+
+
 def test_fix1_default_install_syncs_available_source(tmp_path, monkeypatch):
     home = tmp_path / "home"
     root = home / ".claude/projects"
