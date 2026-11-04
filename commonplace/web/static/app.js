@@ -28,6 +28,7 @@ const state = {
   chat: [], linked: [], chatBoard: null, chatCursor: 0, spaceTab: "chat", chatTasks: new Map(),
   chatHasMore: false, chatLoading: false, chatObserver: null, chatVisible: new Set(), chatTaskRequests: new Map(),
   toggled: new Set(), expandedChildren: new Set(), rulesWaiting: 0,
+  phonePushPending: false,
   queue: null, pollFails: 0, queueFocus: "", queueShownAt: 0, queueField: false, queueDirty: false,
 };
 const statuses = ["backlog", "todo", "doing", "review", "done"];
@@ -187,7 +188,7 @@ async function signin(code = null) {
   const value = cookie ? cookie.slice("cmmn_via=".length) : "";
   const via = /^[a-z]{1,20}$/.test(value) ? value : "";
   if (code !== null) state.error = signinMessage(code, paused, via);
-  const path = location.pathname + location.hash;
+  const path = location.pathname + location.search + location.hash;
   root.innerHTML = signinView({ providers, paused, via, error: state.error, next: signinNext || (path === "/app/" ? "" : path) });
 }
 function shell() {
@@ -413,14 +414,48 @@ function handoffForm(card, prefill = {}) {
   const panel = root.querySelector("#card-panel"); panel.hidden = false;
   panel.innerHTML = `<form class="form-tile" data-form="handoff" data-card="${card.number}"${prefill.connectionsOnly ? ' data-connections-only="true"' : ""}><input type="hidden" name="version" value="${e(card.version)}"><h2>Hand off #${card.number}</h2><label>To<input name="to" value="${e(prefill.to || "")}"${prefill.connectionsOnly ? ' pattern="conn:.+" title="Use conn: followed by the agent name"' : ""} required></label><label>Note<textarea name="note" required></textarea></label><label>Context<textarea name="context">${e(card.status_line || card.body)}</textarea></label><label>Options<input name="options"></label><button class="blockbtn">Hand off</button><button class="opt" type="button" data-action="retry">Cancel</button></form>`;
 }
+function phonePushView(data) {
+  const home = "Phone notifications cover only your home workspace. Cards in other workspaces never notify this phone.";
+  const pause = "Notifications pause while you are signed out everywhere, including when a sign-in expires after 30 days. Nothing you miss is sent later.";
+  const off = '<button data-action="phone-push-off">Turn off</button>';
+  let body;
+  if (!data.available) body = `<p>${e("Not set up on this server.")}</p>${data.subscription ? off : ""}`;
+  else if (!data.subscription && !data.eligible) body = `<p>${e(home)}</p>`;
+  else if (!data.subscription) body = `<button data-action="phone-push-on">Turn on</button><p>${e(home)}</p><p>${e(pause)}</p>`;
+  else {
+    const status = data.test == null ? "" : data.test?.status === "accepted" ? "Accepted by your ntfy server" : data.test?.status === "pending" ? "Waiting" : "Not accepted";
+    body = `<p>Server: ${e(data.subscription.server)}</p><p>Topic: <span data-phone-push-topic>${e(data.subscription.topic)}</span> <button data-action="phone-push-copy">Copy</button></p><button data-action="phone-push-test">Test</button>${status ? `<p role="status">${e(status)}</p>` : ""}${off}<p>${e(home)}</p><p>${e(pause)}</p>`;
+  }
+  return `<section class="settings-section" id="phone-push"><h2>Phone notifications</h2>${body}</section>`;
+}
+async function phonePushAction(action) {
+  if (state.pending.has("phone-push")) return;
+  state.pending.add("phone-push");
+  root.querySelectorAll("#phone-push button").forEach((button) => { button.disabled = true; });
+  const epoch = state.screen;
+  try {
+    if (action === "phone-push-copy") {
+      await navigator.clipboard.writeText(root.querySelector("[data-phone-push-topic]").textContent);
+      return;
+    }
+    const method = action === "phone-push-off" ? "DELETE" : "POST";
+    const path = action === "phone-push-test" ? "/api/phone-push/test" : "/api/phone-push";
+    await api(path, { method, ...(method === "POST" ? { body: {} } : {}) });
+    if (state.me && epoch === state.screen) await settingsView(epoch);
+  } finally {
+    state.pending.delete("phone-push");
+    root.querySelectorAll("#phone-push button").forEach((button) => { button.disabled = false; });
+  }
+}
 async function settingsView(epoch) {
   title("Settings");
   const content = root.querySelector("#content");
   if (!content.querySelector(".settings")) content.innerHTML = message("Loading settings…");
-  const [connections, hooks, plan] = await Promise.allSettled([api("/api/connections"), api("/api/webhooks"), api("/api/plan")]);
+  const [connections, hooks, plan, phonePush] = await Promise.allSettled([api("/api/connections"), api("/api/webhooks"), api("/api/plan"), api("/api/phone-push")]);
   if (epoch !== state.screen) return;
   const saved = remember();
-  content.innerHTML = `<div class="settings">${plan.status === "fulfilled" ? planView(plan.value) : ""}${voice.settings()}${connections.status === "fulfilled" ? agentsView(connections.value) : `<section class="settings-section"><h2>Agents</h2>${message(connections.reason.message, true)}</section>`}<section class="settings-section"><h2>Webhooks</h2><div id="hook-secret"></div>${hooks.status === "fulfilled" ? (hooks.value.webhooks || []).map((h) => `<div class="setting-row"><span>${e(h.url)}<br><small>${e(h.id)}</small></span><button data-action="deliveries" data-hook="${e(h.id)}">Deliveries</button><button data-action="test-hook" data-hook="${e(h.id)}">Test</button><button data-action="remove-hook" data-hook="${e(h.id)}">Remove</button></div>`).join("") || message("No webhooks") : message(hooks.reason.message, true)}<form class="webhook-form" data-form="webhook"><input name="url" type="url" data-draft="webhook-url" aria-label="Webhook URL" required><input name="board" data-draft="webhook-board" aria-label="Board" placeholder="Board"><input name="waiting_on" data-draft="webhook-waiting" aria-label="Waiting on" placeholder="Waiting on"><select name="events" aria-label="Events" data-draft="webhook-events"><option value="*">All events</option><option value="review_needed">Review needed</option><option value="card_changed">Card changed</option><option value="waiting_on_me">Waiting on me</option></select><button class="blockbtn">Add</button></form><div id="deliveries"></div></section><section class="settings-section"><button class="opt" data-action="logout">Sign out</button></section></div>`;
+  state.phonePushPending = phonePush.status === "fulfilled" && phonePush.value.test?.status === "pending";
+  content.innerHTML = `<div class="settings">${plan.status === "fulfilled" ? planView(plan.value) : ""}${voice.settings()}${connections.status === "fulfilled" ? agentsView(connections.value) : `<section class="settings-section"><h2>Agents</h2>${message(connections.reason.message, true)}</section>`}${phonePush.status === "fulfilled" ? phonePushView(phonePush.value) : `<section class="settings-section" id="phone-push"><h2>Phone notifications</h2>${message(phonePush.reason.message, true)}</section>`}<section class="settings-section"><h2>Webhooks</h2><div id="hook-secret"></div>${hooks.status === "fulfilled" ? (hooks.value.webhooks || []).map((h) => `<div class="setting-row"><span>${e(h.url)}<br><small>${e(h.id)}</small></span><button data-action="deliveries" data-hook="${e(h.id)}">Deliveries</button><button data-action="test-hook" data-hook="${e(h.id)}">Test</button><button data-action="remove-hook" data-hook="${e(h.id)}">Remove</button></div>`).join("") || message("No webhooks") : message(hooks.reason.message, true)}<form class="webhook-form" data-form="webhook"><input name="url" type="url" data-draft="webhook-url" aria-label="Webhook URL" required><input name="board" data-draft="webhook-board" aria-label="Board" placeholder="Board"><input name="waiting_on" data-draft="webhook-waiting" aria-label="Waiting on" placeholder="Waiting on"><select name="events" aria-label="Events" data-draft="webhook-events"><option value="*">All events</option><option value="review_needed">Review needed</option><option value="card_changed">Card changed</option><option value="waiting_on_me">Waiting on me</option></select><button class="blockbtn">Add</button></form><div id="deliveries"></div></section><section class="settings-section"><button class="opt" data-action="logout">Sign out</button></section></div>`;
   restore(saved);
 }
 
@@ -864,7 +899,8 @@ root.addEventListener("click", async (event) => {
     return;
   }
   try {
-    if (action.startsWith("agent-")) await agentAction(b);
+    if (action.startsWith("phone-push-")) await phonePushAction(action);
+    else if (action.startsWith("agent-")) await agentAction(b);
     else if (action === "speak-digest") await speech.toggle();
     else if (action === "need-accept") {
       state.drafts.set(`then-${number}`, "done");
@@ -1105,6 +1141,15 @@ async function poll() {
     const feed = await api(`/api/events?after=${state.seq}`);
     if (!state.me) return;
     if (feed.events.length && await refresh({ background: true, events: feed.events }) === false) throw new Error("Refresh failed");
+    if (state.base === "#/settings" && state.phonePushPending) {
+      const epoch = state.screen;
+      const phonePush = await api("/api/phone-push");
+      if (state.me && epoch === state.screen && !state.pending.has("phone-push")) {
+        state.phonePushPending = phonePush.test?.status === "pending";
+        const section = root.querySelector("#phone-push");
+        if (section) section.outerHTML = phonePushView(phonePush);
+      }
+    }
     state.seq = feed.seq;
     retryDelay = 2000; state.pollError = false; state.pollFails = 0;
   } catch { state.pollError = true; state.pollFails += 1; retryDelay = Math.min(30000, retryDelay * 2); }
@@ -1137,7 +1182,16 @@ async function boot() {
   if (!state.me) return;
   shell(); void voice.load();
   if (!state.me) return;
+  let moved = false;
+  const params = new URLSearchParams(location.search);
+  if (/^#\/card\/[1-9]\d*$/.test(location.hash) && params.has("w")) {
+    moved = params.get("w") !== state.me.workspace;
+    params.delete("w");
+    const search = params.toString();
+    history.replaceState(history.state, "", `${location.pathname}${search ? `?${search}` : ""}${moved ? "#/" : location.hash}`);
+  }
   await route();
+  if (moved) showError("This card is in another workspace. Sign out, then sign in again to open it.");
   if (state.me) schedule(0);
 }
 boot();

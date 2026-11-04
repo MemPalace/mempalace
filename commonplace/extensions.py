@@ -35,6 +35,7 @@ MODULES = (
     "commonplace.skills",
     "commonplace.session",
     "commonplace.webhooks",
+    "commonplace.phone_push",
     "commonplace.oauth",
     "commonplace.web",
     "commonplace.voice",

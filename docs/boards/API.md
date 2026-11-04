@@ -92,7 +92,7 @@ When exactly one board is visible, `board` may be omitted. With several visible 
 
 Connection ancestry uses the existing nullable `connections.parent_id` foreign key (`token add --parent <connection>`). Authentication exposes `parent_agent`; cards expose the creator's `agent_parent`. A parent's card assigned to its active direct child is immediately ready; `claim=true` starts that child's claim. Self-created child cards instead have `status=backlog`, `proposal_status=pending`, `proposed_to=<direct parent>`, and the child as assignee. These fields are server-stamped, not client inputs. Agents cannot claim, promote, complete, or hand off pending/rejected proposals. Nested children require their direct parent's approval, not any ancestor's.
 
-`task_approve task=#n approve=true` moves a pending proposal to `todo`, reserved for the child. `approve=false` retains it in backlog as rejected and clears `approved_by`. Only the recorded direct parent or a signed-in workspace owner may decide. A signed-in owner may subsequently re-approve a rejected proposal or dismiss it to `done`; agents cannot reopen a rejection. The version can protect against stale approvals. Every decision records its actor in append-only history. For restricted-origin cards, `approved_by` records only an owner or trusted, unrestricted parent release; other parents still authorize the child's own work without releasing its origin. Stored release markers are checked against the authority's current workspace membership, activity and permissions, so old or revoked approvals cannot feed the ready queue or block later eligible work. Additive nullable columns preserve existing tasks, stamps, tokens and append-only history; no table rebuild or token policy rewrite is needed.
+`task_approve task=#n approve=true` moves a pending proposal to `todo`, reserved for the child. `approve=false` retains it in backlog as rejected and clears `approved_by`. Only the recorded direct parent or a signed-in workspace owner may decide. A signed-in owner may subsequently re-approve a rejected proposal; agents cannot reopen a rejection. The version can protect against stale approvals. Every decision records its actor in append-only history. For restricted-origin cards, `approved_by` records only an owner or trusted, unrestricted parent release; other parents still authorize the child's own work without releasing its origin. Stored release markers are checked against the authority's current workspace membership, activity and permissions, so old or revoked approvals cannot feed the ready queue or block later eligible work. Additive nullable columns preserve existing tasks, stamps, tokens and append-only history; no table rebuild or token policy rewrite is needed.
 
 ### task_heartbeat
 
@@ -231,6 +231,101 @@ An agent can also hand off a card it does not hold, but only from `todo`, only w
 on the boards the caller can see, each with its `need`, most urgent first (by
 `need`, then number). Cards are slim (no `body`, no share `url`). `limit`
 defaults to 200 (1 to 500); `total` counts them all. Home's task table reads it.
+
+### Phone notifications
+
+In Settings, a signed-in owner can turn on phone notifications for their home
+workspace. Members cannot opt in. All three categories are enabled together:
+
+| Category | When | Message |
+|---|---|---|
+| `needs_you` | An ask, completion review or agent backlog needs the owner | `#<n> needs you` |
+| `blocked` | A doing card is stale and has no supervisor route | `#<n> is blocked` |
+| `done` | A card naming the owner enters done | `#<n> is done` |
+
+Phone notifications cover only your home workspace. Cards in other workspaces never notify this phone.
+
+Only changes after you turn notifications on are sent.
+
+Notifications pause while you are signed out everywhere, including when a sign-in expires after 30 days. Nothing you miss is sent later.
+
+The pause applies when there is no live sign-in in the home workspace: new
+deliveries are suppressed and queued deliveries are cancelled. Changes during
+the pause are tracked so signing in does not replay them.
+
+A category that keeps applying pushes once; leaving and entering it again can
+push again. Your own card actions are silent; another owner's actions can notify
+you. Failing checks never push. Claim expiry with a supervisor route never
+pushes. `done` requires your user ID in `created_by`, `return_to`, `ask_to` or
+`assignee`, and a transition after opt-in. With `done_needs_review=1`, an agent's
+completion becomes `needs_you` instead of `done` (the default is `0`).
+
+These routes require a signed-in person, accept no query parameters or options,
+and use the caller's workspace. Request bodies must be absent or exactly `{}`;
+session writes use the normal same-origin protection.
+
+| Method and path | Response |
+|---|---|
+| `GET /api/phone-push` | 200 `{available, eligible, subscription, test}` |
+| `POST /api/phone-push` | 200, same shape; Turn on, or return the existing subscription |
+| `DELETE /api/phone-push` | 200 `{"ok":true}`; Turn off and cancel queued deliveries |
+| `POST /api/phone-push/test` | 202 `{"status":"pending"}`; enqueue `Test from Commonplace` on your own topic |
+
+`subscription` is `{server, topic, created_at}` or `null`; only your own active
+subscription is returned. `test` is `{status:"pending"|"accepted"|"not_accepted"}`
+or `null`. Turn on and Test return 409 if you are ineligible or the server is
+unconfigured. Turn off still works then; an already-off subscription returns
+404. A changing opt-in snapshot can return 503; retry Turn on. Re-enabling
+creates a new topic. Configure the phone's read access for that topic separately.
+
+With no `COMMONPLACE_NTFY_URL`, no thread or outbound call runs and
+`available` is false. See the [operator setup and activation checklist](../../deploy/PUBLIC.md#phone-notifications-optional)
+for configuration and device acceptance.
+
+#### Privacy and disclosure
+
+A notification that is already being sent when you turn this off can still arrive once.
+
+A retry after a sender crash can duplicate a notification. There is no
+exactly-once or receipt guarantee. “Accepted by your ntfy server” means a 2xx
+response with a valid message ID, not proof that the phone received it or that
+anyone tapped it.
+
+The configured ntfy server sees the topic, card number, category, timing, hub
+token's identity and opaque Click code. It keeps them for its own
+`cache-duration` (default 12 hours). No card title, body, ask text, `why`, email,
+slug, workspace name or actor is sent. A tap uses a permanent short link to open
+the card, with sign-in when needed. Test notifications have no Click link.
+
+The topic is a bearer-equivalent secret stored in plaintext in the control
+database and its backups. Protect both. Topics never appear in logs, errors,
+delivery rows or events.
+
+On iOS without an upstream, “delivery can take hours, depending on the state of the phone. If you are using your phone, it shouldn't take more than 20-30 minutes though.” Setting `upstream-base-url` would disclose the message ID and a topic hash to a third party (e.g. ntfy.sh); this feature never enables it.
+
+Use HTTPS for the ntfy server. Plain HTTP is accepted only for the local and
+private addresses the webhook URL rule allows, because the publisher token is
+sent with every message.
+
+#### Limits
+
+- `blocked` and `needs_you` changes without a card event are checked every five
+  minutes. Event-less `needs_you` waits for a sweep where the workspace's card
+  events are reconciled. Reconciliation catches up within one wake, releasing
+  the work lock between batches; there is no five-batch cap.
+- Event-less `needs_you` has no actor, so it can push even if you caused it by
+  revoking the agent that could approve a proposal. A sweep between a board
+  commit and its event emission can also push for your own action, at most once
+  per card.
+- An aborted batch retries from the same cursor on the next wake (a new event
+  or within five minutes); it is never skipped. A persistent evaluation error
+  stalls pushes and is logged. If event emission fails after a commit, `done`
+  is not seen; `needs_you` is found by the sweep.
+- A foreign-workspace tap asks you to sign out and sign in again for that
+  workspace. The next refresh can clear this notice.
+- Turn on can wait for reconciliation, a sweep or a delivery attempt in
+  progress. One attempt can wait up to five seconds for the ntfy server; no
+  overall wait bound is claimed. Turn off never waits for these operations.
 
 ### Spoken Needs you digest
 

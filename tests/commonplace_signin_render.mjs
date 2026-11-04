@@ -68,10 +68,10 @@ test("messages match the contract and unknown codes never get reflected", () => 
 });
 
 const settle = () => new Promise((resolve) => setImmediate(resolve));
-function app({ search = "", pathname = "/app/", hash = "", cookie = "", loadProviders = () => ({ providers }) } = {}) {
+function app({ search = "", pathname = "/app/", hash = "", cookie = "", loadProviders = () => ({ providers }), me, answers = {}, elements = {} } = {}) {
   const listeners = new Map(), rootListeners = new Map(), calls = [], replacements = [];
-  const voice = { resets: 0, stops: 0, reset() { this.resets++; }, stop() { this.stops++; } };
-  const root = { innerHTML: "", addEventListener: (name, handler) => rootListeners.set(name, handler), querySelector: () => null, querySelectorAll: () => [] };
+  const voice = { resets: 0, stops: 0, reset() { this.resets++; }, stop() { this.stops++; }, load() {} };
+  const root = { innerHTML: "", addEventListener: (name, handler) => rootListeners.set(name, handler), querySelector: (selector) => elements[selector] || null, querySelectorAll: () => [] };
   const location = { search, pathname, hash };
   const history = { state: { retained: true }, replaceState(state, unused, path) {
     replacements.push({ state, path });
@@ -80,7 +80,8 @@ function app({ search = "", pathname = "/app/", hash = "", cookie = "", loadProv
   } };
   const document = { cookie, querySelector: () => root, addEventListener: (name, handler) => listeners.set(name, handler) };
   const context = createContext({
-    document, location, history, URLSearchParams, signinView, signinMessage, e: escape,
+    document, location, history, URLSearchParams, signinView, signinMessage, e: escape, calls,
+    setPeople() {},
     window: { addEventListener() {} },
     digestSpeech: () => ({ stop() {} }),
     voiceInput: () => voice,
@@ -90,14 +91,17 @@ function app({ search = "", pathname = "/app/", hash = "", cookie = "", loadProv
       calls.push(path);
       if (path === "/app/logout") { assert.equal(voice.stops, 1); return {}; }
       if (path === "/api/me") {
+        if (me !== undefined) return me;
         listeners.get("session-expired")();
         throw Object.assign(new Error("Unauthorized"), { status: 401 });
       }
+      if (Object.hasOwn(answers, path)) return answers[path];
       assert.equal(path, "/app/auth/providers");
       return loadProviders();
     },
   });
-  runInContext(appSource, context);
+  const source = me === undefined ? appSource : appSource.replace("async function route() {", 'async function route() { calls.push("route:" + location.hash); return; } async function __route() {');
+  runInContext(source, context);
   return { root, calls, replacements, location, context, voice, expire: () => listeners.get("session-expired")(), logout: () => rootListeners.get("click")({ target: { closest: () => ({ dataset: { action: "logout" } }) } }) };
 }
 
@@ -248,4 +252,80 @@ test("boot resolves paused code after providers load and explicit errors win", a
   await settle();
   assert.ok(explicit.root.innerHTML.includes("Sign-in cancelled."));
   assert.doesNotMatch(explicit.root.innerHTML, /paused until/);
+});
+
+test("R1: sign-in preserves the tap workspace and card for every provider and email", async () => {
+  const next = "/app/?w=W#/card/5";
+  const page = app({ search: "?w=W", hash: "#/card/5" });
+  await settle();
+  assert.deepEqual(page.calls, ["/api/me", "/app/auth/providers"]);
+  for (const provider of providers) {
+    assert.ok(page.root.innerHTML.includes(`href="${provider.url}?next=${encodeURIComponent(next)}"`));
+  }
+  assert.ok(page.root.innerHTML.includes(`<input type="hidden" name="next" value="${escape(next)}">`));
+});
+
+async function tap(workspace) {
+  const error = { hidden: true, innerHTML: "" };
+  const page = app({ search: "?w=W", hash: "#/card/5", me: { workspace }, elements: { "#screen-error": error } });
+  await settle();
+  assert.ok(page.calls.includes("/api/me"));
+  assert.equal(page.calls.filter((call) => call.startsWith("route:")).length, 1);
+  return { ...page, error };
+}
+
+test("R2: a foreign workspace tap routes home and shows the notice after routing", async () => {
+  const page = await tap("W2");
+  assert.ok(page.calls.includes("route:#/"));
+  assert.equal(page.replacements.at(-1)?.path, "/app/#/");
+  assert.equal(page.error.hidden, false);
+  assert.ok(page.error.innerHTML.includes("This card is in another workspace. Sign out, then sign in again to open it."));
+});
+
+test("R3a: a matching workspace tap keeps the card route", async () => {
+  const page = await tap("W");
+  assert.ok(page.calls.includes("route:#/card/5"));
+});
+
+test("R3b: a matching workspace tap removes the workspace query", async () => {
+  const page = await tap("W");
+  assert.ok(page.calls.includes("route:#/card/5"));
+  assert.equal(page.replacements.at(-1)?.path, "/app/#/card/5");
+});
+
+test("R4: phone notifications render the four states with escaped values and acceptance labels", async () => {
+  const page = app();
+  await settle();
+  assert.equal(runInContext("typeof phonePushView", page.context), "function");
+  const view = (data) => {
+    page.context.phonePushData = data;
+    const html = runInContext("phonePushView(phonePushData)", page.context);
+    assert.doesNotMatch(html, /deliver|type="checkbox"|>Save<|needs_you|blocked|category/i);
+    return html;
+  };
+  const home = "Phone notifications cover only your home workspace. Cards in other workspaces never notify this phone.";
+  const pause = "Notifications pause while you are signed out everywhere, including when a sign-in expires after 30 days. Nothing you miss is sent later.";
+  const base = { available: true, eligible: true, subscription: null, test: null };
+  const attack = '<script>"&\'topic</script>';
+  const subscription = { server: `https://ntfy.example/${attack}`, topic: attack };
+  const unavailable = view({ ...base, available: false });
+  assert.ok(unavailable.includes("Not set up on this server."));
+  assert.doesNotMatch(unavailable, />Turn on<|>Turn off</);
+  const unavailableOn = view({ ...base, available: false, subscription });
+  assert.ok(unavailableOn.includes(">Turn off<"));
+  assert.doesNotMatch(unavailableOn, />Turn on<|>Test<|<script>/);
+  const ineligible = view({ ...base, eligible: false });
+  assert.ok(ineligible.includes(home));
+  assert.doesNotMatch(ineligible, />Turn on<|>Turn off</);
+  const off = view(base);
+  assert.ok(off.includes(">Turn on<"));
+  assert.ok(off.includes(pause));
+  assert.doesNotMatch(off, />Turn off</);
+  for (const [status, label] of [["accepted", "Accepted by your ntfy server"], ["pending", "Waiting"], ["not_accepted", "Not accepted"], [null, ""]]) {
+    const on = view({ ...base, subscription, test: status ? { status } : null });
+    for (const text of [escape(subscription.server), escape(subscription.topic), ">Test<", ">Turn off<", home, pause, label]) assert.ok(on.includes(text));
+    assert.equal((on.match(/>Copy</g) || []).length, 1);
+    assert.doesNotMatch(on, /<script>|>Turn on</);
+    if (status === null) assert.doesNotMatch(on, /role="status"|Not accepted|Waiting|Accepted by your ntfy server/);
+  }
 });

@@ -51,6 +51,55 @@ Provider registration and signup policy: [social sign-in setup](../commonplace/S
 
 OAuth issuer and every metadata URL then come from `https://cmmn.dev`; sign-in and app links from `https://app.cmmn.dev`. Existing tokens keep working. Short links retain the base URL used when they were created; links using a private host resolve only where that host is reachable.
 
+## Phone notifications (optional)
+
+Phone notifications are off unless the hub has valid configuration. With no
+`COMMONPLACE_NTFY_URL`, no dispatcher thread or outbound call runs. The owner
+must complete the checklist below before activating a real hub; agents do not
+provision or activate this service.
+
+| Variable | Value |
+|---|---|
+| `COMMONPLACE_NTFY_URL` | Self-hosted ntfy base, e.g. `https://ntfy.example`; no credentials, query, fragment, `;`, `@` or path beyond `/` |
+| `COMMONPLACE_NTFY_TOKEN` | Optional raw token matching `[A-Za-z0-9_-]{1,128}`; no `Bearer ` prefix, spaces or line breaks; hub only |
+| `COMMONPLACE_APP_URL` | Phone-reachable app base, e.g. `https://cp.example` |
+| `COMMONPLACE_AGENT_URL` | Phone-reachable short-link base, e.g. `https://cp.example` |
+
+The app and agent hosts must not be localhost, loopback or unspecified
+addresses. Use HTTPS for the ntfy server; plain HTTP is accepted only for the
+local and private addresses the webhook URL rule allows. Invalid configuration disables phone push and logs one
+fixed warning naming only the variable. Apply configuration in the hub's
+operator-owned environment and restart only after the activation approval.
+
+In Settings, signed-in owners opt in for their home workspace; members cannot.
+All three categories (`needs_you`, `blocked`, `done`) are enabled together.
+Read the [behavior, privacy disclosure and delivery limits](../docs/boards/API.md#phone-notifications)
+before activation. Server acceptance is separate from phone receipt.
+
+Record each item as a separate explicit owner act before device acceptance:
+
+- [ ] **O1 — Server.** Record the self-hosted ntfy version. Configure `auth-file`
+  (or `database-url`) authentication and `auth-default-access: deny-all`.
+- [ ] **O2 — Hub credential.** Create a dedicated non-admin ntfy user with only
+  `write-only` on `cp*`, no read access and no other topic under deny-all. A
+  token inherits the account's full authority; never use an admin or shared
+  account. The owner creates the user and token; agents create no user, ACL,
+  token or topic. Set `COMMONPLACE_NTFY_TOKEN` only on the hub.
+- [ ] **O3 — Phone read credential.** Give each person a separate non-admin user
+  with exact-topic read access. Name who provisions it after each Turn on
+  (the topic changes), and how it is revoked at Turn off.
+- [ ] **O4 — Activation.** Explicitly approve setting `COMMONPLACE_NTFY_URL` on
+  the real hub and any Caddy or DNS route.
+- [ ] **O5 — Product.** Confirm the built default, pause after sign-out or
+  session expiry, and home-workspace-only coverage. The pause default stands
+  until the owner answers. Choosing “keep pushing after sign-out” requires an
+  explicit product change before activation.
+- [ ] **O6 — iOS upstream.** Keep `upstream-base-url` unset unless the owner
+  approves the disclosure described in the privacy section.
+- [ ] **O7 — Device acceptance.** Verify one real needs-you, one blocked and one
+  done notification arrive, and a tap opens the right card. Record this
+  separately from server acceptance.
+
 ## Public surface
 
 - [ ] Every gateway route answers 401 without credentials, except: `/health`, `/healthz`, `/app/` static files, `/app/login`, `/app/auth/*`, `/s/<code>`, `/.well-known/*`, `/oauth/register|authorize|token|revoke` (test: `tests/test_commonplace_public_surface.py`).

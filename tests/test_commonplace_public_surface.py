@@ -64,6 +64,10 @@ EXACT = {
     ("DELETE", "/api/settings/handoff"): "authenticated",
     ("GET", "/app/settings/memory"): "public",
     ("POST", "/app/settings/memory"): "authenticated",
+    ("GET", "/api/phone-push"): "authenticated",
+    ("POST", "/api/phone-push"): "authenticated",
+    ("DELETE", "/api/phone-push"): "authenticated",
+    ("POST", "/api/phone-push/test"): "authenticated",
 }
 PREFIX = {
     ("POST", "/api/connections/"): "authenticated",
