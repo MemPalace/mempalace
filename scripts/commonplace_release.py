@@ -33,6 +33,7 @@ CHECKS = (
     "create_space",
     "agent_connection",
     "mcp_startup",
+    "grant_import_no_duplicates",
     "card_owner_decision",
     "memory_save_search",
     "rule_owner_acceptance",
@@ -47,6 +48,7 @@ CHECKS = (
 NO_SCREENSHOT_CHECKS = {
     "agent_connection",
     "mcp_startup",
+    "grant_import_no_duplicates",
     "wing_scope",
     "storage_limit",
     "voice_limit",
@@ -185,7 +187,7 @@ class Journey:
 
     async def check(self, name, action):
         row = self.report.results[name]
-        if name in {"mcp_startup", "wing_scope", "import_capture_raw_readback"}:
+        if name in {"mcp_startup", "wing_scope", "grant_import_no_duplicates"}:
             row.evidence_kind = "protocol assertions"
         try:
             detail = await asyncio.wait_for(action(), timeout=45)
@@ -292,6 +294,107 @@ class Journey:
             await tool(session, "rules_get", {"effective": True})
         self.values["startup"] = True
         return "Stock MCP SDK initialize returns rules; prescribed startup read fetches rules and exact memory"
+
+    async def grant_import_no_duplicates(self):
+        import httpx
+
+        self.need("signup")
+        connection = await api(
+            self.page,
+            "/api/connections",
+            "POST",
+            {"name": "release-import", "client": "generic", "import": True},
+            201,
+        )
+        token = connection.get("token", "")
+        require(token.startswith("cmmn_"), "Import connection omitted its one-time token")
+        identity = "release-import-" + secrets.token_hex(12)
+        words = "  café 🦉 " + identity + "\r\nKeep  every word.\t"
+        archive = (
+            json.dumps(
+                {
+                    "type": "user",
+                    "timestamp": "2026-01-01T12:00:00Z",
+                    "message": {"role": "user", "content": words},
+                },
+                ensure_ascii=False,
+            )
+            + "\r\n"
+        )
+        body = {
+            "source": "claude-code",
+            "threads": [{"thread_id": identity, "format": "claude-code", "transcript": archive}],
+        }
+        # Independent client: bearer requests must never inherit the person's cookies.
+        async with httpx.AsyncClient(trust_env=False, timeout=15) as bearer:
+            before = None
+            for attempt in range(2):
+                response = await bearer.post(
+                    self.instance.origin + "/api/import",
+                    json=body,
+                    headers={"Authorization": "Bearer " + token},
+                )
+                checked_json(response.status_code, None, "POST", "/api/import")
+                require(
+                    response.json()
+                    == {
+                        "source": "claude-code",
+                        "status": "completed",
+                        "processed": 1,
+                        "total": 1,
+                        "accepted": 1,
+                        "errors": 0,
+                        "facts": 0,
+                        "results": [
+                            {
+                                "index": 0,
+                                "thread_id": identity,
+                                "status": "accepted",
+                                "messages": 1,
+                                "source_bytes": len(archive.encode("utf-8")),
+                            }
+                        ],
+                    },
+                    "First import and exact own retry must return the documented accepted response",
+                )
+                listing = await api(self.page, "/api/imports")
+                rows = listing["imports"]
+                require(
+                    listing["next"] is None and len(rows) == 1,
+                    "Import or exact retry created an unexpected thread",
+                )
+                row = rows[0]
+                require(
+                    row["thread_id"] == identity
+                    and row["source"] == "claude-code"
+                    and row["stored_messages"] == 1,
+                    "Owner import metadata differs",
+                )
+                messages = await api(
+                    self.page,
+                    "/api/threads/"
+                    + quote(row["stored_thread_id"], safe="")
+                    + "/messages?start=0&end=199",
+                )
+                require(
+                    len(messages) == 2
+                    and messages[0]["raw"].encode("utf-8") == archive.encode("utf-8")
+                    and messages[1]["text"] == words,
+                    "Owner read-back changed the archive bytes or readable words",
+                )
+                snapshot = (row["stored_thread_id"], row["stored_messages"], messages)
+                if attempt:
+                    require(snapshot == before, "Exact retry changed stored identity or read-back")
+                before = snapshot
+            denied = await bearer.get(
+                self.instance.origin + "/api/imports", headers={"Authorization": "Bearer " + token}
+            )
+            checked_json(denied.status_code, None, "GET", "/api/imports", 403)
+        return (
+            "First import and immediate exact retry: HTTP 200, completed, accepted=1, "
+            "errors=0; one unchanged owner-listed thread, exact UTF-8 archive and words; "
+            "bearer listing HTTP 403"
+        )
 
     async def card_owner_decision(self):
         token, space = self.need("token", "space")

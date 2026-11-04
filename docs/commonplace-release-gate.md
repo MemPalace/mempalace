@@ -35,6 +35,17 @@ to bypass that decision, and answers through the browser before completion.
 The Rules page must show a summary, expand the exact full text, accept the
 proposal, and supply it to a new agent session.
 
+After agent connection/startup, required check `grant_import_no_duplicates` creates
+an explicitly import-consented connection through the signed-in session. Its bearer
+uploads a synthetic native Claude Code archive containing a unique marker, Unicode,
+CRLF and repeated spaces. The owner lists exactly one import and reads its exact
+archive bytes and readable words. An immediate identical upload with the same token
+must again return HTTP 200, `completed`, `accepted: 1`, `errors: 0` (including an
+`accepted` result row), as documented in [one-time import](one-time-import.md).
+The owner must still see one identical stored thread ID/message count and unchanged
+read-back. A cookie-free bearer request to list imports must return HTTP 403.
+This API-only check records protocol assertions without a success screenshot.
+
 Two separate browser contexts/email identities prove workspace isolation, with
 list, search, direct-object and MCP checks. An owner-created connection with
 `read_wings: ["inbox"]` must retrieve the inbox canary and exclude another wing,
@@ -89,6 +100,9 @@ date, browser and any failures. Save screenshots without secrets.
   space exists and opens as a board, then create another space.
 - In Settings create a named agent. Copy its one-time token into a stock MCP
   client's HTTP configuration. Check startup rules and memory retrieval.
+- Create an import-consented connection and upload a synthetic native archive. List
+  and read it as the owner, repeat the exact upload, verify one unchanged thread
+  and exact bytes/words, and confirm the bearer cannot list imports.
 - Through that agent create a card, claim it, and request an owner decision with
   context and two real options. Try to finish it before the owner answers: the
   request must fail. Answer as the person, then reclaim and finish the card.

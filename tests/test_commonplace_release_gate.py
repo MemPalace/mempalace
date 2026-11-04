@@ -176,3 +176,73 @@ def test_mailbox_waits_for_matching_delayed_capture_without_sleep(monkeypatch, p
         box.send("other@example.test", "link", expected)
         box.send("later@example.test", "link", expected)
         assert result.result(timeout=3) == expected
+
+
+@pytest.mark.parametrize("fault", [None, "duplicate", "raw", "retry_status", "bearer_read"])
+def test_grant_import_check_uses_public_routes_and_detects_regressions(monkeypatch, fault):
+    import asyncio
+    from types import SimpleNamespace
+
+    from scripts.commonplace_release import NO_SCREENSHOT_CHECKS, Journey
+
+    name = "grant_import_no_duplicates"
+    assert name in CHECKS
+    assert CHECKS.index(name) == CHECKS.index("mcp_startup") + 1
+    assert name in NO_SCREENSHOT_CHECKS
+    with (
+        throwaway_instance() as instance,
+        httpx.Client(trust_env=False, follow_redirects=True, timeout=5) as owner,
+    ):
+        signup(owner, instance.origin, "import-release@example.test")
+        reads = []
+
+        async def fetch(url, *, method, data, headers, timeout):
+            response = owner.request(method, url, content=data, headers=headers)
+            value = response.json()
+            if "/api/imports" in url:
+                reads.append(value)
+                if fault == "duplicate" and len(reads) == 2:
+                    value["imports"].append(dict(value["imports"][0]))
+            if "/messages?" in url and fault == "raw":
+                value[0]["raw"] = value[0]["raw"].replace("\r\n", "\n")
+
+            async def result():
+                return value
+
+            return SimpleNamespace(status=response.status_code, json=result)
+
+        original = httpx.AsyncClient
+
+        class BearerClient(original):
+            async def post(self, *args, **kwargs):
+                assert not self.cookies
+                response = await super().post(*args, **kwargs)
+                if fault == "retry_status" and getattr(self, "uploaded", False):
+                    value = response.json()
+                    value["results"][0]["status"] = "duplicate"
+                    return httpx.Response(200, json=value)
+                self.uploaded = True
+                return response
+
+            async def get(self, *args, **kwargs):
+                assert not self.cookies
+                response = await super().get(*args, **kwargs)
+                if fault == "bearer_read":
+                    return httpx.Response(200, json={"imports": []})
+                return response
+
+        monkeypatch.setattr(httpx, "AsyncClient", BearerClient)
+        journey = Journey(None, instance, None, Report(CHECKS))
+        journey.page = SimpleNamespace(
+            url=instance.origin + "/app/",
+            context=SimpleNamespace(request=SimpleNamespace(fetch=fetch)),
+        )
+        journey.values["signup"] = True
+        if fault:
+            with pytest.raises(AssertionError):
+                asyncio.run(journey.grant_import_no_duplicates())
+        else:
+            detail = asyncio.run(journey.grant_import_no_duplicates())
+            assert "accepted=1" in detail and "403" in detail
+            assert len(reads) == 2
+            assert reads[0] == reads[1]
