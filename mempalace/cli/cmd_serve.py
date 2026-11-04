@@ -124,6 +124,18 @@ def cmd_serve(args):
     if not token and not tokenless:
         token, token_created = load_or_create_server_token(palace_path)
     token_path = server_token_path(palace_path)
+    grants_file = getattr(args, "grants_file", None)  # the env var is checked by the server
+    if grants_file is not None:
+        from ..acl.grants import GrantsError, load_for_server
+
+        grants_file = (
+            os.path.abspath(os.path.expanduser(grants_file)) if grants_file.strip() else ""
+        )
+        try:
+            load_for_server(grants_file, token, local_only and not token)
+        except GrantsError as exc:
+            print(f"mempalace: --grants-file refused: {exc}", file=sys.stderr)
+            sys.exit(2)
 
     # Build the child environment. Token rides in the env (never argv) so it
     # stays out of the process table.
@@ -138,6 +150,8 @@ def cmd_serve(args):
     env["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:
         env["MEMPALACE_BACKEND"] = str(backend).strip().lower()
+    if grants_file:
+        env["MEMPALACE_MCP_GRANTS_FILE"] = grants_file
     if token:
         env["MEMPALACE_MCP_HTTP_TOKEN"] = token
     if not token and not local_only and tokenless:

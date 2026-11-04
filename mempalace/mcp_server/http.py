@@ -445,6 +445,21 @@ def _http_request_rejected(handler, require_auth: bool) -> bool:
         logger.warning("HTTP request rejected: cross-origin %r", origin)
         handler.send_error(403, "Forbidden")
         return True
+    if require_auth and getattr(srv, "grants", None) is not None:
+        identity = srv.resolver.resolve(handler.headers)
+        if identity is None:
+            handler.send_error(401, "Unauthorized")
+            return True
+        handler.acl_scope = srv.grants.scope_for(identity)
+        path = urlparse(handler.path).path
+        # /mcp/light resolves wing names before call_tool sees the request.
+        admin_only = path in ("/statusz", "/logstream/stream", _HTTP_LIGHT_MCP_PATH) or (
+            path.startswith("/sync/")
+        )
+        if admin_only and handler.acl_scope.kind != "admin":
+            handler.send_error(403, "Forbidden")
+            return True
+        return False
     if require_auth and srv.auth_token:
         provided = handler.headers.get("Authorization", "")
         if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
@@ -680,7 +695,7 @@ def _http_dispatch(request):
         tool_name = request["params"].get("name")
     if not isinstance(tool_name, str):
         return handle_request(request)
-    if tool_name in _HTTP_LOCK_FREE_TOOLS:
+    if tool_name in _HTTP_LOCK_FREE_TOOLS or _acl.denies_tool(tool_name):
         return handle_request(request)
     if _tool_capabilities.classify_tool(tool_name) == "read":
         release_mode = _embedding_release_mode(tool_name, request, "read")
@@ -1212,7 +1227,7 @@ def _start_peer_sync_thread(
             except Exception:
                 logger.warning("peer sync round failed", exc_info=True)
 
-    thread = threading.Thread(target=_loop, name="mempalace-logsync", daemon=True)
+    thread = threading.Thread(target=_run_internal(_loop), name="mempalace-logsync", daemon=True)
     _peer_sync_thread = thread
     _peer_sync_stop_event = stop
     thread.start()
@@ -1370,6 +1385,21 @@ def _http_resolve_token(host: str) -> str:
     return token
 
 
+def _http_load_grants(host: str, auth_token: str):
+    """``(GrantStore, resolver)`` for MEMPALACE_MCP_GRANTS_FILE, or ``(None, None)``."""
+    raw = os.environ.get("MEMPALACE_MCP_GRANTS_FILE")  # set-but-blank must not mean "off"
+    if raw is None:
+        _acl.disable()  # the flag is process-wide: a server without grants is not locked
+        return None, None
+    from ..acl.grants import GrantsError, TokenResolver, load_for_server
+
+    if not raw.strip():
+        raise GrantsError("MEMPALACE_MCP_GRANTS_FILE is set but blank; refusing to start open")
+    grants = load_for_server(raw.strip(), auth_token, _http_local_only(host) and not auth_token)
+    _acl.enable()
+    return grants, TokenResolver(grants, auth_token)
+
+
 def _build_http_server(host: str, port: int):
     """Construct (but do not start) the MCP HTTP server.
 
@@ -1385,6 +1415,7 @@ def _build_http_server(host: str, port: int):
     from .._net import bind_without_reverse_dns
 
     auth_token = _http_resolve_token(host)
+    grants, resolver = _http_load_grants(host, auth_token)
 
     # Resolve TLS before bind so a bad cert/key fails loudly rather than at the
     # first request. TLS is transport encryption only — the bearer-token guard
@@ -1526,7 +1557,8 @@ def _build_http_server(host: str, port: int):
             # Chroma-touching tools, lock-free for logstream tools.
             try:
                 dispatch = _http_dispatch_light if path == _HTTP_LIGHT_MCP_PATH else _http_dispatch
-                response = dispatch(request)
+                with _acl.request_scope(getattr(self, "acl_scope", None)):
+                    response = dispatch(request)
             except Exception:
                 # Without this the exception escaped into BaseHTTPRequestHandler,
                 # which closes the connection with no reply at all -- the client
@@ -1572,6 +1604,8 @@ def _build_http_server(host: str, port: int):
     httpd.enforce_host_pin = _http_is_loopback(host)
     httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
     httpd.auth_token = auth_token
+    httpd.grants = grants
+    httpd.resolver = resolver
     httpd.scheme = "http"
     httpd.bind_host = host
     httpd.started_at = utc_now_iso()

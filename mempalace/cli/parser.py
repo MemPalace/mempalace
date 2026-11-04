@@ -615,6 +615,12 @@ def main():
         help="Expose recall only: tools that change state are hidden and refused",
     )
     p_serve.add_argument(
+        "--grants-file",
+        default=None,
+        help="Per-wing access grants (YAML or JSON, mode 0600); see docs/acl.md. "
+        "Default: MEMPALACE_MCP_GRANTS_FILE, else access control is off.",
+    )
+    p_serve.add_argument(
         "--allow-insecure",
         action="store_true",
         help="Permit a non-loopback bind with no token (only behind a trusted proxy)",

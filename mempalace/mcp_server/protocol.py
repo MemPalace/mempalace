@@ -926,7 +926,7 @@ def call_tool(req_id, params: dict, internal: bool = False):
         ), None
     tool_name = params.get("name")
     tool_args = params.get("arguments") or {}
-    if tool_name not in TOOLS:
+    if tool_name not in TOOLS or _acl.denies_tool(tool_name):
         return _json_rpc_error(req_id, -32601, f"Unknown tool: {tool_name}"), None
     # Whitelist arguments to declared schema properties only.
     # Prevents callers from spoofing internal params like added_by/source_file.
@@ -965,6 +965,13 @@ def call_tool(req_id, params: dict, internal: bool = False):
     except ToolArgumentError as e:
         return _json_rpc_error(req_id, -32602, f"Invalid params for tool {tool_name}: {e}"), None
     tool_args.pop("wait_for_previous", None)
+    acl_scope = _acl.current_scope()
+    if not acl_scope.bypass:
+        tool_args = _acl.scoped_args(acl_scope, tool_name, tool_args)
+        if tool_args is None:
+            return _json_rpc_error(req_id, -32602, "Invalid params: wing not available"), None
+        if problem := _acl.input_problem(tool_name, tool_args):
+            return None, {"success": False, "error": problem}
     # A lease this call takes is released when it ends; one already held
     # (writable HTTP, an embedding host) is left alone.
     lease_held_before = _MCP_WRITER_LOCK_CM is not None
@@ -985,9 +992,10 @@ def call_tool(req_id, params: dict, internal: bool = False):
             tool_args["entry"] = content_val
     try:
         with _write_stall_watch(tool_name):
-            return None, _decorate_mcp_tool_result(
-                tool_name, TOOLS[tool_name]["handler"](**tool_args)
-            )
+            result = TOOLS[tool_name]["handler"](**tool_args)
+            if not acl_scope.bypass:
+                result = _acl.scrub_result(result)
+            return None, _decorate_mcp_tool_result(tool_name, result)
     except TypeError as e:
         # Qualname match prevents leaking internal helper/param names raised
         # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
@@ -1010,8 +1018,12 @@ def call_tool(req_id, params: dict, internal: bool = False):
                 return _json_rpc_error(
                     req_id, -32602, f"Missing required {word} {quoted} for tool {tool_name}"
                 ), None
+        if not acl_scope.bypass:
+            return None, dict(_acl.GENERIC_ERROR)
         return _internal_tool_error(req_id, tool_name, e, include_message=internal), None
     except Exception as exc:
+        if not acl_scope.bypass:
+            return None, dict(_acl.GENERIC_ERROR)
         expose = internal or isinstance(exc, ValueError)
         return _internal_tool_error(req_id, tool_name, exc, include_message=expose), None
     finally:
@@ -1063,6 +1075,7 @@ def handle_request(request):
                     _tool_catalog_entry(n, t)
                     for n, t in TOOLS.items()
                     if not (_READ_ONLY and n in _READ_ONLY_REFUSED_TOOLS)
+                    and not _acl.denies_tool(n)
                 ]
             },
         }
@@ -1355,7 +1368,9 @@ def _start_write_stall_watchdog() -> None:
                 )
                 os._exit(_WRITE_STALL_EXIT_CODE)
 
-    t = threading.Thread(target=_watchdog, name="mcp-write-stall-watchdog", daemon=True)
+    t = threading.Thread(
+        target=_run_internal(_watchdog), name="mcp-write-stall-watchdog", daemon=True
+    )
     t.start()
 
 
@@ -1417,7 +1432,7 @@ def _start_idle_exit_watchdog() -> None:
                 )
                 _exit_running_registered_cleanup()
 
-    t = threading.Thread(target=_watchdog, name="mcp-idle-watchdog", daemon=True)
+    t = threading.Thread(target=_run_internal(_watchdog), name="mcp-idle-watchdog", daemon=True)
     t.start()
 
 
