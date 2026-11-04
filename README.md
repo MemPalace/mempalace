@@ -38,6 +38,10 @@ the system.
 
 Nothing leaves your machine unless you opt in.
 
+Optional [room suggestions](docs/room-suggestions.md) use a local decision model
+in the background. Review a preview before explicitly applying changes, with a
+durable undo journal. No drawers move automatically.
+
 Architecture, concepts, and mining flows:
 [mempalaceofficial.com/concepts/the-palace](https://mempalaceofficial.com/concepts/the-palace.html).
 
