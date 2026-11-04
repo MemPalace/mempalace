@@ -390,12 +390,14 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
 def _try_codex_jsonl(content: str) -> Optional[str]:
     """OpenAI Codex CLI sessions (~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl).
 
-    Uses only event_msg entries (user_message / agent_message) which represent
-    the canonical conversation turns. response_item entries are skipped because
-    they include synthetic context injections and duplicate the real messages.
+    Prefers event_msg entries (user_message / agent_message), which represent
+    the canonical conversation turns. Newer Codex CLI rollouts (0.166+) can
+    carry the conversation only as response_item messages; those are used
+    when no event_msg turn is present, with synthetic context skipped.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
+    response_messages = []
     has_session_meta = False
     for line in lines:
         try:
@@ -422,6 +424,10 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
                 _record("tool_result_omitted")
             elif item_type != "message":
                 _record("conversations.content_block_drop")
+            else:
+                turn = codex_response_message(payload)
+                if turn:
+                    response_messages.append(turn)
             continue
 
         if entry_type != "event_msg":
@@ -440,9 +446,49 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
         elif payload_type == "agent_message":
             messages.append(("assistant", text))
 
+    if not messages:
+        messages = response_messages
     if len(messages) >= 2 and has_session_meta:
         return _messages_to_transcript(messages)
     return None
+
+
+# Codex injects these as role=user messages; they are context, not turns.
+_CODEX_SYNTHETIC_USER_PREFIXES = (
+    "<environment_context>",
+    "<user_instructions>",
+    "<user_shell_command>",
+    "<turn_aborted>",
+    "# AGENTS.md instructions for ",
+)
+
+
+def codex_response_message(payload: dict) -> Optional[tuple]:
+    """Return (role, text) for a Codex response_item message payload.
+
+    Only user and assistant messages count; developer/system messages and
+    synthetic context that Codex sends as role=user are skipped.
+    """
+    if payload.get("type") != "message":
+        return None
+    role = payload.get("role")
+    if role not in ("user", "assistant"):
+        return None
+    blocks = payload.get("content")
+    if not isinstance(blocks, list):
+        return None
+    want = "input_text" if role == "user" else "output_text"
+    parts = [
+        b["text"]
+        for b in blocks
+        if isinstance(b, dict) and b.get("type") == want and isinstance(b.get("text"), str)
+    ]
+    text = "\n".join(parts).strip()
+    if not text:
+        return None
+    if role == "user" and text.startswith(_CODEX_SYNTHETIC_USER_PREFIXES):
+        return None
+    return role, text
 
 
 def _try_gemini_jsonl(content: str) -> Optional[str]:

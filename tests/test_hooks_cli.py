@@ -225,6 +225,48 @@ def test_count_malformed_json_lines(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_count_codex_response_item_messages(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+
+    def item(role, text, kind):
+        content = [{"type": kind, "text": text}]
+        return {
+            "type": "response_item",
+            "payload": {"type": "message", "role": role, "content": content},
+        }
+
+    _write_transcript(
+        transcript,
+        [
+            {"type": "session_meta", "payload": {}},
+            item("user", "<environment_context>cwd</environment_context>", "input_text"),
+            item("user", "first", "input_text"),
+            item("assistant", "ok", "output_text"),
+            item("user", "second", "input_text"),
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 2
+
+
+def test_count_codex_event_msg_not_doubled_by_response_item(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "hi"}},
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
 # --- _extract_recent_messages ---
 
 
