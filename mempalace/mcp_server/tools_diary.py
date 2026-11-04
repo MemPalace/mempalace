@@ -605,6 +605,15 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
                 {"item": item, "error": "wing, room, content must be non-empty strings"}
             )
             continue
+        supersedes = item.get("supersedes")
+        if supersedes is not None and not (
+            isinstance(supersedes, str)
+            or (isinstance(supersedes, list) and all(isinstance(s, str) for s in supersedes))
+        ):
+            out["errors"].append(
+                {"item": item, "error": "supersedes must be a drawer id string or a list of them"}
+            )
+            continue
         dup = tool_check_duplicate(content, threshold=dedup_threshold)
         if dup.get("is_duplicate"):
             out["duplicates"].append({"room": room, "matches": dup.get("matches", [])})
@@ -613,7 +622,13 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
+        res = tool_add_drawer(
+            wing=wing,
+            room=room,
+            content=content,
+            added_by=resolved_added_by,
+            supersedes=supersedes,
+        )
         if res.get("success"):
             out["added"].append(res)
         else:

@@ -406,6 +406,10 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "supersedes": {
+                    "type": "string",
+                    "description": "Drawer ID (or IDs, comma-separated) this drawer replaces — the target is stamped superseded_by (optional)",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -430,6 +434,10 @@ TOOLS = {
                             "content": {
                                 "type": "string",
                                 "description": "Verbatim content to store",
+                            },
+                            "supersedes": {
+                                "type": "string",
+                                "description": "Drawer ID (or IDs, comma-separated) this item replaces — stamps the old handoff superseded_by (optional)",
                             },
                         },
                         "required": ["wing", "room", "content"],

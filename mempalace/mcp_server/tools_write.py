@@ -486,8 +486,67 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
     return chunk_ids, chunk_docs, chunk_metas
 
 
+def _normalize_supersedes(supersedes):
+    """Normalize the ``supersedes`` argument to a list of target drawer ids.
+
+    Accepts a single id string (comma-separated for several) or a list of
+    strings. Returns ``(ids, error)`` — ``error`` is None when usable.
+    """
+    if supersedes is None:
+        return [], None
+    if isinstance(supersedes, str):
+        supersedes = supersedes.split(",")
+    if not isinstance(supersedes, list) or any(
+        not isinstance(s, str) or not s.strip() for s in supersedes
+    ):
+        return [], "supersedes must be a drawer id string or a list of them"
+    return [strip_lone_surrogates(s.strip()) for s in supersedes if s.strip()], None
+
+
+def _stamp_superseded_by(col, target_ids, superseded_by):
+    """Stamp ``superseded_by`` onto every physical row of each target drawer.
+
+    A target id that is itself a physical row stamps that row; a chunked
+    logical group resolves via its chunks' ``parent_drawer_id``. Returns the
+    targets that could not be resolved or stamped (unknown ids, index
+    errors) — stamping is best-effort and never fails the filing.
+    """
+    missing = []
+    for target in target_ids:
+        try:
+            row_ids = list(_get_result_ids(col.get(ids=[target], include=[])))
+            if not row_ids:
+                row_ids = list(
+                    _get_result_ids(col.get(where={"parent_drawer_id": target}, include=[]))
+                )
+            if not row_ids:
+                missing.append(target)
+                continue
+            # Merge into the CURRENT metadata and pass the full dict: the
+            # chroma backend's update merges keys, but the sqlite_exact
+            # backend may replace — tool_update_drawer uses the same
+            # read-merge-write shape, so the stamp is backend-safe.
+            got = col.get(ids=row_ids, include=["metadatas"])
+            metas = list(got.get("metadatas") or [])
+            while len(metas) < len(row_ids):
+                metas.append({})
+            col.update(
+                ids=row_ids,
+                metadatas=[{**(m or {}), "superseded_by": superseded_by} for m in metas],
+            )
+        except Exception as e:
+            logger.warning("supersedes stamp failed for %s: %s", target, e)
+            missing.append(target)
+    return missing
+
+
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    supersedes=None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -499,6 +558,11 @@ def tool_add_drawer(
     ``tool_get_drawer(drawer_id)`` automatically hydrates and reassembles all
     chunks, and ``tool_delete_drawer(drawer_id)`` removes both the logical group
     and all constituent physical chunks.
+    ``supersedes`` names drawer id(s) this drawer replaces: the new drawer
+    carries ``supersedes`` metadata and every physical row of each target is
+    stamped ``superseded_by`` — handoff records stay linked to their closure
+    instead of silently going stale. Unresolvable targets are reported in
+    ``supersedes_unresolved`` and never fail the filing.
     """
     global _metadata_cache
     try:
@@ -508,6 +572,9 @@ def tool_add_drawer(
         if source_file:
             source_file = strip_lone_surrogates(source_file)
         added_by = strip_lone_surrogates(added_by)
+        supersedes_ids, sup_err = _normalize_supersedes(supersedes)
+        if sup_err:
+            return {"success": False, "error": sup_err}
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -546,6 +613,8 @@ def tool_add_drawer(
         base_meta.update(identity_metadata(source_file))
 
     base_meta["last_modified"] = base_meta["filed_at"]
+    if supersedes_ids:
+        base_meta["supersedes"] = ",".join(supersedes_ids)
     # Idempotency. Three cases to detect a prior committed write:
     # (a) Single-doc path: drawer_id row exists (the only id used).
     # (b) Chunked path: probe the LAST chunk id — its presence implies
@@ -564,6 +633,16 @@ def tool_add_drawer(
         existing = col.get(ids=idempotency_probe_ids, include=[])
         if _get_result_ids(existing):
             outcome = {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            if supersedes_ids:
+                # A re-filed identical closure (retry after a timeout, a
+                # replayed batch) must still stamp its targets — the first
+                # filing may have predated the supersedes argument or its
+                # stamp may have missed an then-unresolvable target.
+                # Re-stamping is idempotent (same superseded_by value).
+                outcome["supersedes"] = supersedes_ids
+                missing = _stamp_superseded_by(col, supersedes_ids, drawer_id)
+                if missing:
+                    outcome["supersedes_unresolved"] = missing
             _wal_result("add_drawer", outcome)
             return outcome
     except Exception as e:
@@ -594,6 +673,11 @@ def tool_add_drawer(
                 "room": room,
                 "chunks": 1,
             }
+            if supersedes_ids:
+                outcome["supersedes"] = supersedes_ids
+                missing = _stamp_superseded_by(col, supersedes_ids, drawer_id)
+                if missing:
+                    outcome["supersedes_unresolved"] = missing
             _wal_result("add_drawer", outcome)
             return outcome
 
@@ -632,6 +716,11 @@ def tool_add_drawer(
             "chunks": len(chunk_ids),
             "chunk_ids": chunk_ids,
         }
+        if supersedes_ids:
+            outcome["supersedes"] = supersedes_ids
+            missing = _stamp_superseded_by(col, supersedes_ids, drawer_id)
+            if missing:
+                outcome["supersedes_unresolved"] = missing
         _wal_result("add_drawer", outcome)
         return outcome
     except Exception as e:
