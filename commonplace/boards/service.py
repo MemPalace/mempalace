@@ -1490,6 +1490,14 @@ class BoardService:
                 "no: proposal needs parent approval with task_approve before work starts"
             )
         if status in ("todo", "doing") and not self._available_origin(row):
+            if (
+                status == "doing"
+                and old == "todo"
+                and row["assignee"] == self.principal.actor
+                and self._claimable_origin(row)
+                and not _waiting_on_person(row)
+            ):
+                raise ToolError("no: claim this card with task_take_next")
             raise ToolError("no: restricted-origin work needs parent or workspace owner release")
         if (
             old == "review"

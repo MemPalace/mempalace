@@ -640,3 +640,46 @@ def test_rejected_reapproval_stays_owner_only(hub, fresh, authority):
     if authority == "root":
         assert "not a pending proposal" in reply["error"]
     assert fresh.owner.task_show(number) == before
+
+
+@pytest.mark.parametrize("shape", RESTRICTED)
+def test_reserved_restricted_update_names_claim_route(hub, fresh, shape):
+    a, b = agent(fresh, "a", shape), agent(fresh, "b", shape)
+    number = a.work.task_add(board="work", title="Reserved work", claim=True)["number"]
+    handoff(a, number, b.principal.actor)
+    before = fresh.owner.task_show(number)
+    with pytest.raises(ToolError) as exc:
+        b.work.task_update(number, status="doing")
+    assert type(exc.value) is ToolError
+    assert "task_take_next" in str(exc.value)
+    assert fresh.owner.task_show(number) == before
+    status, reply = change(hub, fresh, b.token, number, status="doing")
+    assert status == 403, reply
+    assert "task_take_next" in reply["error"]
+    assert fresh.owner.task_show(number) == before
+    take(hub, b, number)
+    claimed = fresh.owner.task_show(number)
+    assert claimed["status"] == "doing"
+    assert claimed["assignee"] == b.principal.actor
+    assert claimed["claim_until"] and not claimed["claim_expired"]
+
+
+@pytest.mark.parametrize("kind", ["other", "subagent", "waiting"])
+def test_restricted_update_keeps_release_message(hub, fresh, kind):
+    a, b = agent(fresh, "a"), agent(fresh, "b")
+    who = agent(fresh, "child", parent=b.id) if kind == "subagent" else b
+    number = a.work.task_add(board="work", title="Protected work", claim=True)["number"]
+    handoff(a, number, a.principal.actor if kind == "other" else who.principal.actor)
+    if kind == "waiting":
+        # Test-only legacy todo reservation waiting on a person.
+        with a.work.store.transaction() as conn:
+            conn.execute("UPDATE tasks SET ask_to=? WHERE id=?", (f"user:{fresh.user}", number))
+    before = fresh.owner.task_show(number)
+    with pytest.raises(
+        ToolError, match="restricted-origin work needs parent or workspace owner release"
+    ):
+        who.work.task_update(number, status="doing")
+    assert fresh.owner.task_show(number) == before
+    with pytest.raises(ToolError, match="card is not available to take"):
+        who.work.task_take_next(task=number)
+    assert fresh.owner.task_show(number) == before
