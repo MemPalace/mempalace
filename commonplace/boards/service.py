@@ -557,7 +557,7 @@ class BoardService:
 
     def _top_level_taker(self):
         p = self.principal
-        return not p.person and p.parent_connection_id is None
+        return not p.person and p.parent_connection_id is None and p.runner is None
 
     def _creator_connection(self, row):
         try:

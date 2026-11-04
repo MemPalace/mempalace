@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS connections (
     UNIQUE (workspace_id, name),
     FOREIGN KEY (workspace_id, user_id) REFERENCES memberships(workspace_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS runner_connections (
+    connection_id TEXT PRIMARY KEY REFERENCES connections(id),
+    machine_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('machine','worker'))
+);
 CREATE TABLE IF NOT EXISTS account_plans (
     user_id TEXT PRIMARY KEY REFERENCES users(id),
     plan TEXT NOT NULL CHECK (plan IN ('free','paid')),
@@ -139,6 +144,21 @@ class ControlError(ValueError):
     """A refused control operation: unknown user, wrong role, duplicate name."""
 
 
+class RunnerLinkedError(ControlError):
+    """A runner connection must be managed with its machine registry."""
+
+    def __init__(self):
+        super().__init__("manage this runner under /api/runners")
+
+
+def link_runner(conn, connection_id, machine_id, kind):
+    """Link a runner connection inside the caller's control transaction."""
+    conn.execute(
+        "INSERT INTO runner_connections(connection_id, machine_id, kind) VALUES (?,?,?)",
+        (connection_id, machine_id, kind),
+    )
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -173,6 +193,7 @@ class Principal:
     person: bool = False  # a signed-in person (web session), not an agent's token
     parent_connection_id: Optional[str] = None
     parent_agent: Optional[str] = None
+    runner: Optional[str] = None
 
     @property
     def actor(self) -> str:
@@ -462,6 +483,13 @@ class ControlDB:
             parent_row = self.connection(parent, ws["id"]) if parent is not None else None
             if parent_row is not None and parent_row["revoked_at"]:
                 raise ControlError("parent connection is revoked")
+            if (
+                parent_row is not None
+                and self._conn.execute(
+                    "SELECT 1 FROM runner_connections WHERE connection_id=?", (parent_row["id"],)
+                ).fetchone()
+            ):
+                raise ControlError("a runner connection cannot be a parent")
             try:
                 self._conn.execute(
                     "INSERT INTO connections(id, workspace_id, user_id, name, client, auth, "
@@ -542,12 +570,26 @@ class ControlDB:
         with self._lock:
             return self._conn.execute(sql + " ORDER BY created_at", params).fetchall()
 
-    def revoke(self, ref: str, *, actor: str, workspace_ref: Optional[str] = None) -> None:
+    def revoke(
+        self,
+        ref: str,
+        *,
+        actor: str,
+        workspace_ref: Optional[str] = None,
+        _runner_owned: bool = False,
+    ) -> None:
         row = self.connection(ref, workspace_ref)
         actor_id = self.user(actor)["id"]
         if actor_id != row["user_id"]:
             self.require_owner(row["workspace_id"], actor_id)
         with self._lock:
+            if (
+                not _runner_owned
+                and self._conn.execute(
+                    "SELECT 1 FROM runner_connections WHERE connection_id=?", (row["id"],)
+                ).fetchone()
+            ):
+                raise RunnerLinkedError()
             self._conn.execute(
                 "UPDATE connections SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?",
                 (_iso(_now()), row["id"]),
@@ -562,13 +604,26 @@ class ControlDB:
         )
 
     def rotate_token(
-        self, ref: str, *, actor: str, workspace_ref: str, expires_days: int = DEFAULT_TOKEN_DAYS
+        self,
+        ref: str,
+        *,
+        actor: str,
+        workspace_ref: str,
+        expires_days: int = DEFAULT_TOKEN_DAYS,
+        _runner_owned: bool = False,
     ) -> str:
         """Replace a live PAT's secret, preserving its identity and permissions."""
         with self._lock:
             row = self.connection(ref, workspace_ref)
             actor_id = self.user(actor)["id"]
             self.require_owner(row["workspace_id"], actor_id)
+            if (
+                not _runner_owned
+                and self._conn.execute(
+                    "SELECT 1 FROM runner_connections WHERE connection_id=?", (row["id"],)
+                ).fetchone()
+            ):
+                raise RunnerLinkedError()
             if row["auth"] != "pat" or row["revoked_at"]:
                 raise ControlError("only active personal access tokens can be rotated")
             token = tokens.new_token()
@@ -599,10 +654,13 @@ class ControlDB:
         digest = tokens.token_hash(token)
         with self._lock:
             row = self._conn.execute(
-                "SELECT c.*, u.email AS user_email, u.disabled_at AS user_disabled, m.role AS role "
+                "SELECT c.*, u.email AS user_email, u.disabled_at AS user_disabled, m.role AS role, "
+                "r.kind AS runner_kind "
                 "FROM connections c JOIN users u ON u.id = c.user_id "
                 "LEFT JOIN memberships m ON m.workspace_id = c.workspace_id "
-                "AND m.user_id = c.user_id WHERE c.token_hash = ? AND c.auth = 'pat'",
+                "AND m.user_id = c.user_id "
+                "LEFT JOIN runner_connections r ON r.connection_id = c.id "
+                "WHERE c.token_hash = ? AND c.auth = 'pat'",
                 (digest,),
             ).fetchone()
         if row is None or not tokens.hashes_match(row["token_hash"], digest):
@@ -613,10 +671,12 @@ class ControlDB:
         """Rebuild a durable subscription owner's current connection authority."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT c.*, u.email AS user_email, u.disabled_at AS user_disabled, m.role "
+                "SELECT c.*, u.email AS user_email, u.disabled_at AS user_disabled, m.role, "
+                "r.kind AS runner_kind "
                 "FROM connections c JOIN users u ON u.id = c.user_id "
                 "LEFT JOIN memberships m ON m.workspace_id = c.workspace_id "
-                "AND m.user_id = c.user_id WHERE c.id = ?",
+                "AND m.user_id = c.user_id "
+                "LEFT JOIN runner_connections r ON r.connection_id = c.id WHERE c.id = ?",
                 (connection_id,),
             ).fetchone()
             return self._connection_principal(row)
@@ -640,7 +700,7 @@ class ControlDB:
             connection=row["name"],
             client=row["client"],
             auth=row["auth"],
-            role=row["role"],
+            role="member" if row["runner_kind"] is not None else row["role"],
             policy=Policy.from_json(row["policy"]),
             parent_connection_id=row["parent_id"],
             parent_agent=(
@@ -648,6 +708,7 @@ class ControlDB:
                 if row["parent_id"]
                 else None
             ),
+            runner=row["runner_kind"],
         )
 
     def _touch(self, row, now: datetime) -> None:

@@ -40,6 +40,11 @@ EXACT = {
     ("PATCH", "/api/voice"): "authenticated",
     ("POST", "/api/voice/transcribe"): "authenticated",
     ("POST", "/api/facts"): "authenticated",
+    # Machine runner (commonplace/runner), inert until an owner attests.
+    ("GET", "/api/runners"): "authenticated",
+    ("POST", "/api/runners"): "authenticated",
+    ("POST", "/api/card-starts"): "authenticated",
+    ("GET", "/api/card-starts"): "authenticated",
     **{
         (method, path): "authenticated"
         for method in ("GET", "POST", "PATCH", "DELETE")
@@ -63,6 +68,12 @@ EXACT = {
 PREFIX = {
     ("POST", "/api/connections/"): "authenticated",
     ("DELETE", "/api/connections/"): "authenticated",
+    ("PATCH", "/api/runners/"): "authenticated",
+    ("POST", "/api/runners/"): "authenticated",
+    ("DELETE", "/api/runners/"): "authenticated",
+    ("GET", "/api/runner/"): "authenticated",
+    ("POST", "/api/runner/"): "authenticated",
+    ("POST", "/api/card-starts/"): "authenticated",
     **{
         (method, path): "authenticated"
         for method in ("GET", "POST", "PATCH", "DELETE")
@@ -736,6 +747,10 @@ REST_TOOLS = [
     ("DELETE", "/api/webhooks/id", "webhook_remove"),
     ("GET", "/api/webhooks/id/deliveries", "webhook_list"),
     ("POST", "/api/webhooks/id/test", "webhook_test"),
+    ("POST", "/api/card-starts", "card_start"),
+    ("GET", "/api/card-starts", "card_start_status"),
+    ("POST", "/api/card-starts/id/cancel", "card_start_cancel"),
+    ("POST", "/api/card-starts/id/resolve", "card_start_resolve"),
 ]
 
 

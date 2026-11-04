@@ -379,7 +379,7 @@ def test_served_state_is_connection_scoped_and_default_reads_do_not_serve(env):
 @pytest.mark.parametrize("name", sorted(enforce.CHECKED_WRITES))
 def test_every_checked_mcp_tool_rejects_before_dispatch(env, name, monkeypatch):
     setup(env)
-    if name == "handoff_start":
+    if name in ("handoff_start", "card_start", "card_start_cancel", "card_start_resolve"):
         monkeypatch.setitem(
             extensions.REGISTRY, name, replace(extensions.get(name), available=None)
         )

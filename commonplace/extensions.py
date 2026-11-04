@@ -42,6 +42,7 @@ MODULES = (
     "commonplace.email_auth",
     "commonplace.handoff.extension",
     "commonplace.import_tools",
+    "commonplace.runner",
 )
 
 ALL_PROFILES = frozenset({"slim", "standard", "full"})

@@ -848,12 +848,28 @@ def cmd_restore(args) -> int:
     return 0
 
 
+def cmd_runner(args) -> int:
+    from .runner.agent import check, run
+
+    if args.action == "check":
+        return check(args.config)
+    return run(args.config, args.once)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="commonplace")
     p.add_argument("--data", help=f"data directory (default ${DATA_ENV} or ~/.commonplace)")
     sub = p.add_subparsers(dest="command", required=True)
     add_webhook_commands(sub)
     _client_parsers(sub)
+
+    runner = sub.add_parser("runner").add_subparsers(dest="action", required=True)
+    for action in ("check", "run"):
+        s = runner.add_parser(action)
+        s.add_argument("--config", required=True)
+        if action == "run":
+            s.add_argument("--once", action="store_true")
+        s.set_defaults(func=cmd_runner)
 
     s = sub.add_parser("init", help="create the control database and the first admin")
     s.add_argument("--admin-email", required=True)
@@ -984,6 +1000,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "runner":
+        return args.func(args)
     if args.command in {"onboard", "remember", "rule", "check"}:
         from .client import ClientError
 

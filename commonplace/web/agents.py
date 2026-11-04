@@ -53,6 +53,8 @@ def connection_view(row):
 
 def install(gateway):
     def manage(h):
+        from commonplace.control_db import RunnerLinkedError
+
         principal = require_principal(gateway, h)
         if principal is None:
             return
@@ -137,9 +139,13 @@ def install(gateway):
             send_json(h, 409, {"error": "Manage this connection in its sign-in client"})
             return
         if h.command == "DELETE":
-            gateway.db.revoke(
-                row["id"], actor=principal.user_id, workspace_ref=principal.workspace_id
-            )
+            try:
+                gateway.db.revoke(
+                    row["id"], actor=principal.user_id, workspace_ref=principal.workspace_id
+                )
+            except RunnerLinkedError as exc:
+                send_json(h, 409, {"error": str(exc)})
+                return
             send_json(h, 200, {"ok": True})
             return
         try:
@@ -156,6 +162,9 @@ def install(gateway):
                 workspace_ref=principal.workspace_id,
                 expires_days=TOKEN_DAYS,
             )
+        except RunnerLinkedError as exc:
+            send_json(h, 409, {"error": str(exc)})
+            return
         except ControlError:
             send_json(h, 409, {"error": "Revoked agents cannot be rotated"})
             return
