@@ -199,7 +199,17 @@ function bootFixture() {
     async route() { calls.push("route"); },
     schedule() { calls.push("schedule"); },
     signin() { calls.push("signin"); context.voice.reset(); },
+    signinCode: null,
+    showError(text) { calls.push(`error:${text}`); },
+    URLSearchParams,
+    location: { pathname: "/app/", search: "", hash: "" },
+    history: { state: null, replaceState(_state, _title, url) { calls.push(`replace:${url}`); } },
   };
+  // boot() runs in a bare vm context: every browser global or app function it
+  // names must be provided here, or the test dies with a ReferenceError.
+  for (const name of ["URLSearchParams", "URL", "location", "history", "window", "navigator", "localStorage", "sessionStorage", "showError", "signinCode"]) {
+    if (new RegExp(`\\b${name}\\b`).test(bootSource)) assert.ok(name in context, `boot() uses ${name}; add it to the boot fixture`);
+  }
   const { boot, api } = runInNewContext([apiSource.replace(/export /g, ""), expiredSource, bootSource, "({ boot, api })"].join("\n"), context);
   const root = { querySelector: () => null, querySelectorAll: () => [], addEventListener() {} };
   context.voice = voiceInput(root, api, assert.fail, { document });
@@ -212,6 +222,12 @@ booting.resolveStatus({ ok: false, status: 401, json: async () => ({ error: "Sig
 await new Promise(setImmediate);
 assert.equal(booting.state.me, null);
 assert.equal(booting.calls.at(-1), "signin");
+// A tapped card link for another workspace: boot drops ?w=, keeps the user on
+// the board and explains why, without waiting for the voice status.
+const otherWorkspace = bootFixture();
+otherWorkspace.context.location = { pathname: "/app/", search: "?w=ws_other", hash: "#/card/7" };
+await otherWorkspace.boot();
+assert.deepEqual(otherWorkspace.calls, ["shell", "replace:/app/#/", "route", "error:This card is in another workspace. Sign out, then sign in again to open it.", "schedule"]);
 const expiredAtLoad = bootFixture();
 expiredAtLoad.context.voice = { load() { expiredAtLoad.state.me = null; } };
 await expiredAtLoad.boot(); assert.deepEqual(expiredAtLoad.calls, ["shell"]);
