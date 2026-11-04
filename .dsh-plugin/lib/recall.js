@@ -66,6 +66,8 @@ const MAX_READ_ATTEMPTS = 3
 const L0_PLACEHOLDER = '## L0 — IDENTITY\nNo identity configured. Create ~/.mempalace/identity.txt'
 /** Blocks `mempalace wake-up` prints in place of L1 when the palace cannot be read. */
 const L1_UNAVAILABLE = [/^## L1 — No palace found\b/, /^## Palace is busy\b/]
+/** The line that opens a fence of stored words in `mempalace wake-up` output. */
+const FENCE_OPEN = /^<(stored-memory-[0-9a-f]{16})>$/
 
 /**
  * The memory in `mempalace wake-up` output, verbatim, or '' when there is none.
@@ -81,11 +83,24 @@ export function parseWakeup(stdout) {
   if (/^Wake-up text \(~\d+ tokens\):$/.test(lines[0] ?? '')) start = /^=+$/.test(lines[1] ?? '') ? 2 : 1
 
   // Blocks start only at a section heading, so a stored line that happens to
-  // read like a CLI hint stays inside its block and is kept.
-  const blocks = lines
-    .slice(start)
-    .join('\n')
-    .split(/\n(?=## )/)
+  // read like a CLI hint stays inside its block and is kept. Stored words can
+  // hold a heading line too (a file name may contain a newline), so a fence is
+  // copied whole: splitting inside it would lose its closing tag.
+  const body = lines.slice(start)
+  const blocks = []
+  let current = []
+  for (let i = 0; i < body.length; i++) {
+    if (i > 0 && body[i].startsWith('## ')) {
+      blocks.push(current.join('\n'))
+      current = []
+    }
+    const open = FENCE_OPEN.exec(body[i])
+    const close = open ? body.indexOf(`</${open[1]}>`, i + 1) : -1
+    const end = close === -1 ? i : close
+    current.push(...body.slice(i, end + 1))
+    i = end
+  }
+  blocks.push(current.join('\n'))
   const kept = blocks.filter((block) => {
     const trimmed = block.trim()
     return trimmed !== L0_PLACEHOLDER && !L1_UNAVAILABLE.some((pattern) => pattern.test(trimmed))
