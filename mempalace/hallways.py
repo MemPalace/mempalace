@@ -389,6 +389,22 @@ def _load_hallways_json(config=None) -> list[dict]:
             legacy,
             current_hallway_file,
         )
+
+    pre_keyed = os.path.join(os.path.dirname(current_hallway_file), "hallways.json")
+    if pre_keyed != current_hallway_file and os.path.exists(pre_keyed):
+        pre_keyed_db = os.path.splitext(pre_keyed)[0] + ".sqlite3"
+        db_hint = (
+            f" Its SQLite store at '{pre_keyed_db}' also needs to be renamed."
+            if os.path.exists(pre_keyed_db)
+            else ""
+        )
+        logger.warning(
+            "Hallways file at '%s' is being ignored; the per-palace name is now '%s'. "
+            "Move or copy the file (preserving its contents) to the new path to recover its hallways.%s",
+            pre_keyed,
+            current_hallway_file,
+            db_hint,
+        )
     return []
 
 

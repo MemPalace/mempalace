@@ -8,6 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two palaces in the same parent directory no longer collide on tunnel
+  and hallway state files.** `MempalaceConfig.tunnel_file` and
+  `MempalaceConfig.hallway_file` are now siblings whose **filenames
+  incorporate a per-palace key** derived from the normalized
+  `palace_path` (a SHA-256 digest, first 24 hex chars — the same
+  primitive the codebase already uses for per-palace daemon state in
+  `daemon.py` and per-palace server-registry state in
+  `server_registry.py`), e.g.\
+  `tunnels_a1b2c3d4e5f6a1b2c3d4e5f6.json` and
+  `hallways_a1b2c3d4e5f6a1b2c3d4e5f6.json` (with the SQLite hallway\
+  store `hallways_a1b2c3d4e5f6a1b2c3d4e5f6.sqlite3` beside it). Previously both were
+  pinned to `tunnels.json` / `hallways.json` in
+  `os.path.dirname(palace_path)`, so two palaces sharing a parent
+  directory silently wrote to the same file and one palace's tunnel or
+  hallway records clobbered the other's. Two palaces under different
+  parents, the original case tested by `tests/test_hallways_palace_scoped.py`,
+  are unaffected. Existing installs of a *single* palace under a parent
+  that previously held no other palace will need to re-write their
+  tunnel / hallway state once, or the state files renamed, to match the
+  new names; state is not silently migrated because an ambiguous
+  rename cannot be safe without knowing which palace previously wrote to
+  the shared file. (Issue #2710)
+
 ---
 
 ## [3.12.0] — 2026-10-31
