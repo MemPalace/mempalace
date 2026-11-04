@@ -60,6 +60,11 @@ def _readable(principal, stored: StoredThread) -> bool:
     )
 
 
+def readable(principal, stored: StoredThread) -> bool:
+    """Apply the read policy shared by recall and message ranges."""
+    return _readable(principal, stored)
+
+
 def _normalise(hits: list[RecallHit], ids: set[str]) -> list[RecallHit]:
     """Min-max scale each source independently; higher input scores are better.
 

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+import re
 import threading
 from collections import Counter
+from urllib.parse import parse_qs, urlsplit
 
 from . import import_grant, ingest_cadence, plans
 from .capture import PRIVATE_WING
-from .handoff.api import _object, _read_json, _RequestError, _text
+from .handoff.api import _object, _query, _read_json, _RequestError, _text
 from .handoff.models import THREADS_WING
+from .handoff.recall import readable
 from .handoff.thread_store import ThreadConflict, ThreadStorageLimit, canonical_sha256
 from .http_util import log_failure
 from .import_parts import append_part
@@ -83,7 +88,75 @@ def register(ctx):
         handler.close_connection = True
         handler._send_json(status, result, {"Connection": "close"})
 
+    def list_imports(handler):
+        try:
+            principal = ctx.gateway.principal_for(handler)
+            if principal is None:
+                raise _RequestError(401, "Sign in")
+            if not principal.person:
+                raise _RequestError(403, "Sign in to list your imports")
+            query = parse_qs(urlsplit(handler.path).query, keep_blank_values=True)
+            try:
+                limit = int(_query(query, "limit", "50"))
+                if not 1 <= limit <= 100:
+                    raise ValueError()
+            except ValueError:
+                raise _RequestError(400, "invalid limit") from None
+            after = _decode_cursor(_query(query, "cursor")) if "cursor" in query else None
+            rows = ctx.store_for(principal.workspace_id).list_source_range(
+                principal.workspace_id,
+                f"import-private:{principal.user_id}:",
+                after=after,
+                limit=limit,
+            )
+            result = {"imports": [], "next": None}
+            result["imports"] = [_import_row(row) for row in rows if readable(principal, row)]
+            if len(rows) == limit:
+                result["next"] = _encode_cursor(rows[-1])
+            status = 200
+        except _RequestError as error:
+            status, result = error.status, {"error": error.message}
+        handler._send_json(status, result)
+
+    ctx.gateway.add_route("GET", "/api/imports", list_imports)
     ctx.gateway.add_route("POST", "/api/import", handle)
+
+
+def _decode_cursor(cursor):
+    """An opaque keyset cursor: base64url JSON [source_thread_id, stored_id]."""
+    try:
+        decoded = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+        after = json.loads(decoded)
+        if not (
+            isinstance(after, list)
+            and len(after) == 2
+            and all(isinstance(value, str) for value in after)
+        ):
+            raise ValueError()
+        for value in after:
+            value.encode("utf-8")  # A lone surrogate is invalid input, not a 500.
+    except (ValueError, binascii.Error, UnicodeError):
+        raise _RequestError(400, "invalid cursor") from None
+    return after
+
+
+def _encode_cursor(row):
+    raw = json.dumps([row.source_thread_id, row.id]).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _import_row(row):
+    """Metadata only; the words stay behind the existing thread read route."""
+    _, _, source, identity = row.source_thread_id.split(":", 3)
+    match = re.search(r"#(sha256:[0-9a-fA-F]{64})$", identity)
+    return {
+        "stored_thread_id": row.id,
+        "source": source,
+        "thread_id": identity[: match.start()] if match else identity,
+        "conflict_of": match.group(1) if match else None,
+        "created_at": row.created_at,
+        "stored_messages": row.message_count - 1,
+    }
 
 
 def grant_admit(ctx, principal, digest) -> int:

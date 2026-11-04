@@ -222,6 +222,32 @@ exact retry can return the latest own cursor. Treat `incomplete` as incomplete
 until the final whole-source hash and recognition checks succeed. No large-file
 performance guarantee is established: server work grows with accumulated history.
 
+## Find your imported history
+
+Sign in to your personal workspace, then call `GET /api/imports` with your
+session cookie. Agent tokens cannot list imports. ACL imports are not listed;
+their upload response already returns the stored ID.
+
+The response is `{"imports": [...], "next": null}`. Each row contains
+`stored_thread_id` (the `thr_...` ID), `source`, `thread_id`, `conflict_of`,
+`created_at` and `stored_messages`, without message text. Read the original
+archive through `GET /api/threads/<stored_thread_id>/messages?start=0&end=199`;
+request subsequent ranges as needed, at most 200 messages per call.
+
+Use `limit=1` through `limit=100` (default 50). Pass a non-null `next` back as
+the URL-encoded `cursor` query parameter until `next` is null, even if a page
+has no visible rows. Invalid limits or cursors return 400. Ordering is binary
+source identity then stored ID, rather than creation time. The cursor only
+advances within your own workspace and import namespace.
+
+`stored_messages` counts every item after archive message 0. For a first part
+this includes `import.part`; each later part adds `import.raw` and `import.part`
+as well as parsed messages. See the multipart reconstruction instructions below.
+`conflict_of` is the content digest suffix `sha256:<64 hex>` for a changed
+snapshot, not an original thread ID. Only the final matching suffix is split
+from `thread_id`. A user-chosen ID ending in that same suffix is inherently
+ambiguous and is displayed using the same split.
+
 ## Existing ACL import
 
 Use an ordinary signed-in session or an already authorized connection with

@@ -643,6 +643,20 @@ class ThreadStore:
                 ).fetchone()
             )
 
+    def list_source_range(self, workspace_id, prefix, *, after=None, limit):
+        """Page a literal source namespace in binary identity order."""
+        if not prefix.endswith(":"):
+            raise ValueError("source prefix must end with a colon")
+        sql = "SELECT * FROM threads WHERE workspace_id=? AND source_thread_id>=? AND source_thread_id<?"
+        parameters = [workspace_id, prefix, prefix[:-1] + ";"]
+        if after is not None:
+            sql += " AND (source_thread_id, id) > (?, ?)"
+            parameters.extend(after)
+        sql += " ORDER BY source_thread_id, id LIMIT ?"
+        parameters.append(limit)
+        with self._lock:
+            return [_stored_thread(row) for row in self._conn.execute(sql, parameters).fetchall()]
+
     def parent_of(self, stored_id: str) -> Optional[str]:
         """The stored thread this one's agent was a successor of, if any."""
         with self._lock:
