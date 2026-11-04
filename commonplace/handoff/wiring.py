@@ -100,7 +100,13 @@ def install(gateway, data_dir=None, **_ignored) -> HandoffContext:
     ctx.handoff_db = HandoffDB(gateway.db)
     ctx.events = Events(gateway.db, ctx.handoff_db)
     ctx.settings = SettingsService(ctx.handoff_db, ctx.events)
-    ctx.recall = Recall(ctx.store_for, call_tool=ctx.call_tool)
+    from commonplace import continuity_read
+
+    ctx.recall = Recall(
+        ctx.store_for,
+        call_tool=ctx.call_tool,
+        private=continuity_read.PrivateReader(gateway.db, ctx.store_for),
+    )
     ctx.service = HandoffService(
         control_db=gateway.db,
         handoff_db=ctx.handoff_db,
@@ -113,10 +119,11 @@ def install(gateway, data_dir=None, **_ignored) -> HandoffContext:
     )
     gateway.handoff = ctx
     api.register(ctx)
-    from commonplace import capture, imports
+    from commonplace import capture, imports, sync_sessions
 
     imports.register(ctx)
     capture.register(ctx)
+    sync_sessions.register(ctx)
     web.register(ctx)
     # Events a crash left queued (handoff.completed) go out now.
     ctx.service.replay_pending()

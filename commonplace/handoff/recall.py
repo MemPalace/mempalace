@@ -100,10 +100,11 @@ def _created_at(stored: StoredThread) -> float:
 
 
 class Recall:
-    def __init__(self, store_for: Callable, *, call_tool: Optional[Callable] = None):
+    def __init__(self, store_for: Callable, *, call_tool: Optional[Callable] = None, private=None):
         """``store_for(workspace_id) -> ThreadStore``."""
         self._store_for = store_for
         self._call_tool = call_tool
+        self._private = private
 
     def thread(self, principal, stored_thread_id: str) -> StoredThread:
         if (
@@ -115,6 +116,12 @@ class Recall:
         stored = self._store_for(principal.workspace_id).get(stored_thread_id)
         if stored is None or not _readable(principal, stored):
             raise ThreadNotFound("thread not found")
+        if self._private is not None:
+            if not self._private.readable(principal, stored):
+                raise ThreadNotFound("thread not found")
+            view = self._private.view(stored)
+            if view is not None:
+                stored = replace(stored, message_count=view.count)
         return stored
 
     def chain(self, principal, stored_thread_id: str) -> list[StoredThread]:
@@ -209,4 +216,8 @@ class Recall:
         end = min(end, start + MAX_RANGE - 1) if end is not None else start + MAX_RANGE - 1
         if end < start:
             return []
+        if self._private is not None:
+            view = self._private.view(stored)
+            if view is not None:
+                return view.messages(start, end)
         return self._store_for(principal.workspace_id).messages(stored.id, start, end)

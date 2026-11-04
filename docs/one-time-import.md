@@ -240,7 +240,9 @@ has no visible rows. Invalid limits or cursors return 400. Ordering is binary
 source identity then stored ID, rather than creation time. The cursor only
 advances within your own workspace and import namespace.
 
-`stored_messages` counts every item after archive message 0. For a first part
+`stored_messages` is the number of items this import's own submissions produced,
+counted as #151 counts them when the import is accepted. Later live sync does not
+change it; merged session size is `bytes` in `GET /api/sync/sessions`. For a first part
 this includes `import.part`; each later part adds `import.raw` and `import.part`
 as well as parsed messages. See the multipart reconstruction instructions below.
 `conflict_of` is the content digest suffix `sha256:<64 hex>` for a changed
@@ -326,8 +328,18 @@ The thread and handoff HTTP routes also accept ordinary signed-in sessions.
 Session requests retain origin checks and workspace isolation, and signing out
 revokes access to imported threads.
 
-Live hooks, watchers, Free's 15-minute sync, Paid's live sync and private-data
-dogfooding are outside this one-time import implementation.
+Live hooks, watchers, Free's 15-minute sync and Paid's live sync are described in
+`live-sync.md`. Private-data dogfooding is outside this one-time import implementation.
+
+## Live sync after import
+
+Use [live sync](live-sync.md) to continue a native session after importing it; Free
+may wait up to 900 seconds before the first live upload. Matching native history
+for the same user shares stored bytes without changing the import's listed count.
+Diverging imports are stored whole and ungrouped. A snapshot that ends in a live
+tail is kept as its own import and does not join a live-synced session. Older T3
+imports whose explicit native format automatic detection cannot recognize, and
+identities containing `#sha256:`, also stay ungrouped.
 
 ## Oversized native sessions (part protocol v1)
 

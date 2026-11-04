@@ -718,6 +718,9 @@ def _client_parsers(sub):
         parser.set_defaults(func=handler)
     check = sub.add_parser("check", help="warn about instructions or memory saved only locally")
     check.set_defaults(func=cmd_check)
+    from . import sync_cli
+
+    sync_cli.register(sub)
     for parser in (sub.choices["onboard"], check):
         parser.add_argument("--home", type=Path)
         project = parser.add_mutually_exclusive_group()
@@ -1002,7 +1005,7 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "runner":
         return args.func(args)
-    if args.command in {"onboard", "remember", "rule", "check"}:
+    if args.command in {"onboard", "remember", "rule", "check", "sync"}:
         from .client import ClientError
 
         # Client operations neither open server databases nor take their lock.

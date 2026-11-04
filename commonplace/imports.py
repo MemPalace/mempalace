@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import re
@@ -11,14 +12,14 @@ import threading
 from collections import Counter
 from urllib.parse import parse_qs, urlsplit
 
-from . import import_grant, ingest_cadence, plans
+from . import continuity_schema, import_grant, ingest_cadence, plans, sync_protocol
 from .capture import PRIVATE_WING
 from .handoff.api import _object, _query, _read_json, _RequestError, _text
 from .handoff.models import THREADS_WING
 from .handoff.recall import readable
 from .handoff.thread_store import ThreadConflict, ThreadStorageLimit, canonical_sha256
 from .http_util import log_failure
-from .import_parts import append_part
+from .import_parts import append_part, native_records, validate_part
 from .import_sources import SOURCES, parse_import
 from .workspace_store import thread_path, workspace_path
 
@@ -26,8 +27,46 @@ MAX_IMPORT_BYTES = 64 * 1024 * 1024
 MAX_THREADS = 50
 
 
+def _acl_import_allowed(policy):
+    return (
+        policy.has_scope("memory:read")
+        and policy.has_scope("memory:write")
+        and policy.has_scope("threads:read")
+        and policy.can_write_wing(THREADS_WING)
+        and policy.can_read_wing(THREADS_WING)
+        and policy.trust != "untrusted"
+    )
+
+
+def _import_envelope(ctx, principal, handler):
+    policy = principal.policy
+    acl_allowed = _acl_import_allowed(policy)
+    acl_error = _RequestError(
+        403, "Import requires memory:read, memory:write and threads:read for threads"
+    )
+    path = "acl"
+    if policy.has_scope(import_grant.IMPORT_SCOPE):
+        if not import_grant.grant_path(ctx.control_db, principal):
+            raise _RequestError(403, import_grant.INELIGIBLE_TEXT)
+        path = "grant"
+    if path == "acl" and not acl_allowed and not principal.person:
+        raise acl_error
+    data = _read_json(handler, MAX_IMPORT_BYTES)
+    if isinstance(data, dict) and "private" in data:
+        if not principal.person or data["private"] is not True:
+            raise _RequestError(400, "private requires a person and true")
+        if not import_grant.eligible(ctx.control_db, principal.user_id, principal.workspace_id):
+            raise _RequestError(403, import_grant.OWNER_ONLY_TEXT)
+        path = "grant"
+    if path == "acl" and not acl_allowed:
+        raise acl_error
+    data = _object(data, {"source", "threads", "private"})
+    return data, path
+
+
 def register(ctx):
     ingest_cadence.ensure_schema(ctx.control_db)
+    continuity_schema.ensure_schema(ctx.control_db)
     # Serialize imports so simultaneous batches cannot spend the same quota.
     lock = threading.Lock()
 
@@ -47,33 +86,24 @@ def register(ctx):
             principal = ctx.gateway.principal_for(handler)
             if principal is None:
                 raise _RequestError(401, "Sign in")
-            policy = principal.policy
-            path = "acl"
-            if policy.has_scope(import_grant.IMPORT_SCOPE):
-                if not import_grant.grant_path(ctx.control_db, principal):
-                    raise _RequestError(403, import_grant.INELIGIBLE_TEXT)
-                path = "grant"
-            elif not (
-                policy.has_scope("memory:read")
-                and policy.has_scope("memory:write")
-                and policy.has_scope("threads:read")
-                and policy.can_write_wing(THREADS_WING)
-                and policy.can_read_wing(THREADS_WING)
-                and policy.trust != "untrusted"
-            ):
-                raise _RequestError(
-                    403, "Import requires memory:read, memory:write and threads:read for threads"
-                )
-            data = _object(_read_json(handler, MAX_IMPORT_BYTES), {"source", "threads"})
+            data, path = _import_envelope(ctx, principal, handler)
             source = _text(data, "source", required=True)
-            if source not in SOURCES:
+            if source not in (*SOURCES, sync_protocol.MEMORY_IMPORT_SOURCE) or (
+                source == sync_protocol.MEMORY_IMPORT_SOURCE and path != "grant"
+            ):
                 raise _RequestError(400, "Unsupported source")
             threads = data.get("threads")
             if not isinstance(threads, list) or not 1 <= len(threads) <= MAX_THREADS:
                 raise _RequestError(400, f"Send between 1 and {MAX_THREADS} threads")
             if path == "grant":
                 digest = import_grant.request_digest("http:/api/import", data)
-                wait = grant_admit(ctx, principal, digest)
+                wait = grant_admit(
+                    ctx,
+                    principal,
+                    digest,
+                    ride=source
+                    in (*sync_protocol.TRANSCRIPT_SOURCES, sync_protocol.MEMORY_IMPORT_SOURCE),
+                )
                 if wait > 0:
                     raise _RequestError(429, f"Import not due; retry in {wait} seconds")
             result = import_batch(principal, source, threads, path=path)
@@ -89,6 +119,8 @@ def register(ctx):
         handler._send_json(status, result, {"Connection": "close"})
 
     def list_imports(handler):
+        from .continuity_read import listed_messages
+
         try:
             principal = ctx.gateway.principal_for(handler)
             if principal is None:
@@ -110,7 +142,11 @@ def register(ctx):
                 limit=limit,
             )
             result = {"imports": [], "next": None}
-            result["imports"] = [_import_row(row) for row in rows if readable(principal, row)]
+            result["imports"] = [
+                _import_row(row, listed_messages(ctx.control_db, row))
+                for row in rows
+                if readable(principal, row)
+            ]
             if len(rows) == limit:
                 result["next"] = _encode_cursor(rows[-1])
             status = 200
@@ -145,7 +181,7 @@ def _encode_cursor(row):
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def _import_row(row):
+def _import_row(row, listed=None):
     """Metadata only; the words stay behind the existing thread read route."""
     _, _, source, identity = row.source_thread_id.split(":", 3)
     match = re.search(r"#(sha256:[0-9a-fA-F]{64})$", identity)
@@ -155,11 +191,11 @@ def _import_row(row):
         "thread_id": identity[: match.start()] if match else identity,
         "conflict_of": match.group(1) if match else None,
         "created_at": row.created_at,
-        "stored_messages": row.message_count - 1,
+        "stored_messages": listed if listed is not None else row.message_count - 1,
     }
 
 
-def grant_admit(ctx, principal, digest) -> int:
+def grant_admit(ctx, principal, digest, *, ride=False) -> int:
     return ingest_cadence.admit(
         ctx.control_db,
         account_id=principal.user_id,
@@ -167,7 +203,89 @@ def grant_admit(ctx, principal, digest) -> int:
         request_sha256=digest,
         interval=ingest_cadence.interval_for(ctx.control_db, principal.user_id),
         now=plans._now(),
+        ride=ride,
     )
+
+
+def _validate_memory_identity(thread_id, transcript, path):
+    try:
+        label, rest = thread_id.split(":", 1)
+        relpath, _ = rest.rsplit(":", 1)
+        expected = sync_protocol.memory_thread_id(
+            label, relpath, hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+        )
+        if path != "grant" or thread_id != expected:
+            raise ValueError()
+    except ValueError:
+        raise _RequestError(400, "Invalid memory identity") from None
+
+
+def _validate_native_part(source, fmt, transcript, part):
+    if (
+        source not in sync_protocol.TRANSCRIPT_SOURCES
+        or fmt not in ("claude-code", "codex")
+        or (source != "t3" and source != fmt)
+    ):
+        raise ValueError("Parts require an explicit native format")
+    validate_part(part, transcript.encode("utf-8"))
+    native_records(transcript, fmt, part["final"])
+
+
+def _store_private_snapshot(
+    ctx,
+    principal,
+    store,
+    *,
+    source,
+    fmt,
+    thread_id,
+    transcript,
+    messages,
+    source_id,
+    maximum,
+    continuity_item,
+):
+    if continuity_item:
+        from . import continuity
+
+        with ctx.control_db._lock, ctx.control_db._tx() as conn:
+            with store._transaction():
+                grouped = continuity.import_item(
+                    conn,
+                    store,
+                    ws=principal.workspace_id,
+                    user_id=principal.user_id,
+                    source=source,
+                    fmt=fmt,
+                    thread_id=thread_id,
+                    transcript=transcript,
+                    messages=messages,
+                    actor=principal.actor,
+                    maximum=maximum,
+                )
+        if grouped is not None:
+            return
+    with store._transaction():
+        # Refuse uniformly, including an already covered request.
+        store._check_storage_budget(maximum, messages)
+        try:
+            store.store(
+                principal.workspace_id,
+                source_id,
+                messages,
+                actor=principal.actor,
+                max_storage_bytes=maximum,
+                wing=PRIVATE_WING,
+            )
+        except ThreadConflict:
+            store.store(
+                principal.workspace_id,
+                f"{source_id}#sha256:{canonical_sha256(messages)}",
+                messages,
+                actor=principal.actor,
+                max_storage_bytes=maximum,
+                wing=PRIVATE_WING,
+            )
 
 
 def run_batch(ctx, principal, source, threads, *, path="acl"):
@@ -191,7 +309,12 @@ def run_batch(ctx, principal, source, threads, *, path="acl"):
             multipart = "part" in item
             transcript = _text(item, "transcript", required=not multipart)
             fmt = _text(item, "format", "auto")
+            if source == sync_protocol.MEMORY_IMPORT_SOURCE:
+                _validate_memory_identity(thread_id, transcript, path)
             messages = None if multipart else parse_import(source, transcript, fmt)
+            if multipart:
+                # Preserve the strict multipart policy before any continuity write.
+                _validate_native_part(source, fmt, transcript, item["part"])
             # A fresh store has schema/WAL overhead. Refuse before creating it
             # when the account cannot fit even that, using an uncached meter.
             used = plans.StorageMeter._walk(directory)
@@ -199,6 +322,23 @@ def run_batch(ctx, principal, source, threads, *, path="acl"):
                 if used + 1024 * 1024 > limit:
                     raise ThreadStorageLimit()
             store = ctx.store_for(principal.workspace_id)
+            native_source = sync_protocol.native_source(source, fmt, transcript)
+            continuity_item = (
+                path == "grant"
+                and native_source is not None
+                and (
+                    multipart
+                    or not sync_protocol.live_tail(transcript)
+                    and sync_protocol.native_identity(transcript.encode("utf-8"), native_source)
+                    is not None
+                )
+            )
+            if continuity_item:
+                from . import continuity
+
+                continuity.backfill(
+                    ctx.control_db, store, principal.workspace_id, principal.user_id
+                )
             source_id = (
                 import_grant.grant_id(principal.user_id, source, thread_id)
                 if path == "grant"
@@ -239,18 +379,40 @@ def run_batch(ctx, principal, source, threads, *, path="acl"):
                 placement = (
                     {"source_id": source_id, "wing": PRIVATE_WING} if path == "grant" else {}
                 )
-                part_result = append_part(
-                    store,
-                    principal.workspace_id,
-                    source,
-                    thread_id,
-                    fmt,
-                    transcript,
-                    item["part"],
-                    actor=principal.actor,
-                    maximum=allowance,
-                    **placement,
-                )
+                if continuity_item:
+                    with ctx.control_db._lock, ctx.control_db._tx() as conn:
+                        with store._transaction():
+                            part_result = continuity.stream_push(
+                                conn,
+                                store,
+                                ws=principal.workspace_id,
+                                user_id=principal.user_id,
+                                connection_id=principal.connection_id,
+                                kind="import",
+                                stream_id=source_id,
+                                source=source,
+                                native_source=native_source,
+                                data=transcript.encode("utf-8"),
+                                offset=item["part"]["offset"],
+                                prefix=item["part"]["prefix_sha256"],
+                                actor=principal.actor,
+                                maximum=allowance,
+                                gate=lambda: None,
+                                part=item["part"],
+                            )
+                else:
+                    part_result = append_part(
+                        store,
+                        principal.workspace_id,
+                        source,
+                        thread_id,
+                        fmt,
+                        transcript,
+                        item["part"],
+                        actor=principal.actor,
+                        maximum=allowance,
+                        **placement,
+                    )
                 if path == "grant":
                     row.update(
                         {
@@ -274,28 +436,19 @@ def run_batch(ctx, principal, source, threads, *, path="acl"):
                 results.append(row)
                 continue
             if path == "grant":
-                with store._transaction():
-                    # Refuse uniformly before store.store can look up a source
-                    # or compare a digest, including an already covered request.
-                    store._check_storage_budget(maximum, messages)
-                    try:
-                        store.store(
-                            principal.workspace_id,
-                            source_id,
-                            messages,
-                            actor=principal.actor,
-                            max_storage_bytes=maximum,
-                            wing=PRIVATE_WING,
-                        )
-                    except ThreadConflict:
-                        store.store(
-                            principal.workspace_id,
-                            f"{source_id}#sha256:{canonical_sha256(messages)}",
-                            messages,
-                            actor=principal.actor,
-                            max_storage_bytes=maximum,
-                            wing=PRIVATE_WING,
-                        )
+                _store_private_snapshot(
+                    ctx,
+                    principal,
+                    store,
+                    source=source,
+                    fmt=fmt,
+                    thread_id=thread_id,
+                    transcript=transcript,
+                    messages=messages,
+                    source_id=source_id,
+                    maximum=maximum,
+                    continuity_item=continuity_item,
+                )
                 row.update(
                     status="accepted",
                     messages=len(messages) - 1,

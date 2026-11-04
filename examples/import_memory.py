@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import time
 from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -16,11 +17,14 @@ MAX_IMPORT_BYTES = 64 * 1024 * 1024
 _RECORD_END = re.compile(rb"[\r\n]")
 
 
-def serialize(source, identity, fmt, transcript, part=None):
+def serialize(source, identity, fmt, transcript, part=None, *, private=False):
     item = {"thread_id": identity, "transcript": transcript, "format": fmt}
     if part is not None:
         item["part"] = part
-    return json.dumps({"source": source, "threads": [item]}, ensure_ascii=False).encode("utf-8")
+    data = {"source": source, "threads": [item]}
+    if private:
+        data["private"] = True
+    return json.dumps(data, ensure_ascii=False).encode("utf-8")
 
 
 def binary_records(stream, maximum, block_size=65536):
@@ -73,18 +77,34 @@ def descriptor(size, digest, index, offset, prefix, part_hash, final=False):
     )
 
 
-def native_plan(stream, source, identity, fmt="auto", *, budget=MAX_IMPORT_BYTES, block_size=65536):
+def native_plan(
+    stream,
+    source,
+    identity,
+    fmt="auto",
+    *,
+    budget=MAX_IMPORT_BYTES,
+    block_size=65536,
+    private=False,
+):
     """Freeze hashes/spans before HTTP; buffers are bounded by a record/body cap."""
-    if not isinstance(identity, str) or not identity.strip() or len(identity) > 512:
+    from commonplace.sync_protocol import live_tail, native_identity, native_source
+
+    if identity is not None and (
+        not isinstance(identity, str) or not identity.strip() or len(identity) > 512
+    ):
         raise ValueError("Invalid original thread ID")
     if source != "t3" and fmt not in ("auto", source):
         raise ValueError("Unsupported native format")
     stream.seek(0)
     first_hash = hashlib.sha256()
     size = escaped = 0
+    sample = bytearray()
+    text = ""
     resolved = source if source != "t3" else (None if fmt == "auto" else fmt)
     for raw in binary_records(stream, budget, block_size):
         text = raw.decode("utf-8")
+        sample.extend(raw[: max(0, 1024 * 1024 - len(sample))])
         first_hash.update(raw)
         size += len(raw)
         escaped += escaped_size(text)
@@ -94,6 +114,12 @@ def native_plan(stream, source, identity, fmt="auto", *, budget=MAX_IMPORT_BYTES
             except ValueError:
                 pass  # Legacy-fitting live tails keep the server's parser policy.
     fingerprint = first_hash.hexdigest()
+    derived = native_identity(
+        bytes(sample), native_source(source, fmt, sample.decode("utf-8", errors="replace"))
+    )
+    identity = identity or derived
+    if identity is None:
+        raise ValueError("--thread-id is required when the native session has no identity")
     base = dict(
         source=source,
         thread_id=identity,
@@ -102,8 +128,11 @@ def native_plan(stream, source, identity, fmt="auto", *, budget=MAX_IMPORT_BYTES
         session_sha256=fingerprint,
         budget=budget,
         version=1,
+        private=private,
+        native_identity=derived,
+        live_tail=live_tail(text),
     )
-    if len(serialize(source, identity, fmt, "")) + escaped <= budget:
+    if len(serialize(source, identity, fmt, "", private=private)) + escaped <= budget:
         return dict(base, legacy=True, parts=[dict(offset=0, size=size, sha256=fingerprint)])
     if resolved not in ("claude-code", "codex") or not 0 < size <= 2**63 - 1:
         raise ValueError("Unrecognized native session")
@@ -143,7 +172,7 @@ def native_plan(stream, source, identity, fmt="auto", *, budget=MAX_IMPORT_BYTES
                 raise ValueError("Invalid complete native JSON record") from None
         extra = escaped_size(text)
         empty = descriptor(size, fingerprint, len(parts), start, prefix, "0" * 64)
-        overhead = len(serialize(source, identity, resolved, "", empty))
+        overhead = len(serialize(source, identity, resolved, "", empty, private=private))
         if overhead + cost + extra > budget and offset > start:
             finish()
             start = offset
@@ -151,7 +180,7 @@ def native_plan(stream, source, identity, fmt="auto", *, budget=MAX_IMPORT_BYTES
             cost = 0
             part_hash = hashlib.sha256()
             empty = descriptor(size, fingerprint, len(parts), start, prefix, "0" * 64)
-            overhead = len(serialize(source, identity, resolved, "", empty))
+            overhead = len(serialize(source, identity, resolved, "", empty, private=private))
         if overhead + extra > budget:
             raise ValueError("record_too_large")
         whole.update(raw)
@@ -173,7 +202,12 @@ def planned_body(stream, plan, span):
     if len(raw) != span["size"] or hashlib.sha256(raw).hexdigest() != span["sha256"]:
         raise ValueError("Source changed after preflight")
     body = serialize(
-        plan["source"], plan["thread_id"], plan["format"], raw.decode("utf-8"), span.get("part")
+        plan["source"],
+        plan["thread_id"],
+        plan["format"],
+        raw.decode("utf-8"),
+        span.get("part"),
+        private=plan.get("private", False),
     )
     if len(body) > plan["budget"]:
         raise ValueError("Serialized request exceeds the request limit")
@@ -212,13 +246,13 @@ def acknowledge(report, plan, span):
     cursor = row.get("offset")
     next_index = row.get("next_index")
     if (
-        row.get("status") not in ("imported", "duplicate")
+        row.get("status") not in ("imported", "duplicate", "accepted")
         or row.get("unit") != "part"
         or row.get("thread_id") != plan["thread_id"]
         or row.get("format") != plan["format"]
         or row.get("part") != part
-        or not isinstance(row.get("stored_thread_id"), str)
-        or not row["stored_thread_id"]
+        or not (row.get("status") == "accepted" and "stored_thread_id" not in row)
+        and (not isinstance(row.get("stored_thread_id"), str) or not row["stored_thread_id"])
         or type(cursor) is not int
         or not end <= cursor <= plan["session_bytes"]
         or type(next_index) is not int
@@ -243,8 +277,15 @@ def acknowledge(report, plan, span):
     return row
 
 
-def upload_native(stream, source, identity, fmt, send, *, budget=MAX_IMPORT_BYTES):
-    plan = native_plan(stream, source, identity, fmt, budget=budget)
+def upload_native(stream, source, identity, fmt, send, *, budget=MAX_IMPORT_BYTES, private=False):
+    plan = native_plan(stream, source, identity, fmt, budget=budget, private=private)
+    if identity and plan["native_identity"] and identity != plan["native_identity"]:
+        print("Warning: --thread-id differs from the native session identity", file=sys.stderr)
+    identity = plan["thread_id"]
+    if plan["legacy"] and plan["live_tail"]:
+        print(
+            "Warning: this snapshot ends in a live tail and will be kept separate", file=sys.stderr
+        )
     acknowledged = 0
     stored_id = None
     for span in plan["parts"]:
@@ -253,9 +294,9 @@ def upload_native(stream, source, identity, fmt, send, *, budget=MAX_IMPORT_BYTE
             print(json.dumps(report, ensure_ascii=False), flush=True)
             return bool(report["errors"])
         row = acknowledge(report, plan, span)
-        if stored_id is not None and stored_id != row["stored_thread_id"]:
+        if stored_id is not None and stored_id != row.get("stored_thread_id"):
             raise ValueError("Import part identity changed")
-        stored_id = row["stored_thread_id"]
+        stored_id = row.get("stored_thread_id")
         acknowledged += span["size"]  # each planned interval exactly once, never cursor sums
         print(
             json.dumps(
@@ -342,6 +383,9 @@ def main(argv=None):
     )
     parser.add_argument("--thread-id")
     parser.add_argument(
+        "--private", action="store_true", help="Import privately with a personal owner session"
+    )
+    parser.add_argument(
         "--format",
         default="auto",
         choices=("auto", "messages", "claude-code", "codex", "grok-facts"),
@@ -369,8 +413,21 @@ def main(argv=None):
             data=body,
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         )
-        with opener.open(request, timeout=60) as response:
-            return json.load(response)
+        while True:
+            try:
+                with opener.open(request, timeout=60) as response:
+                    return json.load(response)
+            except HTTPError as error:
+                if error.code != 429:
+                    raise
+                try:
+                    message = json.load(error).get("error", "")
+                except (ValueError, AttributeError):
+                    raise ValueError("Invalid retry response") from None
+                match = re.search(r"retry in (\d+) seconds", message)
+                if match is None:
+                    raise ValueError("Invalid retry response") from None
+                time.sleep(int(match.group(1)))
 
     failed = False
     try:
@@ -388,6 +445,7 @@ def main(argv=None):
                         args.format,
                         send,
                         budget=MAX_IMPORT_BYTES,
+                        private=args.private,
                     )
                 )
         with args.file.open(encoding="utf-8", newline="") as stream:
@@ -398,19 +456,7 @@ def main(argv=None):
             else conversations(text, args.source, args.thread_id)
         )
         for identity, transcript in records:
-            body = json.dumps(
-                {
-                    "source": args.source,
-                    "threads": [
-                        {
-                            "thread_id": identity,
-                            "transcript": transcript,
-                            "format": args.format,
-                        }
-                    ],
-                },
-                ensure_ascii=False,
-            ).encode("utf-8")
+            body = serialize(args.source, identity, args.format, transcript, private=args.private)
             if len(body) > 64 * 1024 * 1024:
                 raise ValueError("Conversation exceeds the 64 MiB request limit")
             report = send(body)

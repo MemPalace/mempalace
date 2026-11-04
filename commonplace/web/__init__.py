@@ -6,7 +6,7 @@ import mimetypes
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-from commonplace import events, plans, sessions, urls
+from commonplace import events, plans, sessions, sync_feed, urls
 from commonplace.http_util import query, require_principal, send_json
 
 STATIC = Path(__file__).parent / "static"
@@ -141,6 +141,9 @@ def install(gateway):
     def feed(h):
         principal = require_principal(gateway, h)
         if principal is None:
+            return
+        if query(h).get("feed") == "sync":
+            sync_feed.handle(gateway, h, principal)
             return
         # Events carry labels without theme ACLs. Restrict unfilterable metadata
         # to people and agents already permitted to read the entire workspace.

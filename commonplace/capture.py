@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 
-from . import plans
+from . import continuity_schema, import_grant, ingest_cadence, plans, sync_protocol
 from .handoff.api import _integer, _object, _read_json, _RequestError, _text
 from .handoff.models import ThreadMessage
 from .handoff.thread_store import ThreadConflict, ThreadStorageLimit
@@ -65,7 +66,7 @@ def cursor(store, stored):
 
 
 def append_capture(
-    store, workspace, identity, source, text, offset, prefix, *, actor, maximum, interval
+    store, workspace, identity, source, text, offset, prefix, *, actor, maximum, interval, gate=None
 ):
     """Cursor validation, raw archive, readable suffix and quota commit together.
 
@@ -108,6 +109,8 @@ def append_capture(
             )
             if remaining > 0:
                 raise _RequestError(429, f"Capture not due; retry in {int(remaining) + 1} seconds")
+        if gate is not None:
+            gate()
         previous = store.messages(stored.id) if stored else []
         start = len(previous)
         archive = ThreadMessage(
@@ -130,8 +133,145 @@ def append_capture(
         return dict(cursor(store, stored), status="appended", added_messages=len(messages))
 
 
-def register(ctx):
+def _push(db, conn, store, principal, data, identity, source, maximum, continuity):
+    actor_id = principal.user_id if principal.person else principal.connection_id
+    op = data.get("client_op_id")
+    if "client_op_id" in data and (
+        not isinstance(op, str) or re.fullmatch(sync_protocol.OP_ID_PATTERN, op) is None
+    ):
+        raise _RequestError(400, "Invalid client_op_id")
+    now = plans._now()
+    conn.execute(
+        "DELETE FROM capture_ops WHERE at < ?",
+        ((now - timedelta(seconds=ingest_cadence.RETRY_WINDOW_SECONDS)).isoformat(),),
+    )
+    digest = import_grant.request_digest("http:/api/capture", data)
+    if op is not None:
+        row = conn.execute(
+            "SELECT request_sha256, response FROM capture_ops "
+            "WHERE workspace_id=? AND actor_id=? AND client_op_id=?",
+            (principal.workspace_id, actor_id, op),
+        ).fetchone()
+        if row:
+            if row["request_sha256"] != digest:
+                return {
+                    "error": "client_op_id was used for a different request",
+                    "code": "op_conflict",
+                }
+            return json.loads(row["response"])
+
+    def gate():
+        wait = ingest_cadence.admit(
+            db,
+            account_id=ingest_cadence.account_key(db, principal),
+            connection_id=actor_id,
+            request_sha256=digest,
+            interval=ingest_cadence.account_interval(db, principal),
+            now=plans._now(),
+            window=sync_protocol.PUSH_WINDOW_SECONDS,
+            conn=conn,
+        )
+        if wait:
+            raise _RequestError(429, f"Capture not due; retry in {wait} seconds")
+
+    result = continuity.stream_push(
+        conn,
+        store,
+        ws=principal.workspace_id,
+        user_id=principal.user_id,
+        connection_id=principal.connection_id,
+        kind="capture",
+        stream_id=identity,
+        source=source,
+        native_source=source,
+        data=_text(data, "transcript", required=True).encode("utf-8"),
+        offset=_integer(data.get("offset"), "offset", maximum=2**63 - 1),
+        prefix=_text(data, "prefix_sha256", required=True),
+        actor=principal.actor,
+        maximum=maximum,
+        gate=gate,
+    )
+    if op is not None:
+        conn.execute(
+            "INSERT INTO capture_ops VALUES (?,?,?,?,?,?)",
+            (principal.workspace_id, actor_id, op, digest, json.dumps(result), now.isoformat()),
+        )
+    return result
+
+
+def _backfill(ctx, principal, data, continuity):
     db = ctx.control_db
+    try:
+        _object(
+            data,
+            {
+                "source",
+                "thread_id",
+                "offset",
+                "prefix_sha256",
+                "transcript",
+                "client_op_id",
+            },
+        )
+        source, _ = _identity(principal, data)
+        raw = _text(data, "transcript", required=True).encode("utf-8")
+        groupable = sync_protocol.native_identity(raw, source) is not None
+    except (_RequestError, ValueError):
+        groupable = False
+    if groupable:
+        if ctx.has_threads(principal.workspace_id):
+            continuity.backfill(
+                db,
+                ctx.store_for(principal.workspace_id),
+                principal.workspace_id,
+                principal.user_id,
+            )
+        else:
+            with db._lock, db._tx() as conn:
+                conn.execute(
+                    "INSERT INTO sync_backfill(workspace_id,user_id,done) VALUES (?,?,1) "
+                    "ON CONFLICT(workspace_id,user_id) DO UPDATE SET done=1",
+                    (principal.workspace_id, principal.user_id),
+                )
+
+
+def _update_settings(db, conn, principal, data, sync_feed):
+    _object(data, {"enabled", "sync_now"})
+    if not data:
+        raise _RequestError(400, "Provide enabled or sync_now")
+    if "enabled" in data and type(data["enabled"]) is not bool:
+        raise _RequestError(400, "enabled must be a boolean")
+    if "sync_now" in data and data["sync_now"] is not True:
+        raise _RequestError(400, "sync_now must be true")
+    if "enabled" in data:
+        conn.execute(
+            "INSERT INTO capture_settings VALUES (?,?) ON CONFLICT(workspace_id) "
+            "DO UPDATE SET enabled=excluded.enabled",
+            (principal.workspace_id, int(data["enabled"])),
+        )
+        db.audit(
+            action="capture.setting",
+            decision="ok",
+            workspace_id=principal.workspace_id,
+            user_id=principal.user_id,
+            reason="enabled" if data["enabled"] else "disabled",
+        )
+        sync_feed.record(
+            conn,
+            principal.workspace_id,
+            "sync.capture",
+            {"enabled": data["enabled"]},
+        )
+    if "sync_now" in data:
+        sync_feed.record(conn, principal.workspace_id, "sync.request", {})
+
+
+def register(ctx):
+    from . import continuity, sync_feed
+
+    db = ctx.control_db
+    ingest_cadence.ensure_schema(db)
+    continuity_schema.ensure_schema(db)
     with db._lock:
         db._conn.execute(
             "CREATE TABLE IF NOT EXISTS capture_settings ("
@@ -142,15 +282,15 @@ def register(ctx):
         row = db._conn.execute(
             "SELECT enabled FROM capture_settings WHERE workspace_id=?", (principal.workspace_id,)
         ).fetchone()
-        account = plans.workspace_account(db, principal.workspace_id)
         return {
             "enabled": bool(row and row[0]),
-            "interval_seconds": plans.sync_interval(db, account) if account else 0,
+            "interval_seconds": ingest_cadence.account_interval(db, principal),
             "private": True,
         }
 
     def route(handler):
         handler._handoff_body_read = False
+        changed = False
         try:
             principal = ctx.gateway.principal_for(handler)
             if principal is None:
@@ -169,26 +309,15 @@ def register(ctx):
                 if handler.command == "GET"
                 else _read_json(handler, 1024 * 1024 if is_settings else MAX_CAPTURE_BYTES)
             )
+            if not is_settings and handler.command == "POST":
+                _backfill(ctx, principal, data, continuity)
             # This control transaction serializes capture with opt-out, including
             # across gateway processes. Opt-out returns after earlier writes finish.
             with db._lock, db._tx() as conn:
                 if is_settings:
                     if handler.command == "POST":
-                        _object(data, {"enabled"})
-                        if type(data.get("enabled")) is not bool:
-                            raise _RequestError(400, "enabled must be a boolean")
-                        conn.execute(
-                            "INSERT INTO capture_settings VALUES (?,?) ON CONFLICT(workspace_id) "
-                            "DO UPDATE SET enabled=excluded.enabled",
-                            (principal.workspace_id, int(data["enabled"])),
-                        )
-                        db.audit(
-                            action="capture.setting",
-                            decision="ok",
-                            workspace_id=principal.workspace_id,
-                            user_id=principal.user_id,
-                            reason="enabled" if data["enabled"] else "disabled",
-                        )
+                        _update_settings(db, conn, principal, data, sync_feed)
+                        changed = True
                     result = settings(principal)
                 else:
                     setting = settings(principal)
@@ -198,12 +327,20 @@ def register(ctx):
                         data,
                         {"source", "thread_id"}
                         if handler.command == "GET"
-                        else {"source", "thread_id", "offset", "prefix_sha256", "transcript"},
+                        else {
+                            "source",
+                            "thread_id",
+                            "offset",
+                            "prefix_sha256",
+                            "transcript",
+                            "client_op_id",
+                        },
                     )
                     source, identity = _identity(principal, data)
                     directory = workspace_path(ctx.data_dir, principal.workspace_id)
                     account = plans.workspace_account(db, principal.workspace_id)
                     plan = plans.get_plan(db, account) if plans.enabled() and account else None
+                    plan = (plan or plans.FREE) if plans.enabled() else None
                     limit = plan.storage_bytes if plan else None
                     if handler.command == "GET" and not ctx.has_threads(principal.workspace_id):
                         result = dict(
@@ -215,14 +352,25 @@ def register(ctx):
                                 raise ThreadStorageLimit()
                         store = ctx.store_for(principal.workspace_id)
                         if handler.command == "GET":
+                            grouped = conn.execute(
+                                "SELECT 1 FROM sync_streams WHERE workspace_id=? AND stream_id=?",
+                                (principal.workspace_id, identity),
+                            ).fetchone()
                             result = dict(
-                                cursor(store, store.by_source(principal.workspace_id, identity)),
+                                continuity.stream_cursor(
+                                    conn,
+                                    store,
+                                    ws=principal.workspace_id,
+                                    stream_id=identity,
+                                    own_identity=identity,
+                                )
+                                if grouped
+                                else cursor(
+                                    store, store.by_source(principal.workspace_id, identity)
+                                ),
                                 interval_seconds=setting["interval_seconds"],
                             )
                         else:
-                            offset = _integer(data.get("offset"), "offset", maximum=2**63 - 1)
-                            prefix = _text(data, "prefix_sha256", required=True)
-                            transcript = _text(data, "transcript", required=True)
 
                             def maximum():
                                 if limit is None:
@@ -239,19 +387,20 @@ def register(ctx):
                                 )
                                 return limit - (plans.StorageMeter._walk(directory) - own)
 
-                            result = append_capture(
+                            result = _push(
+                                db,
+                                conn,
                                 store,
-                                principal.workspace_id,
+                                principal,
+                                data,
                                 identity,
                                 source,
-                                transcript,
-                                offset,
-                                prefix,
-                                actor=principal.actor,
-                                maximum=maximum,
-                                interval=setting["interval_seconds"],
+                                maximum,
+                                continuity,
                             )
-            status = 200
+            if changed:
+                sync_feed.notify(principal.workspace_id)
+            status = 409 if result.get("code") == "op_conflict" else 200
         except _RequestError as error:
             status, result = error.status, {"error": error.message}
         except ThreadConflict:

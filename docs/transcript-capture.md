@@ -25,10 +25,15 @@ capture channel, including for the default untrusted inbox connection; it does
 not grant general private writes or transcript reads. An authenticated connection
 can append only under its own connection ID, source and native session ID.
 Rotation of a connection token preserves that identity; replacing a connection
-creates a separate capture namespace. Signed-in people can also submit capture
-requests, under their own user namespace.
+creates a separate capture namespace while matching native history for the same
+user shares stored bytes. Signed-in people can also submit capture requests,
+under their own user namespace.
 
 ## Local selection and scheduling
+
+For a persistent user service with a durable outbox and automatic retries, use
+[live sync](live-sync.md). The commands below remain available for one-pass scans
+and existing hook schedules.
 
 Install the package in the environment running the native client. Explicitly set
 `COMMONPLACE_URL` to the destination gateway and `COMMONPLACE_TOKEN` to that
@@ -70,8 +75,9 @@ an absolute `transcript_path` or `rollout_path`. The hook starts a detached,
 one-pass child; network and transcript reads occur in that child, and hook
 errors never interrupt the conversation. It does not change handoff settings.
 Periodic scans are still needed to catch sessions without a final hook, late
-flushes and retryable failures. Paid “live” means capture at supplied hook
-events, not a token-by-token stream or an installed filesystem watcher.
+flushes and retryable failures. With these hook commands, Paid capture runs at
+supplied hook events. The [live-sync daemon](live-sync.md) also checks selected
+files every two seconds.
 Codex notifications without a native rollout path need the directory scan or
 the existing adapter that supplies that path. No hook is installed by these
 commands. Remove the local hook or unset the local switch to stop scheduling;
@@ -114,10 +120,11 @@ captured text is historical proposal data, never approved rules.
 
 Captured threads use the `private_chats` wing and private file permissions.
 The normal thread API and tools still require `threads:read`, the same workspace,
-and explicit private read permission and wing scope. Capturing alone grants none
-of those reads. Other workspaces cannot access the content or its cursor.
-One-time imports and capture use distinct source namespaces; importing the same
-file separately is not deduplicated against capture.
+explicit private read permission and wing scope, and the filing user. Capturing
+alone grants none of those reads. Other workspaces cannot access the content or
+its cursor. One-time imports and capture keep distinct source namespaces while
+sharing matching native session bytes for the same user; see
+[live-sync continuity and its exceptions](live-sync.md#imports-and-shared-sessions).
 
 Free's normal storage limit includes the thread database, compressed/raw frames,
 indexes, WAL and all other workspace files. Capture recomputes its available

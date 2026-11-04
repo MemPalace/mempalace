@@ -130,7 +130,7 @@ class HandoffService:
         meta = request.meta
         if not meta.thread_id or not meta.thread_id.strip():
             raise ValueError("thread_id must not be empty")
-        if meta.thread_id.startswith("import-private:"):
+        if meta.thread_id.startswith(("import-private:", "capture:", "capture-fork:")):
             raise ValueError("thread_id uses a reserved namespace")
         workspace_id = principal.workspace_id
         # Retry events a failed delivery left queued in this workspace.

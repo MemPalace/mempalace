@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Optional Commonplace live sync joins native session imports and captures, with a durable local outbox, private session reads, plan cadence and explicitly enabled user services ([guide](docs/live-sync.md)).
 - Commonplace can send mail over SMTP, configured with `COMMONPLACE_SMTP_*` and off by default. `commonplace login-link --send` emails the sign-in link and never prints it ([mail setup](commonplace/README.md#mail)).
 - Commonplace rules: the owner can change who a rule applies to, between one agent and All agents (or another agent), from an "Applies to…" menu, and accept an agent's proposal for all agents in one step. The move keeps the rule's history, and the agent's later republishes of that key stay with the moved rule for the owner to review ([design](docs/design/RULES.md)).
 - Optional context handoff in Commonplace, off by default: verbatim thread storage, successor agents, thread recall, settings and webhooks ([guide](docs/handoff.md)).
