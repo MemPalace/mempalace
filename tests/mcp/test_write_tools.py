@@ -41,6 +41,40 @@ class TestWriteTools:
         assert stored["metadatas"], stored
         assert stored["metadatas"][0].get("source_dir_ino") == expected
 
+    def test_add_drawer_canonicalizes_wing_slug_issue_2579_regression(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression #2579: add_drawer must store wings in canonical slug
+        form, so ``MyProject`` and ``My-App`` round-trip into the same wing
+        the project miner files under (``myproject``, ``my_app``), while
+        path-traversal inputs are still rejected rather than slugified.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(
+            wing="My-Project",
+            room="Scratch-Room",
+            content="Case and hyphen canonicalization probe.",
+        )
+
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"], stored
+        assert stored["metadatas"][0]["wing"] == "my_project"
+        # Rooms are NOT canonicalized in this change — they stay as given.
+        assert stored["metadatas"][0]["room"] == "Scratch-Room"
+
+        rejected = tool_add_drawer(
+            wing="../etc/passwd",
+            room="scratch",
+            content="Must not silently slugify path traversal.",
+        )
+        assert rejected["success"] is False
+        assert "invalid path characters" in rejected["error"]
+
     def test_wal_result_entries_match_tool_outcome_issue_538_regression(
         self, monkeypatch, config, palace_path, kg, tmp_path
     ):
@@ -1007,9 +1041,14 @@ class TestWriteTools:
         assert fetched["room"] == "scratchroom"
 
     def test_update_drawer_identical_case_is_noop(self, monkeypatch, config, palace_path, kg):
-        """Regression for #2395: re-submitting the exact same casing must
-        still be a content-preserving no-op (no spurious write, old value
-        unchanged)."""
+        """Re-submitting the same wing must still be a content-preserving
+        no-op (no spurious write, old value unchanged).
+
+        Under #2579 (write-path canonicalization) the wing is stored in
+        canonical slug form regardless of the casing the client sends, so
+        re-submitting any casing collapses to the same slug and is a true
+        no-op.
+        """
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_add_drawer, tool_update_drawer
 
@@ -1019,7 +1058,7 @@ class TestWriteTools:
 
         result = tool_update_drawer(drawer_id, wing="StableWing", room="stable_room")
         assert result["success"] is True
-        assert result["wing"] == "StableWing"
+        assert result["wing"] == "stablewing"
         assert result["room"] == "stable_room"
 
     def test_update_drawer_case_variant_with_existing_target_wing(
@@ -1046,6 +1085,18 @@ class TestWriteTools:
             tool_update_drawer,
         )
 
+        # Source wing with the legacy mixed-case drawer we intend to move
+        # (issue's "wing_Codex has 1" half). Seed directly into the collection
+        # because post-#2579 tool_add_drawer canonicalizes wings on write.
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        drawer_id = "legacy_wing_Codex_diary_1"
+        col.add(
+            ids=[drawer_id],
+            documents=["the drawer we are moving"],
+            metadatas=[{"wing": "wing_Codex", "room": "diary", "added_by": "legacy"}],
+        )
+
         # Existing destination wing with several drawers (issue's "wing_codex
         # has many" half).
         for i in range(3):
@@ -1053,12 +1104,6 @@ class TestWriteTools:
                 wing="wing_codex", room="general", content=f"existing codex drawer {i}"
             )
             assert existed["success"] is True, existed
-
-        # Source wing with the drawer we intend to move (issue's "wing_Codex
-        # has 1" half).
-        added = tool_add_drawer(wing="wing_Codex", room="diary", content="the drawer we are moving")
-        assert added["success"] is True
-        drawer_id = added["drawer_id"]
 
         pre = tool_list_wings()
         assert pre["wings"].get("wing_Codex") == 1
