@@ -20,6 +20,16 @@ ROOT = Path(__file__).resolve().parents[1]
 NIGHTLY = ROOT / "nightly-backup.sh"
 
 
+@pytest.fixture(autouse=True)
+def no_host_process_scan(monkeypatch):
+    # In-process backup and restore check the host's /proc for live workers. On a
+    # shared test host other same-user processes (parallel workers, non-dumpable
+    # helpers) make that check fail safe at random. The check itself is covered
+    # against a fake /proc in test_commonplace_w5_backup.py.
+    module = importlib.import_module("commonplace.backup")
+    monkeypatch.setattr(module, "_verify_offline", lambda root: None)
+
+
 @pytest.fixture
 def fresh_data(tmp_path):
     data = tmp_path / "data"
