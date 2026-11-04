@@ -164,8 +164,15 @@ def _finish_legacy_repair(backend, palace_path, collection_name, col, total, arg
     return filed, backup_path
 
 
-def _legacy_repair_after_prompt(backend, palace_path, collection_name, args):
-    """Confirm, then extract under a fresh lease. Returns None if declined."""
+def _legacy_repair_after_prompt(palace_path, collection_name, args):
+    """Confirm, then open a fresh client and extract under a fresh lease.
+
+    The caller closed its client before releasing the lease (holding a live
+    client outside the lease is the race that lock exists to close), so this
+    path must build a new backend *after* the unbounded prompt and close it
+    before releasing the lease. Returns None if declined.
+    """
+    from ..backends.chroma import ChromaBackend
     from ..migrate import confirm_destructive_action
     from ..palace import MineAlreadyRunning, mine_palace_lock
     from ..repair import index_read_recovery_guidance
@@ -174,18 +181,24 @@ def _legacy_repair_after_prompt(backend, palace_path, collection_name, args):
         return None
     try:
         with mine_palace_lock(palace_path):
+            backend = ChromaBackend()
             try:
-                col = backend.get_collection(palace_path, collection_name)
-                total = col.count()
-                print(f"  Drawers found: {total}")
-            except Exception as e:
-                print(f"  Error reading palace: {e}")
-                print(index_read_recovery_guidance())
-                return None
-            if total == 0:
-                print("  Nothing to repair.")
-                return None
-            return _finish_legacy_repair(backend, palace_path, collection_name, col, total, args)
+                try:
+                    col = backend.get_collection(palace_path, collection_name)
+                    total = col.count()
+                    print(f"  Drawers found: {total}")
+                except Exception as e:
+                    print(f"  Error reading palace: {e}")
+                    print(index_read_recovery_guidance())
+                    return None
+                if total == 0:
+                    print("  Nothing to repair.")
+                    return None
+                return _finish_legacy_repair(
+                    backend, palace_path, collection_name, col, total, args
+                )
+            finally:
+                backend.close()
     except MineAlreadyRunning as exc:
         print(f"  Another writer already holds this palace: {exc}")
         print("  Repair stopped before extracting or copying anything; nothing changed.")
@@ -429,7 +442,9 @@ def cmd_repair(args):
         raise SystemExit(2) from None
 
     if not assume_yes:
-        finished = _legacy_repair_after_prompt(backend, palace_path, collection_name, args)
+        # The interactive branch closed the client before releasing the lease;
+        # the helper opens a fresh one only after the confirmation prompt.
+        finished = _legacy_repair_after_prompt(palace_path, collection_name, args)
         if finished is None:
             return
         filed, backup_path = finished

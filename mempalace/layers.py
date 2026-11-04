@@ -314,7 +314,10 @@ class Layer0:
             return self._text
 
         if os.path.exists(self.path):
-            with open(self.path, "r") as f:
+            # The user writes this file in an editor, so read it as UTF-8 rather
+            # than the locale code page (cp1252, cp950, ... on Windows), and
+            # drop the byte-order mark Notepad can save at the start.
+            with open(self.path, "r", encoding="utf-8-sig") as f:
                 self._text = f.read().strip()
         else:
             self._text = (

@@ -8,6 +8,7 @@ import pytest
 from mempalace.config import (
     MempalaceConfig,
     _default_config_dir,
+    canonical_wing,
     connect_sqlite_read,
     normalize_wing_name,
     sanitize_iso_temporal,
@@ -572,6 +573,19 @@ def test_sanitize_name_rejects_path_traversal():
 def test_sanitize_name_rejects_empty():
     with pytest.raises(ValueError):
         sanitize_name("")
+
+
+def test_canonical_wing_slugs_valid_inputs():
+    assert canonical_wing("MyProject") == "myproject"
+    assert canonical_wing("My-App") == "my_app"
+    assert canonical_wing("My App") == "my_app"
+    assert canonical_wing("Jānis Project") == "jānis_project"
+
+
+def test_canonical_wing_preserves_sanitize_name_rejections():
+    for bad in ("", "   ", "../etc/passwd", "foo/bar", "_foo", "foo\x00bar", "a" * 129):
+        with pytest.raises(ValueError):
+            canonical_wing(bad)
 
 
 # --- sanitize_kg_value ---
