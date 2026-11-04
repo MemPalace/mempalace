@@ -3,8 +3,8 @@ export const CHAT_COPY = Object.freeze({
   noProjects: "Choose a project to chat with its orchestrator.", empty: "Send a message to your project's orchestrator.",
   placeholder: "Message the orchestrator…", send: "Send", basic: "Basic replies (no model)",
   model: "Answers by {provider}/{model}", statusPrivate: "status private", decisions: "Decisions",
-  noOrchestratorOwner: "No orchestrator for this project yet. Choose one above.",
-  noOrchestratorMember: "No orchestrator for this project yet. Ask the workspace owner to choose one.",
+  noOrchestratorOwner: "This project's orchestrator isn't connected yet. Use Connect above.",
+  noOrchestratorMember: "This project's orchestrator isn't connected yet. Ask the workspace owner to connect it.",
 });
 
 // Escape first: only the fixed redaction wrapper becomes markup.

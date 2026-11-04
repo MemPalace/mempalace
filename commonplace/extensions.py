@@ -46,6 +46,7 @@ MODULES = (
     "commonplace.runner",
     "commonplace.console",
     "commonplace.chat",
+    "commonplace.projects",
 )
 
 ALL_PROFILES = frozenset({"slim", "standard", "full"})

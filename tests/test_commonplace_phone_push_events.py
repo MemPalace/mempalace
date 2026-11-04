@@ -519,7 +519,8 @@ def test_t11b_one_wake_drains_fifteen_hundred_stopped_events(hub, signup, monkey
         list(pool.map(reviews, zip((owner, second), cards)))
     target = latest(hub)
     assert target - cursor(hub) >= 1500
-    assert target - cursor(hub) == 1500
+    # The initial board also contributes one space_created event.
+    assert target - cursor(hub) == 1501
     wake_once(monkeypatch, dispatcher, start)
     assert cursor(hub) == target
     assert bodies(hub) == [f"#{number} needs you"]

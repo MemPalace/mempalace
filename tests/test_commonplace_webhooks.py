@@ -681,6 +681,7 @@ def test_dispatcher_out_of_order_notifications_do_not_skip_events(security):
 
 def test_committed_board_event_recovers_when_listener_enqueue_fails(security, monkeypatch, caplog):
     s = security
+    before = events.latest_seq(s.db, s.ws)
 
     def fail(*args):
         raise RuntimeError("PRIVATE-CANARY")
@@ -692,7 +693,7 @@ def test_committed_board_event_recovers_when_listener_enqueue_fails(security, mo
             created = s.owner.task_add(board="work", title="PRIVATE-CANARY")
     finally:
         events.remove_listener(s.dispatcher.on_event)
-    persisted = events.after(s.db, s.ws)
+    persisted = events.after(s.db, s.ws, before)
     assert len(persisted) == 1 and persisted[0]["subject"] == f"#{created['number']}"
     assert s.db._conn.execute("SELECT count(*) FROM webhook_deliveries").fetchone()[0] == 0
     assert "PRIVATE-CANARY" not in caplog.text

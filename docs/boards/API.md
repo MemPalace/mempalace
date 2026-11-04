@@ -437,6 +437,12 @@ A space is a board. Signed-in workspace members and trusted tokens can create on
 
 Creating a shared space requires trusted token identity, independently of whether its memory saves go to inbox. Picking up another agent's backlog has the stricter trusted, unrestricted writer gate. Card titles and bodies follow the board's read visibility; restricted origin protects work ownership, not confidentiality. Use a private board theme for private card content.
 
+Board creation emits the `space_created` event with resource `space:<slug>` and
+data `{"board": "<slug>"}` after commit. It contains no chat text; wildcard
+webhook subscribers receive it too. Each project gets one main orchestrator
+seat automatically, with a lazy repair on first view if needed. See
+[projects](../projects.md) for connection setup and lifecycle.
+
 `space_read(board, after=0)` returns up to 100 original messages
 in ID order and a `cursor` for the next page. `last=N` (1–100) reads the latest N;
 combine it with `before=<oldest id>` to page backwards. These modes cannot be combined
@@ -477,6 +483,39 @@ asks; answered asks stay in the conversation. `#/board/<slug>` keeps the kanban 
 Webhook authentication may reference an operator-defined environment variable,
 for example `env:COMMONPLACE_WEBHOOK_AUTH_COORDINATOR`. Set the variable only
 in the server environment; the database stores the reference, not its value.
+
+## Project routes
+
+These routes require a signed-in person session; agent tokens are refused.
+Readers need access to an active board; missing, archived or unreadable boards
+return 404. Only workspace owners may Connect or write model choices.
+
+| Method | Route | Body / result |
+|---|---|---|
+| GET | `/api/projects/<slug>` | `{board, name, main, models, can_configure}` |
+| POST | `/api/projects/<slug>/orchestrator/connect` | `{}` or boolean `replace` / `allow_shared` flags; 201 for a new connection, 200 for rotation. |
+| PUT | `/api/projects/<slug>/models` | Optional `main` and `worker` keys, each `{provider, model}` or `null` to clear; returns the project view. |
+
+`main` contains `role`, `name`, `source` (`seat` or `coordinator`), `connected`,
+`seen`, `status`, `wakeable` and `connectable`. `seen` means the connection has
+been used at least once; `connected` alone does not mean an agent is running.
+Names are redacted and status follows the caller's visibility permissions.
+`models` contains `main` and `worker` choices, each `{provider, model}` or `null`.
+Choices store labels only; they do not invoke providers or change chat settings.
+
+Connect attaches an agent to the project's automatic orchestrator seat. It
+returns `{connection, token, mcp_url, board, wing, setup, warning?}`. The token
+appears only in this response. The standard-trust connection can read and write
+the board's wing and expires after 90 days. Rotation invalidates its old token.
+`setup` supplies the project and `space_message` subscription details; the
+operator must still register the webhook and run the agent.
+
+A different active coordinator requires `replace: true` (otherwise 409).
+A shared-wing project requires `allow_shared: true` (otherwise 409 with
+`error: "shared_wing"`), confirming read and write access to all shared memory.
+Unauthenticated requests return 401; agents and non-owner writes return 403.
+Invalid bodies or model labels return 400 without echoing the supplied values.
+Model writes and connections are audited without token values.
 
 
 ## Rules freshness

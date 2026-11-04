@@ -114,6 +114,7 @@ PREFIX = {
     ("GET", "/app/static/"): "public",
     ("POST", "/api/console/agents/"): "authenticated",
     ("GET", "/api/chat/"): "authenticated",
+    **{(method, "/api/projects/"): "authenticated" for method in ("GET", "POST", "PUT")},
 }
 BUILTIN = {
     ("GET", "/health"): "public",

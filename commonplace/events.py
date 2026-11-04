@@ -14,6 +14,7 @@ Kinds in use (add, never rename):
     card.expired  card.handoff  card.review_needed  card.decided  card.ask_withdrawn
     memory.saved  memory.linked  fact.saved
     rule.changed  rule.suggestion
+    space_created
     webhook.failed
 """
 

@@ -353,6 +353,8 @@ class BoardService:
             self._projection_cache = previous
 
     def _live_connection(self, ref):
+        from commonplace.projects.types import SEAT_CLIENT, SEAT_IDLE_S
+
         cache = getattr(self, "_projection_cache", None)
         cache = cache if cache is not None else {}
         key = ("live", ref)
@@ -360,6 +362,13 @@ class BoardService:
             try:
                 ws = self.principal.workspace_id
                 connection = self.ctx.db.connection(ref, ws)
+                if connection["client"] == SEAT_CLIENT:
+                    last_used = connection["last_used_at"]
+                    if last_used is None or datetime.fromisoformat(
+                        last_used.replace("Z", "+00:00")
+                    ) < datetime.now(timezone.utc) - timedelta(seconds=SEAT_IDLE_S):
+                        cache[key] = None
+                        return None
                 q = self.ctx.db.authenticate_connection(connection["id"])
                 cache[key] = q if q is not None and q.workspace_id == ws and not q.person else None
             except (ControlError, ValueError, TypeError):
@@ -786,6 +795,7 @@ class BoardService:
                 "INSERT INTO board_repos(repo,board_id) VALUES (?,?)",
                 (normalized_repo, cur.lastrowid),
             )
+        self.pending.append(("space_created", f"space:{slug}", {"board": slug}, p.actor))
         return conn.execute("SELECT * FROM boards WHERE id=?", (cur.lastrowid,)).fetchone()
 
     def _expire(self, conn, board):

@@ -516,35 +516,17 @@ async function chatScreen(epoch) {
   slug = root.querySelector(".chat-view")?.dataset.board || slug;
   const board = state.boards.find((b) => b.slug === slug);
   const header = root.querySelector(".chat-header");
-  if (header && board && !board.coordinator) {
-    header.querySelector("[data-chat-notice]")?.remove();
-    const notice = document.createElement("p");
-    notice.dataset.chatNotice = "";
-    notice.textContent = board.can_configure ? CHAT_COPY.noOrchestratorOwner : CHAT_COPY.noOrchestratorMember;
-    header.append(notice);
-  }
-  if (board?.can_configure) {
-    const result = await api("/api/connections");
-    if (epoch !== state.screen) return;
-    const header = root.querySelector(".chat-header");
-    if (header) {
-      header.querySelector("[data-chat-orchestrator]")?.remove();
-      const label = document.createElement("label");
-      label.dataset.chatOrchestrator = "";
-      label.innerHTML = `Orchestrator<select aria-label="Orchestrator"><option value="">None</option>${(result.connections || []).filter((c) => c.auth === "pat" && !c.revoked_at && (!c.expires_at || Date.parse(c.expires_at) > Date.now())).map((c) => `<option value="${e(`conn:${c.name}`)}" ${board.coordinator === `conn:${c.name}` ? "selected" : ""}>${e(c.name)}</option>`).join("")}</select>`;
-      const picker = label.querySelector("select");
-      picker.onchange = async () => {
-        picker.disabled = true;
-        try {
-          await api(`/api/boards/${enc(slug)}`, { method: "PATCH", body: { coordinator: picker.value || null } });
-          if (epoch !== state.screen) return;
-          board.coordinator = picker.value || null;
-          chatUI.stop(); await chatScreen(epoch);
-        } catch { showError("Could not change the orchestrator."); picker.value = board.coordinator || ""; }
-        finally { picker.disabled = false; }
-      };
-      header.append(label);
-    }
+  if (header && slug) {
+    const { mountProject } = await import("./projects.js");
+    if (epoch !== state.screen || !header.isConnected) return;
+    header.querySelector("[data-chat-orchestrator]")?.remove();
+    const main = document.createElement("div");
+    main.dataset.chatOrchestrator = "";
+    header.append(main);
+    await mountProject(main, {
+      slug, api, e, current: () => epoch === state.screen,
+      notice: board?.can_configure ? CHAT_COPY.noOrchestratorOwner : CHAT_COPY.noOrchestratorMember,
+    });
   }
 }
 function consoleScreen() {
@@ -998,9 +980,12 @@ root.addEventListener("click", async (event) => {
       const saved = remember(); state.spaceTab = b.dataset.tab; spaceView(); restore(saved);
     } else if (action === "coordinator") {
       voice.stop();
-      const slug = decodeURIComponent(state.base.split("/")[2]), board = state.boards.find((b) => b.slug === slug);
+      const slug = decodeURIComponent(state.base.split("/")[2]), epoch = state.screen;
+      const { mountProject } = await import("./projects.js");
+      if (epoch !== state.screen) return;
       const panel = root.querySelector("#card-panel"); panel.hidden = false;
-      panel.innerHTML = `<form class="form-tile" data-form="coordinator" data-board="${e(slug)}"><h2>Coordinator</h2><label>Agent<input name="coordinator" value="${e(board?.coordinator || "")}" data-draft="coordinator-${e(slug)}"></label><button class="blockbtn">Save</button><button type="button" class="opt" data-action="close-panel">Cancel</button></form>`;
+      panel.innerHTML = '<section class="form-tile"><button type="button" class="close" data-action="close-panel" aria-label="Close project settings">×</button><div data-project-settings></div></section>';
+      await mountProject(panel.querySelector("[data-project-settings]"), { slug, api, e, settings: true, current: () => epoch === state.screen });
     }
     else if (action === "close-panel") {
       if (state.route.startsWith("#/card/")) location.hash = state.base;

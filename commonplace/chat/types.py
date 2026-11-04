@@ -80,12 +80,12 @@ RECEIPT_COPY = {
         for role in ("owner", "member")
     },
     "no_orchestrator": {
-        "owner": "No orchestrator for this project yet. Choose one above.",
-        "member": "No orchestrator for this project yet. Ask the workspace owner to choose one.",
+        "owner": "This project's orchestrator isn't connected yet. Use Connect above.",
+        "member": "This project's orchestrator isn't connected yet. Ask the workspace owner to connect it.",
     },
     "orchestrator_gone": {
-        "owner": "The orchestrator for this project is no longer connected. Choose one above.",
-        "member": "The orchestrator for this project is no longer connected. Ask the workspace owner to choose one.",
+        "owner": "The orchestrator for this project is no longer connected. Use Connect above to connect it again.",
+        "member": "The orchestrator for this project is no longer connected. Ask the workspace owner to connect it again.",
     },
     "_handoff": {
         role: "If nobody picks this up within {wait} minutes, I'll put it on the board as a card for you."
