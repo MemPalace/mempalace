@@ -61,6 +61,23 @@ use it too. Paid and unrestricted self-hosted instances send changes immediately
 within the server's write budget. Continuous sync checks files every two seconds;
 it does not stream individual tokens.
 
+Continuous `sync run` gets one backfill phase per hub and local state, including
+existing installs on upgrade. It uses the normal 120 attempts per hour first,
+then adds at most one backfill attempt every 2 seconds (with an immediate
+legacy-format retry if required), up to 5,000 additional attempts in total.
+It ends once at least one selected session has a known cursor and every selected
+session is caught up or refused, or the cap is reached. Workspace capture being
+off does not end backfill. Conflict, paused, and revoked queued rows do not keep
+backfill alive; revoked rows are retried once after each daemon restart.
+Transient failures retain the normal retry backoff.
+After catch-up or the cap, only the normal hourly budget applies; unused hourly
+slots remain available immediately. Backfill never restarts. `run --once` uses
+the normal budget. After the first backfill attempt, `commonplace sync status`
+shows `Backfill: active, X of 5000 attempts` or
+`Backfill: done, X of 5000 attempts`; it hides this line at zero attempts.
+Free's server cadence still applies. Additional backfill exposure is bounded by
+about 5,000 × (512 KiB + one record); retries also consume attempts.
+
 The sync event feed contains settings and timing signals, without transcript or
 memory content. Paid and unrestricted instances long-poll for up to 25 seconds;
 Free polls at its next window. Workspace members can see sync toggles and request

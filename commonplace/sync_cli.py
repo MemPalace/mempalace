@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from .capture_client import CaptureError, endpoint
-from .sync_protocol import CURSOR_MESSAGE, TOKEN_ENV
+from .sync_protocol import BACKFILL_WRITES, CURSOR_MESSAGE, TOKEN_ENV
 
 
 def register(sub):
@@ -246,6 +246,11 @@ def _status(directory, home):
             row = state.feed_cursor(_feed_key(config["hub"], name))
             if row:
                 print(f"Sync cursor: {row['seq']}")
+        bkey = _feed_key(config["hub"], "backfill")
+        used = state.next_due(bkey)
+        if used > 0:
+            mode = "done" if state.next_due(bkey + "-done") else "active"
+            print(f"Backfill: {mode}, {int(used)} of {BACKFILL_WRITES} attempts")
         print(f"Pending operations: {len(state.outbox_pending())}")
         for row in state.statuses():
             print(f"Source status: {row['status']}")

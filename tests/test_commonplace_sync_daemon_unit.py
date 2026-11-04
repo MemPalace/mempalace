@@ -574,3 +574,313 @@ def test_memory_only_install_does_not_select_unrequested_transcripts(tmp_path, m
     config = json.loads((tmp_path / ".commonplace/sync/config.json").read_text())
     assert config["sources"] == []
     assert config["memories"][0]["label"] == "notes"
+
+
+class ManySources:
+    SliceConflict = Sources.SliceConflict
+
+    def __init__(self, n):
+        self.sizes = {f"s{i}": 1 for i in range(n)}
+
+    def discover(self, config):
+        return [
+            SimpleNamespace(source="claude-code", path=k, native_id=k, size=size)
+            for k, size in self.sizes.items()
+        ]
+
+    def snapshot_targets(self, config):
+        return self.sizes.copy()
+
+    def scan(self, config, state, *, now):
+        pending = {op.native_id for op in state.pending}
+        for source in config["_discovered"]:
+            cursor = state.cursor(source.source, source.path, source.native_id)
+            target = config["targets"][source.path]
+            if cursor and cursor["offset"] < target and source.native_id not in pending:
+                state.pending.append(
+                    Op(
+                        f"{source.native_id}-{cursor['offset']}",
+                        "capture",
+                        source.source,
+                        source.path,
+                        source.native_id,
+                        cursor["offset"],
+                        target - cursor["offset"],
+                    )
+                )
+        return state.outbox_pending()
+
+    def body(self, op):
+        return {
+            "source": op.source,
+            "thread_id": op.native_id,
+            "offset": op.offset,
+            "prefix_sha256": EMPTY,
+            "transcript": "x" * op.length,
+            "client_op_id": op.op_id,
+        }
+
+
+@pytest.fixture
+def backfill_setup(tmp_path, monkeypatch):
+    import commonplace
+
+    sources = ManySources(300)
+    monkeypatch.setitem(sys.modules, "commonplace.sync_sources", sources)
+    monkeypatch.setattr(commonplace, "sync_sources", sources, raising=False)
+    state = State(tmp_path / "state.db")
+    config = {
+        "hub": "https://sync.example",
+        "tokens": {TOKEN_ENV["claude-code"]: TOKEN},
+    }
+    now = [10000.0]
+    posts, starts, refused = [], {}, {}
+
+    def transport(target, token, method, route, body=None):
+        if method == "GET":
+            native_id = parse_qs(urlsplit(route).query)["thread_id"][0]
+            return refused.get(
+                native_id, (200, {"offset": starts.get(native_id, 0), "prefix_sha256": EMPTY})
+            )
+        posts.append(body)
+        return 200, {
+            "offset": body["offset"] + len(body["transcript"]),
+            "prefix_sha256": EMPTY,
+        }
+
+    def session():
+        return sync_daemon._Session(config, state, lambda: now[0], transport)
+
+    def drive(active, ticks):
+        for _ in range(ticks):
+            active.cycle()
+            now[0] += 2
+
+    yield SimpleNamespace(
+        sources=sources,
+        state=state,
+        config=config,
+        now=now,
+        posts=posts,
+        starts=starts,
+        refused=refused,
+        session=session,
+        drive=drive,
+        bkey=sync_daemon._feed_key(config["hub"], "backfill"),
+        transport=transport,
+    )
+    state.conn.close()
+
+
+def test_backfill_fresh_setup_catches_up_within_backfill_budget(backfill_setup):
+    b = backfill_setup
+    b.drive(b.session(), 900)
+    assert len(b.posts) == 300  # RED
+    assert b.state.next_due(b.bkey + "-done") > 0
+    assert b.state.next_due(b.bkey) == 180
+
+
+def test_backfill_progress_survives_daemon_restart(backfill_setup):
+    b = backfill_setup
+    b.drive(b.session(), 100)
+    b.drive(b.session(), 800)
+    assert len(b.posts) == 300  # RED
+    assert b.state.next_due(b.bkey) == 180
+
+
+def test_backfill_cap_returns_to_normal_limit(backfill_setup, monkeypatch):
+    b = backfill_setup
+    monkeypatch.setattr(sync_daemon, "BACKFILL_WRITES", 150, raising=False)
+    active = b.session()
+    b.drive(active, 900)
+    assert len(b.posts) == 270  # RED
+    assert b.state.next_due(b.bkey + "-done") > 0
+    b.drive(active, 1800)
+    assert len(b.posts) == 300
+
+
+def test_status_reports_backfill_progress(tmp_path, monkeypatch, capsys):
+    from commonplace import sync_cli, sync_state
+
+    config = {"hub": "https://sync.example"}
+    monkeypatch.setattr(sync_cli, "_load", lambda *_: config)
+    bkey = sync_daemon._feed_key(config["hub"], "backfill")
+    with sync_state.open_state(tmp_path / "state.db") as state:
+        state.defer(bkey, 812)
+    sync_cli._status(tmp_path, tmp_path)
+    assert "Backfill: active, 812 of 5000 attempts" in capsys.readouterr().out  # RED
+    with sync_state.open_state(tmp_path / "state.db") as state:
+        state.defer(bkey + "-done", 10000)
+    sync_cli._status(tmp_path, tmp_path)
+    assert "Backfill: done, 812 of 5000 attempts" in capsys.readouterr().out
+
+
+def test_steady_state_burst_after_catch_up_hits_normal_limit(backfill_setup):
+    b = backfill_setup
+    b.starts.update(b.sources.sizes)
+    active = b.session()
+    b.drive(active, 5)
+    b.sources.sizes = dict.fromkeys(b.sources.sizes, 2)
+    b.drive(active, 900)
+    assert len(b.posts) == 120
+    b.now[0] += 3600
+    b.drive(active, 1)
+    assert len(b.posts) == 240
+
+
+def test_backfill_revoked_source_returns_to_normal_limit(backfill_setup):
+    b = backfill_setup
+    b.starts.update(b.sources.sizes)
+    b.refused["s0"] = (401, {})
+    active = b.session()
+    b.drive(active, 5)
+    b.sources.sizes = dict.fromkeys(b.sources.sizes, 2)
+    b.drive(active, 900)
+    assert len(b.posts) == 120
+
+
+def test_backfill_legacy_retry_lands_without_spacing_delay(backfill_setup):
+    b = backfill_setup
+    b.sources.sizes = {"s0": 1}
+    calls = []
+
+    def transport(*args):
+        if args[2] == "POST":
+            calls.append(args[4])
+            if "client_op_id" in args[4]:
+                return 400, {}
+        return b.transport(*args)
+
+    active = sync_daemon._Session(b.config, b.state, lambda: b.now[0], transport)
+    b.drive(active, 10)
+    assert len(b.posts) == 1
+    assert len(calls) == 2
+    assert "client_op_id" not in calls[1]
+    assert not b.state.outbox_pending()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_run_backfill_refusal_does_not_back_off(backfill_setup, monkeypatch, status):
+    b = backfill_setup
+    b.refused["s0"] = (status, {})
+    times = []
+
+    def transport(*args):
+        if args[3].startswith("/api/events"):
+            return 403, {}
+        if args[3] == "/api/settings/capture":
+            return 200, {"enabled": True, "interval_seconds": 0}
+        if args[2] == "POST":
+            times.append(b.now[0])
+        return b.transport(*args)
+
+    def sleep(seconds):
+        b.now[0] += seconds
+
+    monkeypatch.setattr(
+        sync_daemon._Session, "_apply_cached", lambda self: setattr(self, "interval", 0)
+    )
+    result = sync_daemon.run(
+        b.config,
+        b.state,
+        clock=lambda: b.now[0],
+        sleep=sleep,
+        transport=transport,
+        stop=lambda: b.now[0] >= 10600,
+    )
+    assert result == 0
+    assert len(b.posts) == 299  # RED
+    assert times[-1] - times[120] <= 2 * 179
+    assert b.state.next_due(b.bkey + "-done") > 0
+
+
+def test_capture_off_does_not_end_backfill(backfill_setup):
+    b = backfill_setup
+    b.refused.update(dict.fromkeys(b.sources.sizes, (409, {})))
+    active = b.session()
+    b.drive(active, 1)
+    assert not b.state.next_due(b.bkey + "-done")
+    b.refused.clear()
+    b.drive(active, 200)
+    assert len(b.posts) == 300  # RED
+    assert b.state.next_due(b.bkey + "-done") > 0
+
+
+def test_backfill_budget_survives_real_state_reopen(tmp_path):
+    from commonplace import sync_state
+
+    config = {"hub": "https://sync.example", "tokens": {TOKEN_ENV["claude-code"]: TOKEN}}
+    path = tmp_path / "durable.db"
+    now = [10000.0]
+    with sync_state.open_state(path) as state:
+        active = sync_daemon._Session(config, state, lambda: now[0], None)
+        active.backfill = True
+        for _ in range(121):
+            assert active._budget(TOKEN_ENV["claude-code"])  # RED
+        bkey = active.bkey
+        assert state.next_due(bkey) == 1
+    with sync_state.open_state(path) as state:
+        active = sync_daemon._Session(config, state, lambda: now[0], None)
+        active.backfill = True
+        assert not active._budget(TOKEN_ENV["claude-code"])
+        now[0] += 2
+        assert active._budget(TOKEN_ENV["claude-code"])
+        assert state.next_due(bkey) == 2
+
+
+def test_once_rate_limited_cursor_still_checks_other_streams(backfill_setup):
+    b = backfill_setup
+    b.sources.sizes = {"s0": 1, "s1": 1, "s2": 1}
+    b.refused["s0"] = (429, {"error": "Capture not due; retry in 5 seconds"})
+    b.refused["s1"] = (401, {"error": "revoked"})
+    assert b.session().cycle(once=True) == 1  # RED
+    assert b.state.status["claude-code", "s1", "s1"] == "revoked"
+
+
+def test_all_streams_refused_keeps_run_backoff(backfill_setup):
+    b = backfill_setup
+    for native_id in b.sources.sizes:
+        b.refused[native_id] = (401, {"error": "revoked"})
+    assert b.session().cycle() == 1  # RED
+    assert b.posts == []
+
+
+def test_capture_off_cursor_marks_stream_paused(backfill_setup):
+    b = backfill_setup
+    b.sources.sizes = {"s0": 1}
+    b.refused["s0"] = (409, {"error": "Workspace capture is off"})
+    b.session().cycle(once=True)
+    assert b.state.status.get(("claude-code", "s0", "s0")) == "paused"  # RED
+
+
+def test_continuous_rate_limited_cursor_stops_the_pass(backfill_setup):
+    b = backfill_setup
+    gets = []
+
+    def transport(target, token, method, route, body=None):
+        if method == "GET":
+            gets.append(route)
+            return 429, {"error": "slow down; retry in 5 seconds"}
+        return b.transport(target, token, method, route, body)
+
+    sync_daemon._Session(b.config, b.state, lambda: b.now[0], transport).cycle()
+    assert len(gets) == 1  # RED
+
+
+def test_deferred_feed_keeps_backoff_with_a_refused_stream(backfill_setup):
+    b = backfill_setup
+    b.sources.sizes = {"s0": 2, "s1": 1}
+    b.starts["s0"] = 1
+    b.refused["s1"] = (401, {"error": "revoked"})
+
+    def transport(target, token, method, route, body=None):
+        if method == "POST":
+            return 429, {"error": "Capture not due; retry in 60 seconds"}
+        return b.transport(target, token, method, route, body)
+
+    active = sync_daemon._Session(b.config, b.state, lambda: b.now[0], transport)
+    active.cycle()
+    b.now[0] += 2
+    assert active.cycle() == 1  # RED
+    b.now[0] += 60
+    assert active.cycle() == 1  # RED

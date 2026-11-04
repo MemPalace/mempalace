@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 
 from .capture_client import endpoint
 from .sync_protocol import (
+    BACKFILL_WRITES,
     LIVE_TICK_SECONDS,
     MAX_WAIT_SECONDS,
     RETRY_RE,
@@ -81,6 +82,10 @@ class _Session:
         self.signals = True
         self.refresh = False
         self.next_poll = 0.0
+        self.bkey = _feed_key(config["hub"], "backfill")
+        self.backfill = False
+        self.unavailable = set()
+        self.initialize_transient = False
         self._apply_cached()
 
     def now(self):
@@ -143,9 +148,11 @@ class _Session:
         match = re.search(RETRY_RE, str(payload.get("error", "")), re.IGNORECASE)
         self.state.defer(key, self.now() + (max(1, int(match[1])) if match else 60))
 
-    def initialize(self, sources=None):
+    def initialize(self, sources=None, *, once=False):
         """Adopt each server cursor before scanning a stream for the first time."""
         failed = False
+        self.unavailable = set()
+        self.initialize_transient = False
         for source in self.sources.discover(self.config) if sources is None else sources:
             if self.state.cursor(source.source, source.path, source.native_id) is not None:
                 continue
@@ -162,18 +169,27 @@ class _Session:
                 )
             except (OSError, http.client.HTTPException, ValueError):
                 failed = True
+                self.initialize_transient = True
                 continue
             if status == 429:
                 self._defer(payload, self.key)
-                continue
+                if once:
+                    continue  # --once still reports every other stream's state
+                return int(failed)  # the feed is deferred; stop asking this pass
             if status != 200:
-                if status in (401, 409):
+                if status == 409:
+                    self.state.set_status(source.source, source.path, source.native_id, "paused")
+                if 400 <= status < 500 and status not in (408, 409, 425, 429):
                     self.state.set_status(
                         source.source,
                         source.path,
                         source.native_id,
-                        "revoked" if status == 401 else "paused",
+                        "revoked",
                     )
+                    self.unavailable.add((source.source, source.path, source.native_id))
+                self.initialize_transient |= status != 409 and not (
+                    400 <= status < 500 and status not in (408, 425, 429)
+                )
                 failed |= status != 409
                 continue
             offset, prefix = payload.get("offset"), payload.get("prefix_sha256")
@@ -184,31 +200,82 @@ class _Session:
                 or re.fullmatch(r"[0-9a-f]{64}", prefix) is None
             ):
                 failed = True
+                self.initialize_transient = True
                 continue
             self.state.store_cursor(source.source, source.path, source.native_id, offset, prefix)
         return int(failed)
 
-    def _budget(self, env_name):
-        """A durable sliding-hour client budget, independent of server cadence."""
+    def _backfill(self, discovered, ops):
+        """Faster first catch-up, once per feed: ends when caught up or capped, never re-enters."""
+        # Cadence rows also hold durable counters; no separate schema is needed.
+        done = self.bkey + "-done"
+        if self.state.next_due(done):
+            return False
+        if self.state.next_due(self.bkey) >= BACKFILL_WRITES or (
+            not ops
+            and any(
+                self.state.cursor(s.source, s.path, s.native_id) is not None for s in discovered
+            )
+            and all(
+                self.state.cursor(s.source, s.path, s.native_id) is not None
+                or (s.source, s.path, s.native_id) in self.unavailable
+                for s in discovered
+            )
+        ):
+            self.state.defer(done, self.now())
+            return False
+        return True
+
+    def _budget(self, env_name, retry=False):
+        """Durable client budget: bounded first-sync backfill, then sliding-hour slots."""
         key = self.key + ":writes:" + env_name
         now = self.now()
         slots = [(self.state.next_due(f"{key}:{i}"), i) for i in range(WRITE_BUDGET[0])]
         due, slot = min(slots)
-        if due > now:
-            self.state.defer(self.key, due)
-            return False
-        self.state.defer(f"{key}:{slot}", now + WRITE_BUDGET[1])
-        return True
+        if due <= now:
+            self.state.defer(f"{key}:{slot}", now + WRITE_BUDGET[1])
+            return True
+        if self.backfill:
+            used = self.state.next_due(self.bkey)
+            if used < BACKFILL_WRITES:
+                extra_due = self.state.next_due(self.bkey + "-next")
+                if extra_due > now and not retry:
+                    self.state.defer(self.key, min(due, extra_due))
+                    return False
+                self.state.defer(self.bkey, used + 1)
+                if not retry:
+                    self.state.defer(self.bkey + "-next", now + LIVE_TICK_SECONDS)
+                return True
+            self.backfill = False
+        self.state.defer(self.key, due)
+        return False
 
     def cycle(self, *, once=False):
         # Freeze targets before cursor requests, which may take time on reconnect.
         config = dict(self.config, _state=self.state)
         config["_discovered"] = self.sources.discover(config)
         config["targets"] = self.sources.snapshot_targets(config)
-        failed = self.initialize(config["_discovered"])
+        failed = self.initialize(config["_discovered"], once=once)
+        initializing = True
         # scan commits immutable ops even if the feed or network is unavailable.
         while True:
             ops = self.sources.scan(config, self.state, now=self.now())
+            self.backfill = not once and self._backfill(config["_discovered"], ops)
+
+            # Refused streams do not slow backfill while others can progress;
+            # with nothing to make progress on, or a deferred feed, keep run()'s backoff.
+            if (
+                initializing
+                and self.backfill
+                and not self.initialize_transient
+                and self.state.next_due(self.key) <= self.now()
+                and any(
+                    self.state.cursor(s.source, s.path, s.native_id) is not None
+                    for s in config["_discovered"]
+                )
+            ):
+                failed = 0
+            initializing = False
             if not ops or not self.enabled:
                 return failed
             if not once and self.state.next_due(self.key) > self.now():
@@ -231,7 +298,7 @@ class _Session:
             try:
                 status, payload = self.transport(self.target, token, "POST", route, body)
                 if status == 400 and op.kind == "capture" and "client_op_id" in body:
-                    if not self._budget(env_name):
+                    if not self._budget(env_name, retry=True):
                         return failed
                     legacy = {k: v for k, v in body.items() if k != "client_op_id"}
                     status, payload = self.transport(self.target, token, "POST", route, legacy)
@@ -239,7 +306,8 @@ class _Session:
                 return 1
             if status == 429:
                 self._defer(payload, self.key)
-                return failed
+                # A refused stream keeps run()'s backoff while the feed waits.
+                return max(failed, int(bool(self.unavailable)))
             if status == 409:
                 self.refresh = True
                 off = "off" in str(payload.get("error", "")).lower() and payload.get(

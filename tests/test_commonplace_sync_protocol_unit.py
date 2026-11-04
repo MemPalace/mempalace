@@ -205,3 +205,9 @@ def test_deeply_nested_json_never_escapes_identity_or_tail_helpers():
     assert protocol.native_source("t3", "auto", nested) is None
     assert protocol.native_identity(nested.encode(), "claude-code") is None
     assert protocol.live_tail(nested) is True
+
+
+def test_server_untrusted_write_limit_unchanged():
+    from commonplace import ratelimit
+
+    assert ratelimit.WRITES == ratelimit.Limit("untrusted-writes", 120, 3600)
