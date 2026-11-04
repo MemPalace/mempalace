@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **`mempalace-native` finds the palace of an XDG install.** `stats`, `bench`
+  and `search` defaulted `--db` to `~/.mempalace/palace/sqlite_exact.sqlite3`,
+  so on an install whose config lives under `$XDG_CONFIG_HOME/mempalace` the
+  default file did not exist and every command failed unless `--db` was passed,
+  while the Python tools found the palace. The default now resolves with the
+  same precedence as `mempalace.config._default_config_dir()` —
+  `$MEMPALACE_CONFIG_DIR`, a real legacy `~/.mempalace`, `$XDG_CONFIG_HOME`,
+  `~/.config/mempalace` — and honours a configured `palace_path` (#2520).
+
 ---
 
 ## [3.12.0] — 2026-10-31
