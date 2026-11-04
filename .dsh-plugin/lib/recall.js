@@ -97,7 +97,7 @@ export function parseWakeup(stdout) {
     const open = FENCE_OPEN.exec(body[i])
     const close = open ? body.indexOf(`</${open[1]}>`, i + 1) : -1
     const end = close === -1 ? i : close
-    current.push(...body.slice(i, end + 1))
+    for (let j = i; j <= end; j++) current.push(body[j])
     i = end
   }
   blocks.push(current.join('\n'))

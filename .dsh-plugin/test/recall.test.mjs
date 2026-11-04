@@ -80,6 +80,12 @@ test('parseWakeup keeps a fence whole when stored words hold a heading line', ()
   assert.equal(recall.parseWakeup(`${placeholder}\n\n${fenced}\n`), fenced)
 })
 
+test('parseWakeup copes with a fence of any length', () => {
+  const tag = 'stored-memory-0123456789abcdef'
+  const fenced = ['## L1 — ESSENTIAL STORY', `<${tag}>`, ...Array(100000).fill('x'), ...Array(100000).fill('y'), `</${tag}>`]
+  assert.equal(recall.parseWakeup(fenced.join('\n')), fenced.join('\n'))
+})
+
 test('parseWakeup still drops a later unavailable block after a fence', () => {
   const fenced = ['## L1 — ESSENTIAL STORY', '<stored-memory-0123456789abcdef>', 'x', '</stored-memory-0123456789abcdef>'].join('\n')
   assert.equal(recall.parseWakeup(`${fenced}\n## Palace is busy\nTry again.`), fenced)
