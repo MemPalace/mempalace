@@ -27,7 +27,7 @@ import re
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from time import sleep
+from time import monotonic, sleep
 from typing import Callable, Optional
 from urllib.parse import unquote, urlparse
 
@@ -220,6 +220,15 @@ class WorkerClient:
         return _tool_result(response)
 
 
+def _observe_console(mediator, principal, request, response, started):
+    try:
+        from commonplace.console import recorder
+
+        recorder.observe(mediator, principal, request, response, started)
+    except Exception as exc:
+        log_failure(logger, "console recorder failed", exc)
+
+
 class Mediator:
     """Applies a principal's policy to one JSON-RPC request."""
 
@@ -249,7 +258,12 @@ class Mediator:
             if method == "tools/list":
                 return self._tools_list(principal, request)
             if method == "tools/call":
-                return self._tools_call(principal, request)
+                started, response = monotonic(), None
+                try:
+                    response = self._tools_call(principal, request)
+                    return response
+                finally:
+                    _observe_console(self, principal, request, response, started)
         except WorkerUnavailable:
             return _rpc_error(req_id, -32603, "This workspace's memory is unavailable right now")
         if req_id is None:

@@ -10,6 +10,7 @@ import json
 import os
 import sqlite3
 import stat
+import sys
 from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote, urlsplit
 
@@ -247,3 +248,16 @@ def integrity_error_type(connection):
     """Return the connection driver's specific constraint exception class."""
     module = driver() if type(connection).__module__.startswith("sqlcipher3") else sqlite3
     return module.IntegrityError
+
+
+def operational_error_type(connection):
+    """Return the driver's operational exception, including a failed open.
+
+    With no connection yet, SQLCipher can only have raised after its driver
+    was loaded. Do not require that optional dependency for plain SQLite.
+    """
+    if connection is None:
+        module = sys.modules.get("sqlcipher3", sqlite3)
+    else:
+        module = driver() if type(connection).__module__.startswith("sqlcipher3") else sqlite3
+    return module.OperationalError

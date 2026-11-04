@@ -1,0 +1,41 @@
+/* The console owns its scrolling, independently of the app's feed. */
+.console-view { flex: 1; min-height: 0; min-width: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: var(--gap, 16px); }
+.console-error { grid-column: 1 / -1; color: var(--danger); overflow-wrap: anywhere; }
+.console-view:has(.console-error) { grid-template-rows: auto minmax(0, 1fr); }
+.console-view > .console-message { grid-column: 1 / -1; }
+.console-agents { min-width: 0; min-height: 0; overflow-y: auto; border-right: 1px solid var(--line); }
+.console-agents ul { list-style: none; padding: 0; margin: 0; }
+.console-agent { padding: 12px; border-bottom: 1px solid var(--line); }
+.console-agent.selected { background: var(--surface); box-shadow: inset 2px 0 var(--strong); }
+.console-select { display: grid; width: 100%; grid-template-columns: 8px minmax(0, 1fr); gap: 6px 10px; align-items: center; text-align: left; }
+.console-agent-name { color: var(--strong); overflow-wrap: anywhere; }
+.console-agent-meta { grid-column: 2; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.console-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--quiet); }
+.console-dot.working { background: var(--ok); }
+.console-dot.idle { background: var(--muted); }
+.console-dot.unused { background: none; box-shadow: inset 0 0 0 1px var(--quiet); }
+.console-record { margin: 8px 0 0 18px; font-size: 12px; color: var(--muted); text-align: left; overflow-wrap: anywhere; }
+.console-panels { min-width: 0; min-height: 0; display: grid; grid-template-rows: minmax(100px, .8fr) minmax(160px, 1fr); gap: var(--gap, 16px); }
+.console-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; border: 1px solid var(--line); }
+.console-panel h2 { flex: none; padding: 12px 16px; border-bottom: 1px solid var(--line); font-size: 15px; line-height: 22px; color: var(--strong); }
+.console-stream, .console-output-items { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; }
+.console-item { padding: 10px 16px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.console-item:last-child { border-bottom: 0; }
+.console-item time, .console-output-meta { color: var(--muted); font-size: 12px; }
+.console-output-meta time { display: block; }
+.console-output-text, .console-stream .console-item > div { white-space: pre-wrap; overflow-wrap: anywhere; }
+.console-output-text { margin-top: 6px; }
+.console-message { padding: 12px 16px; color: var(--muted); overflow-wrap: anywhere; }
+.console-new { flex: none; padding: 8px 16px; border-top: 1px solid var(--line); color: var(--muted); text-align: right; }
+.console-view .redacted { background: var(--side); color: var(--muted); }
+.console-view button:focus-visible, .console-stream:focus-visible { outline: 1px solid var(--strong); outline-offset: -2px; }
+@media (max-width: 640px) {
+  .console-view { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .console-view:has(.console-error) { grid-template-rows: auto auto minmax(0, 1fr); }
+  .console-agents { overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid var(--line); }
+  .console-agents ul { display: flex; width: max-content; }
+  .console-agent { flex: 0 0 220px; width: 220px; border-bottom: 0; border-right: 1px solid var(--line); }
+  .console-agent.selected { box-shadow: inset 0 -2px var(--strong); }
+  .console-select, .console-record, .console-new { min-height: 44px; }
+  .console-panels { grid-template-rows: minmax(100px, .8fr) minmax(140px, 1fr); }
+}

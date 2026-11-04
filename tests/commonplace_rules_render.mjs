@@ -504,10 +504,10 @@ console.log("Rules permissions, retirement, counts and shell refresh checks pass
 const shellClickSource = shellSource.slice(shellSource.indexOf('root.addEventListener("click",'), shellSource.indexOf('root.addEventListener("submit",'));
 let retryClick;
 const retryOptions = [];
-new Function("root", "state", "rulesUI", "refresh", "showError", shellClickSource)(
+new Function("root", "state", "rulesUI", "refresh", "showError", "consoleUI", shellClickSource)(
   { addEventListener: (_name, listener) => { retryClick = listener; } }, shellState, shellUI,
   (options) => { retryOptions.push(options); return shellRefresh(options); },
-  (error) => { throw new Error(error); },
+  (error) => { throw new Error(error); }, null,
 );
 const clickRetry = () => retryClick({ target: { closest: () => ({ dataset: { action: "retry" } }) } });
 shellState.base = shellState.route = "#/rules";

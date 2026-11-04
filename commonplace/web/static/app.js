@@ -10,6 +10,7 @@ import { rulesView, rulesHandlers } from "./rules.js";
 import { signinView, signinMessage } from "./signin.js";
 import { childProgress } from "./children.js";
 import { agentsView, createAgent, agentAction, changeAgentClient, clearAgentSecret } from "./agents.js";
+import { createConsole } from "./console.js";
 
 const signinParams = new URLSearchParams(location.search);
 const signinCode = signinParams.get("signin"), signinNext = signinParams.get("next") || "";
@@ -31,6 +32,7 @@ const state = {
   phonePushPending: false,
   queue: null, pollFails: 0, queueFocus: "", queueShownAt: 0, queueField: false, queueDirty: false,
 };
+let consoleUI = null;
 const statuses = ["backlog", "todo", "doing", "review", "done"];
 const enc = encodeURIComponent;
 const data = (form) => Object.fromEntries(new FormData(form));
@@ -192,7 +194,7 @@ async function signin(code = null) {
   root.innerHTML = signinView({ providers, paused, via, error: state.error, next: signinNext || (path === "/app/" ? "" : path) });
 }
 function shell() {
-  root.innerHTML = `<div class="app"><aside class="side"><div class="ws"><a class="brand-home" href="#/" aria-label="Commonplace"><img class="brand-v2" src="/app/brand/logo-small-dark.svg" alt="Commonplace"></a></div><nav class="navs"><a href="#/" data-nav="needs">Home <span class="n" id="needs-count">0</span></a><a href="#/memory" data-nav="memory">Memory</a><a href="#/rules" data-nav="rules">Rules <span class="n" data-rules-count>0</span></a></nav><nav class="navs fill" id="board-nav"></nav><nav class="navs"><a href="#/settings" data-nav="settings">Settings</a><button class="logout" data-action="logout">Sign out</button></nav></aside><main class="main"><header class="head"><h1 id="title">Home</h1><div class="right" id="head-actions"></div></header><div id="connection-state" role="status" hidden>Disconnected</div><div id="screen-error" role="alert" hidden></div><div id="content"></div><aside class="panel" id="card-panel" role="dialog" aria-label="Card" hidden></aside></main><nav class="mtabs"><a href="#/" data-nav="needs">Home <b id="mobile-count">0</b></a><a href="#/boards" data-nav="boards">Spaces</a><a href="#/memory" data-nav="memory">Memory</a><a href="#/rules" data-nav="rules">Rules <span class="n" data-rules-count>0</span></a><a href="#/settings" data-nav="settings">Settings</a></nav></div>`;
+  root.innerHTML = `<div class="app"><aside class="side"><div class="ws"><a class="brand-home" href="#/" aria-label="Commonplace"><img class="brand-v2" src="/app/brand/logo-small-dark.svg" alt="Commonplace"></a></div><nav class="navs"><a href="#/" data-nav="needs">Home <span class="n" id="needs-count">0</span></a><a href="#/memory" data-nav="memory">Memory</a><a href="#/console" data-nav="console">Console</a><a href="#/rules" data-nav="rules">Rules <span class="n" data-rules-count>0</span></a></nav><nav class="navs fill" id="board-nav"></nav><nav class="navs"><a href="#/settings" data-nav="settings">Settings</a><button class="logout" data-action="logout">Sign out</button></nav></aside><main class="main"><header class="head"><h1 id="title">Home</h1><div class="right" id="head-actions"></div></header><div id="connection-state" role="status" hidden>Disconnected</div><div id="screen-error" role="alert" hidden></div><div id="content"></div><aside class="panel" id="card-panel" role="dialog" aria-label="Card" hidden></aside></main><nav class="mtabs"><a href="#/" data-nav="needs">Home <b id="mobile-count">0</b></a><a href="#/boards" data-nav="boards">Spaces</a><a href="#/memory" data-nav="memory">Memory</a><a href="#/console" data-nav="console">Console</a><a href="#/rules" data-nav="rules">Rules <span class="n" data-rules-count>0</span></a><a href="#/settings" data-nav="settings">Settings</a></nav></div>`;
   navigation();
 }
 function navigation() {
@@ -202,7 +204,7 @@ function navigation() {
   root.querySelectorAll("#needs-count, #mobile-count").forEach((n) => { n.textContent = state.needs.count || 0; });
   root.querySelectorAll("[data-rules-count]").forEach((n) => { const count = state.rulesWaiting; n.textContent = count; n.dataset.waiting = String(count > 0); });
   root.querySelector(".app")?.setAttribute("data-screen", state.base === "#/decide" ? "decide" : "");
-  const key = state.base === "#/rules" ? "rules" : state.base.startsWith("#/memory") ? "memory" : state.base === "#/settings" ? "settings" : /^#\/(board|space)/.test(state.base) ? "boards" : "needs";
+  const key = state.base === "#/rules" ? "rules" : state.base.startsWith("#/memory") ? "memory" : state.base === "#/console" ? "console" : state.base === "#/settings" ? "settings" : /^#\/(board|space)/.test(state.base) ? "boards" : "needs";
   root.querySelectorAll("[data-nav]").forEach((a) => a.dataset.nav === key ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"));
 }
 function showError(text) {
@@ -504,6 +506,11 @@ async function search(form) {
   if (epoch !== state.screen) return;
   results.innerHTML = found.results.map((m) => `<button data-action="memory" data-id="${e(m.id)}"><span class="meta">${e(m.theme)} · ${e(m.author)} · ${e(m.at)}</span><p>${e(m.text)}</p></button>`).join("") || message("No memories found");
 }
+function consoleScreen() {
+  consoleUI ??= createConsole({ mount: () => root.querySelector("#content"), api, e });
+  consoleUI.show();
+  title("Console");
+}
 async function refresh({ background = false, events = [] } = {}) {
   if (!state.me) return;
   const epoch = state.screen, request = ++state.refreshRequest;
@@ -557,6 +564,8 @@ async function refresh({ background = false, events = [] } = {}) {
     } else if (state.base.startsWith("#/memory")) {
       const changed = events.some((event) => event.kind.startsWith("memory."));
       if (!background || changed) await memoryView(epoch, background && !changed);
+    } else if (state.base === "#/console") {
+      if (!background) consoleScreen();
     } else if (state.base === "#/settings") {
       if (!background || events.some((event) => event.kind.startsWith("webhook."))) await settingsView(epoch);
     } else if (state.base === "#/decide") {
@@ -780,9 +789,10 @@ async function route() {
   state.screen++; state.route = hash;
   const start = decideStart(hash);
   if (!/^#\/card\/[1-9]\d*$/.test(hash)) {
-    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board|space)\/[^/?]+|boards|rules|memory(?:\?.*)?|settings)$/.test(hash) ? hash : "#/");
+    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board|space)\/[^/?]+|boards|rules|memory(?:\?.*)?|console|settings)$/.test(hash) ? hash : "#/");
     state.card = null;
   }
+  if (previousBase === "#/console" && state.base !== "#/console") consoleUI?.stop();
   if (previousBase === "#/decide" && state.base !== "#/decide") {
     queueFlush(true); queueStop(); state.queue = null; state.queueFocus = "";
   }
@@ -874,6 +884,7 @@ root.addEventListener("focusin", (event) => {
 root.addEventListener("click", async (event) => {
   const b = event.target.closest("[data-action]"); if (!b) return;
   const number = Number(b.dataset.card), action = b.dataset.action;
+  if (consoleUI?.click(action, b)) return;
   if (action.startsWith("queue-")) {
     // A double tap must not answer the next question too: answers wait out the arm delay.
     if (["queue-yes", "queue-no", "queue-answer", "queue-ask-new"].includes(action) && performance.now() < state.queueShownAt + SWIPE.arm) return;

@@ -141,7 +141,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 1px
   .head { display: flex; height: auto; }
   .head h1 { background: none; display: block; height: auto; padding: 0; }
   .head .right { display: flex; margin-left: auto; }
-  .mtabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .mtabs { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
   .mtabs a { display: flex; justify-content: center; align-items: center; min-height: 50px; font-size: 12px; }
   .item { padding: 16px; }
   .item .top { align-items: start; }
@@ -230,12 +230,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 1px
 @media (min-width: 641px) and (max-width: 1100px) {
   .app:has(.space) { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) 56px; height: 100dvh; }
   .app:has(.space) .side { display: none; }
-  .app:has(.space) .mtabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; }
+  .app:has(.space) .mtabs { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 0; }
   .app:has(.space) .mtabs a { display: flex; justify-content: center; align-items: center; min-height: 50px; font-size: 12px; }
 }
 @media (max-width: 640px) {
   .space { display: flex; flex-direction: column; }
-  .app:has(.space) .mtabs { grid-template-columns: 1.25fr repeat(3, minmax(0, 1fr)); }
   .space-tabs { display: flex; flex: none; gap: 6px; padding: 4px 12px; }
   .space-tabs button { flex: 1; min-height: 44px; color: var(--muted); }
   .space-chat, .space-tasks { flex: 1; }

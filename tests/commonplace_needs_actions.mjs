@@ -47,6 +47,7 @@ function fixture() {
   };
   let beforeRefresh = () => {}, nextError = null;
   const context = {
+    consoleUI: null,
     state, root, location, e, enc: encodeURIComponent, actor: (value) => value || "Worker",
     document: { activeElement: null }, CSS: { escape: (value) => value },
     voice: { stop() {}, remember() {}, view() {} },

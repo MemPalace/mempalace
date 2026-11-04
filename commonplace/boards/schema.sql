@@ -177,3 +177,5 @@ CREATE TRIGGER IF NOT EXISTS rules_visibility_board_repos_delete AFTER DELETE ON
 BEGIN UPDATE meta SET value=(random() & 0x7fffffffffffffff) | 1 WHERE key='visibility'; END;
 CREATE TRIGGER IF NOT EXISTS rules_visibility_board_repos_update AFTER UPDATE ON board_repos
 BEGIN UPDATE meta SET value=(random() & 0x7fffffffffffffff) | 1 WHERE key='visibility'; END;
+CREATE INDEX IF NOT EXISTS space_messages_by_connection ON space_messages(stamp_connection, id, board_id);
+CREATE INDEX IF NOT EXISTS task_events_output_by_connection ON task_events(stamp_connection, id, task_id) WHERE kind IN ('comment', 'handoff', 'ask');
