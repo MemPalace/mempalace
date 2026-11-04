@@ -13,6 +13,8 @@ commonplace serve --host 127.0.0.1 --port 8765
 
 Social sign-in: [provider setup](SETUP.md).
 
+Project chat offers instant basic receipts, optional owner-configured model answers and a linked-card fallback for unclaimed work requests; see [project chat](../docs/chat.md).
+
 ## Mail
 
 The signed-out app accepts an email address and sends a single-use sign-in link, valid for 15 minutes. New accounts and personal workspaces are created only after verification with `COMMONPLACE_SIGNUP=open`. Signup is closed by default; existing accounts can still sign in. The request gives the same neutral response for unknown addresses and delivery failures.

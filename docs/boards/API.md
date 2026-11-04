@@ -460,7 +460,7 @@ agent replies emit `space_replied` for app polling only, preventing wake loops. 
 payloads contain `data.message_id` and the space URL, never chat text. The coordinator
 reads with `space_read(board, after=message_id-1)` and uses existing tools: `task_add(..., message_id=<request id>,
 assignee="codex:vm")` links and reserves a task. Only messages in the same board can
-be linked. The hub never invokes an LLM or starts an agent process.
+be linked. The hub never starts an agent process. It invokes a model only for the chat front agent, and only after a workspace owner configures one ([project chat](../chat.md)). Its only board write is filing an unclaimed chat work request as a linked todo card, as the poster ([project chat](../chat.md)).
 
 REST aliases, with the same tool visibility and wing rules:
 

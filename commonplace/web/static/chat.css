@@ -1,0 +1,14 @@
+.chat-view { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+.chat-header { display: flex; flex-wrap: wrap; align-items: center; gap: 16px; }
+.chat-header label { display: flex; align-items: center; gap: 8px; }
+.chat-status { width: 100%; display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: .875rem; color: var(--muted, #aaa); }
+.chat-stream { list-style: none; padding: 0; margin: 0; max-height: 60vh; overflow-y: auto; }
+.chat-message { padding: 16px 0; border-bottom: 1px solid var(--line, #333); }
+.chat-message p { white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; }
+.chat-stamp, .chat-hint { font-size: .8rem; color: var(--muted, #aaa); }
+.chat-stamp time { margin-left: 8px; }
+.chat-reply { border-left: 2px solid var(--line, #555); padding-left: 16px; margin-top: 12px; }
+.chat-compose { display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 8px; }
+.chat-compose label { grid-column: 1 / -1; }
+.chat-compose textarea { width: 100%; min-width: 0; resize: vertical; }
+.chat-view mark.redacted { color: inherit; background: #76612966; }

@@ -11,6 +11,7 @@ import { signinView, signinMessage } from "./signin.js";
 import { childProgress } from "./children.js";
 import { agentsView, createAgent, agentAction, changeAgentClient, clearAgentSecret } from "./agents.js";
 import { createConsole } from "./console.js";
+import { createChat, CHAT_COPY } from "./chat.js";
 
 const signinParams = new URLSearchParams(location.search);
 const signinCode = signinParams.get("signin"), signinNext = signinParams.get("next") || "";
@@ -32,7 +33,7 @@ const state = {
   phonePushPending: false,
   queue: null, pollFails: 0, queueFocus: "", queueShownAt: 0, queueField: false, queueDirty: false,
 };
-let consoleUI = null;
+let consoleUI = null, chatUI = null;
 const statuses = ["backlog", "todo", "doing", "review", "done"];
 const enc = encodeURIComponent;
 const data = (form) => Object.fromEntries(new FormData(form));
@@ -194,7 +195,7 @@ async function signin(code = null) {
   root.innerHTML = signinView({ providers, paused, via, error: state.error, next: signinNext || (path === "/app/" ? "" : path) });
 }
 function shell() {
-  root.innerHTML = `<div class="app"><aside class="side"><div class="ws"><a class="brand-home" href="#/" aria-label="Commonplace"><img class="brand-v2" src="/app/brand/logo-small-dark.svg" alt="Commonplace"></a></div><nav class="navs"><a href="#/" data-nav="needs">Home <span class="n" id="needs-count">0</span></a><a href="#/memory" data-nav="memory">Memory</a><a href="#/console" data-nav="console">Console</a><a href="#/rules" data-nav="rules">Rules <span class="n" data-rules-count>0</span></a></nav><nav class="navs fill" id="board-nav"></nav><nav class="navs"><a href="#/settings" data-nav="settings">Settings</a><button class="logout" data-action="logout">Sign out</button></nav></aside><main class="main"><header class="head"><h1 id="title">Home</h1><div class="right" id="head-actions"></div></header><div id="connection-state" role="status" hidden>Disconnected</div><div id="screen-error" role="alert" hidden></div><div id="content"></div><aside class="panel" id="card-panel" role="dialog" aria-label="Card" hidden></aside></main><nav class="mtabs"><a href="#/" data-nav="needs">Home <b id="mobile-count">0</b></a><a href="#/boards" data-nav="boards">Spaces</a><a href="#/memory" data-nav="memory">Memory</a><a href="#/console" data-nav="console">Console</a><a href="#/rules" data-nav="rules">Rules <span class="n" data-rules-count>0</span></a><a href="#/settings" data-nav="settings">Settings</a></nav></div>`;
+  root.innerHTML = `<div class="app"><aside class="side"><div class="ws"><a class="brand-home" href="#/" aria-label="Commonplace"><img class="brand-v2" src="/app/brand/logo-small-dark.svg" alt="Commonplace"></a></div><nav class="navs"><a href="#/" data-nav="needs">Home <span class="n" id="needs-count">0</span></a><a href="#/memory" data-nav="memory">Memory</a><a href="#/chat" data-nav="chat">Chat</a><a href="#/console" data-nav="console">Console</a><a href="#/rules" data-nav="rules">Rules <span class="n" data-rules-count>0</span></a></nav><nav class="navs fill" id="board-nav"></nav><nav class="navs"><a href="#/settings" data-nav="settings">Settings</a><button class="logout" data-action="logout">Sign out</button></nav></aside><main class="main"><header class="head"><h1 id="title">Home</h1><div class="right" id="head-actions"></div></header><div id="connection-state" role="status" hidden>Disconnected</div><div id="screen-error" role="alert" hidden></div><div id="content"></div><aside class="panel" id="card-panel" role="dialog" aria-label="Card" hidden></aside></main><nav class="mtabs"><a href="#/" data-nav="needs">Home <b id="mobile-count">0</b></a><a href="#/boards" data-nav="boards">Spaces</a><a href="#/memory" data-nav="memory">Memory</a><a href="#/chat" data-nav="chat">Chat</a><a href="#/console" data-nav="console">Console</a><a href="#/rules" data-nav="rules">Rules <span class="n" data-rules-count>0</span></a><a href="#/settings" data-nav="settings">Settings</a></nav></div>`;
   navigation();
 }
 function navigation() {
@@ -204,7 +205,7 @@ function navigation() {
   root.querySelectorAll("#needs-count, #mobile-count").forEach((n) => { n.textContent = state.needs.count || 0; });
   root.querySelectorAll("[data-rules-count]").forEach((n) => { const count = state.rulesWaiting; n.textContent = count; n.dataset.waiting = String(count > 0); });
   root.querySelector(".app")?.setAttribute("data-screen", state.base === "#/decide" ? "decide" : "");
-  const key = state.base === "#/rules" ? "rules" : state.base.startsWith("#/memory") ? "memory" : state.base === "#/console" ? "console" : state.base === "#/settings" ? "settings" : /^#\/(board|space)/.test(state.base) ? "boards" : "needs";
+  const key = /^#\/chat(?:\/|$)/.test(state.base) ? "chat" : state.base === "#/rules" ? "rules" : state.base.startsWith("#/memory") ? "memory" : state.base === "#/console" ? "console" : state.base === "#/settings" ? "settings" : /^#\/(board|space)/.test(state.base) ? "boards" : "needs";
   root.querySelectorAll("[data-nav]").forEach((a) => a.dataset.nav === key ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"));
 }
 function showError(text) {
@@ -261,7 +262,7 @@ function needsView() {
 function boardView() {
   const slug = decodeURIComponent(state.base.slice("#/board/".length));
   const board = state.boards.find((b) => b.slug === slug);
-  title(board?.name || slug, `<a class="opt" href="#/space/${enc(slug)}">Chat</a><button class="blockbtn" data-action="new-card">New card</button>`);
+  title(board?.name || slug, `<a class="opt" href="#/chat/${enc(slug)}">Chat</a><button class="blockbtn" data-action="new-card">New card</button>`);
   root.querySelector("#content").innerHTML = `<div class="cols ${state.backlog ? "expanded" : ""}">${statuses.map((status) => {
     const all = state.cards.filter((c) => c.status === status);
     const list = status === "done" ? [...all].sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at)).slice(0, 20) : all;
@@ -453,11 +454,11 @@ async function settingsView(epoch) {
   title("Settings");
   const content = root.querySelector("#content");
   if (!content.querySelector(".settings")) content.innerHTML = message("Loading settings…");
-  const [connections, hooks, plan, phonePush] = await Promise.allSettled([api("/api/connections"), api("/api/webhooks"), api("/api/plan"), api("/api/phone-push")]);
+  const [connections, hooks, plan, phonePush, chatSettings] = await Promise.allSettled([api("/api/connections"), api("/api/webhooks"), api("/api/plan"), api("/api/phone-push"), api("/api/chat-settings")]);
   if (epoch !== state.screen) return;
   const saved = remember();
   state.phonePushPending = phonePush.status === "fulfilled" && phonePush.value.test?.status === "pending";
-  content.innerHTML = `<div class="settings">${plan.status === "fulfilled" ? planView(plan.value) : ""}${voice.settings()}${connections.status === "fulfilled" ? agentsView(connections.value) : `<section class="settings-section"><h2>Agents</h2>${message(connections.reason.message, true)}</section>`}${phonePush.status === "fulfilled" ? phonePushView(phonePush.value) : `<section class="settings-section" id="phone-push"><h2>Phone notifications</h2>${message(phonePush.reason.message, true)}</section>`}<section class="settings-section"><h2>Webhooks</h2><div id="hook-secret"></div>${hooks.status === "fulfilled" ? (hooks.value.webhooks || []).map((h) => `<div class="setting-row"><span>${e(h.url)}<br><small>${e(h.id)}</small></span><button data-action="deliveries" data-hook="${e(h.id)}">Deliveries</button><button data-action="test-hook" data-hook="${e(h.id)}">Test</button><button data-action="remove-hook" data-hook="${e(h.id)}">Remove</button></div>`).join("") || message("No webhooks") : message(hooks.reason.message, true)}<form class="webhook-form" data-form="webhook"><input name="url" type="url" data-draft="webhook-url" aria-label="Webhook URL" required><input name="board" data-draft="webhook-board" aria-label="Board" placeholder="Board"><input name="waiting_on" data-draft="webhook-waiting" aria-label="Waiting on" placeholder="Waiting on"><select name="events" aria-label="Events" data-draft="webhook-events"><option value="*">All events</option><option value="review_needed">Review needed</option><option value="card_changed">Card changed</option><option value="waiting_on_me">Waiting on me</option></select><button class="blockbtn">Add</button></form><div id="deliveries"></div></section><section class="settings-section"><button class="opt" data-action="logout">Sign out</button></section></div>`;
+  content.innerHTML = `<div class="settings">${plan.status === "fulfilled" ? planView(plan.value) : ""}${voice.settings()}${chatSettings.status === "fulfilled" ? `<section class="settings-section"><h2>Chat</h2><p>${e(chatSettings.value.front.enabled && chatSettings.value.front.provider !== "none" ? `Answers by ${chatSettings.value.front.provider}/${chatSettings.value.front.model}` : chatSettings.value.front.enabled ? "Basic replies (no model)" : "Front replies off")}</p><p>Model answers today: ${e(chatSettings.value.usage.used_today)} · Yours: ${e(chatSettings.value.usage.user_used_today)}</p>${chatSettings.value.usage.last_error ? `<p role="status">Last model error: ${e(chatSettings.value.usage.last_error)}</p>` : ""}</section>` : ""}${connections.status === "fulfilled" ? agentsView(connections.value) : `<section class="settings-section"><h2>Agents</h2>${message(connections.reason.message, true)}</section>`}${phonePush.status === "fulfilled" ? phonePushView(phonePush.value) : `<section class="settings-section" id="phone-push"><h2>Phone notifications</h2>${message(phonePush.reason.message, true)}</section>`}<section class="settings-section"><h2>Webhooks</h2><div id="hook-secret"></div>${hooks.status === "fulfilled" ? (hooks.value.webhooks || []).map((h) => `<div class="setting-row"><span>${e(h.url)}<br><small>${e(h.id)}</small></span><button data-action="deliveries" data-hook="${e(h.id)}">Deliveries</button><button data-action="test-hook" data-hook="${e(h.id)}">Test</button><button data-action="remove-hook" data-hook="${e(h.id)}">Remove</button></div>`).join("") || message("No webhooks") : message(hooks.reason.message, true)}<form class="webhook-form" data-form="webhook"><input name="url" type="url" data-draft="webhook-url" aria-label="Webhook URL" required><input name="board" data-draft="webhook-board" aria-label="Board" placeholder="Board"><input name="waiting_on" data-draft="webhook-waiting" aria-label="Waiting on" placeholder="Waiting on"><select name="events" aria-label="Events" data-draft="webhook-events"><option value="*">All events</option><option value="review_needed">Review needed</option><option value="card_changed">Card changed</option><option value="waiting_on_me">Waiting on me</option></select><button class="blockbtn">Add</button></form><div id="deliveries"></div></section><section class="settings-section"><button class="opt" data-action="logout">Sign out</button></section></div>`;
   restore(saved);
 }
 
@@ -505,6 +506,46 @@ async function search(form) {
   const found = await api(`/api/memory/search?q=${enc(q)}&limit=30`);
   if (epoch !== state.screen) return;
   results.innerHTML = found.results.map((m) => `<button data-action="memory" data-id="${e(m.id)}"><span class="meta">${e(m.theme)} · ${e(m.author)} · ${e(m.at)}</span><p>${e(m.text)}</p></button>`).join("") || message("No memories found");
+}
+async function chatScreen(epoch) {
+  chatUI ??= createChat({ mount: () => root.querySelector("#content"), api, e });
+  let slug = state.base.startsWith("#/chat/") ? decodeURIComponent(state.base.slice(7)) : null;
+  title("Chat");
+  await chatUI.show(slug);
+  if (epoch !== state.screen) return;
+  slug = root.querySelector(".chat-view")?.dataset.board || slug;
+  const board = state.boards.find((b) => b.slug === slug);
+  const header = root.querySelector(".chat-header");
+  if (header && board && !board.coordinator) {
+    header.querySelector("[data-chat-notice]")?.remove();
+    const notice = document.createElement("p");
+    notice.dataset.chatNotice = "";
+    notice.textContent = board.can_configure ? CHAT_COPY.noOrchestratorOwner : CHAT_COPY.noOrchestratorMember;
+    header.append(notice);
+  }
+  if (board?.can_configure) {
+    const result = await api("/api/connections");
+    if (epoch !== state.screen) return;
+    const header = root.querySelector(".chat-header");
+    if (header) {
+      header.querySelector("[data-chat-orchestrator]")?.remove();
+      const label = document.createElement("label");
+      label.dataset.chatOrchestrator = "";
+      label.innerHTML = `Orchestrator<select aria-label="Orchestrator"><option value="">None</option>${(result.connections || []).filter((c) => c.auth === "pat" && !c.revoked_at && (!c.expires_at || Date.parse(c.expires_at) > Date.now())).map((c) => `<option value="${e(`conn:${c.name}`)}" ${board.coordinator === `conn:${c.name}` ? "selected" : ""}>${e(c.name)}</option>`).join("")}</select>`;
+      const picker = label.querySelector("select");
+      picker.onchange = async () => {
+        picker.disabled = true;
+        try {
+          await api(`/api/boards/${enc(slug)}`, { method: "PATCH", body: { coordinator: picker.value || null } });
+          if (epoch !== state.screen) return;
+          board.coordinator = picker.value || null;
+          chatUI.stop(); await chatScreen(epoch);
+        } catch { showError("Could not change the orchestrator."); picker.value = board.coordinator || ""; }
+        finally { picker.disabled = false; }
+      };
+      header.append(label);
+    }
+  }
 }
 function consoleScreen() {
   consoleUI ??= createConsole({ mount: () => root.querySelector("#content"), api, e });
@@ -564,6 +605,8 @@ async function refresh({ background = false, events = [] } = {}) {
     } else if (state.base.startsWith("#/memory")) {
       const changed = events.some((event) => event.kind.startsWith("memory."));
       if (!background || changed) await memoryView(epoch, background && !changed);
+    } else if (/^#\/chat(?:\/|$)/.test(state.base)) {
+      if (!background) await chatScreen(epoch);
     } else if (state.base === "#/console") {
       if (!background) consoleScreen();
     } else if (state.base === "#/settings") {
@@ -789,9 +832,10 @@ async function route() {
   state.screen++; state.route = hash;
   const start = decideStart(hash);
   if (!/^#\/card\/[1-9]\d*$/.test(hash)) {
-    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board|space)\/[^/?]+|boards|rules|memory(?:\?.*)?|console|settings)$/.test(hash) ? hash : "#/");
+    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board|space)\/[^/?]+|boards|rules|memory(?:\?.*)?|chat(?:\/[^/?]+)?|console|settings)$/.test(hash) ? hash : "#/");
     state.card = null;
   }
+  if (/^#\/chat(?:\/|$)/.test(previousBase) && state.base !== previousBase) chatUI?.stop();
   if (previousBase === "#/console" && state.base !== "#/console") consoleUI?.stop();
   if (previousBase === "#/decide" && state.base !== "#/decide") {
     queueFlush(true); queueStop(); state.queue = null; state.queueFocus = "";
@@ -974,6 +1018,7 @@ root.addEventListener("click", async (event) => {
       panel.innerHTML = '<form class="form-tile" data-form="memory"><h2>Save memory</h2><label>Text<textarea name="text" required></textarea></label><label>Theme<input name="theme"></label><label>Topic<input name="topic"></label><label>Card<input name="task"></label><button class="blockbtn">Save</button><button type="button" class="opt" data-action="close-panel">Cancel</button></form>';
     } else if (action === "logout") {
       voice.stop();
+      chatUI?.stop(); chatUI = null;
       await api("/app/logout", { method: "POST" }); state.me = null; state.drafts.clear(); signin();
     } else if (action === "remove-hook") await mutate(`hook-${b.dataset.hook}`, () => api(`/api/webhooks/${enc(b.dataset.hook)}`, { method: "DELETE" }));
     else if (action === "test-hook") await mutate(`hook-${b.dataset.hook}`, () => api(`/api/webhooks/${enc(b.dataset.hook)}/test`, { method: "POST", body: {} }));
