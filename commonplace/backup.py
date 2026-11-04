@@ -206,17 +206,28 @@ def _snapshot(source: Path, target: Path) -> None:
     the source main file or WAL.
     """
     if encryption_settings(source) is None:
+        # Stall deadline: fail only when the copy makes no new progress for 30 s.
+        # Compare with the lowest remaining count seen so far, not the previous
+        # one: a source change restarts the copy from the top, and resetting on
+        # every drop would let a restarting copy run forever. A late restart
+        # must re-copy below the old low before the timer resets (fails closed).
         deadline = time.monotonic() + 30
+        remaining = None
 
         def progress(_status, _remaining, _total):
-            if time.monotonic() > deadline:
+            nonlocal deadline, remaining
+            now = time.monotonic()
+            if remaining is None or _remaining < remaining:
+                deadline = now + 30
+                remaining = _remaining
+            if now > deadline:
                 raise BackupError(f"database backup timed out: {source.name}")
 
         src = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=1)
         try:
             dst = sqlite3.connect(target)
             try:
-                src.backup(dst, pages=256, progress=progress, sleep=0.01)
+                src.backup(dst, pages=4096, progress=progress, sleep=0.01)
                 dst.execute("PRAGMA journal_mode = DELETE")
                 if dst.execute("PRAGMA quick_check").fetchone() != ("ok",):
                     raise BackupError(f"database integrity check failed: {source.name}")
