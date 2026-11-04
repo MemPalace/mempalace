@@ -13,9 +13,9 @@ import contextlib
 import os
 import sqlite3
 from collections import defaultdict
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
-from ..lexical import tokenize
+from ..lexical import fts_short_terms, fts_terms, is_cjk, tokenize
 from ..stored_text import FLAG, decode_record, decode_value, encode_filter, encode_where
 from ..timeutil import recency_floor, recency_key
 from ._filters import matches_where
@@ -239,12 +239,17 @@ _FTS_FILTER_DRIVEN_MAX = 20_000
 
 
 def _fts_tokens(query: str, stop_words: frozenset = frozenset()) -> list[str]:
-    """Query terms the trigram index can match: three or more characters.
+    """Query terms the trigram index can match: see :func:`mempalace.lexical.fts_terms`.
 
     Stop words are dropped unless the query holds nothing else.
     """
-    terms = [t for t in tokenize(query) if len(t) >= 3]
+    terms = fts_terms(query)
     return [t for t in terms if t not in stop_words] or terms
+
+
+def _fts_short_tokens(query: str, stop_words: frozenset = frozenset()) -> list[str]:
+    """CJK words too short for the trigram index: see :func:`mempalace.lexical.fts_short_terms`."""
+    return [t for t in fts_short_terms(query) if t not in stop_words]
 
 
 # When the ranked window above is full but holds fewer whole-word matches than
@@ -258,6 +263,27 @@ class CandidateRows(list):
     truncated = False
 
 
+def _whole_word_matcher(query_tokens: Iterable[str]) -> Callable[[Optional[str]], bool]:
+    """Predicate: does a drawer's text hold one of ``query_tokens`` as a whole word?
+
+    CJK is written without spaces, so a CJK term has no word boundary to
+    respect and counts wherever it appears; any other term must be a whole
+    ``\\w{2,}`` token of the text.
+    """
+    tokens = list(query_tokens)
+    cjk = [t for t in tokens if is_cjk(t)]
+    words = {t for t in tokens if not is_cjk(t)}
+
+    def matches(text: Optional[str]) -> bool:
+        if cjk and text:
+            lowered = text.lower()
+            if any(t in lowered for t in cjk):
+                return True
+        return bool(words) and not words.isdisjoint(tokenize(text, cjk_bigrams=False))
+
+    return matches
+
+
 def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) -> list[int]:
     """Row ids from ``(row_id, text)`` pairs, whole-word matches first.
 
@@ -266,17 +292,61 @@ def _whole_words_first(rows, query_tokens: Iterable[str], limit: Optional[int]) 
     only contain a query term inside another word keep the places left over:
     they still carry near misses such as ``vectors`` for ``vector``.
     """
-    words = set(query_tokens)
+    is_whole = _whole_word_matcher(query_tokens)
     whole: list[int] = []
     partial: list[int] = []
     for row_id, text in rows:
-        if words.intersection(tokenize(text)):
+        if is_whole(text):
             whole.append(int(row_id))
             if limit is not None and len(whole) >= limit:
                 break
         elif limit is None or len(partial) < limit:
             partial.append(int(row_id))
     picked = whole + partial
+    return picked if limit is None else picked[:limit]
+
+
+def _substring_rows(
+    conn,
+    collection_name: str,
+    terms: list[str],
+    *,
+    filter_sql: str = "",
+    filter_params: Iterable = (),
+) -> list[tuple]:
+    """``(row_id, text)`` of drawers holding any of ``terms``, most terms first.
+
+    For CJK words too short for the trigram index. SQLite answers ``LIKE`` on
+    a trigram table by scanning it when the pattern has fewer than three
+    characters, so at most ``_FTS_SCAN_CAP`` matches are read, newest first,
+    and the order among drawers holding as many terms stays newest first. The
+    terms are CJK runs, so they hold no ``LIKE`` wildcard to escape.
+    """
+    like = " OR ".join(["embedding_fulltext_search.string_value LIKE ?"] * len(terms))
+    rows = conn.execute(
+        f"""
+        SELECT embedding_fulltext_search.rowid, embedding_fulltext_search.string_value
+        FROM embedding_fulltext_search
+        JOIN embeddings e ON e.id = embedding_fulltext_search.rowid
+        JOIN segments s ON e.segment_id = s.id
+        JOIN collections c ON s.collection = c.id
+        WHERE ({like}) AND c.name = ?
+        {filter_sql}
+        ORDER BY embedding_fulltext_search.rowid DESC LIMIT ?
+        """,
+        (*(f"%{t}%" for t in terms), collection_name, *filter_params, _FTS_SCAN_CAP),
+    ).fetchall()
+    if len(terms) > 1:
+        rows.sort(key=lambda row: -sum(t in (row[1] or "").lower() for t in terms))
+    return rows
+
+
+def _both_first(primary: list[int], secondary: list[int], limit: Optional[int]) -> list[int]:
+    """Ids in both lists first, then the rest of ``primary``, then of ``secondary``."""
+    in_primary, in_secondary = set(primary), set(secondary)
+    picked = [i for i in primary if i in in_secondary]
+    picked += [i for i in primary if i not in in_secondary]
+    picked += [i for i in secondary if i not in in_primary]
     return picked if limit is None else picked[:limit]
 
 
@@ -292,6 +362,42 @@ def _fts_candidate_rows(
 ) -> list[int]:
     """Row ids of the full-text matches most worth ranking, best first.
 
+    Trigram terms go through :func:`_trigram_candidate_rows`. CJK words of
+    two characters, which no trigram can match, are found by
+    :func:`_substring_rows`; drawers matching both kinds of term go first.
+    ``filter_sql`` is appended to the WHERE clause and may refer to
+    ``embedding_fulltext_search.rowid``.
+    """
+    tokens = _fts_tokens(query, stop_words)
+    short = _fts_short_tokens(query, stop_words)
+    kwargs = {"limit": limit, "filter_sql": filter_sql, "filter_params": filter_params}
+    if not short:
+        return _trigram_candidate_rows(conn, collection_name, tokens, **kwargs)
+    rows = _substring_rows(
+        conn, collection_name, short, filter_sql=filter_sql, filter_params=filter_params
+    )
+    by_substring = _whole_words_first(rows, short, limit)
+    if not tokens:
+        out = CandidateRows(by_substring)
+    else:
+        by_trigram = _trigram_candidate_rows(conn, collection_name, tokens, **kwargs)
+        out = CandidateRows(_both_first(by_trigram, by_substring, limit))
+        out.truncated = by_trigram.truncated
+    out.truncated = out.truncated or len(rows) >= _FTS_SCAN_CAP
+    return out
+
+
+def _trigram_candidate_rows(
+    conn,
+    collection_name: str,
+    tokens: list[str],
+    *,
+    limit: Optional[int],
+    filter_sql: str = "",
+    filter_params: Iterable = (),
+) -> "CandidateRows":
+    """Row ids of the trigram full-text matches most worth ranking, best first.
+
     ``chroma.sqlite3``'s full-text index uses the trigram tokenizer, so a
     query term matches inside other words: ``aven`` hits ``haven't`` and
     ``Avenue``, and a short name can have tens of thousands of such matches.
@@ -299,12 +405,11 @@ def _fts_candidate_rows(
     BM25 re-rank the oldest substring hits, so the drawers that actually say
     ``Aven`` never reached it. Matches are read in FTS rank order (documents
     matching more query terms first), at most ``_FTS_SCAN_CAP`` of them, and
-    picked by :func:`_whole_words_first`. ``filter_sql`` is appended to the
-    WHERE clause and may refer to ``embedding_fulltext_search.rowid``.
-    ``stop_words`` are left out of the full-text query: they match nearly
-    every drawer and would make the ranking score the whole palace.
+    picked by :func:`_whole_words_first`. ``tokens`` come from
+    :func:`_fts_tokens`, which leaves stop words out of the full-text query:
+    they match nearly every drawer and would make the ranking score the whole
+    palace.
     """
-    tokens = _fts_tokens(query, stop_words)
     if not tokens:
         return CandidateRows()
     match_sql = f"""
@@ -317,7 +422,7 @@ def _fts_candidate_rows(
         {filter_sql}
     """
     params = (" OR ".join(tokens), collection_name, *filter_params)
-    words = set(tokens)
+    is_whole = _whole_word_matcher(tokens)
     ranked = conn.execute(
         match_sql + " ORDER BY embedding_fulltext_search.rank LIMIT ?",
         (*params, _FTS_SCAN_CAP),
@@ -326,7 +431,7 @@ def _fts_candidate_rows(
     if len(ranked) < _FTS_SCAN_CAP:
         return result
     text_by_id = {int(row_id): text or "" for row_id, text in ranked}
-    whole = [row_id for row_id in result if words.intersection(tokenize(text_by_id[row_id]))]
+    whole = [row_id for row_id in result if is_whole(text_by_id[row_id])]
     if limit is not None and len(whole) >= limit:
         return result
     # The ranked window is full and short of whole-word matches: a name can
@@ -340,7 +445,7 @@ def _fts_candidate_rows(
         (*params, _FTS_CONTINUATION_BUDGET),
     ):
         read += 1
-        if int(row_id) in seen or not words.intersection(tokenize(text)):
+        if int(row_id) in seen or not is_whole(text):
             continue
         extra.append(int(row_id))
         if limit is not None and len(whole) + len(extra) >= limit:
@@ -374,12 +479,12 @@ def _filtered_candidate_rows(
     string metadata matches, checked by one count on the
     ``(key, string_value)`` index)
     matches at most ``_FTS_FILTER_DRIVEN_MAX`` drawers, this reads just those
-    drawers' text, keeps the ones the trigram index would match (any term of
-    three or more characters as a case-insensitive substring), newest first,
+    drawers' text, keeps the ones the full-text lookup would match (any
+    trigram term or two-character CJK word as a case-insensitive substring), newest first,
     and picks by :func:`_whole_words_first`. ``filter_sql`` must hold every
     filter and may refer to ``e.id``. ``None`` when the filter is too broad.
     """
-    tokens = _fts_tokens(query, stop_words)
+    tokens = _fts_tokens(query, stop_words) + _fts_short_tokens(query, stop_words)
     if not tokens or not equalities:
         return None
     sizes = _equality_sizes(conn, equalities)
@@ -456,16 +561,19 @@ def sqlite_lexical_rows(
 
     The best ``limit`` full-text matches by FTS rank, or every match under a
     ``where``, which is applied to the stored metadata afterwards: a cap
-    before filtering could fill with wrong-scope rows. The newest ``limit``
-    rows stand in when no query term is three characters long or the
-    full-text query fails; a clean miss stays empty. ``[]`` when the database
-    is missing or unreadable.
+    before filtering could fill with wrong-scope rows. Two-character CJK
+    words, which the trigram index cannot match, are read by
+    :func:`_substring_rows`, and drawers matching both kinds of term go first.
+    The newest ``limit`` rows stand in when the query has no term either way
+    can look up or the full-text query fails; a clean miss stays empty.
+    ``[]`` when the database is missing or unreadable.
     """
-    tokens = [t for t in tokenize(query) if len(t) >= 3]
+    tokens = fts_terms(query)
+    short = fts_short_terms(query)
 
     def read(conn):
         row_ids: list[int] = []
-        recency = not tokens
+        recency = not tokens and not short
         if tokens:
             limit_sql = "" if where else "ORDER BY embedding_fulltext_search.rank LIMIT ?"
             try:
@@ -487,6 +595,13 @@ def sqlite_lexical_rows(
                 ]
             except sqlite3.Error:
                 recency = True
+        if short:
+            try:
+                rows = _substring_rows(conn, collection_name, short)
+            except sqlite3.Error:
+                recency = True
+            else:
+                row_ids = _both_first(row_ids, [r[0] for r in rows], None if where else limit)
         if not row_ids and recency:
             row_ids = _newest_row_ids(conn, collection_name, limit)
         return _decoded_rows(conn, row_ids, where)
