@@ -1,6 +1,7 @@
 """MCP server tests — diary tools and chunked diary ids."""
 
 from datetime import datetime
+from pathlib import Path
 
 from _mcp_server_helpers import (
     _get_collection,
@@ -441,3 +442,124 @@ class TestDiaryTools:
 
 
 # ── Cache Invalidation (inode/mtime) ──────────────────────────────────
+
+
+# ── memories_filed_away: fail-soft on non-object JSON roots ────────────
+
+
+def _write_checkpoint(home_dir: Path, body_text: str) -> Path:
+    """Write last_checkpoint under an isolated home, returning the Path.
+
+    ``home_dir`` must be the value returned by the patched
+    ``pathlib.Path.home()``; the file is laid out exactly as the tool
+    under test reads it, under ``<home>/.mempalace/hook_state``.
+    """
+    state_dir = Path(home_dir) / ".mempalace" / "hook_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    ack = state_dir / "last_checkpoint"
+    ack.write_text(body_text, encoding="utf-8")
+    return ack
+
+
+def _patch_home(monkeypatch, tmp_path: Path) -> None:
+    """Point mempalace.paths.Path.home() at tmp_path (cross-platform).
+
+    ``tool_memories_filed_away`` resolves its state directory via
+    ``mempalace.paths.state_path("hook_state")`` -- NOT a ``pathlib.Path``
+    imported into ``mempalace.mcp_server``. ``state_home()`` references
+    ``Path`` as a module global of ``mempalace.paths``, so the patch
+    target is ``mempalace.paths.Path``; patching ``mempalace.mcp_server``
+    instead would be a no-op and the tool would hit the real home.
+    """
+    import mempalace.paths as paths_mod
+
+    class _Home(Path):
+        @classmethod
+        def home(cls):  # noqa: N805 -- mirroring pathlib.Path.home
+            return Path(str(tmp_path))
+
+    monkeypatch.setattr(paths_mod, "Path", _Home)
+
+
+def test_filed_away_null_root_is_error(monkeypatch, tmp_path):
+    from mempalace import mcp_server
+
+    _patch_home(monkeypatch, tmp_path)
+    ack = _write_checkpoint(tmp_path, "null")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not ack.exists()
+
+
+def test_filed_away_array_root_is_error(monkeypatch, tmp_path):
+    from mempalace import mcp_server
+
+    _patch_home(monkeypatch, tmp_path)
+    ack = _write_checkpoint(tmp_path, "[]")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not ack.exists()
+
+
+def test_filed_away_string_root_is_error(monkeypatch, tmp_path):
+    from mempalace import mcp_server
+
+    _patch_home(monkeypatch, tmp_path)
+    ack = _write_checkpoint(tmp_path, '"hello"')
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not ack.exists()
+
+
+def test_filed_away_number_root_is_error(monkeypatch, tmp_path):
+    from mempalace import mcp_server
+
+    _patch_home(monkeypatch, tmp_path)
+    ack = _write_checkpoint(tmp_path, "42")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not ack.exists()
+
+
+def test_filed_away_bool_root_is_error(monkeypatch, tmp_path):
+    from mempalace import mcp_server
+
+    _patch_home(monkeypatch, tmp_path)
+    ack = _write_checkpoint(tmp_path, "true")
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "error"
+    assert result["count"] == 0
+    assert result["timestamp"] is None
+    assert not ack.exists()
+
+
+def test_filed_away_object_root_success_unchanged(monkeypatch, tmp_path):
+    from mempalace import mcp_server
+
+    _patch_home(monkeypatch, tmp_path)
+    ack = _write_checkpoint(tmp_path, '{"msgs": 5, "ts": "2026-01-01T00:00:00Z"}')
+
+    result = mcp_server.tool_memories_filed_away()
+
+    assert result["status"] == "ok"
+    assert result["count"] == 5
+    assert result["timestamp"] == "2026-01-01T00:00:00Z"
+    assert not ack.exists()
