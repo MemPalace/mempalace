@@ -1,10 +1,10 @@
 """Person-session routes for project orchestrators and model preferences."""
 
 from commonplace import redact
-from commonplace.boards.service import BoardService
+from commonplace.boards.service import BoardService, WingRefused, project_wing, shared_wing
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import path_parts, read_json, require_principal, send_json
-from commonplace.projects import connect, models, seats
+from commonplace.projects import connect, models, seats, wing
 from commonplace.projects.types import ProjectDenied
 
 
@@ -20,6 +20,11 @@ def _view(gateway, principal, board):
     choices = models.get(gateway.db, principal.workspace_id, board["slug"])
     return {
         "board": board["slug"],
+        "memory": {
+            "wing": board["wing"],
+            "shared": shared_wing(board["wing"]) and not any(c in board["wing"] for c in "*?[]"),
+            "own_wing": project_wing(board["slug"]),
+        },
         "name": redact.redact(board["name"])[0],
         "main": seats.main(gateway, principal, board["slug"]).public(),
         "models": {
@@ -41,7 +46,8 @@ def install(gateway) -> None:
             h.command == "POST" and len(parts) == 3 and parts[1:] == ["orchestrator", "connect"]
         )
         configuring = h.command == "PUT" and len(parts) == 2 and parts[1] == "models"
-        if not (viewing or connecting or configuring):
+        owning = h.command == "POST" and len(parts) == 2 and parts[1] == "wing"
+        if not (viewing or connecting or configuring or owning):
             send_json(h, 404, {"error": "Not found"})
             return
         if not viewing and principal.role != "owner":
@@ -57,6 +63,9 @@ def install(gateway) -> None:
                     body = read_json(h)
                 except ValueError:
                     return
+            if owning and (not isinstance(body, dict) or body):
+                send_json(h, 400, {"error": "Own-wing body must be exactly {}"})
+                return
             if connecting:
                 if (
                     not isinstance(body, dict)
@@ -74,6 +83,11 @@ def install(gateway) -> None:
                     replace=body.get("replace", False),
                     allow_shared=body.get("allow_shared", False),
                 )
+            elif owning:
+                result = wing.own_wing(gateway, principal, slug)
+                with service.store.connection() as conn:
+                    board = service._board(conn, slug)
+                status, payload = 200, {**_view(gateway, principal, board), **result}
             else:
                 if configuring:
                     models.put(gateway.db, principal, slug, body)
@@ -83,6 +97,9 @@ def install(gateway) -> None:
             return
         except ValueError:
             send_json(h, 400, {"error": "Invalid project settings"})
+            return
+        except WingRefused as exc:
+            send_json(h, 409, exc.payload)
             return
         except ToolError as exc:
             missing = str(exc).removeprefix("no: ") == "board not found"

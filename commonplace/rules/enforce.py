@@ -13,7 +13,7 @@ from .store import rules_sequence
 
 CHECKED_WRITES = frozenset(
     "task_add task_update task_comment task_take_next task_handoff ask space_post "
-    "board_add memory_save memory_link fact_save handoff_start decide board_set rules_publish "
+    "board_own_wing board_add memory_save memory_link fact_save handoff_start decide board_set rules_publish "
     "task_approve facts_import card_start card_start_cancel card_start_resolve".split()
 )
 

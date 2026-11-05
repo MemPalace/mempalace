@@ -3,26 +3,14 @@
 import secrets
 
 from commonplace import control_db, redact, urls
-from commonplace.boards.service import BoardService
+from commonplace.boards.service import BoardService, shared_wing
 from commonplace.control_db import ControlError
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.policy import Policy
-from commonplace.projects.seats import ensure_main
+from commonplace.projects.copy import OWN_WING_EFFECT, SHARED_EXPLAIN
+from commonplace.projects.seats import active_connection, ensure_main, reconcile
 from commonplace.projects.types import SEAT_CLIENT, SEAT_PREFIX, TOKEN_DAYS, ProjectDenied
 from commonplace.web.agents import connection_view
-
-
-def _active_connection(db, workspace_id, ref):
-    if ref is None:
-        return None
-    try:
-        row = db.connection(ref, workspace_id)
-    except ControlError:
-        return None
-    expires = control_db._parse(row["expires_at"])
-    if row["revoked_at"] or (expires is not None and expires <= control_db._now()):
-        return None
-    return row
 
 
 def connect(
@@ -47,30 +35,44 @@ def connect(
         trust="standard",
     )
     # Decide consent on the effective grant: every spelling of "shared" counts.
-    if not allow_shared and (policy.can_read_wing("shared") or policy.can_write_wing("shared")):
+    if not allow_shared and shared_wing(wing):
         return 409, {
             "error": "shared_wing",
+            "explanation": SHARED_EXPLAIN,
+            "fix": {
+                "label": "Give this project its own memory section",
+                "method": "POST",
+                "path": f"/api/projects/{board}/wing",
+                "effect": OWN_WING_EFFECT,
+            },
+            "alternative": {
+                "label": "Allow access to all shared memory",
+                "method": "POST",
+                "path": f"/api/projects/{board}/orchestrator/connect",
+                "body": {"allow_shared": True},
+            },
             "message": (
                 "This project uses the shared memory wing. Connecting gives the agent "
                 "read and write access to all shared memory."
             ),
         }
 
+    reconcile(db, ws, board, wing, principal.user_id)
     seat = ensure_main(db, ws, board)
     coordinator = project["coordinator"]
-    own = _active_connection(db, ws, seat.connection_id)
+    own = active_connection(db, ws, seat.connection_id)
     if (
         not replace
         and coordinator
         and (own is None or coordinator != "conn:" + own["name"])
         and coordinator.startswith("conn:")
-        and _active_connection(db, ws, coordinator.removeprefix("conn:")) is not None
+        and active_connection(db, ws, coordinator.removeprefix("conn:")) is not None
     ):
         return 409, {"error": "replaces current orchestrator"}
 
     minted = False
     with db._lock:
-        row = _active_connection(db, ws, seat.connection_id)
+        row = active_connection(db, ws, seat.connection_id)
         if row is not None:
             cid, name = row["id"], row["name"]
             token = db.rotate_token(
@@ -116,7 +118,7 @@ def connect(
                     "WHERE workspace_id=? AND board=? AND role='main'",
                     (ws, board),
                 ).fetchone()
-                row = _active_connection(db, ws, winner["connection_id"]) if winner else None
+                row = active_connection(db, ws, winner["connection_id"]) if winner else None
                 if row is None:
                     return 409, {"error": "The orchestrator connection changed; try again"}
                 cid, name = row["id"], row["name"]

@@ -512,12 +512,13 @@ See [runner setup](../runner.md#chat-answers) for context, egress and limits.
 
 These routes require a signed-in person session; agent tokens are refused.
 Readers need access to an active board; missing, archived or unreadable boards
-return 404. Only workspace owners may Connect or write model choices.
+return 404. Only workspace owners may Connect, give a project its own wing, or write model choices.
 
 | Method | Route | Body / result |
 |---|---|---|
-| GET | `/api/projects/<slug>` | `{board, name, main, models, can_configure}` |
+| GET | `/api/projects/<slug>` | `{board, name, main, models, memory, can_configure}` |
 | POST | `/api/projects/<slug>/orchestrator/connect` | `{}` or boolean `replace` / `allow_shared` flags; 201 for a new connection, 200 for rotation. |
+| POST | `/api/projects/<slug>/wing` | Exactly `{}`; returns the re-read project view plus the own-wing result below. |
 | PUT | `/api/projects/<slug>/models` | Optional `main` and `worker` keys, each `{provider, model}` or `null` to clear; returns the project view. |
 
 `main` contains `role`, `name`, `source` (`seat` or `coordinator`), `connected`,
@@ -541,6 +542,32 @@ Unauthenticated requests return 401; agents and non-owner writes return 403.
 Invalid bodies or model labels return 400 without echoing the supplied values.
 Model writes and connections are audited without token values.
 
+
+Own-wing results contain `{board, wing, previous_wing, changed, coordinator,
+unbound, revoked, runner_linked, affected}`. `unbound` contains cleared actor refs;
+`revoked` and `runner_linked` contain connection IDs. `affected` entries are
+`{name, lost: "read"|"write"|"read+write", runner: bool}` with redacted names.
+On no-op calls `affected` is empty. Side effects are audited even on a no-op;
+clearing a coordinator emits `space_configured` as does converting the wing.
+`memory` is `{wing, shared, own_wing}`; `shared` uses the effective shared grant,
+and `own_wing` is the canonical `project_<resolved slug>` destination.
+
+Own-wing returns 400 for any body other than `{}`, 403 for non-owner callers,
+404 for unknown/archived/unreadable boards, or 409 with `error` of `wing_taken`,
+`wing_in_use` (also `count` and redacted `connections`), or `not_shared` for wildcard
+wings. A failed compare-and-set returns 409 `wing_changed`; retry the request.
+It requires read and write access to both wings. MCP `board_own_wing {board}` runs
+the same full flow for trusted or standard, unrestricted owner-held PATs with
+memory-write scope and read/write access to both wings. A seat minted by Connect
+does not have both grants and cannot convert its own board. Conflicts preserve the JSON error payload in
+MCP error text. This is a checked write; REST person sessions skip rules freshness.
+
+The shared-wing Connect 409 keeps `message` unchanged and adds `explanation`,
+`fix: {label, method: "POST", path: "/api/projects/<slug>/wing", effect}`, and
+`alternative: {label, method: "POST", path: "/api/projects/<slug>/orchestrator/connect",
+body: {allow_shared: true}}`. The effect explains visibility loss, possible
+coordinator clearing, and the absence of an undo action here. See
+[project memory effects](../projects.md#give-a-project-its-own-memory-section).
 
 ## Rules freshness
 

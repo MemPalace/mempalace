@@ -42,6 +42,33 @@ def open_store(workspace_dir, *, legacy_origin=None, db=None, workspace_id=None)
     return store
 
 
+def project_wing(slug):
+    from commonplace.policy import canonical_wing
+
+    return canonical_wing("project_" + slug)
+
+
+def shared_wing(wing):
+    from commonplace.policy import Policy
+
+    policy = Policy.build(
+        profile="standard",
+        scopes=("memory:read", "memory:write"),
+        read_wings=[wing],
+        write_wings=[wing],
+        trust="standard",
+    )
+    return policy.can_read_wing("shared") or policy.can_write_wing("shared")
+
+
+class WingRefused(ToolError):
+    """A safe, structured own-wing conflict, also preserved in MCP text."""
+
+    def __init__(self, error, **details):
+        self.payload = {"error": error, **details}
+        super().__init__(json.dumps(self.payload))
+
+
 class VersionClash(ToolError):
     def __init__(self, current):
         super().__init__("no: card changed")
@@ -988,6 +1015,110 @@ class BoardService:
                 "coordinator": board["coordinator"],
                 "counts": dict.fromkeys(STATUSES, 0),
             }
+
+    def board_own_wing(self, board):
+        from commonplace import control_db, redact
+        from commonplace.policy import Policy, canonical_wing
+
+        p, db = self.principal, self.ctx.db
+        _owner(p)
+        unbound, affected = [], []
+        # Store before control DB, including classification and the grant scan.
+        # A connection minted after the scan is an accepted race.
+        with self.transaction() as conn:
+            b = self._board(conn, board)
+            self._write(b)
+            current, slug = b["wing"], b["slug"]
+            target = project_wing(slug)
+            if any(c in current for c in "*?[]"):
+                raise WingRefused("not_shared")
+            changed = shared_wing(current)
+            wing = target if changed else current
+            if not all(
+                p.policy.can_read_wing(w) and p.policy.can_write_wing(w) for w in (current, wing)
+            ):
+                raise ToolError("no: this connection cannot change this board")
+            with db._lock:
+                active = []
+                for row in db.connections(p.workspace_id):
+                    expiry = control_db._parse(row["expires_at"])
+                    if not row["revoked_at"] and (expiry is None or expiry > control_db._now()):
+                        active.append((row, Policy.from_json(row["policy"])))
+                if changed:
+                    if any(
+                        canonical_wing(row["wing"]) == target
+                        for row in conn.execute("SELECT wing FROM boards WHERE id<>?", (b["id"],))
+                    ):
+                        raise WingRefused("wing_taken")
+                    gaining = [
+                        row
+                        for row, policy in active
+                        if (policy.can_read_wing(target) and not policy.can_read_wing(current))
+                        or (policy.can_write_wing(target) and not policy.can_write_wing(current))
+                    ]
+                    if gaining:
+                        raise WingRefused(
+                            "wing_in_use",
+                            count=len(gaining),
+                            connections=[redact.redact(r["name"])[0] for r in gaining],
+                        )
+                    updated = conn.execute(
+                        "UPDATE boards SET wing=? WHERE id=? AND wing=?", (target, b["id"], current)
+                    ).rowcount
+                    if not updated:
+                        # Never report success for a failed compare-and-set.
+                        raise WingRefused("wing_changed")
+                    from commonplace.projects.types import SEAT_CLIENT
+
+                    for row, policy in active:
+                        if row["client"] == SEAT_CLIENT:
+                            continue
+                        lost = [
+                            label
+                            for label, check in (
+                                ("read", policy.can_read_wing),
+                                ("write", policy.can_write_wing),
+                            )
+                            if check(current) and not check(target)
+                        ]
+                        if lost:
+                            runner = (
+                                db._conn.execute(
+                                    "SELECT 1 FROM runner_connections WHERE connection_id=?",
+                                    (row["id"],),
+                                ).fetchone()
+                                is not None
+                            )
+                            affected.append(
+                                {
+                                    "name": redact.redact(row["name"])[0],
+                                    "lost": "+".join(lost),
+                                    "runner": runner,
+                                }
+                            )
+                coordinator = b["coordinator"]
+                if coordinator is not None and not any(
+                    candidate is not None
+                    and candidate.actor == coordinator
+                    and _can_coordinate(candidate, wing)
+                    for row, _ in active
+                    if row["auth"] == "pat"
+                    for candidate in [db.authenticate_connection(row["id"])]
+                ):
+                    unbound.append(coordinator)
+                    coordinator = None
+                    conn.execute("UPDATE boards SET coordinator=NULL WHERE id=?", (b["id"],))
+            if changed or unbound:
+                self.pending.append(("space_configured", f"space:{slug}", {"board": slug}, p.actor))
+        return {
+            "board": slug,
+            "wing": wing,
+            "previous_wing": current,
+            "changed": changed,
+            "coordinator": coordinator,
+            "unbound": unbound,
+            "affected": affected,
+        }
 
     def board_set(self, board, coordinator):
         _owner(self.principal)

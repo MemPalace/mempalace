@@ -255,6 +255,7 @@ def _link_target(ctx, task, store):
     board = store.board_for_task(task, principal=ctx.principal)
     if not ctx.principal.policy.can_write_wing(board["wing"]):
         raise ToolError("no: cannot link this card")
+    return board
 
 
 def _link(ctx, memory_id, task, store):
@@ -279,13 +280,22 @@ def _link(ctx, memory_id, task, store):
 
 def _save(ctx, args):
     text = _string(args, "text")
-    theme = _string(args, "theme", ctx.principal.policy.write_wing or "shared")
     topic = _string(args, "topic", "general")
     task = _task(args) if args.get("task") is not None else None
     source = _source(args)
     store = _boards(ctx, required=True) if task is not None else None
+    default = ctx.principal.policy.write_wing or "shared"
     if task is not None:
-        _link_target(ctx, task, store)
+        board = _link_target(ctx, task, store)
+        wing = canonical_wing(board["wing"])
+        if (
+            not ctx.principal.policy.write_wing
+            and wing.startswith("project_")
+            and not any(c in wing for c in "*?[]")
+            and ctx.principal.policy.can_write_wing(wing)
+        ):
+            default = wing
+    theme = _string(args, "theme", default)
     flags = _privacy_flags(text)
     if "health" in flags and ctx.principal.policy.can_write_wing("private"):
         theme = "private"
