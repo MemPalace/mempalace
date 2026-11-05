@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- The `wing` in `mempalace.yaml` is validated when a project is mined, so a
+  cloned repository's config cannot hang the miner with a yaml alias structure
+  or file drawers under unsafe text, a number or a list. A rejected name becomes
+  its wing slug, with a warning, and a config with no usable wing, including one
+  with no `wing` key, uses the directory's wing instead of failing. Valid names
+  and `--wing` are unchanged. Drawers already filed under the old spelling stay
+  there, and a wing filter finds both.
+
 ---
 
 ## [3.12.0] — 2026-10-31
