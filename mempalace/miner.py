@@ -2076,9 +2076,10 @@ def _project_wing(raw, project_path: Path) -> str:
     The config can arrive with a cloned repository. A valid name is kept as
     written. A rejected one becomes the one wing slug, and with nothing usable
     the project falls back to the wing it has without a config. Drawers already
-    filed under the old spelling stay there, and ``wing_aliases`` matches both.
-    Only scalars are turned into text, because yaml aliases can build a small
-    value whose text form is exponentially large.
+    filed under the old spelling stay there. ``wing_aliases`` links the two by
+    slug, so a name with no slug (``+++``) stays reachable only by that name or an
+    unfiltered search. Only scalars are turned into text, because yaml aliases can
+    build a small value whose text form is exponentially large.
     """
     from .config import normalize_wing_name, sanitize_name
 

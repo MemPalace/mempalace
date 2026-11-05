@@ -1165,21 +1165,31 @@ def test_wing_override_is_used_as_given_and_never_checks_the_config(tmp_path, ca
     assert "Invalid wing" not in capsys.readouterr().err
 
 
-def test_a_renamed_wing_moves_changed_files_without_duplicating_them(tmp_path):
-    """A palace can already hold ``c++``: nothing is lost or filed twice."""
+def _remine_after_rename(tmp_path, old):
+    """Mine under ``old``, edit one file, and mine again from the config."""
     project = tmp_path / "proj"
-    _project_with_config(project, 'wing: "c++"\n')
+    _project_with_config(project, f'wing: "{old}"\n')
     write_file(project / "b.md", "Another line long enough to keep as a drawer.\n" * 5)
     palace_path = str(tmp_path / "palace")
-    mine(str(project), palace_path, wing_override="c++")
+    mine(str(project), palace_path, wing_override=old)
 
     write_file(project / "a.md", "The same file after an edit, still long enough.\n" * 5)
     future = (project / "a.md").stat().st_mtime + 60
     os.utime(project / "a.md", (future, future))
     mine(str(project), palace_path)
+    return sorted(_wing_rows(palace_path))
 
-    assert sorted(_wing_rows(palace_path)) == [("a.md", "c"), ("b.md", "c++")]
-    assert {"c", "c++"} <= set(wing_aliases("c", {"c", "c++"}))
+
+@pytest.mark.parametrize(("old", "new"), [("c++", "c"), ("wing-c++", "wing_c")])
+def test_a_renamed_wing_moves_changed_files_without_duplicating_them(tmp_path, old, new):
+    """A palace can already hold the old name: nothing is lost or filed twice."""
+    assert _remine_after_rename(tmp_path, old) == [("a.md", new), ("b.md", old)]
+    assert {new, old} <= set(wing_aliases(new, {new, old}))
+
+
+def test_a_wing_with_no_slug_keeps_its_drawers_under_the_old_name(tmp_path):
+    """Nothing links ``+++`` to the directory wing, but no drawer is lost."""
+    assert _remine_after_rename(tmp_path, "+++") == [("a.md", "proj"), ("b.md", "+++")]
 
 
 def test_scan_project_skips_oversized_files(tmp_path, capsys, monkeypatch):

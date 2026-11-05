@@ -16,7 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   its wing slug, with a warning, and a config with no usable wing, including one
   with no `wing` key, uses the directory's wing instead of failing. Valid names
   and `--wing` are unchanged. Drawers already filed under the old spelling stay
-  there, and a wing filter finds both.
+  there, and a wing filter finds both by slug. A wing with no slug, such as
+  `+++`, stays reachable by that name or an unfiltered search.
 
 ---
 
