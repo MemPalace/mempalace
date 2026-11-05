@@ -475,7 +475,7 @@ def _patch_home(monkeypatch, tmp_path: Path) -> None:
 
     class _Home(Path):
         @classmethod
-        def home(cls):  # noqa: N805 -- mirroring pathlib.Path.home
+        def home(cls):
             return Path(str(tmp_path))
 
     monkeypatch.setattr(paths_mod, "Path", _Home)
