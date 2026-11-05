@@ -1004,11 +1004,13 @@ def _filter_drawer_batch(result, policy: Policy):
     errors = 0
     for item in result["results"]:
         cleaned = _scrub(item, policy.can_read_wing)
-        if cleaned is _DROP or (isinstance(cleaned, dict) and cleaned.get("error")):
+        if cleaned is _DROP:
             drawer_id = item.get("drawer_id") if isinstance(item, dict) else None
             errors += 1
             items.append({"drawer_id": drawer_id, "error": f"Drawer not found: {drawer_id}"})
         else:
+            if isinstance(cleaned, dict) and cleaned.get("error"):
+                errors += 1
             items.append(cleaned)
     return {"results": items, "count": len(items), "errors": errors}
 

@@ -553,11 +553,20 @@ def write_mirror_units(thread_id: str, units: list):
                 drawer_id=make_mirror_unit_id(thread_id, start, end, kind, text),
             )
         )
+    from ..palace import mine_yield_point
+
     committed = {}
     for arguments in prepared:
         if arguments["drawer_id"] in committed:
             continue
-        result = _write_drawer(**arguments)
+        # Handled units include idempotent replays. The loop holds no collection
+        # locally across a yield; each unit re-fetches through _get_collection.
+        if committed and mine_yield_point():
+            refusal = _mcp_tool_preflight_refusal(None, "mempalace_add_drawer")
+            if refusal is not None:
+                return {"success": False, "error": refusal["error"]["message"]}
+        with _write_stall_watch("mempalace_add_drawer"):
+            result = _write_drawer(**arguments)
         if not result.get("success"):
             return result
         committed[arguments["drawer_id"]] = result["drawer_id"]

@@ -272,6 +272,23 @@ Work durably checkpoints bounded message ranges; completed ranges are trusted an
 are not checked again for missing drawers. Replay also does not repair a unit whose earlier chunks were lost while its last chunk survived (an existing limitation of the drawer writer). Restarts and repeated runs resume saved
 progress without deleting history or adding duplicate searchable copies.
 
+The worker yields its request lock between distinct units in each 64-unit mirror
+batch, including replays and keyword-only units. Queued reads can see a completed
+prefix of a batch; the same wing and source-thread read checks still apply. The
+sweep yields to any queued request or writer and resumes when the lock is free;
+sustained foreground load delays it. This includes waiting for a long mine. The
+sweep rechecks write permission after yielding. If refused, its unfinished range
+is retried on the next indexing trigger, replaying committed units idempotently;
+there is no automatic retry timer. Storage-budget checks still run before each
+batch. A single slow unit can still delay a read beyond the startup deadline.
+This reduces contention; it does not guarantee the startup deadline during a
+sweep. Expect fewer timeouts, not zero.
+
+Memory search and session startup fetch deduplicated drawer hits in one bulk read
+when the caller's tool policy permits it. Slim profiles retain individual reads;
+empty searches perform no drawer read. Both paths return the original text and
+apply the same per-drawer access checks and not-found handling.
+
 Imports are backfilled automatically. Captured sessions catch up in full on their
 next accepted sync. Older captured sessions that have not synced again need an
 explicit operator run, starting with the owner's workspace and watching storage:

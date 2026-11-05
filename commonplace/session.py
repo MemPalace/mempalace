@@ -74,7 +74,7 @@ def _search_args(ctx, args):
 
 
 def _memories(ctx, args):
-    # memory_search fetches each full record via the normal get-drawer path.
+    # memory_search fetches full records via singular or batched drawer reads.
     # Check the public memory_get allowlist too, so composing tools grants no
     # extra access compared with separate calls by this same principal.
     if not all(_available(ctx, name) for name in _MEMORY_TOOLS):
