@@ -867,3 +867,57 @@ def test_bootstrap_only_treats_known_missing_palace_errors_as_empty(response, ac
     else:
         with pytest.raises(MirrorError):
             _legacy_mirrored_seq(read, None, stored)
+
+
+def test_similarity_duplicate_query_excludes_mirrors_before_limit(writer, monkeypatch):
+    server, col, embedded, backend = writer
+    monkeypatch.setattr(server, "_vector_disabled", False)
+    # More mirror rows than n_results: post-filtering would hide the public match.
+    for index in range(6):
+        server.write_mirror_units(
+            f"thr_{index:02x}",
+            [
+                {
+                    "seq_start": 0,
+                    "seq_end": 0,
+                    "message_class": "conversation",
+                    "part": 0,
+                    "text": "Exact duplicate document",
+                }
+            ],
+        )
+    hidden = server.tool_check_duplicate("Exact duplicate document")
+    assert hidden == {"is_duplicate": False, "matches": []}
+    public = server.tool_add_drawer("shared", "public", "Exact duplicate document")
+    assert public["success"]
+    visible = server.tool_check_duplicate("Exact duplicate document")
+    assert visible["is_duplicate"]
+    assert {m["id"] for m in visible["matches"]} == {public["drawer_id"]}
+    assert all(m["wing"] == "shared" for m in visible["matches"])
+
+
+def test_checkpoint_files_document_present_only_in_mirror(writer, monkeypatch):
+    server, col, embedded, backend = writer
+    monkeypatch.setattr(server, "_vector_disabled", False)
+    server.write_mirror_units(
+        "thr_ab",
+        [
+            {
+                "seq_start": 0,
+                "seq_end": 0,
+                "message_class": "conversation",
+                "part": 0,
+                "text": "Exact checkpoint document",
+            }
+        ],
+    )
+    result = server.tool_checkpoint(
+        items=[
+            {
+                "wing": "shared",
+                "room": "saved",
+                "content": "Exact checkpoint document",
+            }
+        ]
+    )
+    assert result["added"] and not result["duplicates"] and not result["errors"]

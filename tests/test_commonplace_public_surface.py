@@ -52,6 +52,7 @@ EXACT = {
         for path in ("/api/skills", "/api/skill-decks")
     },
     ("GET", "/api/imports"): "authenticated",
+    ("GET", "/api/search-index"): "authenticated",
     ("POST", "/api/import"): "authenticated",
     ("GET", "/api/capture"): "authenticated",
     ("POST", "/api/capture"): "authenticated",

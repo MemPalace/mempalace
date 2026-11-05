@@ -243,6 +243,7 @@ def tool_kg_add(
         "triple_id": triple_id,
         "fact": f"{subject} → {predicate} → {object}",
         "wing": wing,
+        "sources": _call_kg(lambda kg: kg.sources([triple_id]), read=True).get(triple_id, []),
     }
     _wal_result("kg_add", outcome)
     return _with_kg_notice(outcome)
@@ -332,19 +333,25 @@ def tool_kg_save(
         outcome = {"success": False, "error": str(e)}
         _wal_result("kg_save", outcome)
         return outcome
-    saved = _call_kg(
-        lambda kg: next(
-            (
-                row
-                for row in kg.query_entity(
-                    subject, wings=[wing] if wing else None, sensitivities=sensitivities
-                )
-                if row["id"] == outcome["triple_id"]
-            ),
-            {},
+    rows = _call_kg(
+        lambda kg: kg.query_entity(
+            subject, wings=[wing] if wing else None, sensitivities=sensitivities
         ),
         read=True,
     )
+    saved = next((row for row in rows if row["id"] == outcome["triple_id"]), {})
+    # Previous/current ids and values are also echoes of stored facts. Bind
+    # them to their own sources so the gateway can drop an unreadable echo.
+    related_ids = list(outcome.get("superseded", []))
+    if outcome.get("current"):
+        related_ids.append(outcome["current"])
+    if related_ids:
+        sources = _call_kg(lambda kg: kg.sources(related_ids), read=True)
+        by_id = {row["id"]: row for row in rows}
+        outcome["related_facts"] = [
+            {**by_id.get(key, {"fact": "", "wing": wing}), "sources": sources.get(key, [])}
+            for key in related_ids
+        ]
     from mempalace.fact_provenance import COLUMNS
 
     outcome = {
@@ -353,6 +360,9 @@ def tool_kg_save(
         **outcome,
         "fact": f"{subject} → {predicate} → {object}",
         "wing": wing,
+        "sources": _call_kg(lambda kg: kg.sources([outcome["triple_id"]]), read=True).get(
+            outcome["triple_id"], []
+        ),
     }
     _wal_result("kg_save", outcome)
     return _with_kg_notice(outcome)
@@ -501,6 +511,8 @@ def tool_kg_supersede(
             "triple_id": triple_id,
             "fact": f"{subject} → {predicate} → {new_object}",
             "superseded": old_object,
+            "wing": wing,
+            "sources": _call_kg(lambda kg: kg.sources([triple_id]), read=True).get(triple_id, []),
         }
     )
 
@@ -535,6 +547,9 @@ def tool_kg_timeline(
         }
 
     result = _call_kg(_query, read=True)
+    sources = _call_kg(lambda kg: kg.sources([row["id"] for row in result["timeline"]]), read=True)
+    for row in result["timeline"]:
+        row["sources"] = sources.get(row["id"], [])
     return _with_kg_notice(
         {
             "entity": entity or "all",

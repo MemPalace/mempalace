@@ -859,6 +859,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         results = col.query(
             query_texts=[content],
             n_results=5,
+            where={"wing": {"$ne": "private_threads"}},
             include=["metadatas", "documents", "distances"],
         )
         duplicates = []
@@ -871,6 +872,8 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                     # Chroma 1.5.x can return None for partially-flushed rows;
                     # coerce to empty sentinels so downstream .get() is safe.
                     meta = _safe_meta(results["metadatas"][0][i])
+                    if meta.get("wing") == "private_threads":
+                        continue
                     doc = results["documents"][0][i] or ""
                     duplicates.append(
                         {

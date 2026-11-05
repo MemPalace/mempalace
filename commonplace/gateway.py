@@ -458,8 +458,21 @@ class Mediator:
                     args["drawer_id"] = unhide.get(args.get("drawer_id"), args.get("drawer_id"))
                 notes.append(f"{len(unhide)} hidden drawer(s) answered as missing")
 
+        from .handoff.mirror_access import gate
+
+        committed_result = None
+        if isinstance(response, dict) and "result" in response:
+            result = committed_result = _tool_result(response)
+            cleaned = gate(self.gateway, principal, rule, result)
+            if cleaned is not result:
+                response = (
+                    _replace_result(response, cleaned)
+                    if isinstance(response.get("result"), dict)
+                    else _tool_response(req_id, cleaned)
+                )
+
         if classify_tool(name) != "read":
-            result = _tool_result(response) if isinstance(response, dict) else None
+            result = committed_result
             ok = isinstance(result, dict) and not result.get("error") and "error" not in response
             self._audit(
                 principal,
@@ -489,6 +502,11 @@ class Mediator:
         return None
 
     def _before_all_wings(self, principal, name, args, notes):
+        if name == "mempalace_checkpoint":
+            items = args.get("items")
+            for item in items if isinstance(items, list) else ():
+                if isinstance(item, dict):
+                    self._check_thread_room(principal, item.get("wing"), item.get("room"))
         return None  # Policy.refusal already required every wing.
 
     def _before_wing_list(self, principal, name, args, notes):
@@ -516,6 +534,11 @@ class Mediator:
             or any(not isinstance(w, str) or not w for w in requested)
         ):
             raise Denied("wings must be a list of at most 64 wing names")
+        from .handoff.models import MIRROR_WING
+
+        cli = bool(args.get("cli_compatible"))
+        if cli and canonical_wing(args.get("wing") or "") == MIRROR_WING:
+            return {"respond": {"query": args.get("query", ""), "results": [], "facts": []}}
         policy = principal.policy
         if requested is not None:
             requested = [w for w in requested if policy.can_read_wing(w)]
@@ -531,7 +554,7 @@ class Mediator:
         # A worker has workspace authority. Always suppress its unscoped fact
         # search, including captured CLI output, and attach the scoped read.
         args["include_facts"] = False
-        if wing or (policy.sees_all_wings and requested is None):
+        if wing or (policy.sees_all_wings and requested is None and not cli):
             if requested is not None and not any(
                 canonical_wing(wing) == canonical_wing(w) for w in requested
             ):
@@ -549,7 +572,8 @@ class Mediator:
         try:
             if not principal.policy.tool_visible("mempalace_kg_query"):
                 return {"facts": []}
-            call = {"entity": args.get("query", ""), "search": True, "limit": args.get("limit", 5)}
+            limit = max(1, min(int(args.get("limit", 5)), 100))
+            call = {"entity": args.get("query", ""), "search": True, "limit": min(limit * 4, 100)}
             if args.get("wing"):
                 call["wings"] = [args["wing"]]
             elif args.get("wings") is not None:
@@ -562,8 +586,12 @@ class Mediator:
                 or not isinstance(result.get("facts"), list)
             ):
                 raise ValueError("Invalid fact search response")
+            from .handoff.mirror_access import gate
+
+            # Scrub before _with_search_facts can render facts into CLI text.
+            result = gate(self.gateway, principal, "kg_read", result)
             return {
-                "facts": result["facts"],
+                "facts": gate(self.gateway, principal, "kg_read", result.get("facts", [])[:limit]),
                 **({"facts_error": "unavailable"} if result.get("facts_error") else {}),
             }
         except Exception:
@@ -591,6 +619,7 @@ class Mediator:
                 continue
             if not policy.can_write_wing(wing):
                 raise Denied(f"this connection can't change memories in wing {wing!r}")
+        self._check_thread_room(principal, args.get("wing"), args.get("room"))
         new_wing = args.get("wing")
         if new_wing and not policy.can_write_wing(new_wing):
             raise Denied(f"this connection can't write to wing {new_wing!r}")
@@ -604,6 +633,7 @@ class Mediator:
         return None
 
     def _before_add_drawer(self, principal, name, args, notes):
+        self._check_thread_room(principal, args.get("wing"), args.get("room"))
         self._pin_write_wing(principal.policy, args, args.get("wing"), notes)
         return None
 
@@ -628,6 +658,10 @@ class Mediator:
             wing = args.get(key)
             if not wing or not policy.can_write_wing(wing):
                 raise Denied(f"this connection can't link wing {wing!r}")
+        for prefix in ("source", "target"):
+            self._check_thread_room(
+                principal, args.get(prefix + "_wing"), args.get(prefix + "_room")
+            )
         ids = [args[k] for k in ("source_drawer_id", "target_drawer_id") if args.get(k)]
         wings = self._drawer_wings(principal, ids) if ids else {}
         for drawer_id in ids:
@@ -745,6 +779,21 @@ class Mediator:
         return _replace_result(response, cleaned)
 
     # ── helpers that ask the worker ──
+    def _check_thread_room(self, principal, wing, room):
+        from .handoff.mirror_access import _THREAD_ROOM
+        from .handoff.models import MIRROR_WING
+
+        mirror = isinstance(wing, str) and canonical_wing(wing) == MIRROR_WING
+        if mirror or (isinstance(room, str) and _THREAD_ROOM.fullmatch(room)):
+            try:
+                allowed = isinstance(room, str) and self.gateway.handoff.recall.can_read(
+                    principal, room
+                )
+            except Exception:
+                allowed = False
+            if not allowed:
+                raise Hidden({"success": False, "error": "Room not found"})
+
     def _drawer_wings(self, principal, ids: list) -> dict:
         if not ids:
             return {}
@@ -757,17 +806,26 @@ class Mediator:
         wings = {}
         for drawer_id, item in zip(ids, items):
             if isinstance(item, dict) and not item.get("error"):
+                try:
+                    self._check_thread_room(principal, item.get("wing"), item.get("room"))
+                except Hidden:
+                    raise Hidden(
+                        {"success": False, "error": f"Drawer not found: {drawer_id}"}
+                    ) from None
                 wings[drawer_id] = item.get("wing") or ""
         return wings
 
     def _fan_out_search(self, principal, name, args) -> dict:
         """One worker search and one ranking over the readable wing union."""
+        from .handoff.models import MIRROR_WING
+
         listing = self.workers.call_tool(principal, "mempalace_list_wings", {}) or {}
         requested = args.get("wings")
         wings = sorted(
             w
             for w in (listing.get("wings") or {})
             if principal.policy.can_read_wing(w)
+            and (not args.get("cli_compatible") or canonical_wing(w) != MIRROR_WING)
             and (
                 requested is None or any(canonical_wing(w) == canonical_wing(r) for r in requested)
             )

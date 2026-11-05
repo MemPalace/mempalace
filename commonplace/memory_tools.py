@@ -380,7 +380,7 @@ def _recent(ctx, limit):
             for item in items:
                 records[item["drawer_id"]] = item
             offset += len(items)
-            if not items or offset >= page["total"]:
+            if not items or ("total" in page and offset >= page["total"]):
                 break
     counts = Counter(canonical_wing(r["wing"]) for r in records.values())
 
@@ -395,8 +395,8 @@ def _people(ctx, nodes, links, memory_ids):
     policy = ctx.principal.policy
     if not policy.sees_all_wings or not policy.tool_visible("mempalace_kg_query"):
         return
-    # KG tools do not expose entity types or source ids. The brief permits
-    # reading the workspace graph only for principals that see every theme.
+    # Entity types for graph layout need a direct read. Derived facts still
+    # pass the shared source-thread gate, even for see-all principals.
     # Read-only mode never creates a file or resolves to the operator's graph.
     from mempalace.knowledge_graph import _read_only
 
@@ -408,9 +408,22 @@ def _people(ctx, nodes, links, memory_ids):
         conn.execute("BEGIN")
         people = conn.execute("SELECT id, name, created_at FROM entities WHERE type = 'person'")
         people = {row["id"]: dict(row) for row in people}
-        facts = conn.execute("SELECT * FROM triples").fetchall()
+        facts = [dict(row) for row in conn.execute("SELECT * FROM triples")]
+        sources = {}
+        for row in conn.execute("SELECT * FROM fact_sources"):
+            sources.setdefault(row["triple_id"], []).append(dict(row))
+        for fact in facts:
+            fact["sources"] = sources.get(fact["id"], [])
     finally:
         conn.close()
+    from .handoff.mirror_access import gate
+
+    visible = gate(ctx.gateway, ctx.principal, "kg_read", {"facts": facts})["facts"]
+    visible_people = {fact[key] for fact in visible for key in ("subject", "object")}
+    referenced = {fact[key] for fact in facts for key in ("subject", "object")}
+    people = {
+        key: row for key, row in people.items() if key not in referenced or key in visible_people
+    }
     for person in people.values():
         nodes.append(
             {
@@ -423,7 +436,7 @@ def _people(ctx, nodes, links, memory_ids):
             }
         )
     seen = set()
-    for fact in facts:
+    for fact in visible:
         source, target = fact["subject"], fact["object"]
         label = fact["predicate"]
         if source in people and target in people:

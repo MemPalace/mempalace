@@ -83,6 +83,45 @@ the existing adapter that supplies that path. No hook is installed by these
 commands. Remove the local hook or unset the local switch to stop scheduling;
 disable the workspace setting to reject uploads immediately.
 
+## Find captured history in Memory
+
+After an accepted append or exact retry, background indexing makes the session's
+readable messages searchable in Memory, including its earlier history. Upload
+responses do not wait for indexing. Original text stays unchanged; raw archive
+records are retained but are not copied into Memory search.
+
+Structured mirror copies of private stored threads, facts derived from them, and their
+tunnel previews are returned only to callers who can read their source thread. This
+covers structured Memory search, `memory_get` and session start context. CLI-format (`cli_compatible`) search excludes mirror drawer copies for everyone, including owners; its `facts` field is still returned only to callers who can read each fact's source thread. A
+`superseded_by` id is returned only when its target is another kept fact in the same
+response.
+
+Adding, updating, deleting or linking drawers in a stored-thread room requires
+permission to read that thread. Known exceptions: `delete_by_source`, `delete_tunnel`
+and `delete_hallway` take no room and are not checked yet.
+
+Fact mutations (`kg_invalidate`, `kg_supersede`, `kg_save` merges, and single-valued supersedes through `kg_save` or `fact_save`) on thread-derived
+facts are not room-checked. A member with fact-write permissions but no source-thread
+read access can mutate those hidden facts. Invalidate's `closed` count is a yes/no
+oracle for hidden values. This pre-existing write-side exposure is accepted for follow-up alongside `delete_by_source`, `delete_tunnel` and `delete_hallway`. Presence is not hidden either: taxonomy and aggregate counts can show stored-thread ids and per-thread counts to callers who can read the private section, fan-out ranks and counts can reflect hidden hits, and gating runs after a bounded fetch of at most 100 candidates, so hidden hits can take candidate slots.
+
+Mirror copies do not count as duplicates for anyone. Similarity dedup exclusion (D5) is
+verified on compact, sqlite_exact and chroma.
+Capture permission alone is not enough. Default self-service PAT and OAuth
+connections do not receive captured words in Memory search, `memory_get` or
+session start context.
+
+Untouched older captured sessions are not indexed automatically. Operators can
+include them with:
+
+```bash
+commonplace search-index run --workspace WORKSPACE_ID --captures
+```
+
+Index storage counts toward the plan limit and pauses 16 MiB before it. See
+[indexing progress and controls](one-time-import.md#indexing-progress-and-storage)
+for status, resuming work and safely disabling indexing.
+
 ## Append protocol, privacy and recovery
 
 `GET /api/capture?source=codex&thread_id=NATIVE_ID` returns the caller's accepted
@@ -98,7 +137,7 @@ interval. A new stream starts at zero with SHA-256 of the empty byte string.
 The response reports the new cursor and `status: "appended"` or `"duplicate"`.
 Requests are limited to 64 MiB of JSON, including escaping. The server validates
 the expected prefix and atomically commits the raw segment, readable messages,
-search index, counts and storage-budget checks. Retries after a lost response,
+thread search index, counts and storage-budget checks. Retries after a lost response,
 even an older saved chunk after later growth, do not duplicate text. There is
 no separate cursor write that can get ahead of stored content.
 

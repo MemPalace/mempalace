@@ -6,9 +6,9 @@ importing account. The existing signed-in session/full-ACL route remains
 available separately. Neither route requires an administrator or enabling
 context handoff. Workspace membership and token restrictions still apply.
 
-Parsing, indexing and deduplication run on the gateway, without a model or any
-external API. Selecting a remote gateway deliberately uploads the export to
-that gateway. Use your instance's supplied agent endpoint and HTTPS for remote
+Parsing and deduplication run on the gateway, without a model or any
+external API. Background Memory indexing also runs locally on the gateway.
+Selecting a remote gateway deliberately uploads the export to that gateway. Use your instance's supplied agent endpoint and HTTPS for remote
 requests; keep its token out of exports, shared files and logs.
 
 | Source | Accepted input |
@@ -189,9 +189,10 @@ Grant responses contain no foreign thread IDs, hidden read results or storage
 totals. Existing full-ACL imports retain aggregate account storage figures,
 which include grant bytes; this is not a claim that aggregate usage is hidden
 from eligible workspace members. Direct local operator/database/backup access
-is outside the application read guarantee. Rolling back to an older binary
-loses the filer filter and rejects unknown-scope connections; do not add
-members during such a rollback.
+is outside the application read guarantee. For rollback, set
+`COMMONPLACE_SEARCH_INDEX=off` and ship a hotfix retaining the thread-read
+protection. Once imported or captured text has been indexed,
+never deploy a build without that protection.
 
 Exact repeats and identical raw Grok lines in the grant namespace add no rows.
 Deduplication between an ACL copy and a grant copy, deduplication of grown
@@ -223,6 +224,69 @@ until the final whole-source hash and recognition checks succeed. No large-file
 performance guarantee is established: server work grows with accumulated history.
 
 ## Find your imported history
+
+Imports become searchable in Memory after background indexing finishes, not
+necessarily when the upload returns. Existing imports are indexed automatically
+when the gateway starts. Original words, spacing and line endings are preserved;
+long messages are split into searchable sections. Follow a hit's `source.thread`
+to read more. For a shared native session, this may point to the session's
+stored thread rather than the import's own stored ID.
+
+Structured mirror copies of private stored threads, facts derived from them, and their
+tunnel previews are returned only to callers who can read their source thread. This
+covers structured Memory search, `memory_get` and session start context. CLI-format (`cli_compatible`) search excludes mirror drawer copies for everyone, including owners; its `facts` field is still returned only to callers who can read each fact's source thread. A
+`superseded_by` id is returned only when its target is another kept fact in the same
+response.
+
+An import grant alone does not enable those reads. Mirror copies do not count as
+duplicates for anyone. Similarity dedup exclusion (D5) is verified on compact,
+sqlite_exact and chroma. Checkpoint can file the same words as a separate memory.
+
+Adding, updating, deleting or linking drawers in a stored-thread room requires
+permission to read that thread. Known exceptions: `delete_by_source`, `delete_tunnel`
+and `delete_hallway` take no room and are not checked yet.
+
+Fact mutations (`kg_invalidate`, `kg_supersede`, `kg_save` merges, and single-valued supersedes through `kg_save` or `fact_save`) on thread-derived
+facts are not room-checked. A member with fact-write permissions but no source-thread
+read access can mutate those hidden facts. Invalidate's `closed` count is a yes/no
+oracle for hidden values. This pre-existing write-side exposure is accepted for follow-up alongside `delete_by_source`, `delete_tunnel` and `delete_hallway`. Presence is not hidden either: taxonomy and aggregate counts can show stored-thread ids and per-thread counts to callers who can read the private section, fan-out ranks and counts can reflect hidden hits, and gating runs after a bounded fetch of at most 100 candidates, so hidden hits can take candidate slots.
+
+### Indexing progress and storage
+
+The workspace owner can call `GET /api/search-index` with a signed-in session.
+It returns `state`, `threads_indexed`, `threads_pending` and `units_written`,
+without text or thread IDs. States are `idle`, `running`, `deferred_storage`
+and `off`. Operators can check or resume indexing with:
+
+```bash
+commonplace search-index status --workspace WORKSPACE_ID
+commonplace search-index run --workspace WORKSPACE_ID
+```
+
+The CLI prints only persisted `threads_indexed` and `threads_pending` counts.
+The HTTP endpoint's `state` and `units_written` describe its running process.
+
+Index bytes count toward workspace storage. Indexing pauses 16 MiB before the
+plan limit with `deferred_storage`; free space and run it again to resume.
+Work durably checkpoints bounded message ranges; completed ranges are trusted and
+are not checked again for missing drawers. Replay also does not repair a unit whose earlier chunks were lost while its last chunk survived (an existing limitation of the drawer writer). Restarts and repeated runs resume saved
+progress without deleting history or adding duplicate searchable copies.
+
+Imports are backfilled automatically. Captured sessions catch up in full on their
+next accepted sync. Older captured sessions that have not synced again need an
+explicit operator run, starting with the owner's workspace and watching storage:
+
+```bash
+commonplace search-index run --workspace WORKSPACE_ID --captures
+```
+
+Set `COMMONPLACE_SEARCH_INDEX=off` on the gateway to stop new indexing sweeps;
+queued work finishes its current thread. Existing searchable text and read
+protections remain. For rollback, use this switch and ship a hotfix retaining
+the thread-read protection. Never deploy a build without it once any imported
+or captured text has been indexed.
+
+### Browse the original imports
 
 Sign in to your personal workspace, then call `GET /api/imports` with your
 session cookie. Agent tokens cannot list imports. ACL imports are not listed;

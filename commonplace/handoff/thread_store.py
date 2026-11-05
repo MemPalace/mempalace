@@ -39,6 +39,13 @@ CREATE TABLE IF NOT EXISTS mirror_progress (
 )
 """
 
+# GLOB keeps source namespace matching literal and case sensitive.
+_INDEX_PENDING_SQL = """(
+    (p.thread_id IS NULL AND
+        (t.source_thread_id GLOB 'import:*' OR t.source_thread_id GLOB 'import-private:*'))
+    OR p.completed_seq < t.message_count-1
+)"""
+
 
 class ThreadConflict(ValueError):
     """Same source thread id, different content."""
@@ -223,6 +230,41 @@ class ThreadStore:
                 (stored_id,),
             ).fetchone()
             return tuple(row) if row is not None else None
+
+    def index_backlog(self, workspace_id: str, *, after_id: str = "", limit: int = 20):
+        """Return pending imports and enrolled threads, ordered by stored id.
+
+        Unenrolled captures are deliberately excluded. Import-group holders
+        and forks enter this selection when their caller enrolls them with
+        ``begin_mirror``. Only metadata is read, for both store formats.
+        """
+        if limit <= 0:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.* FROM threads t LEFT JOIN mirror_progress p ON p.thread_id=t.id "
+                "WHERE t.workspace_id=? AND t.id>? AND "
+                + _INDEX_PENDING_SQL
+                + " ORDER BY t.id LIMIT ?",
+                (workspace_id, after_id, limit),
+            ).fetchall()
+        return [_stored_thread(row) for row in rows]
+
+    def index_counts(self, workspace_id: str) -> dict[str, int]:
+        """Count completed mirrors and pending threads without loading words.
+
+        Indexed means a progress row has caught up with the current thread.
+        Pending uses exactly the same eligibility rule as ``index_backlog``.
+        Unit-write totals belong to the sweep, not the message checkpoints.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT count(CASE WHEN p.completed_seq >= t.message_count-1 THEN 1 END), "
+                "count(CASE WHEN " + _INDEX_PENDING_SQL + " THEN 1 END) FROM threads t "
+                "LEFT JOIN mirror_progress p ON p.thread_id=t.id WHERE t.workspace_id=?",
+                (workspace_id,),
+            ).fetchone()
+        return {"threads_indexed": row[0], "threads_pending": row[1]}
 
     def begin_mirror(self, stored_id: str, through: int, *, bootstrap: int = -1):
         """Pin an append boundary until its idempotent mirror writes finish."""

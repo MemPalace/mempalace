@@ -72,7 +72,29 @@ def register(ctx):
 
     def import_batch(principal, source, threads, *, path):
         with lock:
-            return run_batch(ctx, principal, source, threads, path=path)
+            result = run_batch(ctx, principal, source, threads, path=path)
+        try:
+            from .continuity_read import content_threads
+
+            ws = principal.workspace_id
+            touched = []
+            for row in result["results"]:
+                if row["status"] not in ("accepted", "imported", "duplicate"):
+                    continue
+                identity = (
+                    import_grant.grant_id(principal.user_id, source, row["thread_id"])
+                    if path == "grant"
+                    else f"import:{source}:{row['thread_id']}"
+                )
+                stored = ctx.store_for(ws).by_source(ws, identity)
+                if stored:
+                    touched.append(stored.id)
+                touched.extend(content_threads(ctx.control_db, ws, identity))
+            if touched:
+                ctx.service.index_later(ws, list(dict.fromkeys(touched)))
+        except Exception as error:
+            log_failure(logging.getLogger(__name__), "Import index scheduling failed", error)
+        return result
 
     def admit(principal, digest) -> int:
         return grant_admit(ctx, principal, digest)

@@ -179,3 +179,15 @@ def sessions(db, store, ws, user_id):
         )
         for group in groups
     ]
+
+
+def content_threads(db, ws, stream_id):
+    """Return a stream's content holder and fork within its workspace."""
+    with db._lock:
+        row = db._conn.execute(
+            "SELECT g.holder_stored_id, s.fork_stored_id FROM sync_streams s "
+            "JOIN sync_groups g ON g.group_id=s.group_id AND g.workspace_id=s.workspace_id "
+            "WHERE s.workspace_id=? AND s.stream_id=?",
+            (ws, stream_id),
+        ).fetchone()
+    return list(dict.fromkeys(value for value in row if value)) if row else []

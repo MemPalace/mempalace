@@ -62,11 +62,12 @@ from __future__ import annotations
 import logging
 import secrets
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from dataclasses import dataclass, replace
 from typing import Optional
 
-from . import launchers, palace_mirror, thread_store, transcripts, writer
+from . import launchers, palace_mirror, search_index, thread_store, transcripts, writer
 from .authority import HandoffPermissionError, require_launch_authority
 from .db import HandoffDBError, HandoffLeaseError
 from .models import (
@@ -117,6 +118,10 @@ class HandoffService:
         self.prompt_dir = prompt_dir
         self.db.set_document_store(store_for)
         self._mirror_lock = threading.Lock()
+        self._mirror_condition = threading.Condition(self._mirror_lock)
+        self._index_states = {}
+        self._index_active = set()
+        self._index_timers = {}
         self._mirror_pool = None
         self._mirror_jobs: list = []
         self._fact_lock = threading.Lock()
@@ -337,6 +342,11 @@ class HandoffService:
         """Bound shutdown waiting across both background indexes."""
         with self._mirror_lock, self._fact_lock:
             self._background_closed = True
+            for timer in self._index_timers.values():
+                timer.cancel()
+            self._index_timers.clear()
+            self._index_active.clear()
+            self._mirror_condition.notify_all()
             jobs = [*self._mirror_jobs, *self._fact_jobs]
             pools = [self._mirror_pool, self._fact_pool]
         futures_wait(jobs, timeout=timeout)
@@ -369,11 +379,89 @@ class HandoffService:
             self._mirror_jobs.append(self._mirror_pool.submit(job))
             self._mirror_jobs = [f for f in self._mirror_jobs if not f.done()]
 
-    def wait_for_mirrors(self, timeout: Optional[float] = None) -> None:
-        """Block until queued mirror jobs finish (tests and shutdown)."""
+    def index_later(self, workspace_id, stored_ids=()) -> None:
+        """Enroll sources and coalesce one asynchronous workspace sweep."""
+        try:
+            if not search_index.enabled() or self.call_tool is None:
+                return
+            if stored_ids:
+                store = self.store_for(workspace_id)
+                for stored_id in stored_ids:
+                    stored = store.get(stored_id)
+                    if stored is not None and stored.workspace_id == workspace_id:
+                        store.begin_mirror(stored_id, -1, bootstrap=-1)
+            with self._mirror_lock:
+                if self._background_closed:
+                    return
+                state = self._index_states.setdefault(workspace_id, search_index.State())
+                state.dirty = True
+                if workspace_id in self._index_active:
+                    return
+                self._index_active.add(workspace_id)
+                state.state = "running"
+                self._submit_index(workspace_id)
+        except Exception:
+            pass
+
+    def index_status(self, workspace_id):
+        """Return counts for the owner/operator progress surface."""
+        counts = self.store_for(workspace_id).index_counts(workspace_id)
         with self._mirror_lock:
-            jobs = list(self._mirror_jobs)
-        futures_wait(jobs, timeout=timeout)
+            state = self._index_states.get(workspace_id, search_index.State())
+            return {
+                **counts,
+                "state": state.state if search_index.enabled() else "off",
+                "units_written": state.units_written,
+            }
+
+    def _submit_index(self, workspace_id):
+        if self._mirror_pool is None:
+            self._mirror_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="handoff-mirror"
+            )
+        self._index_timers.pop(workspace_id, None)
+        self._mirror_jobs = [f for f in self._mirror_jobs if not f.done()]
+        self._mirror_jobs.append(self._mirror_pool.submit(self._index_job, workspace_id))
+
+    def _index_job(self, workspace_id):
+        state = self._index_states[workspace_id]
+        again = search_index.sweep(self, workspace_id, state)
+        with self._mirror_condition:
+            if (again or state.dirty) and not self._background_closed and search_index.enabled():
+                timer = threading.Timer(
+                    search_index.PAUSE_SECONDS, self._resume_index, args=(workspace_id,)
+                )
+                timer.daemon = True
+                self._index_timers[workspace_id] = timer
+                timer.start()
+            else:
+                self._index_active.discard(workspace_id)
+            self._mirror_condition.notify_all()
+
+    def _resume_index(self, workspace_id):
+        with self._mirror_condition:
+            if self._background_closed:
+                self._index_active.discard(workspace_id)
+                self._index_timers.pop(workspace_id, None)
+            else:
+                self._submit_index(workspace_id)
+            self._mirror_condition.notify_all()
+
+    def wait_for_mirrors(self, timeout: Optional[float] = None) -> None:
+        """Drain mirrors, including delayed sweep continuations."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            with self._mirror_condition:
+                jobs = [f for f in self._mirror_jobs if not f.done()]
+                if not jobs and not self._index_active:
+                    return
+                if remaining == 0:
+                    return
+                if not jobs:
+                    self._mirror_condition.wait(remaining)
+                    continue
+            futures_wait(jobs, timeout=remaining)
 
     def _superseded(self, workspace_id: str, key: str, lease_token: str, handoff: Handoff):
         with self.control_db._lock:

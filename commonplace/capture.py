@@ -398,6 +398,24 @@ def register(ctx):
                                 maximum,
                                 continuity,
                             )
+            if (
+                not is_settings
+                and handler.command == "POST"
+                and result.get("status") in ("appended", "duplicate")
+            ):
+                try:
+                    from .continuity_read import content_threads
+
+                    ws = principal.workspace_id
+                    touched = content_threads(db, ws, identity)
+                    if not touched:
+                        stored = store.by_source(ws, identity)
+                        touched = [stored.id] if stored else []
+                    ctx.service.index_later(ws, touched)
+                except Exception as error:
+                    log_failure(
+                        logging.getLogger(__name__), "Capture index scheduling failed", error
+                    )
             if changed:
                 sync_feed.notify(principal.workspace_id)
             status = 409 if result.get("code") == "op_conflict" else 200

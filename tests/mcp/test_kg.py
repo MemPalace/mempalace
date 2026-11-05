@@ -713,3 +713,36 @@ class TestKGSave:
             result = tool_kg_save(subject="A", predicate="b", object="C", **args)
             assert result["success"] is False, args
         assert kg.stats()["triples"] == 0
+
+
+def test_save_echo_binds_replaced_values_to_their_own_sources(monkeypatch, config, kg):
+    from mempalace import mcp_server
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    first = mcp_server.tool_kg_save(
+        "Sample",
+        "deploy_port",
+        "8000",
+        wing="private_threads",
+        source_thread="thr_1111",
+        source_seq_start=0,
+        source_seq_end=0,
+        valid_from="2026-01-01",
+        single_valued=True,
+    )
+    second = mcp_server.tool_kg_save(
+        "Sample",
+        "deploy_port",
+        "9000",
+        wing="private_threads",
+        source_thread="thr_2222",
+        source_seq_start=0,
+        source_seq_end=0,
+        valid_from="2026-02-01",
+        single_valued=True,
+    )
+    assert first["success"] and second["success"]
+    assert second["previous"] == ["8000"]
+    assert second["sources"][0]["source_thread"] == "thr_2222"
+    assert second["related_facts"][0]["object"] == "8000"
+    assert second["related_facts"][0]["sources"][0]["source_thread"] == "thr_1111"

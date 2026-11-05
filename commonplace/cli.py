@@ -431,6 +431,56 @@ def cmd_thread(args) -> int:
     return 0
 
 
+def cmd_search_index(args) -> int:
+    from .gateway import WorkerClient
+    from .handoff.db import HandoffDB
+    from .handoff.events import Events
+    from .handoff.service import HandoffService
+    from .search_index_api import progress
+    from .workers import WorkerSupervisor
+
+    db = _db(args)
+    workspace = db.workspace(args.workspace)["id"]
+    with ExitStack() as stack:
+        store_for = _stores(args, stack)
+        handoff_db = HandoffDB(db)
+        worker = None
+        if args.action == "run":
+            supervisor = WorkerSupervisor(str(_data_dir(args)))
+            stack.callback(supervisor.close)
+            worker = WorkerClient(supervisor)
+        service = HandoffService(
+            control_db=db,
+            handoff_db=handoff_db,
+            settings=_settings(db, handoff_db),
+            store_for=store_for,
+            events=Events(db, handoff_db),
+            call_tool=worker.call_tool if worker else None,
+        )
+        stack.callback(service.close)
+        if args.action == "run":
+            store = store_for(workspace)
+            if args.captures:
+                for prefix in ("capture:", "capture-fork:"):
+                    after = None
+                    while rows := store.list_source_range(
+                        workspace, prefix, after=after, limit=100
+                    ):
+                        for row in rows:
+                            store.begin_mirror(row.id, -1, bootstrap=-1)
+                        after = (rows[-1].source_thread_id, rows[-1].id)
+            service.index_later(workspace)
+            service.wait_for_mirrors()
+        counts = progress(service, workspace)
+        print(
+            json.dumps(
+                {k: v for k, v in counts.items() if k not in ("state", "units_written")},
+                sort_keys=True,
+            )
+        )
+    return 0
+
+
 def _positive_int(value):
     number = int(value)
     if number <= 0:
@@ -542,6 +592,14 @@ def _handoff_parsers(sub):
         else:
             s.add_argument("query")
         s.set_defaults(func=cmd_thread)
+
+    search_index = sub.add_parser("search-index").add_subparsers(dest="action", required=True)
+    for action in ("status", "run"):
+        s = search_index.add_parser(action)
+        s.add_argument("--workspace", required=True)
+        if action == "run":
+            s.add_argument("--captures", action="store_true")
+        s.set_defaults(func=cmd_search_index)
 
 
 def cmd_serve(args) -> int:

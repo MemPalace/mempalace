@@ -119,12 +119,27 @@ def install(gateway, data_dir=None, **_ignored) -> HandoffContext:
     )
     gateway.handoff = ctx
     api.register(ctx)
-    from commonplace import capture, imports, sync_sessions
+    from commonplace import capture, imports, search_index_api, sync_sessions
 
+    search_index_api.register(gateway)
     imports.register(ctx)
     capture.register(ctx)
     sync_sessions.register(ctx)
     web.register(ctx)
     # Events a crash left queued (handoff.completed) go out now.
     ctx.service.replay_pending()
+    # Resume eligible history without opening stores on the startup path.
+    try:
+        with gateway.db._lock:
+            workspaces = gateway.db._conn.execute(
+                "SELECT id FROM workspaces ORDER BY id"
+            ).fetchall()
+        for workspace in workspaces:
+            try:
+                if ctx.has_threads(workspace["id"]):
+                    ctx.service.index_later(workspace["id"])
+            except Exception:
+                pass  # Indexing is best effort; startup must still succeed.
+    except Exception:
+        pass
     return ctx

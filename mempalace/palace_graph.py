@@ -982,10 +982,14 @@ def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = T
             try:
                 results = col.get(ids=drawer_ids, include=["documents", "metadatas"])
                 drawer_map = dict(zip(results["ids"], results["documents"]))
+                metadata_map = dict(zip(results["ids"], results["metadatas"]))
                 for c in connections:
                     did = c.get("drawer_id")
                     if did and did in drawer_map:
                         c["drawer_preview"] = drawer_map[did][:300]
+                        metadata = metadata_map.get(did) or {}
+                        c["drawer_wing"] = metadata.get("wing")
+                        c["drawer_room"] = metadata.get("room")
             except Exception:
                 logger.debug("Drawer preview hydration failed", exc_info=True)
 

@@ -181,26 +181,83 @@ def _bootstrap_seq(store, stored, end: int) -> int:
     return end - 1  # Split, missing or unexpected: replay the final message in full.
 
 
-def mirror_pending(call_tool, principal, stored, store):
-    """Resume a durable batch, then mirror later appends at a new boundary."""
+def mirror_pending(
+    call_tool,
+    principal,
+    stored,
+    store,
+    *,
+    skip_empty=False,
+    should_continue=None,
+    max_messages=None,
+    max_units=None,
+    before_range=None,
+):
+    """Resume a durable batch; interrupted writes leave its checkpoint pending.
+
+    ``skip_empty`` omits archive-only rows without renumbering messages.
+    ``should_continue`` may stop writes by returning False before a worker call.
+    ``max_messages`` pins and finishes at most one bounded range per call;
+    without it, handoff keeps its existing whole-thread behavior. ``max_units``
+    reduces new ranges to a whole-message prefix. ``before_range`` can defer
+    a range before its first write; its durable pin survives the deferral.
+    """
+    if max_messages is not None and (type(max_messages) is not int or max_messages < 1):
+        raise ValueError("max_messages must be a positive integer")
     progress = store.mirror_progress(stored.id)
     end = _legacy_mirrored_seq(call_tool, principal, stored) if progress is None else -1
     bootstrap = _bootstrap_seq(store, stored, end)
     drawer_ids = []
     while True:
-        completed, through = store.begin_mirror(
-            stored.id, stored.message_count - 1, bootstrap=bootstrap
-        )
+        progress = store.mirror_progress(stored.id)
+        completed = progress[0] if progress is not None else bootstrap
+        through = stored.message_count - 1
+        if max_messages is not None:
+            through = min(through, completed + max_messages)
+            if max_units is not None and (progress is None or progress[0] == progress[1]):
+                through = _bounded_end(store, stored, completed, through, max_units, skip_empty)
+        completed, through = store.begin_mirror(stored.id, through, bootstrap=bootstrap)
         if completed >= stored.message_count - 1:
             return drawer_ids
         messages = store.messages(stored.id, completed + 1, through)
         if not messages or messages[0].seq != completed + 1 or messages[-1].seq != through:
             raise MirrorError("Stored thread has an incomplete mirror range")
-        drawer_ids.extend(mirror(call_tool, principal, stored, class_units(messages)))
+        if skip_empty:
+            messages = [message for message in messages if message.text]
+        units = class_units(messages)
+        if before_range is not None:
+            before_range(units)
+        if should_continue is None:
+            drawer_ids.extend(mirror(call_tool, principal, stored, units))
+        else:
+            drawer_ids.extend(
+                mirror(call_tool, principal, stored, units, should_continue=should_continue)
+            )
         store.finish_mirror(stored.id, through)
+        if max_messages is not None:
+            return drawer_ids
 
 
-def mirror(call_tool: CallTool, principal, stored: StoredThread, chunks: list) -> list[str]:
+def _bounded_end(store, stored, completed, through, max_units, skip_empty):
+    messages = store.messages(stored.id, completed + 1, through)
+    low, high = 1, len(messages)
+    # Whole messages are the durable unit. At least one message is allowed,
+    # even when that single message exceeds the soft per-job unit budget.
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = messages[:middle]
+        if skip_empty:
+            candidate = [row for row in candidate if row.text]
+        if len(class_units(candidate)) <= max_units:
+            low = middle
+        else:
+            high = middle - 1
+    return completed + low if messages else through
+
+
+def mirror(
+    call_tool: CallTool, principal, stored: StoredThread, chunks: list, *, should_continue=None
+) -> list[str]:
     """Return stable unit IDs; legacy chunks retain content-based deduplication."""
     if chunks and isinstance(chunks[0], MirrorUnit):
         # Do not send thousands of identical continuations to the worker.
@@ -214,6 +271,8 @@ def mirror(call_tool: CallTool, principal, stored: StoredThread, chunks: list) -
         units = list(unique.values())
         drawer_ids = []
         for offset in range(0, len(units), 64):
+            if should_continue is not None and not should_continue():
+                raise MirrorError("Memory mirror paused before worker write")
             batch = units[offset : offset + 64]
             result = _call(
                 call_tool,
@@ -265,6 +324,8 @@ def mirror(call_tool: CallTool, principal, stored: StoredThread, chunks: list) -
             "source_file": f"handoff:{stored.id}#{chunk.index}",
             "added_by": f"handoff:{chunk.seq_start}-{chunk.seq_end}:{len(chunk.text)}",
         }
+        if should_continue is not None and not should_continue():
+            raise MirrorError("Memory mirror paused before worker write")
         result = _call(
             call_tool,
             principal,

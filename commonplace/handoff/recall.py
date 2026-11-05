@@ -106,6 +106,21 @@ class Recall:
         self._call_tool = call_tool
         self._private = private
 
+    def can_read(self, principal, stored_id: str) -> bool:
+        """Check access with one metadata lookup, without building a private view."""
+        if (
+            not isinstance(stored_id, str)
+            or _THREAD_ID.fullmatch(stored_id) is None
+            or not principal.policy.has_scope("threads:read")
+        ):
+            return False
+        stored = self._store_for(principal.workspace_id).get(stored_id)
+        return bool(
+            stored is not None
+            and _readable(principal, stored)
+            and (self._private is None or self._private.readable(principal, stored))
+        )
+
     def thread(self, principal, stored_thread_id: str) -> StoredThread:
         if (
             not isinstance(stored_thread_id, str)

@@ -477,6 +477,8 @@ def test_free_quota_new_and_existing_stores_and_noop_at_limit(surface):
     padding.unlink()
     _, report = upload(surface)
     stored_id = report["results"][0]["stored_thread_id"]
+    # Background search indexing also counts toward storage; let it settle first.
+    surface.gateway.handoff.service.wait_for_mirrors(timeout=30)
     used = plans.StorageMeter._walk(surface.directory)
     with padding.open("wb") as stream:
         stream.truncate(plans.FREE.storage_bytes - used)

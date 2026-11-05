@@ -110,6 +110,41 @@ format detection cannot recognize; and identities containing `#sha256:`.
 An incomplete final multipart JSON object is refused; a complete final record
 without a newline is accepted. Exact bytes remain available in every case.
 
+## Find synced history in Memory
+
+Uploads and Memory indexing have separate progress. After an accepted capture
+append or exact retry, background indexing catches up the whole stored session.
+Imports, including memory-file imports, are also indexed in the background.
+Searchable text keeps the original words; a hit's `source.thread` can point to
+the shared session rather than an individual import.
+
+Structured mirror copies of private stored threads, facts derived from them, and their
+tunnel previews are returned only to callers who can read their source thread. This
+covers structured Memory search, `memory_get` and session start context. CLI-format (`cli_compatible`) search excludes mirror drawer copies for everyone, including owners; its `facts` field is still returned only to callers who can read each fact's source thread. A
+`superseded_by` id is returned only when its target is another kept fact in the same
+response.
+
+Adding, updating, deleting or linking drawers in a stored-thread room requires
+permission to read that thread. Known exceptions: `delete_by_source`, `delete_tunnel`
+and `delete_hallway` take no room and are not checked yet.
+
+Fact mutations (`kg_invalidate`, `kg_supersede`, `kg_save` merges, and single-valued supersedes through `kg_save` or `fact_save`) on thread-derived
+facts are not room-checked. A member with fact-write permissions but no source-thread
+read access can mutate those hidden facts. Invalidate's `closed` count is a yes/no
+oracle for hidden values. This pre-existing write-side exposure is accepted for follow-up alongside `delete_by_source`, `delete_tunnel` and `delete_hallway`. Presence is not hidden either: taxonomy and aggregate counts can show stored-thread ids and per-thread counts to callers who can read the private section, fan-out ranks and counts can reflect hidden hits, and gating runs after a bounded fetch of at most 100 candidates, so hidden hits can take candidate slots.
+
+Mirror copies do not count as duplicates for anyone. Similarity dedup exclusion (D5) is
+verified on compact, sqlite_exact and chroma.
+Default self-service PAT and OAuth connections still cannot retrieve this
+history through Memory search, `memory_get` or session start context, even when allowed to upload it.
+
+Existing imports are indexed automatically. Older captures that never sync again
+need `commonplace search-index run --workspace WORKSPACE_ID --captures` from an
+operator. This is separate from the upload backfill described above. Index bytes
+count toward workspace storage, and indexing pauses 16 MiB before the plan limit.
+See [indexing progress and controls](one-time-import.md#indexing-progress-and-storage)
+for the owner status endpoint, operator commands and the indexing off switch.
+
 ## Stop or remove
 
 `commonplace sync uninstall` previews removal. Add `--enable` to stop the service
