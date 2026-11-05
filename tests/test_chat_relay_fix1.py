@@ -262,7 +262,8 @@ def test_once_hub_exit_codes(relay_hub, tmp_path, monkeypatch, kind, status, exp
 
 
 def test_context_wire_size_and_newest_line_last(monkeypatch):
-    newest = "\x01" * 9_000 + "\nNewest line"
+    # Keep the newest below the wire limit so this case trims only context.
+    newest = "\x01" * 7_000 + "\nNewest line"
     service = SimpleNamespace(
         board_list=lambda: [{"slug": "work", "name": "Example project"}],
         task_list=lambda board: [
