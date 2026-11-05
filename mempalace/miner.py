@@ -556,6 +556,43 @@ def _apply_exclude_patterns_to_prescanned_files(
 # =============================================================================
 
 
+def _valid_room_name(value) -> str | None:
+    """``value`` as ``sanitize_name`` returns it, or None when it is rejected."""
+    from .config import sanitize_name
+
+    try:
+        return sanitize_name(value, "room")
+    except ValueError:
+        return None
+
+
+def _clean_room_names(rooms: list, source: str) -> list:
+    """``rooms`` with names that are safe to store on drawers and print.
+
+    A project config can arrive with a cloned repository, and room names reach
+    wake-up text. A rejected name becomes its slug, as ``rooms.py`` does for
+    proposed names, so its files stay together. With no usable slug the room is
+    dropped and its files fall through to the other rooms or ``general``. Either
+    way the file is still mined. Only scalars are turned into text, because yaml
+    aliases can build a small value whose text form is exponentially large.
+    """
+    clean = []
+    for room in rooms:
+        raw = room.get("name") if isinstance(room, dict) else None
+        name = _valid_room_name(raw)
+        if name is None:
+            from .rooms import slugify_room
+
+            text = str(raw) if isinstance(raw, (str, int, float)) else ""
+            name = _valid_room_name(slugify_room(text)) if text else None
+            outcome = f"using '{name}'" if name else "skipping that room"
+            shown = ascii(text[:80]) if text else f"of type {type(raw).__name__}"
+            print(f"  Invalid room name {shown} in {source}: {outcome}.", file=sys.stderr)
+        if name:
+            clean.append({**room, "name": name})
+    return clean
+
+
 def load_config(project_dir: str) -> dict:
     """Load the project config from ``project_dir``.
 
@@ -594,7 +631,10 @@ def load_config(project_dir: str) -> dict:
             ],
         }
     with open(config_path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    if isinstance(config, dict) and isinstance(config.get("rooms"), list):
+        config["rooms"] = _clean_room_names(config["rooms"], config_path.name)
+    return config
 
 
 # =============================================================================
