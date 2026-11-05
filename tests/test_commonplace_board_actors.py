@@ -55,9 +55,9 @@ def test_deep_actors_roll_up_four_children_and_agents_still_see_them(hub, env): 
         deeper.task_add(title="Test the counts", board="work"),
     ]
     for child in children[:2]:
-        top.task_approve(child["number"])
+        top.task_approve(child["number"], reason="synthetic reason")
     for child in children[2:]:
-        sub.task_approve(child["number"])
+        sub.task_approve(child["number"], reason="synthetic reason")
     for worker, child in ((sub, children[0]), (deeper, children[2])):
         worker.task_update(child["number"], status="done")
     assert {c["parent"] for c in children} == {parent["number"]}
@@ -153,7 +153,7 @@ def test_assigned_current_card_and_nested_explicit_parent_are_flattened(hub, env
         sub.task_add(title="Explicit flatten", board="work", parent=nested["number"])["parent"]
         == parent["number"]
     )
-    owner.task_approve(nested["number"])
+    owner.task_approve(nested["number"], reason="synthetic reason")
     owner.task_handoff(nested["number"], to=principal.actor, note="Take the nested task")
     top.task_take_next(task=nested["number"])
     assert sub.task_add(title="Automatic flatten", board="work")["parent"] == parent["number"]
@@ -169,7 +169,7 @@ def test_reassigned_child_cannot_roll_work_into_another_actors_top_level_card(hu
     _, _, second_sub = actor(hub, "second-worker", parent=other_id)
     nested = second_sub.task_add(title="Reassigned child", board="work", assignee=principal.actor)
     assert nested["parent"] == foreign["number"]
-    owner.task_approve(nested["number"])
+    owner.task_approve(nested["number"], reason="synthetic reason")
     owner.task_handoff(nested["number"], to=principal.actor, note="Reassign approved work")
     first.task_take_next(task=nested["number"])
     _, sub_token, first_sub = actor(hub, "first-worker", parent=principal.connection_id)
@@ -208,7 +208,7 @@ def test_chat_linked_children_keep_asks_and_answer_history(hub, env):  # noqa: F
     parent = top.task_add(title="Parent", board="work", message_id=message["id"])
     _, _, sub = actor(hub, "worker", parent=principal.connection_id)
     child = sub.task_add(title="Child approval", board="work", message_id=message["id"])
-    top.task_approve(child["number"])
+    top.task_approve(child["number"], reason="synthetic reason")
     sub.ask(
         'Ship <script> & "original"?',
         ["Ship", "Wait"],
@@ -322,7 +322,7 @@ def test_child_asks_stay_in_needs_me_and_refresh_parent_count(hub, env):  # noqa
     parent = top.task_add(title="Parent", board="work")
     _, _, sub = actor(hub, "worker", parent=principal.connection)
     child = sub.task_add(title="Pick the release", board="work")
-    top.task_approve(child["number"])
+    top.task_approve(child["number"], reason="synthetic reason")
     child = sub.ask(
         "Pick the release? Which approach should we take?",
         ["Now", "Later"],

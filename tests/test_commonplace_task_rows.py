@@ -49,7 +49,7 @@ REPORT = {"pr_state": "open", "pr_head": "a" * 40, "pr_reported_at": FRESH}
         ({**ASK, "ask_to": ME}, "you"),
         ({**ASK, "ask_to": OTHER}, "idle"),
         ({**ASK, **REPORT, "ask_to": OTHER, "pr_url": PR, "checks": "passing"}, "merge"),
-        ({"status": "review"}, "plan"),
+        ({"status": "review"}, "idle"),
         ({"labels": ["plan"]}, "plan"),
         (
             {**REPORT, "status": "doing", "pr_url": PR, "checks": "passing", "heartbeat_at": FRESH},
@@ -126,7 +126,7 @@ def test_precedence_follows_needs_order():
         heartbeat_at=FRESH,
     )
     assert derive(everything) == "you"
-    assert derive({**everything, "ask_to": OTHER}) == "plan"
+    assert derive({**everything, "ask_to": OTHER}) == "merge"
     assert derive({**everything, "ask_to": OTHER, "labels": []}) == "merge"
     doing = {**everything, "status": "doing", "ask": None, "ask_to": None, "labels": []}
     assert derive(doing) == "merge"
@@ -173,7 +173,7 @@ def test_need_in_rest_and_mcp_output(hub, env):  # noqa: F811
         )
     expected = {
         asked["number"]: "you",
-        planned["number"]: "plan",
+        planned["number"]: "you",
         merge["number"]: "merge",
         checks["number"]: "checks",
         building["number"]: "working",

@@ -20,7 +20,7 @@ This builds on PRODUCT-DESIGN.md §10 and keeps all of it: kanzo's design and no
 2. Two agents never work on the same card.
 3. Everything waiting on Avery is on one screen, oldest first, and each item takes one decision.
 4. Every card, move and comment shows who did it, stamped by the server.
-5. Every agent owns work by default. Self-created child proposals require their direct parent or a signed-in owner; memory trust and private-scope boundaries remain intact.
+5. Every agent owns work by default. Self-created child proposals require their parent, top-level agent, board coordinator or owner; memory trust and private-scope boundaries remain intact.
 
 **Non-goals for v1:** sub-tasks, due dates, labels, estimates, swimlanes, per-board permissions beyond the wing, the sealed tier for boards, starting agents from a card (that is module A).
 
@@ -54,7 +54,7 @@ backlog │ todo │ doing │ review │ done
 
 The full table of who may make each move is in [API.md](API.md#move-rules). Three rules carry the design:
 
-- **Every agent can create, claim and maintain its own cards.** Pending child proposals require `task_approve` by their direct parent or a signed-in owner; only a signed-in owner can recover or dismiss a rejection. Parent work approval does not release restricted origin unless the parent is trusted and unrestricted. Other holders and person decisions stay protected. Trusted unrestricted writers retain shared backlog pickup; memory inbox routing never forces a top-level card into backlog.
+- **Every agent can create, claim and maintain its own cards.** Pending child proposals require `task_approve` by their parent, top-level agent, board coordinator or owner; only a signed-in owner can recover or dismiss a rejection. An unrestricted parent may release restricted origin at standard trust; restricted parents cannot. Agents cannot approve cards they hold. Orchestrators handle approvals each heartbeat with a reason or escalate to the owner. Other holders and person decisions stay protected. Trusted unrestricted writers retain shared backlog pickup; memory inbox routing never forces a top-level card into backlog.
 - **Only the holder changes a `doing` card.** Others can comment.
 - **Cards are never deleted.** Closing one with a reason is a move to `done`. The event log is append-only (enforced by triggers in `schema.sql`).
 
@@ -71,8 +71,8 @@ to `todo` or `doing` by withdrawing its ask in the same transaction. Person
 recipients (including the default owner), person assignees and person return
 targets block withdrawal and keep their decision queue intact. Agents cannot
 complete person-directed reviews or relay a person's approval through `decide`.
-Only a signed-in workspace owner may answer those decisions. Direct parents
-may still approve child proposals with `task_approve`.
+Only a signed-in workspace owner may answer those decisions. Direct parents, top-level agents, board coordinators and the owner may approve proposals.
+For advisory plan reviews, approvers are the direct parent, creator-parent, board coordinator and owner. Agents use `task_approve` with a reason, or escalate to the owner.
 
 Withdrawal preserves the review/open-ask database constraint. A `release`
 event stores the original ask and optional verbatim reason, with actor, time,
@@ -175,7 +175,7 @@ All from PRODUCT-DESIGN.md §6–§10, nothing new:
 - **Expiry:** a claim past `claim_until` keeps its assignee and is shown as expired on the next board call, with one `expire` event.
 - **Move rules:** every row of the API.md table, allowed and refused, over MCP and over HTTP, against the same service code.
 - **Canary:** a board, card, comment and ask in a forbidden wing never appear in any tool reply or HTTP response for a scoped token.
-- **Backlog guard:** a pending child proposal cannot be taken or promoted before direct-parent or signed-in-owner approval.
+- **Backlog guard:** a pending child proposal cannot be taken or promoted before parent, top-level agent, board coordinator or owner approval.
 - **B's done test** (PRODUCT-DESIGN.md §15) extended: the winning agent hands the card to Avery with options, he decides on the Decide screen, and the same agent's next `task_take_next` returns it with the decision.
 
 ## Decisions
@@ -193,3 +193,5 @@ Open:
 
 - [ ] **Notify Avery outside the web app?** The Decide count is the only signal in v1. A push to his phone needs a channel that keeps the "no external service" promise (a self-hosted notification service would). Decide before B ships.
 - [ ] **Reserve for an agent kind** (`to=codex`, any Codex connection) as well as one connection. Wait for real use.
+
+The plan label requests review without gating work; a doing holder may drop it. Plan approval keeps status and claims. Rejected plans return to the board backlog, with the existing card history informing the holder. Only the owner may reject a doing plan. Escalated decisions require the owner.

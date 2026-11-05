@@ -4,10 +4,10 @@ import { escape as e, elapsed, pullRequestUrl } from "./api.js";
 import { hasQuestions } from "./decide.js";
 
 const enc = encodeURIComponent;
-const BUCKETS = ["asks", "done_review", "backlog_from_agents", "ready_to_merge", "stale"];
+const BUCKETS = ["asks", "done_review", "backlog_from_agents", "plans", "ready_to_merge", "stale"];
 // The server's need order, with a stale claim slotted in after "ready to merge".
 const ORDER = ["you", "plan", "merge", "stale", "checks", "expired", "working", "idle", "done"];
-const LABELS = { you: "Needs you", plan: "Plan to approve", merge: "Ready to merge", stale: "Stuck", checks: "Checks running", working: "Working", expired: "Expired", idle: "Idle", done: "Done", quiet: "Quiet" };
+const LABELS = { you: "Needs you", plan: "Awaiting plan review", merge: "Ready to merge", stale: "Stuck", checks: "Checks running", working: "Working", expired: "Expired", idle: "Idle", done: "Done", quiet: "Quiet" };
 const rank = (state) => (ORDER.includes(state) ? ORDER.indexOf(state) : ORDER.indexOf("idle"));
 const staleSet = (needs) => new Set((needs.stale || []).map((c) => c.number));
 const stateOf = (card, stale) => (stale.has(card.number) && rank(card.need) > rank("stale") ? "stale" : card.need);
@@ -29,7 +29,7 @@ export function needItems(needs) {
 function reason({ card, buckets }, asked) {
   if (card.why != null) return card.why;
   if (asked && card.ask) return `asks: ${card.ask.split("\n")[0]}`;
-  if (card.need === "plan") return "plan to approve";
+  if (card.need === "plan") return "awaiting plan review";
   if (card.need === "merge") return "ready to merge";
   if (buckets.has("stale")) return "stopped checking in and has no available supervisor";
   if (buckets.has("backlog_from_agents")) return "filed by an agent";
@@ -37,10 +37,12 @@ function reason({ card, buckets }, asked) {
 }
 
 const pill = (state, dot) => `<span class="pill ${e(state)}">${dot({ need: ["stale", "quiet"].includes(state) ? "idle" : state })}${e(LABELS[state] || LABELS.idle)}</span>`;
-function action(card, state) {
+function action(card, state, buckets = new Set()) {
   const open = (label) => `<a class="opt" href="#/card/${card.number}">${label}</a>`;
+  if (buckets.has("plans") || buckets.has("backlog_from_agents")) return open("Approve");
+  if (buckets.has("asks") || buckets.has("done_review")) return open("Answer");
   if (state === "you") return open("Answer");
-  if (state === "plan") return open("Approve");
+  if (state === "plan") return "";
   if (state === "merge") {
     const href = pullRequestUrl(card);
     return href ? `<a class="opt" href="${e(href)}" target="_blank" rel="noopener noreferrer">Merge</a>` : open("Merge");
@@ -85,15 +87,15 @@ function spaces(boards, open, items, stale, dot) {
   }).join("")}</section>`;
 }
 
-function tasks(open, total, stale, boards, selected, { dot, taskRow, children = () => "" }) {
+function tasks(open, total, stale, boards, selected, buckets, { dot, taskRow, children = () => "" }) {
   const names = new Map(boards.map((b) => [b.slug, b.name || b.slug]));
   const rows = open.map((card) => ({ card, state: stateOf(card, stale) })).sort((a, b) => rank(a.state) - rank(b.state) || a.card.number - b.card.number);
   const space = (card) => `<a href="#/board/${enc(card.board)}">${e(names.get(card.board) || card.board)}</a>`;
   const sub = (card) => [card.branch ? `<span>${e(card.branch)}</span>` : "", card.pr_number ? `<span>PR #${e(card.pr_number)}</span>` : ""].filter(Boolean).join("");
-  return `<section class="home-tasks" aria-labelledby="tasks-title"><h2 id="tasks-title">Open tasks <span class="n">${total ?? rows.length}</span></h2>${rows.length ? `<table><thead><tr><th scope="col">Task</th><th scope="col">Space</th><th scope="col">Status</th><th scope="col">Elapsed</th><th scope="col"><span class="sr-only">Action</span></th></tr></thead><tbody>${rows.map(({ card, state }) => `<tr data-row="${card.number}" data-key="task-${card.number}" class="${card.number === selected ? "sel" : ""}"><td class="task"><a href="#/card/${card.number}">${e(card.title)}</a>${sub(card) ? `<span class="sub">${sub(card)}</span>` : ""}${children(card, "home")}</td><td>${space(card)}</td><td>${pill(state, dot)}</td><td><time data-elapsed="${e(card.updated_at)}" datetime="${e(card.updated_at)}">${elapsed(card.updated_at)}</time></td><td class="act">${action(card, state)}</td></tr>`).join("")}</tbody></table><div class="tstack">${rows.map(({ card, state }) => `<article class="trow-card ${card.number === selected ? "sel" : ""}" data-row="${card.number}" data-key="stack-${card.number}">${taskRow(card, space(card))}${children(card, "stack")}${action(card, state) ? `<div class="opts">${action(card, state)}</div>` : ""}</article>`).join("")}</div>` : '<p class="empty">No open tasks</p>'}</section>`;
+  return `<section class="home-tasks" aria-labelledby="tasks-title"><h2 id="tasks-title">Open tasks <span class="n">${total ?? rows.length}</span></h2>${rows.length ? `<table><thead><tr><th scope="col">Task</th><th scope="col">Space</th><th scope="col">Status</th><th scope="col">Elapsed</th><th scope="col"><span class="sr-only">Action</span></th></tr></thead><tbody>${rows.map(({ card, state }) => `<tr data-row="${card.number}" data-key="task-${card.number}" class="${card.number === selected ? "sel" : ""}"><td class="task"><a href="#/card/${card.number}">${e(card.title)}</a>${sub(card) ? `<span class="sub">${sub(card)}</span>` : ""}${children(card, "home")}</td><td>${space(card)}</td><td>${pill(state, dot)}</td><td><time data-elapsed="${e(card.updated_at)}" datetime="${e(card.updated_at)}">${elapsed(card.updated_at)}</time></td><td class="act">${action(card, state, buckets.get(card.number))}</td></tr>`).join("")}</tbody></table><div class="tstack">${rows.map(({ card, state }) => `<article class="trow-card ${card.number === selected ? "sel" : ""}" data-row="${card.number}" data-key="stack-${card.number}">${taskRow(card, space(card))}${children(card, "stack")}${action(card, state, buckets.get(card.number)) ? `<div class="opts">${action(card, state, buckets.get(card.number))}</div>` : ""}</article>`).join("")}</div>` : '<p class="empty">No open tasks</p>'}</section>`;
 }
 
 export function homeView({ needs = {}, boards = [], open = [], total = null, selected = null, speak = false }, rows) {
   const items = needItems(needs), stale = staleSet(needs);
-  return `<section class="queue home">${needBox(items, selected, speak, rows.dot, hasQuestions(needs))}${spaces(boards, open, items, stale, rows.dot)}${tasks(open, total, stale, boards, selected, rows)}</section>`;
+  return `<section class="queue home">${needBox(items, selected, speak, rows.dot, hasQuestions(needs))}${spaces(boards, open, items, stale, rows.dot)}${tasks(open, total, stale, boards, selected, new Map(items.map(i => [i.card.number, i.buckets])), rows)}</section>`;
 }

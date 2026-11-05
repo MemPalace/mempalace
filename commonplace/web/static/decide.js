@@ -788,3 +788,10 @@ export function renderDecide(session, opts = {}) {
   else return "";
   return `<section class="decide" data-phase="${e(session.phase)}">${bar(session)}${listHTML(session)}<div class="decide-main">${main}</div></section>`;
 }
+
+
+// Shared history row; all event text, including reasons, is quoted data.
+export function eventItem(event, name = actor) {
+  const clock = (at) => `<time datetime="${e(at)}" title="${e(at)}">${e(at?.slice(11, 16) || "")}</time>`;
+  return `<li class="ev">${clock(event.at)}<span><span class="actor">${e(name(event.actor))}</span> <span class="v">${e(event.kind)}${event.target ? ` → ${e(name(event.target))}` : ""}</span></span>${event.text != null || event.choice ? `<p class="said">${e(event.choice || "")}${event.choice && event.text ? "\n" : ""}${e(event.text || "")}</p>` : ""}${event.reason != null ? `<p class="said">Reason: ${e(event.reason)}</p>` : ""}</li>`;
+}

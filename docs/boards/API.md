@@ -26,7 +26,7 @@ Card tools return short plain text, one fact per line. Chat tools return JSON wi
 | `task_comment` | `task`, `text` | slim, standard, full |
 | `task_take_next` | `board?`, `task?` | slim, standard, full |
 | `task_heartbeat` | `task` | slim, standard, full |
-| `task_approve` | `task`, `approve?`, `version?` | slim, standard, full |
+| `task_approve` | `task`, `approve?`, `version?`, `reason?`, `escalate?` | slim, standard, full |
 | `board_add` | `slug`, `name?`, `wing?`, `repo?` | all profiles; trusted tokens or signed-in users |
 | `task_update` | `task`, `title?`, `body?`, `status?` (`backlog` \| `todo` \| `doing` \| `review` \| `done`), `before?`, `after?`, `link?`, `unlink?`, `lesson?`, `reason?` (review returns only) | slim, standard, full |
 | `task_handoff` | `task`, `to`, `note`, `options?` | slim, standard, full |
@@ -86,13 +86,25 @@ links: drawer_7f3a "Token lifecycle notes", drawer_91c0 (invalidated)
 #149 added to todo on mempalace
 ```
 
-Top-level agent cards start in `todo`, regardless of client, profile, trust or memory inbox routing. Restricted-origin stamps are retained. Untrusted/inbox submissions without an explicit assignee are reserved for their verified creator, so they can work immediately without feeding another agent’s queue. Restricted work stays with its creator or the creator's assigned direct child until a trusted, unrestricted parent or signed-in workspace owner releases it. A foreign reservation alone never grants that release. `claim=true`, `status=doing` or `assignee=self` starts work immediately with a claim. Existing tokens with no parent remain top-level. The first task can bootstrap the workspace's shared default board without setup, including for untrusted tokens with `memory:write` and shared-board visibility. Additional spaces still require a trusted token or a signed-in user.
+Top-level agent cards start in `todo`, regardless of client, profile, trust or memory inbox routing. Restricted-origin stamps are retained. Untrusted/inbox submissions without an explicit assignee are reserved for their verified creator, so they can work immediately without feeding another agent’s queue. Restricted work stays with its creator or the creator's assigned direct child until an authorized parent, top-level agent, board coordinator or signed-in workspace owner releases it. A foreign reservation alone never grants that release. `claim=true`, `status=doing` or `assignee=self` starts work immediately with a claim. Existing tokens with no parent remain top-level. The first task can bootstrap the workspace's shared default board without setup, including for untrusted tokens with `memory:write` and shared-board visibility. Additional spaces still require a trusted token or a signed-in user.
 
 When exactly one board is visible, `board` may be omitted. With several visible boards, pass its slug or repository explicitly; the server never silently chooses a different space. Agent assignees and handoff recipients must be active connections in this workspace with `memory:write` and visibility of the board. Connection names and IDs resolve to the same verified actor. A missing, revoked, expired or inaccessible recipient is refused before the card changes.
 
-Connection ancestry uses the existing nullable `connections.parent_id` foreign key (`token add --parent <connection>`). Authentication exposes `parent_agent`; cards expose the creator's `agent_parent`. A parent's card assigned to its active direct child is immediately ready; `claim=true` starts that child's claim. Self-created child cards instead have `status=backlog`, `proposal_status=pending`, `proposed_to=<direct parent>`, and the child as assignee. These fields are server-stamped, not client inputs. Agents cannot claim, promote, complete, or hand off pending/rejected proposals. Nested children require their direct parent's approval, not any ancestor's.
+Connection ancestry uses the existing nullable `connections.parent_id` foreign key (`token add --parent <connection>`). Authentication exposes `parent_agent`; cards expose the creator's `agent_parent`. A parent's card assigned to its active direct child is immediately ready; `claim=true` starts that child's claim. Self-created child cards instead have `status=backlog`, `proposal_status=pending`, `proposed_to=<direct parent>`, and the child as assignee. These fields are server-stamped, not client inputs. Agents cannot claim, promote, complete, or hand off pending/rejected proposals. Nested proposals may be approved by their direct parent or owning top-level root, not an arbitrary intermediate ancestor. A root has no approval role solely from ancestry on an advisory plan review.
 
-`task_approve task=#n approve=true` moves a pending proposal to `todo`, reserved for the child. `approve=false` retains it in backlog as rejected and clears `approved_by`. Only the recorded direct parent or a signed-in workspace owner may decide. A signed-in owner may subsequently re-approve a rejected proposal; agents cannot reopen a rejection. The version can protect against stale approvals. Every decision records its actor in append-only history. For restricted-origin cards, `approved_by` records only an owner or trusted, unrestricted parent release; other parents still authorize the child's own work without releasing its origin. Stored release markers are checked against the authority's current workspace membership, activity and permissions, so old or revoked approvals cannot feed the ready queue or block later eligible work. Additive nullable columns preserve existing tasks, stamps, tokens and append-only history; no table rebuild or token policy rewrite is needed.
+An authority change, owner decision 5 Nov 2026: `task_approve task=#n approve=true reason=…` accepts pending proposals or advisory plan reviews. A proposal moves to todo; a plan keeps status, assignee and claim and drops the plan label. Rejection retains any stored release marker; a plan returns to backlog with its label and assignee, and existing history informs the holder. Only the owner may reject a doing plan or recover a rejected proposal. Agents supply a nonempty reason of at most 500 characters, never approve cards they hold, and may instead use `escalate=true reason=…` without `approve`. Escalation records the reason, routes to the owner and prevents further agent decisions until the owner decides. The version protects against stale decisions.
+
+| Authority | Releases restricted work |
+|---|---|
+| Signed-in workspace owner | yes |
+| Owning top-level root, any trust, not the holder | yes |
+| Board coordinator | yes |
+| Unrestricted direct parent, standard or trusted | yes |
+| Unrestricted creator-parent of an assigned direct child | yes |
+| Restricted non-root parent or restricted creator-parent | no |
+| Holder, unrelated agent or top-level claimer | no |
+
+Within approval decisions, only approval writes `approved_by`, and only when the new approver releases and the stored value no longer does. An owner moving restricted work to todo or doing also records an owner release. Reject never writes this column. Stored release markers are checked against current membership, activity and permissions; every agent marker is void while that agent holds the card. Approving a proposal also drops the plan label. The plan label is advisory, and a doing holder may drop it. Backlog plan-labelled cards and review-without-ask cards no longer derive need=plan. Nullable `escalated_to` is migrated additively; schema.sql is unchanged.
 
 ### task_heartbeat
 
@@ -334,10 +346,12 @@ and owner-role connections, including standard-trust, untrusted and inbox tokens
 Trusted, unrestricted member connections with `memory:read` may also read them;
 other member connections are refused. Every bucket is scoped to readable board
 wings. Only `asks` and `done_review` additionally filter by `ask_to`: unset or
-addressed to the token's user. `backlog_from_agents`, `ready_to_merge` and `stale`
+addressed to the token's user. `backlog_from_agents`, `plans`, `ready_to_merge` and `stale`
 include all qualifying cards within those readable wings. This grants no decision
 or board configuration rights: `board_set` remains owner-only, and an agent never
 answers its own ask.
+
+Agent `approvals` contains actionable proposals and plan reviews with roles and reasons. Heartbeat and startup approval reads use the same Needs-me read gate. `approvals_truncated` is a sibling boolean, never a bucket. Scans prefilter related rows, check board visibility before roles, and stop at 200 role checks (60 at session startup). Heartbeat and session startup quote titles and show a truncation note directing the caller to needs_me. Startup reads never create or migrate a board store. Owner plan rows have approve/reject actions; agent rows have notification only.
 
 Owner-role tokens may configure a board's coordinator through `board_set` when their normal profile, trust, scope and board-write permissions allow it. This is delegated configuration authority, distinct from a person's decision: only a signed-in owner answers `decide` or recovers rejected proposals. Member-role tokens cannot configure boards.
 
@@ -389,7 +403,7 @@ All bodies are JSON. Writes send the card's `version`; a stale one gets `409` wi
 | `PATCH /app/api/tasks/{id}` | `{version, status?, before?, after?, title?, body?, assignee?}`. Drag and drop and edits. |
 | `POST /app/api/tasks/{id}/comments` | `{text}` |
 | `POST /api/cards/{id}/heartbeat` | Renew the holder’s claim. |
-| `POST /api/cards/{id}/approve` | `{approve?, version?}` for a pending child proposal. |
+| `POST /api/cards/{id}/approve` | `{approve?, version?, reason?, escalate?}` for a proposal or advisory plan review. |
 | `GET /app/api/decide` | The decide queue: `review` cards asking this user, then `backlog` cards filed by agents, oldest first, across all boards. |
 | `POST /app/api/tasks/{id}/decide` | `{version, choice?, reply?, then}`. Ends a `review`. |
 | `POST /app/api/tasks/{id}/triage` | `{version, then: "todo" \| "done", reply?}`. Ends a `backlog` card from the decide queue. |

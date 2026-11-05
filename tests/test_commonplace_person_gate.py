@@ -65,7 +65,7 @@ def pending_question(fresh, actor="creator"):
     worker = getattr(fresh, actor).service
     card = worker.task_add(title="Decision required", body=REVIEW_CONTEXT, board="work")
     if card["proposal_status"] == "pending":
-        fresh.creator.service.task_approve(card["number"])
+        fresh.creator.service.task_approve(card["number"], reason="synthetic reason")
     return worker.ask(REVIEW_QUESTION, REVIEW_OPTIONS, task=card["number"], context=REVIEW_CONTEXT)
 
 
@@ -177,7 +177,7 @@ def test_ordinary_agent_work_does_not_require_a_person(fresh, actor):
     for destination in ("todo", "doing"):
         card = worker.task_add(title="Ordinary work", status="backlog", board="work")
         if card["proposal_status"] == "pending":
-            fresh.creator.service.task_approve(card["number"])
+            fresh.creator.service.task_approve(card["number"], reason="synthetic reason")
         worker.task_update(card["number"], status=destination)
         assert worker.task_update(card["number"], status="done")["status"] == "done"
 
@@ -198,11 +198,13 @@ def test_pending_child_proposal_requires_real_parent_approval(hub, fresh, surfac
         with pytest.raises(ToolError):
             connection.service.task_take_next(task=number)
     for connection in (fresh.trusted, fresh.subagent):
-        assert not mcp(hub, connection.token, "task_approve", task=number)[0]
+        assert not mcp(
+            hub, connection.token, "task_approve", task=number, reason="synthetic reason"
+        )[0]
         assert api(hub, connection.token, "POST", f"/api/cards/{number}/approve", {})[0] == 403
     assert fresh.owner.task_show(number) == before
     assert events.after(hub.db, fresh.workspace) == emitted
-    assert mcp(hub, fresh.creator.token, "task_approve", task=number)[0]
+    assert mcp(hub, fresh.creator.token, "task_approve", task=number, reason="synthetic reason")[0]
     approved = child.task_show(number)
     assert approved["approved_by"] == fresh.creator.service.principal.actor
     assert approved["proposal_status"] == "approved"
@@ -256,7 +258,7 @@ def test_handoff_cannot_clear_a_pending_person_recipient(hub, fresh, surface):
 @pytest.mark.parametrize("actor", ["owner", "parent"])
 def test_rejected_child_proposal_cannot_be_released_by_handoff(hub, fresh, lane, actor):
     proposed = fresh.subagent.service.task_add(title="Rejected proposal", board="work")
-    fresh.creator.service.task_approve(proposed["number"], approve=False)
+    fresh.creator.service.task_approve(proposed["number"], approve=False, reason="synthetic reason")
     # Old versions could leave a rejected proposal in an active lane. A
     # transfer is still not an approval, even when requested by its owner.
     with fresh.owner.store.transaction() as conn:

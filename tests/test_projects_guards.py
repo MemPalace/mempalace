@@ -109,6 +109,6 @@ def test_manual_coordinator_release_unchanged(projects_hub):
         h.a1,
         "POST",
         f"/api/cards/{proposal['number']}/approve",
-        {"version": proposal["version"], "approve": True},
+        {"version": proposal["version"], "approve": True, "reason": "synthetic reason"},
     )
     assert approved[0] == 200 and approved[1]["proposal_status"] == "approved"

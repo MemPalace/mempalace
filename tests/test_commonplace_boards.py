@@ -21,7 +21,7 @@ from tests._commonplace_helpers import (
 )
 
 CARD_KEYS = set(
-    "review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number pr_state pr_head pr_reported_at checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id".split()
+    "escalated_to review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number pr_state pr_head pr_reported_at checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id".split()
 )
 
 
@@ -936,12 +936,18 @@ def test_needs_me_member_filters_asks_by_user_and_other_buckets_by_wing(hub, env
 
     clock(monkeypatch, ready["claim_until"])
     result = reader.needs_me()
-    assert {key: {c["number"] for c in result[key]} for key in result if key != "count"} == {
+    assert {
+        key: {c["number"] for c in result[key]}
+        for key in result
+        if key not in ("count", "approvals_truncated")
+    } == {
         "asks": {addressed["number"]},
         "done_review": {done["number"]},
         "backlog_from_agents": set(),
         "ready_to_merge": set(),
         "stale": set(),
+        "plans": set(),
+        "approvals": set(),
     }
     assert result["count"] == 2
     assert all(item["actions"] == [] for key in ("asks", "done_review") for item in result[key])

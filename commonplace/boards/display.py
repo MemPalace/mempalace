@@ -36,6 +36,24 @@ def merge_ready(card, cutoff) -> bool:
     )
 
 
+def _waiting_on_person(row):
+    return (
+        bool(row.get("ask"))
+        or any((row.get(key) or "").startswith("user:") for key in ("assignee", "ask_to"))
+        or (row["status"] == "backlog" and (row.get("return_to") or "").startswith("user:"))
+    )
+
+
+def plan_waiting(card):
+    """The plan label requests review without gating the holder's work."""
+    return (
+        card["status"] in ("todo", "doing")
+        and "plan" in (card.get("labels") or ())
+        and card.get("proposal_status") not in ("pending", "rejected")
+        and not _waiting_on_person(card)
+    )
+
+
 def need(card, *, me=None, owner=False, now=None, person_release: bool | None = None) -> str:
     """One of ``NEEDS`` for a public card dict, seen by actor ``me``.
 
@@ -54,8 +72,8 @@ def need(card, *, me=None, owner=False, now=None, person_release: bool | None = 
     ask_to = card.get("ask_to")
     if card.get("ask") and (ask_to == me if ask_to else owner):
         return "you"
-    if "plan" in (card.get("labels") or ()) or (status == "review" and not card.get("ask")):
-        return "plan"
+    if plan_waiting(card):
+        return "you" if owner and person_release else "plan"
     cutoff = stale_before(now)
     if merge_ready(card, cutoff):
         return "merge"

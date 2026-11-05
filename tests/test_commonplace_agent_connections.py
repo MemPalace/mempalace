@@ -233,7 +233,9 @@ def test_child_proposals_still_need_parent_approval_after_parent_rotation(hub, f
         cookie=fresh.cookie,
         body={},
     )
-    assert not tool(hub, rotated["token"], "task_approve", task=number)[0]
+    assert not tool(hub, rotated["token"], "task_approve", task=number, reason="synthetic reason")[
+        0
+    ]
     assert not tool(hub, child["token"], "task_take_next", task=number)[0]
 
 

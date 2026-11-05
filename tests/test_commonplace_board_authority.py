@@ -62,16 +62,14 @@ def fresh(hub):
     )
 
 
-@pytest.mark.parametrize(
-    "trust,wing", [("untrusted", "inbox"), ("standard", "shared"), ("trusted", "inbox")]
-)
+@pytest.mark.parametrize("trust,wing", [("untrusted", "inbox"), ("trusted", "inbox")])
 def test_parent_approval_does_not_release_restricted_origin(fresh, trust, wing):
     top = fresh.connect("top")
     parent = fresh.connect("parent", parent=top.id, trust=trust, write_wing=wing)
     child = fresh.connect("child", parent=parent.id, trust="untrusted", write_wing="inbox")
     receiver = fresh.connect("receiver")
     proposal = child.work.task_add(board="work", title="Child follow-up")
-    approved = parent.work.task_approve(proposal["number"])
+    approved = parent.work.task_approve(proposal["number"], reason="synthetic reason")
     assert approved["proposal_status"] == "approved"
     held = child.work.task_take_next(task=proposal["number"])
     assert held["status"] == "doing"  # Approval still authorizes the child's own work.
@@ -91,7 +89,7 @@ def test_authorized_approval_releases_restricted_work(fresh, approver):
     receiver = fresh.connect("receiver")
     proposal = child.work.task_add(board="work", title="Approved follow-up")
     authority = fresh.owner if approver == "owner" else parent.work
-    approved = authority.task_approve(proposal["number"])
+    approved = authority.task_approve(proposal["number"], reason="synthetic reason")
     assert approved["approved_by"] == authority.principal.actor
     child.work.task_take_next(task=proposal["number"])
     child.work.task_handoff(proposal["number"], receiver.principal.actor, "Continue this work")
@@ -119,7 +117,7 @@ def test_legacy_approval_marker_cannot_release_or_block_safe_queue(hub, fresh, k
         if kind == "revoked":
             hub.db.revoke(old.id, actor=fresh.user, workspace_ref=fresh.workspace)
     legacy = creator.work.task_add(board="work", title="Legacy restricted work")
-    fresh.owner.task_approve(legacy["number"])
+    fresh.owner.task_approve(legacy["number"], reason="synthetic reason")
     creator.work.task_take_next(task=legacy["number"])
     creator.work.task_handoff(legacy["number"], receiver.principal.actor, "Continue this work")
     # Simulate an existing marker from an older server, never a live data repair.
@@ -156,7 +154,7 @@ def test_legacy_person_release_requires_an_active_workspace_owner(hub, fresh, ki
     creator = fresh.connect("creator", parent=top.id, trust="untrusted", write_wing="inbox")
     receiver = fresh.connect("receiver")
     legacy = creator.work.task_add(board="work", title="Old release")
-    fresh.owner.task_approve(legacy["number"])
+    fresh.owner.task_approve(legacy["number"], reason="synthetic reason")
     creator.work.task_take_next(task=legacy["number"])
     creator.work.task_handoff(legacy["number"], receiver.principal.actor, "Continue this work")
     # Test-only historical person marker; never a live data repair.
@@ -255,10 +253,12 @@ def test_reject_is_not_an_approval_and_parent_cannot_reopen(fresh):
     parent = fresh.connect("parent")
     child = fresh.connect("child", parent=parent.id)
     proposal = child.work.task_add(board="work", title="Proposed work")
-    rejected = parent.work.task_approve(proposal["number"], approve=False)
+    rejected = parent.work.task_approve(
+        proposal["number"], approve=False, reason="synthetic reason"
+    )
     assert rejected["proposal_status"] == "rejected" and rejected["approved_by"] is None
     with pytest.raises(ToolError):
-        parent.work.task_approve(proposal["number"])
+        parent.work.task_approve(proposal["number"], reason="synthetic reason")
     with pytest.raises(ToolError):
         child.work.task_take_next(task=proposal["number"])
     assert fresh.owner.task_show(proposal["number"])["can_approve"]
@@ -268,7 +268,9 @@ def test_owner_can_reapprove_a_rejected_proposal(hub, fresh):
     parent = fresh.connect("parent")
     child = fresh.connect("child", parent=parent.id)
     proposal = child.work.task_add(board="work", title="Rejected work")
-    rejected = parent.work.task_approve(proposal["number"], approve=False)
+    rejected = parent.work.task_approve(
+        proposal["number"], approve=False, reason="synthetic reason"
+    )
     status, restored = api(
         hub,
         fresh.cookie,
@@ -284,7 +286,9 @@ def test_owner_can_dismiss_rejected_work_without_parent_reopening(hub, fresh):
     parent = fresh.connect("parent")
     child = fresh.connect("child", parent=parent.id)
     proposal = child.work.task_add(board="work", title="Dismissed work")
-    rejected = parent.work.task_approve(proposal["number"], approve=False)
+    rejected = parent.work.task_approve(
+        proposal["number"], approve=False, reason="synthetic reason"
+    )
     status, closed = api(
         hub,
         fresh.cookie,
@@ -295,6 +299,15 @@ def test_owner_can_dismiss_rejected_work_without_parent_reopening(hub, fresh):
     assert status == 200 and closed["status"] == "done", closed
     assert closed["approved_by"] is None and not closed["can_approve"]
     with pytest.raises(ToolError):
-        parent.work.task_approve(proposal["number"])
+        parent.work.task_approve(proposal["number"], reason="synthetic reason")
     with pytest.raises(ToolError):
         child.work.task_update(proposal["number"], status="todo")
+
+
+def test_unrestricted_standard_parent_releases(fresh):
+    top = fresh.connect("root-standard")
+    parent = fresh.connect("parent-standard", parent=top.id, trust="standard")
+    child = fresh.connect("child-standard", parent=parent.id, trust="untrusted", write_wing="inbox")
+    proposal = child.work.task_add(board="work", title="Synthetic standard parent release")
+    result = parent.work.task_approve(proposal["number"], reason="synthetic reason")
+    assert result["approved_by"] == parent.principal.actor

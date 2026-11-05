@@ -17,7 +17,7 @@ Call `session_start` automatically at session start, resume and after compaction
 2. A card that came back from the user shows their decision on a `decision by` line. Act on it first.
 3. Every active workstream needs a card. If none matches, use `task_add title=… body=… claim=true` (add `board` outside a repo). Top-level agents start directly in `todo` or `doing`, including slim and inbox connections.
 4. Orchestrators create cards assigned to each subagent with `task_add assignee=<child connection>`. Add `claim=true` to start that child's work immediately.
-5. A subagent's own new card is a pending proposal in backlog. Its authenticated direct parent is shown as `agent parent` and `parent:`. The parent uses `task_approve task=#n approve=true` (or `false` to reject); a signed-in workspace owner may also decide. Do not start proposed work before approval.
+5. A subagent's own new card is a pending proposal in backlog. Its authenticated direct parent is shown as `agent parent` and `parent:`. The parent, top-level agent, board coordinator or owner uses `task_approve task=#n approve=true reason=…` (or `false` to reject). Do not start proposed work before approval.
 6. Use `task_take_next` or `task_update task=#n status=doing` to claim approved work. Other holders and pending person decisions stay protected.
 
 ## Rules
@@ -31,6 +31,8 @@ When replacing your complete own rule set, call `rules_publish` with `replace=tr
 ## While working
 
 - Report progress with `task_update task=#n status_line="<what you are doing now>"` at every real step. Call `task_heartbeat task=#n` at least every 20 minutes, including while waiting on checks. Holder writes renew the 30-minute claim. Expiry keeps the assignee and `doing` lane, with an explicit `expired` indication; heartbeat to resume.
+- On each heartbeat, `needs_me` and `session_start`, handle approvals: approve or reject with `reason=…`, or `task_approve escalate=true reason=…` for the owner. Never approve your own proposal or a card you hold. Agents reject proposals and unclaimed (todo) plan cards. A doing plan can only be approved or escalated; the owner may reject it.
+- The `plan` label is advisory; a doing holder may drop it. Authorized approvals release restricted work.
 - If you supervise agents, `task_list mine=true` lists their stuck claims; resume the agent or `ask` the owner.
 - Record the work: `task_update task=#n repo=… branch=… pr=<url>` as soon as they exist.
 - After each push to the PR: `python -m commonplace.callstack --base origin/<base branch> --card <n> --hub <hub URL>` so the reviewer sees the change as a call tree. There is no default hub: pass `--hub` or set `COMMONPLACE_URL`; the token comes from `COMMONPLACE_TOKEN` (or `--token`) and is sent to that hub only, never through a redirect.
@@ -87,7 +89,7 @@ The hub only stores and wakes. Replies posted with `space_post` do not trigger w
 ## Decisions
 
 `needs_me`: asks and done reviews addressed to the token's user (or with no target),
-merge asks backed by a fresh open-PR head report, and pending proposals only a person can release.
+merge asks backed by a fresh open-PR head report, and pending proposals and plan reviews no live agent can approve, or escalated.
 Stuck claims go to each available direct parent, top-level agent or owner-appointed board coordinator;
 the person owner sees them only when none is live and able to read, write and ask for help.
 An agent sees only claims it supervises, with notification only: resume the holder or ask the owner.

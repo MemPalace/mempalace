@@ -38,6 +38,8 @@ def agent(fresh, name, shape=("untrusted", "inbox"), **kwargs):
 
 def change(hub, fresh, auth, number, method="PATCH", suffix="", **body):
     before = fresh.owner.task_show(number)
+    if suffix == "/approve" and isinstance(auth, str):
+        body.setdefault("reason", "synthetic reason")
     return api(
         hub,
         auth,
@@ -478,7 +480,7 @@ def test_unrelated_release_and_cross_root_parent_are_refused(hub, fresh):
     before = fresh.owner.task_show(number)
     assert change(hub, fresh, unrelated.token, number, "POST", "/approve")[0] == 403
     assert fresh.owner.task_show(number) == before
-    approved = allowed(lambda: mid.work.task_approve(number))
+    approved = allowed(lambda: mid.work.task_approve(number, reason="synthetic reason"))
     assert approved["approved_by"] is None
     take(hub, child, number)
     handoff(child, number)
@@ -505,7 +507,7 @@ def test_pending_release_lapses_live(hub, fresh, authority):
     child = agent(fresh, "child", parent=root.id)
     receiver = agent(fresh, "receiver")
     number = proposed(child)
-    allowed(lambda: root.work.task_approve(number))
+    allowed(lambda: root.work.task_approve(number, reason="synthetic reason"))
     take(hub, child, number)
     handoff(child, number)
     if authority == "root":
@@ -632,7 +634,7 @@ def test_rejected_reapproval_stays_owner_only(hub, fresh, authority):
     child = agent(fresh, "child", parent=root.id)
     k = coordinator(hub, fresh)
     number = proposed(child)
-    allowed(lambda: root.work.task_approve(number, approve=False))
+    allowed(lambda: root.work.task_approve(number, approve=False, reason="synthetic reason"))
     before = fresh.owner.task_show(number)
     who = root if authority == "root" else k
     status, reply = change(hub, fresh, who.token, number, "POST", "/approve")

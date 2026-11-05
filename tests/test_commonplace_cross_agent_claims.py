@@ -170,7 +170,7 @@ def test_default_inbox_reservation_requires_owner_release_for_other_agents(hub, 
     )
     proposal = add(hub, child)
     number = proposal["number"]
-    assert mcp(hub, mid.token, "task_approve", task=number)[0]
+    assert mcp(hub, mid.token, "task_approve", task=number, reason="synthetic reason")[0]
     assert show(hub, child, number)["approved_by"] is None
     assert mcp(hub, child.token, "task_take_next", task=number)[0]
     assert mcp(
@@ -219,16 +219,25 @@ def test_child_proposals_require_the_direct_parents_approval(hub, fresh, reject)
     assert proposed["proposed_to"] == fresh.first.principal.actor
     assert proposed["assignee"] == child.principal.actor and proposed["claim_until"] is None
     for agent in (fresh.second, child):
-        assert not mcp(hub, agent.token, "task_approve", task=number)[0]
+        assert not mcp(hub, agent.token, "task_approve", task=number, reason="synthetic reason")[0]
         assert show(hub, child, number) == proposed
     if reject:
-        assert mcp(hub, fresh.first.token, "task_approve", task=number, approve=False)[0]
+        assert mcp(
+            hub,
+            fresh.first.token,
+            "task_approve",
+            task=number,
+            approve=False,
+            reason="synthetic reason",
+        )[0]
         proposed = show(hub, child, number)
         assert proposed["proposal_status"] == "rejected"
     for agent in (fresh.first, fresh.second, child):
         refused_claims(hub, agent, proposed)
     if not reject:
-        assert mcp(hub, fresh.first.token, "task_approve", task=number)[0]
+        assert mcp(hub, fresh.first.token, "task_approve", task=number, reason="synthetic reason")[
+            0
+        ]
         approved = show(hub, child, number)
         assert approved["proposal_status"] == "approved"
         assert approved["approved_by"] == fresh.first.principal.actor

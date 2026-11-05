@@ -16,7 +16,7 @@ _NEEDS_EVENTS = {
 def current(gateway, owner) -> dict[int, set[str]]:
     report = service.BoardService(ToolContext(principal=owner, gateway=gateway)).needs_me()
     result = {}
-    for bucket in ("asks", "done_review", "backlog_from_agents", "stale"):
+    for bucket in ("asks", "done_review", "backlog_from_agents", "plans", "stale"):
         category = "blocked" if bucket == "stale" else "needs_you"
         for card in report[bucket]:
             result.setdefault(card["number"], set()).add(category)

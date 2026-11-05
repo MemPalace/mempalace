@@ -7,6 +7,7 @@ import logging
 import re
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from urllib.parse import urlparse
 
 from commonplace import events, privacy
@@ -16,7 +17,13 @@ from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
 
 from .digest import digest
-from .display import merge_ready, people, stale_before
+from .display import (
+    _waiting_on_person as _display_waiting,
+    merge_ready,
+    people,
+    plan_waiting,
+    stale_before,
+)
 from .store import (
     STATUSES,
     BoardStore,
@@ -31,6 +38,7 @@ from .store import (
 )
 
 logger = logging.getLogger(__name__)
+_UNSET = object()
 
 
 def open_store(workspace_dir, *, legacy_origin=None, db=None, workspace_id=None) -> BoardStore:
@@ -238,11 +246,30 @@ def _can_coordinate(principal, wing):
 
 
 def _waiting_on_person(row):
-    return (
-        bool(row["ask"])
-        or any((row[key] or "").startswith("user:") for key in ("assignee", "ask_to"))
-        or (row["status"] == "backlog" and (row["return_to"] or "").startswith("user:"))
-    )
+    return _display_waiting(dict(row))
+
+
+def _plan_waiting(row):
+    data = dict(row)
+    if isinstance(data.get("labels"), str):
+        data["labels"] = json.loads(data["labels"] or "[]")
+    return plan_waiting(data)
+
+
+APPROVALS_TRUNCATED = "(list truncated: more approvals may be waiting; call needs_me)"
+
+
+def approvals_text(report):
+    lines = [
+        f"#{c['number']} {json.dumps(c['title'], ensure_ascii=False)} ({c['approval_role']}, {c['approval_kind']})"
+        for c in report["items"]
+    ]
+    text = "approvals waiting on you:\n" + "\n".join(lines) if lines else ""
+    if report["truncated"]:
+        text += ("\n" if text else "") + APPROVALS_TRUNCATED
+    elif report.get("more"):
+        text += "\n(more approvals waiting; call needs_me)"
+    return text
 
 
 def _owner(principal, *, trusted_read=False):
@@ -266,7 +293,16 @@ def needs_me(store, principal, *, release=None, names=None, supervisors=None) ->
     """Decision queue: asks, done_review, backlog_from_agents, ready_to_merge, stale, count."""
     _owner(principal, trusted_read=True)
     result = {
-        key: [] for key in ("asks", "done_review", "backlog_from_agents", "ready_to_merge", "stale")
+        key: []
+        for key in (
+            "asks",
+            "done_review",
+            "backlog_from_agents",
+            "ready_to_merge",
+            "stale",
+            "plans",
+            "approvals",
+        )
     }
     cutoff = stale_before()
     names = names or (lambda text: text)
@@ -300,6 +336,13 @@ def needs_me(store, principal, *, release=None, names=None, supervisors=None) ->
             routes = ()
             if _stuck(row, cutoff):
                 routes = supervisors(row) if supervisors is not None else ()
+            if (
+                _plan_waiting(row)
+                and (release is None or release(row))
+                and (not _stuck(row, cutoff) or (principal.person and routes))
+            ):
+                kind = "plans"
+            if _stuck(row, cutoff):
                 if (principal.person and not routes) or (
                     not principal.person and principal.actor in {a for a, _ in routes}
                 ):
@@ -325,6 +368,13 @@ def needs_me(store, principal, *, release=None, names=None, supervisors=None) ->
                 else:
                     why = f"{asker} asks {recipient}: {ask_line}"
                     actions = ["answer"]
+            elif kind == "plans":
+                why = (
+                    "Awaiting plan review. Approve or reject it."
+                    if principal.person
+                    else "The owner must review this plan."
+                )
+                actions = ["approve", "reject"]
             elif kind == "backlog_from_agents":
                 creator = actor(row["created_by"])
                 decision = (
@@ -351,6 +401,15 @@ def needs_me(store, principal, *, release=None, names=None, supervisors=None) ->
                 else:
                     role = next(role for a, role in routes if a == principal.actor)
                     why += f". You are its {role}: resume {holder}, or ask the owner."
+            if "escalated_to" in row.keys() and row["escalated_to"]:
+                handoff = conn.execute(
+                    "SELECT reason FROM task_events WHERE task_id=? AND kind='handoff' "
+                    "AND target=? AND reason IS NOT NULL ORDER BY id DESC LIMIT 1",
+                    (row["id"], row["escalated_to"]),
+                ).fetchone()
+                why += " Escalated to the owner."
+                if handoff and handoff["reason"]:
+                    why += " Reason: " + json.dumps(handoff["reason"], ensure_ascii=False)
             item.update(why=why, actions=actions if principal.person else [])
             result[kind].append(item)
     result["count"] = len({c["number"] for bucket in result.values() for c in bucket})
@@ -358,14 +417,18 @@ def needs_me(store, principal, *, release=None, names=None, supervisors=None) ->
 
 
 class BoardService:
-    def __init__(self, ctx):
+    def __init__(self, ctx, *, store=True):
         self.ctx = ctx
         self.principal = ctx.principal
-        self.store = open_store(
-            ctx.workspace_dir(),
-            legacy_origin=self._legacy_restricted_origin,
-            db=ctx.db,
-            workspace_id=self.principal.workspace_id,
+        self.store = (
+            open_store(
+                ctx.workspace_dir(),
+                legacy_origin=self._legacy_restricted_origin,
+                db=ctx.db,
+                workspace_id=self.principal.workspace_id,
+            )
+            if store
+            else None
         )
         self.pending = []
 
@@ -441,34 +504,160 @@ class BoardService:
             return {}
         return dict(pr_state=None, pr_head=None, pr_reported_at=None, checks="")
 
-    def _needs_person_release(self, row):
-        if row["status"] != "backlog" or row["proposal_status"] != "pending":
-            return False
-        to = row["proposed_to"] or ""
-        if to.startswith("user:"):
-            return True
-        try:
-            for q in self._release_candidates(row):
-                if q is None or q.person:
-                    continue
-                if not (
-                    q.policy.has_scope("memory:write")
-                    and q.policy.can_read_wing(row["board_wing"])
-                    and q.policy.tool_visible("task_approve")
-                ):
-                    continue
-                parent = (
-                    to == q.actor
-                    and self.ctx.db.connection(
-                        row["created_by"].removeprefix("conn:"), self.principal.workspace_id
-                    )["parent_id"]
-                    == q.connection_id
+    def _release_role(self, q, row):
+        """Authority shared by live decisions and stored parent releases."""
+        if q.person:
+            return "owner" if q.role == "owner" else None
+        if row["assignee"] == q.actor:
+            return None
+        if row["proposed_to"] == q.actor:
+            try:
+                creator = self.ctx.db.connection(
+                    row["created_by"].removeprefix("conn:"), q.workspace_id
                 )
-                if parent or self._owning_top_level(row, q) or self._coordinates(q, row):
-                    return False
+                if creator["parent_id"] == q.connection_id:
+                    return "parent"
+            except (ControlError, ValueError, TypeError):
+                pass
+        if not _plan_waiting(row) and self._owning_top_level(row, q):
+            return "top-level agent"
+        if self._coordinates(q, row):
+            return "board coordinator"
+        if row["created_by"] == q.actor and (row["assignee"] or "").startswith("conn:"):
+            try:
+                holder = self.ctx.db.connection(row["assignee"][5:], q.workspace_id)
+                if holder["parent_id"] == q.connection_id:
+                    return "creator-parent"
+            except (ControlError, ValueError, TypeError):
+                pass
+        return None
+
+    def _approval_role(self, q, row):
+        if not q.person and "escalated_to" in row.keys() and row["escalated_to"]:
+            return None
+        role = self._release_role(q, row)
+        if role == "creator-parent" and not _plan_waiting(row):
+            return None
+        return role
+
+    @staticmethod
+    def _approval_visible(q, row):
+        try:
+            _owner(q, trusted_read=True)
+        except ToolError:
+            return False
+        return (
+            q.policy.has_scope("memory:read")
+            and q.policy.has_scope("memory:write")
+            and q.policy.can_read_wing(row["board_wing"])
+            and q.policy.tool_visible("task_approve")
+        )
+
+    def _live_approvers(self, row):
+        candidates = list(self._release_candidates(row))
+        if _plan_waiting(row) and (row["created_by"] or "").startswith("conn:"):
+            candidates.append(self._live_connection(row["created_by"][5:]))
+        live = {}
+        for q in candidates:
+            if q is not None and self._approval_visible(q, row):
+                role = self._approval_role(q, row)
+                if role:
+                    live[q.actor] = role
+        return tuple(live.items())
+
+    def _needs_person_release(self, row):
+        if "escalated_to" in row.keys() and row["escalated_to"]:
             return True
-        except (ControlError, ValueError, TypeError):
+        if not (
+            _plan_waiting(row)
+            or (row["status"] == "backlog" and row["proposal_status"] == "pending")
+        ):
+            return False
+        if (row["proposed_to"] or "").startswith("user:"):
             return True
+        return not self._live_approvers(row)
+
+    def approvals_for_me(self, conn=None, *, limit=10, budget="tools"):
+        """Bound role checks after SQL and visibility filtering, without a row cap."""
+        if conn is None:
+            with self.store.connection() as conn:
+                return self.approvals_for_me(conn, limit=limit, budget=budget)
+        p = self.principal
+        result = dict(items=[], truncated=False, more=False)
+        try:
+            _owner(p, trusted_read=True)
+        except ToolError:
+            return result
+        if (
+            p.person
+            or not p.policy.has_scope("memory:read")
+            or not p.policy.has_scope("memory:write")
+            or not p.policy.tool_visible("task_approve")
+        ):
+            return result
+        descendants = []
+        if p.parent_connection_id is None:
+            connections = self.ctx.db.connections(p.workspace_id)
+            ids = {p.connection_id}
+            while True:
+                children = {c["id"] for c in connections if c["parent_id"] in ids}
+                added = children - ids
+                if not added:
+                    break
+                ids.update(added)
+            descendants = [
+                "conn:" + c["name"]
+                for c in connections
+                if c["id"] in ids and c["id"] != p.connection_id
+            ]
+        actors = [p.actor, *descendants]
+        placeholders = ",".join("?" for _ in actors)
+        board_columns = {r[1] for r in conn.execute("PRAGMA table_info(boards)")}
+        coordinator = "b.coordinator" if "coordinator" in board_columns else "NULL"
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
+        escalated = "AND t.escalated_to IS NULL " if "escalated_to" in columns else ""
+        sql = (
+            f"SELECT t.*, b.slug AS board,b.wing AS board_wing,{coordinator} AS board_coordinator "
+            "FROM tasks t JOIN boards b ON b.id=t.board_id WHERE t.id>? AND t.status!='done' "
+            + escalated
+            + "AND (t.proposal_status='pending' OR (t.status IN ('todo','doing') AND t.labels LIKE '%\"plan\"%')) "
+            f"AND (t.proposed_to=? OR t.created_by IN ({placeholders}) OR {coordinator}=?) ORDER BY t.id LIMIT 50"
+        )
+        cap = 60 if budget == "session" else 200
+        checked, last = 0, 0
+        started = monotonic()
+        with self._projection():
+            while True:
+                rows = conn.execute(sql, (last, p.actor, *actors, p.actor)).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    last = row["id"]
+                    if not self._approval_visible(p, row):
+                        continue
+                    if checked >= cap:
+                        result["truncated"] = True
+                        break
+                    checked += 1
+                    role = self._approval_role(p, row)
+                    if role and (row["proposal_status"] == "pending" or _plan_waiting(row)):
+                        item = self._card(conn, row, approval_role=role)
+                        item.update(
+                            approval_role=role,
+                            approval_kind="plan" if _plan_waiting(row) else "proposal",
+                            why=f"You are its {role}: approve or reject with a reason, or escalate.",
+                            actions=[],
+                        )
+                        result["items"].append(item)
+                        if len(result["items"]) > limit:
+                            result["more"] = True
+                            break
+                if result["truncated"] or result["more"] or len(rows) < 50:
+                    break
+        result["items"] = result["items"][:limit]
+        result["role_checks"] = checked
+        result["elapsed_ms"] = (monotonic() - started) * 1000
+        return result
 
     def _supervisors(self, row):
         cache = getattr(self, "_projection_cache", None)
@@ -514,9 +703,16 @@ class BoardService:
         cache[key] = tuple(routes.items())
         return cache[key]
 
-    def _card(self, conn, row, principal=None):
+    def _card(self, conn, row, principal=None, *, approval_role=None):
+        q = principal or self.principal
         with self._projection():
-            return card(conn, row, principal or self.principal, release=self._needs_person_release)
+            return card(
+                conn,
+                row,
+                q,
+                release=self._needs_person_release,
+                approver=lambda row: approval_role or self._approval_role(q, row),
+            )
 
     def _legacy_restricted_origin(self, row):
         if row["stamp_trust"] not in ("trusted", "standard"):
@@ -680,10 +876,15 @@ class BoardService:
             return bool(
                 approver is not None
                 and approver.actor == actor
+                and row["assignee"] != actor
                 and approver.policy.has_scope("memory:write")
                 and approver.policy.can_read_wing(row["board_wing"])
                 and (
-                    _trusted_agent(approver)
+                    (
+                        not _restricted(approver)
+                        and self._release_role(approver, row) in ("parent", "creator-parent")
+                    )
+                    or _trusted_agent(approver)
                     or self._coordinates(approver, row)
                     or self._owning_top_level(row, approver)
                 )
@@ -907,9 +1108,10 @@ class BoardService:
             "%Y-%m-%dT%H:%M:%SZ"
         )
 
-    def _set(self, conn, row, updates):
+    def _set(self, conn, row, updates, *, release_origin=True):
         if (
-            self.principal.person
+            release_origin
+            and self.principal.person
             and self.principal.role == "owner"
             and row["restricted_origin"] == 1
             and updates.get("status") in ("todo", "doing")
@@ -1353,7 +1555,11 @@ class BoardService:
                     "at": r["created_at"],
                     "choice": r["choice"],
                     "target": r["target"],
-                    **({"reason": r["reason"]} if r["kind"] == "release" else {}),
+                    **(
+                        {"reason": r["reason"]}
+                        if r["kind"] == "release" or r["reason"] is not None
+                        else {}
+                    ),
                     # Events that opened an ask carry the choices offered, verbatim.
                     **(
                         {"options": json.loads(r["options"] or "[]"), "context": r["context"]}
@@ -1621,61 +1827,99 @@ class BoardService:
                 claim=claim,
             )
 
-    def task_approve(self, task, approve=True, version=None):
-        if not isinstance(approve, bool):
-            raise ToolError("no: approve must be a boolean")
+    def task_approve(self, task, approve=_UNSET, version=None, reason=None, escalate=False):
         with self.transaction() as conn:
             row, board = self._get(conn, task)
             self._write(board, submission=True)
             self._version(conn, row, version)
             p = self.principal
-            owner = p.person and p.role == "owner"
-            parent = False
-            if not p.person and row["proposed_to"] == p.actor:
-                creator = self.ctx.db.connection(
-                    row["created_by"].removeprefix("conn:"), p.workspace_id
-                )
-                parent = creator["parent_id"] == p.connection_id
-            coordinator = self._coordinates(p, row)
-            root = self._owning_top_level(row, p)
-            if not (owner or parent or coordinator or root):
+            role = self._approval_role(p, row)
+            owner = role == "owner"
+            if not p.person and row["escalated_to"]:
+                raise ToolError("no: escalated to the owner, who decides")
+            if not role:
                 raise ToolError(
                     "no: only the direct parent, its top-level agent, the board coordinator or "
                     "the signed-in workspace owner may approve proposals"
                 )
-            if row["proposal_status"] != "pending" and not (
-                owner and row["proposal_status"] == "rejected"
+            plan = _plan_waiting(row)
+            if not (
+                plan
+                or row["proposal_status"] == "pending"
+                or (owner and row["proposal_status"] == "rejected")
             ):
-                raise ToolError("no: card is not a pending proposal")
-            status = "todo" if approve else "backlog"
-            self._set(
-                conn,
-                row,
-                {
-                    "proposal_status": "approved" if approve else "rejected",
-                    "approved_by": p.actor
-                    if approve
-                    and (
-                        owner
-                        or row["restricted_origin"] == 0
-                        or _trusted_agent(p)
-                        or coordinator
-                        or root
+                raise ToolError("no: card is not a pending proposal or a plan awaiting review")
+            if not isinstance(escalate, bool):
+                raise ToolError("no: escalate must be a boolean")
+            if escalate and p.person:
+                raise ToolError("no: only agents may escalate to the owner")
+            if escalate and approve is not _UNSET:
+                raise ToolError("no: agents escalate without approve")
+            if approve is not _UNSET and not isinstance(approve, bool):
+                raise ToolError("no: approve must be a boolean")
+            if isinstance(reason, str) and len(reason) > 500:
+                raise ToolError("no: reason must be at most 500 characters")
+            if reason is not None or not p.person:
+                reason = validate_text(reason, "reason", required=not p.person, limit=500)
+            if escalate:
+                target = self._owner_actor()
+                self._set(conn, row, {"escalated_to": target})
+                self._log(
+                    conn,
+                    row["id"],
+                    "handoff",
+                    reason=reason,
+                    target=target,
+                    flags=flags_for(reason),
+                )
+                self._emit(conn, row["id"], "card.review_needed", ask_to=target, return_to=p.actor)
+                return self._card(conn, task_row(conn, row["id"]), p)
+            approve = True if approve is _UNSET else approve
+            if plan and not approve and not owner and row["status"] == "doing":
+                raise ToolError(
+                    "no: a held plan card can only be approved or escalated; the owner may reject it"
+                )
+            changes = {"escalated_to": None} if owner else {}
+            if plan:
+                if approve:
+                    changes["labels"] = json.dumps(
+                        [label for label in json.loads(row["labels"] or "[]") if label != "plan"]
                     )
-                    else None,
-                    "status": status,
-                },
-            )
+                else:
+                    changes.update(status="backlog", claim_until=None, claim_from=None)
+            else:
+                changes.update(
+                    proposal_status="approved" if approve else "rejected",
+                    status="todo" if approve else "backlog",
+                )
+                if approve:
+                    changes["labels"] = json.dumps(
+                        [label for label in json.loads(row["labels"] or "[]") if label != "plan"]
+                    )
+            if approve and not self._origin_released(row):
+                candidate = dict(row)
+                candidate.update(approved_by=p.actor, proposal_status="approved")
+                if self._origin_released(candidate):
+                    changes["approved_by"] = p.actor
+            self._set(conn, row, changes, release_origin=False)
+            status = changes.get("status", row["status"])
             self._log(
                 conn,
                 row["id"],
-                "decide",
-                choice="approve" if approve else "reject",
+                ("edit" if approve else "move") if plan else "decide",
+                choice=("approve" if approve else "reject") + (" plan" if plan else ""),
                 from_status=row["status"],
                 to_status=status,
                 target=row["assignee"],
+                reason=reason,
+                flags=flags_for(reason),
             )
-            self._emit(conn, row["id"], "card.moved", **{"from": row["status"], "to": status})
+            self._emit(
+                conn,
+                row["id"],
+                "card.updated" if plan and approve else "card.moved",
+                **{"from": row["status"], "to": status},
+            )
             return self._card(conn, task_row(conn, row["id"]), p)
 
     def task_heartbeat(self, task):
@@ -2411,7 +2655,27 @@ class BoardService:
                 names=lambda text: people(self.ctx, text),
                 supervisors=self._supervisors,
             )
-        return digest(groups) if format == "digest" else groups
+            approvals = (
+                self.approvals_for_me()
+                if not self.principal.person
+                else dict(items=[], truncated=False, more=False)
+            )
+            groups["approvals"] = approvals["items"]
+            groups["count"] = len(
+                {
+                    c["number"]
+                    for bucket in groups.values()
+                    if isinstance(bucket, list)
+                    for c in bucket
+                }
+            )
+            groups["approvals_truncated"] = approvals["truncated"] or approvals["more"]
+        if format == "digest":
+            result = digest(groups)
+            if groups["approvals_truncated"]:
+                result["text"] += "\n" + APPROVALS_TRUNCATED
+            return result
+        return groups
 
     def seed_card(
         self,

@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 from commonplace.extensions import ToolError
 from mempalace.sqlite_crypto import connect, row_factory
 
-from .display import need_for
+from .display import need_for, plan_waiting
 
 STATUSES = ("backlog", "todo", "doing", "review", "done")
 TASK_COLUMNS = {
@@ -34,6 +34,7 @@ TASK_COLUMNS = {
     "proposal_status": "TEXT CHECK (proposal_status IN ('pending', 'approved', 'rejected'))",
     "proposed_to": "TEXT",
     "approved_by": "TEXT",
+    "escalated_to": "TEXT",
     "review_kind": "TEXT",
     "review_context": "TEXT",
 }
@@ -121,7 +122,7 @@ def owns_card(row, actor):
     )
 
 
-def card(conn, row, principal=None, *, release=None) -> dict:
+def card(conn, row, principal=None, *, release=None, approver=None) -> dict:
     """The public card shape, deliberately independent of SQLite's schema."""
     result = {
         "number": row["id"],
@@ -138,7 +139,7 @@ def card(conn, row, principal=None, *, release=None) -> dict:
         "return_to": row["return_to"],
         "flags": json.loads(row["flags"] or "[]"),
         **{
-            key: row[key]
+            key: row[key] if key in row.keys() else None
             for key in TASK_COLUMNS
             if key not in ("labels", "parent_number", "pr_repo")
         },
@@ -153,7 +154,9 @@ def card(conn, row, principal=None, *, release=None) -> dict:
     person_owner = bool(principal and principal.person and principal.role == "owner")
     person_release = (
         release(row)
-        if release is not None and person_owner and row["proposal_status"] == "pending"
+        if release is not None
+        and person_owner
+        and (row["proposal_status"] == "pending" or plan_waiting(result))
         else None
     )
     result["need"] = need_for(result, principal, person_release=person_release)
@@ -162,14 +165,24 @@ def card(conn, row, principal=None, *, release=None) -> dict:
     )
     result["can_approve"] = bool(
         principal
-        and row["status"] == "backlog"
         and (
-            (
-                row["proposal_status"] in ("pending", "rejected")
-                and principal.person
-                and principal.role == "owner"
+            (plan_waiting(result) and (person_owner or (approver is not None and approver(row))))
+            or (
+                row["status"] == "backlog"
+                and (
+                    (
+                        row["proposal_status"] in ("pending", "rejected")
+                        and principal.person
+                        and principal.role == "owner"
+                    )
+                    or (
+                        row["proposal_status"] == "pending"
+                        and row["proposed_to"] == principal.actor
+                        and row["assignee"] != principal.actor
+                        and not result["escalated_to"]
+                    )
+                )
             )
-            or (row["proposal_status"] == "pending" and row["proposed_to"] == principal.actor)
         )
     )
     if row["parent_number"] is None:
@@ -186,7 +199,9 @@ def card(conn, row, principal=None, *, release=None) -> dict:
             fields = {**child, "labels": json.loads(child["labels"] or "[]")}
             person_release = (
                 release(child)
-                if release is not None and person_owner and child["proposal_status"] == "pending"
+                if release is not None
+                and person_owner
+                and (child["proposal_status"] == "pending" or plan_waiting(fields))
                 else None
             )
             children.append(

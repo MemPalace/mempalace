@@ -50,7 +50,7 @@ MCP tools (all `profiles` per API.md; text replies, 10–60 tokens, errors start
 | `space_post` | `board`, `text` | standard/full, trusted_only; board read/write wing + memory:write; append-only, verbatim |
 | `task_list` | `board?`, `status?`, `mine?` | |
 | `task_heartbeat` | `task` | holder-only claim renewal, including after expiry |
-| `task_approve` | `task`, `approve?`, `version?` | direct parent or signed-in owner decides pending child proposals |
+| `task_approve` | `task`, `approve?`, `version?`, `reason?`, `escalate?` | direct parent, top-level agent, board coordinator or owner decides proposals; direct parent, creator-parent, board coordinator or owner decides plan reviews; agents give a reason or escalate |
 | `task_show` | `task` | includes branch / PR / checks / status line / links |
 | `task_add` | `title`, `body?`, `board?`, `status?`, `assignee?`, `labels?`, `message_id?`, `claim?` | top-level defaults todo; claim=true or assignee=self starts doing; child-created cards are pending; parent-created child assignments are ready |
 | `task_comment` | `task`, `text` | |
@@ -151,7 +151,7 @@ Tables in the control DB: `webhooks(id, workspace_id, connection_id, owner_actor
 - Routes: `GET /app/login?t=<token>` (redeem, set cookie, 302 to `/app/`), `POST /app/logout`, `GET /app/*` static (index.html for unknown paths), `GET /api/me` → `{"user","email","workspace","actor"}`, `GET /api/events?after=<seq>` → `{"events":[…],"seq":<latest>}`, `GET /api/connections` (token list without secrets; owners).
 - Not signed in: `/app/` shows only a "Sign in" state with a token field (paste a login link token) — no helper text.
 - Screens (look B; port `design/kanban-opus-v2/` and `design/memory-map-mix/` on their branches; system fonts or the bundled Geist Mono OFL font only; no third-party requests; strict CSP):
-  - **Home** (default, nav count of what needs you): an "N things need you" box, one line per card (title + a reason from its `need`: asks, plan to approve, ready to merge, claim went stale, filed by an agent; Speak in its header; asks are answered in the card), one tile per space (worst need, open and waiting counts, Open), and a table of open tasks from `GET /api/cards` (Answer / Approve / Merge / Retake only where needed).
+  - **Home** (default, nav count of what needs you): an "N things need you" box, one line per card (title + a reason from its `need`: asks, awaiting plan review, ready to merge, claim went stale, filed by an agent; Speak in its header; asks are answered in the card), one tile per space (worst need, open and waiting counts, Open), and a table of open tasks from `GET /api/cards` (Answer / Approve / Merge / Retake only where needed).
   - **Board**: columns backlog rail, todo, doing, review, done; task rows show status dot, title, assignee, branch, PR #, elapsed time, status line, claim bar; drag & drop with version.
   - **Card panel**: as in DESIGN.md + branch/PR/checks.
   - **Memory**: search + the map (from memory-map-mix) on `/api/memory/map`, panel with verbatim text and linked cards.

@@ -197,7 +197,9 @@ def test_agents_keep_space_creation_authority_and_child_approval(signup):
     patch = {"status": "doing", "version": proposal["version"]}
     assert api(client, None, path, "PATCH", patch, token=child)[0] == 403
     assert api(client, None, path + "/approve", "POST", {}, token=child)[0] == 403
-    status, approved = api(client, None, path + "/approve", "POST", {}, token=parent)
+    status, approved = api(
+        client, None, path + "/approve", "POST", {"reason": "synthetic reason"}, token=parent
+    )
     assert status == 200 and approved["proposal_status"] == "approved"
     # The owning top-level agent releases its child's work (owner decision 3 Nov 14:17).
     assert approved["approved_by"] == "conn:parent"

@@ -3,7 +3,7 @@ import { mountMap } from "./map.js";
 import { digestSpeech } from "./digest.js";
 import { voiceInput } from "./voice.js";
 import { homeView, needItems } from "./home.js";
-import { ASKED_KEY, COPY as DECIDE_COPY, createSession, decideQueue, leftCount, offlineNow, queueKey, RELOAD_ERRORS, reduce, renderDecide, statusHTML, toolsHTML } from "./decide.js";
+import { eventItem, ASKED_KEY, COPY as DECIDE_COPY, createSession, decideQueue, leftCount, offlineNow, queueKey, RELOAD_ERRORS, reduce, renderDecide, statusHTML, toolsHTML } from "./decide.js";
 import { bindSwipe, SWIPE } from "./decide-swipe.js";
 import { planView } from "./plan.js";
 import { rulesView, rulesHandlers } from "./rules.js";
@@ -57,7 +57,7 @@ const prLink = (card) => {
   const href = pullRequestUrl(card);
   return href ? `<a href="${e(href)}" target="_blank" rel="noopener noreferrer">PR #${e(card.pr_number || "↗")}</a>` : card.pr_number ? `<span>PR #${e(card.pr_number)}</span>` : "";
 };
-const needLabels = { you: "Needs you", plan: "Plan to approve", merge: "Ready to merge", checks: "Checks running", working: "Working", expired: "Expired", idle: "Idle", done: "Done" };
+const needLabels = { you: "Needs you", plan: "Awaiting plan review", merge: "Ready to merge", checks: "Checks running", working: "Working", expired: "Expired", idle: "Idle", done: "Done" };
 function dot(card) {
   const need = needLabels[card.need] ? card.need : "idle";
   return `<i class="status-dot ${need}" data-need="${need}" role="img" aria-label="${needLabels[need]}"></i>`;
@@ -244,7 +244,7 @@ function conversation(card, { compact = false, controls = true } = {}) {
     if (ask) ask.open = true;
     else items.push({ ask: { kind: "ask", actor: card.return_to, target: card.ask_to, text: card.ask, at: card.updated_at }, open: true });
   }
-  return items.map(({ event, ...item }) => event ? `<li class="ev">${clock(event.at)}<span><span class="actor">${e(actor(event.actor))}</span> <span class="v">${e(event.kind)}${event.target ? ` → ${e(actor(event.target))}` : ""}</span></span>${event.text != null || event.choice ? `<p class="said">${e(event.choice || "")}${event.choice && event.text ? "\n" : ""}${e(event.text || "")}</p>` : ""}</li>` : askCard(card, item.ask, { ...item, compact, controls })).join("");
+  return items.map(({ event, ...item }) => event ? eventItem(event, actor) : askCard(card, item.ask, { ...item, compact, controls })).join("");
 }
 function needsCards() {
   return needItems(state.needs).map((item) => item.card);
@@ -393,7 +393,7 @@ async function cardPanel(number, epoch) {
     if (request !== state.panelRequest || epoch !== state.screen || state.route !== `#/card/${number}`) return;
     state.card = card;
     const saved = remember();
-    panel.innerHTML = `<div class="tile top"><div class="bar"><span class="id">#${card.number}</span><a href="#/board/${enc(card.board)}">${e(card.board)}</a><button class="close" data-action="close-panel" aria-label="Close card">×</button></div><span><span class="state ${e(card.status)}">${e(card.status)}</span></span><h2>${e(card.title)}</h2>${cardMeta(card)}<p class="prose">${e(card.body)}</p>${card.proposal_status ? `<p>Proposal: ${e(card.proposal_status)} · Parent: ${e(actor(card.proposed_to))}</p>` : ""}${card.can_approve ? '<button class="opt" data-action="approve-proposal">Approve</button><button class="opt" data-action="reject-proposal">Reject</button>' : ""}<div class="panel-actions"><select aria-label="Card status" id="card-status">${options(statuses, card.status)}</select><button class="opt" data-action="panel-move">Move</button><button class="opt" data-action="edit-card">Edit</button><button class="opt" data-action="handoff">Hand off</button></div>${card.linked?.length ? `<div class="linked">${card.linked.map((link) => `<a href="#/memory?id=${enc(link.drawer_id)}" class="${link.invalidated ? "gone" : ""}">${e(link.title || "Memory")}</a>`).join("")}</div>` : ""}${callTree(card)}</div><ol class="log">${conversation(card)}</ol><form class="composer" data-form="comment"><input name="text" data-draft="comment-${card.number}" aria-label="Comment" autocomplete="off" required><button>Send</button></form>`;
+    panel.innerHTML = `<div class="tile top"><div class="bar"><span class="id">#${card.number}</span><a href="#/board/${enc(card.board)}">${e(card.board)}</a><button class="close" data-action="close-panel" aria-label="Close card">×</button></div><span><span class="state ${e(card.status)}">${e(card.status)}</span></span><h2>${e(card.title)}</h2>${cardMeta(card)}<p class="prose">${e(card.body)}</p>${card.proposal_status ? `<p>Proposal: ${e(card.proposal_status)} · Parent: ${e(actor(card.proposed_to))}</p>` : ""}${card.escalated_to ? `<p>Escalated to ${e(actor(card.escalated_to))}</p>` : ""}${card.can_approve ? '<button class="opt" data-action="approve-proposal">Approve</button><button class="opt" data-action="reject-proposal">Reject</button>' : ""}<div class="panel-actions"><select aria-label="Card status" id="card-status">${options(statuses, card.status)}</select><button class="opt" data-action="panel-move">Move</button><button class="opt" data-action="edit-card">Edit</button><button class="opt" data-action="handoff">Hand off</button></div>${card.linked?.length ? `<div class="linked">${card.linked.map((link) => `<a href="#/memory?id=${enc(link.drawer_id)}" class="${link.invalidated ? "gone" : ""}">${e(link.title || "Memory")}</a>`).join("")}</div>` : ""}${callTree(card)}</div><ol class="log">${conversation(card)}</ol><form class="composer" data-form="comment"><input name="text" data-draft="comment-${card.number}" aria-label="Comment" autocomplete="off" required><button>Send</button></form>`;
     restore(saved);
     if (opening) panel.querySelector("[data-ask]")?.scrollIntoView({ block: "nearest" });
   } catch (error) {

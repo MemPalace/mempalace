@@ -131,13 +131,13 @@ def test_direct_parent_creates_child_cards_and_approves_proposals(hub):
     assert not proposed["claim_until"]
     assert number in {c["number"] for c in parent.task_list(mine=True)}
     for token in (child_token, unrelated_token):
-        assert not mcp(hub, token, "task_approve", task=number)[0]
+        assert not mcp(hub, token, "task_approve", task=number, reason="synthetic reason")[0]
     for status in ("todo", "doing", "review", "done"):
         assert not mcp(hub, child_token, "task_update", task=number, status=status)[0]
     assert not mcp(hub, child_token, "task_take_next", task=number)[0]
     assert not mcp(hub, child_token, "task_handoff", task=number, to="anyone", note=CONTEXT)[0]
     assert api(hub, child_token, "POST", f"/api/cards/{number}/approve", {})[0] == 403
-    assert mcp(hub, parent_token, "task_approve", task=number)[0]
+    assert mcp(hub, parent_token, "task_approve", task=number, reason="synthetic reason")[0]
     assert child.task_show(number)["approved_by"] == parent.principal.actor
     assert mcp(hub, child_token, "task_update", task=number, status="doing")[0]
     assert mcp(hub, child_token, "task_update", task=number, status="done")[0]
@@ -161,19 +161,25 @@ def test_rejection_owner_fallback_and_nested_parent(hub):
     proposal = nested.task_add(title="Nested proposal")
     _, _, unrelated = actor(hub, "unrelated-root")
     with pytest.raises(ToolError, match="direct parent"):
-        unrelated.task_approve(proposal["number"])
-    rejected = child.task_approve(proposal["number"], approve=False)
+        unrelated.task_approve(proposal["number"], reason="synthetic reason")
+    rejected = child.task_approve(proposal["number"], approve=False, reason="synthetic reason")
     assert rejected["proposal_status"] == "rejected"
     for status in ("todo", "doing", "done"):
         with pytest.raises(ToolError):
             nested.task_update(proposal["number"], status=status)
     person = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
     proposal = nested.task_add(title="Owner fallback")
-    assert person.task_approve(proposal["number"])["proposal_status"] == "approved"
+    assert (
+        person.task_approve(proposal["number"], reason="synthetic reason")["proposal_status"]
+        == "approved"
+    )
     assert nested.task_update(proposal["number"], status="doing")["status"] == "doing"
     assert nested.task_update(proposal["number"], status="done")["status"] == "done"
     proposal = nested.task_add(title="Root release")
-    assert root.task_approve(proposal["number"])["approved_by"] == root.principal.actor
+    assert (
+        root.task_approve(proposal["number"], reason="synthetic reason")["approved_by"]
+        == root.principal.actor
+    )
 
 
 def test_heartbeat_expiry_keeps_assignment_and_records_once(hub):
@@ -423,7 +429,7 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     _, child = restricted_child("inbox-child", mid_id)
     proposal = child.task_add(title="Restricted child work")
     number = proposal["number"]
-    assert mid.task_approve(number)["approved_by"] is None
+    assert mid.task_approve(number, reason="synthetic reason")["approved_by"] is None
     child.task_take_next(task=number)
     child.task_handoff(number, to="anyone", note="Ready for approval")
     assert not mcp(hub, other_token, "task_take_next", task=number)[0]
@@ -481,6 +487,6 @@ def test_restricted_child_can_claim_after_direct_parent_approval(hub):
     child = service(hub, hub.db.authenticate_token(token))
     created = child.task_add(title="Child proposal", claim=True)
     assert created["proposal_status"] == "pending"
-    parent.task_approve(created["number"])
+    parent.task_approve(created["number"], reason="synthetic reason")
     assert mcp(hub, token, "task_update", task=created["number"], status="doing")[0]
     assert mcp(hub, token, "task_update", task=created["number"], status="done")[0]

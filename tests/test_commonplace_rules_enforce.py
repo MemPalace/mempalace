@@ -516,7 +516,7 @@ def test_checked_rest_shapes_refuse_then_accept_fresh_header(env, http, route):
             "options": ["Proceed now", "Wait for more information"],
         },
         "decide": {"version": card["version"], "reply": "Proceed"},
-        "task_approve": {"approve": True},
+        "task_approve": {"approve": True, "reason": "synthetic reason"},
         "task_add": {"title": "New card"},
         "board_add": {"slug": "new", "wing": "shared"},
         "board_set": {"coordinator": None},
