@@ -207,7 +207,8 @@ def test_free_daemon_never_faster_than_900(hub):
     assert rc == 0  # COUNTED:L22
     reached("L22")
     observed = []
-    for seconds in (0, 10, 450, 899, 900, 1810):
+    # The hub's retry hint at t=10 is 891 seconds, so the durable deadline is t=901.
+    for seconds in (0, 10, 450, 899, 900, 901, 1810):
         h.at(seconds)
         if seconds:
             for sid in histories:
@@ -223,7 +224,7 @@ def test_free_daemon_never_faster_than_900(hub):
                 if m.name == "capture.raw"
             )
         observed.append((seconds, set(writes)))
-    assert observed[0][1] == observed[1][1] == observed[2][1] == observed[3][1]
+    assert all(writes == observed[0][1] for seconds, writes in observed if seconds < 901)
     times = {}
     for stream, at in observed[-1][1]:
         times.setdefault(stream, []).append(at)
@@ -234,4 +235,4 @@ def test_free_daemon_never_faster_than_900(hub):
         stamps = sorted(datetime.fromisoformat(at) for at in entries)
         assert all((b - a).total_seconds() >= 900 for a, b in zip(stamps, stamps[1:]))
         starts.update(stamps)
-    assert sorted((at - h.now).total_seconds() + 1810 for at in starts) == [0, 900, 1810]
+    assert sorted((at - h.now).total_seconds() + 1810 for at in starts) == [0, 901, 1810]

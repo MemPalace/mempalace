@@ -252,6 +252,14 @@ def _status(directory, home):
             mode = "done" if state.next_due(bkey + "-done") else "active"
             print(f"Backfill: {mode}, {int(used)} of {BACKFILL_WRITES} attempts")
         print(f"Pending operations: {len(state.outbox_pending())}")
+        operations = state.outbox_all()
+        parks = [
+            f"{kind}={sum(op.state == kind for op in operations)}"
+            for kind in ("failed", "unreadable", "rejected", "conflict", "revoked")
+            if any(op.state == kind for op in operations)
+        ]
+        if parks:
+            print("Parked operations: " + " ".join(parks))
         for row in state.statuses():
             print(f"Source status: {row['status']}")
     return 0

@@ -138,7 +138,7 @@ def test_ack_and_cursor_are_one_transaction(client, monkeypatch):
 
 
 @pytest.mark.parametrize("mutation", ["slice", "prefix", "shrink", "remove", "symlink"])
-def test_pending_slice_conflict_keeps_cursor(client, mutation):
+def test_pending_changed_or_removed_slice_keeps_cursor(client, mutation):
     config, state, root = client
     first, second = record("first"), record("second")
     path = root / "session.jsonl"
@@ -157,7 +157,7 @@ def test_pending_slice_conflict_keeps_cursor(client, mutation):
             target = root / "target"
             target.write_bytes(first + second)
             path.symlink_to(target)
-    with pytest.raises(SliceConflict):
+    with pytest.raises(OSError if mutation == "remove" else SliceConflict):
         body(op)
     assert state.cursor(op.source, op.path, op.native_id)["offset"] == len(first)
     assert state.outbox_pending() == [op]

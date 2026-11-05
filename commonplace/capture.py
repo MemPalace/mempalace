@@ -172,7 +172,7 @@ def _push(db, conn, store, principal, data, identity, source, maximum, continuit
             conn=conn,
         )
         if wait:
-            raise _RequestError(429, f"Capture not due; retry in {wait} seconds")
+            raise _RequestError(429, f"Account capture not due; retry in {wait} seconds")
 
     result = continuity.stream_push(
         conn,

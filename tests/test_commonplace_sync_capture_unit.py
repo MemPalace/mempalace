@@ -266,22 +266,21 @@ def test_account_identity_for_grants_shared_and_unknown_accounts(unit):
     assert ingest_cadence.account_interval(unit.db, owner) == 900
 
 
-def test_ungrouped_capture_obeys_account_and_stream_cadence(unit, monkeypatch):
+def test_card223_account_gate_distinguishes_capture_cadence(unit, monkeypatch):
     status, first = unit.request(body())
     assert status == 200
     assert unit.backfills == []  # no native identity: no adoption
     monkeypatch.setattr(plans, "_now", lambda: NOW + timedelta(seconds=30))
-    assert (
-        unit.request(
-            body(native("suffix"), offset=first["offset"], prefix_sha256=first["prefix_sha256"])
-        )[0]
-        == 429
+    status, refused = unit.request(
+        body(native("suffix"), offset=first["offset"], prefix_sha256=first["prefix_sha256"])
     )
+    assert status == 429
+    assert refused["error"].startswith("Capture not due; retry in ")
     assert unit.request(body(tid="second"))[0] == 200
     monkeypatch.setattr(plans, "_now", lambda: NOW + timedelta(seconds=61))
     status, refused = unit.request(body(tid="third"))
     assert status == 429
-    assert refused["error"] == "Capture not due; retry in 840 seconds"
+    assert refused["error"] == "Account capture not due; retry in 840 seconds"  # RED
     rows = unit.db._conn.execute("SELECT connection_id FROM ingest_requests").fetchall()
     assert [row[0] for row in rows] == [unit.user]
     assert (
@@ -370,7 +369,7 @@ def test_person_admission_cannot_borrow_owners_exact_retry(unit, monkeypatch):
     monkeypatch.setattr(plans, "_now", lambda: NOW + timedelta(seconds=61))
     assert unit.request(body(), principal=person) == (
         429,
-        {"error": "Capture not due; retry in 840 seconds"},
+        {"error": "Account capture not due; retry in 840 seconds"},
     )
     assert [
         row[0] for row in unit.db._conn.execute("SELECT connection_id FROM ingest_requests")

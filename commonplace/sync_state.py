@@ -134,7 +134,14 @@ class State:
         )
 
     def retry_rejected(self):
-        self.conn.execute("UPDATE outbox SET state='pending' WHERE state='revoked'")
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE source_status SET status='pending' WHERE EXISTS "
+                "(SELECT 1 FROM outbox WHERE state IN ('revoked') "
+                "AND outbox.source=source_status.source AND outbox.path=source_status.path "
+                "AND outbox.native_id=source_status.native_id)"
+            )
+            self.conn.execute("UPDATE outbox SET state='pending' WHERE state IN ('revoked')")
 
     def close(self):
         self.conn.close()
@@ -223,9 +230,26 @@ class State:
         )
 
     def outbox_mark(self, op_id, status):
-        if status not in ("pending", "conflict", "paused", "revoked"):
+        if status not in (
+            "pending",
+            "conflict",
+            "rejected",
+            "paused",
+            "revoked",
+            "failed",
+            "unreadable",
+        ):
             raise StateError("Invalid source status")
-        self.conn.execute("UPDATE outbox SET state=? WHERE op_id=?", (status, op_id))
+        with self.transaction():
+            self.conn.execute("UPDATE outbox SET state=? WHERE op_id=?", (status, op_id))
+            if status not in ("pending", "failed", "unreadable"):
+                self._clear_op_retry(op_id)
+
+    def _clear_op_retry(self, op_id):
+        self.conn.execute(
+            "DELETE FROM cadence WHERE key LIKE ? OR key LIKE ?",
+            ("%:op:" + op_id, "%:op:" + op_id + ":%"),
+        )
 
     def outbox_ack(self, op_id, response):
         """Caller passes a decoded HTTP 200 response; other responses are never acks."""
@@ -253,6 +277,7 @@ class State:
                     "INSERT OR IGNORE INTO memory_seen VALUES (?,?,?)", (label, relpath, digest)
                 )
             self.conn.execute("DELETE FROM outbox WHERE op_id=?", (op_id,))
+            self._clear_op_retry(op_id)
         return True
 
     def memory_seen(self, label, relpath, digest):
@@ -271,8 +296,10 @@ class State:
             "paused",
             "revoked",
             "conflict",
+            "rejected",
             "too_large",
             "unreadable",
+            "failed",
         ):
             raise StateError("Invalid source status")
         self.conn.execute(
@@ -286,6 +313,9 @@ class State:
     def next_due(self, key):
         row = self.conn.execute("SELECT next_due FROM cadence WHERE key=?", (key,)).fetchone()
         return float(row[0]) if row else 0.0
+
+    def clear_defer(self, key):
+        self.conn.execute("DELETE FROM cadence WHERE key=?", (key,))
 
     def defer(self, key, until):
         self.conn.execute("INSERT OR REPLACE INTO cadence VALUES (?,?)", (key, float(until)))

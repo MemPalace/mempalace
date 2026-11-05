@@ -152,7 +152,7 @@ def body(op):
         if body_digest(request) != op.body_sha256:
             raise SliceConflict("Pending request changed; operation kept")
         return request
-    except (OSError, UnicodeError, SourceError) as error:
+    except (UnicodeError, SourceError) as error:
         if isinstance(error, SliceConflict):
             raise
         raise SliceConflict("Pending source unavailable; operation kept") from None
