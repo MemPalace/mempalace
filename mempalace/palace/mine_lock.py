@@ -68,11 +68,53 @@ def _permission_error_is_lasting(lock_path: str) -> bool:
     return os.path.exists(lock_path) and not os.access(lock_path, os.W_OK)
 
 
-def _lock_mine_lock_file(lock_file, *, blocking: bool) -> bool:
+def _windows_shared_file_lock(lock_file, *, blocking):
+    """Lock byte zero shared; use the same byte as the existing CRT writer."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t),
+            ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD),
+            ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    lock = ctypes.WinDLL("kernel32", use_last_error=True).LockFileEx
+    lock.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    lock.restype = wintypes.BOOL
+    overlap = Overlapped()
+    while True:
+        if lock(msvcrt.get_osfhandle(lock_file.fileno()), 1, 0, 1, 0, ctypes.byref(overlap)):
+            lock_file._source_shared_overlap = overlap
+            return True
+        error = ctypes.get_last_error()
+        if error != 33:  # ERROR_LOCK_VIOLATION; never retry bad handles/permissions.
+            raise ctypes.WinError(error)
+        if not blocking:
+            return False
+        time.sleep(0.05)
+
+
+def _lock_mine_lock_file(lock_file, *, blocking: bool, shared: bool = False) -> bool:
     lock_file.seek(0)
     if os.name == "nt":
         import msvcrt
 
+        if shared:
+            # CRT LK_NBRLCK is an alias of its exclusive lock, not a shared
+            # reader lock. LockFileEx without EXCLUSIVE supplies real readers.
+            return _windows_shared_file_lock(lock_file, blocking=blocking)
         if not blocking:
             try:
                 msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
@@ -91,7 +133,7 @@ def _lock_mine_lock_file(lock_file, *, blocking: bool) -> bool:
 
     import fcntl
 
-    flags = fcntl.LOCK_EX
+    flags = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
     if not blocking:
         flags |= fcntl.LOCK_NB
     try:
@@ -108,7 +150,25 @@ def _unlock_mine_lock_file(lock_file) -> None:
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        overlap = getattr(lock_file, "_source_shared_overlap", None)
+        if overlap is not None:
+            import ctypes
+            from ctypes import wintypes
+
+            unlock = ctypes.WinDLL("kernel32", use_last_error=True).UnlockFileEx
+            unlock.argtypes = [
+                wintypes.HANDLE,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+            ]
+            unlock.restype = wintypes.BOOL
+            if not unlock(msvcrt.get_osfhandle(lock_file.fileno()), 0, 1, 0, ctypes.byref(overlap)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            del lock_file._source_shared_overlap
+        else:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
         return
 
     import fcntl

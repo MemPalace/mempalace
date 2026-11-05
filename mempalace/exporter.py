@@ -106,76 +106,79 @@ def export_palace(palace_path: str, output_dir: str) -> dict:
     total_drawers = 0
 
     print(f"  Streaming {total} drawers...")
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=1000, offset=offset, include=["documents", "metadatas"])
-        if not batch["ids"]:
-            break
+    from .sources.read_visibility import iter_drawer_batches
 
-        # Group this batch by wing/room so we do one file write per room per batch
-        batch_grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
-        for doc_id, doc, meta in zip(batch["ids"], batch["documents"], batch["metadatas"]):
-            if is_bookkeeping(meta, doc_id):
-                continue
-            wing = meta.get("wing", "unknown")
-            room = meta.get("room", "general")
-            batch_grouped[wing][room].append(
-                {
-                    "id": doc_id,
-                    "content": doc,
-                    "source": meta.get("source_file", ""),
-                    "filed_at": meta.get("filed_at", ""),
-                    "added_by": meta.get("added_by", ""),
-                }
-            )
+    batches = iter_drawer_batches(col, palace_path)
+    try:
+        for batch in batches:
+            if not batch["ids"]:
+                break
 
-        # Write/append each room file
-        for wing, rooms in batch_grouped.items():
-            safe_wing = _safe_path_component(wing)
-            wing_dir = os.path.join(output_dir, safe_wing)
-            if wing_dir not in created_wing_dirs:
-                _reject_symlink(wing_dir, f"wing directory {safe_wing!r}")
-                os.makedirs(wing_dir, exist_ok=True)
-                try:
-                    os.chmod(wing_dir, 0o700)
-                except (OSError, NotImplementedError):
-                    pass
-                created_wing_dirs.add(wing_dir)
+            # Group this batch by wing/room so we do one file write per room per batch
+            batch_grouped: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+            for doc_id, doc, meta in zip(batch["ids"], batch["documents"], batch["metadatas"]):
+                if is_bookkeeping(meta, doc_id):
+                    continue
+                wing = meta.get("wing", "unknown")
+                room = meta.get("room", "general")
+                batch_grouped[wing][room].append(
+                    {
+                        "id": doc_id,
+                        "content": doc,
+                        "source": meta.get("source_file", ""),
+                        "filed_at": meta.get("filed_at", ""),
+                        "added_by": meta.get("added_by", ""),
+                    }
+                )
 
-            for room, drawers in rooms.items():
-                safe_room = _safe_path_component(room)
-                room_path = os.path.join(wing_dir, f"{safe_room}.md")
-                key = (wing, room)
-                is_new = key not in opened_rooms
+            # Write/append each room file
+            for wing, rooms in batch_grouped.items():
+                safe_wing = _safe_path_component(wing)
+                wing_dir = os.path.join(output_dir, safe_wing)
+                if wing_dir not in created_wing_dirs:
+                    _reject_symlink(wing_dir, f"wing directory {safe_wing!r}")
+                    os.makedirs(wing_dir, exist_ok=True)
+                    try:
+                        os.chmod(wing_dir, 0o700)
+                    except (OSError, NotImplementedError):
+                        pass
+                    created_wing_dirs.add(wing_dir)
 
-                with _safe_open_for_write(room_path, "a" if not is_new else "w") as f:
-                    if is_new:
-                        f.write(f"# {wing} / {room}\n\n")
-                        opened_rooms.add(key)
+                for room, drawers in rooms.items():
+                    safe_room = _safe_path_component(room)
+                    room_path = os.path.join(wing_dir, f"{safe_room}.md")
+                    key = (wing, room)
+                    is_new = key not in opened_rooms
 
-                    for drawer in drawers:
-                        source = drawer["source"] or "unknown"
-                        filed = drawer["filed_at"] or "unknown"
-                        added_by = drawer["added_by"] or "unknown"
+                    with _safe_open_for_write(room_path, "a" if not is_new else "w") as f:
+                        if is_new:
+                            f.write(f"# {wing} / {room}\n\n")
+                            opened_rooms.add(key)
 
-                        f.write(
-                            f"## {drawer['id']}\n"
-                            f"\n"
-                            f"> {_quote_content(drawer['content'])}\n"
-                            f"\n"
-                            f"| Field | Value |\n"
-                            f"|-------|-------|\n"
-                            f"| Source | {source} |\n"
-                            f"| Filed | {filed} |\n"
-                            f"| Added by | {added_by} |\n"
-                            f"\n"
-                            f"---\n\n"
-                        )
+                        for drawer in drawers:
+                            source = drawer["source"] or "unknown"
+                            filed = drawer["filed_at"] or "unknown"
+                            added_by = drawer["added_by"] or "unknown"
 
-                    wing_stats[wing][room] += len(drawers)
-                    total_drawers += len(drawers)
+                            f.write(
+                                f"## {drawer['id']}\n"
+                                f"\n"
+                                f"> {_quote_content(drawer['content'])}\n"
+                                f"\n"
+                                f"| Field | Value |\n"
+                                f"|-------|-------|\n"
+                                f"| Source | {source} |\n"
+                                f"| Filed | {filed} |\n"
+                                f"| Added by | {added_by} |\n"
+                                f"\n"
+                                f"---\n\n"
+                            )
 
-        offset += len(batch["ids"])
+                        wing_stats[wing][room] += len(drawers)
+                        total_drawers += len(drawers)
+
+    finally:
+        batches.close()
 
     # Build and print stats
     index_rows = []

@@ -672,6 +672,7 @@ def _supports_metadata_facets(col) -> bool:
 
 
 _metadata_cache = None
+_metadata_cache_epoch = None
 _metadata_cache_time = 0
 _METADATA_CACHE_TTL = 5.0  # seconds
 _taxonomy_cache = None
@@ -717,14 +718,20 @@ def _palace_db_fingerprint():
             wal_stamp = (wal.st_ino, wal.st_mtime_ns, wal.st_size)
     except OSError:
         return None
-    return main, wal_stamp
+    from ..sources.lifecycle import visibility_epoch
+
+    return main, wal_stamp, visibility_epoch(_config.palace_path)
 
 
 def _get_cached_metadata(col, where=None):
     """Return cached metadata if fresh, else fetch and cache."""
-    global _metadata_cache, _metadata_cache_time
+    global _metadata_cache, _metadata_cache_time, _metadata_cache_epoch
+    from ..sources.lifecycle import visibility_epoch
+
+    epoch = visibility_epoch(_config.palace_path)
     if (
-        where is None
+        _metadata_cache_epoch == epoch
+        and where is None
         and _metadata_cache is not None
         and (time.time() - _metadata_cache_time) < _METADATA_CACHE_TTL
     ):
@@ -732,6 +739,7 @@ def _get_cached_metadata(col, where=None):
     result = _fetch_all_metadata(col, where=where)
     if where is None:
         _metadata_cache = result
+        _metadata_cache_epoch = epoch
         # Stamp once the fetch is done: stamped at the start, a fetch slower
         # than the TTL stored an entry that had already expired.
         _metadata_cache_time = time.time()

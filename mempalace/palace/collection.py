@@ -50,7 +50,7 @@ def _collection_has_rows(collection, palace_path, collection_name) -> Optional[b
     except Exception:
         pass
     try:
-        return collection.count() > 0
+        return getattr(collection, "physical_count", collection.count)() > 0
     except Exception:
         return None
 

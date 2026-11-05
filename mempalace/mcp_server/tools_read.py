@@ -63,7 +63,13 @@ def _sqlite_taxonomy():
     GROUP BY so status does not page every metadata row.
     """
     global _taxonomy_cache, _taxonomy_cache_time
-    cache_key = (_config.palace_path, _config.collection_name)
+    from ..sources.lifecycle import visibility_epoch
+
+    cache_key = (
+        _config.palace_path,
+        _config.collection_name,
+        visibility_epoch(_config.palace_path),
+    )
     # Taken before the query, so a write that lands during it invalidates.
     fingerprint = _palace_db_fingerprint()
     # The Chroma database/WAL fingerprint changes on committed writes, so a
@@ -237,7 +243,13 @@ def _chroma_room_wing_hall_counts():
 
     # Same full GROUP BY as the status taxonomy; reuse it while chroma.sqlite3
     # has not been written (see _palace_db_fingerprint).
-    cache_key = (_config.palace_path, _config.collection_name)
+    from ..sources.lifecycle import visibility_epoch
+
+    cache_key = (
+        _config.palace_path,
+        _config.collection_name,
+        visibility_epoch(_config.palace_path),
+    )
     fingerprint = _palace_db_fingerprint()
     if (
         fingerprint is not None

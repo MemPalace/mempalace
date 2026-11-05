@@ -6,11 +6,9 @@ progress hooks. Adapters receive a ``PalaceContext`` instance and MUST NOT
 import ``mempalace.palace`` directly — that coupling is what the facade
 exists to prevent.
 
-This module publishes the shape third-party adapters target. Core's mine
-loop will construct a concrete ``PalaceContext`` and pass it to adapters
-when the filesystem/conversations miners are migrated onto ``BaseSourceAdapter``
-in a follow-up PR; until then, no in-tree code constructs one, but the
-contract is stable.
+This module publishes the shape third-party adapters target. Explicit source
+dispatch constructs this facade; incremental adapters receive the guarded
+subclass in ``sources.incremental``. Legacy miners keep their own dispatch.
 """
 
 from __future__ import annotations
@@ -159,8 +157,9 @@ def _build_drawer_id(record: DrawerRecord) -> str:
     existing metadata values). 96-bit SHA-256 prefix keeps collision risk
     negligible across corpora the size of a palace (sha1@64 bits was too
     close to the birthday bound for large ingests). Adapters that need a
-    different id scheme can bypass :meth:`PalaceContext.upsert_drawer` and
-    write through ``drawer_collection.upsert`` directly.
+    different id scheme can write through ``drawer_collection.upsert`` directly
+    only in nonincremental mode. The incremental facade reserves all IDs and
+    rejects direct collection writes.
     """
     import hashlib
 

@@ -69,6 +69,7 @@ _graph_cache_lock = threading.Lock()
 _graph_cache_nodes = None
 _graph_cache_edges = None
 _graph_cache_time = 0.0
+_graph_cache_epoch = None
 _GRAPH_CACHE_TTL = 60.0  # seconds — graph changes less often than metadata
 
 
@@ -252,12 +253,19 @@ def build_graph(col=None, config=None):
         nodes: dict of {room: {wings: set, halls: set, count: int}}
         edges: list of {room, wing_a, wing_b, hall} — one per tunnel crossing
     """
-    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time
+    global _graph_cache_nodes, _graph_cache_edges, _graph_cache_time, _graph_cache_epoch
+    from .sources.lifecycle import visibility_epoch
+
+    epoch = visibility_epoch((config or MempalaceConfig()).palace_path)
     now = time.time()
     # NOTE: warm cache ignores col/config args — intentional for the MCP server's
     # single-palace use case. Callers switching collections must invalidate first.
     with _graph_cache_lock:
-        if _graph_cache_nodes is not None and (now - _graph_cache_time) < _GRAPH_CACHE_TTL:
+        if (
+            _graph_cache_nodes is not None
+            and _graph_cache_epoch == epoch
+            and (now - _graph_cache_time) < _GRAPH_CACHE_TTL
+        ):
             return _graph_cache_nodes, _graph_cache_edges
 
     # Only when the caller did not pass a collection: MCP tools. Tests that
@@ -271,6 +279,7 @@ def build_graph(col=None, config=None):
                     _graph_cache_nodes = nodes
                     _graph_cache_edges = edges
                     _graph_cache_time = time.time()
+                    _graph_cache_epoch = epoch
             return nodes, edges
         col = _get_collection(config)
     if not col:
@@ -337,6 +346,7 @@ def build_graph(col=None, config=None):
             _graph_cache_nodes = nodes
             _graph_cache_edges = edges
             _graph_cache_time = time.time()
+            _graph_cache_epoch = epoch
 
     return nodes, edges
 

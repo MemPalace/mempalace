@@ -254,11 +254,13 @@ class TestSearchTool:
     def test_search_cli_compatible_repeats_unknown_embedder_warning(self, monkeypatch, config, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace import embedding, mcp_server, palace
+        from mempalace.backends.chroma import ChromaCollection
 
-        collection = MagicMock()
+        collection = MagicMock(spec=ChromaCollection)
         collection.effective_embedder_identity.return_value = None
         collection.get_stored_embedder_identity.return_value = None
-        collection.count.return_value = 1
+        collection.count.return_value = 0
+        collection.physical_count.return_value = 1  # Staging rows still need identity validation.
         monkeypatch.setattr(embedding, "current_model_name", lambda: "minilm")
         monkeypatch.setattr(mcp_server, "_refresh_vector_disabled_flag", lambda: None)
         monkeypatch.setattr(mcp_server, "_vector_disabled", False)

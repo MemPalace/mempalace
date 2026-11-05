@@ -176,7 +176,9 @@ def _bm25_only_via_sqlite(
         return sql, params
 
     try:
-        conn = open_palace_reader(db_path)
+        from ..sources.read_visibility import open_logical_reader
+
+        conn = open_logical_reader(db_path)
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
 
