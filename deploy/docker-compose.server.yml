@@ -11,6 +11,10 @@
 #      claude mcp add --transport http mempalace http://YOUR_HOST:8765/mcp \
 #        --header "Authorization: Bearer $MEMPALACE_MCP_HTTP_TOKEN"
 #
+# The token reaches the server as a Compose secret, a file under /run/secrets,
+# not as a container environment variable, so `docker inspect`,
+# `docker compose config` and the server's process environment do not show it.
+#
 # SECURITY: this exposes plaintext HTTP on :8765. For anything beyond a trusted
 # private network, put a TLS-terminating reverse proxy in front (nginx/Caddy/
 # Traefik) and only expose the proxy. The bearer token is mandatory for the
@@ -42,10 +46,20 @@ services:
       - qdrant
       # Uncomment to expose recall without write access to most clients:
       # - --read-only
+    secrets:
+      # Required for the network-exposed bind. Set MEMPALACE_MCP_HTTP_TOKEN in
+      # deploy/.env. `up` refuses to start when it is unset; when it is set but
+      # empty, Compose creates no secret file and the server exits naming it.
+      - mempalace_mcp_http_token
     environment:
-      # Required for the network-exposed bind. Set in deploy/.env.
-      MEMPALACE_MCP_HTTP_TOKEN: ${MEMPALACE_MCP_HTTP_TOKEN:?set MEMPALACE_MCP_HTTP_TOKEN in deploy/.env}
+      MEMPALACE_MCP_HTTP_TOKEN_FILE: /run/secrets/mempalace_mcp_http_token
       MEMPALACE_QDRANT_URL: http://qdrant:6333
+      # The bundled Qdrant needs no key. For one that does, this passes the key
+      # in the container environment; to pass it as a secret instead, replace
+      # this line with MEMPALACE_QDRANT_API_KEY_FILE: /run/secrets/mempalace_qdrant_api_key,
+      # list mempalace_qdrant_api_key under secrets: above, and declare it below
+      # with `environment: MEMPALACE_QDRANT_API_KEY`. Keep only one of the two:
+      # MemPalace refuses to start when both are set.
       MEMPALACE_QDRANT_API_KEY: ${MEMPALACE_QDRANT_API_KEY:-}
       # Set to cuda/dml/coreml on an accelerated host (see Dockerfile.gpu).
       MEMPALACE_EMBEDDING_DEVICE: ${MEMPALACE_EMBEDDING_DEVICE:-auto}
@@ -65,6 +79,10 @@ services:
       timeout: 5s
       retries: 5
       start_period: 40s
+
+secrets:
+  mempalace_mcp_http_token:
+    environment: MEMPALACE_MCP_HTTP_TOKEN
 
 volumes:
   qdrant-storage:

@@ -63,10 +63,9 @@ docker compose -f docker-compose.yml config --quiet \
     || fail "docker-compose.yml is not a valid Compose file"
 echo "  docker-compose.yml ok"
 
-# The server file interpolates a mandatory token; a dummy satisfies the
-# `:?` guard so the rest of the file still gets validated.
-MEMPALACE_MCP_HTTP_TOKEN=smoke-token \
-    docker compose -f deploy/docker-compose.server.yml config --quiet \
+# The server file's token is a secret sourced from MEMPALACE_MCP_HTTP_TOKEN at
+# `up`; `config` validates the file without it.
+docker compose -f deploy/docker-compose.server.yml config --quiet \
     || fail "deploy/docker-compose.server.yml is not a valid Compose file"
 echo "  deploy/docker-compose.server.yml ok"
 

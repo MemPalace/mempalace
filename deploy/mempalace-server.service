@@ -9,8 +9,9 @@
 #   sudo cp deploy/mempalace-server.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now mempalace-server
 #
-# This binds 0.0.0.0:8765 and requires MEMPALACE_MCP_HTTP_TOKEN (set in the
-# EnvironmentFile). Front it with a TLS-terminating reverse proxy, or set
+# This binds 0.0.0.0:8765 and requires a bearer token: MEMPALACE_MCP_HTTP_TOKEN
+# in the EnvironmentFile, the credential form below, or the stored token serve
+# generates. Front it with a TLS-terminating reverse proxy, or set
 # MEMPALACE_MCP_TLS_CERT / _KEY in the EnvironmentFile for native TLS.
 
 [Unit]
@@ -23,6 +24,11 @@ Type=exec
 User=mempalace
 Group=mempalace
 EnvironmentFile=/etc/mempalace/server.env
+# To keep the token out of the service's environment, leave
+# MEMPALACE_MCP_HTTP_TOKEN unset in server.env and pass it as a credential:
+#   sudo sh -c 'umask 077; openssl rand -hex 32 > /etc/mempalace/token'
+# LoadCredential=mempalace_mcp_http_token:/etc/mempalace/token
+# Environment=MEMPALACE_MCP_HTTP_TOKEN_FILE=%d/mempalace_mcp_http_token
 ExecStart=mempalace serve --host 0.0.0.0 --port 8765
 # The idle watchdog exits with status 0, which on-failure reads as an
 # intentional stop, so the server would stay down. server.env disables the
