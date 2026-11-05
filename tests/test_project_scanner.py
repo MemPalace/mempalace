@@ -23,6 +23,9 @@ from mempalace.project_scanner import (
     _parse_package_json,
     _parse_pom,
     _parse_pyproject,
+    _git_user_identity,
+    _global_git_identity,
+    _run_git,
     _UnionFind,
     discover_entities,
     find_git_repos,
@@ -294,6 +297,51 @@ def test_find_git_repos_empty_dir(tmp_path):
     assert find_git_repos(tmp_path) == []
 
 
+# ── git subprocess decoding ─────────────────────────────────────────────
+
+
+def test_run_git_decodes_utf8_regardless_of_locale(monkeypatch):
+    """git emits UTF-8; decoding must not depend on the locale codepage.
+
+    With bare text=True, Python decodes the pipe with the ANSI codepage on
+    Windows (e.g. cp1254 on Turkish systems). A name like "Gürkan ŞANLI"
+    ("Ş" = 0xc5 0x9e; 0x9e is undefined in cp1254) crashed the stdout
+    reader thread and left stdout=None, aborting `mempalace init`.
+    """
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr("mempalace.project_scanner.subprocess.run", fake_run)
+    assert _run_git(Path("."), "config", "user.name") == "ok\n"
+    assert captured["encoding"] == "utf-8"
+    assert captured["errors"] == "replace"
+
+
+def test_run_git_returns_empty_string_when_stdout_is_none(monkeypatch):
+    """A missing stdout must surface as "" — callers chain .strip() on it."""
+    monkeypatch.setattr(
+        "mempalace.project_scanner.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=None),
+    )
+    assert _run_git(Path("."), "config", "user.name") == ""
+
+
+def test_global_git_identity_decodes_utf8_regardless_of_locale(monkeypatch):
+    captured = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(kwargs)
+        stdout = "Gürkan ŞANLI\n" if "user.name" in cmd else "gurkan@example.com\n"
+        return SimpleNamespace(returncode=0, stdout=stdout)
+
+    monkeypatch.setattr("mempalace.project_scanner.subprocess.run", fake_run)
+    assert _global_git_identity() == ("Gürkan ŞANLI", "gurkan@example.com")
+    assert all(k["encoding"] == "utf-8" and k["errors"] == "replace" for k in captured)
+
+
 # ── scan ────────────────────────────────────────────────────────────────
 
 
@@ -502,6 +550,27 @@ def test_scan_excludes_bot_commits_from_totals(tmp_path):
     assert projects[0].total_commits == 1
     assert projects[0].user_commits == 1
     assert [person.name for person in people] == ["Jane Doe"]
+
+
+def test_git_user_identity_preserves_non_ascii_name(tmp_path):
+    """Regression: reading `git config user.name` crashed on cp1254 locales."""
+    _init_git_repo(tmp_path, name="Gürkan ŞANLI", email="gurkan@example.com")
+    assert _git_user_identity(tmp_path) == ("Gürkan ŞANLI", "gurkan@example.com")
+
+
+def test_scan_preserves_non_ascii_git_identity(tmp_path):
+    """End-to-end: a non-ASCII identity survives both git subprocess paths.
+
+    Exercises `git config user.name` (identity) and `git log --format=%aN|%aE`
+    (authors) through a real git repo. On a non-UTF-8 Windows codepage the
+    unfixed code either crashed outright (cp1254) or mojibake'd the name
+    (cp1252), so the equality below catches both failure modes.
+    """
+    (tmp_path / "package.json").write_text(json.dumps({"name": "utf8-app"}))
+    _init_git_repo(tmp_path, name="Gürkan ŞANLI", email="gurkan@example.com")
+    projects, people = scan(tmp_path)
+    assert [person.name for person in people] == ["Gürkan ŞANLI"]
+    assert projects[0].total_commits == 1
 
 
 def test_scan_empty_dir(tmp_path):
