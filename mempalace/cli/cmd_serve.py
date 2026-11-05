@@ -76,9 +76,10 @@ def cmd_serve(args):
     it resolves a bearer token (reusing or auto-generating the palace's stored
     one; a loopback bind needs none unless ``--token`` is given), prints a
     ready-to-paste client config, then execs the real server in the foreground so
-    Docker/systemd own the process lifecycle. The token is passed via the
-    environment, never argv, so it can't leak through ``ps``, and is never
-    printed: a token in a terminal or a service log is a leaked token.
+    Docker/systemd own the process lifecycle. The token reaches the server in
+    the environment or by file path, never on its argv, where ``ps`` would show
+    it, and is never printed: a token in a terminal or a service log is a leaked
+    token.
     """
     from .._env import env_str
     from ..server_registry import load_or_create_server_token, server_token_path
@@ -145,9 +146,9 @@ def cmd_serve(args):
         token_file = str(server_token_path(palace_path))
     token_path = server_token_path(palace_path)
 
-    # Build the child environment. Token rides in the env (never argv) so it
-    # stays out of the process table. Exactly one form is passed: the server
-    # refuses to start when both are set.
+    # Build the child environment. The token goes in the env or by file path,
+    # never argv, where ``ps`` would show it. Exactly one form is passed: the
+    # server refuses to start when both are set.
     env = dict(os.environ)
     env["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:

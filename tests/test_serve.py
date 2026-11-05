@@ -2,8 +2,8 @@
 
 These exercise the wrapper's security-relevant behavior — token autogeneration
 and 0600 persistence, the secure-by-default non-loopback gate, and that the
-bearer token is passed via the environment (never argv, so it can't leak via
-``ps``) — without binding a real socket. ``cmd_serve`` ends by exec'ing the real
+bearer token reaches the server by env or file path (never argv, where ``ps``
+would show it) — without binding a real socket. ``cmd_serve`` ends by exec'ing the real
 server; we intercept ``os.execve`` to capture the child invocation instead.
 """
 

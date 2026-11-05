@@ -9,8 +9,9 @@
 #   sudo cp deploy/mempalace-server.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now mempalace-server
 #
-# This binds 0.0.0.0:8765 and requires MEMPALACE_MCP_HTTP_TOKEN (set in the
-# EnvironmentFile). Front it with a TLS-terminating reverse proxy, or set
+# This binds 0.0.0.0:8765 and requires a bearer token: MEMPALACE_MCP_HTTP_TOKEN
+# in the EnvironmentFile, the credential form below, or the stored token serve
+# generates. Front it with a TLS-terminating reverse proxy, or set
 # MEMPALACE_MCP_TLS_CERT / _KEY in the EnvironmentFile for native TLS.
 
 [Unit]
