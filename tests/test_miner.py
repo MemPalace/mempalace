@@ -390,8 +390,35 @@ def test_load_config_keeps_valid_room_names_exactly(tmp_path, capsys, name):
 )
 def test_load_config_turns_a_rejected_room_name_into_its_slug(tmp_path, capsys, name, slug):
     _write_rooms(tmp_path, [{"name": name, "keywords": ["k"]}])
-    assert load_config(str(tmp_path))["rooms"] == [{"name": slug, "keywords": ["k"]}]
+    assert load_config(str(tmp_path))["rooms"] == [
+        {"name": slug, "keywords": ["k"], "match_name": str(name)}
+    ]
     assert f"using '{slug}'" in capsys.readouterr().err
+
+
+def _route(project, rooms, relative, content="hello world"):
+    _write_rooms(project, rooms)
+    return detect_room(project / relative, content, load_config(str(project))["rooms"], project)
+
+
+@pytest.mark.parametrize(
+    ("room", "relative", "content", "expected"),
+    [
+        ({"name": "c++"}, "c++/a.md", "hello world", "c"),
+        ({"name": "c++"}, "c++.md", "hello world", "c"),
+        ({"name": "c++", "keywords": ["c++"]}, "c++.md", "hello world", "c"),
+        ({"name": "c++"}, "a.md", "written in c++", "c"),
+        ({"name": "notes&ideas"}, "a.md", "see notes&ideas", "notes-ideas"),
+    ],
+)
+def test_a_slugged_room_routes_by_its_config_spelling(tmp_path, room, relative, content, expected):
+    assert _route(tmp_path, [room], relative, content) == expected
+
+
+def test_a_slug_never_routes_a_file(tmp_path):
+    """``c`` as a content keyword would claim nearly every file."""
+    assert _route(tmp_path, [{"name": "c++"}], "a.md", "cc cc cc") == "general"
+    assert _route(tmp_path, [{"name": "c++"}], "c/a.md") == "general"
 
 
 @pytest.mark.parametrize("room", [{"name": "+++"}, {"name": None}, {"keywords": ["k"]}, "plain"])

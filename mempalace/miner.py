@@ -571,10 +571,12 @@ def _clean_room_names(rooms: list, source: str) -> list:
 
     A project config can arrive with a cloned repository, and room names reach
     wake-up text. A rejected name becomes its slug, as ``rooms.py`` does for
-    proposed names, so its files stay together. With no usable slug the room is
-    dropped and its files fall through to the other rooms or ``general``. Either
-    way the file is still mined. Only scalars are turned into text, because yaml
-    aliases can build a small value whose text form is exponentially large.
+    proposed names, and keeps its config spelling as ``match_name``, so files
+    route exactly as before and only the stored name changes. With no usable slug
+    the room is dropped and its files fall through to the other rooms or
+    ``general``. Either way the file is still mined. Only scalars are turned into
+    text, because yaml aliases can build a small value whose text form is
+    exponentially large.
     """
     clean = []
     for room in rooms:
@@ -588,7 +590,9 @@ def _clean_room_names(rooms: list, source: str) -> list:
             outcome = f"using '{name}'" if name else "skipping that room"
             shown = ascii(text[:80]) if text else f"of type {type(raw).__name__}"
             print(f"  Invalid room name {shown} in {source}: {outcome}.", file=sys.stderr)
-        if name:
+            if name:
+                clean.append({**room, "name": name, "match_name": text})
+        else:
             clean.append({**room, "name": name})
     return clean
 
@@ -664,6 +668,14 @@ def _name_matches(a: str, b: str) -> bool:
     return b in _tokens(a) or a in _tokens(b)
 
 
+def _match_name(room: dict) -> str:
+    """The spelling ``room`` routes by, which is never a slug made from it.
+
+    A slug can be as short as ``c``, and content scoring would count that letter.
+    """
+    return room.get("match_name", room["name"])
+
+
 def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -> str:
     """
     Route a file to the right room.
@@ -681,19 +693,19 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
     path_parts = relative.replace("\\", "/").split("/")
     for part in path_parts[:-1]:  # skip filename itself
         for room in rooms:
-            candidates = [room["name"].lower()] + [k.lower() for k in room.get("keywords", [])]
+            candidates = [_match_name(room).lower()] + [k.lower() for k in room.get("keywords", [])]
             if any(_name_matches(part, c) for c in candidates):
                 return room["name"]
 
     # Priority 2: filename matches room name
     for room in rooms:
-        if _name_matches(filename, room["name"]):
+        if _name_matches(filename, _match_name(room)):
             return room["name"]
 
     # Priority 3: keyword scoring from room keywords + name
     scores = defaultdict(int)
     for room in rooms:
-        keywords = room.get("keywords", []) + [room["name"]]
+        keywords = room.get("keywords", []) + [_match_name(room)]
         for kw in keywords:
             count = content_lower.count(kw.lower())
             scores[room["name"]] += count
