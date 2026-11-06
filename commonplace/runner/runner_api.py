@@ -68,7 +68,18 @@ def _items(machine, key):
     return json.loads(value) if isinstance(value, str) else value
 
 
-def _starting_check(gateway, machine, row):
+def _config_job_check(store, card, row):
+    """Config-driven jobs: the card must not carry ``plan`` at ``starting``, and
+    the pinned config version must still be readable and match its sha256."""
+    from commonplace.orch import runner_bridge
+
+    if "plan" in runner_bridge._labels(card):
+        return "plan_pending"
+    with store.connection() as conn:
+        return runner_bridge.config_problem(conn, row)
+
+
+def _starting_check(gateway, machine, row, store=None):
     if not machine["enabled"] or machine["revoked_at"]:
         return "machine_disabled"
     if machine["binding_state"] != "owner_attested":
@@ -98,6 +109,10 @@ def _starting_check(gateway, machine, row):
             card = task_row(conn, row["task_number"])
             require_visible(card, principal)
             board = service._board(conn, card["board"])
+            if row["config_version"] is not None:
+                refusal = _config_job_check(store, card, row)
+                if refusal is not None:
+                    return refusal
             service._write(board, row=card)
             predicate.startable(gateway, machine, card, board)
     except (ToolError, predicate.Refused):
@@ -170,11 +185,17 @@ def register(gateway):
                             store,
                             machine,
                             **body,
-                            validate=lambda row: _starting_check(gateway, machine, row),
+                            validate=lambda row: _starting_check(gateway, machine, row, store),
                         )
                     else:
                         row = jobs.result(store, machine, **body)
                     payload = jobs.job_object(row, tokens=action == "lease")
+                    if action == "lease" and row["config_version"] is not None:
+                        from commonplace.orch import runner_bridge
+
+                        # Pinned prompt, workflow and model of a config-driven start.
+                        with store.connection() as conn:
+                            payload.update(runner_bridge.launch_fields(conn, row))
             send_json(h, 200, payload)
         except HTTPError as exc:
             send_json(h, exc.status, {"error": str(exc)})

@@ -62,7 +62,10 @@ def register(gateway):
             send_json(handler, exc.status, {"error": str(exc)})
         except ToolError as exc:
             message = str(exc).removeprefix("no: ")
-            status = 404 if message in NOT_FOUND else 409 if message in CONFLICTS else 403
+            status = getattr(exc, "status", None)
+            if not isinstance(status, int) or isinstance(status, bool):
+                # Orchestrator refusals carry their own status; others map by text.
+                status = 404 if message in NOT_FOUND else 409 if message in CONFLICTS else 403
             send_json(handler, status, {"error": str(exc)})
 
     gateway.add_route("POST", "/api/card-starts", route)

@@ -787,6 +787,35 @@ class BoardService:
     def _own_card(self, row):
         return owns_card(row, self.principal.actor)
 
+    def _plan_gate(self, conn, board_id):
+        """The orchestrator plan gate of a board with an accepted live config, else None."""
+        from commonplace.orch import plan_check
+
+        slug = conn.execute("SELECT slug FROM boards WHERE id=?", (board_id,)).fetchone()
+        return plan_check.board_gate(self.ctx.workspace_dir(), slug[0]) if slug else None
+
+    def _plan_label_check(self, conn, row, labels):
+        """On a board with an orchestrator config only task_approve removes ``plan``."""
+        if (
+            "plan" in json.loads(row["labels"] or "[]")
+            and "plan" not in labels
+            and self._plan_gate(conn, row["board_id"]) is not None
+        ):
+            raise ToolError(
+                "no: on a board with an orchestrator config only task_approve "
+                "removes the plan label"
+            )
+
+    def _planner_card_check(self, conn, board_id, created_by, status, body):
+        """A configured planner connection's card passes plan-check before todo or done."""
+        if status not in ("todo", "done") or not (created_by or "").startswith("conn:"):
+            return
+        gate = self._plan_gate(conn, board_id)
+        if gate is not None and gate.is_planner(created_by):
+            from commonplace.orch import plan_check
+
+            plan_check.require_plan(body, what="a planner card")
+
     def _top_level_taker(self):
         p = self.principal
         return not p.person and p.parent_connection_id is None and p.runner is None
@@ -1109,6 +1138,14 @@ class BoardService:
         )
 
     def _set(self, conn, row, updates, *, release_origin=True):
+        if updates.get("status", row["status"]) != row["status"]:
+            self._planner_card_check(
+                conn,
+                row["board_id"],
+                row["created_by"],
+                updates["status"],
+                updates.get("body", row["body"]),
+            )
         if (
             release_origin
             and self.principal.person
@@ -1735,6 +1772,7 @@ class BoardService:
             from commonplace.projects import limits
 
             limits.check(conn, board, assignee)
+        self._planner_card_check(conn, board["id"], p.actor, status, body)
         until = self._until(board) if status == "doing" and assignee.startswith("conn:") else None
         position = conn.execute(
             "SELECT coalesce(max(position),0)+1 FROM tasks WHERE board_id=? AND status=?",
@@ -1886,6 +1924,13 @@ class BoardService:
                 raise ToolError(
                     "no: a held plan card can only be approved or escalated; the owner may reject it"
                 )
+            if approve:
+                labelled = "plan" in json.loads(row["labels"] or "[]")
+                gate = self._plan_gate(conn, board["id"])
+                if gate is not None and (labelled or gate.is_planner(row["created_by"])):
+                    from commonplace.orch import plan_check
+
+                    plan_check.require_plan(row["body"], what="the plan")
             changes = {"escalated_to": None} if owner else {}
             if plan:
                 if approve:
@@ -2372,9 +2417,11 @@ class BoardService:
                 labels = args["labels"]
                 if not isinstance(labels, list) or len(labels) > 100:
                     raise ToolError("no: labels must be a list")
-                updates["labels"] = json.dumps(
-                    [validate_text(label, "label", required=True, limit=200) for label in labels]
-                )
+                labels = [
+                    validate_text(label, "label", required=True, limit=200) for label in labels
+                ]
+                self._plan_label_check(conn, row, labels)
+                updates["labels"] = json.dumps(labels)
             for key in ("title", "body", "branch", "status_line"):
                 if key in args:
                     updates[key] = validate_text(

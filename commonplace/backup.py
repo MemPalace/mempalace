@@ -407,6 +407,30 @@ def verify_backup(backup_dir) -> dict:
     return manifest
 
 
+RESTORE_MARKER = "orch-restore-marker.json"
+
+
+def _write_restore_markers(root: Path, manifest: dict) -> None:
+    """Leave a restore marker in every restored workspace directory.
+
+    The orchestrator store turns it into a restore flag on its first open
+    (commonplace/orch/store.py). Markers are not in the manifest.
+    """
+    workspaces = root / "workspaces"
+    if not workspaces.is_dir():
+        return
+    marker = {
+        "version": 1,
+        "backup_created_at": manifest.get("created_at"),
+        "id": os.urandom(16).hex(),
+    }
+    for directory in sorted(workspaces.iterdir()):
+        if directory.is_dir() and not directory.is_symlink():
+            path = directory / RESTORE_MARKER
+            path.write_text(json.dumps(marker) + "\n", encoding="utf-8")
+            path.chmod(0o600)
+
+
 def restore(backup_dir, dest_dir) -> dict:
     """Verify and atomically restore into a new, offline scratch directory.
 
@@ -435,6 +459,7 @@ def restore(backup_dir, dest_dir) -> dict:
             shutil.copyfile(path, target)
             target.chmod(0o600)
         verify_backup(partial)
+        _write_restore_markers(partial, manifest)
         if destination.exists() or destination.is_symlink():
             raise BackupError("restore destination already exists")
         partial.rename(destination)

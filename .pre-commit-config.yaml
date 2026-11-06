@@ -29,3 +29,10 @@ repos:
         types: [rust]
         pass_filenames: false
         stages: [pre-push]
+      - id: docs-check
+        name: docs-check (manual; the test suite runs it too)
+        entry: python3 -m commonplace orch docs-check --base origin/develop --head HEAD
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [manual]

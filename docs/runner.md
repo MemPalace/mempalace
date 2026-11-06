@@ -28,6 +28,36 @@ An ambiguous launch becomes `uncertain`, never automatically queued again. It ke
 
 `card_start_cancel` on `uncertain` returns 409 for everyone, including the owner: `start outcome is uncertain; a workspace owner must resolve it`. Cancelling a `starting` job only records the request; it does not stop a remote thread or free the slot. Resolve spans the control and workspace databases: a crash between commits can leave a resolution without its audit row, although the job retains `resolved_by` and `resolved_at`.
 
+## Boards with an orchestrator config
+
+A board whose owner accepted a live orchestrator config with a `[runner]`
+table ([orchestrator.md](orchestrator.md)) changes how starts reach this
+runner. Boards without one behave exactly as described above.
+
+- **Requests.** `card_start` (MCP and `POST /api/card-starts`) is accepted only
+  from the person owner; a coordinator PAT gets `no: use orch_card_start` and
+  uses the orchestrator lease instead. Cancelling a job that belongs to an
+  orchestrator step is person-owner only.
+- **Triggers.** A card that enters `todo` on the board is started without a
+  request, by the event's actor if it passes the same requester check. A
+  refusal is recorded as a coded miss, not retried.
+- **One fenced start.** Every config-driven start checks the restore flag, the
+  `plan` label (`plan_pending`), the existing step or request key, and the
+  config's `max_agents` cap in one transaction, then inserts the job with the
+  checks above (one active start per card, 24 h rule for non-person starts,
+  queue and hourly limits).
+- **Pinned launch.** The job records the config version, its sha256, the
+  channel, the step key and the resolved model provider and model. Its lease
+  payload adds `message` (`SPAWN_MESSAGE`, then the role's prompt, then its
+  workflow steps) and `modelSelection {instanceId: provider, model}`; the runner
+  sends both to `t3_thread_launch`. When the runner reports `starting`, a card
+  that has gained the `plan` label is refused and the job ends `cancelled` with
+  outcome `plan_pending`. Whether T3 honours `modelSelection` at runtime is part
+  of D2; effort then comes from T3's defaults.
+- **Restore.** After a restore, config-driven starts and the trigger sweep stay
+  blocked until the owner types the acknowledgement (`SYSTEM.md`, restore
+  runbook).
+
 ## Hub failures
 
 Continuous mode backs off on disabled-machine 404s and transient failures (429, 5xx, redirects, timeouts, connection errors or non-JSON success bodies). The delay is `min(poll_seconds * 2**k, 300)` seconds for consecutive non-ok calls, reset by success. Redirects are never followed. Journals replay outcomes before new leases and never re-spawn a recorded launch. The hub timeout is at least 10 seconds to cover the plan delay of up to 2 seconds.
@@ -217,9 +247,9 @@ config and 5 for a hub failure in `--once` mode.
 ## Owner checklists (open; no agent performs any item)
 
 **D1–D3 (decisions).**
-- [ ] **D1 worker identity.** The owner decides whether "attested, not verified" is acceptable. The setup would be a dedicated T3 provider instance whose Commonplace MCP entry uses the worker token, mapped to the granted topics, recorded through attest. Anything stronger needs a future T3 per-thread credential field. The card goal is not done until D1 is decided.
+- [ ] **D1 worker identity.** The owner decides whether "attested, not verified" is acceptable. The setup would be a dedicated T3 provider instance whose Commonplace MCP entry uses the worker token, mapped to the granted topics, recorded through attest. Anything stronger needs a future T3 per-thread credential field. The card goal is not done until D1 is decided. Until then every runner child shares the machine's worker PAT, so orchestrator evidence and project limits cannot tell children apart.
 - [ ] **D2 launch shape.** One owner-approved real `t3_thread_launch` capture on an owner machine. It settles `structuredContent.threadId/runId/status`, `workspaceStrategy` `root` vs. `existing_worktree`, `modelSelection`, and what "modes cannot exceed yours" means for the T3 grant. Record the artifact path. An optional later detective read-back (the `t3.py:115–148` pattern) is design only.
-- [ ] **D3 recovery.** Capture the `thread list --json` keys before any reconcile. Until then, `uncertain` goes to a person resolve.
+- [ ] **D3 recovery.** Capture the `thread list --json` keys before any reconcile. Until then, `uncertain` goes to a person resolve, and an orchestrator that finds no thread titled `[commonplace-job:<id>]` treats that as no proof: the step goes to `needs_person`.
 
 **Activation (F10; strict order, each a separate owner act).**
 1. [ ] D1 decision recorded.

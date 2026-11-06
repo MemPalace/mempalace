@@ -453,7 +453,20 @@ WING_SCOPED_SINCE_BASELINE = {
     "mempalace_kg_save",
     "fact_save",
 }
-TOOLS_ADDED_SINCE_BASELINE = {"rules_publish", "rules_get", "rules_changed", "session_start"}
+TOOLS_ADDED_SINCE_BASELINE = {
+    "rules_publish",
+    "rules_get",
+    "rules_changed",
+    "session_start",
+    # Orchestrator config, lease, journal and gate tools (not part of handoff).
+    *"""
+    orch_card_start orch_checkpoint orch_config_accept orch_config_diff orch_config_get
+    orch_config_propose orch_config_reject orch_config_render orch_config_write orch_exp_retire
+    orch_force_release orch_gate_open orch_gate_record orch_heartbeat orch_journal_intent
+    orch_journal_record orch_release orch_restore_ack orch_restore_status orch_resume
+    orch_void_step
+    """.split(),
+}
 STARTUP_ADDED_SINCE_BASELINE = (
     "Commonplace is the single source of rules and memory.\n"
     "Automatically call session_start at session start, resume and after compaction, "

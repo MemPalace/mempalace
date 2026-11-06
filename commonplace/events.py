@@ -16,6 +16,8 @@ Kinds in use (add, never rename):
     rule.changed  rule.suggestion
     space_created
     webhook.failed
+    orch.config.proposed  orch.config.accepted  orch.config.rejected
+    orch.experiment.retired  orch.restore.acked  orch.lease.forced  orch.step.voided
 """
 
 from __future__ import annotations

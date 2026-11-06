@@ -58,12 +58,33 @@ def _requester(ctx):
         raise ToolError("no: requester not allowed")
 
 
+def _check_request_key(request_key):
+    if request_key is not None and (
+        not isinstance(request_key, str) or not 1 <= len(request_key) <= 128
+    ):
+        raise ToolError("no: invalid request_key")
+
+
 def card_start(
-    ctx, task, machine, project, topic, runtime_mode="approval-required", request_key=None
+    ctx,
+    task,
+    machine,
+    project,
+    topic,
+    runtime_mode=None,
+    request_key=None,
+    config_ref=None,
 ):
+    """On a board with an accepted live ``[runner]`` config only a signed-in workspace
+    owner may call this (anyone else is told to use ``orch_card_start``); the start then
+    runs the config's pinned role through the orchestrator's fenced, capped start."""
     for key, value in (("machine", machine), ("project", project), ("topic", topic)):
         if not isinstance(value, str) or not value:
             raise ToolError(f"no: {key} is required")
+    if runtime_mode is not None and not isinstance(runtime_mode, str):
+        raise ToolError("no: runtime mode not allowed")
+    if config_ref is not None and (not isinstance(config_ref, str) or not config_ref):
+        raise ToolError("no: invalid config_ref")
     machine = registry.get_machine(ctx.db, ctx.principal.workspace_id, machine)
     if machine is None or not machine["enabled"] or machine["revoked_at"]:
         raise ToolError("no: machine not found")
@@ -79,6 +100,30 @@ def card_start(
         if "restricted-origin" in str(exc):
             raise Refused("origin_not_released") from None
         raise
+    from commonplace.orch import runner_bridge
+
+    if runner_bridge.configured(ctx.gateway, ctx.principal.workspace_id, board["slug"]):
+        _check_request_key(request_key)
+        if not person_owner(ctx.principal):
+            raise runner_bridge.StartRefused(
+                "use_orch_card_start",
+                "use orch_card_start: this board's starts run from its orchestrator config",
+            )
+        return runner_bridge.person_start(
+            ctx,
+            store,
+            machine=machine,
+            card_row=row,
+            board_row=board,
+            project=project,
+            topic=topic,
+            runtime_mode=runtime_mode,
+            request_key=request_key,
+            config_ref=config_ref,
+        )
+    if config_ref is not None:
+        raise ToolError("no: config_ref needs a board with an orchestrator config")
+    runtime_mode = "approval-required" if runtime_mode is None else runtime_mode
     startable(ctx.gateway, machine, row, board)
     if project not in grant_values(machine, "projects"):
         raise ToolError("no: project not allowed")
@@ -88,10 +133,7 @@ def card_start(
         machine["max_runtime_mode"]
     ):
         raise ToolError("no: runtime mode not allowed")
-    if request_key is not None and (
-        not isinstance(request_key, str) or not 1 <= len(request_key) <= 128
-    ):
-        raise ToolError("no: invalid request_key")
+    _check_request_key(request_key)
     status, row = jobs.create(
         store,
         machine=machine,
@@ -155,9 +197,12 @@ OPERATIONS = {
             "topic": STRING,
             "runtime_mode": {"type": "string", "enum": list(MODES), "default": "approval-required"},
             "request_key": {**STRING, "maxLength": 128},
+            "config_ref": {**STRING, "maxLength": 40},
         },
         ("task", "machine", "project", "topic"),
-        "Request an attested machine to start a worker for a claimable card.",
+        "Request an attested machine to start a worker for a claimable card. On a board "
+        "with an orchestrator config only a signed-in workspace owner may call it; "
+        "config_ref (live or exp:<name>) picks the config version.",
     ),
     "card_start_cancel": (
         card_start_cancel,
@@ -191,7 +236,7 @@ def dispatch(ctx, name, arguments):
     if any(key not in arguments for key in required):
         raise ToolError("no: missing required arguments")
     for key, value in arguments.items():
-        if key == "request_key" and value is None:
+        if key in ("request_key", "config_ref") and value is None:
             continue
         types = properties[key]["type"]
         if types == "string" and (not isinstance(value, str) or not value):

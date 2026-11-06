@@ -44,6 +44,7 @@ MODULES = (
     "commonplace.handoff.extension",
     "commonplace.import_tools",
     "commonplace.runner",
+    "commonplace.orch",
     "commonplace.console",
     "commonplace.chat",
     "commonplace.holds",

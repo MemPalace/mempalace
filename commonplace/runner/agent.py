@@ -29,6 +29,11 @@ SPAWN_MESSAGE = (
 )
 
 _MODES = ("approval-required", "auto-accept-edits", "auto", "full-access")
+MAX_MESSAGE_CHARS = 120_000  # thread launch message limit
+_MAX_REPLY_BYTES = 65_536
+_MAX_LEASE_BYTES = 1_048_576  # a config-driven lease carries the pinned launch message
+_PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")  # as projects.types.PROVIDER
+_MODEL = re.compile(r"[A-Za-z0-9._:/-]{1,120}")  # as projects.types.MODEL
 _CHILD_KEYS = (
     "PATH",
     "HOME",
@@ -183,9 +188,35 @@ def validate_job(job) -> None:
         raise ValueError("job_invalid")
 
 
+def _launch_text(job):
+    """The launch message and optional model of a job, or ValueError.
+
+    A config-driven job carries ``message`` (``SPAWN_MESSAGE`` for this job, then the
+    pinned role prompt and workflow) and ``modelSelection``; other jobs carry neither
+    and get ``SPAWN_MESSAGE``."""
+    base = SPAWN_MESSAGE.format(n=job["task_number"], job_id=job["job_id"])
+    message, model = job.get("message"), job.get("modelSelection")
+    if message is None and model is None:
+        return base, None
+    if (
+        not isinstance(message, str)
+        or not message.startswith(base)
+        or len(message) > MAX_MESSAGE_CHARS
+        or not isinstance(model, dict)
+        or set(model) != {"instanceId", "model"}
+        or not isinstance(model["instanceId"], str)
+        or not _PROVIDER.fullmatch(model["instanceId"])
+        or not isinstance(model["model"], str)
+        or not _MODEL.fullmatch(model["model"])
+    ):
+        raise ValueError("job_invalid")
+    return message, {"instanceId": model["instanceId"], "model": model["model"]}
+
+
 def _job_code(config, job):
     try:
         validate_job(job)
+        _launch_text(job)
     except ValueError:
         return "job_invalid"
     project = job.get("project")
@@ -249,8 +280,9 @@ class _Hub:
                 if status == 204:
                     result = None
                 else:
-                    raw = response.read(65537)
-                    if len(raw) > 65536:
+                    limit = _MAX_LEASE_BYTES if route == "lease" else _MAX_REPLY_BYTES
+                    raw = response.read(limit + 1)
+                    if len(raw) > limit:
                         raise ValueError
                     result = json.loads(raw)
                     if not isinstance(result, dict):
@@ -314,14 +346,17 @@ def _parse_launch(result, secrets):
 
 
 def _spawn(config, job, env, secrets):
+    message, model = _launch_text(job)
     launch = {
         "title": f"Card #{job['task_number']} [commonplace-job:{job['job_id']}]",
         "projectId": config["projects"][job["project"]]["project_id"],
-        "message": SPAWN_MESSAGE.format(n=job["task_number"], job_id=job["job_id"]),
+        "message": message,
         "runtimeMode": job["runtime_mode"],
         "topic": job["topic"],
         "workspaceStrategy": WORKSPACE_STRATEGY,
     }
+    if model is not None:
+        launch["modelSelection"] = model
     _require(not any(secret in json.dumps(launch) for secret in secrets), "credential in launch")
     try:
         result = subprocess.run(

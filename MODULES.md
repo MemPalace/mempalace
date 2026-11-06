@@ -1,0 +1,219 @@
+# Modules
+
+Who owns each path, what it promises, how it fails and which tests hold it to
+that. `SYSTEM.md` holds the cross-module decisions and residuals.
+
+Format (read by `commonplace orch docs-check`):
+
+- One `## <module>` block per module. Each block has exactly the five fields
+  **Paths**, **Owns**, **Promises**, **How it fails** and **Tests**; a missing
+  or empty field fails the check.
+- **Paths** lists repository paths in backticks, separated by commas. A
+  directory ends in `/`. There are no wildcards.
+- Every entry of the repository root and of `commonplace/` is listed exactly
+  once. A path belongs to the block that lists its longest matching entry, so a
+  more specific path (for example `docs/runner.md`) may be listed in another
+  block than its directory (`docs/`). `commonplace/` itself is split into its
+  entries.
+- A change that touches a module's paths updates that module's block, unless a
+  `Docs-waiver` from `SYSTEM.md` applies.
+
+## system-docs
+
+- **Paths:** `SYSTEM.md`, `MODULES.md`
+- **Owns:** The system-wide decisions, numbers, stores, residuals and waiver list (`SYSTEM.md`) and this ownership map.
+- **Promises:** Every root and `commonplace/` entry has exactly one owner block with all five fields; `SYSTEM.md` changes with every change that `docs-check` covers, unless a base-listed waiver applies.
+- **How it fails:** A stale block passes the mechanical check while describing old behaviour; reviewers judge whether the text is true. A path added without a block fails `docs-check`.
+- **Tests:** `tests/test_docs_obligations.py` runs `docs-check` against the merge base; `tests/test_orch_checks.py` covers unowned paths, missing obligations, empty blocks and waivers.
+
+## project-docs
+
+- **Paths:** `AGENTS.md`, `CHANGELOG.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `HUB-DESIGN.md`, `INSPIRATION-REPOS.md`, `LICENSE`, `MISSION.md`, `PRODUCT-DESIGN.md`, `README.md`, `REPORT.md`, `ROADMAP.md`, `SECURITY.md`, `openarena-claim.txt`, `design/`, `docs/`
+- **Owns:** Contributor and agent instructions, the mission and design notes, user and operator documentation, release history, the licence and the security policy.
+- **Promises:** Documentation describes shipped behaviour; design notes are marked as proposals. Public text uses synthetic names only and carries no secrets or private hosts.
+- **How it fails:** Text drifts from code silently; nothing executes most of it. Broken commands in docs surface only when someone follows them.
+- **Tests:** `tests/test_commonplace_public_surface.py`, `tests/test_commonplace_legal_pages.py` and the documentation checks in `tests/test_commonplace_release_gate.py`.
+
+## build-and-ci
+
+- **Paths:** `pyproject.toml`, `uv.lock`, `.python-version`, `Cargo.toml`, `Cargo.lock`, `crates/`, `.gitattributes`, `.gitignore`, `.pre-commit-config.yaml`, `.github/`, `.devcontainer/`
+- **Owns:** Python and Rust packaging, pinned dependencies, the coverage gate, lint and format settings, pre-commit hooks, repository metadata and the development container.
+- **Promises:** `uv sync --extra dev` reproduces the locked environment; `ruff check` and `ruff format --check` define style; the coverage threshold in `pyproject.toml` is the gate.
+- **How it fails:** A lock that drifts from `pyproject.toml` breaks installs; a lowered threshold or a widened lint ignore weakens every other module's tests without any test failing.
+- **Tests:** `tests/test_version_consistency.py` and the full suite under the configured coverage gate.
+
+## container-and-deploy
+
+- **Paths:** `Dockerfile`, `Dockerfile.gpu`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore`, `deploy/`, `backup-hook.sh`, `nightly-backup.sh`
+- **Owns:** Container images, compose files, example reverse-proxy and service units, and the nightly backup wrappers.
+- **Promises:** Images run the gateway as an unprivileged user on a mounted data directory; examples hold placeholders, never real hosts or secrets; the backup wrappers call the verified backup path and report failure.
+- **How it fails:** A broken image or unit only shows at deploy time; a backup wrapper that exits 0 on failure hides missing backups.
+- **Tests:** `tests/test_commonplace_deploy.py`, `tests/test_commonplace_nightly_backup.py`, `tests/test_commonplace_w5_backup.py`.
+
+## scripts-and-tools
+
+- **Paths:** `scripts/`, `tools/`, `benchmarks/`
+- **Owns:** Maintenance and release scripts, review tooling, evaluation scripts and benchmarks.
+- **Promises:** Scripts are run by hand or by the release process; none runs on import or ships in the package. Benchmarks are informational and never gate a change.
+- **How it fails:** A script can rot unnoticed between releases; benchmark numbers vary with the machine.
+- **Tests:** `tests/test_commonplace_release_gate.py`, `tests/test_backfill_authored_at.py`; benchmarks run under the `benchmark` marker only.
+
+## agent-integrations
+
+- **Paths:** `.agents/`, `.antigravity-plugin/`, `.claude-plugin/`, `.codex-plugin/`, `.cursor-plugin/`, `.dsh-plugin/`, `.mcp.json`, `mcp.json`, `commands/`, `hooks/`, `integrations/`, `skills/`, `rules/`, `examples/`
+- **Owns:** Plugin manifests, slash commands, hook scripts, editor rules, packaged skills and integration examples for coding agents.
+- **Promises:** Hooks fail open and stay within the hook time budget; manifests reference files that exist; no integration enables an external provider by default.
+- **How it fails:** A manifest that points at a moved file breaks installation for that agent only; a slow hook delays the user's session.
+- **Tests:** `tests/test_claude_plugin_hook_config.py`, `tests/test_claude_plugin_hook_wrappers.py`, `tests/test_antigravity_plugin_manifest.py`, `tests/test_claude_marketplace_skills.py`, `tests/test_hooks_cli.py`.
+
+## sites
+
+- **Paths:** `landing/`, `website/`, `assets/`
+- **Owns:** The landing page, the documentation website and shared images.
+- **Promises:** Static content only; no tracking and no external calls beyond what the page states.
+- **How it fails:** Broken links or layouts show only in a browser.
+- **Tests:** `landing/check.mjs` and the website build.
+
+## mempalace
+
+- **Paths:** `mempalace/`, `seed/`
+- **Owns:** The memory engine: verbatim drawers, mining, search, knowledge graph, storage backends and the MCP server; plus the reviewed seed card list.
+- **Promises:** User content is stored verbatim; ingest is append-only; search returns original words; nothing leaves the machine unless the user configured a provider.
+- **How it fails:** Backend lock or index damage degrades recall; repair tools rebuild indexes without touching drawers.
+- **Tests:** The `tests/test_` files for mining, search, palace, knowledge graph, backends and the MCP server.
+
+## tests
+
+- **Paths:** `tests/`
+- **Owns:** Shared fixtures and harnesses and every test file not listed in another block.
+- **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls.
+- **How it fails:** A shared fixture change can break unrelated suites; slow or flaky tests waste every run.
+- **Tests:** The suite itself under the coverage gate.
+
+## hub-core
+
+- **Paths:** `commonplace/__init__.py`, `commonplace/__main__.py`, `commonplace/gateway.py`, `commonplace/control_db.py`, `commonplace/auth.py`, `commonplace/policy.py`, `commonplace/tokens.py`, `commonplace/extensions.py`, `commonplace/_http.py`, `commonplace/http_util.py`, `commonplace/urls.py`, `commonplace/ratelimit.py`, `commonplace/workers.py`
+- **Owns:** The gateway (the only way into a workspace), the control database, principals, token policy, the extension seam and one memory worker per workspace.
+- **Promises:** Every request resolves to one principal or none; scopes, wings and trust are checked before any tool runs; tokens are stored hashed; writes are audited.
+- **How it fails:** A worker that does not start returns an error, never another workspace's data; the control database is the single point of failure for sign-in.
+- **Tests:** `tests/test_commonplace_gateway.py`, `tests/test_commonplace_control_db.py`, `tests/test_commonplace_policy.py`, `tests/test_hub_` files.
+
+## sessions-and-sign-in
+
+- **Paths:** `commonplace/sessions.py`, `commonplace/session.py`, `commonplace/email_auth.py`, `commonplace/mailer.py`, `commonplace/oauth/`, `commonplace/social/`
+- **Owns:** Web sign-in links and cookies, startup context reads, email challenges, outgoing mail, OAuth for MCP clients and provider sign-in.
+- **Promises:** Accounts exist only after verification; sessions are cookie-bound and revocable; mail is configured only through the environment.
+- **How it fails:** Mail outages block new sign-ins but not existing sessions; a misconfigured provider fails closed.
+- **Tests:** `tests/test_commonplace_email_auth.py`, `tests/test_commonplace_oauth.py`, `tests/test_commonplace_social.py`, `tests/test_commonplace_session.py`.
+
+## cli-and-client
+
+- **Paths:** `commonplace/cli.py`, `commonplace/client.py`, `commonplace/client_hooks.py`, `commonplace/client_install.py`, `commonplace/bridge.py`, `commonplace/onboarding.py`, `commonplace/seed.py`, `commonplace/README.md`, `commonplace/SETUP.md`, `commonplace/agent-skill/`
+- **Owns:** The `commonplace` command line, the credential-scoped client, native hooks and installers, the stdio bridge and the agent skill.
+- **Promises:** CLI commands act through the same services as the network routes; installers never change trust policy; hooks fail open.
+- **How it fails:** The CLI runs with data-dir access, so anyone with the service's OS user can use it (residual in `SYSTEM.md`).
+- **Tests:** `tests/test_commonplace_cli.py`, `tests/test_commonplace_client.py`, `tests/test_commonplace_client_hooks.py`, `tests/test_commonplace_client_install.py`, `tests/test_commonplace_onboarding.py`.
+
+## boards
+
+- **Paths:** `commonplace/boards/`, `commonplace/events.py`, `commonplace/webhooks.py`, `commonplace/holds.py`, `commonplace/callstack.py`
+- **Owns:** Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
+- **Promises:** Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval.
+- **How it fails:** A swallowed emission loses a notification but not the change (the trigger sweep reads `task_events`); webhook delivery retries and records failures.
+- **Tests:** `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`.
+
+## runner
+
+- **Paths:** `commonplace/runner/`, `docs/runner.md`
+- **Owns:** Machine enrollment and grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
+- **Promises:** A start needs a person owner or a listed trusted PAT and a card the worker could claim; one active start per card; an uncertain launch is never re-queued; on a configured board `card_start` is person-owner only, starts are fenced and capped, and the lease payload carries the pinned message and model.
+- **How it fails:** A lost launch result becomes `uncertain` and waits for a person; a revoked machine cancels queued jobs on the next sweep; a busy queue refuses with `busy`.
+- **Tests:** The `tests/test_runner_` files, `tests/test_orch_runner.py`, `tests/test_orch_acceptance.py`.
+
+## orch
+
+- **Paths:** `commonplace/orch/`, `docs/orchestrator.md`, `tests/_orch_helpers.py`, `tests/test_orch_acceptance.py`, `tests/test_orch_schema.py`, `tests/test_orch_store.py`, `tests/test_orch_durable.py`, `tests/test_orch_runner.py`, `tests/test_orch_surfaces.py`, `tests/test_orch_checks.py`, `tests/test_orch_plan_gate.py`, `tests/test_docs_obligations.py`
+- **Owns:** The orchestrator config format and its versions and experiments, config-driven starts, triggers, leases, the journal, resume, the restore flag and acknowledgement, `plan-check` and `docs-check`.
+- **Promises:** Only owner-accepted versions run; every config-driven start is one fenced, capped transaction; a retry returns the stored job; external effects are never re-issued by the hub; after a restore nothing config-driven runs until the owner acknowledges; boards without a `[runner]` config behave as before.
+- **How it fails:** Refusals become coded misses shown on resume; an unproven external effect becomes `needs_person`; infrastructure errors leave the trigger cursor in place for the next sweep.
+- **Tests:** The `tests/test_orch_` files listed in Paths and `tests/test_docs_obligations.py`.
+
+## projects
+
+- **Paths:** `commonplace/projects/`, `commonplace/plans.py`
+- **Owns:** Project orchestrator seats, project model choices, project limits, project wings and optional hosted plans.
+- **Promises:** Only a signed-in owner changes models or limits; `max_agents` counts distinct connection assignees; model resolution goes project, then workspace, then the runner default.
+- **How it fails:** An unresolved model refuses a config-driven start before insert; a limit change does not stop work already started.
+- **Tests:** The `tests/test_projects_` files, `tests/test_commonplace_plans.py`.
+
+## rules-and-guards
+
+- **Paths:** `commonplace/rules/`, `commonplace/guards/`, `commonplace/privacy.py`, `commonplace/redact.py`
+- **Owns:** Owner-reviewed rules and their freshness gate, guard building blocks, sensitive-text flags and redaction.
+- **Promises:** Rules take effect only after owner review; writes from a client with stale rules get 428; flags are deterministic.
+- **How it fails:** Redaction can miss a sensitive detail; flags are hints, not blocks.
+- **Tests:** `tests/test_commonplace_rules.py`, `tests/test_commonplace_rules_enforce.py`, `tests/test_commonplace_privacy.py`, the `tests/test_guards_` files.
+
+## handoff-and-continuity
+
+- **Paths:** `commonplace/handoff/`, `commonplace/continuity.py`, `commonplace/continuity_read.py`, `commonplace/continuity_schema.py`
+- **Owns:** Agent context handoff to a fresh agent and append-only native session continuity.
+- **Promises:** A handoff never loses the source thread; continuity is append-only and resumable.
+- **How it fails:** A failed launch of the successor leaves the source agent running; an interrupted archive adoption resumes from its last committed step.
+- **Tests:** The `tests/test_handoff_` files, `tests/test_commonplace_continuity_unit.py`.
+
+## chat-and-voice
+
+- **Paths:** `commonplace/chat/`, `commonplace/voice.py`, `commonplace/phone_push/`
+- **Owns:** The workspace chat front agent, server-local dictation and opt-in phone notifications.
+- **Promises:** Chat answers come from the configured provider or the poster's own runner, never a silent fallback; audio stays in request memory; push is opt-in.
+- **How it fails:** Without a provider or runner the chat shows a receipt and no answer; push delivery failures are recorded, not retried forever.
+- **Tests:** The `tests/test_chat_` files, `tests/test_commonplace_voice.py`, the `tests/test_commonplace_phone_push_` files.
+
+## memory-and-search
+
+- **Paths:** `commonplace/memory_tools.py`, `commonplace/search_index_api.py`, `commonplace/store_embed.py`, `commonplace/store_switch.py`, `commonplace/workspace_store.py`, `commonplace/capture.py`, `commonplace/capture_client.py`
+- **Owns:** Memory tools and routes under the caller's policy, search index progress, workspace store generations and cutovers, and opt-in chat capture.
+- **Promises:** Reads and writes respect the caller's wings and scopes; store cutovers are backup-gated and restartable; capture is explicit and append-only.
+- **How it fails:** An interrupted cutover keeps the previous store live; an index rebuild degrades search speed, not stored text.
+- **Tests:** `tests/test_commonplace_memory.py`, `tests/test_commonplace_capture.py`, `tests/test_workspace_store_switch.py`.
+
+## imports
+
+- **Paths:** `commonplace/imports.py`, `commonplace/import_grant.py`, `commonplace/import_parts.py`, `commonplace/import_sources.py`, `commonplace/import_tools.py`, `commonplace/ingest_cadence.py`
+- **Owns:** Consented one-time imports of conversations and facts and the shared ingest cadence.
+- **Promises:** Imports are verbatim, bounded and consented; no capture, model or external call is involved.
+- **How it fails:** A refused or interrupted import leaves already committed batches in place and reports where it stopped.
+- **Tests:** `tests/test_commonplace_import.py`, `tests/test_commonplace_import_grant.py`, `tests/test_commonplace_import_list.py`.
+
+## sync
+
+- **Paths:** `commonplace/sync_cli.py`, `commonplace/sync_daemon.py`, `commonplace/sync_feed.py`, `commonplace/sync_protocol.py`, `commonplace/sync_service.py`, `commonplace/sync_sessions.py`, `commonplace/sync_sources.py`, `commonplace/sync_state.py`
+- **Owns:** Opt-in client synchronization of transcripts and memory, its local state and the content-free live feed.
+- **Promises:** Sync never opens a server database and never reads credentials; local state holds metadata only.
+- **How it fails:** A lost connection keeps the outbox and resumes from the cursor; a corrupt local cache is rebuilt from the server.
+- **Tests:** The `tests/test_commonplace_sync_` files.
+
+## backup-and-encryption
+
+- **Paths:** `commonplace/backup.py`, `commonplace/backup_online.py`, `commonplace/backup_supervisor.py`, `commonplace/backup_pause.py`, `commonplace/admission.py`, `commonplace/workspace_encryption.py`
+- **Owns:** Offline and online verified backups and restores of the data directory, the gateway pause socket and run fence, the admission gate for store/file creators and the successor registry, the restore marker, and opt-in workspace SQLite encryption.
+- **Promises:** A backup copies every SQLite file with a manifest; an online backup runs beside the serving gateway without stopping or replacing it and publishes only after the run is committed; a restore publishes a verified copy into a new directory and never overwrites; the restore marker blocks config-driven work until the owner acknowledges.
+- **How it fails:** A damaged backup is refused at verify time; an online run that loses its lease, heartbeat or fence ends invalid and publishes nothing; a live in-container successor refuses the run; a hand-copied restore carries no marker (residual in `SYSTEM.md`).
+- **Tests:** `tests/test_backups.py`, `tests/test_backup_snapshot_deadline.py`, `tests/test_commonplace_w5_backup.py`, `tests/test_backup_online.py`, `tests/test_backup_hook_online.py`, `tests/test_backup_pause.py`, `tests/test_backup_cli_fence.py`, `tests/test_admission_gate.py`, `tests/test_orch_store.py`.
+
+## skills
+
+- **Paths:** `commonplace/skills/`
+- **Owns:** Workspace skills exposed through scoped MCP tools and owner-managed routes.
+- **Promises:** Skills are versioned; only the owner publishes them; reads follow the caller's scopes.
+- **How it fails:** A missing skill version is refused, not silently replaced.
+- **Tests:** `tests/test_commonplace_skills.py`, `tests/test_commonplace_skill.py`.
+
+## web-and-console
+
+- **Paths:** `commonplace/web/`, `commonplace/console/`
+- **Owns:** The cookie-authenticated web app and the live console.
+- **Promises:** The web app calls the same services as REST; it shows only what the signed-in person may read.
+- **How it fails:** Rendering errors surface in the browser; the server state is unaffected.
+- **Tests:** The `tests/test_workbench_` files, the `tests/test_console_` files and the `tests/test_commonplace_console_` files.

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 from contextlib import contextmanager
@@ -10,6 +11,7 @@ from pathlib import Path
 
 from commonplace.admission import GATE
 from commonplace.extensions import ToolError
+from commonplace.http_util import log_failure
 from mempalace.sqlite_crypto import connect, row_factory
 
 from . import registry
@@ -29,6 +31,7 @@ PRESPAWN_CODES = frozenset(
         "busy",
     )
 )
+logger = logging.getLogger(__name__)
 THREAD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,255}\Z")
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runner_jobs (
@@ -50,6 +53,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS runner_jobs_one_active ON runner_jobs(task_num
 CREATE UNIQUE INDEX IF NOT EXISTS runner_jobs_request
  ON runner_jobs(task_number,requested_by,request_key) WHERE request_key IS NOT NULL;
 """
+# Run record of a config-driven start (orchestrator config). Added by ALTER on every
+# open, so a file created before these columns gains them in place; NULL on every
+# start that is not config-driven.
+CONFIG_COLUMNS = {
+    "config_version": "INTEGER",
+    "config_sha256": "TEXT",
+    "channel": "TEXT",
+    "step_key": "TEXT",
+    "model_provider": "TEXT",
+    "model": "TEXT",
+}
+# Conflict messages of create/create_in and the stable refusal code of each.
+CONFLICT_CODES = {
+    "request_key reused with different arguments": "request_conflict",
+    "card already has an active start": "active_start",
+    "card was started recently": "started_recently",
+    "busy": "busy",
+}
 
 
 class Conflict(Exception):
@@ -75,6 +96,7 @@ class JobStore:
         self.path = str(directory / "runner.sqlite3")
         with self.connection() as conn:
             conn.executescript(SCHEMA)
+            _migrate(conn)
 
     @contextmanager
     def connection(self):
@@ -98,8 +120,31 @@ class JobStore:
                 raise
 
 
+def _migrate(conn):
+    """Add the config run-record columns to a runner_jobs table that lacks them."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(runner_jobs)")}
+    missing = [name for name in CONFIG_COLUMNS if name not in columns]
+    if not missing:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(runner_jobs)")}
+        for name, datatype in CONFIG_COLUMNS.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE runner_jobs ADD COLUMN {name} {datatype}")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def open_store(gateway, ws):
     return JobStore(gateway, ws)
+
+
+def conflict_code(exc) -> str:
+    """Stable refusal code of a create/create_in Conflict."""
+    return CONFLICT_CODES.get(str(exc), "conflict")
 
 
 def job_object(row, *, tokens=False):
@@ -183,6 +228,14 @@ def sweep(store, db, ws):
 
 def _sweep(store):
     sweep(store, store.gateway.db, store.workspace_id)
+    # Config-driven todo triggers run after sweep() committed, never inside its
+    # transaction. A failure is logged; the next sweep retries from the cursor.
+    try:
+        from commonplace.orch import triggers
+
+        triggers.run(store)
+    except Exception as exc:
+        log_failure(logger, "orchestrator trigger sweep failed", exc)
 
 
 def _hourly(conn, machine, now):
@@ -193,6 +246,20 @@ def _hourly(conn, machine, now):
         ).fetchone()[0]
         >= machine["max_starts_per_hour"]
     )
+
+
+def request_digest(machine_id, project, topic, runtime_mode, config=None):
+    """The stored request hash. A start that is not config-driven hashes exactly the
+    four grant arguments, as before; a config-driven start adds its pinned config and
+    model fields (``CONFIG_COLUMNS`` minus ``step_key``)."""
+    arguments = dict(machine_id=machine_id, project=project, topic=topic, runtime_mode=runtime_mode)
+    if config is not None:
+        arguments.update(
+            {key: config[key] for key in CONFIG_COLUMNS if key != "step_key"},
+        )
+    return hashlib.sha256(
+        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def create(
@@ -214,64 +281,103 @@ def create(
     """
     _sweep(store)
     now = _now()
-    arguments = dict(
-        machine_id=machine["id"], project=project, topic=topic, runtime_mode=runtime_mode
-    )
-    digest = hashlib.sha256(
-        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
     with store.transaction() as conn:
-        if request_key is not None:
-            previous = conn.execute(
-                "SELECT * FROM runner_jobs WHERE task_number=? AND requested_by=? AND request_key=?",
-                (task_number, requested_by, request_key),
-            ).fetchone()
-            if previous:
-                if previous["request_hash"] != digest:
-                    raise Conflict("request_key reused with different arguments")
-                return 200, dict(previous)
-        if conn.execute(
-            "SELECT 1 FROM runner_jobs WHERE task_number=? AND state IN "
-            "('queued','leased','starting','uncertain')",
-            (task_number,),
-        ).fetchone():
-            raise Conflict("card already has an active start")
-        if (
-            not person
-            and conn.execute(
-                "SELECT 1 FROM runner_jobs WHERE task_number=? AND started_at>?",
-                (task_number, _after(now, -86400)),
-            ).fetchone()
-        ):
-            raise Conflict("card was started recently")
-        queued = conn.execute(
-            "SELECT COUNT(*) FROM runner_jobs WHERE machine_id=? AND state='queued'",
-            (machine["id"],),
-        ).fetchone()[0]
-        if queued >= QUEUE_LIMIT or _hourly(conn, machine, now):
-            raise Conflict("busy")
-        job = "job_" + secrets.token_hex(8)
-        conn.execute(
-            "INSERT INTO runner_jobs(id,task_number,board_slug,machine_id,project,topic,"
-            "grant_version,runtime_mode,requested_by,request_key,request_hash,state,created_at,updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)",
-            (
-                job,
-                task_number,
-                board_slug,
-                machine["id"],
-                project,
-                topic,
-                machine["grant_version"],
-                runtime_mode,
-                requested_by,
-                request_key,
-                digest,
-                now,
-                now,
-            ),
+        return create_in(
+            conn,
+            now=now,
+            task_number=task_number,
+            board_slug=board_slug,
+            machine=machine,
+            project=project,
+            topic=topic,
+            requested_by=requested_by,
+            runtime_mode=runtime_mode,
+            request_key=request_key,
+            person=person,
         )
-        return 201, dict(_row(conn, job))
+
+
+def create_in(
+    conn,
+    *,
+    now,
+    task_number,
+    board_slug,
+    machine,
+    project,
+    topic,
+    requested_by,
+    runtime_mode="approval-required",
+    request_key=None,
+    person=False,
+    config=None,
+):
+    """``create`` on the caller's open ``BEGIN IMMEDIATE`` connection.
+
+    Never sweeps (the caller swept and took its control snapshot before the
+    transaction). Keeps every guard of ``create``: the request-key dedupe, one active
+    start per card, the 24 h rule for non-person starts and the queue/hourly limits.
+    ``config`` (config-driven starts) holds ``CONFIG_COLUMNS``; it is stored on the job
+    and its fields join the request hash. Returns (HTTP status, stored row)."""
+    digest = request_digest(machine["id"], project, topic, runtime_mode, config)
+    if request_key is not None:
+        previous = conn.execute(
+            "SELECT * FROM runner_jobs WHERE task_number=? AND requested_by=? AND request_key=?",
+            (task_number, requested_by, request_key),
+        ).fetchone()
+        if previous:
+            if previous["request_hash"] != digest:
+                raise Conflict("request_key reused with different arguments")
+            return 200, dict(previous)
+    if conn.execute(
+        "SELECT 1 FROM runner_jobs WHERE task_number=? AND state IN "
+        "('queued','leased','starting','uncertain')",
+        (task_number,),
+    ).fetchone():
+        raise Conflict("card already has an active start")
+    if (
+        not person
+        and conn.execute(
+            "SELECT 1 FROM runner_jobs WHERE task_number=? AND started_at>?",
+            (task_number, _after(now, -86400)),
+        ).fetchone()
+    ):
+        raise Conflict("card was started recently")
+    queued = conn.execute(
+        "SELECT COUNT(*) FROM runner_jobs WHERE machine_id=? AND state='queued'",
+        (machine["id"],),
+    ).fetchone()[0]
+    if queued >= QUEUE_LIMIT or _hourly(conn, machine, now):
+        raise Conflict("busy")
+    job = "job_" + secrets.token_hex(8)
+    conn.execute(
+        "INSERT INTO runner_jobs(id,task_number,board_slug,machine_id,project,topic,"
+        "grant_version,runtime_mode,requested_by,request_key,request_hash,state,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)",
+        (
+            job,
+            task_number,
+            board_slug,
+            machine["id"],
+            project,
+            topic,
+            machine["grant_version"],
+            runtime_mode,
+            requested_by,
+            request_key,
+            digest,
+            now,
+            now,
+        ),
+    )
+    if config is not None:
+        conn.execute(
+            "UPDATE runner_jobs SET "
+            + ",".join(f"{key}=?" for key in CONFIG_COLUMNS)
+            + " WHERE id=?",
+            (*(config.get(key) for key in CONFIG_COLUMNS), job),
+        )
+    return 201, dict(_row(conn, job))
 
 
 def lease(store, machine):
@@ -394,9 +500,11 @@ def cancel(store, job, principal):
     now = _now()
     with store.transaction() as conn:
         row = _row(conn, job)
-        if not (principal.person and principal.role == "owner") and row[
-            "requested_by"
-        ] != requester_ref(principal):
+        owner = principal.person and principal.role == "owner"
+        if row["step_key"] is not None and not owner:
+            # An orchestrator step's start: only a signed-in workspace owner cancels it.
+            raise ToolError("no: only a workspace owner may cancel an orchestrator start")
+        if not owner and row["requested_by"] != requester_ref(principal):
             raise ToolError("no: only the requester or a workspace owner may cancel")
         if row["state"] == "uncertain":
             raise Conflict("start outcome is uncertain; a workspace owner must resolve it")

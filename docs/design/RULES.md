@@ -348,6 +348,7 @@ The Rules screen's incident-count projection is a separate follow-up.
 The following paths deliberately remain open, retaining existing authorization:
 
 - `task_heartbeat`: mechanical claim renewal.
+- `orch_heartbeat`, `orch_release`: mechanical orchestrator lease renewal and release.
 - `webhook_add`, `webhook_remove`, `webhook_test`: configuration and outbound automation.
 - `mempalace_add_drawer`, `mempalace_update_drawer`, `mempalace_diary_write`,
   `mempalace_kg_add`, `mempalace_kg_invalidate`, `mempalace_kg_supersede`,

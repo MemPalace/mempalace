@@ -18,6 +18,7 @@ from .backup_supervisor import cli_fence
 from .control_db import ControlDB, ControlError
 from .extensions import ToolError
 from .mailer import MailError
+from .orch import cli as orch_cli
 from .policy import PROFILES, TRUST_LEVELS, Policy, PolicyError
 
 DATA_ENV = "COMMONPLACE_DATA"
@@ -1096,6 +1097,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("backup_dir")
     s.add_argument("dest_dir")
     s.set_defaults(func=cmd_restore)
+    orch_cli.add_parsers(sub)
     return p
 
 
@@ -1119,7 +1121,8 @@ def main(argv=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     _check_backup_args(parser, args)
-    if args.command == "runner":
+    if args.command == "runner" or orch_cli.repo_only(args):
+        # Repository checks and the runner client never open the data directory.
         return args.func(args)
     if args.command in {"onboard", "remember", "rule", "check", "sync"}:
         from .client import ClientError
@@ -1158,7 +1161,7 @@ def main(argv=None) -> int:
         print(f"commonplace: {exc}", file=sys.stderr)
         return 2
     except ValueError as exc:
-        if args.command not in {"login-link", "seed", "backup", "workspace", "doctor"}:
+        if args.command not in {"login-link", "seed", "backup", "workspace", "doctor", "orch"}:
             raise
         print(f"commonplace: {exc}", file=sys.stderr)
         return 2
