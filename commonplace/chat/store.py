@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from commonplace.admission import GATE
 from commonplace.chat.types import JOB_CODES, MAX_PENDING_PER_WORKSPACE, STALE_AFTER_S, Job, Reply
 from mempalace.sqlite_crypto import connect, row_factory
 
@@ -82,15 +83,16 @@ class ReplyStore:
         if not create and not path.is_file():
             return None
         if self._conn is None:
-            if create:
-                path.parent.mkdir(parents=True, exist_ok=True)
-            conn = connect(
-                str(path) if create else path.as_uri() + "?mode=rw",
-                uri=not create,
-                timeout=0.05,
-                check_same_thread=False,
-                isolation_level=None,
-            )
+            with GATE.creating(path):
+                if create:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                conn = connect(
+                    str(path) if create else path.as_uri() + "?mode=rw",
+                    uri=not create,
+                    timeout=0.05,
+                    check_same_thread=False,
+                    isolation_level=None,
+                )
             try:
                 conn.row_factory = row_factory
                 conn.execute("PRAGMA journal_mode=WAL")

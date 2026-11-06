@@ -31,9 +31,15 @@ class HandoffContext:
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def store_for(self, workspace_id: str):
+        from commonplace.admission import GATE
         from commonplace.workspace_store import open_threads, workspace_path
 
         with self._lock:
+            store = self._stores.get(workspace_id)
+            if store is not None:
+                return store
+        # Enter the gate before the lock, so a waiting opener never holds it.
+        with GATE.creating(), self._lock:
             store = self._stores.get(workspace_id)
             if store is None:
                 directory = workspace_path(self.data_dir, workspace_id)

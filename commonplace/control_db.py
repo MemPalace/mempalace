@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Optional
 
 from . import tokens
+from .admission import GATE
 from .policy import Policy
 
 SCHEMA_VERSION = 1
@@ -364,7 +365,8 @@ class ControlDB:
             raise ControlError("workspace name is empty")
         wid = _new_id("ws")
         now = _iso(_now())
-        with self._lock, self._tx() as conn:
+        # A new workspace adds stores to the data tree: never during a backup cut.
+        with GATE.creating(), self._lock, self._tx() as conn:
             conn.execute(
                 "INSERT INTO workspaces(id, name, personal_of, initial_space_pending, created_at) "
                 "VALUES (?,?,?,?,?)",

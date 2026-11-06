@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Operator-invoked, offline snapshot -> encrypted remote restic -> 30-day retention.
+# Operator-invoked online snapshot of the running service -> encrypted remote restic -> 30-day retention.
 set -Eeuo pipefail
 umask 077
 

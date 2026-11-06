@@ -405,6 +405,22 @@ def _close_backend_clients(palace_module) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _private_admin_socket(monkeypatch):
+    """Give every test its own gateway admin socket directory.
+
+    The successor registry (``successors.json``) lives next to the admin
+    socket, so without this a test that launches a successor would write the
+    host's default ``/tmp/commonplace-<uid>/`` registry. The path stays short
+    (a Unix socket path is limited to 107 bytes), so it is not under tmp_path.
+    """
+    base = "/tmp" if os.path.isdir("/tmp") else None
+    directory = tempfile.mkdtemp(prefix="cpadm-", dir=base)
+    monkeypatch.setenv("COMMONPLACE_ADMIN_SOCKET", os.path.join(directory, "gateway.sock"))
+    yield
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_one_shot_warnings():
     """Let every test see the warnings that fire once per process."""
     once = sys.modules.get("mempalace._once")

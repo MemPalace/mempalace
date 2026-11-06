@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import plans
 from .backup import BackupError, data_lock
+from .backup_supervisor import cli_fence
 from .control_db import ControlDB, ControlError
 from .extensions import ToolError
 from .mailer import MailError
@@ -895,10 +896,19 @@ def cmd_workspace_prune(args) -> int:
 
 
 def cmd_backup(args) -> int:
-    from .backup import backup
+    from . import backup_supervisor
 
-    backup(_data_dir(args), args.dest_dir)
-    print(Path(args.dest_dir).expanduser().resolve() / "manifest.json")
+    data = _data_dir(args)
+    if args.check_online:
+        print(json.dumps(backup_supervisor.check_online(data, args.dest_dir), sort_keys=True))
+        return 0
+    if args.online_cleanup:
+        print(json.dumps(backup_supervisor.cleanup(data, args.dest_dir), sort_keys=True))
+        return 0
+    if args.online:
+        print(backup_supervisor.run_online(data, args.dest_dir, deadline=args.deadline))
+        return 0
+    print(backup_supervisor.backup_auto(data, args.dest_dir, deadline=args.deadline))
     return 0
 
 
@@ -1054,8 +1064,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--by")
     s.set_defaults(func=cmd_seed)
 
-    s = sub.add_parser("backup")
-    s.add_argument("dest_dir")
+    s = sub.add_parser(
+        "backup",
+        help="verified backup: offline when the data directory is free, else online",
+    )
+    s.add_argument("dest_dir", nargs="?", metavar="DEST")
+    mode = s.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--online",
+        action="store_true",
+        help="snapshot next to a running gateway; DEST is <data>/.backup-staging/<stamp>",
+    )
+    mode.add_argument(
+        "--check-online",
+        action="store_true",
+        help="exit 0 when a gateway for this data directory can run an online backup",
+    )
+    mode.add_argument(
+        "--online-cleanup",
+        action="store_true",
+        help="remove an unlocked staging run's leftovers for DEST (never signals)",
+    )
+    s.add_argument(
+        "--deadline", type=_epoch, metavar="EPOCH", help="stop the run at this Unix time"
+    )
     s.set_defaults(func=cmd_backup)
     s = sub.add_parser("restore", help="verify and restore a backup into a new directory")
     s.add_argument("backup_dir")
@@ -1064,8 +1096,26 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _epoch(value):
+    number = float(value)
+    if not 0 < number < float("inf"):
+        raise argparse.ArgumentTypeError("must be a positive Unix time")
+    return number
+
+
+def _check_backup_args(parser, args) -> None:
+    if args.command != "backup":
+        return
+    if args.dest_dir is None and not args.check_online:
+        parser.error("backup: the following arguments are required: DEST")
+    if args.deadline is not None and (args.check_online or args.online_cleanup):
+        parser.error("backup: --deadline applies to a backup run only")
+
+
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _check_backup_args(parser, args)
     if args.command == "runner":
         return args.func(args)
     if args.command in {"onboard", "remember", "rule", "check", "sync"}:
@@ -1095,7 +1145,11 @@ def main(argv=None) -> int:
             args.command == "workspace" and args.action in {"store", "prune-stores", "encrypt"}
         ):
             return args.func(args)
-        with data_lock(_data_dir(args)):
+        if args.func is cmd_serve:
+            # Serve never takes the backup fence; an online backup runs beside it.
+            with data_lock(_data_dir(args)):
+                return args.func(args)
+        with cli_fence(_data_dir(args)), data_lock(_data_dir(args)):
             return args.func(args)
     except errors as exc:
         print(f"commonplace: {exc}", file=sys.stderr)

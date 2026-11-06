@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from commonplace.admission import GATE
 from commonplace.extensions import ToolError
 
 SCHEMA = """
@@ -35,14 +36,16 @@ def digest(text):
 class SkillStore:
     def __init__(self, workspace_dir):
         self.root = Path(workspace_dir) / "skills"
-        self.root.mkdir(parents=True, exist_ok=True)
+        with GATE.creating(self.root):
+            self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "index.sqlite3"
         with self.connection() as conn:
             conn.executescript(SCHEMA)
 
     @contextmanager
     def connection(self):
-        conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
+        with GATE.creating(self.path):
+            conn = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -97,61 +100,63 @@ class SkillStore:
         """Publish file references only after every new file is complete; old files stay intact."""
         paths = []
         records = []
-        try:
-            with self.connection() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                if receipt:
-                    existing = conn.execute(
-                        "SELECT skill_ids FROM installs WHERE receipt=?", (receipt,)
-                    ).fetchone()
-                    if existing:
-                        return [self.get(sid, 1) for sid in json.loads(existing[0])]
-                if skill_id is not None:
-                    current = conn.execute(
-                        "SELECT MAX(version) FROM versions WHERE skill_id=?", (skill_id,)
-                    ).fetchone()[0]
-                    if current is None:
-                        raise ToolError("no: skill not found")
-                    if type(expected_version) is not int or expected_version != current:
-                        raise ToolError("no: skill version changed")
-                for entry in entries:
-                    sid = skill_id or opaque("sk_")
-                    version = expected_version + 1 if skill_id else 1
-                    directory = self.root / sid
-                    directory.mkdir(exist_ok=True)
-                    sha256 = digest(entry["markdown"])
-                    path = directory / f"{version}-{sha256}.md"
-                    # A crash before the metadata commit may leave a complete orphan.
-                    # Reuse only an identical orphan; never overwrite a prior version.
-                    if path.exists():
-                        if path.read_bytes() != entry["markdown"].encode("utf-8"):
-                            raise ToolError("no: skill Markdown integrity check failed")
-                    else:
-                        with path.open("xb") as stream:
-                            paths.append(path)
-                            stream.write(entry["markdown"].encode("utf-8"))
-                    record = dict(
-                        skill_id=sid,
-                        version=version,
-                        name=entry["name"],
-                        sha256=sha256,
-                        source=json.dumps(entry["source"], ensure_ascii=False),
-                        created_at=now(),
-                    )
-                    conn.execute(
-                        "INSERT INTO versions VALUES "
-                        "(:skill_id,:version,:name,:sha256,:source,:created_at)",
-                        record,
-                    )
-                    records.append({**entry, **record, "source": entry["source"]})
-                if receipt:
-                    conn.execute(
-                        "INSERT INTO installs VALUES (?,?)",
-                        (receipt, json.dumps([row["skill_id"] for row in records])),
-                    )
-                conn.commit()
-        except BaseException:
-            for path in paths:
-                path.unlink(missing_ok=True)
-            raise
+        # The whole append (files, then rows) is one creator: a backup cut sees all or none.
+        with GATE.creating():
+            try:
+                with self.connection() as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if receipt:
+                        existing = conn.execute(
+                            "SELECT skill_ids FROM installs WHERE receipt=?", (receipt,)
+                        ).fetchone()
+                        if existing:
+                            return [self.get(sid, 1) for sid in json.loads(existing[0])]
+                    if skill_id is not None:
+                        current = conn.execute(
+                            "SELECT MAX(version) FROM versions WHERE skill_id=?", (skill_id,)
+                        ).fetchone()[0]
+                        if current is None:
+                            raise ToolError("no: skill not found")
+                        if type(expected_version) is not int or expected_version != current:
+                            raise ToolError("no: skill version changed")
+                    for entry in entries:
+                        sid = skill_id or opaque("sk_")
+                        version = expected_version + 1 if skill_id else 1
+                        directory = self.root / sid
+                        directory.mkdir(exist_ok=True)
+                        sha256 = digest(entry["markdown"])
+                        path = directory / f"{version}-{sha256}.md"
+                        # A crash before the metadata commit may leave a complete orphan.
+                        # Reuse only an identical orphan; never overwrite a prior version.
+                        if path.exists():
+                            if path.read_bytes() != entry["markdown"].encode("utf-8"):
+                                raise ToolError("no: skill Markdown integrity check failed")
+                        else:
+                            with path.open("xb") as stream:
+                                paths.append(path)
+                                stream.write(entry["markdown"].encode("utf-8"))
+                        record = dict(
+                            skill_id=sid,
+                            version=version,
+                            name=entry["name"],
+                            sha256=sha256,
+                            source=json.dumps(entry["source"], ensure_ascii=False),
+                            created_at=now(),
+                        )
+                        conn.execute(
+                            "INSERT INTO versions VALUES "
+                            "(:skill_id,:version,:name,:sha256,:source,:created_at)",
+                            record,
+                        )
+                        records.append({**entry, **record, "source": entry["source"]})
+                    if receipt:
+                        conn.execute(
+                            "INSERT INTO installs VALUES (?,?)",
+                            (receipt, json.dumps([row["skill_id"] for row in records])),
+                        )
+                    conn.commit()
+            except BaseException:
+                for path in paths:
+                    path.unlink(missing_ok=True)
+                raise
         return records

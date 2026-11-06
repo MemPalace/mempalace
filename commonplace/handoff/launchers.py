@@ -34,6 +34,7 @@ from urllib.request import (
     build_opener,
 )
 
+from ..admission import GATE, REGISTRY, RegistryError
 from .launcher_policy import (
     LauncherPolicyError,
     require_enabled,
@@ -87,18 +88,19 @@ class _NoRedirect(HTTPRedirectHandler):
 def _write_prompt(directory: Path, handoff_id: str, prompt: str) -> Path:
     if not handoff_id or handoff_id in (".", "..") or any(char in handoff_id for char in "/\\\0"):
         raise LaunchError("Invalid handoff id.")
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory.chmod(0o700)
-    destination = directory / f"{handoff_id}.md"
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{handoff_id}.", dir=directory)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(prompt.encode("utf-8"))
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, destination)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+    with GATE.creating():
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.chmod(0o700)
+        destination = directory / f"{handoff_id}.md"
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{handoff_id}.", dir=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(prompt.encode("utf-8"))
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, destination)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
     return destination
 
 
@@ -139,22 +141,36 @@ def _command(
             COMMONPLACE_THREAD_ID=handoff.stored_thread_id,
         )
         log_path = directory / f"{handoff.id}.log"
-        descriptor = os.open(
-            log_path,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        with os.fdopen(descriptor, "ab") as log:
-            log_path.chmod(0o600)
-            process = subprocess.Popen(
-                argv,
-                cwd=cwd,
-                env=environment,
-                start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=log,
+        # The successor is recorded (and the launch counted) before it exists, so
+        # a backup either refuses while it runs or sees its launch mid-run.
+        with GATE.creating():
+            descriptor = os.open(
+                log_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
             )
+            with os.fdopen(descriptor, "ab") as log:
+                log_path.chmod(0o600)
+                with REGISTRY.launching(handoff.id) as started:
+                    process = subprocess.Popen(
+                        argv,
+                        cwd=cwd,
+                        env=environment,
+                        start_new_session=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=log,
+                    )
+                    for _attempt in (1, 2):
+                        try:
+                            started(int(process.pid))
+                            break
+                        except (RegistryError, AttributeError, TypeError, ValueError):
+                            # Retried once; then the starting entry stays and keeps
+                            # backups refused until the gateway restarts (fail closed).
+                            continue
+    except RegistryError:
+        raise LaunchError("Could not record the handoff command.") from None
     except (OSError, ValueError):
         raise LaunchError("Could not start the handoff command.") from None
     try:

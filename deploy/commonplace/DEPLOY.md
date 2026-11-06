@@ -82,15 +82,17 @@ refused. A static test does not prove TLS, container startup or recovery.
 ## Backups
 
 Use [nightly backups and scratch restore](../../docs/backups.md) to configure
-`app/nightly-backup.sh`: consistent offline snapshots, encrypted off-host
-restic storage, 30-day retention and failure notification. Keep credentials
+`app/nightly-backup.sh`: consistent online snapshots of the running service,
+encrypted off-host restic storage, 30-day retention and failure notification. Keep credentials
 and scheduler configuration outside the checkout. The older 30-daily / 12-weekly
 policy is superseded.
 
 For integration into another host backup job, executable `app/backup-hook.sh`
 still accepts an existing absolute staging directory and only creates a
-snapshot. That hook does not configure or invoke restic; its caller must
-upload, apply retention, remove local staging and alert on failure.
+snapshot. The staging directory must be on the same filesystem as the data
+directory. That hook does not configure or invoke restic; its caller must
+upload, apply retention, remove local staging (`commonplace-*` and
+`.commonplace-staging`, also after a failure) and alert on failure.
 
 By default the hook reads `.env` and `compose.yml` from the parent of its
 source checkout. Override that directory with `COMMONPLACE_DEPLOY_DIR`,
@@ -100,15 +102,45 @@ relative paths are rejected before the gateway is touched. The deploy
 wrapper and backup scheduler must agree on these files and the Compose
 project name.
 
-The hook locks the backup directory, checks the backup CLI, stops the
-container and its workers, takes a consistent snapshot in a one-off
-container, and restarts the gateway even if snapshot creation fails.
-Expect a short outage. Staging is owned by `10001:10001` and is mounted at
-`/backup` separately from the source `/data`. Only a complete snapshot with
-`control.sqlite3` and a valid `manifest.json` is published by atomic rename.
-Failure returns nonzero, preserves staging and a mode-600 diagnostic log,
-and must abort the parent backup job. Verify failure propagation and an
-off-host restore before relying on the scheduler.
+The hook never stops, starts, restarts, recreates, removes or kills the
+serve container and never starts a one-off container; it uses only Compose `ps`
+and `exec` plus `docker inspect`. It locks the backup directory, records the
+serve container's ID and start time, finds the host path mounted at `/data`,
+creates `.backup-staging/` there (owned by `10001:10001`, mode 0700), removes
+earlier unlocked leftovers and checks free space. It then runs
+`commonplace backup --online` inside the running container with stdin closed,
+bounded by `COMMONPLACE_BACKUP_DEADLINE` (default 4500 seconds) plus a grace
+period, while it refreshes a heartbeat file the in-container snapshot watches.
+If the container's ID or start time changed, the run fails as "serve changed".
+Only a committed snapshot with `control.sqlite3` and a valid `manifest.json`
+is moved to the staging directory and published by atomic rename; both parent
+directories are synced. The service stays up. Memory pauses for about a minute
+or two and one-shot CLI commands are refused during the run; see
+[backups](../../docs/backups.md) for what users see and when a run is refused.
+
+Failure returns nonzero with a one-line stage, keeps a mode-600 diagnostic log
+(stages, counts and seconds only), removes its staging, leaves the service
+untouched and must abort the parent backup job. Staging that a still-running
+snapshot holds locked stays until the next run removes it. Verify failure
+propagation and an off-host restore before relying on the scheduler.
+
+Never put worktrees or other project paths inside the data directory. Install
+this release's `commonplace` CLI on the data host before enabling the hook, or
+install none; an older host CLI does not take the backup fence.
+
+### Live proof
+
+`deploy/commonplace/backup-live-probe.sh EVIDENCE_DIR` runs one backup through
+the scheduler unit and samples the service while it runs: `/healthz` locally
+and publicly every second, a board read and a heartbeat on a dedicated probe
+card every 5 seconds, and an MCP memory search every 5 seconds. It passes only
+if the serve container keeps its ID and start time, no one-off container
+appears, every health check and board read and write succeeds, memory fails
+only with `-32603` inside one bounded pause window, no sampler stalls, and a
+new restic snapshot exists and verifies. An OOM kill in the window makes the
+result inconclusive. Run it as root, with the owner's approval, and see the
+script header for its settings; the token is never printed or put on a command
+line.
 
 ## Rollback and recovery
 
@@ -122,8 +154,9 @@ docker compose --env-file "$COMMONPLACE_ENV_FILE" -f "$COMPOSE_FILE" \
 
 Restore the previous installed Caddy site files if routes changed, validate
 the full configuration and reload Caddy. Check health, sign-in and MCP.
-A wrapper that always rebuilds is unsuitable for image rollback. Keep the
-backup hook aligned with the selected image before the next scheduled run.
+A wrapper that always rebuilds is unsuitable for image rollback. An image
+without online backup makes the hook fail closed with an alert; it never
+stops the service. Do not reinstall an older hook that stops the service.
 
 For data recovery, retrieve a selected snapshot into a separate directory, then
 run `commonplace restore <snapshot_dir> <new_data_dir>` to verify its manifest,
@@ -140,7 +173,8 @@ Verify health, search, cards and a new backup.
 uv run pytest -q -p no:cacheprovider tests/test_commonplace_deploy.py
 uv run ruff check .
 uv run ruff format --check .
-bash -n backup-hook.sh deploy/commonplace/deploy.sh
+bash -n backup-hook.sh nightly-backup.sh deploy/commonplace/deploy.sh deploy/commonplace/backup-live-probe.sh
+shellcheck backup-hook.sh nightly-backup.sh deploy/commonplace/backup-live-probe.sh
 ```
 
 ## Deploy
@@ -197,6 +231,9 @@ The script performs these steps in order:
 2. Start the backup unit with `systemctl start --wait`, require a changed,
    nonempty InvocationID and a successful Result. The unit must be loaded, Type=oneshot and RemainAfterExit=no. The start is
    bounded by DEPLOY_BACKUP_TIMEOUT (positive integer seconds, default 3600);
+   the unit's own `TimeoutStartSec` must be finite and below it, or the deploy
+   refuses before starting the unit. For the online backup use
+   `TimeoutStartSec=3h` and `DEPLOY_BACKUP_TIMEOUT=11400`.
    ExecMainStartTimestamp must independently be at or after deploy start.
    All clock comparisons use epoch seconds, matching systemd timestamp precision.
    Missing InvocationID/Result state fails closed. A prerequisite is that the
@@ -214,7 +251,7 @@ The script performs these steps in order:
    and print the health HTTP status. The health probe is informational and has
    a 10-second timeout; verify readiness separately as described above.
 
-The deploy script makes no docker/compose call until steps 2–4 pass. The backup unit itself may briefly stop and start the gateway (that is the backup's design, not a deploy step). The default MAX_AGE of 7200 seconds exceeds the default 3600-second backup timeout. MAX_AGE must exceed your measured backup duration (restic stamps `time` at the start of the backup).
+The deploy script makes no docker/compose call until steps 2–4 pass. The backup unit never stops, restarts or replaces the gateway; it snapshots the running service. MAX_AGE must exceed your measured backup duration (restic stamps `time` at the start of the backup); the default 7200 seconds covers the hook's 75-minute snapshot deadline plus upload for typical data sizes.
 
 On failure, fix the backup or configuration and rerun the script. Do not work
 around the gate. The script does not fetch source or delete operator files.

@@ -8,6 +8,8 @@ import re
 import sqlite3
 from pathlib import Path
 
+from .admission import GATE
+
 POINTER = ".store-pointer.json"
 POINTER_PREVIOUS = ".store-pointer.prev.json"
 INVENTORIES = ".store-retired-files.json"
@@ -235,7 +237,8 @@ def open_threads(directory, *, sample_every=100):
         raise ValueError(
             "Workspace thread format disagrees with settings; a verified store switch is required"
         )
-    store = (ThreadStoreV2 if path.name == "threads.v2.sqlite3" else ThreadStore)(str(path))
+    with GATE.creating(path):
+        store = (ThreadStoreV2 if path.name == "threads.v2.sqlite3" else ThreadStore)(str(path))
     try:
         comparison = read_json(directory / ".store-comparison.json")
     except ValueError:

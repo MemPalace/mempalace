@@ -1,4 +1,4 @@
-"""Offline restore drills and nightly failure propagation; no remote credentials."""
+"""Restore drills and nightly failure propagation; no remote credentials, serve never stopped."""
 
 import importlib
 import json
@@ -15,6 +15,11 @@ import pytest
 
 from commonplace.backup import BackupError, backup, restore, verify_backup
 from commonplace.control_db import ControlDB
+from tests.test_commonplace_deploy import (
+    assert_serve_never_displaced,
+    install_fake_host,
+    snapshot_calls,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 NIGHTLY = ROOT / "nightly-backup.sh"
@@ -194,58 +199,17 @@ def test_restore_copy_failure_cleans_partial(fresh_data, tmp_path, monkeypatch):
     assert not list(tmp_path.glob(".scratch.partial-*"))
 
 
-# Simulate only Docker/ownership, remote restic and alert delivery. Snapshot and
-# restore use real SQLite and the production backup implementation throughout.
-FAKE_COMMAND = r"""
-import json, os, pathlib, sys
-name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
-with open(os.environ["FAKE_COMMANDS"], "a") as log:
-    log.write(json.dumps({"command": name, "args": args}) + "\n")
-fail = os.environ.get("FAKE_FAIL", "")
-if name == "install":
-    pathlib.Path(args[-1]).mkdir(parents=True, exist_ok=True)
-elif name == "docker":
-    if "ps" in args:
-        print("test-container")
-    elif "exec" in args:
-        if fail == "preflight": sys.exit(9)
-    elif "stop" in args:
-        if fail == "stop": sys.exit(9)
-    elif "start" in args:
-        if fail == "restart": sys.exit(9)
-    elif "run" in args:
-        if fail == "snapshot": sys.exit(9)
-        from commonplace.backup import backup
-        mount = args[args.index("--volume") + 1]
-        target = pathlib.Path(mount.removesuffix(":/backup")) / pathlib.Path(args[-1]).name
-        backup(os.environ["FAKE_DATA"], target)
-    else:
-        sys.exit(10)
-elif name == "restic":
-    if args[0] == "backup":
-        from commonplace.backup import restore
-        restore(args[-1], os.environ["FAKE_RESTORED"])
-        if fail == "upload": sys.exit(3)
-    elif args[0] == "forget":
-        if fail == "retention": sys.exit(9)
-    else:
-        sys.exit(10)
-elif name == "alert":
-    if fail == "alert": sys.exit(9)
-else:
-    sys.exit(10)
-"""
-
-
+# Simulate only Docker/ownership, remote restic and alert delivery. The hook runs
+# for real and snapshots the running serve container through `compose exec`; the
+# fake container writes that snapshot with the production writer (format v1).
+# Restore uses real SQLite and the production implementation throughout.
 def run_nightly(tmp_path, data, fail="", **overrides):
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for name in ("docker", "install", "restic", "alert"):
-        executable = bin_dir / name
-        executable.write_text(f"#!{sys.executable}\n" + FAKE_COMMAND)
-        executable.chmod(0o755)
+    install_fake_host(bin_dir, ("docker", "install", "restic", "alert"))
     staging = tmp_path / "staging"
     staging.mkdir()
+    fake_state = tmp_path / "fake-state"
+    fake_state.mkdir()
     commands = tmp_path / "commands.jsonl"
     recovered = tmp_path / "recovered"
     env = {
@@ -253,8 +217,13 @@ def run_nightly(tmp_path, data, fail="", **overrides):
         "PYTHONPATH": str(ROOT),
         "FAKE_COMMANDS": str(commands),
         "FAKE_DATA": str(data),
+        "FAKE_STATE": str(fake_state),
+        "FAKE_SNAPSHOT": "real",
         "FAKE_RESTORED": str(recovered),
         "FAKE_FAIL": fail,
+        # The test filesystem is small; the disk reserve and margin are the operator's.
+        "COMMONPLACE_BACKUP_RESERVE_BYTES": "0",
+        "COMMONPLACE_BACKUP_MARGIN_BYTES": "0",
         "RESTIC_REPOSITORY": "sftp:backup@backup.example.test:/backups",
         "COMMONPLACE_BACKUP_ID": "test-deployment",
         "COMMONPLACE_BACKUP_ALERT": str(bin_dir / "alert"),
@@ -263,9 +232,10 @@ def run_nightly(tmp_path, data, fail="", **overrides):
     result = subprocess.run(
         ["bash", str(NIGHTLY), str(staging)],
         env=env,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=60,
     )
     calls = (
         [json.loads(line) for line in commands.read_text().splitlines()]
@@ -284,6 +254,8 @@ def run_nightly(tmp_path, data, fail="", **overrides):
         ):
             Path(child_log).unlink()
         log_path.unlink()
+    # Serve is never stopped, restarted or replaced, on success or failure.
+    assert_serve_never_displaced(calls)
     return result, calls, recovered
 
 
@@ -292,6 +264,7 @@ def test_nightly_uploads_restorable_tree_then_retains_thirty_days(fresh_data, tm
     assert result.returncode == 0, result.stderr
     assert result.stdout == "commonplace nightly backup completed\n"
     assert_restored(recovered, fresh_data[1])
+    assert not (recovered / ".backup-staging").exists()
     uploads = [call["args"] for call in calls if call["command"] == "restic"]
     assert len(uploads) == 2
     assert uploads[0][:6] == ["backup", "--host", "test-deployment", "--tag", "commonplace", "--"]
@@ -307,16 +280,20 @@ def test_nightly_uploads_restorable_tree_then_retains_thirty_days(fresh_data, tm
         "30d",
         "--prune",
     ]
-    start = next(
-        i for i, call in enumerate(calls) if call["command"] == "docker" and "start" in call["args"]
-    )
+    # One online snapshot inside the running container, without stdin, then upload.
+    snapshot = snapshot_calls(calls)
+    assert len(snapshot) == 1
+    exec_index = next(i for i, call in enumerate(calls) if call["args"] == snapshot[0])
+    assert calls[exec_index]["stdin"] == "devnull"
     upload = next(i for i, call in enumerate(calls) if call["command"] == "restic")
-    assert start < upload
+    assert exec_index < upload
+    stamp = snapshot[0][-1].rsplit("/", 1)[1]
+    assert not [p for p in (fresh_data[0] / ".backup-staging").iterdir() if stamp in p.name]
     assert not any(call["command"] == "alert" for call in calls)
 
 
 @pytest.mark.parametrize(
-    "failure", ["preflight", "stop", "snapshot", "restart", "upload", "retention"]
+    "failure", ["serve_down", "snapshot", "serve_changed", "upload", "retention"]
 )
 def test_nightly_failure_propagates_alerts_and_skips_unsafe_followup(fresh_data, tmp_path, failure):
     result, calls, _ = run_nightly(tmp_path, fresh_data[0], failure)
@@ -327,8 +304,7 @@ def test_nightly_failure_propagates_alerts_and_skips_unsafe_followup(fresh_data,
     assert alerts[0]["args"][0] == (failure if failure in {"upload", "retention"} else "snapshot")
     restic = [call["args"][0] for call in calls if call["command"] == "restic"]
     assert restic == ({"upload": ["backup"], "retention": ["backup", "forget"]}.get(failure, []))
-    if failure in {"stop", "snapshot", "restart"}:
-        assert any(call["command"] == "docker" and "start" in call["args"] for call in calls)
+    assert len(snapshot_calls(calls)) == (0 if failure == "serve_down" else 1)
 
 
 @pytest.mark.parametrize("repository", ["/local/repo", "relative", ""])

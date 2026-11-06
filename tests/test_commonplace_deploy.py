@@ -125,19 +125,35 @@ def test_caddy_security_headers_and_future_short_links():
     assert "app.cmmn.dev {" in commented
 
 
+# The hook snapshots the running serve container through `compose exec` and must
+# never displace it (no one-off container, no stop/start). These verbs replace,
+# stop or freeze the serve container; neither the hook nor the nightly job may
+# send them.
+DISPLACING_VERBS = frozenset(
+    {"stop", "start", "restart", "run", "up", "down", "rm", "kill", "create", "pause", "unpause"}
+)
+
+
 def test_hook_is_executable_and_uses_only_host_managed_restic():
     assert HOOK.stat().st_mode & 0o111
     text = HOOK.read_text()
     assert "set -Eeuo pipefail" in text
     assert 'docker compose --env-file "$env_file" -f "$compose_file"' in text
-    assert "exec -T commonplace commonplace backup --help" in text
-    assert "stop --timeout 60 commonplace" in text
-    assert '--volume "$staging_parent:/backup"' in text
-    assert 'container_staging="/backup/$stamp"' in text
-    assert "install -d -o 10001 -g 10001 -m 0700" in text
+    # The snapshot runs inside the running serve container, bounded, without stdin.
+    assert (
+        'timeout -k 10 "$t" "${compose[@]}" exec -T commonplace commonplace backup --online'
+        ' --deadline "$deadline" "/data/.backup-staging/$stamp" </dev/null'
+    ) in text
+    assert 'install -d -o 10001 -g 10001 -m 0700 "$data_host/.backup-staging"' in text
+    assert 'install -d -m 0700 -- "$backup_dir/.commonplace-staging"' in text
+    assert "trap 'exit 143' TERM INT" in text
     assert "flock -n 9" in text
-    assert 'mv -T -- "$host_staging" "$destination"' in text
-    commands = "\n".join(line for line in text.splitlines() if not line.startswith("#"))
+    assert "mv -T" in text
+    commands = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    assert "--volume" not in commands
+    verbs = re.findall(r'"\$\{compose\[@\]\}"\s+(?:-\S+\s+)*([a-z-]+)', commands)
+    assert "exec" in verbs
+    assert not DISPLACING_VERBS & set(verbs), verbs
     assert not re.search(r"\brestic\s+(backup|forget|prune|init)\b", commands)
 
 
@@ -150,56 +166,269 @@ def test_hook_rejects_invalid_destination_with_one_failure_line(arguments):
     assert result.stderr.startswith("commonplace backup failed: setup")
 
 
-# This fake only models the external container/permission boundary. Each test
-# runs the actual hook, including its traps, lock, validation and atomic move.
-FAKE_DOCKER = """#!/usr/bin/python3
-import json, os, pathlib, sys
-args = sys.argv[1:]
-if pathlib.Path(sys.argv[0]).name == 'install':
+# This fake models only the external boundary: the Docker CLI and the root-only
+# `install -o`. It holds one running serve container whose /data is a host
+# directory (FAKE_DATA). Each test runs the actual hook, including its traps,
+# locks, validation and atomic moves. Every call is logged at entry. Verbs that
+# would displace serve fail loudly. `inspect --format` supports the Go-template
+# subset a shell hook needs ({{.A.B}}, {{json .X}}, range, if eq, println).
+FAKE_HOST_COMMANDS = r"""
+import json, os, pathlib, re, shutil, stat, sys
+name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
+try:
+    st = os.fstat(0)
+    devnull = os.stat(os.devnull)
+    stdin = "devnull" if (stat.S_ISCHR(st.st_mode) and st.st_rdev == devnull.st_rdev) else "other"
+except OSError:
+    stdin = "closed"
+with open(os.environ["FAKE_COMMANDS"], "a") as log:
+    log.write(json.dumps({"command": name, "args": args, "stdin": stdin}) + "\n")
+fail = os.environ.get("FAKE_FAIL", "")
+state = pathlib.Path(os.environ["FAKE_STATE"])
+data = pathlib.Path(os.environ["FAKE_DATA"])
+DISPLACING = {"stop", "start", "restart", "run", "up", "down", "rm", "kill", "create",
+              "pause", "unpause"}
+VALUED = {"--env-file", "-f", "--file", "-p", "--project-name", "--project-directory",
+          "--profile", "--ansi", "--progress", "--parallel"}
+
+def die(code, message):
+    print(f"fake {name}: {message}", file=sys.stderr)
+    sys.exit(code)
+
+def split_verb(words):
+    index = 0
+    while index < len(words) and words[index].startswith("-"):
+        index += 2 if words[index] in VALUED and "=" not in words[index] else 1
+    return (words[index], words[index + 1:]) if index < len(words) else ("", [])
+
+def container():
+    snapshotted = (state / "snapshotted").exists()
+    started = "2026-01-01T00:00:00.000000000Z"
+    if fail == "serve_changed" and snapshotted:
+        started = "2026-01-01T00:09:00.000000000Z"
+    return {
+        "Id": "c" * 64,
+        "Name": "/test-commonplace-1",
+        "State": {"Status": "running", "Running": True, "StartedAt": started},
+        "Mounts": [{"Type": "bind", "Source": str(data), "Destination": "/data", "RW": True}],
+        "Config": {"Labels": {"com.docker.compose.service": "commonplace"}},
+        "HostConfig": {"Init": True},
+    }
+
+def lookup(context, path):
+    for part in [p for p in path.strip().lstrip(".").split(".") if p]:
+        context = context[part]
+    return context
+
+def parse(tokens, index=0):
+    nodes = []
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if not token.startswith("{{"):
+            nodes.append(("text", token))
+            continue
+        action = token[2:-2].strip("- ").strip()
+        if action == "end":
+            return nodes, index
+        if action.startswith(("range ", "if ")):
+            body, index = parse(tokens, index)
+            nodes.append((action, body))
+        else:
+            nodes.append(("expr", action))
+    return nodes, index
+
+def show(value):
+    if isinstance(value, bool):
+        return str(value).lower()
+    return value if isinstance(value, str) else json.dumps(value)
+
+def render(nodes, context):
+    out = []
+    for kind, value in nodes:
+        if kind == "text":
+            out.append(value)
+        elif kind == "expr":
+            if value == "println":
+                out.append("\n")
+            elif value.startswith("json "):
+                out.append(json.dumps(lookup(context, value[5:])))
+            elif value.startswith("."):
+                out.append(show(lookup(context, value)))
+            else:
+                die(98, f"unsupported template action {value!r}")
+        elif kind.startswith("range "):
+            out.extend(render(value, item) for item in lookup(context, kind[6:]))
+        else:
+            condition = kind[3:].strip()
+            match = re.fullmatch(r'eq (\.\S*) "([^"]*)"', condition)
+            if match:
+                ok = show(lookup(context, match[1])) == match[2]
+            elif condition.startswith("."):
+                ok = bool(lookup(context, condition))
+            else:
+                die(98, f"unsupported template condition {condition!r}")
+            if ok:
+                out.append(render(value, context))
+    return "".join(out)
+
+def inspect(words):
+    template, targets, index = None, [], 0
+    while index < len(words):
+        word = words[index]
+        if word in ("-f", "--format"):
+            template, index = words[index + 1], index + 2
+            continue
+        if word.startswith("--format="):
+            template = word.split("=", 1)[1]
+        elif word == "--type":
+            index += 1
+        elif not word.startswith("-"):
+            targets.append(word)
+        index += 1
+    serve = container()
+    if fail == "serve_down" or not targets or any(
+        t not in (serve["Id"], serve["Id"][:12], serve["Name"].lstrip("/")) for t in targets
+    ):
+        die(1, "Error: No such object")
+    if template is None:
+        print(json.dumps([serve for _ in targets], indent=4))
+    else:
+        nodes, _ = parse(re.split(r"({{.*?}})", template))
+        for _ in targets:
+            print(render(nodes, serve))
+
+def write_snapshot(destination):
+    if fail == "snapshot":
+        die(9, "snapshot failed")
+    if os.environ.get("FAKE_SNAPSHOT") == "real":
+        # The production snapshot writer (format v1) on the container's /data,
+        # minus the hook's own staging; published by one rename like the child.
+        from commonplace import backup as module
+        inventory = module._inventory
+        def without_staging(root, *args, **kwargs):
+            files, dirs = inventory(root, *args, **kwargs)
+            keep = lambda p: p.relative_to(root).parts[0] not in (
+                ".backup-staging", ".commonplace-fence.lock")
+            return [p for p in files if keep(p)], [p for p in dirs if keep(p)]
+        module._inventory = without_staging
+        partial = state / f"snapshot-{destination.name}"
+        module.backup(data, partial)
+        partial.rename(destination)
+    else:
+        destination.mkdir()
+        (destination / "control.sqlite3").write_bytes(b"consistent snapshot")
+        if fail != "manifest":
+            (destination / "manifest.json").write_text("invalid" if fail == "corrupt" else "{}")
+
+def compose(words):
+    verb, rest = split_verb(words)
+    if verb in DISPLACING:
+        die(97, f"displacing verb {verb!r}")
+    if verb == "ps":
+        if fail != "serve_down":
+            print(container()["Id"])
+    elif verb == "exec":
+        while rest and rest[0].startswith("-"):
+            rest = rest[2:] if rest[0] in ("-u", "--user", "-e", "--env", "-w", "--workdir",
+                                            "--index") else rest[1:]
+        if rest[:3] != ["commonplace", "commonplace", "backup"]:
+            die(10, f"unexpected exec {rest!r}")
+        if fail == "serve_down":
+            die(1, "service is not running")
+        if "--online" in rest:
+            target = rest[-1]
+            if not target.startswith("/data/.backup-staging/"):
+                die(2, f"bad snapshot destination {target!r}")
+            (state / "snapshotted").touch()
+            write_snapshot(data / target[len("/data/"):])
+    elif verb != "config":
+        die(10, f"unexpected compose verb {verb!r}")
+
+if name == "install":
     pathlib.Path(args[-1]).mkdir(parents=True, exist_ok=True)
-    sys.exit(0)
-with open(os.environ['FAKE_COMMANDS'], 'a') as log:
-    log.write(json.dumps(args) + '\\n')
-mode = os.environ.get('FAKE_FAIL', '')
-if 'ps' in args:
-    print('test-container')
-elif 'exec' in args:
-    if mode == 'preflight': sys.exit(9)
-elif 'stop' in args:
-    if mode == 'stop': sys.exit(9)
-elif 'start' in args:
-    if mode == 'restart': sys.exit(9)
-elif 'run' in args:
-    if mode == 'snapshot': sys.exit(9)
-    mount = args[args.index('--volume') + 1]
-    assert mount.endswith(':/backup'), mount
-    destination = pathlib.Path(mount[:-len(':/backup')]) / pathlib.Path(args[-1]).name
-    destination.mkdir()
-    (destination / 'control.sqlite3').write_bytes(b'consistent snapshot')
-    if mode != 'manifest':
-        (destination / 'manifest.json').write_text('invalid' if mode == 'corrupt' else '{}')
+elif name == "docker":
+    verb, rest = split_verb(args)
+    if verb == "compose":
+        compose(rest)
+    elif verb == "inspect":
+        inspect(rest)
+    elif verb == "container" and rest[:1] == ["inspect"]:
+        inspect(rest[1:])
+    elif verb == "ps":
+        pass  # no one-off containers exist
+    elif verb in DISPLACING or (verb == "container" and rest[:1] and rest[0] in DISPLACING):
+        die(97, f"displacing verb {verb!r}")
+    else:
+        die(10, f"unexpected docker verb {verb!r}")
+elif name == "restic":
+    if args[0] == "backup":
+        from commonplace.backup import restore
+        restore(args[-1], os.environ["FAKE_RESTORED"])
+        if fail == "upload": sys.exit(3)
+    elif args[0] == "forget":
+        if fail == "retention": sys.exit(9)
+    else:
+        sys.exit(10)
+elif name == "alert":
+    if fail == "alert": sys.exit(9)
 else:
     sys.exit(10)
 """
 
 
+def install_fake_host(bin_dir, names=("docker", "install")):
+    bin_dir.mkdir(exist_ok=True)
+    for name in names:
+        executable = bin_dir / name
+        executable.write_text(f"#!{sys.executable}\n" + FAKE_HOST_COMMANDS)
+        executable.chmod(0o755)
+
+
+def docker_calls(calls):
+    return [call["args"] for call in calls if call["command"] == "docker"]
+
+
+def assert_serve_never_displaced(calls):
+    """No call may stop, replace or freeze the serve container."""
+    for args in docker_calls(calls):
+        assert not DISPLACING_VERBS & set(args), args
+
+
+def snapshot_calls(calls):
+    return [args for args in docker_calls(calls) if "exec" in args and "--online" in args]
+
+
 def run_hook(tmp_path, fail="", env_overrides=None):
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    docker = bin_dir / "docker"
-    docker.write_text(FAKE_DOCKER)
-    docker.chmod(0o755)
-    (bin_dir / "install").symlink_to(docker)
+    install_fake_host(bin_dir)
     backups = tmp_path / "backups"
     backups.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    fake_state = tmp_path / "fake-state"
+    fake_state.mkdir()
     commands = tmp_path / "commands.jsonl"
     env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
     for key in ("COMMONPLACE_DEPLOY_DIR", "COMMONPLACE_ENV_FILE", "COMPOSE_FILE"):
         env.pop(key, None)
-    env.update(FAKE_COMMANDS=str(commands), FAKE_FAIL=fail)
+    env.update(
+        FAKE_COMMANDS=str(commands),
+        FAKE_FAIL=fail,
+        FAKE_DATA=str(data),
+        FAKE_STATE=str(fake_state),
+        # The test filesystem is small; the disk reserve and margin are the operator's.
+        COMMONPLACE_BACKUP_RESERVE_BYTES="0",
+        COMMONPLACE_BACKUP_MARGIN_BYTES="0",
+    )
     env.update(env_overrides or {})
     result = subprocess.run(
-        ["bash", str(HOOK), str(backups)], env=env, capture_output=True, text=True, timeout=10
+        ["bash", str(HOOK), str(backups)],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
     calls = (
         [json.loads(line) for line in commands.read_text().splitlines()]
@@ -213,25 +442,40 @@ def run_hook(tmp_path, fail="", env_overrides=None):
         log_path = Path(log_match[1])
         assert log_path.is_file()
         log_path.unlink()
-    return result, backups, calls
+    return result, backups, calls, data
 
 
-def test_hook_publishes_complete_snapshot_after_restarting_gateway(tmp_path):
-    result, backups, calls = run_hook(tmp_path)
+def test_hook_publishes_snapshot_without_displacing_serve(tmp_path):
+    result, backups, calls, data = run_hook(tmp_path)
     assert result.returncode == 0, result.stderr
     snapshots = list(backups.glob("commonplace-*"))
     assert len(snapshots) == 1
+    stamp = snapshots[0].name.removeprefix("commonplace-")
+    assert re.fullmatch(r"[0-9TZ.]+-[0-9]+", stamp)
     assert (snapshots[0] / "control.sqlite3").read_bytes() == b"consistent snapshot"
     assert json.loads((snapshots[0] / "manifest.json").read_text()) == {}
     assert list((backups / ".commonplace-staging").iterdir()) == []
-    actions = [
-        next(word for word in call if word in {"ps", "exec", "stop", "run", "start"})
-        for call in calls
+    assert not [path for path in (data / ".backup-staging").iterdir() if stamp in path.name]
+    assert_serve_never_displaced(calls)
+    snapshot = snapshot_calls(calls)
+    assert len(snapshot) == 1
+    assert snapshot[0][snapshot[0].index("exec") :] == [
+        "exec",
+        "-T",
+        "commonplace",
+        "commonplace",
+        "backup",
+        "--online",
+        "--deadline",
+        snapshot[0][-2],
+        f"/data/.backup-staging/{stamp}",
     ]
-    assert actions == ["ps", "exec", "stop", "run", "start"]
-    for call in calls:
-        assert call[:4] == ["compose", "--env-file", str(ROOT.parent / ".env"), "-f"]
-        assert Path(call[4]) == ROOT.parent / "compose.yml"
+    assert snapshot[0][-2].isdigit()
+    assert [call["stdin"] for call in calls if call["args"] == snapshot[0]] == ["devnull"]
+    for args in docker_calls(calls):
+        if args[0] == "compose":
+            assert args[1:4] == ["--env-file", str(ROOT.parent / ".env"), "-f"]
+            assert Path(args[4]) == ROOT.parent / "compose.yml"
 
 
 @pytest.mark.parametrize("individual_paths", [False, True])
@@ -242,17 +486,18 @@ def test_hook_uses_external_operator_configuration(tmp_path, individual_paths):
     overrides = {"COMMONPLACE_DEPLOY_DIR": str(operator_dir)}
     if individual_paths:
         overrides.update(COMMONPLACE_ENV_FILE=str(env_file), COMPOSE_FILE=str(compose_file))
-    result, _, calls = run_hook(tmp_path, env_overrides=overrides)
+    result, _, calls, _ = run_hook(tmp_path, env_overrides=overrides)
     assert result.returncode == 0, result.stderr
-    assert calls
-    for call in calls:
-        assert call[:5] == ["compose", "--env-file", str(env_file), "-f", str(compose_file)]
+    compose_calls = [args for args in docker_calls(calls) if args[0] == "compose"]
+    assert compose_calls
+    for args in compose_calls:
+        assert args[:5] == ["compose", "--env-file", str(env_file), "-f", str(compose_file)]
 
 
 @pytest.mark.parametrize("name", ["COMMONPLACE_DEPLOY_DIR", "COMMONPLACE_ENV_FILE", "COMPOSE_FILE"])
 @pytest.mark.parametrize("value", ["relative/config", "~/config"])
 def test_hook_rejects_relative_overrides_before_touching_gateway(tmp_path, name, value):
-    result, backups, calls = run_hook(tmp_path, env_overrides={name: value})
+    result, backups, calls, _ = run_hook(tmp_path, env_overrides={name: value})
     assert result.returncode == 2
     assert result.stdout == ""
     assert result.stderr.count("\n") == 1
@@ -261,23 +506,20 @@ def test_hook_rejects_relative_overrides_before_touching_gateway(tmp_path, name,
     assert list(backups.iterdir()) == []
 
 
-@pytest.mark.parametrize(
-    "fail", ["preflight", "stop", "snapshot", "restart", "manifest", "corrupt"]
-)
-def test_hook_fails_closed_and_recovers_gateway(tmp_path, fail):
-    result, backups, calls = run_hook(tmp_path, fail)
+@pytest.mark.parametrize("fail", ["serve_down", "snapshot", "manifest", "corrupt", "serve_changed"])
+def test_hook_fails_closed_without_displacing_serve(tmp_path, fail):
+    result, backups, calls, _ = run_hook(tmp_path, fail)
     assert result.returncode != 0
     assert result.stderr.count("\n") == 1
     assert result.stderr.startswith("commonplace backup failed:")
     assert list(backups.glob("commonplace-*")) == []
-    if fail == "preflight":
-        assert not any("stop" in call or "run" in call for call in calls)
+    assert_serve_never_displaced(calls)
+    if fail == "serve_down":
+        assert snapshot_calls(calls) == []
     else:
-        assert "start" in calls[-1]
-    if fail == "snapshot":
-        assert "snapshot" in result.stderr
-    if fail == "restart":
-        assert "gateway restart failed" in result.stderr
+        assert len(snapshot_calls(calls)) == 1
+    if fail == "serve_changed":
+        assert "serve changed" in result.stderr
 
 
 def test_backup_shell_syntax():
@@ -311,6 +553,7 @@ def run_deploy(tmp_path, **fakes):
 "show -p LoadState --value test-backup.service") echo loaded ;;
 "show -p Type --value test-backup.service") echo oneshot ;;
 "show -p RemainAfterExit --value test-backup.service") echo REMAIN ;;
+"show -p TimeoutStartUSec --value test-backup.service") echo UNIT_TIMEOUT ;;
 "show -p ExecMainStartTimestamp --value test-backup.service") date -u +%Y-%m-%dT%H:%M:%S.%NZ ;;
 "is-active --quiet test-backup.service") exit ACTIVE ;;
 "show -p InvocationID --value test-backup.service")
@@ -327,6 +570,7 @@ esac""".replace(
         .replace("START_RC", str(fakes.get("start_rc", 0)))
         .replace("RESULT", fakes.get("result", "success"))
         .replace("REMAIN", fakes.get("remain", "no"))
+        .replace("UNIT_TIMEOUT", fakes.get("unit_timeout", "45min"))
         .replace("ACTIVE", str(fakes.get("active", 1))),
         "docker": """if [[ "$*" == *"config --format json" ]]; then
  echo '{"services":{"commonplace":{"ports":[{"host_ip":"HOST_IP","published":"PUBLISHED"}]}}}'
@@ -395,13 +639,13 @@ def assert_deploy_failure(result, calls, step, prefix):
 @pytest.mark.parametrize(
     "fakes,step,prefix",
     [
-        ({"result": "exit-code"}, "backup", ["id"] + ["systemctl"] * 7),
-        ({"check_rc": 1}, "check", ["id"] + ["systemctl"] * 8 + ["latest", "check"]),
+        ({"result": "exit-code"}, "backup", ["id"] + ["systemctl"] * 8),
+        ({"check_rc": 1}, "check", ["id"] + ["systemctl"] * 9 + ["latest", "check"]),
         ({"missing_unit": True}, "config", ["id"]),
-        ({"latest": "echo null"}, "latest", ["id"] + ["systemctl"] * 8 + ["latest"]),
-        ({"latest": "exit 2"}, "latest", ["id"] + ["systemctl"] * 8 + ["latest"]),
+        ({"latest": "echo null"}, "latest", ["id"] + ["systemctl"] * 9 + ["latest"]),
+        ({"latest": "exit 2"}, "latest", ["id"] + ["systemctl"] * 9 + ["latest"]),
         ({"uid": 1000}, "preflight", ["id"]),
-        ({"start_rc": 1}, "backup", ["id"] + ["systemctl"] * 5),
+        ({"start_rc": 1}, "backup", ["id"] + ["systemctl"] * 6),
     ],
 )
 @pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
@@ -419,14 +663,14 @@ def test_deploy_sh_snapshot_before_start(tmp_path):
     snapshot = int(time.time()) - 5
     latest = f'jq -cn --arg time "$(date -u -d @{snapshot} +%Y-%m-%dT%H:%M:%S.%NZ)" \'{{id:("a" * 64),time:$time}}\''
     result, calls = run_deploy(tmp_path, latest=latest)
-    assert_deploy_failure(result, calls, "latest", ["id"] + ["systemctl"] * 8 + ["latest"])
+    assert_deploy_failure(result, calls, "latest", ["id"] + ["systemctl"] * 9 + ["latest"])
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
 def test_deploy_sh_unchanged_invocation(tmp_path):
     assert DEPLOY_SH.is_file()
     result, calls = run_deploy(tmp_path, after="old")
-    assert_deploy_failure(result, calls, "backup", ["id"] + ["systemctl"] * 6)
+    assert_deploy_failure(result, calls, "backup", ["id"] + ["systemctl"] * 7)
 
 
 @pytest.mark.parametrize("timestamp", ["now", "+1 hour", "", "future"])
@@ -440,7 +684,7 @@ def test_deploy_sh_invalid_timestamp(tmp_path, timestamp):
     )
     latest = f"jq -cn --arg time {value} '{{id:(\"a\" * 64),time:$time}}'"
     result, calls = run_deploy(tmp_path, latest=latest)
-    assert_deploy_failure(result, calls, "latest", ["id"] + ["systemctl"] * 8 + ["latest"])
+    assert_deploy_failure(result, calls, "latest", ["id"] + ["systemctl"] * 9 + ["latest"])
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
@@ -456,7 +700,7 @@ def test_deploy_sh_success_order(tmp_path):
         "--env-file",
         str(tmp_path / ".env"),
     ]
-    assert [call[0] for call in calls] == ["id"] + ["systemctl"] * 8 + [
+    assert [call[0] for call in calls] == ["id"] + ["systemctl"] * 9 + [
         "latest",
         "check",
         "systemctl",
@@ -529,6 +773,52 @@ def test_deploy_sh_rejects_remain_after_exit(tmp_path):
     assert DEPLOY_SH.is_file()
     result, calls = run_deploy(tmp_path, remain="yes")
     assert_deploy_failure(result, calls, "config", ["id"] + ["systemctl"] * 3)
+
+
+@pytest.mark.parametrize(
+    "unit_timeout,client_timeout,message",
+    [
+        # A oneshot unit's default TimeoutStartSec is infinity: never deploy on it.
+        ("infinity", None, "must be finite"),
+        ("0", None, "must be finite"),
+        ("", None, "must be finite"),
+        ("soon", None, "must be finite"),
+        ("3 h", None, "must be finite"),
+        # The unit must end before the client gives up, so never equal or above.
+        ("3h", None, "must be below"),
+        ("1h", "3600", "must be below"),
+        ("3h", "10800", "must be below"),
+        ("1h 15min 30.500000s", "4531", "must be below"),
+        ("2w", "999999", "must be below"),
+    ],
+)
+@pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
+def test_deploy_sh_refuses_unbounded_or_outlasting_unit_timeout(
+    tmp_path, unit_timeout, client_timeout, message
+):
+    env = {"DEPLOY_BACKUP_TIMEOUT": client_timeout} if client_timeout else {}
+    result, calls = run_deploy(tmp_path, unit_timeout=unit_timeout, env=env)
+    assert_deploy_failure(result, calls, "config", ["id"] + ["systemctl"] * 4)
+    assert f"unit TimeoutStartSec {message}" in result.stderr
+    assert not any(call[:2] == ["systemctl", "start"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "unit_timeout,client_timeout",
+    [
+        ("59min 59s", None),
+        ("3h", "11400"),  # the documented rollout pair: unit 3h < client 11400 s
+        ("1h 15min 30.500000s", "4532"),
+        ("1min 30s", "91"),
+        ("500ms", "2"),
+    ],
+)
+@pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
+def test_deploy_sh_accepts_unit_timeout_below_client(tmp_path, unit_timeout, client_timeout):
+    env = {"DEPLOY_BACKUP_TIMEOUT": client_timeout} if client_timeout else {}
+    result, calls = run_deploy(tmp_path, unit_timeout=unit_timeout, env=env)
+    assert result.returncode == 0, result.stderr
+    assert ["systemctl", "start", "--wait", "test-backup.service"] in calls
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
@@ -617,7 +907,7 @@ def test_deploy_sh_whitespace_command(tmp_path, key, step):
     assert DEPLOY_SH.is_file()
     result, calls = run_deploy(tmp_path, env={key: "   "})
     assert_deploy_failure(
-        result, calls, step, ["id"] + ["systemctl"] * 8 + (["latest"] if step == "check" else [])
+        result, calls, step, ["id"] + ["systemctl"] * 9 + (["latest"] if step == "check" else [])
     )
 
 
@@ -644,7 +934,7 @@ def test_deploy_sh_wrong_published_port(tmp_path):
 def test_deploy_sh_unloaded_unit(tmp_path):
     assert DEPLOY_SH.is_file()
     result, calls = run_deploy(tmp_path, after="")
-    assert_deploy_failure(result, calls, "backup", ["id"] + ["systemctl"] * 6)
+    assert_deploy_failure(result, calls, "backup", ["id"] + ["systemctl"] * 7)
     assert "backup unit was unloaded; keep it referenced" in result.stderr
 
 
@@ -696,7 +986,7 @@ def test_deploy_sh_rejects_unsafe_config_permissions(tmp_path, ownership):
 def test_deploy_sh_missing_execution_time(tmp_path):
     assert DEPLOY_SH.is_file()
     result, calls = run_deploy(tmp_path, execution="printf ''")
-    assert_deploy_failure(result, calls, "backup", ["id"] + ["systemctl"] * 8)
+    assert_deploy_failure(result, calls, "backup", ["id"] + ["systemctl"] * 9)
     assert "missing execution time" in result.stderr
 
 

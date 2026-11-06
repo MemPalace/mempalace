@@ -11,6 +11,7 @@ from pathlib import Path
 from time import monotonic
 
 from commonplace import redact
+from commonplace.admission import GATE
 from commonplace.http_util import log_failure
 from mempalace.sqlite_crypto import connect, operational_error_type, row_factory
 
@@ -72,15 +73,17 @@ class ActivityStore:
                 self._conn.executescript(_SCHEMA)
                 self._schema_ready = True
             return self._conn
-        if create:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        conn = connect(
-            str(path) if create else path.as_uri() + "?mode=rw",
-            uri=not create,
-            timeout=0.05,
-            check_same_thread=False,
-            isolation_level=None,
-        )
+        # Activity is informational: an append drops rather than wait out a backup cut.
+        with GATE.creating(path, timeout=0.05 if create else None):
+            if create:
+                path.parent.mkdir(parents=True, exist_ok=True)
+            conn = connect(
+                str(path) if create else path.as_uri() + "?mode=rw",
+                uri=not create,
+                timeout=0.05,
+                check_same_thread=False,
+                isolation_level=None,
+            )
         try:
             conn.row_factory = row_factory
             conn.execute("PRAGMA journal_mode=WAL")

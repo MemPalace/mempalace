@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from commonplace.admission import GATE
 from commonplace.extensions import ToolError
 from mempalace.sqlite_crypto import connect, row_factory
 
@@ -283,7 +284,8 @@ class BoardStore:
     def __init__(self, workspace_dir, *, legacy_origin=None, create=True):
         directory = Path(workspace_dir)
         if create:
-            directory.mkdir(parents=True, exist_ok=True)
+            with GATE.creating(directory):
+                directory.mkdir(parents=True, exist_ok=True)
         self.create = create
         self.path = str(directory / "boards.sqlite3")
         with self.connection() as conn:
@@ -363,9 +365,13 @@ class BoardStore:
     @contextmanager
     def connection(self):
         target = self.path if self.create else Path(self.path).resolve().as_uri() + "?mode=rw"
-        conn = connect(
-            target, uri=not self.create, timeout=10 if self.create else 0.2, isolation_level=None
-        )
+        with GATE.creating(self.path):
+            conn = connect(
+                target,
+                uri=not self.create,
+                timeout=10 if self.create else 0.2,
+                isolation_level=None,
+            )
         conn.row_factory = row_factory
         conn.execute("PRAGMA foreign_keys=ON")
         try:

@@ -15,6 +15,32 @@ validate_literal_path() {
     [[ $2 != *[[:space:]\"\'\$\`\\#]* ]] || die config "$1 must be a literal path without whitespace, quotes, expansions or comments"
 }
 
+# Whole seconds, rounded up, of a span as `systemctl show` prints it
+# ("3h", "1h 15min 30.500000s"). Fails on infinity, zero or anything else.
+timespan_seconds() {
+    local rest=$1 total=0 number unit
+    [[ -n $rest && $rest != infinity ]] || return 1
+    while [[ -n $rest ]]; do
+        [[ $rest =~ ^([0-9]{1,12})(\.[0-9]{1,9})?(y|month|w|d|h|min|s|ms|us)( +|$) ]] || return 1
+        number=$((10#${BASH_REMATCH[1]}))
+        unit=${BASH_REMATCH[3]}
+        rest=${rest:${#BASH_REMATCH[0]}}
+        case $unit in
+            y) total=$(( total + number * 31557600 )) ;;
+            month) total=$(( total + number * 2629800 )) ;;
+            w) total=$(( total + number * 604800 )) ;;
+            d) total=$(( total + number * 86400 )) ;;
+            h) total=$(( total + number * 3600 )) ;;
+            min) total=$(( total + number * 60 )) ;;
+            s) total=$(( total + number )) ;;
+            *) total=$(( total + (number > 0) )) ;;
+        esac
+        [[ ${BASH_REMATCH[2]} =~ [1-9] ]] && total=$(( total + 1 ))
+    done
+    (( total > 0 )) || return 1
+    printf '%s\n' "$total"
+}
+
 run_command() {
     local -a command
     read -r -a command <<< "$1"
@@ -26,6 +52,7 @@ run_command() {
 main() {
     local owner mode
     local key value line config start before after result latest timestamp snap now rendered health execution
+    local unit_timeout
     [[ $(id -u) == 0 ]] || die preflight 'must run as root'
     [[ $# == 0 && ! -v SKIP_BACKUP ]] || die usage 'deploy.sh accepts no arguments'
     COMMONPLACE_ROOT=${COMMONPLACE_ROOT:-/srv/commonplace}
@@ -103,6 +130,11 @@ main() {
     [[ $(systemctl show -p LoadState --value "$DEPLOY_BACKUP_UNIT") == loaded ]] || die config 'unit is not loaded'
     [[ $(systemctl show -p Type --value "$DEPLOY_BACKUP_UNIT") == oneshot ]] || die config 'unit must be oneshot'
     [[ $(systemctl show -p RemainAfterExit --value "$DEPLOY_BACKUP_UNIT") == no ]] || die config 'unit must have RemainAfterExit=no'
+    # The unit must end (and clean up) before this client gives up on it:
+    # refuse an infinite unit timeout or one not below DEPLOY_BACKUP_TIMEOUT.
+    unit_timeout=$(systemctl show -p TimeoutStartUSec --value "$DEPLOY_BACKUP_UNIT") || die config 'cannot read unit TimeoutStartSec'
+    unit_timeout=$(timespan_seconds "$unit_timeout") || die config 'unit TimeoutStartSec must be finite'
+    (( unit_timeout < 10#$DEPLOY_BACKUP_TIMEOUT )) || die config 'unit TimeoutStartSec must be below DEPLOY_BACKUP_TIMEOUT'
     start=$(date -u +%s) || die preflight 'cannot read clock'
 
     before=$(systemctl show -p InvocationID --value "$DEPLOY_BACKUP_UNIT" 2>/dev/null) || die backup 'cannot read invocation'

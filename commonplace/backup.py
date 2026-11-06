@@ -4,6 +4,11 @@ CLI database users hold ``data_lock`` for their whole lifetime. Backups take
 its exclusive form before inspecting or opening any database. Linux /proc is
 also checked for workers left behind by a stopped gateway. Other platforms
 refuse backup until equivalent worker verification is available.
+
+A serving data directory is backed up online instead (``backup_online``),
+through the gateway's pause socket. That path never takes ``data_lock``; it
+takes the separate fence lock (:func:`fence_lock`) exclusively. One-shot CLI
+commands take the fence shared, ``serve`` never takes it.
 """
 
 from __future__ import annotations
@@ -25,12 +30,24 @@ from pathlib import Path
 from mempalace.sqlite_crypto import connect, encryption_settings, is_workspace_database
 
 LOCK_NAME = ".commonplace.lock"
+#: Taken exclusive by an online backup, shared by one-shot CLI commands.
+FENCE_NAME = ".commonplace-fence.lock"
+#: Online snapshots are staged here, inside the data directory.
+STAGING_NAME = ".backup-staging"
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _PROC_ROOT = Path("/proc")
 
 
 class BackupError(ValueError):
     """A backup cannot safely be completed."""
+
+
+class DataDirInUse(BackupError):
+    """The data directory lock is held in a conflicting mode."""
+
+
+class FenceBusy(BackupError):
+    """The data directory fence is held in a conflicting mode."""
 
 
 @contextmanager
@@ -60,7 +77,7 @@ def data_lock(data_dir, *, exclusive=False):
         yield
     except OSError as exc:
         if not acquired and exc.errno in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
-            raise BackupError("data directory is in use; stop Commonplace before backup") from exc
+            raise DataDirInUse("data directory is in use; stop Commonplace before backup") from exc
         raise
     finally:
         if acquired:
@@ -73,6 +90,49 @@ def data_lock(data_dir, *, exclusive=False):
                 import fcntl
 
                 fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@contextmanager
+def fence_lock(data_dir, *, exclusive=False, wait_s=0.0, busy_message=None):
+    """Hold the data-directory fence; never remove the lock file.
+
+    The fence is a different file from ``data_lock``: ``serve`` holds
+    ``data_lock`` shared and never the fence, so an online backup can take the
+    fence exclusive while serve runs, and one-shot CLI commands (shared) wait
+    for it. Polls for at most ``wait_s`` seconds, then raises
+    :class:`FenceBusy` (with ``busy_message`` when given). The lock is released
+    only by closing its descriptor (never ``LOCK_UN``), so a forked child that
+    inherited it keeps the fence until it exits too. Windows has no online
+    backup; the fence is a no-op.
+    """
+    root = Path(data_dir).expanduser()
+    if os.name == "nt":
+        yield
+        return
+    import fcntl
+
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(root / FENCE_NAME, flags, 0o600)
+    try:
+        mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        while True:
+            try:
+                fcntl.flock(fd, mode)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise FenceBusy(
+                        busy_message
+                        or "the data directory fence is held by a backup or maintenance command"
+                    ) from exc
+                time.sleep(0.05)
+        yield
+    finally:
         os.close(fd)
 
 
@@ -98,14 +158,18 @@ def _process_path(value: str, proc: Path) -> Path:
     return path.resolve()
 
 
-def _verify_offline(root: Path) -> None:
-    """Reject live processes naming this data tree, including orphan workers."""
+def _verify_offline(root: Path, exempt=()) -> None:
+    """Reject live processes naming this data tree, including orphan workers.
+
+    ``exempt`` pids are skipped as well (an online backup passes the gateway
+    and, before the pause, its worker pids).
+    """
     proc_root = _PROC_ROOT
     if not sys.platform.startswith("linux") or not (proc_root / "self" / "environ").exists():
         raise BackupError("offline worker verification requires Linux /proc")
     # This process and its ancestors (a shell, sudo, docker-init under
     # ``init: true``) carry our command line and environment but write nothing.
-    own = _ancestors(proc_root)
+    own = _ancestors(proc_root) | {int(pid) for pid in exempt}
     for proc in proc_root.iterdir():
         if not proc.name.isdigit() or int(proc.name) in own:
             continue
@@ -153,13 +217,15 @@ def _verify_offline(root: Path) -> None:
             raise BackupError(f"cannot verify whether process {proc.name} uses this data") from exc
 
 
-def _inventory(root: Path) -> tuple[list[Path], list[Path]]:
+def _inventory(root: Path, exclude=()) -> tuple[list[Path], list[Path]]:
+    """Regular files and directories of ``root``; ``exclude`` lists skipped relative paths."""
     files, dirs = [], []
+    skipped = {Path(LOCK_NAME), Path("manifest.json"), *(Path(name) for name in exclude)}
 
     def visit(directory: Path):
         for path in sorted(directory.iterdir()):
             relative = path.relative_to(root)
-            if relative in (Path(LOCK_NAME), Path("manifest.json")):
+            if relative in skipped:
                 # A restored backup can itself be backed up; its previous
                 # manifest is replaced, never listed as a user-data file.
                 continue
@@ -382,12 +448,44 @@ def restore(backup_dir, dest_dir) -> dict:
     }
 
 
+def _serving_gateway(source: Path):
+    """The probe ``hello`` of a gateway serving ``source`` on the admin socket, else None."""
+    try:
+        from .backup_pause import answering
+    except ImportError:
+        return None
+    hello = answering()
+    if not hello or os.path.realpath(str(hello.get("data_dir") or "")) != str(source.resolve()):
+        return None
+    return hello
+
+
 def backup(data_dir, dest_dir) -> dict:
+    """Offline backup: refused while anything (serve included) holds ``data_lock``.
+
+    The flock refusal is the guard. When a gateway answers on the admin socket
+    the refusal names the online path; a gateway that answers for this data
+    directory without holding the lock (another mount namespace) also refuses.
+    """
     source = Path(data_dir).expanduser().absolute()
     if source.is_symlink() or not source.is_dir():
         raise BackupError("data directory must be an existing directory, without a symlink")
-    with data_lock(source, exclusive=True):
-        return _backup_locked(source, dest_dir)
+    locked = False
+    try:
+        with data_lock(source, exclusive=True):
+            locked = True
+            if _serving_gateway(source) is not None:
+                raise DataDirInUse(
+                    "data directory is in use by a serving gateway; "
+                    "use `commonplace backup --online`"
+                )
+            return _backup_locked(source, dest_dir)
+    except DataDirInUse as exc:
+        if locked or _serving_gateway(source) is None:
+            raise
+        raise DataDirInUse(
+            f"{exc}; a gateway is serving it, use `commonplace backup --online`"
+        ) from exc
 
 
 def _backup_locked(data_dir, dest_dir) -> dict:
@@ -415,7 +513,8 @@ def _backup_locked(data_dir, dest_dir) -> dict:
     partial = None
     try:
         _verify_offline(source)
-        files, directories = _inventory(source)
+        # Operational files of online backups are never user data.
+        files, directories = _inventory(source, exclude=(FENCE_NAME, STAGING_NAME))
         control = source / "control.sqlite3"
         databases = {path for path in files if _encrypted_database(path) or _is_sqlite(path)}
         if control not in databases:

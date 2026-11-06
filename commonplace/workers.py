@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Protocol
@@ -52,6 +53,74 @@ _PASSED_ENV = frozenset(
     }
 )
 DEFAULT_IDLE_STOP_S = 15 * 60
+# A memory call that meets a backup pause waits this long, then is refused
+# with a retry hint (COMMONPLACE_BACKUP_MEMORY_WAIT_S overrides the wait).
+DEFAULT_PAUSE_WAIT_S = 20.0
+PAUSE_RETRY_AFTER_S = 30
+STOP_WAIT_S = 10.0
+
+
+class WorkersPaused(RuntimeError):
+    """A memory call met a backup pause that did not end in time."""
+
+    def __init__(self, retry_after_s: int = PAUSE_RETRY_AFTER_S):
+        super().__init__("memory is paused for a backup")
+        self.retry_after_s = retry_after_s
+
+
+class DrainTimeout(RuntimeError):
+    """In-flight memory calls did not finish in time; nothing was stopped."""
+
+
+class SupervisorClosed(RuntimeError):
+    """The supervisor closed while a memory call waited."""
+
+
+class WorkerStopFailed(RuntimeError):
+    """A worker process survived SIGTERM and SIGKILL."""
+
+
+def _proc_starttime(pid: Optional[int]) -> Optional[int]:
+    """Field 22 of ``/proc/<pid>/stat``; ``None`` if gone, a zombie or not Linux."""
+    if pid is None:
+        return None
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return None
+    rest = raw[raw.rfind(b")") + 2 :].split()
+    if not rest or rest[0] in (b"Z", b"X"):
+        return None
+    try:
+        return int(rest[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def process_gone(pid: Optional[int], starttime: Optional[int]) -> bool:
+    """True once ``pid`` (started at ``starttime``) no longer runs."""
+    if pid is None or not sys.platform.startswith("linux"):
+        return True
+    now = _proc_starttime(pid)
+    return now is None or (starttime is not None and now != starttime)
+
+
+def stop_process(proc, term_wait_s: float = STOP_WAIT_S, kill_wait_s: float = STOP_WAIT_S) -> bool:
+    """SIGTERM and wait, then SIGKILL and wait. True when the process was reaped."""
+    if proc.poll() is not None:
+        return True
+    proc.terminate()
+    try:
+        proc.wait(timeout=term_wait_s)
+        return True
+    except subprocess.TimeoutExpired:
+        pass
+    proc.kill()
+    try:
+        proc.wait(timeout=kill_wait_s)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
 
 
 @dataclass
@@ -64,6 +133,7 @@ class Worker:
     alive: Callable[[], bool] = lambda: True
     pid: Optional[int] = None
     last_used: float = field(default_factory=time.monotonic)
+    starttime: Optional[int] = None
 
     @property
     def host_header(self) -> str:
@@ -165,13 +235,10 @@ class SubprocessLauncher:
         finally:
             log.close()  # The worker holds its own copy of the handle.
 
+        starttime = _proc_starttime(proc.pid)
+
         def stop() -> None:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+            stop_process(proc)
 
         worker = Worker(
             workspace_id=workspace_id,
@@ -181,6 +248,7 @@ class SubprocessLauncher:
             stop=stop,
             alive=lambda: proc.poll() is None,
             pid=proc.pid,
+            starttime=starttime,
         )
         try:
             wait_until_ready(worker, self.startup_timeout_s)
@@ -219,15 +287,111 @@ class WorkerSupervisor:
         self.idle_stop_s = idle_stop_s
         self._workers: dict = {}
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._starting: dict = {}
         self._closed = False
+        # Backup pause: memory calls hold a slot; a pause closes the gate,
+        # drains the slots and stops every worker until resume.
+        self._paused = False
+        self._in_flight = 0
+        self._local = threading.local()
+        self.pause_wait_s = float(
+            os.environ.get("COMMONPLACE_BACKUP_MEMORY_WAIT_S") or DEFAULT_PAUSE_WAIT_S
+        )
 
     def workspace_dir(self, workspace_id: str) -> Path:
         from .workspace_store import workspace_path
 
         return workspace_path(self.root.parent, workspace_id)
 
+    @contextmanager
+    def call(self, wait_s: Optional[float] = None):
+        """Hold one in-flight memory slot. Re-entrant per thread.
+
+        While a backup pause is on, a new call waits up to ``wait_s``
+        (default ``pause_wait_s``) for resume, then raises ``WorkersPaused``.
+        """
+        depth = getattr(self._local, "depth", 0)
+        if depth == 0:
+            wait_s = self.pause_wait_s if wait_s is None else wait_s
+            with self._cond:
+                if not self._cond.wait_for(lambda: not self._paused or self._closed, wait_s):
+                    raise WorkersPaused()
+                if self._closed:
+                    raise SupervisorClosed("worker supervisor is closed")
+                self._in_flight += 1
+        self._local.depth = depth + 1
+        try:
+            yield
+        finally:
+            self._local.depth = depth
+            if depth == 0:
+                with self._cond:
+                    self._in_flight -= 1
+                    self._cond.notify_all()
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    def worker_pids(self) -> list:
+        with self._lock:
+            return [w.pid for w in self._workers.values() if w.pid is not None and w.alive()]
+
+    def pause(self, drain_s: float = 60.0) -> list:
+        """Close the gate, drain in-flight calls, stop every worker.
+
+        Returns the stopped workers' pids. ``DrainTimeout`` (gate reopened,
+        nothing stopped) if calls are still running after ``drain_s``: a call
+        is never cut. ``WorkerStopFailed`` (gate reopened) if a worker
+        survives SIGKILL or its ``/proc`` entry stays.
+        """
+        with self._cond:
+            if self._closed:
+                raise RuntimeError("worker supervisor is closed")
+            if self._paused:
+                raise RuntimeError("workers are already paused")
+            self._paused = True
+            drained = self._cond.wait_for(
+                lambda: self._in_flight == 0 and not self._starting, drain_s
+            )
+            if not drained:
+                self._paused = False
+                self._cond.notify_all()
+                raise DrainTimeout(f"{self._in_flight} memory call(s) still running")
+            workers = list(self._workers.values())
+            self._workers.clear()
+        try:
+            for worker in workers:
+                worker.stop()
+                deadline = time.monotonic() + 1.0
+                # A worker without a pid runs in-process; its stop() is final.
+                while worker.pid is not None and (
+                    worker.alive() or not process_gone(worker.pid, worker.starttime)
+                ):
+                    if time.monotonic() >= deadline:
+                        raise WorkerStopFailed(f"worker for {worker.workspace_id} did not stop")
+                    time.sleep(0.02)
+        except BaseException:
+            self.resume()
+            raise
+        return [w.pid for w in workers]
+
+    def resume(self) -> None:
+        """Reopen the gate; workers start again on their next call."""
+        with self._cond:
+            self._paused = False
+            self._cond.notify_all()
+
     def get(self, workspace_id: str) -> Worker:
+        with self.call():
+            return self._get(workspace_id)
+
+    def _get(self, workspace_id: str) -> Worker:
         while True:
             with self._lock:
                 if self._closed:
@@ -253,8 +417,9 @@ class WorkerSupervisor:
                 raise RuntimeError("worker supervisor is closed")
             return worker
         finally:
-            with self._lock:
+            with self._cond:
                 self._starting.pop(workspace_id, None)
+                self._cond.notify_all()
             gate.set()
 
     def stop_idle(self) -> list:
@@ -279,6 +444,7 @@ class WorkerSupervisor:
 
     def close(self) -> None:
         """Permanently stop workers, including ones whose launch is in flight."""
-        with self._lock:
+        with self._cond:
             self._closed = True
+            self._cond.notify_all()
         self.stop_all()

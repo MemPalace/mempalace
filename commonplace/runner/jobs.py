@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from commonplace.admission import GATE
 from commonplace.extensions import ToolError
 from mempalace.sqlite_crypto import connect, row_factory
 
@@ -69,14 +70,16 @@ class JobStore:
     def __init__(self, gateway, ws):
         self.gateway, self.workspace_id = gateway, ws
         directory = Path(gateway.workspace_dir(ws))
-        directory.mkdir(parents=True, exist_ok=True)
+        with GATE.creating(directory):
+            directory.mkdir(parents=True, exist_ok=True)
         self.path = str(directory / "runner.sqlite3")
         with self.connection() as conn:
             conn.executescript(SCHEMA)
 
     @contextmanager
     def connection(self):
-        conn = connect(self.path, timeout=10, isolation_level=None)
+        with GATE.creating(self.path):
+            conn = connect(self.path, timeout=10, isolation_level=None)
         conn.row_factory = row_factory
         try:
             yield conn

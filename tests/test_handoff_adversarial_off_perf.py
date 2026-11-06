@@ -541,6 +541,8 @@ def legacy(tmp_path_factory):
         ignore=shutil.ignore_patterns("__pycache__"),
     )
     shutil.copy2(ROOT / "commonplace" / "callstack.py", snapshot / "commonplace" / "callstack.py")
+    # Current board and rules stores create files through the admission gate.
+    shutil.copy2(ROOT / "commonplace" / "admission.py", snapshot / "commonplace" / "admission.py")
     # Overlaid board tools use the current registry contract; handoff remains
     # absent from the baseline's enabled modules below.
     shutil.copy2(ROOT / "commonplace" / "extensions.py", snapshot / "commonplace" / "extensions.py")

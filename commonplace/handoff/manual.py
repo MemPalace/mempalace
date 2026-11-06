@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
+from ..admission import GATE
 from .authority import require_launch_authority
 from .hook import _atomic_text, _private_dir
 from .launchers import _write_prompt
@@ -23,11 +24,12 @@ class ManualHandoffError(ValueError):
 @contextmanager
 def _start_lock(directory, workspace_id, thread_id):
     """Serialize local manual callers without holding a database transaction."""
-    _private_dir(directory)
     key = hashlib.sha256(f"{workspace_id}\0{thread_id}".encode()).hexdigest()
-    descriptor = os.open(
-        directory / f"{key}.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600
-    )
+    with GATE.creating():
+        _private_dir(directory)
+        descriptor = os.open(
+            directory / f"{key}.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
     try:
         if os.name == "nt":
             import msvcrt
@@ -166,7 +168,8 @@ class ManualHandoff:
             # A confirmed launch must never be classified as a failed launch,
             # even if journalling/registration fails: its claim remains held.
             try:
-                _atomic_text(journal, json.dumps(asdict(successor)))
+                with GATE.creating():
+                    _atomic_text(journal, json.dumps(asdict(successor)))
                 handoff = self.service.register_successor(principal, handoff.id, successor)
             except Exception:
                 raise ManualHandoffError(

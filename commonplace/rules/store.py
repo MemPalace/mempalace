@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from commonplace.admission import GATE
 from mempalace.sqlite_crypto import connect, row_factory
 
 
@@ -84,7 +85,8 @@ class RuleStore:
 
     def __init__(self, workspace_dir):
         directory = Path(workspace_dir)
-        directory.mkdir(parents=True, exist_ok=True)
+        with GATE.creating(directory):
+            directory.mkdir(parents=True, exist_ok=True)
         self.path = str((directory / "rules.sqlite3").resolve())
         with self._init_lock:
             if self.path not in self._initialized or not Path(self.path).exists():
@@ -97,7 +99,8 @@ class RuleStore:
 
     @contextmanager
     def connection(self):
-        conn = connect(self.path, timeout=10, isolation_level=None)
+        with GATE.creating(self.path):
+            conn = connect(self.path, timeout=10, isolation_level=None)
         conn.row_factory = row_factory
         conn.execute("PRAGMA foreign_keys=ON")
         try:
