@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  com.mempalace.proxy.plist — macOS launchd template for the MCP proxy.
+
+  Install:
+    cp deploy/proxy/com.mempalace.proxy.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.mempalace.proxy.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.mempalace.proxy.plist
+    rm ~/Library/LaunchAgents/com.mempalace.proxy.plist
+
+  Edit the EnvironmentVariables below to match your MemPalace server setup.
+  The proxy auto-starts on login and restarts if it crashes (KeepAlive).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.mempalace.proxy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Adjust this path to where you installed the proxy script -->
+        <string>/usr/bin/python3</string>
+        <string>/usr/local/bin/mempalace_mcp_proxy.py</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- MemPalace server endpoint -->
+        <key>UPSTREAM_URL</key>
+        <string>http://127.0.0.1:8765/mcp</string>
+
+        <!-- Bearer token if your MemPalace server has MEMPALACE_MCP_HTTP_TOKEN set -->
+        <!-- <key>UPSTREAM_TOKEN</key> -->
+        <!-- <string>your-secret-token-here</string> -->
+
+        <!-- Proxy bind address -->
+        <key>HOST</key>
+        <string>127.0.0.1</string>
+        <key>PORT</key>
+        <string>8766</string>
+
+        <!-- Tuning -->
+        <key>UPSTREAM_TIMEOUT</key>
+        <string>120</string>
+        <key>MAX_RETRIES</key>
+        <string>2</string>
+        <key>SESSION_TTL</key>
+        <string>1800</string>
+        <key>LOG_LEVEL</key>
+        <string>INFO</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/mempalace_proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mempalace_proxy.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
