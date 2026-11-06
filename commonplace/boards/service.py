@@ -940,7 +940,7 @@ class BoardService:
             self._top_level_taker() and self._top_level_origin(row)
         )
 
-    def _write(self, board, *, submission=False, row=None, claiming=False):
+    def _write(self, board, *, submission=False, row=None, claiming=False, content_edit=False):
         p = self.principal
         if not p.policy.has_scope("memory:write") or not p.policy.can_read_wing(board["wing"]):
             raise ToolError("no: this connection cannot change this board")
@@ -950,7 +950,7 @@ class BoardService:
                 if claiming or self._own_card(row)
                 else self._available_origin(row)
             )
-            if not available:
+            if not available and not content_edit:
                 raise ToolError(
                     "no: restricted-origin work needs parent or workspace owner release"
                 )
@@ -2374,7 +2374,17 @@ class BoardService:
         }
         with self.transaction() as conn:
             row, board = self._get(conn, task)
-            self._write(board, row=row)
+            # Coordination may refine available work without releasing its origin.
+            # Keep this exception limited to title/body edits, never work transitions.
+            content_edit = (
+                bool(args)
+                and set(args) <= {"title", "body"}
+                and row["restricted_origin"] == 1
+                and row["status"] == "todo"
+                and row["assignee"] is None
+                and (_trusted_agent(self.principal) or self._coordinates(self.principal, row))
+            )
+            self._write(board, row=row, content_edit=content_edit)
             self._version(conn, row, version)
             if set(args) - permitted or (
                 "reason" in args
@@ -2384,7 +2394,7 @@ class BoardService:
             self._holder(
                 row,
                 completing=args.get("status") == "done",
-                editing=bool(set(args) & {"title", "body", "labels"}),
+                editing=bool(set(args) & {"title", "body", "labels"}) and not content_edit,
                 reopening=set(args) == {"status"} and args["status"] == "todo",
                 annotating=bool(set(args) - {"status"})
                 and set(args) - {"status"} <= {"lesson", "pr", "link"}

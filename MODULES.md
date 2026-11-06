@@ -86,7 +86,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `tests/`
 - **Owns:** Shared fixtures and harnesses and every test file not listed in another block.
-- **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls.
+- **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls. Restricted-origin content-edit regressions verify audit attribution and unchanged release and claim state through both public routes.
 - **How it fails:** A shared fixture change can break unrelated suites; slow or flaky tests waste every run.
 - **Tests:** The suite itself under the coverage gate.
 
@@ -118,7 +118,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `commonplace/boards/`, `commonplace/events.py`, `commonplace/webhooks.py`, `commonplace/holds.py`, `commonplace/callstack.py`
 - **Owns:** Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
-- **Promises:** Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval.
+- **Promises:** Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval. Trusted agents and authorized board coordinators may edit only the title/body of unassigned restricted-origin todo cards without releasing the origin or changing claim authority.
 - **How it fails:** A swallowed emission loses a notification but not the change (the trigger sweep reads `task_events`); webhook delivery retries and records failures.
 - **Tests:** `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`.
 
