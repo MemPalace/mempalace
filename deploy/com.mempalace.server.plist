@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MemPalace MCP server - macOS LaunchAgent template.
+
+  Install:
+    cp deploy/com.mempalace.server.plist ~/Library/LaunchAgents/
+    # edit the two absolute paths below, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.mempalace.server.plist
+    launchctl print gui/$(id -u)/com.mempalace.server     # confirm it is running
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/com.mempalace.server
+
+  Two things differ from a normal shell launch and both bite silently:
+
+  1. ProcessType. Without it, launchd applies its default resource policy.
+     From launchd.plist(5): "If left unspecified, the system will apply light
+     resource limits to the job, throttling its CPU usage and I/O bandwidth."
+     For a request/response server that is the wrong policy: the job is
+     latency-sensitive and does short bursts of CPU and random disk reads,
+     which is exactly what gets throttled. A throttled job shows PRI 20 in
+     `ps -o pri=` where a normal process shows 31, while `nice` stays 0, so
+     nice/renice never reveals it. Interactive removes those limits.
+
+  2. PATH. launchd hands the job the minimal /usr/bin:/bin:/usr/sbin:/sbin,
+     not your shell PATH, so ProgramArguments must be an absolute path to the
+     mempalace executable. `which mempalace` in a normal terminal prints it
+     (pipx installs to ~/.local/bin, Homebrew to /opt/homebrew/bin).
+
+  Defaults to loopback, which needs no token. To serve other machines, add
+  --host 0.0.0.0 and set MEMPALACE_MCP_HTTP_TOKEN below; serve refuses a
+  non-loopback bind with no token. See deploy/server.env.example for the
+  full set of environment variables.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.mempalace.server</string>
+
+  <!-- Absolute path required: see note 2 above. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/ABSOLUTE/PATH/TO/mempalace</string>
+    <string>serve</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8765</string>
+  </array>
+
+  <!-- See note 1 above. Without this the server is CPU and I/O throttled. -->
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- An always-on server does not want the idle watchdog. KeepAlive would
+         restart it anyway, so leaving the watchdog on just churns the process. -->
+    <key>MEMPALACE_MCP_IDLE_HOURS</key>
+    <string>0</string>
+    <!-- Required only for a non-loopback bind. Generate: openssl rand -hex 32
+    <key>MEMPALACE_MCP_HTTP_TOKEN</key>
+    <string></string>
+    -->
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/mempalace-server.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/mempalace-server.log</string>
+</dict>
+</plist>
