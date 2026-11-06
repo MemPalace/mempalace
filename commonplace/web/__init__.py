@@ -174,14 +174,32 @@ def install(gateway):
         if principal.role != "owner":
             send_json(h, 403, {"error": "Owner access required"})
             return
+        from commonplace.extensions import ToolError
+        from commonplace.policy import canonical_wing, is_private_wing
+
         from .agents import connection_view
 
         rows = gateway.db.connections(principal.workspace_id)
+        try:
+            known = gateway.call_memory_tool(principal, "mempalace_list_wings", {}).get("wings", {})
+        except ToolError:
+            # Connection management remains available while memory is offline.
+            known = {}
+        wings = sorted(
+            {
+                canonical_wing(wing)
+                for wing in known
+                if not is_private_wing(wing)
+                and principal.policy.can_read_wing(wing)
+                and not any(c in wing for c in "*?[]")
+            }
+        )
         send_json(
             h,
             200,
             {
                 "connections": [connection_view(row) for row in rows],
+                "wings": wings,
                 "mcp_url": urls.AGENT_URL + "/mcp",
             },
         )

@@ -82,6 +82,7 @@ PREFIX = {
     ("POST", "/api/holds/"): "authenticated",
     ("POST", "/api/connections/"): "authenticated",
     ("DELETE", "/api/connections/"): "authenticated",
+    ("PATCH", "/api/connections/"): "authenticated",
     ("PATCH", "/api/runners/"): "authenticated",
     ("POST", "/api/runners/"): "authenticated",
     ("DELETE", "/api/runners/"): "authenticated",

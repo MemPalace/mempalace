@@ -11,13 +11,18 @@ export function usedText(value) {
   return age === "now" ? "Used just now" : `Used ${age} ago`;
 }
 
-function agentRows(rows) {
-  return rows.map((c) => `<div class="setting-row"><span>${e(c.name)}<br><small>${e(c.client)} · ${c.revoked_at ? "Revoked" : c.expires_at && Date.parse(c.expires_at) <= Date.now() ? "Expired" : c.last_used_at ? usedText(c.last_used_at) : "Unused"}</small></span>${active(c) ? `<button type="button" data-action="agent-rotate" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Rotate</button><button type="button" data-action="agent-revoke" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Revoke</button>` : ""}</div>`).join("") || '<p class="message">No agents connected</p>';
+function readAccess(c, wings) {
+  if (!wings.length) return "";
+  return `<details data-agent-access><summary>Read access</summary>${wings.map((wing) => `<label><input type="checkbox" value="${e(wing)}" ${(c.read_wings || []).some((grant) => grant === "*" || grant === wing) ? "checked" : ""}>${e(wing)}</label>`).join("")}<button type="button" data-action="agent-wings" data-agent-mutation data-agent-id="${e(c.id)}">Save read access</button></details>`;
+}
+
+function agentRows(rows, wings = []) {
+  return rows.map((c) => `<div class="setting-row"><span>${e(c.name)}<br><small>${e(c.client)} · ${c.revoked_at ? "Revoked" : c.expires_at && Date.parse(c.expires_at) <= Date.now() ? "Expired" : c.last_used_at ? usedText(c.last_used_at) : "Unused"}</small></span>${active(c) ? `${readAccess(c, wings)}<button type="button" data-action="agent-rotate" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Rotate</button><button type="button" data-action="agent-revoke" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Revoke</button>` : ""}</div>`).join("") || '<p class="message">No agents connected</p>';
 }
 
 export function agentsView(payload) {
   const rows = payload.connections || [];
-  return `<section class="settings-section agents-settings"><h2>Agents</h2><div data-agent-reveal></div><form class="agent-form" data-form="agent"><label>Name<input name="name" required maxlength="120" autocomplete="off"></label><label>Client<select name="client">${options("claude-code")}</select></label><label class="agent-consent"><input type="checkbox" name="import">${e(importConsent)}</label><details><summary>Restrict access or set a parent</summary><label>Read wings (comma separated)<input name="read_wings" autocomplete="off"></label><label>Parent<select name="parent">${parents(rows)}</select></label></details><button class="blockbtn" data-agent-mutation>Create token</button></form><div data-agent-list>${agentRows(rows)}</div></section>`;
+  return `<section class="settings-section agents-settings"><h2>Agents</h2><div data-agent-reveal></div><form class="agent-form" data-form="agent"><label>Name<input name="name" required maxlength="120" autocomplete="off"></label><label>Client<select name="client">${options("claude-code")}</select></label><label class="agent-consent"><input type="checkbox" name="import">${e(importConsent)}</label><details><summary>Restrict access or set a parent</summary><label>Read wings (comma separated)<input name="read_wings" autocomplete="off"></label><label>Parent<select name="parent">${parents(rows)}</select></label></details><button class="blockbtn" data-agent-mutation>Create token</button></form><div data-agent-list>${agentRows(rows, payload.wings || [])}</div></section>`;
 }
 
 export function clientConfig(client, url, token) {
@@ -46,7 +51,7 @@ export function changeAgentClient(select) {
 async function refresh(section) {
   const payload = await api("/api/connections");
   if (!section.isConnected) return;
-  section.querySelector("[data-agent-list]").innerHTML = agentRows(payload.connections);
+  section.querySelector("[data-agent-list]").innerHTML = agentRows(payload.connections, payload.wings || []);
   const select = section.querySelector('[name="parent"]'), selected = select.value;
   select.innerHTML = parents(payload.connections);
   select.value = selected;
@@ -86,6 +91,15 @@ export async function agentAction(button) {
     try { await navigator.clipboard.writeText(text); }
     catch { throw new Error("Copy failed. Select the value and copy it manually."); }
     section.querySelector("[data-agent-copy-status]").textContent = "Copied";
+    return;
+  }
+  if (action === "agent-wings") {
+    const read_wings = [...button.closest("[data-agent-access]").querySelectorAll('input[type="checkbox"]:checked')].map((input) => input.value);
+    if (!read_wings.length) throw new Error("Choose at least one read wing.");
+    await mutation(section, async () => {
+      await api(`/api/connections/${encodeURIComponent(button.dataset.agentId)}`, { method: "PATCH", body: { read_wings } });
+      await refresh(section);
+    });
     return;
   }
   const rotate = action === "agent-rotate";

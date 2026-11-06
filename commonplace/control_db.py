@@ -649,6 +649,32 @@ class ControlDB:
             )
         return token
 
+    def set_connection_read_wings(self, ref, wings, *, actor, workspace_ref):
+        """Change only a live agent's read policy, keeping its token and identity."""
+        with self._lock, self._tx():
+            row = self.connection(ref, workspace_ref)
+            actor_id = self.user(actor)["id"]
+            self.require_owner(row["workspace_id"], actor_id)
+            principal = self.authenticate_connection(row["id"])
+            if principal is not None and principal.runner is not None:
+                raise RunnerLinkedError()
+            if row["auth"] != "pat" or principal is None:
+                raise ControlError("only active personal access tokens can be updated")
+            policy = json.loads(row["policy"])
+            policy["read_wings"] = list(wings)
+            self._conn.execute(
+                "UPDATE connections SET policy=? WHERE id=?",
+                (json.dumps(policy, sort_keys=True), row["id"]),
+            )
+            self.audit(
+                action="connection.read_wings",
+                decision="ok",
+                workspace_id=row["workspace_id"],
+                user_id=actor_id,
+                connection_id=row["id"],
+                auth="pat",
+            )
+
     def authenticate_token(self, token: str) -> Optional[Principal]:
         """The principal for a bearer token, or ``None``. Checked on every request."""
         if not tokens.looks_like_token(token):

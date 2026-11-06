@@ -33,7 +33,7 @@ def _read_wings(gateway, principal, data):
 
 
 def connection_view(row):
-    return {
+    view = {
         key: row[key]
         for key in (
             "id",
@@ -49,6 +49,33 @@ def connection_view(row):
             "started_by",
         )
     }
+    view["read_wings"] = list(Policy.from_json(row["policy"]).read_wings)
+    return view
+
+
+def _update_read_wings(gateway, h, principal, row, data):
+    try:
+        if set(data) != {"read_wings"}:
+            raise ValueError
+        wings = _read_wings(gateway, principal, data)
+    except ValueError:
+        send_json(h, 400, {"error": "Choose existing nonprivate workspace wings without patterns"})
+        return
+    except ToolError:
+        send_json(h, 503, {"error": "Workspace wings are unavailable; try again"})
+        return
+    try:
+        gateway.db.set_connection_read_wings(
+            row["id"], wings, actor=principal.user_id, workspace_ref=principal.workspace_id
+        )
+    except ControlError:
+        send_json(h, 409, {"error": "Only active agent tokens can be updated"})
+        return
+    send_json(
+        h,
+        200,
+        {"connection": connection_view(gateway.db.connection(row["id"], principal.workspace_id))},
+    )
 
 
 def install(gateway):
@@ -127,6 +154,7 @@ def install(gateway):
         if not (
             (h.command == "POST" and len(parts) == 2 and parts[1] == "rotate")
             or (h.command == "DELETE" and len(parts) == 1)
+            or (h.command == "PATCH" and len(parts) == 1)
         ):
             send_json(h, 404, {"error": "Agent not found"})
             return
@@ -151,6 +179,9 @@ def install(gateway):
         try:
             data = read_json(h)
         except ValueError:
+            return
+        if h.command == "PATCH":
+            _update_read_wings(gateway, h, principal, row, data)
             return
         if data:
             send_json(h, 400, {"error": "Rotation takes an empty object"})
@@ -183,3 +214,4 @@ def install(gateway):
 
     gateway.add_prefix_route("POST", "/api/connections/", manage)
     gateway.add_prefix_route("DELETE", "/api/connections/", manage)
+    gateway.add_prefix_route("PATCH", "/api/connections/", manage)
