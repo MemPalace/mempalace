@@ -1,6 +1,8 @@
 """MCP server tests — drawer write/update/delete and delete-by-source."""
 
+import base64
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from _mcp_server_helpers import (
@@ -1575,6 +1577,120 @@ class TestWriteTools:
         assert result["success"] is True
         assert result["chunks"] == 1
         assert "chunk_ids" not in result
+
+    def test_search_touches_retrieval_counters(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        from mempalace.mcp_server import tool_add_drawer, tool_get_drawer, tool_search
+
+        added = tool_add_drawer(
+            wing="project",
+            room="search",
+            content="hybrid retrieval counter search signal",
+        )
+        drawer_id = added["drawer_id"]
+
+        result = tool_search(query="retrieval search signal", limit=5)
+        assert "results" in result
+        assert result["results"]
+        assert all("_logical_drawer_id" not in hit for hit in result["results"])
+
+        fetched = tool_get_drawer(drawer_id)
+        # Search counted once, then tool_get_drawer counted once more.
+        assert fetched["access"]["retrieval_count"] >= 2
+        assert fetched["access"]["last_retrieved"]
+        # Counts live beside the palace; reading never rewrites the drawer.
+        assert "retrieval_count" not in fetched["metadata"]
+        assert "last_retrieved" not in fetched["metadata"]
+        assert (Path(palace_path) / "access.sqlite3").is_file()
+
+    def test_read_only_server_records_no_reads(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        from mempalace import mcp_server
+
+        added = mcp_server.tool_add_drawer(wing="project", room="search", content="read only hit")
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+
+        fetched = mcp_server.tool_get_drawer(added["drawer_id"])
+        assert fetched["access"]["retrieval_count"] == 0
+        assert not (Path(palace_path) / "access.sqlite3").exists()
+
+    def test_search_counts_a_chunked_drawer_under_its_logical_id(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        from mempalace import access_stats, mcp_server
+
+        content = "chunked retrieval counter signal " * (config.chunk_size // 16)
+        drawer_id = mcp_server.tool_add_drawer(wing="w", room="r", content=content)["drawer_id"]
+
+        for strategy in ("vector", "union"):
+            hits = mcp_server.tool_search(
+                "chunked retrieval counter", candidate_strategy=strategy, limit=1
+            )["results"]
+            assert [hit["drawer_id"] for hit in hits] == [drawer_id]
+
+        stats = access_stats.access_for(palace_path, [drawer_id])
+        assert stats[drawer_id]["retrieval_count"] == 2
+
+    def test_get_drawer_returns_source_bytes_and_access_together(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Both read paths: the sqlite one, and the collection one behind it."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+
+        from mempalace import mcp_server
+
+        col.add(
+            ids=["encoded"],
+            documents=["caf\u00e9"],
+            metadatas=[{"wing": "w", "room": "r", "source_encoding": "windows-1252"}],
+        )
+
+        expected = base64.b64encode("caf\u00e9".encode("windows-1252")).decode("ascii")
+        fetched = mcp_server.tool_get_drawer("encoded", include_source_bytes=True)
+        assert fetched["source_bytes_base64"] == expected
+        assert fetched["access"]["retrieval_count"] == 1
+
+        monkeypatch.setattr(mcp_server, "_sqlite_logical_drawer_record", lambda _id: None)
+        fetched = mcp_server.tool_get_drawer("encoded", include_source_bytes=True)
+        assert fetched["source_bytes_base64"] == expected
+        assert fetched["access"]["retrieval_count"] == 2
+
+    def test_extra_metadata_cannot_overwrite_what_the_write_path_owns(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+
+        from mempalace import mcp_server
+
+        added = mcp_server.tool_add_drawer(
+            wing="w",
+            room="r",
+            content="extra metadata drawer",
+            _extra_metadata={
+                "height": 2,
+                "parent_drawer_id": "forged",
+                "source_encoding": "ascii",
+                "ingest_mode": "registry",
+            },
+        )
+
+        meta = mcp_server.tool_get_drawer(added["drawer_id"])["metadata"]
+        assert meta["height"] == 2
+        assert not {"parent_drawer_id", "source_encoding", "ingest_mode"} & set(meta)
 
 
 def test_add_drawer_chunked_logical_id_fetches_deletes_and_lists_as_one(
