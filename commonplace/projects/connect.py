@@ -46,7 +46,7 @@ def connect(
                 "effect": OWN_WING_EFFECT,
             },
             "alternative": {
-                "label": "Allow access to all shared memory",
+                "label": "Allow this agent to read and write all shared memory",
                 "method": "POST",
                 "path": f"/api/projects/{board}/orchestrator/connect",
                 "body": {"allow_shared": True},

@@ -24,7 +24,8 @@ test("main shows the automatic seat and owner Connect without a picker", async (
   const member = ui.mainHTML({ ...project, can_configure: false, main: { ...project.main, connectable: false } }, e);
   assert.doesNotMatch(member, /<button\b[^>]*>[\s\S]*?Connect agent/i);
   const waiting = ui.mainHTML({ ...project, main: { ...project.main, connected: true } }, e);
-  assert.match(waiting, /waiting for the agent/i);
+  assert.match(waiting, /no agent has used it yet/i);
+  assert.doesNotMatch(waiting, /Connected/);
   const seen = ui.mainHTML({ ...project, main: { ...project.main, connected: true, seen: true, status: "working" } }, e);
   assert.match(seen, /working/);
 });

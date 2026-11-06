@@ -6,9 +6,11 @@ An existing coordinator stays the main orchestrator until an owner replaces it.
 
 ## Connect an agent
 
-Connect attaches an agent to the project's automatic orchestrator seat. A
-signed-in workspace owner uses **Connect agent** in the chat header or project
-settings, then copies the token and MCP URL into the agent's configuration.
+Connect creates a token for the project's automatic orchestrator seat; an agent
+is attached only once it uses that token. A signed-in workspace owner uses
+**Connect agent** in the chat header or project settings, then follows the
+short checklist: copy the setup for their agent app (Claude Code, Codex, Cursor
+or generic MCP), paste it into the app's MCP servers, and start the app.
 The token is shown once; closing the result hides it. Connect does not start
 an agent process. If another active coordinator holds the project, replacing
 it requires confirmation.
@@ -29,9 +31,9 @@ Register a `space_message` webhook for the project if the agent should wake
 when someone posts; Connect supplies setup details but does not subscribe it.
 Without a webhook, the agent reads messages on its next check.
 
-The header shows the main orchestrator and its connection state. “Connected ·
-waiting for the agent” means the credentials exist but the agent has not used
-them yet. Private status stays private. An unconnected seat leaves release and
+The header shows the main orchestrator and its connection state. “Token
+created · no agent has used it yet” means the credentials exist but no agent has
+used them; it reads “connected” only after an agent has. Private status stays private. An unconnected seat leaves release and
 supervision with the existing people; a seat takes those duties only after its
 agent has used the connection within the last 24 hours.
 

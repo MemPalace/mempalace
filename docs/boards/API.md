@@ -542,8 +542,9 @@ Names are redacted and status follows the caller's visibility permissions.
 `models` contains `main` and `worker` choices, each `{provider, model}` or `null`.
 Choices store labels only; they do not invoke providers or change chat settings.
 
-Connect attaches an agent to the project's automatic orchestrator seat. It
-returns `{connection, token, mcp_url, board, wing, setup, warning?}`. The token
+Connect creates a token for the project's automatic orchestrator seat; it does
+not attach or start an agent. It returns
+`{connection, token, mcp_url, board, wing, setup, warning?}`. The token
 appears only in this response. The standard-trust connection can read and write
 the board's wing and expires after 90 days. Rotation invalidates its old token.
 `setup` supplies the project and `space_message` subscription details; the

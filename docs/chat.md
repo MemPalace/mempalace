@@ -42,14 +42,14 @@ cards, or make decisions. Its only board action is the fallback below.
 
 ## Coordinator contract and card fallback
 
-Each project gets one main orchestrator seat automatically. Connect attaches
-an agent to the project's automatic orchestrator seat: a signed-in workspace
+Each project gets one main orchestrator seat automatically. Connect creates
+a token for the project's automatic orchestrator seat: a signed-in workspace
 owner uses **Connect agent** in the header and configures the agent with the
 token shown once. An existing coordinator remains main until replaced with
 confirmation. See [projects](projects.md) for token scope, renewal and model choices.
 
-The header shows the main orchestrator and its connection state; “connected ·
-waiting for the agent” means its credentials have not been used yet. If it is
+The header shows the main orchestrator and its connection state; “Token
+created · no agent has used it yet” means its credentials have not been used yet. If it is
 not connected or its connection is gone, receipts direct the owner to Connect
 and members to the workspace owner. Connect does not start the agent. Its
 operator must configure a matching `space_message` webhook; connecting does

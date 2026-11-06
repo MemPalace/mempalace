@@ -1,9 +1,9 @@
 export const PROJECT_COPY = Object.freeze({
-  connected: "connected", disconnected: "not connected", waiting: "waiting for the agent",
+  connected: "connected", disconnected: "not connected", unused: "Token created · no agent has used it yet",
   statusPrivate: "status private", connect: "Connect agent", settings: "Project settings",
   sharedExplain: "This project keeps its memory in the shared section that every project uses. An agent connected here could read and change all of it.",
   ownWing: "Give this project its own memory section",
-  allowShared: "Allow access to all shared memory",
+  allowShared: "Allow this agent to read and write all shared memory",
   ownWingEffect: "Agents that can only read shared memory will stop seeing this project. Its coordinator may be cleared. This can't be undone here.",
   ownWingDone: "This project now has its own memory section.",
   wingTaken: "Another project already uses this memory section name. Nothing was changed.",
@@ -175,9 +175,11 @@ function chooseSharedWing(payload, e, options) {
 
 export function mainHTML(project, e, { notAnswering = "" } = {}) {
   const main = project.main;
-  const status = main.connected ? (main.seen ? main.status || PROJECT_COPY.statusPrivate : PROJECT_COPY.waiting) : "";
+  // Connect only creates a token; "connected" waits until an agent has used it.
+  const live = main.connected && main.seen;
+  const state = live ? `${PROJECT_COPY.connected} · ${main.status || PROJECT_COPY.statusPrivate} · reads chat, makes cards` : main.connected ? PROJECT_COPY.unused : PROJECT_COPY.disconnected;
   const initial = String(project.name || "?").trim().charAt(0).toUpperCase() || "?";
-  return `<div class="setting-row orch-row" data-project-main data-project-seat="${e(main.name)}"><span class="av" aria-hidden="true">${e(initial)}</span><span class="orch-text"><b>${e(project.name)} orchestrator</b>${main.connected ? ' <span class="tag ok">Connected</span>' : ""}<small>${e(main.connected ? PROJECT_COPY.connected : PROJECT_COPY.disconnected)}${status ? ` · ${e(status)}` : ""}${main.connected ? " · reads chat, makes cards" : ""}</small></span>${project.can_configure && main.connectable ? `<button type="button" class="btn sm desktop-agent" data-project-connect>${e(main.connected ? "Reconnect…" : PROJECT_COPY.connect)}</button>` : ""}</div>${notAnswering ? `<p class="set-note" data-project-not-answering>${e(notAnswering)}</p>` : ""}`;
+  return `<div class="setting-row orch-row" data-project-main data-project-seat="${e(main.name)}"><span class="av" aria-hidden="true">${e(initial)}</span><span class="orch-text"><b>${e(project.name)} orchestrator</b>${live ? ' <span class="tag ok">Connected</span>' : ""}<small>${e(state)}</small></span>${project.can_configure && main.connectable ? `<button type="button" class="btn sm desktop-agent" data-project-connect>${e(main.connected ? "Reconnect…" : PROJECT_COPY.connect)}</button>` : ""}</div>${notAnswering ? `<p class="set-note" data-project-not-answering>${e(notAnswering)}</p>` : ""}`;
 }
 
 const clockTime = (value) => {
@@ -205,7 +207,8 @@ export async function connectSetup(app, result) {
 }
 
 export function connectResultHTML(result, e, { app = "claude-code" } = {}) {
-  return `<section class="form-tile"><h2 id="project-connect-title">Agent connection</h2><p>Connect attaches an agent to this project's automatic orchestrator seat.</p><p>Copy now. This token will not be shown again.</p><p>The setup holds the MCP address and this token as a Bearer header, in the format your agent app reads. Paste it where the app lists its MCP servers, then restart the app.</p>${appSelect(app)}<button type="button" class="btn primary" data-project-copy-setup>Copy setup</button><details><summary>Show the setup to select it</summary><pre data-project-config></pre></details><label>Token<input data-project-token value="${e(result.token)}" readonly autocomplete="off" spellcheck="false"></label><button type="button" class="opt" data-project-copy>Copy token</button><label>MCP URL<input value="${e(result.mcp_url)}" readonly></label><p>Use this token as a Bearer token in your agent's MCP configuration. Then call webhook_add to receive project chat messages:</p><pre>${e(JSON.stringify(result.setup?.webhook_add || {}, null, 2))}</pre>${result.warning ? `<p role="status">${e(result.warning)}</p>` : ""}<p role="status" data-project-copy-status></p><button type="button" class="blockbtn" data-project-dismiss>Close</button></section>`;
+  const board = result.setup?.webhook_add?.board || result.board;
+  return `<section class="form-tile"><h2 id="project-connect-title">Agent connection</h2><p>A token for this project's orchestrator seat is ready. No agent is attached until one uses it. The token is shown once: copy it now.</p><ol class="dsteps" data-connect-steps><li data-connect-step="setup"><b>Copy the setup for your agent app</b><span class="d">It holds the MCP address and this token as a Bearer header, in the format the app reads.</span>${appSelect(app)}<button type="button" class="btn primary" data-project-copy-setup>Copy setup</button><details><summary>Show the setup to select it</summary><pre data-project-config></pre></details></li><li data-connect-step="paste"><b>Paste it where the app lists its MCP servers</b><span class="d">Some apps call them Tools or Connectors. Save the change.</span></li><li data-connect-step="start"><b>Start or restart the agent app</b><span class="d">The project shows the agent as connected once it uses the token.</span></li><li data-connect-step="webhook"><b>Optional: wake on new chat messages</b><span class="d">Ask the agent to call webhook_add with events space_message${board ? ` and board ${e(board)}` : ""}.</span></li></ol><label>Token<input data-project-token value="${e(result.token)}" readonly autocomplete="off" spellcheck="false"></label><button type="button" class="opt" data-project-copy>Copy token</button><label>MCP URL<input value="${e(result.mcp_url)}" readonly></label>${result.warning ? `<p role="status">${e(result.warning)}</p>` : ""}<p role="status" data-project-copy-status></p><button type="button" class="blockbtn" data-project-dismiss>Close</button></section>`;
 }
 
 export function modelsHTML(project, e) {
