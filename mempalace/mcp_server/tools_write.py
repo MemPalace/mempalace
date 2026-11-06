@@ -1344,6 +1344,15 @@ def tool_get_drawers(drawer_ids: list):
             errors += 1
             results.append({"drawer_id": drawer_id, "error": str(e)})
 
+    ids = [item["drawer_id"] for item in results if "error" not in item]
+    _record_drawer_reads(ids)
+    access = _drawer_access_many(ids)
+    for item in results:
+        if "error" not in item:
+            item["access"] = access.get(
+                item["drawer_id"], {"retrieval_count": 0, "last_retrieved": None}
+            )
+
     return {
         "results": results,
         "count": len(results),
@@ -1671,10 +1680,15 @@ def _record_drawer_reads(logical_ids) -> None:
 
 def _drawer_access(drawer_id: str) -> dict:
     """``{retrieval_count, last_retrieved}`` for one logical drawer."""
+    found = _drawer_access_many([drawer_id]).get(drawer_id)
+    return found or {"retrieval_count": 0, "last_retrieved": None}
+
+
+def _drawer_access_many(drawer_ids: list[str]) -> dict[str, dict]:
+    """Read access counters in batches without opening or mutating the drawer store."""
     from .. import access_stats
 
-    found = access_stats.access_for(_config.palace_path, [drawer_id]).get(drawer_id)
-    return found or {"retrieval_count": 0, "last_retrieved": None}
+    return access_stats.access_for(_config.palace_path, drawer_ids)
 
 
 def _logical_drawer_id_for_any_id(col, drawer_id: str) -> str:
