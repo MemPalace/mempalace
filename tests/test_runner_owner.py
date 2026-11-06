@@ -104,7 +104,13 @@ def test_E2_management_requires_a_person_owner(signup_hub, owners, caller):
     ):
         status, body = edit(hub, owner, machine, method, suffix, data, **auth)
         assert status == 403, (status, body)
-        assert body == {"error": "a signed-in workspace owner is required"}
+        assert body == {
+            "error": (
+                "tool not allowed for this connection"
+                if caller == "worker"
+                else "a signed-in workspace owner is required"
+            )
+        }
 
 
 @pytest.mark.parametrize(

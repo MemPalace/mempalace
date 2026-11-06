@@ -1585,6 +1585,20 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             self._send_json(404, {"error": "not found"})
             return
+        from .runner.registry import WORKER_TOOLS
+
+        tool = _rest_tool(self.command, path)
+        # Worker scopes are not authority for arbitrary extension routes.
+        # Only MCP and REST aliases of the fixed worker tuple may dispatch.
+        if (
+            principal is not None
+            and principal.runner == "worker"
+            and path != "/mcp"
+            and tool not in WORKER_TOOLS
+        ):
+            self.close_connection = True
+            self._send_json(403, {"error": "tool not allowed for this connection"})
+            return
         if (
             principal is not None
             and principal.person
@@ -1596,15 +1610,6 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(403, {"error": "JSON and same-origin request required"})
             return
         handler = self.server.gateway.find_route(self.command, path)
-        if (
-            principal is not None
-            and principal.runner == "worker"
-            and path.startswith("/api/threads/")
-            and not principal.policy.has_scope("threads:read")
-        ):
-            self.close_connection = True
-            self._send_json(403, {"error": "needs scope threads:read"})
-            return
         request, parse_error = None, None
         if path == "/mcp" and self.command == "POST" and principal is not None:
             media = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -1620,7 +1625,6 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                     parse_error = (400, _rpc_error(None, -32700, "Parse error"))
         if self._rate_limit(path, principal, request):
             return
-        tool = _rest_tool(self.command, path)
         if (
             principal is not None
             and not principal.person

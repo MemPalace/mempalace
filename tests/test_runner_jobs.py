@@ -151,7 +151,7 @@ def test_p2_runner_routes_are_machine_only(signup_hub, owners):  # noqa: F811
     for auth in ({"token": machine["worker_token"]}, {"cookie": owner["cookie"]}):
         for method, path in (("POST", "/api/runner/lease"), ("GET", "/api/runner/jobs")):
             status, body = http(hub.port, method, path, body={}, **auth)
-            assert status == 404, (status, body)
+            assert status == (403 if "token" in auth else 404), (status, body)
 
 
 def test_l1_stale_and_foreign_fences(signup_hub, owners):  # noqa: F811

@@ -116,8 +116,8 @@ def test_relay_routes_need_the_machine_credential(relay_hub, action):
             else {"code": "bad_output"}
         )
     path = "/api/runner/chat/" + action
-    for auth in (m["worker_token"], h.a1):
-        assert h.request(auth, "POST", path, body)[0] == 404
+    assert h.request(m["worker_token"], "POST", path, body)[0] == 403
+    assert h.request(h.a1, "POST", path, body)[0] == 404
     assert h.request(h.owner, "POST", path, body)[0] in (403, 404)
     assert h.request(None, "POST", path, body)[0] == 401
 
