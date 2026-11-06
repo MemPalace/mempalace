@@ -44,7 +44,7 @@ def tool_kg_query(
     de-duplicated facts discovered up to ``max_depth`` hops.
     """
     try:
-        entity = sanitize_kg_value(entity, "entity")
+        entity = sanitize_kg_lookup(entity, "entity")
         as_of = sanitize_iso_temporal(as_of, "as_of")
         predicate = sanitize_name(predicate, "predicate") if predicate else None
     except ValueError as e:
@@ -55,19 +55,17 @@ def tool_kg_query(
 
     recurse = bool(recurse)
     max_depth = max(1, min(int(max_depth or 20), 100))
-
-    def _filtered_facts(node_id: str) -> list[dict]:
-        facts = _call_kg(lambda kg: kg.query_entity(node_id, as_of=as_of, direction=direction))
-        if not predicate:
-            return [fact for fact in facts if isinstance(fact, dict)]
-        return [
-            fact for fact in facts if isinstance(fact, dict) and fact.get("predicate") == predicate
-        ]
+    # Predicates are stored lowercased with underscores for spaces.
+    stored_predicate = predicate.lower().replace(" ", "_") if predicate else None
 
     if not recurse:
-        results = _filtered_facts(entity)
+        results = _call_kg(
+            lambda kg: kg.query_entity(entity, as_of=as_of, direction=direction), read=True
+        )
+        if stored_predicate:
+            results = [row for row in results if row.get("predicate") == stored_predicate]
         if as_of is None:
-            now_key = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            now_key = utc_now_z()
             active = []
             historical = []
             future = []
@@ -109,11 +107,11 @@ def tool_kg_query(
                     payload["resolved_from"] = entity
                     payload["entity"] = resolved
         else:
-            candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
+            candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity), read=True)
             if candidates:
                 payload["candidates"] = candidates
 
-        return payload
+        return _with_kg_notice(payload)
 
     # One query per level of the walk, not one query_entity() per node.
     walk = _call_kg(
@@ -124,7 +122,8 @@ def tool_kg_query(
             as_of=as_of,
             max_depth=max_depth,
             max_facts=_KG_QUERY_MAX_FACTS,
-        )
+        ),
+        read=True,
     )
     traversed = walk["facts"]
 
@@ -144,11 +143,11 @@ def tool_kg_query(
         payload["max_facts"] = _KG_QUERY_MAX_FACTS
 
     if not traversed:
-        candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity))
+        candidates = _call_kg(lambda kg: kg.find_entity_candidates(entity), read=True)
         if candidates:
             payload["candidates"] = candidates
 
-    return payload
+    return _with_kg_notice(payload)
 
 
 def tool_kg_add(
@@ -220,7 +219,7 @@ def tool_kg_add(
         "fact": f"{subject} → {predicate} → {object}",
     }
     _wal_result("kg_add", outcome)
-    return outcome
+    return _with_kg_notice(outcome)
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -234,9 +233,9 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
     """
     try:
-        subject = sanitize_kg_value(subject, "subject")
+        subject = sanitize_kg_lookup(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        object = sanitize_kg_value(object, "object")
+        object = sanitize_kg_lookup(object, "object")
         ended = sanitize_iso_temporal(ended, "ended")
     except ValueError as e:
         return {"success": False, "error": str(e)}
@@ -254,11 +253,13 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     )
 
     _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
-    return {
-        "success": True,
-        "fact": f"{subject} → {predicate} → {object}",
-        "ended": resolved_ended,
-    }
+    return _with_kg_notice(
+        {
+            "success": True,
+            "fact": f"{subject} → {predicate} → {object}",
+            "ended": resolved_ended,
+        }
+    )
 
 
 def tool_kg_supersede(
@@ -280,9 +281,9 @@ def tool_kg_supersede(
     (``YYYY-MM-DDTHH:MM:SSZ``) and defaults to the current UTC instant.
     """
     try:
-        subject = sanitize_kg_value(subject, "subject")
+        subject = sanitize_kg_lookup(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
-        old_object = sanitize_kg_value(old_object, "old_object")
+        old_object = sanitize_kg_lookup(old_object, "old_object")
         new_object = sanitize_kg_value(new_object, "new_object")
         at = sanitize_iso_temporal(at, "at")
     except ValueError as e:
@@ -304,12 +305,14 @@ def tool_kg_supersede(
     # -32000 response carries error_class + message in error.data. Only input
     # sanitization above returns the {success: False} envelope.
     triple_id = _call_kg(lambda kg: kg.supersede(subject, predicate, old_object, new_object, at=at))
-    return {
-        "success": True,
-        "triple_id": triple_id,
-        "fact": f"{subject} → {predicate} → {new_object}",
-        "superseded": old_object,
-    }
+    return _with_kg_notice(
+        {
+            "success": True,
+            "triple_id": triple_id,
+            "fact": f"{subject} → {predicate} → {new_object}",
+            "superseded": old_object,
+        }
+    )
 
 
 def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
@@ -322,7 +325,7 @@ def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
     offset = max(0, offset)
     if entity is not None:
         try:
-            entity = sanitize_kg_value(entity, "entity")
+            entity = sanitize_kg_lookup(entity, "entity")
         except ValueError as e:
             return {"error": str(e)}
 
@@ -332,20 +335,22 @@ def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
             "total": kg.timeline_total(entity),
         }
 
-    result = _call_kg(_query)
-    return {
-        "entity": entity or "all",
-        "timeline": result["timeline"],
-        "count": len(result["timeline"]),
-        "total": result["total"],
-        "offset": offset,
-        "limit": limit,
-    }
+    result = _call_kg(_query, read=True)
+    return _with_kg_notice(
+        {
+            "entity": entity or "all",
+            "timeline": result["timeline"],
+            "count": len(result["timeline"]),
+            "total": result["total"],
+            "offset": offset,
+            "limit": limit,
+        }
+    )
 
 
 def tool_kg_stats():
     """Knowledge graph overview: entities, triples, relationship types."""
-    return _call_kg(lambda kg: kg.stats())
+    return _with_kg_notice(_call_kg(lambda kg: kg.stats(), read=True))
 
 
 # ==================== LINEAGE AND MERGE GRAPH ====================
@@ -392,7 +397,7 @@ def _canonical_chains(nodes, max_hops: int = _MAX_MERGE_HOPS) -> dict:
                 out[node] = {"chain": [node] + [names.get(i, i) for i in chain[1:]]}
         return out
 
-    return _call_kg(_resolve)
+    return _call_kg(_resolve, read=True)
 
 
 def _lineage_parents(kg, starts, max_depth=None):
@@ -420,7 +425,7 @@ def _ancestor_sets(nodes, max_depth: int) -> dict:
             for node in nodes
         }
 
-    return _call_kg(_walk)
+    return _call_kg(_walk, read=True)
 
 
 def tool_resolve_canonical(node_id: str, max_hops: int = 50):
@@ -436,12 +441,14 @@ def tool_resolve_canonical(node_id: str, max_hops: int = 50):
         return resolved
 
     chain = resolved["chain"]
-    return {
-        "node_id": node_id,
-        "canonical_node_id": chain[-1],
-        "hops": len(chain) - 1,
-        "chain": chain,
-    }
+    return _with_kg_notice(
+        {
+            "node_id": node_id,
+            "canonical_node_id": chain[-1],
+            "hops": len(chain) - 1,
+            "chain": chain,
+        }
+    )
 
 
 def tool_get_height(node_id: str):
@@ -464,7 +471,7 @@ def tool_get_height(node_id: str):
         start_id = kg.entity_id(start)
         return lineage.heights(parents, [start_id])[start_id]
 
-    computed_height = _call_kg(_height)
+    computed_height = _call_kg(_height, read=True)
 
     stored_height = None
     col = _get_collection()
@@ -473,19 +480,21 @@ def tool_get_height(node_id: str):
         if record is not None:
             stored_height = _height_from_record(record)
 
-    return {
-        "node_id": start,
-        "height": computed_height,
-        "stored_height": stored_height,
-        "canonical_chain": resolved.get("chain", [start]),
-    }
+    return _with_kg_notice(
+        {
+            "node_id": start,
+            "height": computed_height,
+            "stored_height": stored_height,
+            "canonical_chain": resolved.get("chain", [start]),
+        }
+    )
 
 
 def _closets_collection():
     from ..palace import get_closets_collection
 
     try:
-        return get_closets_collection(_config.palace_path, create=False)
+        return get_closets_collection(_config.palace_path, create=False, read_only=True)
     except Exception:
         logger.debug("closet collection lookup failed", exc_info=True)
         return None
@@ -601,7 +610,7 @@ def tool_find_closet_lineage_issues(
     closets_col = _closets_collection()
     closet_records = _closet_records(closets_col, wing=wing, room=room)
     if not closet_records:
-        return empty
+        return _with_kg_notice(empty)
     meta_by_id = {record["closet_id"]: record["metadata"] for record in closet_records}
 
     def _lineage(kg):
@@ -614,9 +623,9 @@ def tool_find_closet_lineage_issues(
         }
         return members, parents, sources
 
-    members, parents, sources = _call_kg(_lineage)
+    members, parents, sources = _call_kg(_lineage, read=True)
     if not members:
-        return empty
+        return _with_kg_notice(empty)
 
     chains = _canonical_chains(members + [s for srcs in sources.values() for s in srcs])
 
@@ -636,7 +645,7 @@ def tool_find_closet_lineage_issues(
         computed = lineage.heights(merged_parents, start_ids.values())
         return {c: computed.get(i, 0) for c, i in start_ids.items()}
 
-    height_of = _call_kg(_heights) if canonical_of else {}
+    height_of = _call_kg(_heights, read=True) if canonical_of else {}
 
     canonical_sources = {
         chains[s]["chain"][-1]
@@ -725,14 +734,16 @@ def tool_find_closet_lineage_issues(
 
     total = len(issues)
     page = issues[offset : offset + limit]
-    return {
-        "orphans": page,
-        "count": len(page),
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "target": "closets",
-    }
+    return _with_kg_notice(
+        {
+            "orphans": page,
+            "count": len(page),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "target": "closets",
+        }
+    )
 
 
 def _merge_scan_node_ids(col, wing: str = None, room: str = None) -> list[str]:
@@ -754,7 +765,7 @@ def _merge_scan_node_ids(col, wing: str = None, room: str = None) -> list[str]:
 
     listed = None
     if _is_chroma_backend() and _config.palace_path:
-        from ..backends.chroma import sqlite_list_id_metadata
+        from ..backends.chroma_sqlite import sqlite_list_id_metadata
 
         listed = sqlite_list_id_metadata(_config.palace_path, _config.collection_name, where=where)
     if listed is not None:
@@ -765,7 +776,9 @@ def _merge_scan_node_ids(col, wing: str = None, room: str = None) -> list[str]:
     logical = set()
     for idx, row_id in enumerate(ids):
         meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
-        parent = meta.get("parent_drawer_id")
+        if is_bookkeeping(meta, row_id):
+            continue
+        parent = _logical_parent_id(meta)
         logical.add(parent if isinstance(parent, str) and parent else row_id)
     return sorted(logical)
 
@@ -787,7 +800,9 @@ def _seed_records(col, seeds: list[str]) -> list[dict]:
     rows_by_seed = {}
     direct = col.get(ids=seeds, include=["embeddings", "documents"])
     direct_ids = _get_result_ids(direct)
-    direct_embs = _chroma_field(direct, "embeddings", []) or []
+    # Embeddings can be a numpy array, which has no truth value: no ``or []``.
+    direct_embs = _chroma_field(direct, "embeddings", [])
+    direct_embs = [] if direct_embs is None else direct_embs
     direct_docs = _chroma_field(direct, "documents", []) or []
     for idx, row_id in enumerate(direct_ids):
         emb = direct_embs[idx] if idx < len(direct_embs) else None
@@ -797,16 +812,17 @@ def _seed_records(col, seeds: list[str]) -> list[dict]:
     chunked = [s for s in seeds if s not in rows_by_seed]
     if chunked:
         rest = col.get(
-            where={"parent_drawer_id": {"$in": chunked}},
+            where={"$or": [{key: {"$in": chunked}} for key in _PARENT_ID_KEYS]},
             include=["embeddings", "documents", "metadatas"],
         )
         rest_ids = _get_result_ids(rest)
-        rest_embs = _chroma_field(rest, "embeddings", []) or []
+        rest_embs = _chroma_field(rest, "embeddings", [])
+        rest_embs = [] if rest_embs is None else rest_embs
         rest_docs = _chroma_field(rest, "documents", []) or []
         rest_metas = _chroma_field(rest, "metadatas", []) or []
         for idx, _row_id in enumerate(rest_ids):
             meta = _safe_meta(rest_metas[idx] if idx < len(rest_metas) else {})
-            parent = meta.get("parent_drawer_id")
+            parent = _logical_parent_id(meta)
             if parent in chunked:
                 rows_by_seed.setdefault(parent, []).append(
                     (
@@ -911,7 +927,7 @@ def _logical_drawer_ids_for_any_ids(
 
         for idx, row_id in enumerate(ids):
             meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
-            parent_id = meta.get("parent_drawer_id")
+            parent_id = _logical_parent_id(meta)
             if isinstance(parent_id, str) and parent_id:
                 resolved[row_id] = parent_id
 
@@ -1061,7 +1077,7 @@ def tool_find_merge_candidates(
     candidates.sort(key=lambda item: float(item.get("similarity") or 0.0), reverse=True)
     capped = candidates[:limit]
 
-    return {**base, "candidates": capped, "count": len(capped)}
+    return _with_kg_notice({**base, "candidates": capped, "count": len(capped)})
 
 
 def tool_apply_merge(
@@ -1141,9 +1157,14 @@ def tool_apply_merge(
             )
         )
     except ValueError as e:
-        return {"success": False, "error": str(e)}
+        outcome = {"success": False, "error": str(e)}
+        _wal_result("apply_merge", outcome)
+        return outcome
+    except Exception as e:
+        _wal_result("apply_merge", {"success": False, "error": str(e)})
+        raise
 
-    return {
+    outcome = {
         "success": True,
         "merged": True,
         "source_node_id": source_canonical,
@@ -1153,3 +1174,5 @@ def tool_apply_merge(
         "invalidated_lineage_edges": result["invalidated_lineage_edges"],
         "ended": result["ended"],
     }
+    _wal_result("apply_merge", outcome)
+    return _with_kg_notice(outcome)

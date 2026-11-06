@@ -107,10 +107,11 @@ def _print_also_in(hit: dict) -> None:
 def _cli_ranked_hits(
     col, query, *, fetch, n_results, where, wing, room, window, metric, stop_words
 ):
-    """``(hits, fetched)``: the top ``fetch`` drawers, re-ranked and folded.
+    """``(hits, fetched, skipped)``: the top ``fetch`` drawers, re-ranked and
+    folded, and how many bookkeeping rows the fetch held.
 
     ``hits`` is not cut to ``n_results``; the caller widens ``fetch`` when
-    folded copies leave it short.
+    folded copies or skipped rows leave it short.
     """
     try:
         kwargs = {
@@ -125,6 +126,13 @@ def _cli_ranked_hits(
             kwargs["where"] = where
         results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
     except Exception as e:
+        if _model_error_class(e) is not None:
+            # The configured embedding function could not be built (C): the
+            # message names the fix, so print it plainly.
+            import sys
+
+            print(f"mempalace: {e}", file=sys.stderr)
+            raise SearchError(str(e)) from e
         print(f"\n  Search error: {e}")
         raise SearchError(f"Search error: {e}") from e
 
@@ -152,7 +160,10 @@ def _cli_ranked_hits(
     hits = [
         {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
         for doc, meta, dist in zip(docs, metas, dists)
+        if not is_bookkeeping(meta)
     ]
+    # Bookkeeping rows held slots in the fetch, so the caller widens for them too.
+    skipped = len(docs) - len(hits)
     vector_weight, bm25_weight = _resolve_hybrid_rank_weights()
     hits = _hybrid_rank(
         hits,
@@ -162,7 +173,7 @@ def _cli_ranked_hits(
         metric=metric,
         stop_words=stop_words,
     )
-    return _fold_copies_across_sources(hits, _cli_hit_source, _cli_hit_ref), fetched
+    return _fold_copies_across_sources(hits, _cli_hit_source, _cli_hit_ref), fetched, skipped
 
 
 def search(
@@ -174,13 +185,50 @@ def search(
     since: str = None,
     before: str = None,
     collection=None,
+    include_media: bool = False,
+    query_task: str = "search",
 ):
     """
     Search the palace. Returns verbatim drawer content.
     Optionally filter by wing (project) or room (aspect), and/or narrow to
     drawers whose ``filed_at`` falls in the ``[since, before)`` window —
-    same semantics as ``search_memories``/``list_drawers`` (#1128/#463).
+    same semantics as ``search_memories``/``list_drawers``.
     """
+    if include_media or query_task != "search":
+        result = search_memories(
+            query,
+            palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+            since=since,
+            before=before,
+            include_media=include_media,
+            query_task=query_task,
+        )
+        if result.get("error"):
+            if result.get("error_class"):
+                # A model error: the details carry the explanation and the fix.
+                import sys
+
+                print(f"mempalace: {result['details']}", file=sys.stderr)
+            else:
+                print(result["error"])
+            raise SearchError(result["error"])
+        for index, hit in enumerate(result["results"], 1):
+            kind = hit.get("media_type") or "text/code"
+            print(f"{index}. [{kind}] {hit['source_file']}  similarity={hit['similarity']:.3f}")
+            print(f"   {hit['source_path']}")
+            if hit.get("result_type") == "asset":
+                if not hit.get("available"):
+                    print("   File is missing; the indexed reference is retained.")
+                if hit.get("drawer_id"):
+                    print(f"   Related drawer: {hit['drawer_id']}")
+            else:
+                print(hit["text"])
+        if not result["results"]:
+            print("No results found.")
+        return None
     # Resolved before the fence below: both exits from this function rank by
     # BM25, so the filter has to be in hand on either branch.
     stop_words = _resolve_stop_words(None)
@@ -233,12 +281,12 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = build_where_filter(wing, room)
+    where = build_where_filter(wing, room, col=col)
 
     metric = _metric_for_collection(col)
     fetch = _candidate_pool_size(n_results, date_window_active)
     while True:
-        hits, fetched = _cli_ranked_hits(
+        hits, fetched, skipped = _cli_ranked_hits(
             col,
             query,
             fetch=fetch,
@@ -250,20 +298,21 @@ def search(
             metric=metric,
             stop_words=stop_words,
         )
-        # Folded copies can leave the page short while the fetch came back
-        # full, so more candidates exist: widen, as search_memories does.
+        # Folded copies or skipped bookkeeping rows can leave the page short
+        # while the fetch came back full, so more candidates exist: widen, as
+        # search_memories does.
         if (
             len(hits) >= n_results
             or fetched < fetch
             or fetch >= _MAX_FOLD_POOL
-            or not any(hit.get("also_in") for hit in hits)
+            or not (skipped or any(hit.get("also_in") for hit in hits))
         ):
             break
         fetch = min(fetch * 4, _MAX_FOLD_POOL)
     hits = hits[:n_results]
     if not hits:
         print(f'\n  No results found for: "{query}"')
-        return
+        return None
 
     print(f"\n{'=' * 60}")
     print(f'  Results for: "{query}"')

@@ -14,7 +14,8 @@ Sister plugins for other harnesses live alongside it: `.claude-plugin/`,
 `.codex-plugin/`, `.cursor-plugin/`, `.antigravity-plugin/`.
 
 Built against DSH `0.1.5` (its `dsh-agent`, `dsh-session`, `dsh-system-prompt`
-and `dsh-subprocess` extension points).
+and `dsh-subprocess` extension points). Also works on `0.2.x`, where
+`agent/session-start` was renamed to `agent/created`.
 
 ## Requirements
 
@@ -95,7 +96,7 @@ not supported. The plugin logs a warning instead of relaying the request.
 A plain [`@deepseek-ai/dsh-mcp-client`](https://github.com/deepseek-ai/deepseek-harness)
 row running MemPalace's **light** MCP server, `mempalace-light-mcp`, over
 stdio. Its three tools (`palace_query`, `palace_exec`, `palace_coordinate`)
-cover everything the 45-tool server does. They take a compact PQL query instead
+cover everything the 52-tool server does. They take a compact PQL query instead
 of one tool per operation, e.g. `FIND "auth flow" IN my_project LIMIT 5`.
 Results come back as JSON with each drawer's text unmodified.
 

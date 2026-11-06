@@ -1,12 +1,13 @@
 """Lineage walks: the in-memory algorithms and the KnowledgeGraph walks under them."""
 
 import random
+import re
 from collections import deque
 
 import pytest
 
 from mempalace import lineage
-
+from mempalace.timeutil import utc_now_z
 
 # ── mempalace.lineage ─────────────────────────────────────────────────────
 
@@ -151,3 +152,46 @@ def test_apply_merge_is_one_transaction(kg):
     }
     current = {(f["predicate"], f["object"]) for f in kg.query_entity("src") if f["current"]}
     assert current == {("merged-into", "dst")}
+
+
+def test_apply_merge_defaults_to_a_utc_instant(kg):
+    # A link supersede() opened an instant ago: a date-only local default could
+    # fall before it wherever the local day is behind UTC.
+    kg.add_triple("src", "synthesized-from", "s1", valid_from=utc_now_z())
+
+    result = kg.apply_merge("src", "dst")
+
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", result["ended"])
+    assert result["invalidated_lineage_edges"] == 1
+
+
+def test_walks_keep_names_that_differ_only_by_punctuation_apart(kg):
+    # "O'Brien" and "OBrien" have distinct ids; a merge of one must not walk,
+    # or end the links of, the other.
+    kg.add_triple("OBrien", "merged-into", "elsewhere")
+    kg.apply_merge("O'Brien", "dst")
+
+    edges, names = kg.reachable_edges(["O'Brien"], "merged-into")
+    assert [names[obj] for _sub, obj in edges] == ["dst"]
+    assert kg.entity_id("O'Brien") != kg.entity_id("OBrien")
+    assert kg.entities_in_triples(["O'Brien", "nobody"]) == {"O'Brien"}
+    assert [f["object"] for f in kg.query_entity("OBrien") if f["current"]] == ["elsewhere"]
+    assert {f["object"] for f in kg.traverse("O'Brien", direction="outgoing")["facts"]} == {"dst"}
+
+
+def test_walks_find_an_entity_stored_under_its_legacy_id(kg):
+    # An id written before punctuation was kept stays where it is, and a walk
+    # seeded with the current spelling of the name still reaches it.
+    with kg._lock:
+        conn = kg._conn()
+        with conn:
+            for eid, name in (("obrien", "Pat O'Brien stored"), ("other", "other")):
+                conn.execute("INSERT INTO entities (id, name) VALUES (?, ?)", (eid, name))
+            conn.execute(
+                "INSERT INTO triples (id, subject, predicate, object) VALUES (?, ?, ?, ?)",
+                ("t1", "obrien", "merged-into", "other"),
+            )
+
+    edges, _names = kg.reachable_edges(["O'Brien"], "merged-into")
+    assert edges == [("obrien", "other")]
+    assert kg.entity_id("O'Brien") == "obrien"

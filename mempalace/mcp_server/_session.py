@@ -3,6 +3,12 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
+# ``error`` of a collection that will not open after the retry. Like a model
+# error (``error_class`` in MODEL_ERROR_CLASS_NAMES), it refuses every call
+# until fixed, so protocol.py sets MCP's ``isError`` for both.
+BACKEND_OPEN_FAILED_ERROR = "Backend open failed"
+
+
 def _stat_palace_db() -> tuple:
     """Return ``(st_ino, st_mtime)`` of the palace's chroma.sqlite3, or ``(0, 0.0)``."""
     try:
@@ -19,7 +25,7 @@ def _restamp_palace_db() -> None:
     chroma.sqlite3's mtime. ``_get_client`` compares against the stat taken
     before those writes, so it read the session's own footprint as an external
     change and rebuilt the client, reloading the whole HNSW index, on nearly
-    every call. Same fix as ``ChromaBackend._restamp`` (#2307): record the
+    every call. Same fix as ``ChromaBackend._restamp``: record the
     stat after our own writes, so a later difference is someone else's. A
     write from another process that lands during our own operation is absorbed
     the same way there and picked up on the next change.
@@ -156,12 +162,12 @@ def _get_client():
     if _client_cache is None or inode_changed or mtime_changed or not client_is_current:
         # Run the HNSW capacity probe BEFORE chromadb opens the segment --
         # if the index is severely undersized, segment load can segfault
-        # the whole MCP server (#1222). The probe is pure sqlite +
+        # the whole MCP server. The probe is pure sqlite +
         # metadata read; never touches the HNSW binary files.
         _refresh_vector_disabled_flag()
         if client_is_current and (inode_changed or mtime_changed):
             ChromaBackend._quarantined_paths.discard(_config.palace_path)
-            # #2002: a peer process changed chroma.sqlite3 on disk. chromadb
+            # A peer process changed chroma.sqlite3 on disk. chromadb
             # caches its System (and the live HNSW segment) keyed by path, so
             # make_client() below would hand back the STALE segment, which then
             # persists its outdated index over the peer's writes, driving the
@@ -283,6 +289,26 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _invalidate_overview_caches()
                 return None
+            except (UnknownEmbeddingModelError, EmbeddingFunctionUnavailableError) as exc:
+                _collection_open_error = _unknown_embedding_model_error(exc)
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _invalidate_overview_caches()
+                return None
+            except (
+                EmbedderIdentityMismatchError,
+                DimensionMismatchError,
+                EmbedderIdentityRecordError,
+            ) as exc:
+                # palace.get_collection's identity check: a different model
+                # built this palace. Retrying cannot help.
+                _collection_open_error = _model_mismatch_error(exc)
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _invalidate_overview_caches()
+                return None
             except Exception:
                 logger.exception(
                     "_get_collection generic attempt %d/2 failed (palace=%s, create=%s)",
@@ -295,7 +321,7 @@ def _get_collection(create=False):
                 _collection_cache_palace = None
                 _invalidate_overview_caches()
                 _collection_open_error = {
-                    "error": "Backend open failed",
+                    "error": BACKEND_OPEN_FAILED_ERROR,
                     "details": "Could not open the selected backend collection.",
                     "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
                 }
@@ -320,6 +346,11 @@ def _get_collection(create=False):
                 _collection_cache = None
                 _collection_cache_backend = None
                 _collection_cache_palace = None
+            if create or _collection_cache is None:
+                # Resolve the configured model before _get_client(): building
+                # the client creates the palace folder, and a misspelled model
+                # (UnknownEmbeddingModelError) must leave nothing behind.
+                _ = _config.embedding_model
             client = _get_client()
             # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
             # collection but not the EF *instance/configuration*. So a reader or
@@ -328,30 +359,31 @@ def _get_collection(create=False):
             # one we spoof in ``mempalace.embedding`` (both report ``"default"``,
             # the identity check passes), but the *provider list* is chromadb's
             # default rather than the user's resolved device. On bleeding-edge
-            # interpreters (#1299: python 3.14 + chromadb 1.5.x on Apple Silicon)
+            # interpreters (python 3.14 + chromadb 1.5.x on Apple Silicon)
             # that default provider selection can SIGSEGV the host process on
             # first ``col.add()``. The miner / Stop hook ingest path avoids this
             # because it routes through ``ChromaBackend.get_collection``, which
-            # resolves the EF via ``ChromaBackend._resolve_embedding_function``;
-            # the MCP server bypassed that abstraction. Resolve the EF inside the
+            # resolves the EF via ``ChromaBackend._resolve_embedding_function``.
+            # Resolve the EF inside the
             # branches that actually open a collection so warm-cache reads stay
             # zero-cost. Reuse the backend helper so the two call sites can't
             # drift on logging or fallback semantics.
             if create:
-                ef = ChromaBackend._resolve_embedding_function()
-                ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+                # Raises EmbeddingFunctionUnavailableError rather than letting
+                # chromadb embed the write with its default function (S2).
+                ef_kwargs = {"embedding_function": ChromaBackend._resolve_embedding_function()}
                 # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
                 # HNSW insert path, which has a race in repairConnectionsForUpdate /
-                # addPoint (see issues #974, #965). Set via metadata on fresh
-                # collections and re-applied via _pin_hnsw_threads() for legacy
-                # palaces whose collections were created before this fix (the
+                # addPoint. Set via metadata on fresh collections and
+                # re-applied via _pin_hnsw_threads() for palaces whose
+                # collections were created without it (the
                 # runtime config does not persist cross-process in chromadb 1.5.x,
                 # so the retrofit runs every time _get_collection opens a cache).
                 #
                 # ChromaDB 1.5.x's Rust binding SIGSEGVs when get_or_create_collection
                 # is called with metadata that differs from what's stored. The split
                 # below skips the metadata-comparison codepath for existing
-                # collections, mirroring the backend-layer fix from #1262.
+                # collections, the same way the backend layer does.
                 try:
                     raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 except _ChromaNotFoundError:
@@ -365,22 +397,20 @@ def _get_collection(create=False):
                         **ef_kwargs,
                     )
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(
-                    raw, palace_path=_config.palace_path, backend=_SessionFreshness
-                )
+                _collection_cache = _checked_chroma_collection(raw, create=True)
                 _restamp_palace_db()
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
                 _collection_open_error = None
                 _invalidate_overview_caches()
             elif _collection_cache is None:
-                ef = ChromaBackend._resolve_embedding_function()
-                ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+                # Reads that never embed keep working; an embed refuses.
+                ef_kwargs = {
+                    "embedding_function": ChromaBackend._resolve_embedding_function(read_only=True)
+                }
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
                 _pin_hnsw_threads(raw)
-                _collection_cache = ChromaCollection(
-                    raw, palace_path=_config.palace_path, backend=_SessionFreshness
-                )
+                _collection_cache = _checked_chroma_collection(raw, create=False)
                 _restamp_palace_db()
                 _collection_cache_backend = "chroma"
                 _collection_cache_palace = _config.palace_path
@@ -403,7 +433,42 @@ def _get_collection(create=False):
             _palace_db_mtime = 0.0
             _invalidate_overview_caches()
             return None
-        except Exception:
+        except (UnknownEmbeddingModelError, EmbeddingFunctionUnavailableError) as exc:
+            # Deterministic config error: retrying cannot help, and the
+            # generic "Backend open failed" would hide the fix.
+            _collection_open_error = _unknown_embedding_model_error(exc)
+            _client_cache = None
+            _collection_cache = None
+            _collection_cache_backend = None
+            _collection_cache_palace = None
+            _invalidate_overview_caches()
+            return None
+        except (
+            EmbedderIdentityMismatchError,
+            DimensionMismatchError,
+            EmbedderIdentityRecordError,
+        ) as exc:
+            # The palace records a different model than the configured one.
+            # Deterministic, like the error above: refuse without retrying and
+            # without caching the collection, so every call refuses.
+            _collection_open_error = _model_mismatch_error(exc)
+            _collection_cache = None
+            _collection_cache_backend = None
+            _collection_cache_palace = None
+            _invalidate_overview_caches()
+            return None
+        except Exception as exc:
+            explained = ChromaBackend._explain_ef_mismatch(exc, _config.palace_path)
+            if explained is not None:
+                # Chroma refused the configured embedding function by name.
+                _collection_open_error = _model_mismatch_error(
+                    EmbeddingFunctionMismatchError(explained)
+                )
+                _collection_cache = None
+                _collection_cache_backend = None
+                _collection_cache_palace = None
+                _invalidate_overview_caches()
+                return None
             logger.exception(
                 "_get_collection attempt %d/2 failed (palace=%s, create=%s)",
                 attempt + 1,
@@ -423,7 +488,7 @@ def _get_collection(create=False):
                 _palace_db_mtime = 0.0
                 _invalidate_overview_caches()
                 _collection_open_error = {
-                    "error": "Backend open failed",
+                    "error": BACKEND_OPEN_FAILED_ERROR,
                     "details": "Could not open the Chroma collection.",
                     "hint": "Run: mempalace repair-status for diagnostics.",
                 }
@@ -435,11 +500,53 @@ def _get_collection(create=False):
     _palace_db_mtime = 0.0
     _invalidate_overview_caches()
     _collection_open_error = _collection_open_error or {
-        "error": "Backend open failed",
+        "error": BACKEND_OPEN_FAILED_ERROR,
         "details": "Could not open the selected backend collection.",
         "hint": "Run: mempalace status or mempalace repair-status for diagnostics.",
     }
     return None
+
+
+def _checked_chroma_collection(raw, *, create):
+    """Wrap a raw Chroma collection and run the RFC 001 identity check on it.
+
+    The same check palace.get_collection runs for the CLI: a palace recorded
+    with a different model raises EmbedderIdentityMismatchError before any
+    write, a brand-new empty collection records the current model, and a
+    write open (``create``) rewrites a legacy raw stored name as minilm.
+    """
+    from ..palace import _enforce_embedder_identity
+
+    collection = ChromaCollection(raw, palace_path=_config.palace_path, backend=_SessionFreshness)
+    _enforce_embedder_identity(
+        collection, _config.palace_path, _config.collection_name, create=create
+    )
+    return collection
+
+
+def _model_mismatch_error(exc) -> dict:
+    """The tool result for a model error (a palace built with another model,
+    or a misspelled embedding_model). Logs one line, no traceback: the full
+    message once per palace and message, then a short line per refusal."""
+    return model_error_result(exc, palace_path=_config.palace_path, log=logger)
+
+
+_unknown_embedding_model_error = _model_mismatch_error
+
+
+def _embed_failure(exc, **fields) -> dict:
+    """The result for a tool whose embed or write raised ``exc``.
+
+    A model error raised while embedding (an openai-compat endpoint that
+    refuses the connection, say) keeps its ``error_class`` so MCP sets
+    ``isError``, as a refusal at open does; any other failure stays the
+    plain ``{"error": str(exc)}`` it always was. ``fields`` (such as
+    ``success=False``) lead the result.
+    """
+    refused = _model_mismatch_error(exc)
+    if refused is not None:
+        return {**fields, **refused}
+    return {**fields, "error": str(exc)}
 
 
 def _no_palace():
@@ -477,6 +584,24 @@ def _is_chroma_backend() -> bool:
         return False
 
 
+def _palace_known_wings() -> frozenset:
+    """The palace's stored wing names, for ``wing_aliases``.
+
+    Chroma reads them from sqlite, without opening the collection.
+    """
+    if _is_chroma_backend() and _config.palace_path:
+        return chroma_known_wings(_config.palace_path)
+    try:
+        return known_wings(_get_collection())
+    except Exception:
+        return frozenset()
+
+
+def _palace_wing_aliases(wing: str) -> list:
+    """``wing_aliases`` for ``wing`` with the palace's stored wing names."""
+    return wing_aliases(wing, _palace_known_wings())
+
+
 def _backend_db_exists() -> bool:
     try:
         return detect_backend_for_path(_config.palace_path) is not None
@@ -498,13 +623,8 @@ def _safe_meta(meta):
 
         AttributeError: 'NoneType' object has no attribute 'get'
 
-    This bug bricked the embeddings_queue cleanup path in issue #1426 —
-    the handler crashed before reaching the ``DELETE FROM embeddings_queue``
-    step, so the queue grew without bound while writes kept appearing
-    successful.
-
-    Centralizing the coercion through this helper makes the contract
-    explicit and keeps the fix self-documenting at every call site:
+    A crash there can stop a cleanup before it finishes (the embeddings_queue
+    then grows without bound while writes keep reporting success), so
     *metadata is always a dict by the time it leaves the boundary*.
     """
     return meta if isinstance(meta, dict) else {}
@@ -513,9 +633,9 @@ def _safe_meta(meta):
 def _fetch_all_metadata(col, where=None):
     """Fetch every matching record's metadata via the backend's best strategy.
 
-    Delegates to BaseCollection.get_all_metadata() (#1796), which Chroma
-    satisfies with the same offset-paginated loop this function used to do
-    inline, and which Qdrant overrides with a single _scroll_all() pass.
+    Delegates to BaseCollection.get_all_metadata(), which Chroma
+    satisfies with an offset-paginated loop and Qdrant overrides with a
+    single _scroll_all() pass.
     Routing through one contract method means every backend gets its own
     correct strategy without this caller needing to know which backend it's
     talking to.
@@ -574,22 +694,30 @@ def _invalidate_overview_caches():
 
 
 def _palace_db_fingerprint():
-    """A stat of chroma.sqlite3 that changes with every committed write, or None.
+    """Stats of the Chroma database and its WAL, or None when unavailable.
 
-    chromadb keeps chroma.sqlite3 in rollback-journal mode (see
-    ``backends.chroma``), so a commit from any process rewrites the main file.
-    Counts grouped from the file cannot change while this value holds, which
-    lets overview caches outlive their TTL on a palace nobody is writing to.
+    New Chroma databases use rollback-journal mode, but an existing database
+    can retain WAL mode. Its commits can change only the WAL until a
+    checkpoint, so both files must participate in overview invalidation.
+    Exclude shm: readers can restamp it without changing stored records.
     ``None`` for other backends (sqlite_exact writes through a WAL, so the main
-    file's stat would miss commits) and when the file cannot be stat'ed.
+    file's stat would miss commits) and when either required stat fails.
     """
     if not _is_chroma_backend():
         return None
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     try:
-        st = os.stat(os.path.join(_config.palace_path, "chroma.sqlite3"))
+        st = os.stat(db_path)
+        main = (st.st_ino, st.st_mtime_ns, st.st_size)
+        try:
+            wal = os.stat(db_path + "-wal")
+        except FileNotFoundError:
+            wal_stamp = None
+        else:
+            wal_stamp = (wal.st_ino, wal.st_mtime_ns, wal.st_size)
     except OSError:
         return None
-    return (st.st_ino, st.st_mtime_ns, st.st_size)
+    return main, wal_stamp
 
 
 def _get_cached_metadata(col, where=None):
@@ -623,7 +751,7 @@ _MAX_SOURCE_FILE_LENGTH = 4096
 
 
 def _sanitize_optional_source_file(value: str = None) -> str:
-    """Validate an optional source_file search filter (#1815).
+    """Validate an optional source_file search filter.
 
     Unlike wing/room, a source_file is a path: ``/``, ``\\`` and ``.`` are
     legal, so it is NOT run through ``sanitize_name`` (which rejects path
@@ -631,7 +759,7 @@ def _sanitize_optional_source_file(value: str = None) -> str:
     ChromaDB metadata-equality / parameterized-SQL value — never used as a
     filesystem path — so there is no traversal risk to guard against. A null
     byte or a pathological length can still upset the backend (chromadb
-    add/upsert chokes on null bytes / lone surrogates, #1235), so guard those
+    add/upsert chokes on null bytes / lone surrogates), so guard those
     for parity with ``sanitize_name``. Blank / whitespace-only is "no filter".
     """
     if value is None:
@@ -650,11 +778,3 @@ def _sanitize_optional_source_file(value: str = None) -> str:
             f"source_file exceeds maximum length of {_MAX_SOURCE_FILE_LENGTH} characters"
         )
     return value
-
-
-# The #1128 date-filter helpers moved to ``mempalace.date_window`` so the
-# search-side window (#463) can share them without importing this module
-# (whose import installs MCP stdio protection). Aliased under their
-# historical private names — every call site and test keeps working.
-_parse_date_filter = parse_date_bound
-_filed_at_in_window = filed_at_in_window

@@ -69,7 +69,7 @@ Query → vector search over mempalace_drawers (the floor; see the fallback belo
 
 The boost is keyed by **source file**, not by the drawer IDs in the pointer lines. Search does not follow the `→drawer_id` pointers.
 
-Every hit carries `matched_via`: `"drawer"` for a plain vector hit, `"drawer+closet"` when a closet boosted it. Boosted hits also carry `closet_boost` and a `closet_preview` field showing the closet line that matched. `similarity` is always the raw vector score; the boost changes only the ordering (`effective_distance`).
+Every hit carries `matched_via`: `"drawer"` for a plain vector hit, `"drawer+closet"` when a closet boosted it. Boosted hits also carry `closet_boost` and a `closet_preview` field showing the closet line that matched. `similarity` is always the raw vector score; the boost changes only the ordering (`effective_distance`, on the cosine scale whatever metric the palace uses).
 
 With no closets (palace created before this feature, or a conversation-only palace), search is plain drawer search plus the BM25 re-rank. Closets are created on the next project mine.
 

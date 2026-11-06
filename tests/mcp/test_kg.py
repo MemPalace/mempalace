@@ -4,7 +4,6 @@ import os
 import subprocess
 import sys
 
-
 from _mcp_server_helpers import (
     _get_collection,
     _patch_mcp_server,
@@ -876,6 +875,115 @@ class TestKGTools:
             metadatas=[metadata],
         )
 
+    def test_kg_query_predicate_filter_uses_the_stored_form(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        mcp_server.tool_kg_add(subject="Pat", predicate="Works At", object="Acme")
+
+        result = mcp_server.tool_kg_query("Pat", predicate="Works At")
+
+        assert [fact["object"] for fact in result["facts"]] == ["Acme"]
+
+    def test_lineage_tools_carry_the_graph_notice(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "knowledge_graph_notice", lambda *a, **kw: "graph moved")
+
+        a = mcp_server.tool_add_drawer(wing="g", room="n", content="notice node a")["drawer_id"]
+        b = mcp_server.tool_add_drawer(wing="g", room="n", content="notice node b")["drawer_id"]
+
+        assert mcp_server.tool_kg_query("anything", recurse=True)["notice"] == "graph moved"
+        assert mcp_server.tool_resolve_canonical(a)["notice"] == "graph moved"
+        assert mcp_server.tool_get_height(a)["notice"] == "graph moved"
+        assert mcp_server.tool_find_closet_lineage_issues()["notice"] == "graph moved"
+        assert mcp_server.tool_find_merge_candidates(threshold=0.0)["notice"] == "graph moved"
+        merged = mcp_server.tool_apply_merge(source_node_id=a, canonical_node_id=b)
+        assert merged["merged"] is True
+        assert merged["notice"] == "graph moved"
+
+    def test_apply_merge_records_its_outcome_in_the_wal(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        outcomes = []
+        monkeypatch.setattr(mcp_server, "_wal_result", lambda op, res: outcomes.append((op, res)))
+
+        a = mcp_server.tool_add_drawer(wing="g", room="n", content="wal node a")["drawer_id"]
+        b = mcp_server.tool_add_drawer(wing="g", room="n", content="wal node b")["drawer_id"]
+        merged = mcp_server.tool_apply_merge(source_node_id=a, canonical_node_id=b)
+
+        assert ("apply_merge", merged) in outcomes
+
+    def test_chunk_of_a_diary_entry_resolves_to_its_entry(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Diary chunks name their entry under ``parent_entry_id``."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        meta = {"wing": "g", "room": "diary", "parent_entry_id": "entry_1"}
+        col.add(
+            ids=["entry_1_chunk_000000", "entry_1_chunk_000001"],
+            documents=["first half of the entry", "second half of the entry"],
+            metadatas=[{**meta, "chunk_index": 0}, {**meta, "chunk_index": 1}],
+        )
+
+        chunk = "entry_1_chunk_000001"
+        assert mcp_server._logical_drawer_id_for_any_id(col, chunk) == "entry_1"
+        assert mcp_server._logical_drawer_ids_for_any_ids(col, [chunk]) == {chunk: "entry_1"}
+        assert mcp_server._merge_scan_node_ids(col, wing="g") == ["entry_1"]
+        records = mcp_server._seed_records(col, ["entry_1"])
+        assert records[0]["content"] == "first half of the entrysecond half of the entry"
+        assert records[0]["embedding"]
+
+    def test_merge_scan_skips_bookkeeping_rows(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        col.add(
+            ids=["_reg_abc", "real"],
+            documents=["registry row", "real drawer"],
+            metadatas=[
+                {"wing": "g", "room": "r", "ingest_mode": "registry"},
+                {"wing": "g", "room": "r"},
+            ],
+        )
+
+        assert mcp_server._merge_scan_node_ids(col, wing="g") == ["real"]
+
+
+class TestLineageReadsCreateNoGraph:
+    """A read against a palace with no graph file answers empty and creates nothing."""
+
+    def test_reads_leave_no_graph_file(self, monkeypatch, config, palace_path, tmp_path):
+        import os
+
+        from mempalace import mcp_server
+
+        graph = tmp_path / "absent" / "knowledge_graph.sqlite3"
+        monkeypatch.setattr(mcp_server, "_config", config)
+        monkeypatch.setattr(mcp_server, "_resolve_kg_path", lambda: str(graph))
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {})
+
+        assert mcp_server.tool_kg_query("nobody", recurse=True)["count"] == 0
+        assert mcp_server.tool_kg_query("nobody", predicate="p")["count"] == 0
+        assert mcp_server.tool_resolve_canonical("nobody")["hops"] == 0
+
+        assert not os.path.exists(graph)
+        assert not graph.parent.exists()
+
 
 # ── Diary Tools ─────────────────────────────────────────────────────────
 
@@ -969,6 +1077,102 @@ class TestKGLazyCache:
         monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_a))
         query_a = mcp_server.tool_kg_query(entity="alice_secret")
         assert query_a.get("count", 0) >= 1, f"tenant A lost its own fact: {query_a}"
+
+
+class TestKGLookupLengthCap:
+    """Tools that only look up a stored value must not cap its length.
+
+    A fact whose object is longer than MAX_NAME_LENGTH can already be in the
+    graph (written before the cap existed, or by a path that skips it). The
+    tools have to stay able to end, supersede and query it, while new names
+    are still capped.
+    """
+
+    LONG = "x" * 130
+
+    def test_invalidate_long_object(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        kg.add_triple("Bot", "notes", self.LONG, valid_from="2026-05-01")
+        result = tool_kg_invalidate(
+            subject="Bot", predicate="notes", object=self.LONG, ended="2026-06-01"
+        )
+        assert result["success"] is True, result
+        current = [
+            f
+            for f in kg.query_entity("Bot", as_of="2026-07-01", direction="outgoing")
+            if f["predicate"] == "notes"
+        ]
+        assert current == []
+
+    def test_supersede_long_old_object(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_supersede
+
+        kg.add_triple("Bot", "notes", self.LONG, valid_from="2026-05-01")
+        result = tool_kg_supersede(
+            subject="Bot",
+            predicate="notes",
+            old_object=self.LONG,
+            new_object="short",
+            at="2026-06-02",
+        )
+        assert result["success"] is True, result
+        notes = [
+            f["object"]
+            for f in kg.query_entity("Bot", as_of="2026-06-02", direction="outgoing")
+            if f["predicate"] == "notes"
+        ]
+        assert notes == ["short"]
+        before = [
+            f["object"]
+            for f in kg.query_entity("Bot", as_of="2026-05-15", direction="outgoing")
+            if f["predicate"] == "notes"
+        ]
+        assert before == [self.LONG]
+
+    def test_query_long_entity(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_query
+
+        kg.add_triple("Bot", "notes", self.LONG, valid_from="2026-05-01")
+        result = tool_kg_query(entity=self.LONG)
+        assert "error" not in result, result
+        assert result["count"] == 1
+
+    def test_timeline_long_entity(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_timeline
+
+        kg.add_triple("Bot", "notes", self.LONG, valid_from="2026-05-01")
+        result = tool_kg_timeline(entity=self.LONG)
+        assert "error" not in result, result
+        assert len(result["timeline"]) == 1
+
+    def test_add_still_caps_object(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add
+
+        result = tool_kg_add(subject="Bot", predicate="notes", object="y" * 200)
+        assert result["success"] is False
+        assert "exceeds maximum length" in result["error"]
+
+    def test_supersede_still_caps_new_object(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_supersede
+
+        kg.add_triple("Bot", "notes", "old", valid_from="2026-05-01")
+        result = tool_kg_supersede(
+            subject="Bot", predicate="notes", old_object="old", new_object="y" * 200
+        )
+        assert result["success"] is False
+        assert "new_object exceeds maximum length" in result["error"]
+        assert [
+            f["object"]
+            for f in kg.query_entity("Bot", direction="outgoing")
+            if f["predicate"] == "notes"
+        ] == ["old"]
 
 
 # ── Structured error codes + MineAlreadyRunning (#1552) ─────────────────

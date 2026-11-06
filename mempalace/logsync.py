@@ -26,14 +26,14 @@ next) never touches the sync logic here.
 import logging
 
 from .transport import (
-    PEERS_FILENAME,  # noqa: F401 — re-exported for existing importers
+    PEERS_FILENAME,
     TransportError,
     get_transport,
     http_request,
     load_peers,
 )
 
-logger = logging.getLogger("mempalace.logsync")
+logger = logging.getLogger(__name__)
 
 _PULL_BATCH = 500
 
