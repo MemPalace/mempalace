@@ -6,16 +6,16 @@
 - **G1** headings ``## 0.`` to ``## 7.`` are present, in order;
 - **G2** section 0 has ``**a.`` to ``**f.``, in order, each with at least 40 non-space
   characters;
-- **G3** every (a) line with a digit carries the word ``M``, ``T``, ``G``, ``MEASURED``,
-  ``TARGET`` or ``GUESS``;
+- **G3** every (a) line with a digit starts with ``M``, ``T``, ``G``, ``MEASURED``,
+  ``TARGET`` or ``GUESS`` after indentation and an optional Markdown list marker;
 - **G4** (e) has a table whose header is exactly ``Dependency | Timeout | Bounded retry |
   Idempotency key | User sees | RED``; each row has six non-empty cells and a RED cell
   like ``R1, R2b``;
 - **G5** (f) has a table whose header starts ``ID | Fault injected | Assertion``, with
   unique ids like ``R1`` or ``R2b``;
 - **G6** every (e) id appears in (f);
-- **G7** a section 6 line ``R-test files:`` maps every (f) id to exactly one file
-  (``file: R1 R2; other_file: R3``).
+- **G7** a section 6 line ``R-test files:`` maps every (f) id to exactly one existing
+  file relative to the current repository root (``file: R1 R2; other_file: R3``).
 
 On a board whose accepted live orchestrator config exists, the board service runs the
 same check (``require_plan``) when a ``plan`` card is approved and before a card created
@@ -41,7 +41,7 @@ F_HEADER = "ID | Fault injected | Assertion"
 TEST_FILES = "R-test files:"
 RED_ID = re.compile(r"R\d+[a-z]?")
 RED_CELL = re.compile(r"R\d+[a-z]?(, R\d+[a-z]?)*")
-LABEL = re.compile(r"\b(?:M|T|G|MEASURED|TARGET|GUESS)\b")
+LABEL = re.compile(r"^\s*(?:(?:[-+*]|\d+[.)])\s+)?(?:M|T|G|MEASURED|TARGET|GUESS)(?=[:\s]|$)")
 _HEADING = re.compile(r"## (\d+)\.(?:\s|$)")
 _PART = re.compile(r"\*\*([a-z])\.")
 _SEPARATOR = re.compile(r":?-+:?")
@@ -151,8 +151,8 @@ def _table(part: list[str]) -> tuple[list[str], list[list[str]]] | None:
 
 def _check_numbers(part: list[str]) -> None:
     for line in part:
-        if any(ch.isdigit() for ch in line) and not LABEL.search(line):
-            raise PlanCheckError("G3", "a line with a number in (a) is not labelled M, T or G")
+        if any(ch.isdigit() for ch in line) and not LABEL.match(line):
+            raise PlanCheckError("G3", "a line with a number in (a) must start with M, T or G")
 
 
 def _failure_ids(part: list[str]) -> list[str]:
@@ -196,6 +196,8 @@ def _test_ids(part: list[str]) -> list[str]:
 
 
 def _test_files(section: list[str], ids: list[str]) -> None:
+    cwd = Path.cwd()
+    root = next((p for p in (cwd, *cwd.parents) if (p / ".git").exists()), cwd)
     files: dict[str, set[str]] = {}
     found = False
     for line in section:
@@ -210,6 +212,15 @@ def _test_files(section: list[str], ids: list[str]) -> None:
             name = name.strip()
             if not colon or not name or any(ch.isspace() for ch in name):
                 raise PlanCheckError("G7", "an 'R-test files:' entry is not 'file: R1 R2'")
+            path = Path(name)
+            try:
+                target = (root / path).resolve()
+            except (OSError, RuntimeError):
+                raise PlanCheckError(
+                    "G7", f"'{name}' cannot be resolved in the repository"
+                ) from None
+            if path.is_absolute() or not target.is_relative_to(root) or not target.is_file():
+                raise PlanCheckError("G7", f"'{name}' is not an existing file in the repository")
             for item in re.split(r"[\s,]+", listed.strip()):
                 if not item:
                     continue

@@ -356,6 +356,89 @@ def test_r21b_waiver_list_parser():
 # ---------------------------------------------------------------- R22
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "- lease lasts 600 seconds according to the measured database value M",
+        "- lease M: lasts 600 seconds according to the measured database value",
+        "- 600 seconds according to the current database lease value GUESS",
+    ],
+)
+def test_r22_g3_label_must_lead_the_line(line):
+    text = PLAN.replace("test_example.py", "tests/test_orch_checks.py").replace(
+        "- M: lease 600 s (`db.py:51`); T: 0 duplicate jobs after a lost ack.", line
+    )
+    found = plan_check.violation(text)
+    assert found is not None and found.rule == "G3", found
+
+
+def test_r22_g7_missing_test_file_fails():
+    text = "\n".join(
+        "R-test files: tests/test_missing_plan_regression.py: R1"
+        if line.startswith("R-test files:")
+        else line
+        for line in PLAN.splitlines()
+    )
+    found = plan_check.violation(text)
+    assert found is not None and found.rule == "G7", found
+
+
+@pytest.mark.parametrize("label", ["M", "T", "G", "MEASURED", "TARGET", "GUESS"])
+@pytest.mark.parametrize("prefix", ["", "  ", "- ", "  + ", "* ", "1. ", "2) "])
+@pytest.mark.parametrize("separator", [" ", ": "])
+def test_r22_g3_leading_labels_pass(label, prefix, separator):
+    text = PLAN.replace(
+        "- M: lease 600 s (`db.py:51`); T: 0 duplicate jobs after a lost ack.",
+        f"{prefix}{label}{separator}lease lasts 600 seconds according to the database value.",
+    )
+    assert plan_check.violation(text) is None
+
+
+def test_r22_g7_uses_current_repo_root_at_check_time(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    nested = repo / "nested"
+    nested.mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: unused\n", encoding="utf-8")
+    test_file = repo / "tests/test_orch_acceptance.py"
+    test_file.parent.mkdir()
+    test_file.write_text("", encoding="utf-8")
+    monkeypatch.chdir(nested)
+    assert plan_check.violation(PLAN) is None
+    test_file.unlink()
+    assert plan_check.violation(PLAN).rule == "G7"
+    test_file.mkdir()
+    assert plan_check.violation(PLAN).rule == "G7"
+
+
+def test_r22_g7_rejects_paths_outside_repo(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    outside = tmp_path / "test_outside.py"
+    outside.write_text("", encoding="utf-8")
+    monkeypatch.chdir(repo)
+    for name in (str(outside), "../test_outside.py"):
+        text = PLAN.replace("tests/test_orch_acceptance.py", name)
+        assert plan_check.violation(text).rule == "G7"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks require an additional Windows privilege")
+def test_r22_g7_rejects_escaping_and_looping_symlinks(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    outside = tmp_path / "test_outside.py"
+    outside.write_text("", encoding="utf-8")
+    link = repo / "linked.py"
+    monkeypatch.chdir(repo)
+    text = PLAN.replace("tests/test_orch_acceptance.py", "linked.py")
+    link.symlink_to(outside)
+    assert plan_check.violation(text).rule == "G7"
+    link.unlink()
+    link.symlink_to(link)
+    assert plan_check.violation(text).rule == "G7"
+
+
 def _replace(old, new, count=1):
     def apply(text):
         if old not in text:
@@ -413,10 +496,16 @@ BROKEN = [
         ),
     ),
     ("G6", _replace("| retry message | R1 |", "| retry message | R1, R2 |")),
-    ("G7", _replace("R-test files: test_example.py: R1\n", "")),
-    ("G7", _replace("test_example.py: R1", "test_example.py: R1; test_other.py: R1")),
-    ("G7", _replace("test_example.py: R1", "test_example.py: R1 nope")),
-    ("G7", _replace("test_example.py: R1", "R1")),
+    ("G7", _replace("R-test files: tests/test_orch_acceptance.py: R1\n", "")),
+    (
+        "G7",
+        _replace(
+            "tests/test_orch_acceptance.py: R1",
+            "tests/test_orch_acceptance.py: R1; test_other.py: R1",
+        ),
+    ),
+    ("G7", _replace("tests/test_orch_acceptance.py: R1", "tests/test_orch_acceptance.py: R1 nope")),
+    ("G7", _replace("tests/test_orch_acceptance.py: R1", "R1")),
     (
         "G7",
         _replace(

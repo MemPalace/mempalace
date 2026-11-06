@@ -114,7 +114,7 @@ Agent tokens with an owner role are not the owner. The project's Connect seat
 
 | Path | Who | Lease | Cap |
 |---|---|---|---|
-| `orch_card_start(board, card, step_key, epoch, token, config_ref?)` | the lease holder | yes | yes |
+| `orch_card_start(board, role, card, step_key, epoch, token, config_ref?)` | the lease holder | yes | yes |
 | `card_start(…, config_ref?)` over MCP or `POST /api/card-starts` | the person owner only; anyone else gets `no: use orch_card_start` | no | yes |
 | trigger | the event's actor | no | yes |
 | `card_start_cancel` of a job that belongs to a step | the person owner only | – | – |
@@ -233,14 +233,25 @@ On a board with an accepted live config:
 - **G2** section 0 has `**a.` to `**f.`, in order, each with at least 40
   non-space characters;
 - **G3** every (a) line with a digit is labelled `M`, `T`, `G`, MEASURED,
-  TARGET or GUESS;
+  TARGET or GUESS as the leading token after indentation and an optional Markdown
+  list marker (for example `- M: …` or `M …`);
 - **G4** (e) has a table with the header `Dependency | Timeout | Bounded retry |
   Idempotency key | User sees | RED`, six non-empty cells per row, and RED
   cells like `R1, R2b`;
 - **G5** (f) has a table whose header starts `ID | Fault injected | Assertion`,
   with unique ids like `R1` or `R2b`;
 - **G6** every (e) id appears in (f);
-- **G7** a section 6 line `R-test files:` maps every (f) id to exactly one file.
+- **G7** a section 6 line `R-test files:` maps every (f) id to exactly one existing
+  file relative to the repository root. Acceptance test files are allowed. The root
+  is the nearest Git checkout above the current directory (or the current directory
+  outside a checkout); absolute paths and paths resolving outside it are refused.
+  File existence is checked on every call, including board plan approval.
+
+The acceptance cases R1, R1b, R1d, R1e, R8b, R10a and R11e live in
+`tests/test_orch_acceptance.py`; the runner guard cases live in
+`tests/test_orch_runner.py`. R22 grammar cases live in `tests/test_orch_checks.py`.
+The `role` argument to `orch_card_start` identifies the lease and step lineage;
+it is separate from the configured runner role that executes the card.
 
 ## Not yet
 

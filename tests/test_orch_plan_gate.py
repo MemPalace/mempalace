@@ -46,7 +46,7 @@ PLAN = """## 0. Design before code
 ## 4. Durable
 ## 5. Docs
 ## 6. Units
-R-test files: test_example.py: R1
+R-test files: tests/test_orch_acceptance.py: R1
 ## 7. Risks
 """
 

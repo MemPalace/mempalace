@@ -87,7 +87,7 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:** Shared fixtures and harnesses and every test file not listed in another block.
 - **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls. Restricted-origin content-edit regressions verify audit attribution and unchanged release and claim state through both public routes.
-- **How it fails:** A shared fixture change can break unrelated suites; slow or flaky tests waste every run.
+- **How it fails:** A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
 - **Tests:** The suite itself under the coverage gate; `tests/test_commonplace_webhooks.py::test_dispatcher_thread_survives_an_unexpected_pass_error` checks that an unexpected delivery-pass error is logged without its private message and the dispatcher retries while staying alive.
 
 ## hub-core
@@ -133,10 +133,10 @@ Format (read by `commonplace orch docs-check`):
 ## orch
 
 - **Paths:** `commonplace/orch/`, `docs/orchestrator.md`, `tests/_orch_helpers.py`, `tests/test_orch_acceptance.py`, `tests/test_orch_schema.py`, `tests/test_orch_store.py`, `tests/test_orch_durable.py`, `tests/test_orch_runner.py`, `tests/test_orch_surfaces.py`, `tests/test_orch_checks.py`, `tests/test_orch_plan_gate.py`, `tests/test_docs_obligations.py`
-- **Owns:** The orchestrator config format and its versions and experiments, config-driven starts, triggers, leases, the journal, resume, the restore flag and acknowledgement, `plan-check` and `docs-check`.
+- **Owns:** The planner grammar, including leading numeric labels and repository-relative existing test-file mappings; the orchestrator config format and its versions and experiments, config-driven starts, triggers, leases, the journal, resume, the restore flag and acknowledgement, `plan-check` and `docs-check`.
 - **Promises:** Only owner-accepted versions run; every config-driven start is one fenced, capped transaction; a retry returns the stored job; external effects are never re-issued by the hub; after a restore nothing config-driven runs until the owner acknowledges; boards without a `[runner]` config behave as before.
 - **How it fails:** Refusals become coded misses shown on resume; an unproven external effect becomes `needs_person`; infrastructure errors leave the trigger cursor in place for the next sweep.
-- **Tests:** The `tests/test_orch_` files listed in Paths and `tests/test_docs_obligations.py`.
+- **Tests:** The `tests/test_orch_` files listed in Paths and `tests/test_docs_obligations.py`; R22 in `tests/test_orch_checks.py` covers misplaced labels, missing files, accepted label forms and repository-root resolution. R1, R1b, R1d, R1e, R8b, R10a and R11e map to `tests/test_orch_acceptance.py`.
 
 ## projects
 
