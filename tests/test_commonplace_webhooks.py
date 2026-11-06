@@ -5,6 +5,7 @@ import hmac
 import http.client
 import json
 import queue
+import sqlite3
 import sys
 import threading
 import time
@@ -709,6 +710,37 @@ def test_committed_board_event_recovers_when_listener_enqueue_fails(security, mo
     finally:
         dispatcher.stop()
         reopened.close()
+
+
+def test_dispatcher_thread_survives_an_unexpected_pass_error(security, monkeypatch, caplog):
+    s = security
+    sent = []
+    monkeypatch.setattr(webhooks, "_post", lambda *args: sent.append(args) or 204)
+    raised = []
+    original_due = webhooks.Dispatcher._due
+
+    def locked_once(self):
+        if not raised:
+            raised.append(True)
+            # Another process held the control DB write lock past the busy timeout.
+            raise sqlite3.OperationalError("database is locked PRIVATE-CANARY")
+        return original_due(self)
+
+    monkeypatch.setattr(webhooks.Dispatcher, "_due", locked_once)
+    dispatcher = s.dispatcher
+    dispatcher.error_backoff = 0.01
+    dispatcher.start()
+    try:
+        wait_for(lambda: raised)
+        event = security_event(s)  # first wake: the listener enqueues and wakes the loop
+        dispatcher._wake.set()  # second wake
+        wait_for(lambda: len(sent) == 1)
+        assert json.loads(sent[0][1])["seq"] == event["seq"]
+        assert dispatcher.thread.is_alive()
+        assert "OperationalError" in caplog.text
+        assert "PRIVATE-CANARY" not in caplog.text
+    finally:
+        dispatcher.stop()
 
 
 def test_auth_header_is_sent_and_never_shown(live, receiver):

@@ -99,6 +99,16 @@ activation, reservation or other update permissions.
   board: no active job and no job started strictly after the card's latest
   firing event (a start in the same second as the event does not count).
 
+### Webhook dispatcher recovery
+
+Each delivery pass contains unexpected errors from reconciliation, due-delivery
+lookup and delivery. An error is logged without its private message and the
+dispatcher waits on its stop event before continuing: 5 s initially, doubling
+after consecutive errors to a 300 s cap. A successful pass resets the backoff;
+stopping interrupts the wait. A closed-database `sqlite3.ProgrammingError` still
+ends the dispatcher, and exit always removes its event listener. This keeps a
+temporary failure from silently ending background delivery.
+
 ### Design before code
 
 - A planner role must include `design_before_code`. On a configured board,

@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 BACKOFF = (10, 60, 300, 1800, 7200, 21600)
 MAX_ATTEMPTS = 6
 HTTP_TIMEOUT = 5
+# Seconds the worker waits after an unexpected pass error, doubling up to the cap.
+ERROR_BACKOFF = 5
+MAX_ERROR_BACKOFF = 300
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS webhooks (
     id TEXT PRIMARY KEY,
@@ -609,6 +612,8 @@ class Dispatcher:
         self.gateway = gateway
         self.schedule = tuple(schedule)
         self.max_attempts = max_attempts
+        self.error_backoff = ERROR_BACKOFF
+        self.max_error_backoff = MAX_ERROR_BACKOFF
         self._stop = threading.Event()
         self._wake = threading.Event()
         self.thread = threading.Thread(target=self._run, name="commonplace-webhooks", daemon=True)
@@ -758,20 +763,30 @@ class Dispatcher:
             )
 
     def _run(self):
+        backoff = self.error_backoff
         try:
             while not self._stop.is_set():
-                self._wake.clear()
-                self.reconcile()
-                row = self._due()
-                if row is not None:
-                    self._deliver(row)
+                try:
+                    self._wake.clear()
+                    self.reconcile()
+                    row = self._due()
+                    if row is not None:
+                        self._deliver(row)
+                        backoff = self.error_backoff
+                        continue
+                except sqlite3.ProgrammingError:
+                    # A test or embedding application may close its ControlDB first.
+                    return
+                except Exception as exc:
+                    # Contain the pass (e.g. a control DB lock held past the busy
+                    # timeout); deliveries stay queued and resume after a bounded backoff.
+                    log_failure(logger, "webhook dispatcher pass failed", exc)
+                    if self._stop.wait(backoff):
+                        return
+                    backoff = min(backoff * 2, self.max_error_backoff)
                     continue
+                backoff = self.error_backoff
                 self._wake.wait(0.1)
-        except sqlite3.ProgrammingError:
-            # A test or embedding application may close its ControlDB first.
-            pass
-        except Exception as exc:
-            log_failure(logger, "webhook dispatcher stopped", exc)
         finally:
             events.remove_listener(self.on_event)
 

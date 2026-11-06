@@ -88,7 +88,7 @@ Format (read by `commonplace orch docs-check`):
 - **Owns:** Shared fixtures and harnesses and every test file not listed in another block.
 - **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls. Restricted-origin content-edit regressions verify audit attribution and unchanged release and claim state through both public routes.
 - **How it fails:** A shared fixture change can break unrelated suites; slow or flaky tests waste every run.
-- **Tests:** The suite itself under the coverage gate.
+- **Tests:** The suite itself under the coverage gate; `tests/test_commonplace_webhooks.py::test_dispatcher_thread_survives_an_unexpected_pass_error` checks that an unexpected delivery-pass error is logged without its private message and the dispatcher retries while staying alive.
 
 ## hub-core
 
@@ -119,8 +119,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/boards/`, `commonplace/events.py`, `commonplace/webhooks.py`, `commonplace/holds.py`, `commonplace/callstack.py`
 - **Owns:** Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
 - **Promises:** Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval. Trusted agents and authorized board coordinators may edit only the title/body of unassigned restricted-origin todo cards without releasing the origin or changing claim authority.
-- **How it fails:** A swallowed emission loses a notification but not the change (the trigger sweep reads `task_events`); webhook delivery retries and records failures.
-- **Tests:** `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`.
+- **How it fails:** A swallowed emission loses a notification but not the change (the trigger sweep reads `task_events`); webhook delivery retries and records failures. Each unexpected dispatcher-pass exception is contained and logged without its private message, then waits on the stop event for 5 s, doubling after consecutive errors up to 300 s, before continuing. A successful pass resets the backoff; stopping interrupts the wait, and a closed database still ends the dispatcher.
+- **Tests:** `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`, `tests/test_commonplace_webhooks.py`.
 
 ## runner
 
