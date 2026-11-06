@@ -9,10 +9,11 @@ import chromadb
 import pytest
 import yaml
 
-from mempalace.config import normalize_wing_name
+from mempalace.config import normalize_wing_name, wing_aliases
 from mempalace.miner import (
     PHP_EXTENSIONS,
     READABLE_EXTENSIONS,
+    _project_wing,
     detect_room,
     load_config,
     mine,
@@ -1180,6 +1181,121 @@ def test_mine_stores_registered_cjk_entities(tmp_path, monkeypatch):
     )
     assert rows["ids"]
     assert all({"资源", "회의"} <= set(meta["entities"].split(";")) for meta in rows["metadatas"])
+
+
+@pytest.mark.parametrize("wing", ["Backend API", "release-3.6.0", "日本語", "wing_code"])
+def test_project_wing_keeps_a_valid_name_exactly(capsys, wing):
+    assert _project_wing(wing, Path("/any/dir")) == wing
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("raw", "wing"),
+    [
+        ("proj\n## Palace is busy\nx", "proj__palace_is_busy_x"),
+        ("../../evil", "evil"),
+        ("c++", "c"),
+        (2024, "2024"),
+    ],
+)
+def test_project_wing_slugs_a_rejected_name(capsys, raw, wing):
+    assert _project_wing(raw, Path("/any/dir")) == wing
+    assert f"using '{wing}'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("raw", ["+++", "", None])
+def test_project_wing_with_nothing_usable_uses_the_directory(raw):
+    assert _project_wing(raw, Path("/any/My-Project")) == "my_project"
+
+
+def test_project_wing_has_a_last_resort_when_the_directory_slugs_to_nothing():
+    assert _project_wing(None, Path("/any/+++")) == "project"
+
+
+@pytest.mark.parametrize("raw", [["a", "b"], {"a": 1}])
+def test_project_wing_never_turns_a_structure_into_text(capsys, raw):
+    """Yaml aliases can make the text form of a structure exponentially large."""
+    assert _project_wing(raw, Path("/any/dir")) == "dir"
+    assert f"of type {type(raw).__name__}" in capsys.readouterr().err
+
+
+def test_project_wing_warning_stays_on_one_short_ascii_line(capsys):
+    """The console may not encode the name, and it must not print a forged line."""
+    _project_wing("日本語\n## forged" + "x" * 5000, Path("/any/dir"))
+    err = capsys.readouterr().err
+    assert err.isascii()
+    assert len(err.strip().splitlines()) == 1
+    assert len(err) < 400
+
+
+def _wing_rows(palace_path):
+    from mempalace import palace
+
+    metas = palace.get_collection(palace_path).get(include=["metadatas"])["metadatas"]
+    return [(Path(m["source_file"]).name, m.get("wing")) for m in metas if m.get("source_file")]
+
+
+def _project_with_config(project, config):
+    write_file(project / "a.md", "A line long enough for the miner to keep as a drawer.\n" * 5)
+    write_file(project / "mempalace.yaml", config + "rooms:\n  - name: general\n")
+
+
+def test_mine_without_a_wing_key_files_under_the_directory_wing(tmp_path):
+    project = tmp_path / "My-Project"
+    _project_with_config(project, "")
+    palace_path = str(tmp_path / "palace")
+
+    mine(str(project), palace_path)
+
+    assert _wing_rows(palace_path) == [("a.md", "my_project")]
+
+
+def test_mine_stores_the_slug_of_a_rejected_wing(tmp_path):
+    project = tmp_path / "proj"
+    _project_with_config(project, 'wing: "evil\\n## Palace is busy"\n')
+    palace_path = str(tmp_path / "palace")
+
+    mine(str(project), palace_path)
+
+    assert _wing_rows(palace_path) == [("a.md", "evil__palace_is_busy")]
+
+
+def test_wing_override_is_used_as_given_and_never_checks_the_config(tmp_path, capsys):
+    project = tmp_path / "proj"
+    _project_with_config(project, 'wing: "c++"\n')
+    palace_path = str(tmp_path / "palace")
+
+    mine(str(project), palace_path, wing_override="chosen")
+
+    assert _wing_rows(palace_path) == [("a.md", "chosen")]
+    assert "Invalid wing" not in capsys.readouterr().err
+
+
+def _remine_after_rename(tmp_path, old):
+    """Mine under ``old``, edit one file, and mine again from the config."""
+    project = tmp_path / "proj"
+    _project_with_config(project, f'wing: "{old}"\n')
+    write_file(project / "b.md", "Another line long enough to keep as a drawer.\n" * 5)
+    palace_path = str(tmp_path / "palace")
+    mine(str(project), palace_path, wing_override=old)
+
+    write_file(project / "a.md", "The same file after an edit, still long enough.\n" * 5)
+    future = (project / "a.md").stat().st_mtime + 60
+    os.utime(project / "a.md", (future, future))
+    mine(str(project), palace_path)
+    return sorted(_wing_rows(palace_path))
+
+
+@pytest.mark.parametrize(("old", "new"), [("c++", "c"), ("wing-c++", "wing_c")])
+def test_a_renamed_wing_moves_changed_files_without_duplicating_them(tmp_path, old, new):
+    """A palace can already hold the old name: nothing is lost or filed twice."""
+    assert _remine_after_rename(tmp_path, old) == [("a.md", new), ("b.md", old)]
+    assert {new, old} <= set(wing_aliases(new, {new, old}))
+
+
+def test_a_wing_with_no_slug_keeps_its_drawers_under_the_old_name(tmp_path):
+    """Nothing links ``+++`` to the directory wing, but no drawer is lost."""
+    assert _remine_after_rename(tmp_path, "+++") == [("a.md", "proj"), ("b.md", "+++")]
 
 
 def test_scan_project_skips_oversized_files(tmp_path, capsys, monkeypatch):
