@@ -95,8 +95,12 @@ def test_readable_config_keeps_every_other_setting(tmp_path):
     assert on_disk["hooks"] == REAL["hooks"]
 
     reloaded = MempalaceConfig(config_dir=str(tmp_path))
-    assert reloaded.palace_path == REAL["palace_path"]
-    assert reloaded.palace_path != os.path.expanduser(DEFAULT_PALACE_PATH)
+    # The persisted value round-trips through canonical_palace_path, which
+    # applies abspath (drive letter + platform separators on Windows). The
+    # on-disk REAL[...] value is the raw stored string; compare against the
+    # normalized form so this is not host-specific.
+    assert reloaded.palace_path == os.path.abspath(REAL["palace_path"])
+    assert reloaded.palace_path != os.path.abspath(DEFAULT_PALACE_PATH)
 
 
 def test_a_failed_write_leaves_the_previous_config_intact(tmp_path, monkeypatch):
