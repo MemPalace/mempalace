@@ -298,6 +298,45 @@ def test_layer1_truncates_long_snippets():
     assert "..." in result
 
 
+def _layer1_story(docs, metas, max_chars=Layer1.MAX_CHARS):
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch.object(Layer1, "MAX_CHARS", max_chars),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        return Layer1(palace_path="/fake").generate()
+
+
+def test_layer1_long_room_name_cannot_crowd_out_the_story():
+    from mempalace.config import MAX_NAME_LENGTH
+
+    long_room = "0" * 5000
+    result = _layer1_story(
+        ["first memory", "second memory"], [{"room": long_room}, {"room": "second-room"}]
+    )
+    assert "first memory" in result
+    assert "second memory" in result
+    assert "0" * (MAX_NAME_LENGTH + 1) not in result
+
+
+def test_layer1_cap_covers_room_lines():
+    rooms = ["a" * 60, "b" * 60]
+    result = _layer1_story(["x", "y"], [{"room": room} for room in rooms], max_chars=100)
+    assert rooms[0] in result
+    assert rooms[1] not in result
+    assert "more in L3 search" in result
+
+
+def test_layer1_renders_a_room_name_stored_with_newlines():
+    """Palaces mined before room names were validated can still hold one."""
+    result = _layer1_story(["a memory"], [{"room": "notes\n## x"}])
+    assert "a memory" in result
+    assert "[notes ## x]" in result
+    assert "\n## x" not in result
+
+
 def test_layer1_respects_max_chars():
     """L1 stops adding entries once MAX_CHARS is reached."""
     docs = [f"Memory number {i} with substantial content padding here" for i in range(30)]

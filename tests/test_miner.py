@@ -367,6 +367,112 @@ def test_load_config_resolution_order_and_shadow_warning(tmp_path, capsys, prese
             assert name in err
 
 
+def _write_rooms(project, rooms):
+    write_file(project / "mempalace.yaml", yaml.safe_dump({"wing": "w", "rooms": rooms}))
+
+
+@pytest.mark.parametrize("name", ["general", "Backend API", "release-3.6.0", "résumé", "日本語"])
+def test_load_config_keeps_valid_room_names_exactly(tmp_path, capsys, name):
+    _write_rooms(tmp_path, [{"name": name, "keywords": ["k"]}])
+    assert load_config(str(tmp_path))["rooms"] == [{"name": name, "keywords": ["k"]}]
+    assert "Invalid room name" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("name", "slug"),
+    [
+        ("notes\n## Palace is busy\nx", "notes-palace-is-busy-x"),
+        ("c++", "c"),
+        ("notes&ideas", "notes-ideas"),
+        ("../../etc", "etc"),
+        (2024, "2024"),
+    ],
+)
+def test_load_config_turns_a_rejected_room_name_into_its_slug(tmp_path, capsys, name, slug):
+    _write_rooms(tmp_path, [{"name": name, "keywords": ["k"]}])
+    assert load_config(str(tmp_path))["rooms"] == [
+        {"name": slug, "keywords": ["k"], "match_name": str(name)}
+    ]
+    assert f"using '{slug}'" in capsys.readouterr().err
+
+
+def _route(project, rooms, relative, content="hello world"):
+    _write_rooms(project, rooms)
+    return detect_room(project / relative, content, load_config(str(project))["rooms"], project)
+
+
+@pytest.mark.parametrize(
+    ("room", "relative", "content", "expected"),
+    [
+        ({"name": "c++"}, "c++/a.md", "hello world", "c"),
+        ({"name": "c++"}, "c++.md", "hello world", "c"),
+        ({"name": "c++", "keywords": ["c++"]}, "c++.md", "hello world", "c"),
+        ({"name": "c++"}, "a.md", "written in c++", "c"),
+        ({"name": "notes&ideas"}, "a.md", "see notes&ideas", "notes-ideas"),
+    ],
+)
+def test_a_slugged_room_routes_by_its_config_spelling(tmp_path, room, relative, content, expected):
+    assert _route(tmp_path, [room], relative, content) == expected
+
+
+def test_a_slug_never_routes_a_file(tmp_path):
+    """``c`` as a content keyword would claim nearly every file."""
+    assert _route(tmp_path, [{"name": "c++"}], "a.md", "cc cc cc") == "general"
+    assert _route(tmp_path, [{"name": "c++"}], "c/a.md") == "general"
+
+
+@pytest.mark.parametrize("room", [{"name": "+++"}, {"name": None}, {"keywords": ["k"]}, "plain"])
+def test_load_config_skips_a_room_with_no_usable_name(tmp_path, capsys, room):
+    _write_rooms(tmp_path, [room, {"name": "kept"}])
+    assert load_config(str(tmp_path))["rooms"] == [{"name": "kept"}]
+    assert "skipping that room" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name", [["a", "b"], {"a": 1}])
+def test_load_config_never_turns_a_structured_room_name_into_text(tmp_path, capsys, name):
+    """Yaml aliases can make the text form of a structure exponentially large."""
+    _write_rooms(tmp_path, [{"name": name}, {"name": "kept"}])
+    assert load_config(str(tmp_path))["rooms"] == [{"name": "kept"}]
+    assert f"of type {type(name).__name__}" in capsys.readouterr().err
+
+
+def test_room_name_warning_stays_on_one_short_ascii_line(tmp_path, capsys):
+    """The console may not encode the name, and it must not print a forged line."""
+    _write_rooms(tmp_path, [{"name": "日本語\n## forged" + "x" * 5000}])
+    load_config(str(tmp_path))
+    err = capsys.readouterr().err
+    assert err.isascii()
+    assert len(err.strip().splitlines()) == 1
+    assert len(err) < 300
+
+
+@pytest.mark.parametrize("body", ["wing: w\n", "wing: w\nrooms:\n", "wing: w\nrooms: nope\n"])
+def test_load_config_leaves_a_rooms_key_that_is_not_a_list(tmp_path, body):
+    write_file(tmp_path / "mempalace.yaml", body)
+    assert load_config(str(tmp_path)) == yaml.safe_load(body)
+
+
+def test_mine_files_everything_when_room_names_are_bad(tmp_path):
+    """Bad names never cost a file: one lands in the slug room, one in general."""
+    from mempalace import palace
+
+    project = tmp_path / "proj"
+    body = "A line long enough for the miner to keep as a drawer.\n" * 5
+    write_file(project / "c++" / "a.md", body)
+    write_file(project / "b.md", "alpha " + body)
+    _write_rooms(
+        project,
+        [{"name": "c++", "keywords": ["c++"]}, {"name": "+++", "keywords": ["alpha"]}],
+    )
+    palace_path = str(tmp_path / "palace")
+
+    mine(str(project), palace_path)
+
+    metas = palace.get_collection(palace_path).get(include=["metadatas"])["metadatas"]
+    rooms = {Path(m["source_file"]).name: m["room"] for m in metas if m.get("source_file")}
+    assert rooms == {"a.md": "c", "b.md": "general"}
+
+
 def test_load_config_single_config_is_quiet(tmp_path, capsys):
     write_file(tmp_path / "mempalace.yml", "wing: solo\nrooms: []\n")
     assert load_config(str(tmp_path))["wing"] == "solo"
