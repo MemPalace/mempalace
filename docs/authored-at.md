@@ -65,9 +65,12 @@ existing behavior. Content-date filtering would require a separate explicit API.
 
 New conversation mines populate `authored_at` automatically. Drawers mined before this feature only have
 `filed_at`. Re-mining does **not** fix them — the scanner skips files already mined at the
-current `NORMALIZE_VERSION`. Two options:
+current `NORMALIZE_VERSION`. The same applies to drawers whose timestamp was
+previously selected by text order across different UTC offsets or fractional
+precision. With the updated timestamp selector, the existing backfill also
+corrects those values from the retained source transcripts. Two options:
 
-1. **In-place backfill (recommended — no re-embedding).** `scripts/backfill_authored_at.py`
+1. **In-place backfill for Chroma (recommended — no re-embedding).** `scripts/backfill_authored_at.py`
    reads each convos drawer's source transcript and updates only the `authored_at` metadata.
    Idempotent and safe to re-run; embeddings are untouched.
 

@@ -1,6 +1,7 @@
 """Scope check: the separate list helper also returns public metadata."""
 
 import json
+
 from _mcp_server_helpers import _patch_mcp_server
 
 

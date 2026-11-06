@@ -1,10 +1,8 @@
 """Tests for mempalace.palace shared helpers."""
 
 import chromadb
-
-from _chroma_palace_helper import make_minimal_chroma_sqlite
-
 import pytest
+from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace.backends import CollectionNotInitializedError, PalaceNotFoundError
 from mempalace.palace import (
@@ -379,7 +377,7 @@ class TestGetCollectionNameValidation:
             )
             assert col is not None
         except CollectionNameMismatchError:  # pragma: no cover
-            raise AssertionError("_skip_name_check=True must bypass the check")
+            raise AssertionError("_skip_name_check=True must bypass the check") from None
 
     def test_configured_override_is_accepted(self, tmp_path, monkeypatch):
         """If the user configures a custom drawers name, that name must pass."""
@@ -401,4 +399,5 @@ class TestGetCollectionNameValidation:
         assert "mempalace_drawers" in allowed
         assert "mempalace_closets" in allowed
         assert ASSETS_COLLECTION_NAME in allowed
-        assert len(allowed) == 3
+        assert "mempalace_aaak" in allowed
+        assert len(allowed) == 4

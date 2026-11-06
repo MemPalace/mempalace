@@ -19,7 +19,23 @@ import urllib.error
 
 import pytest
 
-from mempalace import mcp_proxy
+from mempalace import hub_client, mcp_proxy
+
+
+class _Hub:
+    """A live hub for the proxy to forward to: ``post`` hands each request to ``forward``."""
+
+    base_url = "http://hub"
+
+    def __init__(self, forward=None):
+        self._forward = forward
+
+    def post(self, request, *, timeout=None):
+        return self._forward(self.base_url, {}, request, "/p")
+
+
+def _set_hub(monkeypatch, hub):
+    monkeypatch.setattr(hub_client.HubClient, "discover", classmethod(lambda cls, palace_path: hub))
 
 
 class TestInvocationRouting:
@@ -151,8 +167,7 @@ class TestRouting:
     def test_live_hub_is_used_and_the_server_is_never_loaded(self, monkeypatch):
         """The point of the module: a proxied session pays nothing for storage."""
         forwarded = {"jsonrpc": "2.0", "id": 7, "result": {"content": []}}
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
-        monkeypatch.setattr(mcp_proxy, "_forward", lambda *a: forwarded)
+        _set_hub(monkeypatch, _Hub(lambda *a: forwarded))
         local = _LoadedLocal(_FakeServer())
 
         assert mcp_proxy._handle(dict(self._REQUEST), "/p", local) is forwarded
@@ -174,8 +189,7 @@ class TestRouting:
             "id": 8,
             "result": {"content": [{"type": "text", "text": json.dumps(hub_payload)}]},
         }
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
-        monkeypatch.setattr(mcp_proxy, "_forward", lambda *a: forwarded)
+        _set_hub(monkeypatch, _Hub(lambda *a: forwarded))
         monkeypatch.setattr(
             mcp_proxy,
             "cached_update_status",
@@ -195,7 +209,7 @@ class TestRouting:
         assert local.load_count == 0
 
     def test_no_hub_falls_back_locally_and_warns(self, monkeypatch):
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: None)
+        _set_hub(monkeypatch, None)
         server = _FakeServer()
         local = _LoadedLocal(server)
 
@@ -204,12 +218,11 @@ class TestRouting:
         assert "WITHOUT its shared hub" in out["result"]["content"][0]["text"]
 
     def test_unreachable_hub_falls_back_for_a_read(self, monkeypatch):
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
 
         def boom(*a):
             raise urllib.error.URLError("connection refused")
 
-        monkeypatch.setattr(mcp_proxy, "_forward", boom)
+        _set_hub(monkeypatch, _Hub(boom))
         server = _FakeServer(mutating=False)
         local = _LoadedLocal(server)
 
@@ -219,12 +232,11 @@ class TestRouting:
 
     def test_mutating_call_that_failed_mid_flight_is_not_replayed(self, monkeypatch):
         """The hub may still be executing it — a local retry could double-write."""
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
 
         def boom(*a):
             raise urllib.error.URLError("connection reset")
 
-        monkeypatch.setattr(mcp_proxy, "_forward", boom)
+        _set_hub(monkeypatch, _Hub(boom))
         server = _FakeServer(mutating=True)
         local = _LoadedLocal(server)
 
@@ -234,12 +246,11 @@ class TestRouting:
 
     def test_hub_http_error_is_not_replayed_even_for_a_read(self, monkeypatch):
         """An HTTP status means the hub received it; re-running it here is wrong."""
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
 
         def boom(*a):
             raise urllib.error.HTTPError("http://hub/mcp", 500, "boom", {}, None)
 
-        monkeypatch.setattr(mcp_proxy, "_forward", boom)
+        _set_hub(monkeypatch, _Hub(boom))
         server = _FakeServer(mutating=False)
         local = _LoadedLocal(server)
 
@@ -252,12 +263,11 @@ class TestRouting:
     @pytest.mark.parametrize("error", _BROKEN_OFF, ids=["answer-cut-off", "bad-status-line"])
     def test_a_write_whose_hub_answer_broke_off_is_not_replayed(self, monkeypatch, error):
         """The hub got the call and may have run it; only its answer is missing."""
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
 
         def broken_off(*a):
             raise error
 
-        monkeypatch.setattr(mcp_proxy, "_forward", broken_off)
+        _set_hub(monkeypatch, _Hub(broken_off))
         server = _FakeServer(mutating=True)
 
         out = mcp_proxy._handle(dict(self._REQUEST), "/p", _LoadedLocal(server))
@@ -267,12 +277,11 @@ class TestRouting:
 
     @pytest.mark.parametrize("error", _BROKEN_OFF, ids=["answer-cut-off", "bad-status-line"])
     def test_a_read_whose_hub_answer_broke_off_is_served_locally(self, monkeypatch, error):
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
 
         def broken_off(*a):
             raise error
 
-        monkeypatch.setattr(mcp_proxy, "_forward", broken_off)
+        _set_hub(monkeypatch, _Hub(broken_off))
         server = _FakeServer(mutating=False)
 
         out = mcp_proxy._handle(dict(self._REQUEST), "/p", _LoadedLocal(server))
@@ -281,13 +290,13 @@ class TestRouting:
         assert "WITHOUT its shared hub" in out["result"]["content"][0]["text"]
 
     def test_hub_forward_kill_switch_disables_proxying(self, monkeypatch):
-        monkeypatch.setenv(mcp_proxy._HUB_FORWARD_ENV, "0")
-        assert mcp_proxy._hub_target("/p") is None
+        monkeypatch.setenv(hub_client.HUB_FORWARD_ENV, "0")
+        assert hub_client.HubClient.discover("/p") is None
 
     def test_refused_backend_is_answered_once_the_hub_is_gone(self, monkeypatch, refused_local):
         """Without a hub the request has to be served here, and the local server
         refuses to start. The client is told why instead of waiting for an answer."""
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: None)
+        _set_hub(monkeypatch, None)
 
         out = mcp_proxy._handle(dict(self._REQUEST), "/p", refused_local)
 
@@ -298,7 +307,7 @@ class TestRouting:
     @pytest.mark.parametrize("error", _IMPORT_FAILURES, ids=["ImportError", "RuntimeError"])
     def test_a_local_server_that_cannot_be_imported_is_answered_too(self, monkeypatch, error):
         """Id 0 on purpose: SDK clients number their requests from 0, initialize first."""
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: None)
+        _set_hub(monkeypatch, None)
 
         out = mcp_proxy._handle({**self._REQUEST, "id": 0}, "/p", _UnimportableLocal(error))
 
@@ -307,7 +316,7 @@ class TestRouting:
         assert str(error) in out["error"]["message"]
 
     def test_refused_backend_leaves_a_notification_unanswered(self, monkeypatch, refused_local):
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: None)
+        _set_hub(monkeypatch, None)
         notification = {"jsonrpc": "2.0", "method": "notifications/initialized"}
 
         assert mcp_proxy._handle(notification, "/p", refused_local) is None
@@ -317,12 +326,11 @@ class TestRouting:
     ):
         """The hub may still be running a call that failed mid-flight, so the
         answer is the hub's failure, which says so."""
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
 
         def boom(*a):
             raise urllib.error.URLError("timed out")
 
-        monkeypatch.setattr(mcp_proxy, "_forward", boom)
+        _set_hub(monkeypatch, _Hub(boom))
 
         out = mcp_proxy._handle(dict(self._REQUEST), "/p", refused_local)
 
@@ -336,12 +344,11 @@ class TestRouting:
     def test_failed_hub_call_is_reported_when_the_local_server_cannot_be_imported(
         self, monkeypatch, error
     ):
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
 
         def boom(*a):
             raise urllib.error.URLError("timed out")
 
-        monkeypatch.setattr(mcp_proxy, "_forward", boom)
+        _set_hub(monkeypatch, _Hub(boom))
 
         out = mcp_proxy._handle({**self._REQUEST, "id": 0}, "/p", _UnimportableLocal(error))
 
@@ -354,6 +361,7 @@ class TestRouting:
 def refused_local(monkeypatch):
     """The real local server of a proxy started with a --backend it refuses."""
     from _mcp_server_helpers import _keep_server_command_line_state
+
     from mempalace import mcp_server
 
     _keep_server_command_line_state(monkeypatch)
@@ -368,8 +376,7 @@ class TestProxyLoop:
 
     @staticmethod
     def _run(monkeypatch, lines, forward):
-        monkeypatch.setattr(mcp_proxy, "_hub_target", lambda p: ("http://hub", {}))
-        monkeypatch.setattr(mcp_proxy, "_forward", forward)
+        _set_hub(monkeypatch, _Hub(forward))
         # A path that reaches load() must not start the real server and its
         # watchdog threads inside the test session.
         monkeypatch.setattr(mcp_proxy, "_LocalServer", _UnimportableLocal)
@@ -384,6 +391,17 @@ class TestProxyLoop:
         return {"jsonrpc": "2.0", "id": request["id"], "result": {}}
 
     _PING = '{"jsonrpc": "2.0", "id": 2, "method": "ping"}'
+
+    def test_a_stray_byte_from_the_hub_reaches_the_client_as_u_fffd(self, monkeypatch):
+        """The hub answers the proxy exactly; the proxy's own client gets
+        U+FFFD, because some clients' JSON parsers reject a lone surrogate."""
+
+        def stray(base_url, headers, request, palace_path):
+            content = [{"type": "text", "text": "café \udcff"}]
+            return {"jsonrpc": "2.0", "id": request["id"], "result": {"content": content}}
+
+        (out,) = self._run(monkeypatch, [self._PING], stray)
+        assert out["result"]["content"][0]["text"] == "café �"
 
     @pytest.mark.parametrize(
         ("line", "rejected_with"),
@@ -484,7 +502,7 @@ def test_a_failed_server_import_leaves_the_proxy_answering_on_stdout():
             f"sys.path.insert(0, {package_root!r})\n"
             "sys.modules['chromadb'] = None\n"
             "from mempalace import mcp_proxy\n"
-            "mcp_proxy._hub_target = lambda p: None\n"
+            "mcp_proxy.HubClient.discover = classmethod(lambda cls, p: None)\n"
             f"{before_the_loop}"
             'sys.stdin = io.StringIO(\'{"jsonrpc": "2.0", "id": 1, "method": "ping"}\\n\')\n'
             "mcp_proxy._run_proxy_loop('/p')\n"
@@ -516,6 +534,7 @@ def test_local_fallback_serves_the_palace_the_proxy_was_started_for(monkeypatch,
     so the proxy's own flags have to be applied there. Otherwise the session
     silently serves the configured default palace."""
     from _mcp_server_helpers import _keep_server_command_line_state
+
     from mempalace import mcp_server
 
     _keep_server_command_line_state(monkeypatch)
@@ -555,6 +574,7 @@ def test_local_fallback_restores_stdout_before_a_flag_can_be_refused(monkeypatch
     answering over stdout after a failed load, and a client waiting there would
     never see a response."""
     from _mcp_server_helpers import _keep_server_command_line_state
+
     from mempalace import mcp_server
     from mempalace.backends.registry import BackendUnavailableError
 
@@ -586,3 +606,87 @@ def test_a_failed_local_load_is_not_retried(monkeypatch):
         server.load()
 
     assert calls == ["import"]
+
+
+class TestSearchSettings:
+    """A search this session configured itself is not answered by a hub that may not share it."""
+
+    @staticmethod
+    def _call(name, req_id=11):
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": {"query": "q"}},
+        }
+
+    @pytest.fixture(autouse=True)
+    def _no_overrides(self, monkeypatch):
+        from mempalace.hub_client import SEARCH_OVERRIDE_ENV_VARS
+
+        for name in SEARCH_OVERRIDE_ENV_VARS:
+            monkeypatch.delenv(name, raising=False)
+
+    @pytest.fixture
+    def hub(self, monkeypatch):
+        forwarded = []
+
+        def forward(base_url, headers, request, palace_path):
+            forwarded.append(request["params"]["name"])
+            return {"jsonrpc": "2.0", "id": request["id"], "result": {"content": []}}
+
+        _set_hub(monkeypatch, _Hub(forward))
+        return forwarded
+
+    def test_a_search_with_matching_settings_goes_to_the_hub(self, hub):
+        local = _LoadedLocal(_FakeServer())
+
+        mcp_proxy._handle(self._call("mempalace_search"), "/p", local)
+
+        assert hub == ["mempalace_search"]
+        assert local.load_count == 0
+
+    @pytest.mark.parametrize("tool", ["mempalace_search", "mempalace_check_duplicate"])
+    def test_an_env_override_keeps_the_search_local(self, hub, monkeypatch, tool):
+        monkeypatch.setenv("MEMPALACE_HYBRID_BM25_WEIGHT", "0.9")
+        server = _FakeServer()
+        local = _LoadedLocal(server)
+
+        out = mcp_proxy._handle(self._call(tool), "/p", local)
+
+        assert hub == []
+        assert [c["params"]["name"] for c in server.calls] == [tool]
+        # The hub is alive, so the answer carries no hub-is-gone notice.
+        assert out["result"]["content"] == [{"type": "text", "text": "{}"}]
+
+    def test_an_explicit_backend_keeps_the_search_local(self, hub):
+        server = _FakeServer()
+        local = _LoadedLocal(server)
+
+        mcp_proxy._handle(self._call("mempalace_search"), "/p", local, backend="sqlite_exact")
+
+        assert hub == []
+        assert len(server.calls) == 1
+
+    def test_other_tools_still_go_to_the_hub_with_an_override(self, hub, monkeypatch):
+        monkeypatch.setenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", "team")
+        local = _LoadedLocal(_FakeServer())
+
+        mcp_proxy._handle(self._call("mempalace_list_wings"), "/p", local, backend="chroma")
+
+        assert hub == ["mempalace_list_wings"]
+        assert local.load_count == 0
+
+    def test_main_hands_the_backend_flag_to_the_loop(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(sys, "argv", ["mempalace-mcp", "--palace", "/p", "--backend=chroma"])
+        _set_hub(monkeypatch, _Hub())
+        monkeypatch.setattr(
+            mcp_proxy,
+            "_run_proxy_loop",
+            lambda palace_path, backend=None: seen.update(palace=palace_path, backend=backend),
+        )
+
+        mcp_proxy.main()
+
+        assert seen == {"palace": "/p", "backend": "chroma"}

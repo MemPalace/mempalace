@@ -22,12 +22,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
 from itertools import combinations
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name
+from .fsio import atomic_write_json
 from .hallways import entity_spelling_key, is_generic_entity, same_file_spelling
+from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +293,7 @@ def propose_tunnels(
     chosen.sort(key=lambda r: (-r["strength"], r["entity"], r["wing_a"], r["wing_b"]))
     return {
         "schema_version": PROPOSAL_SCHEMA_VERSION,
-        "planned_at": datetime.now(timezone.utc).isoformat(),
+        "planned_at": utc_now_iso(),
         "candidates": len(rows),
         # Preserve names excluded by the cap/wing filter and existing aliases.
         "entity_spellings": connection_spellings(existing_tunnels or [], candidates),
@@ -307,10 +308,7 @@ def proposal_path(config: MempalaceConfig) -> str:
 def save_proposal(config: MempalaceConfig, plan: dict) -> str:
     path = proposal_path(config)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic_write_json(path, plan, private=False, follow_symlinks=False)
     return path
 
 

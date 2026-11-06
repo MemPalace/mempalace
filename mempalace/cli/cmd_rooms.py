@@ -14,7 +14,11 @@ def _rooms_llm_provider(args):
         timeout=getattr(args, "llm_timeout", 600) or 600,
     )
     if candidate.is_external_service:
-        if not getattr(args, "accept_external_llm", False):
+        from ..llm_client import require_external_consent
+
+        if not require_external_consent(
+            candidate, accept=bool(getattr(args, "accept_external_llm", False))
+        ):
             print(
                 f"  {provider_name} at {candidate.endpoint} is an EXTERNAL service: the sampled "
                 "drawer excerpts would leave this machine. Re-run with --accept-external-llm "
@@ -22,9 +26,6 @@ def _rooms_llm_provider(args):
             )
             sys.exit(1)
         print(f"  Sending {getattr(args, 'sample', 0)} excerpts to EXTERNAL {provider_name}.")
-        # Consent covers the key too: the requests that follow send it anyway,
-        # so the availability check may use a key taken from OPENAI_API_KEY.
-        candidate.external_use_accepted = True
     ok, msg = candidate.check_available()
     if not ok:
         print(f"  LLM unavailable ({provider_name}/{provider_model}): {msg}")
@@ -73,20 +74,20 @@ def cmd_rooms(args):
         DEFAULT_THRESHOLD,
         GENERIC_ROOMS,
         EmbeddingRoomDecider,
-        apply_plan,
-        existing_rooms,
-        load_room_set,
         apply_inputs,
+        apply_plan,
         clear_pending_apply,
         closet_targets,
+        existing_rooms,
         load_pending_apply,
+        load_room_set,
+        plan_closet_moves,
         plan_rooms,
         propose_rooms,
         rekey_closets_by_ids,
-        plan_closet_moves,
-        save_pending_apply,
         room_set_path,
         sample_drawers,
+        save_pending_apply,
         save_room_set,
     )
 

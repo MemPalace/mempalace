@@ -69,50 +69,20 @@ def _server_is_loopback(host: str) -> bool:
     return (host or "").strip().lower() in _SERVER_LOOPBACK_HOSTS
 
 
-def _server_token_path(palace_path: str) -> Path:
-    """Per-palace location for the auto-generated server bearer token.
-
-    Distinct from the daemon's token dir; keyed by the canonical palace path so
-    one server per palace reuses a stable token across restarts. Delegates to
-    ``server_registry`` so the token and the hub serverinfo record share one
-    directory convention.
-    """
-    from ..server_registry import server_token_path
-
-    return server_token_path(palace_path)
-
-
-def _load_or_create_server_token(palace_path: str) -> tuple[str, bool]:
-    """Return (token, created). Reuse an existing 0600 token or mint a new one."""
-    import secrets
-
-    token_path = _server_token_path(palace_path)
-    if token_path.exists():
-        existing = token_path.read_text(encoding="utf-8").strip()
-        if existing:
-            return existing, False
-    token = secrets.token_urlsafe(32)
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(str(token_path.parent), 0o700)
-    except OSError:
-        pass
-    # O_CREAT with 0600 so the token is never briefly world-readable on disk.
-    fd = os.open(str(token_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(token + "\n")
-    return token, True
-
-
 def cmd_serve(args):
-    """Run a secure remote HTTP MCP server for a team to share one palace (#1877).
+    """Run a secure remote HTTP MCP server for a team to share one palace.
 
-    A turnkey wrapper over ``mempalace-mcp --transport http``: it resolves a
-    bearer token (auto-generating a strong one for non-loopback binds), prints a
+    A turnkey wrapper over ``mempalace-mcp --transport http``: on a network bind
+    it resolves a bearer token (reusing or auto-generating the palace's stored
+    one; a loopback bind needs none unless ``--token`` is given), prints a
     ready-to-paste client config, then execs the real server in the foreground so
     Docker/systemd own the process lifecycle. The token is passed via the
-    environment, never argv, so it can't leak through ``ps``.
+    environment, never argv, so it can't leak through ``ps``, and is never
+    printed: a token in a terminal or a service log is a leaked token.
     """
+    from .._env import env_str
+    from ..server_registry import load_or_create_server_token, server_token_path
+
     host = args.host
     port = int(args.port)
     loopback = _server_is_loopback(host)
@@ -134,11 +104,26 @@ def cmd_serve(args):
             sys.exit(2)
     scheme = "https" if tls_cert else "http"
 
-    # Token resolution. Explicit flag > existing env > (non-loopback) auto-generated.
-    token = (args.token or os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "")).strip()
+    # A loopback bind no proxy publishes (no MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS)
+    # needs no token unless one is given; --no-token is a no-op there. A
+    # reachable hub goes tokenless only through --allow-insecure.
+    local_only = loopback and not env_str("MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS")
+    no_token = bool(getattr(args, "no_token", False))
+    if no_token and not local_only:
+        print(
+            "mempalace: --no-token is only allowed on a loopback bind no proxy publishes; "
+            "a reachable server needs a token (or --allow-insecure behind a trusted proxy)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Token resolution. Explicit flag > existing env > the palace's stored token.
+    token = (args.token or env_str("MEMPALACE_MCP_HTTP_TOKEN", "")).strip()
     token_created = False
-    if not token and not loopback and not args.allow_insecure:
-        token, token_created = _load_or_create_server_token(palace_path)
+    tokenless = local_only or args.allow_insecure
+    if not token and not tokenless:
+        token, token_created = load_or_create_server_token(palace_path)
+    token_path = server_token_path(palace_path)
 
     # Build the child environment. Token rides in the env (never argv) so it
     # stays out of the process table.
@@ -148,7 +133,7 @@ def cmd_serve(args):
         env["MEMPALACE_BACKEND"] = str(backend).strip().lower()
     if token:
         env["MEMPALACE_MCP_HTTP_TOKEN"] = token
-    if args.allow_insecure:
+    if not token and not local_only and tokenless:
         env["MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN"] = "1"
 
     child = [
@@ -181,16 +166,17 @@ def cmd_serve(args):
     print(f"  bind     : {host}:{port}  ({'loopback' if loopback else 'network-exposed'})")
     print(f"  tls      : {'on' if tls_cert else 'off (plaintext -- terminate TLS at a proxy)'}")
     print(f"  read-only: {'yes' if args.read_only else 'no'}")
-    if token_created:
-        print("\n  A new bearer token was generated and stored 0600 at:")
-        print(f"    {_server_token_path(palace_path)}")
-        print("  Store it securely -- clients need it to connect:")
-        print(f"    {token}")
+    if token and not args.token and not os.environ.get("MEMPALACE_MCP_HTTP_TOKEN"):
+        state = "new, " if token_created else ""
+        print(f"  token    : {token_path}  ({state}0600; local mempalace clients read it)")
+    elif not token:
+        reason = "loopback bind" if local_only else "--allow-insecure"
+        print(f"  token    : none ({reason})")
     print("\nConnect a client:")
     if token:
         print(
             f"  claude mcp add --transport http mempalace {url} "
-            f'--header "Authorization: Bearer {token if token_created else "$MEMPALACE_MCP_HTTP_TOKEN"}"'
+            '--header "Authorization: Bearer <token>"'
         )
     else:
         print(f"  claude mcp add --transport http mempalace {url}")
@@ -212,7 +198,8 @@ def cmd_serve(args):
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     from ..dialect import Dialect
-    from ..palace import get_closets_collection
+    from ..metadata_types import is_bookkeeping
+    from ..palace import AAAK_COLLECTION_NAME, get_aaak_collection, move_aaak_out_of_closets
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
 
@@ -234,7 +221,7 @@ def cmd_compress(args):
         dialect = Dialect()
 
     # State-aware open: distinguish "no palace" from "initialized but empty"
-    # from "corrupt" via the shared helper (#1498). MCP and library callers
+    # from "corrupt" via the shared helper. MCP and library callers
     # catch the backend exceptions directly; CLI gets the friendly print.
     from ..palace import _open_collection_or_explain
 
@@ -242,8 +229,11 @@ def cmd_compress(args):
     if col is None:
         sys.exit(1)
 
+    from ..search_util import build_where_filter
+
+    # A wing reads every spelling its project was filed under.
+    where = build_where_filter(args.wing, col=col) or None
     # Query drawers in batches to avoid SQLite variable limit (~999)
-    where = {"wing": args.wing} if args.wing else None
     _BATCH = 500
     docs, metas, ids = [], [], []
     offset = 0
@@ -265,9 +255,11 @@ def cmd_compress(args):
         batch_docs = batch.get("documents", [])
         if not batch_docs:
             break
-        docs.extend(batch_docs)
-        metas.extend(batch.get("metadatas", []))
-        ids.extend(batch.get("ids", []))
+        for doc, meta, doc_id in zip(batch_docs, batch.get("metadatas", []), batch.get("ids", [])):
+            if not is_bookkeeping(meta, doc_id):
+                docs.append(doc)
+                metas.append(meta)
+                ids.append(doc_id)
         offset += len(batch_docs)
         if len(batch_docs) < _BATCH:
             break
@@ -311,21 +303,28 @@ def cmd_compress(args):
     # Store compressed versions (unless dry-run)
     if not args.dry_run:
         try:
-            # Route through palace.get_closets_collection so the shared
-            # _DEFAULT_BACKEND is reused (avoids a redundant ChromaBackend
-            # instance and its potential WAL-lock contention on Windows).
-            comp_col = get_closets_collection(palace_path, create=True)
-            for doc_id, compressed, meta, stats in compressed_entries:
-                comp_meta = dict(meta)
-                comp_meta["compression_ratio"] = round(stats["size_ratio"], 1)
-                comp_meta["original_tokens"] = stats["original_tokens_est"]
+            moved = move_aaak_out_of_closets(palace_path)
+            if moved:
+                print(f"  Moved {moved} older AAAK rows out of the closets collection.")
+            comp_col = get_aaak_collection(palace_path, create=True)
+            for start in range(0, len(compressed_entries), _BATCH):
+                batch = compressed_entries[start : start + _BATCH]
                 comp_col.upsert(
-                    ids=[doc_id],
-                    documents=[compressed],
-                    metadatas=[comp_meta],
+                    ids=[doc_id for doc_id, _, _, _ in batch],
+                    documents=[compressed for _, compressed, _, _ in batch],
+                    metadatas=[
+                        {
+                            **meta,
+                            "kind": "aaak",
+                            "compression_ratio": round(stats["size_ratio"], 1),
+                            "original_tokens": stats["original_tokens_est"],
+                        }
+                        for _, _, meta, stats in batch
+                    ],
                 )
             print(
-                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_closets' collection."
+                f"  Stored {len(compressed_entries)} compressed drawers in "
+                f"'{AAAK_COLLECTION_NAME}' collection."
             )
         except Exception as e:
             print(f"  Error storing compressed drawers: {e}")

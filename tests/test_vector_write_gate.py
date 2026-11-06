@@ -17,7 +17,6 @@ import threading
 
 import pytest
 
-
 REASON = "HNSW index holds 803 elements but sqlite has 820 embeddings"
 
 

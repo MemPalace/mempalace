@@ -46,15 +46,14 @@ from mempalace.cli import (
 from mempalace.convo_miner import _is_regular_source_file, scan_convos
 from mempalace.entity_detector import detect_entities
 from mempalace.format_miner import ExtractionStatus, extract_text
-from mempalace.hook_shell import count_human_messages
+from mempalace.hooks_cli import _count_human_messages as count_human_messages
 from mempalace.llm_refine import collect_corpus_text
 from mempalace.miner import _read_text_no_follow, load_config, mine, scan_project
 from mempalace.normalize import _read_transcript_file
 from mempalace.project_scanner import _collect_manifest_names, _parse_gradle
 from mempalace.repair import _copy_file_no_follow, _open_regular_file_no_follow
 from mempalace.room_detector_local import detect_rooms_local
-from mempalace.split_mega_files import main as split_main
-from mempalace.split_mega_files import split_file
+from mempalace.split_mega_files import main as split_main, split_file
 from mempalace.sweeper import parse_claude_jsonl, sweep_directory
 
 # ``os.mkfifo`` and ``SIGALRM`` are both POSIX-only. Windows has no FIFO in
@@ -717,7 +716,8 @@ def test_read_text_no_follow_still_reads_a_large_regular_file_whole(tmp_path):
     with hard_timeout(TIMEOUT_SECONDS, "_read_text_no_follow on a 2 MB file"):
         result = _read_text_no_follow(regular, tmp_path)
     assert result is not None
-    content, mtime = result
+    content, mtime, encoding = result
+    assert encoding == "utf-8"
     assert content == payload
     assert mtime == os.path.getmtime(regular)
 
@@ -861,14 +861,14 @@ def test_split_mega_files_skips_fifo(tmp_path, capsys, monkeypatch):
 
 
 @posix_only
-def test_split_file_skips_a_fifo_at_its_own_output_name(tmp_path, capsys):
+def test_split_file_writes_beside_a_fifo_at_its_own_output_name(tmp_path):
     """The walk gate covers the source; the output name is built here.
 
     ``split_file`` synthesises each per-session filename from the transcript
     and writes it into the source directory, so nothing has vetted that path.
-    A pre-existing FIFO sitting at one of those names turned the write into a
-    blocking open — the same hang, in the one path the discovery gate cannot
-    reach.
+    A pre-existing FIFO sitting at one of those names once turned the write
+    into a blocking open. Now the pipe is left alone and the chunk takes the
+    next free name, so no session is lost.
     """
     session = "Claude Code v1.0\n" + "content line\n" * 14 + "\n" * 5
     source = write_regular(tmp_path, "real.txt", session * 2)
@@ -880,22 +880,21 @@ def test_split_file_skips_a_fifo_at_its_own_output_name(tmp_path, capsys):
     with hard_timeout(TIMEOUT_SECONDS, "split_file writing over a FIFO output"):
         written = split_file(str(source), None, dry_run=False)
 
-    out = capsys.readouterr().out
-    assert f"SKIP: {blocked.name} (not a regular file)" in out
+    assert stat_module.S_ISFIFO(os.lstat(blocked).st_mode)
     assert blocked not in written
-    # The pipe must cost only its own chunk: every other session still lands.
-    assert len(written) == len(planned) - 1
+    assert blocked.with_name(f"{blocked.stem}-2{blocked.suffix}") in written
+    assert len(written) == len(planned)
     assert all(path.is_file() for path in written)
 
 
 @posix_only
-def test_split_file_skips_a_dangling_symlink_at_its_own_output_name(tmp_path, capsys):
+def test_split_file_writes_beside_a_dangling_symlink_at_its_own_output_name(tmp_path):
     """A broken link at an output name must not redirect the write.
 
     ``os.path.exists`` follows the link and answers False for a dangling one,
-    so the type gate would wave it through — and ``write_text`` then CREATES
-    the target, landing a chunk wherever the link points instead of in the
-    output directory. The gate has to ask about the link itself.
+    and writing through it CREATES the target, landing a chunk wherever the
+    link points instead of in the output directory. The link is left alone
+    and the chunk takes the next free name.
     """
     session = "Claude Code v1.0\n" + "content line\n" * 14 + "\n" * 5
     source = write_regular(tmp_path, "real.txt", session * 2)
@@ -910,11 +909,11 @@ def test_split_file_skips_a_dangling_symlink_at_its_own_output_name(tmp_path, ca
     with hard_timeout(TIMEOUT_SECONDS, "split_file writing over a dangling symlink"):
         written = split_file(str(source), None, dry_run=False)
 
-    out = capsys.readouterr().out
-    assert f"SKIP: {blocked.name} (not a regular file)" in out
-    assert blocked not in written
     assert not outside.exists(), "a chunk was written through the link, outside the output dir"
-    assert len(written) == len(planned) - 1
+    assert os.path.islink(blocked)
+    assert blocked not in written
+    assert blocked.with_name(f"{blocked.stem}-2{blocked.suffix}") in written
+    assert len(written) == len(planned)
 
 
 @posix_only
@@ -1091,14 +1090,6 @@ def test_count_human_messages_ignores_a_fifo_transcript(tmp_path):
         assert count_human_messages(str(fifo)) == 0
 
 
-def test_count_human_messages_still_raises_for_a_missing_path(tmp_path):
-    """The type gate is narrowed to paths that exist, so a missing transcript
-    keeps failing the way the plain ``open`` did.
-    """
-    with pytest.raises(FileNotFoundError):
-        count_human_messages(str(tmp_path / "nope.jsonl"))
-
-
 def test_count_human_messages_still_counts_a_regular_transcript(tmp_path):
     path = write_regular(
         tmp_path,
@@ -1253,7 +1244,8 @@ def test_read_text_no_follow_retries_when_a_lease_break_returns_eagain(tmp_path,
     with hard_timeout(TIMEOUT_SECONDS, "_read_text_no_follow under an injected EAGAIN"):
         result = _read_text_no_follow(target, tmp_path)
     assert result is not None
-    content, mtime = result
+    content, mtime, encoding = result
+    assert encoding == "utf-8"
     assert content == payload
     assert mtime == os.path.getmtime(target)
     # An unrelated open must not affect the retry count (CI runs other workers).

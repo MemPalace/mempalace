@@ -90,8 +90,12 @@ _SHARED_FIRST = 0x40000000 + 2
 _SHARED_SIZE = 510
 _SHM_DMS = 120 + 8
 
+# Some Pythons' fcntl doesn't export F_OFD_SETLK (uv's CPython 3.12.14 doesn't; 3.14 does), though Linux has had
+# the lock since kernel 3.15, at the same value on every architecture (asm-generic/fcntl.h: 37). Without this
+# fallback such an interpreter on Linux takes the no-OFD helper path below, where Chroma's next write waits on the
+# helper's read indefinitely.
 _F_OFD_SETLK = (
-    getattr(fcntl, "F_OFD_SETLK", None)
+    getattr(fcntl, "F_OFD_SETLK", 37)
     if fcntl is not None and sys.platform.startswith("linux")
     else None
 )

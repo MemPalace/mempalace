@@ -22,7 +22,7 @@ def _reconfigure_stdio_utf8_on_windows():
 def main():
     """CLI entry point for the ``mempalace`` console script.
 
-    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so
+    Side effect: pops ``PYTHONPATH`` from ``os.environ`` so
     any subprocess this CLI spawns inherits a clean env. Host applications
     that call ``main()`` programmatically should be aware that the parent
     process loses ``PYTHONPATH`` as well. Library imports
@@ -70,7 +70,7 @@ def main():
         "--palace",
         default=argparse.SUPPRESS,
         help="Where the palace lives (default: from ~/.mempalace/config.json or ~/.mempalace/palace); "
-        "may be passed before or after the subcommand — both positions are accepted (#2366)",
+        "may be passed before or after the subcommand",
     )
     p_init.add_argument(
         "--backend",
@@ -98,6 +98,16 @@ def main():
             "(e.g. 'en' or 'en,pt-br'). Defaults to value from config "
             "(MEMPALACE_ENTITY_LANGUAGES env var or config.json), or 'en'. "
             "When given, the value is also persisted to config.json."
+        ),
+    )
+    p_init.add_argument(
+        "--embedding-model",
+        default=None,
+        choices=["embeddinggemma", "embeddinggemma2", "minilm", "openai-compat"],
+        help=(
+            "Embedding model to record in config.json for this palace. "
+            "embeddinggemma is multilingual (~300 MB download); minilm is "
+            "English-only (~30 MB). Left unset, the configured or default model applies."
         ),
     )
     p_init.add_argument(
@@ -150,7 +160,7 @@ def main():
         action="store_true",
         help=(
             "Bypass the interactive consent prompt that fires when an external "
-            "LLM is configured via an environment-variable API key (issue #26). "
+            "LLM is configured via an environment-variable API key. "
             "Use this in CI / non-interactive runs where you've already decided "
             "the external send is acceptable."
         ),
@@ -245,7 +255,7 @@ def main():
             f"Per-file chunk cap; files producing more chunks are skipped with a "
             f"summary counter. Default {_CLI_MAX_CHUNKS_PER_FILE_DEFAULT} "
             f"(or MEMPALACE_MAX_CHUNKS_PER_FILE). Set 0 to disable. Lower this on "
-            f"Windows if you hit ONNX bad_alloc (#1455)."
+            f"Windows if you hit ONNX bad_alloc."
         ),
     )
     p_mine.add_argument(
@@ -275,7 +285,7 @@ def main():
     add_cli_write_routing_flags(p_sweep)
     p_sync = sub.add_parser(
         "sync",
-        help="Prune drawers whose source files are gitignored, deleted, or moved (#1252)",
+        help="Prune drawers whose source files are gitignored, deleted, or moved",
     )
     p_sync.add_argument(
         "dir",
@@ -470,7 +480,7 @@ def main():
         "--confirm-truncation-ok",
         action="store_true",
         help=(
-            "Override the #1208 safety guard. Required when chromadb's collection-layer "
+            "Override the 10,000-drawer safety guard. Required when chromadb's collection-layer "
             "extraction returns exactly 10,000 drawers and the SQLite ground-truth check "
             "either matches or can't be read. Use only after independently confirming "
             "the palace really contains that count."
@@ -530,7 +540,7 @@ def main():
         help="Print what the repair would do and exit without modifying the palace",
     )
 
-    # repair-status — read-only HNSW capacity health check (#1222)
+    # repair-status — read-only HNSW capacity health check
     sub.add_parser(
         "repair-status",
         help="Compare sqlite vs HNSW element counts (read-only; never opens a chromadb client)",
@@ -568,7 +578,7 @@ def main():
         help="Storage backend to include in the MCP startup command",
     )
 
-    # serve — turnkey remote HTTP MCP server (#1877)
+    # serve — turnkey remote HTTP MCP server
     p_serve = sub.add_parser(
         "serve",
         help="Run a secure remote HTTP MCP server for a team to share one palace",
@@ -580,12 +590,22 @@ def main():
     p_serve.add_argument(
         "--backend", default=None, help="Storage backend (default: config/env/detected)"
     )
-    p_serve.add_argument("--palace", default=None, help="Palace path (overrides config/env)")
+    p_serve.add_argument(
+        "--palace",
+        default=argparse.SUPPRESS,
+        help="Palace path (overrides config/env); may be passed before or after the subcommand",
+    )
     p_serve.add_argument(
         "--token",
         default=None,
-        help="Bearer token clients must present. Default: reuse/auto-generate one for "
-        "non-loopback binds (stored 0600 under ~/.mempalace/server/).",
+        help="Bearer token clients must present. A loopback bind needs none unless this is "
+        "given; a network bind reuses/auto-generates one (stored 0600 under "
+        "~/.mempalace/server/; local clients read it from there).",
+    )
+    p_serve.add_argument(
+        "--no-token",
+        action="store_true",
+        help="Accepted for compatibility: a loopback bind already serves without a token",
     )
     p_serve.add_argument("--tls-cert", default=None, help="PEM certificate to enable TLS")
     p_serve.add_argument("--tls-key", default=None, help="PEM private key matching --tls-cert")
@@ -618,7 +638,7 @@ def main():
     # migrate-wings
     p_migrate_wings = sub.add_parser(
         "migrate-wings",
-        help="Normalize legacy wing names (strip leading/trailing separators) so pre-#1675 palaces stay discoverable",
+        help="Normalize legacy wing names (strip leading/trailing separators) so palaces filed under older wing names stay discoverable",
     )
     p_migrate_wings.add_argument(
         "--dry-run",
@@ -754,6 +774,18 @@ def main():
     p_kg_norm.add_argument("--llm-api-key", default=None)
     p_kg_norm.add_argument("--llm-timeout", type=int, default=600)
     p_kg_norm.add_argument("--accept-external-llm", action="store_true")
+    p_kg_import = kg_sub.add_parser(
+        "import-legacy",
+        help="Copy facts from another knowledge graph file into this palace's graph "
+        "(dry run first; --yes applies; rows already here are kept)",
+    )
+    p_kg_import.add_argument(
+        "--from",
+        dest="source",
+        default=None,
+        help="Graph file to copy from (default: ~/.mempalace/knowledge_graph.sqlite3)",
+    )
+    p_kg_import.add_argument("--yes", action="store_true", help="Write the copied rows")
     p_tunnels = sub.add_parser("tunnels", help="Propose or prune cross-wing tunnels")
     tunnels_sub = p_tunnels.add_subparsers(dest="tunnels_action")
     p_tunnels_propose = tunnels_sub.add_parser(
@@ -774,6 +806,8 @@ def main():
         default=None,
         help="Storage backend to use for status (default: config/env/detected/chroma)",
     )
+    p_export = sub.add_parser("export", help="Export the palace as a folder of markdown files")
+    p_export.add_argument("output_dir", help="Directory to write the markdown tree into")
     p_update = sub.add_parser("update", help="Opt-in release checks and upgrade planning")
     update_sub = p_update.add_subparsers(dest="update_action")
     p_update_configure = update_sub.add_parser("configure", help="Configure periodic checks")
@@ -1171,6 +1205,7 @@ def main():
         "wings": cmd_wings,
         "kg": cmd_kg,
         "tunnels": cmd_tunnels,
+        "export": cmd_export,
         "status": cmd_status,
         "update": cmd_update,
     }

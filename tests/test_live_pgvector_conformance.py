@@ -15,7 +15,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-
 from _backend_conformance import assert_partition_isolation
 
 from mempalace.backends import (

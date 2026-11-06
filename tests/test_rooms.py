@@ -1,7 +1,7 @@
 """Tests for mempalace.rooms — closed room sets: propose (LLM) and apply (embedding decider)."""
 
-import os
 import json
+import os
 from argparse import Namespace
 
 import pytest
@@ -524,9 +524,16 @@ def test_main_dispatches_rooms(monkeypatch):
     )
 
 
-def test_rekey_closets_follows_the_drawers_and_reports_splits():
-    from mempalace.rooms import rekey_closets
+def _rekey_closets(closets, plan):
+    """The closet phase `rooms apply` runs: plan the moves, then move by id."""
+    from mempalace.rooms import closet_targets, plan_closet_moves, rekey_closets_by_ids
 
+    targets, ambiguous = closet_targets(plan)
+    moves = plan_closet_moves(closets, plan.wing, targets)
+    return {"moved": rekey_closets_by_ids(closets, plan.wing, moves), "ambiguous": ambiguous}
+
+
+def test_rekey_closets_follows_the_drawers_and_reports_splits():
     rows = [
         {
             "id": "a",
@@ -565,7 +572,7 @@ def test_rekey_closets_follows_the_drawers_and_reports_splits():
             {"id": "k4", "meta": {"wing": "other", "room": "technical", "source_file": "s1"}},
         ]
     )
-    report = rekey_closets(closets, plan)
+    report = _rekey_closets(closets, plan)
     # s1 split across two rooms, so its closet cannot represent both and stays
     # put; s2 moved wholly, so its closet follows.
     assert closets.rows["k1"]["meta"]["room"] == "technical"
@@ -573,13 +580,10 @@ def test_rekey_closets_follows_the_drawers_and_reports_splits():
     assert closets.rows["k3"]["meta"]["room"] == "decisions"  # other room: untouched
     assert closets.rows["k4"]["meta"]["room"] == "technical"  # other wing: untouched
     assert report == {"moved": 1, "ambiguous": 3}
-    assert rekey_closets(None, plan) == {"moved": 0, "ambiguous": 0}
 
 
 def test_rekey_closets_leaves_a_source_whose_drawers_only_partly_moved():
     """A closet indexes the whole source: moving it would strand the stayers."""
-    from mempalace.rooms import rekey_closets
-
     rows = [
         {
             "id": "a",
@@ -601,12 +605,13 @@ def test_rekey_closets_leaves_a_source_whose_drawers_only_partly_moved():
     closets = FakeCollection(
         [{"id": "k", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}}]
     )
-    assert rekey_closets(closets, plan) == {"moved": 0, "ambiguous": 1}
+    assert _rekey_closets(closets, plan) == {"moved": 0, "ambiguous": 1}
     assert closets.rows["k"]["meta"]["room"] == "technical"
 
 
+@pytest.mark.parametrize("wing", ["w", "-Users-fixture-Documents-project"])
 def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, wing
 ):
     """Killed after the drawer phase: the retry has no drawer to move but must
     still move the closets, from the decisions the first run recorded."""
@@ -616,17 +621,19 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
     from mempalace.rooms import pending_apply_path
 
     cfg = MempalaceConfig(palace_path=str(tmp_path))
-    save_room_set(cfg, _room_set())
+    approved = _room_set()
+    approved.wing = wing
+    room_path = save_room_set(cfg, approved)
     rows = [
         {
             "id": "a",
-            "meta": {"wing": "w", "room": "technical", "source_file": "s1"},
+            "meta": {"wing": wing, "room": "technical", "source_file": "s1"},
             "doc": "cut the release",
             "emb": [1.0, 0.0],
         },
         {
             "id": "b",
-            "meta": {"wing": "w", "room": "technical", "source_file": "s2"},
+            "meta": {"wing": wing, "room": "technical", "source_file": "s2"},
             "doc": "fix the bug",
             "emb": [0.0, 1.0],
         },
@@ -634,8 +641,8 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
     col = FakeCollection(rows)
     closets = FakeCollection(
         [
-            {"id": "k1", "meta": {"wing": "w", "room": "technical", "source_file": "s1"}},
-            {"id": "k2", "meta": {"wing": "w", "room": "technical", "source_file": "s2"}},
+            {"id": "k1", "meta": {"wing": wing, "room": "technical", "source_file": "s1"}},
+            {"id": "k2", "meta": {"wing": wing, "room": "technical", "source_file": "s2"}},
         ]
     )
     monkeypatch.setattr("mempalace.palace.get_collection", lambda *a, **k: col)
@@ -649,12 +656,16 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(closets, "update", dies)
-    ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing="w", threshold=0.75, yes=True)
+    ns = Namespace(rooms_action="apply", palace=str(tmp_path), wing=wing, threshold=0.75, yes=True)
     with pytest.raises(KeyboardInterrupt):
         cli.cmd_rooms(ns)
     assert col.rows["a"]["meta"]["room"] == "releases"  # drawer phase finished
     assert closets.rows["k1"]["meta"]["room"] == "technical"  # closet phase did not
-    assert os.path.isfile(pending_apply_path(cfg, "w"))
+    marker = pending_apply_path(cfg, wing)
+    assert os.path.isfile(marker)
+    if wing.startswith("-"):
+        os.rename(room_path, tmp_path / "rooms" / f"{wing}.json")
+        os.rename(marker, tmp_path / "rooms" / f"{wing}.apply-pending.json")
 
     monkeypatch.setattr(closets, "update", real_update)
     capsys.readouterr()
@@ -663,7 +674,8 @@ def test_cmd_rooms_apply_retry_finishes_closets_after_drawers_completed(
     assert "Resuming an interrupted apply" in out and "2 closets followed" in out
     assert closets.rows["k1"]["meta"]["room"] == "releases"
     assert closets.rows["k2"]["meta"]["room"] == "bug-fixes"
-    assert not os.path.exists(pending_apply_path(cfg, "w"))
+    assert not os.path.exists(pending_apply_path(cfg, wing))
+    assert all(row["meta"]["wing"] == wing for row in col.rows.values())
 
     # A completed apply re-run is a no-op.
     cli.cmd_rooms(ns)
