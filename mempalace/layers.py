@@ -26,7 +26,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from . import paths
-from .config import MempalaceConfig
+from .config import MAX_NAME_LENGTH, MempalaceConfig
 from .metadata_types import is_bookkeeping
 from .search_util import (
     _distance_to_similarity,
@@ -425,7 +425,13 @@ class Layer1:
 
         total_len = 0
         for room, entries in sorted(by_room.items()):
-            room_line = f"\n[{room}]"
+            # A name stored before miners validated it can hold newlines or be
+            # any length. This line is only a label, so it stays on one line and
+            # must not crowd out the story.
+            room_line = f"\n[{' '.join(str(room).split())[:MAX_NAME_LENGTH]}]"
+            if total_len + len(room_line) > self.MAX_CHARS:
+                lines.append("  ... (more in L3 search)")
+                break
             lines.append(room_line)
             total_len += len(room_line)
 
