@@ -15,6 +15,7 @@ Public surface:
 """
 
 from .base import (
+    DRAWER_COUNT_ZERO,
     BackendClosedError,
     BackendError,
     BackendMismatchError,
@@ -22,6 +23,7 @@ from .base import (
     BaseCollection,
     CollectionNotInitializedError,
     DimensionMismatchError,
+    DrawerCount,
     EmbedderIdentityMismatchError,
     EmbeddingFunctionMismatchError,
     GetResult,
@@ -65,7 +67,9 @@ __all__ = [
     "ChromaBackend",
     "ChromaCollection",
     "CollectionNotInitializedError",
+    "DRAWER_COUNT_ZERO",
     "DimensionMismatchError",
+    "DrawerCount",
     "EmbedderIdentityMismatchError",
     "EmbeddingFunctionMismatchError",
     "GetResult",

@@ -2515,7 +2515,15 @@ def status(palace_path: str):
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
         total, wing_rooms = counts
-        _print_status(total, wing_rooms)
+        # The sqlite path reports a DrawerCount per bucket (logical drawers plus
+        # physical rows); status renders the logical number on every path.
+        _print_status(
+            total.drawers,
+            {
+                wing: {room: count.drawers for room, count in rooms.items()}
+                for wing, rooms in wing_rooms.items()
+            },
+        )
         return
 
     col = _open_collection_or_explain(palace_path)
@@ -2533,22 +2541,24 @@ def status(palace_path: str):
         print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
         return
 
-    # Fast path: single-pass metadata fetch for backends that expose
-    # get_all_metadata(). Avoids the O(n^2) offset loop below.
+    # Fast path: single-pass fetch for backends that expose one. Avoids the
+    # O(n^2) offset loop below. Row ids come along when the backend can return
+    # them, so a legacy parent row and its chunks collapse into one drawer.
+    get_all_rows = getattr(col, "get_all_rows", None)
+    if callable(get_all_rows):
+        r = get_all_rows(include=["metadatas"])
+        _print_status(*_tally_logical_status(r.ids, r.metadatas))
+        return
     get_all = getattr(col, "get_all_metadata", None)
     if callable(get_all):
-        metas = [m or {} for m in get_all() if not is_bookkeeping(m)]
-        wing_rooms: dict = defaultdict(lambda: defaultdict(int))
-        for m in metas:
-            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
-        _print_status(len(metas), wing_rooms)
+        _print_status(*_tally_logical_status([], get_all()))
         return
 
     # Count by wing and room — paginate to avoid SQLite "too many SQL
     # variables" error on large palaces.
     total = col.count()
-    bookkeeping = 0
-    wing_rooms: dict = defaultdict(lambda: defaultdict(int))
+    ids: list = []
+    metas: list = []
     batch_size = 5000
     offset = 0
     while offset < total:
@@ -2556,15 +2566,34 @@ def status(palace_path: str):
         batch = r["metadatas"]
         if not batch:
             break
-        for m in batch:
-            if is_bookkeeping(m):
-                bookkeeping += 1
-                continue
-            m = m or {}
-            wing_rooms[m.get("wing", "?")][m.get("room", "?")] += 1
+        ids.extend(r["ids"])
+        metas.extend(batch)
         offset += len(batch)
 
-    _print_status(total - bookkeeping, wing_rooms)
+    _print_status(*_tally_logical_status(ids, metas))
+
+
+def _tally_logical_status(ids: list, metadatas: list) -> tuple[int, dict[str, dict[str, int]]]:
+    """Logical drawers by wing/room from fetched rows, for the status fallbacks.
+
+    The rule the sqlite tally applies: a row's logical drawer is its parent when
+    it has one, else the row itself. ``ids`` may be empty when the backend only
+    returns metadata; each parentless row then counts as its own drawer.
+    """
+    logical: dict = defaultdict(set)
+    for idx, meta in enumerate(metadatas):
+        if is_bookkeeping(meta):
+            continue
+        meta = meta or {}
+        parent = meta.get("parent_drawer_id") or meta.get("parent_entry_id")
+        row = ids[idx] if idx < len(ids) else ("row", idx)
+        logical[(meta.get("wing", "?"), meta.get("room", "?"))].add(parent or row)
+    wing_rooms: dict = defaultdict(dict)
+    total = 0
+    for (wing, room), drawers in logical.items():
+        wing_rooms[wing][room] = len(drawers)
+        total += len(drawers)
+    return total, wing_rooms
 
 
 def _describe_device_or_none() -> Optional[str]:

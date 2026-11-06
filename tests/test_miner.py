@@ -1624,8 +1624,8 @@ def test_sqlite_wing_room_counts_exact_tally(palace_path, seeded_collection):
     result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     assert result is not None
     total, wing_rooms = result
-    assert total == 4
-    assert {w: dict(r) for w, r in wing_rooms.items()} == {
+    assert total.drawers == 4
+    assert {w: {r: c.drawers for r, c in rooms.items()} for w, rooms in wing_rooms.items()} == {
         "project": {"backend": 2, "frontend": 1},
         "notes": {"planning": 1},
     }
@@ -1643,6 +1643,40 @@ def test_status_falls_back_to_chroma_when_sqlite_unreadable(palace_path, seeded_
     out = capsys.readouterr().out
     assert "MemPalace Status -- 4 drawers" in out
     assert "WING: project" in out
+
+
+def test_sqlite_wing_room_counts_logical_parent_rule(palace_path, collection, capsys):
+    """A parent counts once with or without its root row, a row with both parent
+    keys does not fan out, and bookkeeping rows are not drawers."""
+    from mempalace.backends.base import DrawerCount
+    from mempalace.backends.chroma_sqlite import _sqlite_wing_room_counts
+    from mempalace.miner import status
+
+    rows = [
+        ("root", {"wing": "w", "room": "r"}),
+        ("root_c0", {"wing": "w", "room": "r", "parent_drawer_id": "root"}),
+        ("root_c1", {"wing": "w", "room": "r", "parent_drawer_id": "root"}),
+        ("gone_c0", {"wing": "w", "room": "r", "parent_drawer_id": "gone"}),
+        ("gone_c1", {"wing": "w", "room": "r", "parent_entry_id": "gone"}),
+        ("both_c0", {"wing": "w", "room": "r", "parent_drawer_id": "both", "parent_entry_id": "x"}),
+        ("single", {"wing": "w", "room": "r"}),
+        ("blank", {"wing": "w", "room": "r", "parent_drawer_id": ""}),
+        ("reg", {"wing": "w", "room": "_registry", "ingest_mode": "registry"}),
+        ("sentinel", {"wing": "w", "room": "r", "is_sentinel": True}),
+    ]
+    collection.add(
+        ids=[row[0] for row in rows],
+        documents=[row[0] for row in rows],
+        metadatas=[row[1] for row in rows],
+        embeddings=[[1.0, 0.0] for _ in rows],
+    )
+
+    total, wing_rooms = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
+    assert total == DrawerCount(drawers=5, chunks=5, rows=8)
+    assert dict(wing_rooms) == {"w": {"r": total}}
+
+    status(palace_path)
+    assert "MemPalace Status -- 5 drawers" in capsys.readouterr().out
 
 
 def test_sqlite_wing_room_counts_none_when_collection_absent(palace_path):
@@ -1673,7 +1707,9 @@ def test_sqlite_wing_room_counts_numeric_wing_not_dropped(palace_path, collectio
     result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     assert result is not None
     _, wing_rooms = result
-    assert {w: dict(r) for w, r in wing_rooms.items()} == {"2026": {"7": 1}}
+    assert {w: {r: c.drawers for r, c in rooms.items()} for w, rooms in wing_rooms.items()} == {
+        "2026": {"7": 1}
+    }
 
 
 def test_sqlite_wing_room_counts_partial_metadata_buckets_question_mark(palace_path, collection):
@@ -1691,8 +1727,8 @@ def test_sqlite_wing_room_counts_partial_metadata_buckets_question_mark(palace_p
     result = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     assert result is not None
     total, wing_rooms = result
-    assert total == 2  # neither drawer dropped
-    assert {w: dict(r) for w, r in wing_rooms.items()} == {
+    assert total.drawers == 2  # neither drawer dropped
+    assert {w: {r: c.drawers for r, c in rooms.items()} for w, rooms in wing_rooms.items()} == {
         "alpha": {"?": 1},
         "?": {"beta": 1},
     }

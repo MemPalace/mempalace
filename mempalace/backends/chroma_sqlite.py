@@ -20,6 +20,7 @@ from ..stored_text import FLAG, decode_record, decode_value, encode_filter, enco
 from ..timeutil import recency_floor, recency_key
 from ._filters import matches_where
 from ._inproc_sqlite import open_reader as open_palace_reader
+from .base import DRAWER_COUNT_ZERO, DrawerCount
 
 
 class MetadataRecoveryPending(sqlite3.OperationalError):
@@ -746,10 +747,10 @@ def sqlite_wing_names(palace_path: str, limit: int = 10_000) -> Optional[list[st
 
 def _sqlite_wing_room_counts(
     palace_path: str, collection_name: str
-) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
+) -> Optional[tuple[DrawerCount, dict[str, dict[str, DrawerCount]]]]:
     """Tally drawers by wing/room straight from ``chroma.sqlite3``.
 
-    Returns ``(total, {wing: {room: count}})`` or ``None`` when the read
+    Returns ``(total, {wing: {room: DrawerCount}})`` or ``None`` when the read
     cannot be trusted — missing DB file, the collection has not been
     bootstrapped, or any sqlite error (including a sustained writer lock).
     ``None`` signals the caller to fall back to the ChromaDB client path
@@ -780,6 +781,10 @@ def _sqlite_wing_room_counts(
     - ``COALESCE`` over ``string_value``/``int_value``/``float_value`` matches
       the ChromaDB path, which surfaces a numeric wing/room natively rather
       than dropping it to ``"?"``.
+    - A row's logical drawer is its parent when it has one, else the row itself,
+      compared by public id (``embedding_id``) so a legacy parent row and its
+      chunks are one drawer. Scalar subqueries rather than joins: a row carrying
+      both parent keys must not fan out into two rows.
     """
 
     def read(conn):
@@ -791,24 +796,40 @@ def _sqlite_wing_room_counts(
         # Registry rows and sentinels track sources; they are not drawers.
         rows = conn.execute(
             f"""
-            SELECT COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
-                            CAST(wm.float_value AS TEXT), '?') AS wing,
-                   COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
-                            CAST(rm.float_value AS TEXT), '?') AS room,
-                   COUNT(*) AS n
-            {_DRAWERS_SQL}
-            LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
-            LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
-            WHERE c.name = ? AND {not_bookkeeping_sql(conn)}
+            WITH logical AS (
+                SELECT COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                                CAST(wm.float_value AS TEXT), '?') AS wing,
+                       COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                                CAST(rm.float_value AS TEXT), '?') AS room,
+                       e.embedding_id AS row_id,
+                       COALESCE(
+                           (SELECT NULLIF(p.string_value, '') FROM embedding_metadata p
+                            WHERE p.id = e.id AND p.key = 'parent_drawer_id'),
+                           (SELECT NULLIF(p.string_value, '') FROM embedding_metadata p
+                            WHERE p.id = e.id AND p.key = 'parent_entry_id')
+                       ) AS parent_id
+                {_DRAWERS_SQL}
+                LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
+                LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+                WHERE c.name = ? AND {not_bookkeeping_sql(conn)}
+            )
+            SELECT wing, room,
+                   COUNT(DISTINCT COALESCE(parent_id, row_id)),
+                   COUNT(parent_id),
+                   COUNT(*)
+            FROM logical
             GROUP BY wing, room
             """,
             (collection_name,),
         ).fetchall()
-        total = 0
-        wing_rooms: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for wing, room, n in rows:
-            wing_rooms[decode_value(wing)][decode_value(room)] += int(n)
-            total += int(n)
+        total = DRAWER_COUNT_ZERO
+        wing_rooms: dict[str, dict[str, DrawerCount]] = defaultdict(dict)
+        for wing, room, drawers, chunks, row_count in rows:
+            count = DrawerCount(drawers=int(drawers), chunks=int(chunks), rows=int(row_count))
+            dest = wing_rooms[decode_value(wing)]
+            room_key = decode_value(room)
+            dest[room_key] = dest.get(room_key, DRAWER_COUNT_ZERO) + count
+            total = total + count
         return total, wing_rooms
 
     return _read_db(palace_path, read, busy=True)

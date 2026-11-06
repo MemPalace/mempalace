@@ -1290,10 +1290,73 @@ def test_sqlite_exact_wing_room_counts(tmp_path):
     )
 
     total, wing_rooms = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
-    assert total == 3
-    assert wing_rooms["alpha"]["notes"] == 1
-    assert wing_rooms["alpha"]["code"] == 1
-    assert wing_rooms["beta"]["notes"] == 1
+    assert total.drawers == 3
+    assert total.chunks == 0
+    assert total.rows == 3
+    assert wing_rooms["alpha"]["notes"].drawers == 1
+    assert wing_rooms["alpha"]["code"].drawers == 1
+    assert wing_rooms["beta"]["notes"].drawers == 1
+
+
+def test_sqlite_exact_wing_room_counts_counts_logical_drawers_not_chunks(tmp_path):
+    """A chunked drawer counts once, however many chunk rows it occupies.
+
+    Counting rows would report this room as 4 drawers; the logical count is 2.
+    """
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["parent", "parent_chunk_000000", "parent_chunk_000001", "single"],
+        documents=["p", "c0", "c1", "s"],
+        metadatas=[
+            {"wing": "alpha", "room": "notes"},
+            {"wing": "alpha", "room": "notes", "parent_drawer_id": "parent", "chunk_index": 0},
+            {"wing": "alpha", "room": "notes", "parent_drawer_id": "parent", "chunk_index": 1},
+            {"wing": "alpha", "room": "notes"},
+        ],
+        embeddings=[[1, 0], [1, 0], [1, 0], [1, 0]],
+    )
+    from mempalace.backends.sqlite_exact import sqlite_wing_room_counts
+
+    total, wings = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
+    assert total.drawers == 2
+    assert total.chunks == 2
+    assert total.rows == 4
+    assert wings["alpha"]["notes"].drawers == 2
+
+
+def test_sqlite_exact_wing_room_counts_logical_parent_rule(tmp_path):
+    """A parent counts once with or without its root row, a row with both parent
+    keys does not fan out, and the client fallback agrees with the SQL."""
+    from mempalace import mcp_server
+    from mempalace.backends import DrawerCount
+    from mempalace.backends.sqlite_exact import sqlite_wing_room_counts
+
+    _backend, col = _collection(tmp_path)
+    rows = [
+        ("root", {"wing": "w", "room": "r"}),
+        ("root_c0", {"wing": "w", "room": "r", "parent_drawer_id": "root"}),
+        ("root_c1", {"wing": "w", "room": "r", "parent_drawer_id": "root"}),
+        ("gone_c0", {"wing": "w", "room": "r", "parent_drawer_id": "gone"}),
+        ("gone_c1", {"wing": "w", "room": "r", "parent_entry_id": "gone"}),
+        ("both_c0", {"wing": "w", "room": "r", "parent_drawer_id": "both", "parent_entry_id": "x"}),
+        ("single", {"wing": "w", "room": "r"}),
+        ("blank", {"wing": "w", "room": "r", "parent_drawer_id": ""}),
+        ("reg", {"wing": "w", "room": "_registry", "ingest_mode": "registry"}),
+        ("sentinel", {"wing": "w", "room": "r", "is_sentinel": True}),
+    ]
+    col.add(
+        ids=[row[0] for row in rows],
+        documents=[row[0] for row in rows],
+        metadatas=[row[1] for row in rows],
+        embeddings=[[1, 0] for _ in rows],
+    )
+
+    total, wing_rooms = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
+    assert total == DrawerCount(drawers=5, chunks=5, rows=8)
+    assert wing_rooms == {"w": {"r": total}}
+    assert mcp_server._client_taxonomy(col) == wing_rooms
+    assert mcp_server._client_taxonomy(col, where={"wing": {"$in": ["w", "wing_w"]}}) == wing_rooms
+    assert mcp_server._client_taxonomy(col, where={"wing": {"$in": ["other"]}}) == {}
 
 
 def test_sqlite_exact_get_metadatas_skips_document_and_embedding(tmp_path):
@@ -1444,8 +1507,10 @@ def test_sqlite_exact_migrates_locus_columns_on_existing_palace(tmp_path):
     from mempalace.backends.sqlite_exact import sqlite_wing_room_counts
 
     total, wings = sqlite_wing_room_counts(str(tmp_path), "mempalace_drawers")
-    assert total == 1
-    assert wings["alpha"]["notes"] == 1
+    assert total.drawers == 1
+    assert total.chunks == 0
+    assert total.rows == 1
+    assert wings["alpha"]["notes"].drawers == 1
 
 
 def test_sqlite_exact_source_file_index_used_for_equality_get(tmp_path):
