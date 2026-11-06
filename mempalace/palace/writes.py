@@ -16,27 +16,60 @@ class StaleDrawerPurgeFailed(RuntimeError):
     """
 
 
-def _source_file_delete_ids(collection, source_file: str, extract_mode: Optional[str]) -> list:
+def _source_file_delete_ids(
+    collection,
+    source_file: str,
+    extract_mode: Optional[str],
+    pass_contents: Optional[set] = None,
+) -> list:
     """Collect drawer IDs for one source file in one extraction mode's scope.
 
     ``extract_mode=None`` is every drawer for the path. Legacy conversation
     drawers did not carry extract_mode; treat those as exchange-mode rows so
     schema rebuilds can still clean them up without deleting newer
     general-mode drawers for the same transcript.
+
+    When ``pass_contents`` is a non-empty set of drawer text bodies produced
+    by the current mine pass, the function applies additive-history filtering:
+    a drawer is kept (excluded from the delete list) only if (a) its metadata
+    matches the current schema version (_meta_is_current) AND (b) its document
+    text is a non-empty string that is NOT in ``pass_contents``.  Drawers that
+    fail either check are included in the list and will be deleted — these are
+    the stale-schema drawers, re-derived drawers, and blank orphans the PR
+    intends to remove.  When ``pass_contents`` is None, the function falls
+    back to the original blanket behavior (every in-scope drawer is a delete
+    candidate), preserving backward compatibility for all existing callers.
     """
     ids: list = []
     offset = 0
+    include = ["metadatas", "documents"] if pass_contents else ["metadatas"]
     while True:
         batch = collection.get(
             where={"source_file": source_file},
             limit=1000,
             offset=offset,
-            include=["metadatas"],
+            include=include,
         )
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
-        for drawer_id, meta in zip(batch_ids, metadatas):
-            if _metadata_matches_extract_mode(meta or {}, extract_mode):
+        documents = batch.get("documents") or [None] * len(batch_ids)
+        for drawer_id, meta, content in zip(batch_ids, metadatas, documents):
+            if not _metadata_matches_extract_mode(meta or {}, extract_mode):
+                continue
+            if pass_contents is not None:
+                # Additive-history rules:
+                #   Rule 1 KEEP  : current schema + content not in pass_contents
+                #   Rule 2 DEL   : older schema (normalize_version < current)
+                #   Rule 3 DEL   : current schema + content IS in pass_contents
+                #   Rule 4 DEL   : blank / empty document text
+                if content and content in pass_contents:
+                    ids.append(drawer_id)  # Rule 3: redundant, upsert replaces
+                elif not content:
+                    ids.append(drawer_id)  # Rule 4: blank orphan
+                elif not _meta_is_current(meta or {}, extract_mode):
+                    ids.append(drawer_id)  # Rule 2: stale schema
+                # else Rule 1: keep — not added to ids
+            else:
                 ids.append(drawer_id)
         if not batch_ids:
             break
@@ -154,6 +187,7 @@ def write_file_drawers(
     *,
     extract_mode: Optional[str] = None,
     prune: bool = True,
+    pass_contents: Optional[set] = None,
     aaak_col=None,
 ) -> int:
     """File one source file's drawers: write the new ones, then drop the stale.
@@ -200,11 +234,10 @@ def write_file_drawers(
 
     fresh = {drawer_id for drawer_id, _, _ in drawers}
     try:
-        stale = [
-            drawer_id
-            for drawer_id in _source_file_delete_ids(collection, source_file, extract_mode)
-            if drawer_id not in fresh
-        ]
+        delete_candidates = _source_file_delete_ids(
+            collection, source_file, extract_mode, pass_contents=pass_contents
+        )
+        stale = [drawer_id for drawer_id in delete_candidates if drawer_id not in fresh]
         if stale:
             collection.delete(ids=stale)
     except MINE_ABORTS:
