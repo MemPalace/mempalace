@@ -55,7 +55,7 @@ def test_overview_observes_wal_commits_with_unchanged_main_file(
         )
 
         def count(result):
-            return result[0] if cache == "taxonomy" else sum(row[3] for row in result)
+            return result[0].drawers if cache == "taxonomy" else sum(row[3] for row in result)
 
         assert count(read()) == 1
         assert count(read()) == 1
