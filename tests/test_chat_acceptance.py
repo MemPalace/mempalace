@@ -95,7 +95,7 @@ def test_model_answer_uses_workspace_front_setting(chat_hub, monkeypatch):
     answer = next(r for r in h.chat(h.owner)[1]["replies"] if r["kind"] == "answer")
     assert (answer["message_id"], answer["model"], answer["code"]) == (
         message,
-        "openai_compatible/fast-model",
+        "local:openai_compatible/fast-model",
         "ok",
     )
 

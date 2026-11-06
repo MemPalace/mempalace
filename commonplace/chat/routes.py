@@ -2,7 +2,7 @@
 
 from commonplace import redact
 from commonplace.boards.service import BoardService
-from commonplace.chat import front, settings, status, store
+from commonplace.chat import front, model, search, settings, status, store
 from commonplace.chat.types import LINKED_CARDS_MAX, ChatDenied
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import path_parts, query, read_json, require_principal, send_json
@@ -69,8 +69,11 @@ def install(gateway) -> None:
         if principal is None:
             return
         parts = path_parts(h, "/api/chat/")
-        if len(parts) not in (1, 2) or (len(parts) == 2 and parts[1] != "status"):
+        if len(parts) not in (1, 2) or (len(parts) == 2 and parts[1] not in ("status", "search")):
             send_json(h, 404, {"error": "Not found"})
+            return
+        if len(parts) == 2 and parts[1] == "search":
+            send_json(h, *search.handle(gateway, principal, parts[0], query(h)))
             return
         try:
             if len(parts) == 2:
@@ -122,41 +125,99 @@ def install(gateway) -> None:
             return
         send_json(h, 200, payload)
 
-    def configuration(h):
-        principal = _person(gateway, h)
-        if principal is None:
-            return
-        if h.command == "PUT":
-            if principal.role != "owner":
-                send_json(h, 403, {"error": "Only workspace owners can change chat settings"})
-                return
-            try:
-                body = read_json(h)
-            except ValueError:
-                return
-            if set(body) != {"front"} or not isinstance(body["front"], dict):
-                send_json(h, 400, {"error": "Invalid chat settings"})
-                return
-            try:
-                config = settings.set_front(gateway.db, principal, body)
-            except ChatDenied:
-                send_json(h, 403, {"error": "Chat settings not allowed"})
-                return
-            except ValueError:
-                send_json(h, 400, {"error": "Invalid chat settings"})
-                return
-        else:
-            config = settings.front(gateway.db, principal.workspace_id)
-        send_json(
-            h,
-            200,
-            {
-                "front": config.public(),
-                "usage": store.counts_today(gateway.db, principal.workspace_id, principal.user_id),
-            },
-        )
-
     gateway.add_route("GET", "/api/chat", listing)
     gateway.add_prefix_route("GET", "/api/chat/", page)
-    gateway.add_route("GET", "/api/chat-settings", configuration)
-    gateway.add_route("PUT", "/api/chat-settings", configuration)
+    gateway.add_route("GET", "/api/chat-settings", lambda h: configuration(gateway, h))
+    gateway.add_route("PUT", "/api/chat-settings", lambda h: configuration(gateway, h))
+
+
+def readable_board(gateway, principal, board):
+    service = BoardService(ToolContext(principal=principal, gateway=gateway))
+    try:
+        service.space_read(board, last=1)
+        return True
+    except ToolError:
+        return False
+
+
+def configuration(gateway, h):
+    principal = _person(gateway, h)
+    if principal is None:
+        return
+    params = query(h)
+    board = params.get("board")
+    if params.get("probe") == "1" and principal.role != "owner":
+        send_json(h, 403, {"error": "Only workspace owners can probe models"})
+        return
+    if h.command == "PUT":
+        if principal.role != "owner":
+            send_json(h, 403, {"error": "Only workspace owners can change chat settings"})
+            return
+        try:
+            body = read_json(h)
+        except ValueError:
+            return
+        if (
+            "front" not in body
+            or set(body) - {"front", "scope", "mode"}
+            or not isinstance(body["front"], dict)
+        ):
+            send_json(h, 400, {"error": "Invalid chat settings"})
+            return
+        board = body.get("scope")
+        if board is not None and not isinstance(board, str):
+            send_json(h, 400, {"error": "Invalid chat settings"})
+            return
+        if board is not None and not readable_board(gateway, principal, board):
+            send_json(h, 404, {"error": "Board not found"})
+            return
+        try:
+            config = settings.set_front(gateway.db, principal, body)
+        except ChatDenied:
+            send_json(h, 403, {"error": "Chat settings not allowed"})
+            return
+        except settings.LocalProviderMismatch:
+            send_json(h, 400, {"error": "invalid_local_provider"})
+            return
+        except settings.NotLoopback:
+            send_json(h, 400, {"error": "not_loopback"})
+            return
+        except ValueError:
+            send_json(h, 400, {"error": "Invalid chat settings"})
+            return
+    else:
+        if board is not None and not readable_board(gateway, principal, board):
+            send_json(h, 404, {"error": "Board not found"})
+            return
+        config = settings.front(gateway.db, principal.workspace_id, board)
+    extra = {}
+    if params.get("probe") == "1":
+        from dataclasses import replace
+
+        probe = (
+            config
+            if settings.is_local(config)
+            else replace(
+                config,
+                provider="openai_compatible",
+                base_url="http://127.0.0.1:11434",
+                key_ref=None,
+            )
+        )
+        local_models, reachable = model.probe_models(probe)
+        usage = store.counts_today(gateway.db, principal.workspace_id, principal.user_id)
+        extra = {
+            "local_models": local_models,
+            "local_reachable": reachable,
+            "last_error": usage.get("last_error"),
+            "hosted": settings.hosted_options(principal.workspace_id),
+        }
+    send_json(
+        h,
+        200,
+        {
+            **extra,
+            "front": config.public(),
+            "usage": store.counts_today(gateway.db, principal.workspace_id, principal.user_id),
+        },
+    )

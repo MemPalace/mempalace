@@ -199,6 +199,8 @@ function bootFixture() {
     async route() { calls.push("route"); },
     schedule() { calls.push("schedule"); },
     signin() { calls.push("signin"); context.voice.reset(); },
+    // Expiry clears the signed-in user's chat state first (seen ids live on the device).
+    clearWorkbenchChat() { calls.push("clear-chat"); },
     signinCode: null,
     showError(text) { calls.push(`error:${text}`); },
     URLSearchParams,
@@ -221,7 +223,7 @@ assert.deepEqual(booting.calls, ["shell", "route", "schedule"]);
 booting.resolveStatus({ ok: false, status: 401, json: async () => ({ error: "Sign in" }) });
 await new Promise(setImmediate);
 assert.equal(booting.state.me, null);
-assert.equal(booting.calls.at(-1), "signin");
+assert.deepEqual(booting.calls.slice(-2), ["clear-chat", "signin"]);
 // A tapped card link for another workspace: boot drops ?w=, keeps the user on
 // the board and explains why, without waiting for the voice status.
 const otherWorkspace = bootFixture();

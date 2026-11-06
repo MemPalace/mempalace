@@ -1,4 +1,4 @@
-"""Home: the open-task list behind its table, and the three sections it renders."""
+"""Needs me replaces Home in the shell; the open-card API behind the old table stays."""
 
 import json
 import shutil
@@ -75,12 +75,29 @@ def test_open_cards_are_capped_most_urgent_first_and_fast(hub, env):  # noqa: F8
     assert status == 200 and len(payload["cards"]) == 301 and payload["total"] == 301
 
 
-def test_home_renders_three_sections_from_a_seeded_payload():
+STATIC = Path(__file__).resolve().parents[1] / "commonplace/web/static"
+
+
+def _render(case):
     node = shutil.which("node")
-    if not node:
-        pytest.skip("node is needed for the Home render check")
+    assert node, "node is needed for the Needs me render checks"
     script = Path(__file__).with_name("commonplace_home_render.mjs")
-    subprocess.run([node, str(script)], check=True, timeout=10)
+    result = subprocess.run([node, str(script), case], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr  # RED
+
+
+def test_needs_view_renders_needs_me():
+    assert (STATIC / "needs.js").is_file(), "needs.js missing"
+    _render("needs_view")
+
+
+def test_home_view_tiles_table_and_stylesheet_removed():
+    assert (STATIC / "home.js").is_file(), "home.js missing"
+    _render("home_removed")
+
+
+def test_guard_need_items_order_kept():
+    _render("need_items")
 
 
 def test_needs_actions_behaviour():

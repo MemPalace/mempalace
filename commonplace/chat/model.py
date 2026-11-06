@@ -2,12 +2,14 @@
 
 import http.client
 import json
+import logging
 import os
 import socket
 import threading
 import time
 from urllib.parse import urlsplit
 
+from commonplace.chat import settings as front_settings
 from commonplace.chat.types import (
     ANTHROPIC_VERSION,
     KEY_HOSTS_ENV,
@@ -59,12 +61,15 @@ def _shutdown_sockets(sockets):
                 pass
 
 
-def _connect_socket(address, remaining, sockets, source_address=None):
+def _connect_socket(address, remaining, sockets, source_address=None, *, local=False):
     last_error = None
     for family, kind, proto, _, target in socket.getaddrinfo(
         address[0], address[1], 0, socket.SOCK_STREAM
     ):
         remaining()
+        if local and not front_settings.loopback_host(target[0]):
+            logging.getLogger(__name__).warning("Local model address refused")
+            raise OSError("Local model address refused")
         candidate = socket.socket(family, kind, proto)
         try:
             candidate.settimeout(remaining())
@@ -152,7 +157,9 @@ def complete(
         _shutdown_sockets([conn.sock, *sockets])
 
     def connect_socket(address, timeout=None, source_address=None):
-        return _connect_socket(address, remaining, sockets, source_address)
+        return _connect_socket(
+            address, remaining, sockets, source_address, local=front_settings.is_local(settings)
+        )
 
     conn._create_connection = connect_socket
     timer = threading.Timer(remaining(), expire)
@@ -217,3 +224,47 @@ def _answer(chunks, anthropic):
     except (ValueError, KeyError, IndexError, TypeError):
         raise ModelError("bad_response") from None
     return answer
+
+
+def probe_models(config):
+    """Local discovery uses the same checked socket path as completions."""
+    if not front_settings.is_local(config):
+        return [], False
+    origin = urlsplit(config.base_url)
+    sockets = []
+    deadline = time.monotonic() + 2
+
+    def remaining():
+        value = deadline - time.monotonic()
+        if value <= 0:
+            raise TimeoutError()
+        return value
+
+    conn = (
+        http.client.HTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
+    )(origin.hostname, origin.port, timeout=2)
+    conn._create_connection = lambda address, timeout=None, source_address=None: _connect_socket(
+        address, remaining, sockets, source_address, local=front_settings.is_local(config)
+    )
+    timer = threading.Timer(2, lambda: _shutdown_sockets([conn.sock, *sockets]))
+    timer.daemon = True
+    timer.start()
+    try:
+        conn.request("GET", origin.path.rstrip("/") + "/v1/models")
+        response = conn.getresponse()
+        if response.status != 200:
+            return [], False
+        data = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(data) > MAX_RESPONSE_BYTES:
+            return [], False
+        rows = json.loads(data)["data"]
+        if not isinstance(rows, list):
+            return [], False
+        return [
+            row["id"] for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)
+        ][:200], True
+    except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException):
+        return [], False
+    finally:
+        timer.cancel()
+        conn.close()

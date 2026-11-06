@@ -33,7 +33,7 @@ def build(gateway, poster, board: str, message_id: int, context: str) -> tuple[s
         job = Job(
             poster.workspace_id, board, message_id, poster.user_id, "running", "", False, "", ""
         )
-        system, turns = worker.build_context(gateway, poster, job)
+        system, turns = worker.build_runner_context(gateway, poster, job)
         prompt = turns[0]["content"]
     else:
         service = BoardService(ToolContext(principal=poster, gateway=gateway))

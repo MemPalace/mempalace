@@ -100,6 +100,7 @@ def install(gateway):
                     "user": principal.user_id,
                     "email": principal.user_email,
                     "workspace": principal.workspace_id,
+                    "workspace_name": gateway.db.workspace(principal.workspace_id)["name"],
                     "actor": principal.actor,
                     "people": _people(gateway.db, principal.workspace_id),
                 },

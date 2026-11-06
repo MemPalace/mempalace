@@ -44,6 +44,7 @@ def test_login_cookie_identity_replay_and_logout(hub):
         "user": hub.admin,
         "email": "owner@example.com",
         "workspace": hub.workspace,
+        "workspace_name": hub.db.workspace(hub.workspace)["name"],
         "actor": f"user:{hub.admin}",
         "people": {f"user:{hub.admin}": "owner"},
     }

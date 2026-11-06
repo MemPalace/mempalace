@@ -159,6 +159,23 @@ class ReplyStore:
                 ).fetchall()
             ]
 
+    def search(self, *, board, for_user, words, actor=None, since=None):
+        """Return at most 21 private answers (the extra row signals truncation)."""
+        from commonplace.chat.search import predicates
+
+        where, values = predicates(words, actor, since)
+        with self._lock:
+            conn = self._connection()
+            if conn is None:
+                return []
+            return conn.execute(
+                "SELECT * FROM (SELECT id,text,created_at AS at,NULL AS actor,model,"
+                "task AS number,'text' AS field FROM chat_replies "
+                "WHERE board=? AND for_user=? AND kind='answer') "
+                f"WHERE {where} ORDER BY julianday(at) DESC,id DESC LIMIT 21",
+                (board, for_user, *values),
+            ).fetchall()
+
     def latest_id(self, *, board, for_user) -> int:
         with self._lock:
             conn = self._connection()

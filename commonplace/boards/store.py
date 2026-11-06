@@ -150,6 +150,8 @@ def card(conn, row, principal=None, *, release=None, approver=None) -> dict:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "position": row["position"],
+        # Filed by a restricted (untrusted) connection; clients gate their own actions on this.
+        "restricted": "restricted_origin" in row.keys() and bool(row["restricted_origin"]),
     }
     person_owner = bool(principal and principal.person and principal.role == "owner")
     person_release = (

@@ -117,8 +117,8 @@ def on_event(gateway, event: dict) -> None:
             wake = handoff.open(
                 db, workspace_id, board, message_id, user_id, page["coordinator"], time.time()
             )
-        front = settings.front(db, workspace_id)
-        if front.enabled and front.provider != "none":
+        front = settings.front(db, workspace_id, board)
+        if front.applies and front.enabled and front.provider != "none":
             wake = store.enqueue(db, workspace_id, board, message_id, user_id) or wake
         if wake:
             gateway.chat_worker.wake()

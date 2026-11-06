@@ -30,7 +30,11 @@ def test_console_view_renders_states_and_escapes():
 def test_app_reaches_console_and_isolates_its_errors():
     app = (STATIC / "app.js").read_text()
     assert 'href="#/memory"' in app
-    assert app.count('href="#/console"') >= 2  # RED
+    # Reachable from the shell's rail and from the command palette.
+    rail = (STATIC / "rail.js").read_text()
+    palette = (STATIC / "palette.js").read_text()
+    assert app.count('href="#/console"') + rail.count('href="#/console"') >= 2  # RED
+    assert "'#/console'" in palette
     assert 'import { createConsole } from "./console.js";' in app
     routing = next(line for line in app.splitlines() if "state.base = start" in line)
     pattern = re.search(r"\(/(.+)/\.test\(hash\)", routing)

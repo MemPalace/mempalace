@@ -31,12 +31,72 @@ function icon(id) {
   return Object.hasOwn(paths, id) ? `<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="currentColor"><path d="${paths[id]}"/></svg>` : "";
 }
 
+// Component styles stay with the view so legacy routes keep their own layout.
+const styles = `
+.signin { width: 100%; min-height: 100vh; margin: 0; padding: 0; box-shadow: none; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); background: var(--surface); }
+.signin .auth-l { display: flex; flex-direction: column; justify-content: center; padding: 48px 96px; gap: 28px; min-width: 0; }
+.signin .brand-home { display: flex; align-items: center; gap: 10px; color: var(--text); text-decoration: none; font-size: 16px; font-weight: 700; }
+.signin .mark { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 6px; background: var(--text); color: #FEFEFC; }
+.signin h1 { margin: 0; color: var(--text); font-size: 30px; line-height: 36px; letter-spacing: -.02em; font-weight: 700; }
+.signin .lead { margin-top: 10px; color: var(--text-2); font-size: 15px; line-height: 22px; max-width: 440px; }
+.signin form { display: flex; flex-direction: column; gap: 14px; max-width: 400px; }
+.signin .lbl { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-weight: 600; }
+.signin input[type=email] { width: 100%; min-height: 44px; padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--surface); color: var(--text); font-size: 15px; font-weight: 400; }
+.signin form .btn { min-height: 44px; justify-content: center; white-space: normal; }
+.signin .providers { margin: 0; max-width: 400px; gap: 8px; }
+.signin .provider { min-height: 44px; padding: 10px 14px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--surface); box-shadow: none; color: var(--text); text-decoration: none; }
+.signin .provider:hover { background: var(--bg); }
+.signin .fine { max-width: 400px; font-size: 12.5px; color: var(--text-3); }
+.signin .message { margin: 0; padding: 12px; border-radius: var(--r); color: var(--text); background: var(--accent-weak); overflow-wrap: anywhere; }
+.signin .legal-links { margin: 0; }
+.signin .auth-r { display: flex; flex-direction: column; justify-content: center; padding: 48px 64px; gap: 18px; min-width: 0; background: var(--bg); border-left: 1px solid var(--line); }
+.signin .auth-r h2 { font-size: 15px; color: var(--text-2); font-weight: 650; }
+.signin .steps3 { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; counter-reset: signin-step; }
+.signin .steps3 li { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 12px; align-items: start; padding: 14px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+.signin .steps3 li::before { counter-increment: signin-step; content: counter(signin-step); width: 26px; height: 26px; border-radius: 50%; background: var(--text); color: #FEFEFC; display: grid; place-items: center; font-weight: 700; font-size: 13px; }
+.signin .steps3 b { display: block; font-weight: 650; }
+.signin .steps3 span, .signin .terms dd { color: var(--text-2); font-size: 13.5px; }
+.signin .terms { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 14px 16px; border-radius: 8px; background: var(--surface); border: 1px solid var(--line); }
+.signin .terms dt { font-weight: 650; }
+.signin .terms dd { margin: 0 0 4px; }
+@media (max-width: 1099px) { .signin .auth-l, .signin .auth-r { padding: 40px 32px; } }
+@media (max-width: 699px) { .signin { grid-template-columns: minmax(0, 1fr); } .signin .auth-l, .signin .auth-r { padding: 32px 24px; } .signin .auth-r { border-left: 0; border-top: 1px solid var(--line); } .signin .legal-links a { display: inline-flex; align-items: center; min-height: 44px; } }
+`;
+
+// Constructed stylesheets respect the app's no-inline-style document policy.
+if (globalThis.document?.adoptedStyleSheets) {
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync(styles);
+  document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+}
+
 export function signinView({ providers = [], paused = [], via = "", error = "", next = "" }) {
   const previous = paused.find((p) => p.id === via);
   const message = error || (previous ? pausedMessage(previous) : "");
+  const expired = message === messages.expired;
   const links = providers.map(({ id, name, url }) => {
     const href = next ? `${url}${url.includes("?") ? "&" : "?"}next=${encodeURIComponent(next)}` : url;
     return `<a class="provider" href="${e(href)}">${icon(id)}<span>Continue with ${e(name)}</span></a>`;
   }).join("");
-  return `<main class="signin"><a class="brand-home" href="/app/" aria-label="Commonplace"><img class="brand-v2" src="/app/brand/logo-small-dark.svg" alt="Commonplace"></a><h1>Sign in</h1>${links ? `<nav class="providers">${links}</nav>` : ""}<form data-form="email-login" action="/app/auth/email" method="post"><input type="hidden" name="next" value="${e(next)}"><input name="email" type="email" aria-label="Email" placeholder="Email" autocomplete="email" maxlength="254" required><button class="blockbtn">Email a sign-in link</button></form>${message ? `<div class="message" role="status">${e(message)}</div>` : ""}<nav class="legal-links" aria-label="Legal"><a href="https://cmmn.dev/privacy">Privacy</a><a href="https://cmmn.dev/terms">Terms</a></nav></main>`;
+  // Registration is controlled by the server. Sign-in never promises a new account.
+  return `<main class="signin"><div class="auth-l">
+    <a class="brand-home" href="/app/" aria-label="Commonplace"><span class="mark" aria-hidden="true">C</span>Commonplace</a>
+    <div><h1>${expired ? "Get a new link" : "Sign in"}</h1><p class="lead">${expired ? "Links work once and for 15 minutes. Nothing is lost; get a new one below." : "One place where you and your AI agents share a board, a chat and a memory that keeps your exact words."}</p></div>
+    ${links ? `<nav class="providers" aria-label="Sign-in options">${links}</nav>` : ""}
+    <form data-form="email-login" action="/app/auth/email" method="post"><input type="hidden" name="next" value="${e(next)}"><label class="lbl">Email<input name="email" type="email" aria-label="Email" placeholder="Email" autocomplete="email" maxlength="254" required></label><button class="btn primary lg">${expired ? "Email me a new link" : "Email a sign-in link"}</button></form>
+    ${message ? `<div class="message" role="status">${e(message)}</div>` : ""}
+    <p class="fine">No password. Use the email for your Commonplace account.</p>
+    <nav class="legal-links" aria-label="Legal"><a href="https://cmmn.dev/privacy">Privacy</a><a href="https://cmmn.dev/terms">Terms</a></nav>
+  </div><section class="auth-r" aria-labelledby="signin-next-heading">
+    <h2 id="signin-next-heading">What happens next</h2>
+    <ol class="steps3">
+      <li><div><b>Name your first project</b><span>A project is one board, one chat and its memory.</span></div></li>
+      <li><div><b>Add a card or ask in chat</b><span>Cards are the work. Agents pick them up.</span></div></li>
+      <li><div><b>Connect an agent</b><span>We show you how, step by step.</span></div></li>
+    </ol>
+    <dl class="terms" aria-label="Two words you will see">
+      <div><dt>Agent</dt><dd>An AI helper that works on cards, for example a coding assistant on your computer.</dd></div>
+      <div><dt>Orchestrator</dt><dd>The project's lead agent. It reads what you ask in chat and turns it into cards. Each project gets one automatically: the first agent you connect.</dd></div>
+    </dl>
+  </section></main>`;
 }

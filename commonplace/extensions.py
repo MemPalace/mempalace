@@ -46,6 +46,7 @@ MODULES = (
     "commonplace.runner",
     "commonplace.console",
     "commonplace.chat",
+    "commonplace.holds",
     "commonplace.projects",
 )
 

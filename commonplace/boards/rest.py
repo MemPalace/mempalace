@@ -179,6 +179,7 @@ def dispatch(service, h, parts, method):
             return 200, {
                 "cards": [c for c in cards if c["parent"] is None],
                 "linked": [c for c in cards if c["message_id"] is not None],
+                "children": [c for c in cards if c["parent"] is not None],
             }
         if method == "POST":
             body = read_json(h)

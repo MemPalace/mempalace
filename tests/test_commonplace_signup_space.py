@@ -83,7 +83,7 @@ def test_fresh_signup_creates_one_owned_space_and_lands_in_board(signup, channel
     assert client.request(landing.split("#")[0], cookie=cookie)[0] == 200
     assert api(client, cookie, "/api/boards/commonplace/cards") == (
         200,
-        {"cards": [], "linked": []},
+        {"cards": [], "linked": [], "children": []},
     )
 
 
@@ -376,7 +376,7 @@ def test_signup_failure_keeps_durable_marker_and_ordinary_retry_finishes_once(
         assert board["name"] == "Commonplace"
     assert api(client, cookie, "/api/boards/commonplace/cards") == (
         200,
-        {"cards": [], "linked": []},
+        {"cards": [], "linked": [], "children": []},
     )
     with client.db._lock:
         [issued] = client.db._conn.execute("SELECT * FROM sessions").fetchall()

@@ -75,3 +75,64 @@
   .panel .grow .sec + .sec { margin-top: 0; }
   .tip { display: none; }
 }
+
+/* Search-first memory; the legacy map keeps its own selectors above. */
+.memory-search { display: flex; flex-direction: column; min-height: 0; height: 100%; color: var(--text); }
+.memory-search .memory-toolbar { padding: 14px 16px 6px; display: flex; flex-direction: column; gap: 10px; background: none; box-shadow: none; flex-wrap: nowrap; }
+.memory-search .search-big { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); }
+.memory-search .search-big:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; }
+.memory-search .search-big input { flex: 1; width: 0; min-width: 0; min-height: 40px; padding: 0; border: 0; box-shadow: none; outline: none; background: transparent; font-size: 15px; }
+.memory-search .filters { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.memory-search .chip { position: relative; display: inline-flex; align-items: center; gap: 3px; min-height: 30px; padding: 2px 10px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface); color: var(--text-2); font-size: 12.5px; }
+.memory-search .chip:focus-within { outline: 3px solid var(--accent); outline-offset: 1px; }
+/* The filters are native selects drawn as chips ("Project: All ⌄"); the legacy boxed field look must not apply. */
+.memory-search .chip select { appearance: none; -webkit-appearance: none; min-height: 24px; max-width: 180px; padding: 0 16px 0 2px; border: 0; border-radius: 0; box-shadow: none; outline: none; background: transparent; color: var(--text); font: inherit; font-weight: 650; cursor: pointer; }
+.memory-search .chip::after { content: ""; position: absolute; right: 11px; top: 50%; width: 6px; height: 6px; margin-top: -5px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); pointer-events: none; }
+.memory-search .memory-status { margin-left: auto; color: var(--text-3); font-size: 12.5px; }
+.memory-search .memory-results { flex: 1; min-height: 0; max-height: none; overflow-y: auto; padding: 4px 16px 16px; background: none; box-shadow: none; }
+.memory-search .res { display: block; width: 100%; margin: 0 0 8px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); color: var(--text); text-align: left; }
+.memory-search .res:hover { background: var(--pane); }
+.memory-search .res.is-selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.memory-search .res.is-loading { border-style: dashed; }
+.memory-search mark { background: #FFE9A8; color: inherit; border-radius: 2px; padding: 0 1px; }
+.memory-search .src, .memory-panel .src { display: flex; align-items: baseline; gap: 4px; flex-wrap: wrap; color: var(--text-3); font-size: 12px; }
+.memory-search .src { margin-bottom: 6px; }
+.memory-search .src b, .memory-panel .src b { color: var(--text); }
+.memory-search .ex { display: block; font-size: 13.5px; line-height: 21px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.memory-search .keys { display: flex; gap: 14px; flex-wrap: wrap; padding: 8px 16px; background: var(--pane); border-top: 1px solid var(--line); font-size: 12px; color: var(--text-3); }
+.memory-search .keys span { display: inline-flex; gap: 5px; align-items: center; }
+.memory-search .memory-empty { position: static; padding: 40px 20px; max-width: 480px; margin: auto; text-align: center; }
+.memory-search .memory-empty h2 { font-size: 20px; line-height: 28px; margin-bottom: 8px; }
+.memory-search .memory-empty p { color: var(--text-2); margin-bottom: 14px; }
+.memory-search .memory-warning { padding: 8px 16px; color: var(--wait); }
+.memory-panel { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--surface); }
+.memory-panel .ctx-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.memory-panel h2 { font-size: 14px; line-height: 20px; }
+.memory-panel .ctx-body { flex: 1; overflow-y: auto; min-height: 0; padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+.memory-panel .detail-h { display: flex; flex-direction: column; gap: 8px; }
+.memory-panel .verbatim { font-size: 12px; font-weight: 600; color: var(--text-2); }
+.memory-panel .thread { display: flex; flex-direction: column; gap: 10px; }
+.memory-panel .msg { display: block; min-width: 0; }
+.memory-panel .msg-h { display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+.memory-panel .msg-h time { color: var(--text-3); }
+.memory-panel .msg-b, .memory-panel .quote { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13.5px; line-height: 21px; }
+.memory-panel .ctxmsg { color: var(--text-2); }
+.memory-panel .hit { background: #FFF8E1; padding: 10px; border-radius: var(--r); box-shadow: inset 0 0 0 1px #E8CE7E; }
+.memory-panel .callout { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--wait-line); border-radius: var(--r); background: var(--wait-bg); }
+.memory-panel .callout h3 { font-size: 13px; line-height: 20px; }
+.memory-panel .callout > p { font-size: 12.5px; line-height: 19px; }
+.memory-panel .quote { padding: 6px 10px; border-radius: 4px; background: var(--surface); }
+.memory-panel-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 12px 16px; border-top: 1px solid var(--line); }
+.memory-panel .memory-destination { flex-basis: 100%; font-size: 12px; color: var(--text-2); }
+.memory-panel [data-memory-link] { display: flex; flex-direction: column; gap: 8px; }
+.memory-panel [data-memory-link] label { display: flex; flex-direction: column; gap: 6px; }
+.memory-panel [data-memory-link] select { max-width: 100%; min-height: 32px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--r); }
+@media (max-width: 699px) {
+  .memory-search .chip, .memory-panel .btn, .memory-panel select { min-height: 44px; }
+  .memory-search .chip select { min-height: 40px; }
+  .memory-search .memory-toolbar, .memory-search .memory-results { padding-left: 12px; padding-right: 12px; }
+  .memory-search .filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: center; }
+  .memory-search .chip { min-width: 0; }
+  .memory-search .chip select { max-width: none; width: 100%; min-width: 0; }
+  .memory-search .memory-status { flex-basis: 100%; grid-column: 1 / -1; }
+}

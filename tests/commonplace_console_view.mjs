@@ -375,8 +375,9 @@ test("phone stylesheet keeps the chip strip and panels within one column", async
   const phone = css.split("@media (max-width: 640px)")[1];
   assert.ok(phone);
   assert.match(phone, /grid-template-columns: minmax\(0, 1fr\)/);
-  assert.match(phone, /overflow-x: auto/);
-  assert.match(phone, /\.console-agents ul \{ display: flex/);
+  // Since #220 the phone chips wrap in a grid inside the column (no sideways scroll strip).
+  assert.match(phone, /\.console-agents \{[^}]*overflow-x: hidden; overflow-y: auto/);
+  assert.match(phone, /\.console-agents ul \{ display: grid; grid-template-columns: repeat\(auto-fill, minmax\(140px, 1fr\)\)/);
   assert.match(phone, /min-height: 44px/);
   assert.match(css, /white-space: pre-wrap/);
 });

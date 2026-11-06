@@ -32,9 +32,9 @@
 @media (max-width: 640px) {
   .console-view { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .console-view:has(.console-error) { grid-template-rows: auto auto minmax(0, 1fr); }
-  .console-agents { overflow-x: auto; overflow-y: hidden; border-right: 0; border-bottom: 1px solid var(--line); }
-  .console-agents ul { display: flex; width: max-content; }
-  .console-agent { flex: 0 0 220px; width: 220px; border-bottom: 0; border-right: 1px solid var(--line); }
+  .console-agents { max-height: 30dvh; overflow-x: hidden; overflow-y: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  .console-agents ul { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .console-agent { min-width: 0; border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); }
   .console-agent.selected { box-shadow: inset 0 -2px var(--strong); }
   .console-select, .console-record, .console-new { min-height: 44px; }
   .console-panels { grid-template-rows: minmax(100px, .8fr) minmax(140px, 1fr); }

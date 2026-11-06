@@ -151,7 +151,9 @@ def test_existing_event_logs_gain_the_options_column(tmp_path):
 
 def test_app_renders_asks_inline_with_one_live_place():
     app = (Path(STATIC) / "app.js").read_text()
-    assert "function askCard(card, ask" in app and "conversation(card)" in app
+    # The card panel still renders the open ask through conversation(); since the
+    # #220 visual round it filters the log to the ask waiting on this person (m10).
+    assert "function askCard(card, ask" in app and "${conversation(" in app
     # The panel header no longer repeats the open ask: the conversation holds it.
     assert '<p class="stamp">${e(actor(card.return_to))}</p>' not in app
     assert 'data-ask="${card.number}"' in app
@@ -209,8 +211,12 @@ def test_app_sends_the_rendered_version_and_keeps_one_live_place():
     app = (Path(STATIC) / "app.js").read_text()
     assert 'data-version="${e(card.version)}"' in app
     assert "body: { ...payload, version }" in app
-    # Home draws no choice buttons. A question in the needbox opens the decide queue.
-    assert "homeView(" in app and "decision(card)" not in app
+    # Needs me draws its own choices and sends them to the decide route with the rendered version.
+    # It never reuses the shell's decide buttons, so one click answers once.
+    needs = (Path(STATIC) / "needs.js").read_text()
+    assert "homeView(" not in app and "decision(card)" not in app
+    assert 'data-action="decide"' not in needs
+    assert "/decide`" in needs and "version: card.version" in needs
     assert 'data-action="decide"' not in (Path(STATIC) / "home.js").read_text()
 
 

@@ -2,10 +2,9 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-// Import lazily: the module may be empty or absent in older revisions.
+// Import lazily from the file itself, so the module's relative imports resolve.
 async function load(name) {
-  const source = await readFile(new URL(`../commonplace/web/static/${name}.js`, import.meta.url), "utf8");
-  return import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+  return import(new URL(`../commonplace/web/static/${name}.js`, import.meta.url));
 }
 const e = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const project = {
@@ -50,6 +49,17 @@ test("model fields show both roles and the chat copy points to Connect", async (
   assert.match(html, /claude-haiku-5-5/);
   assert.match(html, /gpt-5\.5/);
   assert.match(html, /<(?:input|select)\b/);
-  const chat = await load("chat");
-  assert.match(chat.CHAT_COPY.noOrchestratorOwner, /Connect/);
+  // The no-orchestrator copy now lives in the chat pane's recovery strip, not in CHAT_COPY.
+  const chat = await readFile(new URL("../commonplace/web/static/chat.js", import.meta.url), "utf8");
+  assert.match(chat, /Connect an agent in Settings\./);
+});
+
+test("project memory controls preserve owner consent and escape the memory name", async () => {
+  const ui = await load("projects");
+  assert.equal(typeof ui.memoryHTML, "function");
+  assert.equal(typeof ui.sharedWingHTML, "function");
+  const html = ui.memoryHTML({...project, memory: {shared: false, wing: "<section>"}}, e);
+  assert.match(html, /&lt;section&gt;/);
+  assert.doesNotMatch(html, /data-project-own-wing/);
+  assert.doesNotMatch(ui.sharedWingHTML({}, e, {allowShared: false}), /data-wing-choice="shared"/);
 });

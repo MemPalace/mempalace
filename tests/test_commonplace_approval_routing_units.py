@@ -9,7 +9,14 @@ from commonplace.boards.service import BoardService
 from commonplace.boards.store import task_row
 from commonplace.extensions import ToolError
 from tests._commonplace_helpers import hub_fixture  # noqa: F401
-from tests.test_commonplace_approval_routing import count_roles, home, start
+from tests.test_commonplace_approval_routing import (
+    ANSWER,
+    APPROVE,
+    NO_HOME,
+    count_roles,
+    home,
+    start,
+)
 from tests.test_commonplace_board_authority import fresh as fresh
 from tests.test_commonplace_boards import mcp
 
@@ -54,8 +61,9 @@ def test_stuck_plan_remains_an_owner_decision_with_live_supervisor(fresh):
     assert owner_report["count"] == 1
     assert not owner_report["stale"]
     assert {c["number"] for c in parent.work.needs_me()["stale"]} == {card["number"]}
-    assert "need-approve" in home(fresh, card)
-    assert ">Answer<" not in home(fresh, card)
+    html = home(fresh, card)
+    assert APPROVE in html, NO_HOME
+    assert ANSWER not in html
 
 
 def test_escalation_reason_survives_a_later_holder_handoff(fresh):
@@ -205,6 +213,7 @@ def test_stuck_plan_without_supervisor_keeps_owner_recovery_actions(fresh):
     assert stale["actions"] == ["requeue", "reassign", "park"]
     assert "claim that ran out" in stale["why"]
     html = home(fresh, card)
-    assert ">Answer<" in html
-    assert all(f"need-{action}" in html for action in stale["actions"])
-    assert "need-approve" not in html
+    assert all(f"need-{action}" in html for action in stale["actions"]), NO_HOME
+    assert APPROVE not in html and "need-approve" not in html
+    # The owner can still answer the holder: an Answer link to the card.
+    assert f'href="#/card/{card["number"]}">Answer<' in html, NO_HOME

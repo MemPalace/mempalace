@@ -1,7 +1,9 @@
 """Workspace front settings and operator-controlled key access."""
 
+import ipaddress
 import os
 import re
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -19,7 +21,7 @@ CREATE TABLE IF NOT EXISTS chat_model_settings (
     provider TEXT NOT NULL,                   -- #187: 'none'|'openai_compatible'|'anthropic'
     model TEXT NOT NULL DEFAULT '',
     base_url TEXT,                            -- openai_compatible only (required there); NULL otherwise
-    key_ref TEXT,                             -- 'env:COMMONPLACE_CHAT_KEY_<NAME>' only; operator-allowlisted workspaces only; never returned
+    key_ref TEXT,                             -- 'env:COMMONPLACE_CHAT_KEY_<NAME>' only; operator-allowlisted workspaces only; references visible to owners
     daily_limit INTEGER NOT NULL DEFAULT 200 CHECK (daily_limit BETWEEN 0 AND 2000),
     user_daily_limit INTEGER NOT NULL DEFAULT 50 CHECK (user_daily_limit BETWEEN 0 AND 2000),  -- m11; validated <= daily_limit
     updated_by TEXT NOT NULL,
@@ -34,14 +36,51 @@ def ensure_schema(db) -> None:
         db._conn.executescript(_SCHEMA)
 
 
-def front(db, workspace_id: str) -> FrontSettings:
+class LocalProviderMismatch(ValueError):
+    pass
+
+
+class NotLoopback(ValueError):
+    pass
+
+
+def loopback_host(host):
+    if host == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+        return address.is_loopback and getattr(address, "ipv4_mapped", None) is None
+    except ValueError:
+        return False
+
+
+def is_local(config):
+    try:
+        return config.provider == "openai_compatible" and loopback_host(
+            urlsplit(config.base_url or "").hostname
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+@dataclass(frozen=True)
+class ResolvedFront(FrontSettings):
+    inherited: bool = False
+    applies: bool = True
+
+    def public(self):
+        return {**super().public(), "inherited": self.inherited, "applies": self.applies}
+
+
+def front(db, workspace_id: str, board: str | None = None) -> FrontSettings:
     with db._lock:
         row = db._conn.execute(
-            "SELECT * FROM chat_model_settings WHERE workspace_id=? AND scope='*' AND role='front'",
-            (workspace_id,),
+            "SELECT * FROM chat_model_settings WHERE workspace_id=? AND scope IN (?, '*') "
+            "AND role='front' ORDER BY (scope=?) DESC LIMIT 1",
+            (workspace_id, board or "*", board or "*"),
         ).fetchone()
     if row is None:
-        return FrontSettings(
+        return ResolvedFront(
             workspace_id,
             True,
             "none",
@@ -53,7 +92,7 @@ def front(db, workspace_id: str) -> FrontSettings:
             None,
             None,
         )
-    return FrontSettings(
+    config = ResolvedFront(
         workspace_id,
         bool(row["enabled"]),
         row["provider"],
@@ -64,6 +103,11 @@ def front(db, workspace_id: str) -> FrontSettings:
         row["user_daily_limit"],
         row["updated_by"],
         row["updated_at"],
+        inherited=board is not None and row["scope"] == "*",
+    )
+    return replace(
+        config,
+        applies=not (config.inherited and config.provider != "none" and not is_local(config)),
     )
 
 
@@ -81,11 +125,16 @@ def set_front(db, principal, body: dict) -> FrontSettings:
     }
     if (
         not isinstance(body, dict)
-        or set(body) != {"front"}
+        or "front" not in body
+        or set(body) - {"front", "scope", "mode"}
         or not isinstance(body["front"], dict)
         or set(body["front"]) - allowed
     ):
         raise ValueError("Invalid chat settings")
+    scope = body.get("scope", "*")
+    mode = body.get("mode")
+    if not isinstance(scope, str) or not scope or mode not in (None, "local", "hosted"):
+        raise ValueError("Invalid chat scope or mode")
     data = body["front"]
     enabled = data.get("enabled", True)
     provider = data.get("provider", "none")
@@ -109,6 +158,17 @@ def set_front(db, principal, body: dict) -> FrontSettings:
         not isinstance(key_ref, str) or types.KEY_REF.fullmatch(key_ref) is None
     ):
         raise ValueError("Invalid chat key reference")
+    if mode == "local":
+        if provider != "openai_compatible":
+            raise LocalProviderMismatch()
+        if base_url is None:
+            base_url = "http://127.0.0.1:11434"
+        try:
+            local = provider == "openai_compatible" and loopback_host(urlsplit(base_url).hostname)
+        except (ValueError, TypeError):
+            local = False
+        if not local:
+            raise NotLoopback()
     if provider == "openai_compatible":
         try:
             webhooks.validate_url(base_url)
@@ -135,7 +195,7 @@ def set_front(db, principal, body: dict) -> FrontSettings:
         or not 0 <= user_daily_limit <= daily_limit <= types.DAILY_LIMIT_MAX
     ):
         raise ValueError("Invalid chat daily limits")
-    settings = FrontSettings(
+    settings = ResolvedFront(
         principal.workspace_id,
         enabled,
         provider,
@@ -147,6 +207,8 @@ def set_front(db, principal, body: dict) -> FrontSettings:
         principal.user_id,
         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
+    if scope != "*" and settings.provider != "none" and not is_local(settings) and mode != "hosted":
+        raise ValueError("Turn on is required for a board's hosted provider")
     if key_ref is not None and not key_allowed(settings):
         raise types.ChatDenied("key references need operator approval")
     with db._lock, db._tx() as conn:
@@ -154,9 +216,10 @@ def set_front(db, principal, body: dict) -> FrontSettings:
             "INSERT OR REPLACE INTO chat_model_settings "
             "(workspace_id, scope, role, enabled, provider, model, base_url, key_ref, "
             "daily_limit, user_daily_limit, updated_by, updated_at) "
-            "VALUES (?, '*', 'front', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, 'front', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 settings.workspace_id,
+                scope,
                 int(enabled),
                 provider,
                 model,
@@ -170,6 +233,7 @@ def set_front(db, principal, body: dict) -> FrontSettings:
         )
         db.audit(
             action="chat.settings",
+            reason=mode or "legacy",
             decision="ok",
             workspace_id=principal.workspace_id,
             user_id=principal.user_id,
@@ -204,3 +268,23 @@ def key_allowed(settings: FrontSettings) -> bool:
 def _allowlist(name: str, *, lower: bool = False) -> set[str]:
     entries = {entry.strip() for entry in os.environ.get(name, "").split(",") if entry.strip()}
     return {entry.lower() for entry in entries} if lower else entries
+
+
+def hosted_options(workspace_id):
+    if workspace_id not in _allowlist(types.KEY_WORKSPACES_ENV):
+        return []
+    refs = sorted("env:" + name for name in os.environ if types.KEY_REF.fullmatch("env:" + name))
+    hosts = sorted(_allowlist(types.KEY_HOSTS_ENV, lower=True))
+    return [
+        {
+            "provider": provider,
+            "keys": [
+                {"ref": ref, "label": f"Saved key {i} · {provider}"}
+                for i, ref in enumerate(refs, 1)
+            ],
+            "base_urls": ["https://" + host for host in hosts]
+            if provider == "openai_compatible"
+            else [],
+        }
+        for provider in ("anthropic", "openai_compatible")
+    ]

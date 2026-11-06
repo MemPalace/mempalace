@@ -1,0 +1,46 @@
+/* Dock chrome follows the shared Workbench tokens. Message styling lives in chat.css. */
+.chat-toggle { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 6px 0 10px; border-radius: var(--r); border: 1px solid var(--line-strong); background: var(--surface); color: var(--text); font-weight: 600; white-space: nowrap; }
+.chat-toggle kbd { margin-left: 2px; }
+.chat-toggle[aria-expanded="true"] { background: var(--text); color: var(--surface, #FEFEFC); border-color: var(--text); }
+.chat-toggle[aria-expanded="true"] kbd { color: var(--surface); background: transparent; border-color: currentColor; }
+.ct-chip { font-size: 11.5px; line-height: 16px; font-weight: 650; padding: 1px 7px; border-radius: 9px; }
+.ct-chip.new { background: var(--accent-weak); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.ct-chip.off { color: var(--text-2); box-shadow: inset 0 0 0 1px var(--line-strong); font-weight: 500; }
+.chat-toggle[aria-expanded="true"] .ct-chip.off { color: var(--surface); box-shadow: inset 0 0 0 1px currentColor; }
+.chatpane { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface); border-left: 1px solid var(--line); overflow: hidden; }
+.chatpane[hidden], .chat-about[hidden] { display: none !important; }
+.chat-head { display: flex; align-items: center; gap: 10px; min-height: 56px; padding: 8px 10px 8px 16px; border-bottom: 1px solid var(--line); flex: none; }
+.chat-head .ch-t { flex: 1; min-width: 0; }
+.chat-head h2 { font-size: 15px; line-height: 20px; font-weight: 650; }
+.chat-head .ch-ic { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 1px solid var(--line-strong); border-radius: var(--r); color: var(--text-2); }
+.chat-head .ch-status { margin: 0; font-size: 12px; line-height: 16px; color: var(--text-2); }
+.chat-head .ch-status[hidden] { display: none; }
+.chat-head .btn { flex: none; }
+.chat-dock-content { display: flex; flex: 1; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
+.chat-dock-content > .chat-view { flex: 1; min-height: 0; }
+/* The pane inside the dock stays in flow: shell rules for the docked .chatpane must not
+   lift it over the dock header or the strip. The dock header names the chat and closes it. */
+#chat-content > .chat-view { position: static; width: auto; height: auto; z-index: auto; box-shadow: none; border: 0; }
+#chat-content .chat-header { position: static; }
+/* M5: the docked chat has no project picker, board link or status tabs; the dock header carries
+   the name and the one-line status. */
+#chat-content .chat-header { display: none; }
+#chat-content .chat-header > h2, #chat-content .chat-header > [data-close-chat] { display: none; }
+.chat-about { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; background: var(--accent-weak); color: var(--text); border-bottom: 1px solid var(--line); flex: none; font-size: 13px; }
+.chat-about-text { flex: 1; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.from-chat { border-bottom: 1px solid var(--line); }
+.chat-scrim { display: none; }
+@media (min-width: 1024px) {
+  .shell.chat-open > .chatpane { grid-column: 3; grid-row: 1; }
+}
+@media (min-width: 700px) and (max-width: 1023px) {
+  .shell.chat-open > .chatpane { position: fixed; top: 0; right: 0; bottom: 0; width: min(396px, calc(100vw - 48px)); z-index: 31; }
+  .shell.chat-open > .chat-scrim { display: block; position: fixed; inset: 0; z-index: 30; background: rgba(23,24,28,.42); }
+}
+@media (max-width: 699px) {
+  .shell.chat-open > .chatpane { position: fixed; inset: 0; width: auto; height: 100vh; height: 100dvh; border: 0; z-index: 31; padding-bottom: env(safe-area-inset-bottom); }
+  .chatpane .chat-head .btn, .chatpane .chat-about .btn { min-height: 44px; }
+  .chat-toggle { min-height: 44px; }
+  .chatpane textarea { font-size: 16px; }
+  .chatpane .chat-dock-content { flex: 1; min-height: 0; overflow: auto; }
+}

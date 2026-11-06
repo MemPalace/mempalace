@@ -47,7 +47,7 @@
 .decide-body { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
 .decide-card .meta { flex-wrap: wrap; }
 .decide-card .meta b { color: var(--strong); font-weight: 700; }
-.decide-title { font-weight: 700; color: var(--muted); overflow-wrap: anywhere; }
+.decide-title { display: flex; align-items: center; min-height: 24px; font-weight: 700; color: var(--muted); overflow-wrap: anywhere; }
 .decide-title:hover { text-decoration: underline; text-underline-offset: 3px; }
 .decide-q { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); }
 .decide-context { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); }
@@ -143,13 +143,18 @@
 @keyframes decide-rise { from { transform: translateY(8px) scale(0.985); opacity: 0.6; } to { transform: none; opacity: 1; } }
 @keyframes decide-flip { from { transform: perspective(900px) rotateY(-90deg); } to { transform: none; } }
 
-@media (max-width: 640px) {
-  .app[data-screen="decide"] { grid-template-rows: minmax(0, 1fr); height: 100dvh; }
-  .app[data-screen="decide"] :is(.head, .mtabs, #connection-state) { display: none; }
-  .app[data-screen="decide"] #content { padding: 0; overflow: hidden; }
+/* The shell sets data-screen; on phones the queue takes the whole screen without the shell chrome. */
+@media (max-width: 699px) {
+  .decide-mark { width: 44px; margin-left: -8px; }
+  .decide-title { min-height: 44px; }
+  /* `.two` matches the shell's own phone reset (height: auto), which loads after this file. */
+  .shell[data-screen="decide"], .shell.two[data-screen="decide"] { height: 100dvh; }
+  .shell[data-screen="decide"] .center { height: 100%; overflow: hidden; }
+  .shell[data-screen="decide"] :is(.head, .m-top, .m-tabs, #connection-state) { display: none; }
+  .shell[data-screen="decide"] #content { padding: 0; overflow: hidden; }
 }
 
-@media (min-width: 641px) {
+@media (min-width: 700px) {
   .decide { display: grid; grid-template-columns: 360px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 24px; }
   .decide-bar { display: none; }
   .decide-list { display: block; grid-column: 1; grid-row: 1; overflow: auto; min-height: 0; border: 1px solid var(--line); }
@@ -169,10 +174,10 @@
   .decide-done { padding: 0; }
   .decide .k { display: inline-grid; margin-left: auto; }
   .decide-yn .k, .decide-more .k, .decide-dock .opt.ask .k { margin-left: 8px; }
-  .decide-yn .opt.go .k { color: var(--bg); box-shadow: inset 0 0 0 1px rgba(14, 17, 22, 0.25); }
+  .decide-yn .opt.go .k { color: var(--bg); background: none; border-color: currentColor; box-shadow: inset 0 0 0 1px rgba(14, 17, 22, 0.25); }
 }
 
-@media (min-width: 641px) and (max-width: 1100px) {
+@media (min-width: 700px) and (max-width: 1100px) {
   .decide { display: flex; }
   .decide-list { display: none; }
   .decide-main { width: 100%; max-width: none; min-width: 0; }

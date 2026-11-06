@@ -1,5 +1,6 @@
 """Provider sign-in rendering and app boot behavior."""
 
+import os
 import re
 import shutil
 import subprocess
@@ -15,10 +16,15 @@ def node():
     return executable
 
 
-def test_signin_page_renders_and_handles_callback_errors(node):
+@pytest.mark.parametrize("selection", ["guards", "dialog", "modal", "create"])
+def test_signin_page_renders_and_handles_callback_errors(node, selection):
     script = Path(__file__).with_name("commonplace_signin_render.mjs")
+    if selection != "guards":
+        static = Path(__file__).parents[1] / "commonplace" / "web" / "static"
+        assert (static / "onboarding.js").exists(), "onboarding module missing"  # RED
     result = subprocess.run(
         [node, "--test", "--test-reporter=tap", str(script)],
+        env={**os.environ, "SIGNIN_CASE": selection},
         capture_output=True,
         text=True,
         check=False,

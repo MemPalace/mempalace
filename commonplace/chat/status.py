@@ -46,8 +46,14 @@ def snapshot(gateway, principal, board: str) -> dict:
         for item in items
         if item["board"] == board
     }
-    config = settings.front(gateway.db, principal.workspace_id)
-    mode = "off" if not config.enabled else "basic" if config.provider == "none" else "model"
+    config = settings.front(gateway.db, principal.workspace_id, board)
+    mode = (
+        "off"
+        if not config.enabled or not config.applies
+        else "basic"
+        if config.provider == "none"
+        else "model"
+    )
     model = f"{config.provider}/{config.model}" if mode == "model" else None
     runner = None
     if config.enabled and config.provider == "none" and getattr(gateway, "runner_installed", False):

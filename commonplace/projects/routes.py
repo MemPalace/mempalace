@@ -4,7 +4,7 @@ from commonplace import redact
 from commonplace.boards.service import BoardService, WingRefused, project_wing, shared_wing
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import path_parts, read_json, require_principal, send_json
-from commonplace.projects import connect, models, seats, wing
+from commonplace.projects import connect, limits, models, seats, wing
 from commonplace.projects.types import ProjectDenied
 
 
@@ -17,6 +17,9 @@ def _person(gateway, h):
 
 
 def _view(gateway, principal, board):
+    service = BoardService(ToolContext(principal=principal, gateway=gateway))
+    with service.store.connection() as conn:
+        project_limits = limits.get(conn, board["id"])
     choices = models.get(gateway.db, principal.workspace_id, board["slug"])
     return {
         "board": board["slug"],
@@ -27,6 +30,7 @@ def _view(gateway, principal, board):
         },
         "name": redact.redact(board["name"])[0],
         "main": seats.main(gateway, principal, board["slug"]).public(),
+        "limits": project_limits,
         "models": {
             role: choice.public() if choice is not None else None
             for role, choice in choices.items()
@@ -46,8 +50,9 @@ def install(gateway) -> None:
             h.command == "POST" and len(parts) == 3 and parts[1:] == ["orchestrator", "connect"]
         )
         configuring = h.command == "PUT" and len(parts) == 2 and parts[1] == "models"
+        limiting = h.command == "PUT" and len(parts) == 2 and parts[1] == "limits"
         owning = h.command == "POST" and len(parts) == 2 and parts[1] == "wing"
-        if not (viewing or connecting or configuring or owning):
+        if not (viewing or connecting or configuring or owning or limiting):
             send_json(h, 404, {"error": "Not found"})
             return
         if not viewing and principal.role != "owner":
@@ -89,6 +94,9 @@ def install(gateway) -> None:
                     board = service._board(conn, slug)
                 status, payload = 200, {**_view(gateway, principal, board), **result}
             else:
+                if limiting:
+                    with service.transaction() as conn:
+                        limits.put(conn, board["id"], body)
                 if configuring:
                     models.put(gateway.db, principal, slug, body)
                 status, payload = 200, _view(gateway, principal, board)

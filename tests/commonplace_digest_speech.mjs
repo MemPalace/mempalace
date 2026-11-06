@@ -69,26 +69,34 @@ const app = await readFile(new URL("../commonplace/web/static/app.js", import.me
 const functionSource = (start, end) => app.slice(app.indexOf(start), app.indexOf(end, app.indexOf(start)));
 const document = { activeElement: null, title: "" };
 let button = null, buttonsCreated = 0;
-const elements = { "#title": {}, "#head-actions": {}, "#digest-captions": {} };
-// Home draws the Speak button in its Needs you box, inside #content.
-elements["#content"] = {
-  set innerHTML(markup) {
-    if (document.activeElement === button) document.activeElement = null;
-    button = markup.includes('data-action="speak-digest"') ? {
-      dataset: {}, attributes: {},
-      setAttribute(name, value) { this.attributes[name] = value; },
-      focus() { document.activeElement = this; },
-      replaceWith(node) { button = node; },
-    } : null;
-    if (button) buttonsCreated++;
-  },
+// The Speak button may live in the header actions or in the screen content; either container
+// recreates it when redrawn, and redrawing its container drops the old node's focus.
+const container = () => {
+  const node = {
+    set innerHTML(markup) {
+      if (button?.owner === node && document.activeElement === button) document.activeElement = null;
+      if (markup.includes('data-action="speak-digest"')) {
+        button = {
+          owner: node, dataset: {}, attributes: {},
+          setAttribute(name, value) { this.attributes[name] = value; },
+          focus() { document.activeElement = this; },
+          replaceWith(next) { button = next; },
+        };
+        buttonsCreated++;
+      } else if (button?.owner === node) button = null;
+    },
+    querySelector: () => null,
+  };
+  return node;
 };
+const elements = { "#title": {}, "#head-actions": container(), "#content": container(), "#card-panel": { hidden: true }, "#digest-captions": {} };
 const context = {
   document, root: { querySelector: (selector) => selector === '[data-action="speak-digest"]' ? button : elements[selector] },
   speech: { supported: true }, speechState: { active: false, text: "" },
-  state: { needs: {}, open: [], boards: [], route: "#/" }, needsCards: () => [],
+  state: { needs: {}, open: [], boards: [], route: "#/needs", base: "#/needs" }, needsCards: () => [],
   homeView: ({ speak }) => (speak ? '<button data-action="speak-digest">Speak</button>' : ""),
   dot: () => "", taskRow: () => "", children: () => "",
+  createNeeds: () => ({ show: async () => {}, stop() {} }), api() {}, singleKeysEnabled: () => true,
 };
 const view = runInNewContext([
   functionSource("function speechView()", "\nconst prLink"),

@@ -52,11 +52,16 @@ def node(payload):
         pytest.fail("node is required")
     root = Path(__file__).resolve().parents[1]
     code = """
-import * as home from './commonplace/web/static/home.js';
+import * as needs from './commonplace/web/static/needs.js';
 import * as decide from './commonplace/web/static/decide.js';
 const p=JSON.parse(process.argv[1]);
-const rows={dot:()=>'',taskRow:c=>c.title};
-console.log(JSON.stringify({html:home.homeView(p,rows),kind:typeof decide.eventItem,
+// The owner's Needs me: the queue, plus the item detail the shell draws for this card.
+let html='';
+if (p.card) {
+  const item=needs.needsItems(p.needs).find(i=>i.card.number===p.card.number);
+  html=needs.renderNeeds({needs:p.needs})+needs.renderNeedDetail(needs.needsCard(p.needs,p.card),{kind:item?.kind});
+}
+console.log(JSON.stringify({html,kind:typeof decide.eventItem,
 event:typeof decide.eventItem==='function'?decide.eventItem(p.event||{},x=>x):''}));
 """
     out = subprocess.run(
@@ -70,8 +75,14 @@ event:typeof decide.eventItem==='function'?decide.eventItem(p.event||{},x=>x):''
     return json.loads(out.stdout)
 
 
+# The owner's Approve (held for 60 seconds) and decision answers, as Needs me draws them.
+APPROVE = "data-needs-approve"
+ANSWER = "data-needs-choice"
+NO_HOME = "no Needs me control for this action; it needs an owner decision"
+
+
 def home(fresh, c):
-    return node({"open": [fresh.owner.task_show(c["number"])], "needs": fresh.owner.needs_me()})[
+    return node({"card": fresh.owner.task_show(c["number"]), "needs": fresh.owner.needs_me()})[
         "html"
     ]
 
@@ -85,7 +96,7 @@ def start(hub, agent, monkeypatch):
 def test_r01(hub, fresh):
     k, c = setup(fresh)
     html = home(fresh, c)
-    assert ">Approve<" not in html  # RED
+    assert APPROVE not in html  # RED
 
 
 def test_r02(hub, fresh):
@@ -103,7 +114,7 @@ def test_r03(hub, fresh):
 def test_r04(hub, fresh):
     c = fresh.owner.task_add(board="work", title="Synthetic owner plan", labels=["plan"])
     assert c["number"] in numbers(fresh.owner.needs_me(), "plans")  # RED
-    assert ">Approve<" in home(fresh, c)
+    assert APPROVE in home(fresh, c), NO_HOME
     assert fresh.owner.task_show(c["number"])["can_approve"]
     status, out = api(hub, fresh.cookie, "POST", f"/api/cards/{c['number']}/approve", {})
     assert status == 200 and "plan" not in out["labels"]
@@ -125,7 +136,7 @@ def test_r06(hub, fresh):
         claim=True,
     )
     assert row["number"] in numbers(t.work.needs_me(), "approvals")  # RED
-    assert ">Approve<" not in home(fresh, row)
+    assert APPROVE not in home(fresh, row)
     assert approve_compat(hub, t, row["number"])[0]
     out = fresh.owner.task_show(row["number"])
     assert out["status"] == "doing" and out["assignee"] == c.principal.actor
@@ -151,7 +162,8 @@ def test_r08(hub, fresh):
     report = fresh.owner.needs_me()
     item = next(c for c in report["backlog_from_agents"] if c["number"] == row["number"])
     assert '"Synthetic uncertainty"' in item["why"]
-    assert "need-approve" in home(fresh, row)
+    html = home(fresh, row)
+    assert APPROVE in html and "need-approve" not in html
     assert row["number"] not in numbers(p.work.needs_me(), "approvals")
     emitted = events.after(hub.db, fresh.workspace)
     event = next(e for e in reversed(emitted) if e["kind"] == "card.review_needed")
@@ -175,7 +187,7 @@ def test_r09(hub, fresh):
     )
     assert ok  # RED
     assert row["number"] in numbers(fresh.owner.needs_me(), "plans")
-    assert ">Approve<" in home(fresh, row)
+    assert APPROVE in home(fresh, row), NO_HOME
     assert row["number"] in evaluate.current(hub.gateway, fresh.owner.principal)
 
 
@@ -494,7 +506,7 @@ def test_guard(hub, fresh, monkeypatch, case):
         fresh.owner.task_approve(row["number"])
         c.work.task_take_next(task=row["number"])
         c.work.ask(REVIEW_QUESTION, REVIEW_OPTIONS, task=row["number"], context=REVIEW_CONTEXT)
-        assert ">Answer<" in home(fresh, row)
+        assert ANSWER in home(fresh, row)
     elif case == "g07":
         k = fresh.connect("unrelated")
         foreign = fresh.connect("foreign", workspace_ref=hub.workspace, user_ref=hub.admin)
@@ -512,7 +524,8 @@ def test_guard(hub, fresh, monkeypatch, case):
         assert not path.exists()
     elif case == "g09":
         hub.db.revoke(p.id, actor=fresh.user, workspace_ref=fresh.workspace)
-        assert "need-approve" in home(fresh, row)
+        html = home(fresh, row)
+        assert APPROVE in html and "need-approve" not in html
     elif case in ("g11", "g12", "g13", "g14"):
         if case == "g11":
             a = fresh.connect("restricted-root", trust="untrusted", write_wing="inbox")
