@@ -26,7 +26,7 @@ def load() -> Config | None:
     try:
         webhooks.validate_url(value)
         parts = urlsplit(value)
-        if parts.path not in ("", "/") or "?" in value or ";" in value or "@" in value:
+        if parts.path not in ("", "/") or any(c in value for c in "?#;@"):
             raise ValueError
     except (ToolError, ValueError):
         logger.warning("invalid COMMONPLACE_NTFY_URL")
