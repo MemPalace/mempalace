@@ -23,7 +23,6 @@ from mempalace.write_routing import (
     choose_write_route,
 )
 
-
 _SERVICE_ENV_KEYS = (
     "MEMPALACE_PALACE_PATH",
     "MEMPAL_PALACE_PATH",
@@ -143,8 +142,8 @@ def test_cli_direct_policy_selects_direct():
             operation="mine",
         )
 
-    assert routing.use_direct is True
     assert routing.use_daemon is False
+    assert routing.decision.blocked is False
 
 
 def test_explicit_direct_overrides_require_policy():
@@ -157,7 +156,8 @@ def test_explicit_direct_overrides_require_policy():
         )
 
     config.assert_not_called()
-    assert routing.use_direct is True
+    assert routing.use_daemon is False
+    assert routing.decision.blocked is False
     assert routing.source == "--direct"
     assert routing.explicit is True
 
@@ -313,6 +313,33 @@ def test_cmd_mine_payload_room_defaults_to_none(tmp_path):
     assert payload["room"] is None
 
 
+@pytest.mark.parametrize("palace", [None, "given"])
+def test_cmd_mine_daemon_payload_says_whether_palace_was_given(tmp_path, palace):
+    """The daemon job must know --palace was passed, as the direct path does."""
+    args = _mine_args(
+        tmp_path,
+        palace=str(tmp_path / "palace") if palace else None,
+        source="media",
+        wing="photos",
+        related_drawer_id="drawer_x",
+    )
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch("mempalace.cli._submit_daemon_cli_job") as submit,
+    ):
+        cli.cmd_mine(args)
+
+    payload = submit.call_args.args[1]
+    assert payload["explicit_palace"] is bool(palace)
+    assert payload["source_adapter"] == "media"
+    assert payload["wing"] == "photos"
+    assert payload["related_drawer_id"] == "drawer_x"
+
+
 def test_cmd_mine_direct_preserves_direct_path(tmp_path):
     args = _mine_args(tmp_path)
 
@@ -332,6 +359,43 @@ def test_cmd_mine_direct_preserves_direct_path(tmp_path):
 
     submit.assert_not_called()
     direct_mine.assert_called_once()
+
+
+def test_cmd_mine_direct_carries_room_override(tmp_path):
+    """--room is not dropped when the mine runs in this process."""
+    args = _mine_args(tmp_path, room="docs")
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.DIRECT),
+        ),
+        patch("mempalace.cli._mine_args_forwardable", return_value=False),
+        patch("mempalace.miner.mine") as direct_mine,
+    ):
+        cli.cmd_mine(args)
+
+    assert direct_mine.call_args.kwargs["room"] == "docs"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"mode": "convos"}, {"mode": "extract"}, {"source": "media"}, {"room": "bad/room"}],
+)
+def test_cmd_mine_refuses_a_room_it_could_not_honor(tmp_path, capsys, overrides):
+    args = _mine_args(tmp_path, **{"room": "docs", **overrides})
+
+    with (
+        patch("mempalace.cli._resolve_cli_write_routing_or_exit") as routing,
+        patch("mempalace.miner.mine") as direct_mine,
+        pytest.raises(SystemExit) as exc,
+    ):
+        cli.cmd_mine(args)
+
+    assert exc.value.code == 2
+    assert "mempalace:" in capsys.readouterr().err
+    routing.assert_not_called()
+    direct_mine.assert_not_called()
 
 
 def test_daemon_submission_failure_never_falls_back_direct(
@@ -875,6 +939,31 @@ def test_service_run_mine_forwards_valid_prescanned_files(
         first.resolve(),
         second.resolve(),
     ]
+
+
+@pytest.mark.parametrize(
+    "payload_value,expected",
+    [(True, True), (False, False), (None, False)],
+)
+def test_service_run_mine_passes_include_subagents_to_convo_miner(
+    tmp_path, payload_value, expected
+):
+    convos = tmp_path / "convos"
+    convos.mkdir()
+    payload = {
+        "palace_path": str(tmp_path / "palace"),
+        "source": str(convos),
+        "mode": "convos",
+        "dry_run": True,
+    }
+    if payload_value is not None:
+        payload["include_subagents"] = payload_value
+
+    with patch("mempalace.convo_miner.mine_convos") as mine_convos:
+        result = service.run_mine(payload)
+
+    assert result["success"] is True
+    assert mine_convos.call_args.kwargs["include_subagents"] is expected
 
 
 def test_service_run_mine_rejects_prescanned_path_outside_project(

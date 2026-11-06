@@ -19,22 +19,26 @@ Usage:
 import hashlib
 import json
 import logging
-import os
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 
+from . import paths
 from .config import MempalaceConfig
+from .fsio import decode_source, encoding_metadata
 from .miner import _extract_entities_for_metadata
 from .palace import (
+    StaleDrawerPurgeFailed,
     build_closet_lines,
     get_closets_collection,
     get_collection,
     mine_lock,
+    open_aaak_collection,
     purge_file_closets,
     upsert_closet_lines,
+    write_file_drawers,
 )
 from .source_identity import identity_metadata
+from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +52,7 @@ def _state_file_for(palace_path: str, diary_dir: Path) -> Path:
     pointing at the same palace each get an independent state file. The
     state file is *never* written inside the user's diary directory.
     """
-    state_root = Path(os.path.expanduser("~")) / ".mempalace" / "state"
+    state_root = paths.state_path("state")
     state_root.mkdir(parents=True, exist_ok=True)
     key = hashlib.sha256(f"{palace_path}|{diary_dir}".encode()).hexdigest()[:24]
     return state_root / f"diary_ingest_{key}.json"
@@ -66,15 +70,15 @@ def _split_entries(text):
 
 
 def _diary_drawer_id_entry(wing: str, date_str: str, entry_idx: int, entry_chunk_idx: int) -> str:
-    """Per-entry, per-chunk drawer ID introduced in #1539.
+    """Per-entry, per-chunk drawer ID.
 
     The ``v2_`` prefix distinguishes new IDs from the legacy file-level
-    scheme (one drawer per file). Legacy drawers from pre-#1539 palaces
+    scheme (one drawer per file). Legacy file-level drawers
     are auto-purged on any ``ingest_diaries`` call that triggers a full
-    rebuild (``force=True`` or detected content change). The per-source
-    ``delete(where=...)`` step on full rebuild collects both legacy and
-    stale v2 drawers via the ``source_file`` metadata key, so the
-    schema migration runs as a side effect of normal use.
+    rebuild (``force=True`` or detected content change): the rebuild's
+    prune drops every drawer of the ``source_file`` it did not just write,
+    legacy and stale v2 alike, so the schema migration runs as a side
+    effect of normal use.
     """
     suffix = hashlib.sha256(
         f"{wing}|{date_str}|{entry_idx}|{entry_chunk_idx}".encode()
@@ -121,13 +125,14 @@ def ingest_diaries(
 
     drawers_col = get_collection(palace_path)
     closets_col = get_closets_collection(palace_path)
+    aaak_col = open_aaak_collection(palace_path)
     chunk_size = MempalaceConfig().chunk_size
 
     days_updated = 0
     closets_created = 0
 
     for diary_path in diary_files:
-        text = diary_path.read_text(encoding="utf-8", errors="replace")
+        text, source_encoding = decode_source(diary_path.read_bytes(), universal_newlines=True)
         if len(text.strip()) < 50:
             continue
 
@@ -143,7 +148,7 @@ def ingest_diaries(
         prev_hash = prev_entry.get("content_hash")
         prev_size = prev_entry.get("size", 0)
         curr_size = len(text)
-        curr_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        curr_hash = hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
         if not force:
             if prev_hash is not None:
                 if curr_hash == prev_hash:
@@ -159,7 +164,7 @@ def ingest_diaries(
         # not only on entry-count growth.
         content_changed = prev_hash is not None and curr_hash != prev_hash
 
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = utc_now_iso()
         entities = _extract_entities_for_metadata(text)
         source_file = str(diary_path)
 
@@ -179,93 +184,48 @@ def ingest_diaries(
                 "filed_at": now_iso,
             }
             # Which directory this diary was read from, so ``sync`` decides an
-            # ingested drawer by the same reading as a mined one (#2320).
+            # ingested drawer by the same reading as a mined one.
             base_meta.update(identity_metadata(source_file))
+            base_meta.update(encoding_metadata(source_encoding))
             if entities:
                 base_meta["entities"] = entities
 
-            # On full rebuild, purge ALL prior drawers for this source_file
-            # before writing fresh entries. This covers three cases in one
-            # step: (a) legacy pre-#1539 file-level drawers under the old
-            # ``drawer_diary_`` prefix, (b) v2 drawers from a prior pass
-            # where the file had MORE entries than the current run (entry
-            # deletion would otherwise leave trailing orphan drawers), and
-            # (c) in-place edits that shift content across entry boundaries.
-            if full_rebuild:
-                try:
-                    drawers_col.delete(where={"source_file": source_file})
-                except Exception as exc:
-                    # ChromaDB ``delete(where=...)`` against an empty collection
-                    # returns silently rather than raising, so this catch only
-                    # fires on real backend errors (locked DB, schema mismatch,
-                    # transient I/O). Log at debug to preserve diagnostics
-                    # without aborting the rebuild: the upsert below is the
-                    # load-bearing write, and if it also fails the state file
-                    # is left unchanged so the next pass retries cleanly.
-                    logger.debug(
-                        "legacy purge skipped for %s: %s",
-                        source_file,
-                        exc,
-                        exc_info=True,
-                    )
-
             # Per-entry drawers, with character chunking inside any entry
             # whose serialized text exceeds chunk_size. ``chunk_index`` is
-            # a global counter across the file so the searcher's
-            # ``_expand_with_neighbors`` (which queries by source_file +
-            # chunk_index) can stitch sibling chunks back together
-            # regardless of entry boundary. ``entry_index`` and
+            # a global counter across the file so the searcher's closet
+            # enrichment (which orders a source's chunks by chunk_index) can
+            # show sibling chunks as context regardless of entry boundary. ``entry_index`` and
             # ``entry_chunk_index`` are preserved for entry-grouping
             # consumers.
-            #
-            # Accumulate all drawers for the file into one batched upsert
-            # so the embedding pass either commits every chunk or none.
-            # A mid-loop embedding failure would otherwise leave a
-            # half-written day's drawers behind, which the next
-            # incremental pass would skip (state file already updated)
-            # and the searcher would silently return partial results.
-            global_chunk_index = 0
-            batch_ids: list[str] = []
-            batch_docs: list[str] = []
-            batch_metas: list[dict] = []
+            drawers = []
             for entry_idx, (header, body) in enumerate(entries):
                 entry_text = f"{header}\n{body}" if body else header
-                if len(entry_text) <= chunk_size:
-                    batch_ids.append(_diary_drawer_id_entry(wing, date_str, entry_idx, 0))
-                    batch_docs.append(entry_text)
-                    batch_metas.append(
-                        {
-                            **base_meta,
-                            "chunk_index": global_chunk_index,
-                            "entry_index": entry_idx,
-                            "entry_chunk_index": 0,
-                            "entry_header_preview": header[:120],
-                        }
-                    )
-                    global_chunk_index += 1
-                else:
-                    for entry_chunk_idx, start in enumerate(range(0, len(entry_text), chunk_size)):
-                        batch_ids.append(
-                            _diary_drawer_id_entry(wing, date_str, entry_idx, entry_chunk_idx)
-                        )
-                        batch_docs.append(entry_text[start : start + chunk_size])
-                        batch_metas.append(
-                            {
-                                **base_meta,
-                                "chunk_index": global_chunk_index,
-                                "entry_index": entry_idx,
-                                "entry_chunk_index": entry_chunk_idx,
-                                "entry_header_preview": header[:120],
-                            }
-                        )
-                        global_chunk_index += 1
+                for entry_chunk_idx, start in enumerate(range(0, len(entry_text), chunk_size)):
+                    meta = {
+                        **base_meta,
+                        "chunk_index": len(drawers),
+                        "entry_index": entry_idx,
+                        "entry_chunk_index": entry_chunk_idx,
+                        "entry_header_preview": header[:120],
+                    }
+                    drawer_id = _diary_drawer_id_entry(wing, date_str, entry_idx, entry_chunk_idx)
+                    drawers.append((drawer_id, entry_text[start : start + chunk_size], meta))
 
-            if batch_ids:
-                drawers_col.upsert(
-                    ids=batch_ids,
-                    documents=batch_docs,
-                    metadatas=batch_metas,
+            # A full rebuild writes the new drawers, then drops the file's
+            # others: legacy file-level drawers, trailing entries the file no
+            # longer has, and their AAAK summaries. A failed prune leaves the
+            # state untouched, so the next ingest rebuilds the file again.
+            try:
+                write_file_drawers(
+                    drawers_col,
+                    source_file,
+                    drawers,
+                    prune=full_rebuild,
+                    aaak_col=aaak_col,
                 )
+            except StaleDrawerPurgeFailed as exc:
+                logger.warning("%s", exc)
+                continue
 
             new_entries = entries if full_rebuild else entries[prev_entry_count:]
             if new_entries:
@@ -274,9 +234,8 @@ def ingest_diaries(
                     entry_idx = offset if full_rebuild else prev_entry_count + offset
                     entry_text = f"{header}\n{body}" if body else header
                     # Closet references the canonical (entry_chunk_idx=0)
-                    # drawer for the entry. Searcher._expand_with_neighbors
-                    # stitches sibling chunks back via the
-                    # (source_file, chunk_index) pair.
+                    # drawer for the entry. Search enrichment finds sibling
+                    # chunks via the (source_file, chunk_index) pair.
                     entry_drawer_id = _diary_drawer_id_entry(wing, date_str, entry_idx, 0)
                     entry_lines = build_closet_lines(
                         source_file, [entry_drawer_id], entry_text, wing, "daily"
@@ -321,7 +280,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Ingest daily summaries into the palace")
     parser.add_argument("--dir", required=True, help="Path to daily_summaries directory")
-    parser.add_argument("--palace", default=os.path.expanduser("~/.mempalace/palace"))
+    parser.add_argument("--palace", default=paths.default_palace_path())
     parser.add_argument("--wing", default="diary")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()

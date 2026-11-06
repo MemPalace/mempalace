@@ -90,7 +90,7 @@ listed in `.gitignore` paths Cursor users typically already exclude.
 
 ## Related: the Cursor plugin
 
-The hooks here are **only one half** of MemPalace's Cursor integration. The other half is the [`.cursor-plugin/`](../../.cursor-plugin/) folder at the repo root, which packages MemPalace's MCP server, five slash commands, and the model-invocable `mempalace` skill as a regular Cursor plugin you can drop into `~/.cursor/plugins/local/mempalace`.
+The hooks here are **only one half** of MemPalace's Cursor integration. The other half is the [`.cursor-plugin/`](../../.cursor-plugin/) folder at the repo root, which packages MemPalace's MCP server, six slash commands, and the model-invocable `mempalace` skill as a regular Cursor plugin you can drop into `~/.cursor/plugins/local/mempalace`.
 
 The two install paths are orthogonal — install whichever you want, in any order:
 

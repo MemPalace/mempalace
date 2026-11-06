@@ -21,22 +21,23 @@ needs to know its memory backend changed shape underneath it.
 
 from __future__ import annotations
 
-import http.client
 import json
 import logging
 import os
 import sys
 import urllib.error
 
-from .hub_client import HUB_FORWARD_ENV, HUB_PROXY_TIMEOUT_S, discover_hub
-
+from .hub_client import (
+    FORWARD_ERRORS,
+    SEARCH_TOOL_NAMES,
+    HubClient,
+    proxy_error_response,
+    search_settings_overridden,
+)
+from .stored_text import dumps_client
 from .update_awareness import cached_update_status, schedule_update_check
 
 logger = logging.getLogger(__name__)
-
-# Shared with the in-server forwarder and the CLI forwarder.
-_HUB_FORWARD_ENV = HUB_FORWARD_ENV
-_HUB_PROXY_TIMEOUT_S = HUB_PROXY_TIMEOUT_S
 
 _DEGRADED_NOTICE = (
     "MemPalace is running WITHOUT its shared hub. This session is now serving "
@@ -86,13 +87,20 @@ def _is_plain_stdio_invocation(argv: list) -> bool:
     return True
 
 
+def _flag_value(argv: list, flag: str):
+    for i, arg in enumerate(argv):
+        if arg == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
 def _palace_path(argv: list):
     """Resolve the palace path without importing the server."""
-    for i, arg in enumerate(argv):
-        if arg == "--palace" and i + 1 < len(argv):
-            return argv[i + 1]
-        if arg.startswith("--palace="):
-            return arg.split("=", 1)[1]
+    palace = _flag_value(argv, "--palace")
+    if palace:
+        return palace
     try:
         from .config import MempalaceConfig
 
@@ -100,29 +108,6 @@ def _palace_path(argv: list):
     except Exception:
         logger.debug("palace path unresolved; serving locally", exc_info=True)
         return None
-
-
-def _hub_target(palace_path):
-    """Return ``(base_url, headers)`` for a live hub serving our palace, else None."""
-    return discover_hub(palace_path)
-
-
-def _forward(base_url: str, headers: dict, request: dict, palace_path: str):
-    """POST one JSON-RPC request to the hub; None for notifications (202)."""
-    from . import server_registry
-
-    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    with server_registry.urlopen_with_server_tokens(
-        palace_path,
-        f"{base_url}/mcp",
-        data=body,
-        headers=headers,
-        timeout=_HUB_PROXY_TIMEOUT_S,
-    ) as resp:
-        raw = resp.read()
-    if not raw:
-        return None
-    return json.loads(raw.decode("utf-8"))
 
 
 def _annotate_degraded(response):
@@ -216,10 +201,6 @@ class _LocalServer:
         self._module = None
         self._load_error: BaseException | None = None
 
-    @property
-    def loaded(self) -> bool:
-        return self._module is not None
-
     def load(self):
         if self._load_error is not None:
             raise self._load_error
@@ -271,29 +252,12 @@ class _LocalServer:
 
 
 def _proxy_error(request: dict, base_url: str, exc: Exception, local_error=None):
-    """Mirror the in-server proxy failure shape for a request we must not replay.
+    """The in-server proxy failure for a request we must not replay.
 
     ``local_error`` is why this process could not serve the request either.
     """
-    if request.get("id") is None:
-        return None
-    response = {
-        "jsonrpc": "2.0",
-        "id": request.get("id"),
-        "error": {
-            "code": -32000,
-            "message": f"palace hub proxy failed: {exc}",
-            "data": {
-                "hub": base_url,
-                "hint": (
-                    "The palace hub did not complete this request. Mutating tools "
-                    "are not replayed locally — the hub may still be executing the "
-                    "call. Check the hub process, then retry."
-                ),
-            },
-        },
-    }
-    if local_error is not None:
+    response = proxy_error_response(request, base_url, exc)
+    if response is not None and local_error is not None:
         response["error"]["data"]["local_server"] = f"could not start: {local_error}"
     return response
 
@@ -314,25 +278,35 @@ def _local_server_error(request: dict, exc: Exception):
     )
 
 
-def _handle(request: dict, palace_path, local: _LocalServer):
+def _search_stays_local(request: dict, backend) -> bool:
+    """A search whose settings this session chose itself, which the hub may not share."""
+    if request.get("method") != "tools/call":
+        return False
+    params = request.get("params")
+    if not isinstance(params, dict) or params.get("name") not in SEARCH_TOOL_NAMES:
+        return False
+    return search_settings_overridden(backend)
+
+
+def _handle(request: dict, palace_path, local: _LocalServer, backend=None):
     """Route one request: live hub first, this process otherwise."""
     if not isinstance(request, dict):
         # What the full server answers it with.
         return _json_rpc_error(None, -32600, "Invalid Request")
-    target = _hub_target(palace_path)
-    if target is not None:
-        base_url, headers = target
+    if _search_stays_local(request, backend):
+        # The hub is fine; this one search just runs with this session's settings.
         try:
-            return _annotate_forwarded_update_status(
-                request, _forward(base_url, headers, request, palace_path)
-            )
-        except (
-            urllib.error.URLError,
-            OSError,
-            TimeoutError,
-            ValueError,
-            http.client.HTTPException,
-        ) as exc:
+            module = local.load()
+        except Exception as exc:
+            logger.error("Local server could not start: %s", exc)
+            return _local_server_error(request, exc)
+        return module.handle_request(request)
+    hub = HubClient.discover(palace_path)
+    if hub is not None:
+        base_url = hub.base_url
+        try:
+            return _annotate_forwarded_update_status(request, hub.post(request))
+        except FORWARD_ERRORS as exc:
             # Reaching the hub and getting an HTTP error means it may have run
             # the call; so does any mid-flight failure on a mutating tool, an
             # answer that broke off (IncompleteRead, BadStatusLine) included.
@@ -360,7 +334,7 @@ def _handle(request: dict, palace_path, local: _LocalServer):
     return _annotate_degraded(module.handle_request(request))
 
 
-def _run_proxy_loop(palace_path) -> None:
+def _run_proxy_loop(palace_path, backend=None) -> None:
     for stream in (sys.stdin, sys.stdout):
         if hasattr(stream, "reconfigure"):
             try:
@@ -394,12 +368,12 @@ def _run_proxy_loop(palace_path) -> None:
             # leaves the id unknowable: the answer carries a null one, as the
             # hub's HTTP transport answers it.
             logger.error("Server error: %s", exc)
-            payload = json.dumps(_json_rpc_error(None, -32700, "Parse error"), ensure_ascii=False)
+            payload = dumps_client(_json_rpc_error(None, -32700, "Parse error"))
         else:
             try:
-                response = _handle(request, palace_path, local)
+                response = _handle(request, palace_path, local, backend)
                 if response is not None:
-                    payload = json.dumps(response, ensure_ascii=False)
+                    payload = dumps_client(response)
             except KeyboardInterrupt:
                 break
             except Exception:
@@ -410,9 +384,7 @@ def _run_proxy_loop(palace_path) -> None:
                 if req_id is None:
                     # A notification is owed no response, failure included.
                     continue
-                payload = json.dumps(
-                    _json_rpc_error(req_id, -32603, "Internal error"), ensure_ascii=False
-                )
+                payload = dumps_client(_json_rpc_error(req_id, -32603, "Internal error"))
 
         if payload is None:
             continue
@@ -440,10 +412,10 @@ def main() -> None:
         return mcp_server.main()
 
     palace_path = _palace_path(argv)
-    if _hub_target(palace_path) is None:
+    if HubClient.discover(palace_path) is None:
         from . import mcp_server
 
         return mcp_server.main()
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-    _run_proxy_loop(palace_path)
+    _run_proxy_loop(palace_path, _flag_value(argv, "--backend"))

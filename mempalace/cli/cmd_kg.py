@@ -13,20 +13,22 @@ def cmd_kg(args):
         save_normalize_plan,
     )
     from ..knowledge_graph import KnowledgeGraph
-    from ..palace_audit import resolve_kg_path
 
     action = getattr(args, "kg_action", None)
-    if action != "normalize":
-        print("usage: mempalace kg normalize [--vocabulary a,b,c] [--yes]")
+    if action not in ("normalize", "import-legacy"):
+        print("usage: mempalace kg {normalize,import-legacy} [options]")
         sys.exit(2)
-    explicit = bool(getattr(args, "palace", None))
-    palace_path = os.path.expanduser(args.palace) if explicit else MempalaceConfig().palace_path
+    palace = getattr(args, "palace", None)
+    palace_path = os.path.expanduser(palace) if palace else MempalaceConfig().palace_path
     config = MempalaceConfig(palace_path=palace_path)
+    if action == "import-legacy":
+        _kg_import_legacy(args, config)
+        return
     raw = getattr(args, "vocabulary", None)
     vocabulary = (
         tuple(v.strip().lower() for v in raw.split(",") if v.strip()) if raw else DEFAULT_VOCABULARY
     )
-    kg_path = resolve_kg_path(palace_path, explicit=explicit)
+    kg_path = paths.knowledge_graph_path(palace_path, explicit=bool(palace))
     if not os.path.isfile(kg_path):
         print(f"  No knowledge graph at {kg_path}.")
         sys.exit(1)
@@ -73,3 +75,55 @@ def cmd_kg(args):
         f"{result['skipped']} unchanged, {result['stale']} no longer open (left alone). "
         "Old wordings remain valid before that instant."
     )
+
+
+def _kg_import_legacy(args, config):
+    """Copy another graph file's facts into this palace's own graph, on request only."""
+    from ..knowledge_graph import import_graph_rows
+
+    source = os.path.expanduser(args.source) if args.source else paths.legacy_knowledge_graph_path()
+    target = os.path.join(config.palace_path, paths.KNOWLEDGE_GRAPH_FILENAME)
+    if not os.path.isfile(source):
+        print(f"  No knowledge graph at {source}.")
+        sys.exit(1)
+    if paths.same_path(source, target):
+        print(f"  {source} is already this palace's knowledge graph.")
+        sys.exit(1)
+    apply = bool(getattr(args, "yes", False))
+    if apply:
+        # The same cross-process writer lock as normalize: a hub or another
+        # CLI must not write facts while rows are copied in.
+        with _repair_lock(config.palace_path):
+            counts = import_graph_rows(source, target, apply=True)
+    else:
+        counts = import_graph_rows(source, target)
+    verb = "Copied" if apply else "Would copy"
+    for table, numbers in counts.items():
+        print(
+            f"  {verb} {numbers['added']} {table} from {source}; "
+            f"{numbers['present']} already in {target} were kept as they are."
+        )
+    conflicts = counts["triples"]["conflicts"]
+    if conflicts:
+        print(
+            f"\n  {len(conflicts)} current fact(s) not copied: the target or an earlier "
+            "accepted source fact holds a "
+            "different current value for the same subject and predicate. Add the ones "
+            "you want by hand (kg_supersede or kg_add):"
+        )
+        for c in conflicts:
+            print(
+                f"    {c['subject']} | {c['predicate']} | {c['object']} "
+                f"(here: {c['current_object']})"
+            )
+    id_conflicts = counts["triples"]["id_conflicts"]
+    if id_conflicts:
+        print(
+            f"\n  {len(id_conflicts)} fact ID conflict(s) not copied: the target keeps "
+            "a different fact or validity window under the same ID. Review these "
+            "facts before importing them:"
+        )
+        for triple_id in id_conflicts:
+            print(f"    {triple_id}")
+    if not apply:
+        print("\n  Nothing written. Re-run with --yes to copy them.")

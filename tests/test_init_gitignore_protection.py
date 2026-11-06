@@ -78,3 +78,15 @@ def test_gitignore_io_pins_utf8_and_defensive_decode(tmp_path):
 
     read_text.assert_called_once_with(encoding="utf-8", errors="replace")
     append_handle.assert_called_once_with(gitignore, "a", encoding="utf-8")
+
+
+def test_protects_the_config_name_the_project_actually_uses(tmp_path):
+    # A kept ``mempalace.yml`` (or legacy ``mempal.yaml``) is the file init
+    # updates and the miner reads, so it is the one that must stay out of git.
+    _git_init(tmp_path)
+    (tmp_path / "mempalace.yml").write_text("wing: w\n")
+    assert _ensure_mempalace_files_gitignored(tmp_path) is True
+    lines = (tmp_path / ".gitignore").read_text().splitlines()
+    assert "mempalace.yml" in lines
+    assert "entities.json" in lines
+    assert "mempalace.yaml" not in lines

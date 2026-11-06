@@ -24,11 +24,12 @@ from __future__ import annotations
 
 import json
 import os
-import re
-from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig
+from .fsio import atomic_write_json
+from .llm_client import parse_json_reply
+from .timeutil import utc_now_iso, utc_now_z
 
 NORMALIZE_SCHEMA_VERSION = 1
 DEFAULT_VOCABULARY = (
@@ -88,20 +89,6 @@ def _user_prompt(facts: list[dict], vocabulary: Iterable[str]) -> str:
     return "\n".join(lines)
 
 
-def _json_object(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise ValueError("LLM response held no JSON object")
-        return json.loads(match.group(0))
-
-
 def _humanize_prefix(obj: str, old_predicate: str) -> str:
     """``remediated_h1 ...`` → ``remediated h1 ...``: models tend to paste the old
     predicate verbatim at the front of the rewritten object."""
@@ -123,14 +110,14 @@ def plan_normalize(
         return {
             "schema_version": NORMALIZE_SCHEMA_VERSION,
             "vocabulary": list(vocabulary),
-            "planned_at": datetime.now(timezone.utc).isoformat(),
+            "planned_at": utc_now_iso(),
             "facts": [],
             "rejected": 0,
         }
     response = provider.classify(
         _PLAN_SYSTEM, _user_prompt(facts, vocabulary), json_mode=True, think=False
     )
-    data = _json_object(response.text)
+    data = parse_json_reply(response.text, expect=(dict, list))
     proposals = data.get("facts") if isinstance(data, dict) else data
     if not isinstance(proposals, list):
         raise ValueError("LLM response JSON has no 'facts' list")
@@ -166,7 +153,7 @@ def plan_normalize(
     return {
         "schema_version": NORMALIZE_SCHEMA_VERSION,
         "vocabulary": list(vocabulary),
-        "planned_at": datetime.now(timezone.utc).isoformat(),
+        "planned_at": utc_now_iso(),
         "proposed_by": f"{getattr(provider, 'name', 'llm')}/{getattr(provider, 'model', '')}",
         "facts": rows,
         "rejected": rejected,
@@ -180,10 +167,7 @@ def normalize_plan_path(config: MempalaceConfig) -> str:
 def save_normalize_plan(config: MempalaceConfig, plan: dict) -> str:
     path = normalize_plan_path(config)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic_write_json(path, plan, private=False, follow_symlinks=False)
     return path
 
 
@@ -215,7 +199,7 @@ def apply_normalize(kg, plan: dict, at: Optional[str] = None) -> dict:
     was closed or replaced while the plan sat under review is left alone
     and counted in ``stale`` instead of being resurrected.
     """
-    boundary = at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    boundary = at or utc_now_z()
     applied = skipped = stale = 0
     for row in plan["facts"]:
         if row["old_predicate"] == row["predicate"] and row["old_object"] == row["object"]:

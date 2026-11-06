@@ -20,14 +20,19 @@ reviewable list instead:
 from __future__ import annotations
 
 import json
+import logging
 import os
-from datetime import datetime, timezone
+from itertools import combinations
 from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name
+from .fsio import atomic_write_json
 from .hallways import entity_spelling_key, is_generic_entity, same_file_spelling
+from .timeutil import utc_now_iso
 
-PROPOSAL_SCHEMA_VERSION = 1
+logger = logging.getLogger(__name__)
+
+PROPOSAL_SCHEMA_VERSION = 2
 DEFAULT_MAX_TUNNELS = 60
 
 
@@ -86,6 +91,42 @@ def _rooms_match(a: str, b: str) -> bool:
     return room_spelling_key(a) == room_spelling_key(b)
 
 
+def _entity_room_name(room: str) -> Optional[str]:
+    text = str(room or "")
+    if text.startswith("entity:"):
+        return text[len("entity:") :]
+    return None
+
+
+def ambiguous_entity_spellings(spellings: Iterable[str]) -> set[str]:
+    """Spellings that could name two or more distinct files in ``spellings``.
+
+    Pairwise suffix matching is not transitive: bare ``CodeRouter.py`` matches
+    both ``src/models/CodeRouter.py`` and ``tests/fixtures/CodeRouter.py``,
+    while those two do not match each other. Treating the bare name as a
+    duplicate of either would delete a real connection. A spelling is
+    ambiguous when it ``same_file_spelling``-matches two hosts that are not
+    the same file as each other.
+    """
+    by_key: dict[str, set[str]] = {}
+    for spelling in spellings:
+        by_key.setdefault(entity_spelling_key(spelling), set()).add(spelling)
+    ambiguous: set[str] = set()
+    for group in by_key.values():
+        for spelling in group:
+            hosts = [
+                other
+                for other in group
+                if other != spelling and same_file_spelling(spelling, other)
+            ]
+            # Check every pair: a shared suffix such as models/CodeRouter.py
+            # can match both src/models/CodeRouter.py and
+            # tests/models/CodeRouter.py without making those the same file.
+            if any(not same_file_spelling(a, b) for a, b in combinations(hosts, 2)):
+                ambiguous.add(spelling)
+    return ambiguous
+
+
 class LinkIndex:
     """The links seen so far, matched the way a reader would.
 
@@ -95,27 +136,81 @@ class LinkIndex:
     files that only share a basename (``src/models/user.py`` and
     ``tests/fixtures/user.py``) are two links: deduping them as one would
     delete a real connection.
+
+    ``ambiguous`` lists entity spellings that could name more than one file
+    in the full endpoint set. Those only match an identical spelling, never
+    a qualified path, so an ambiguous bare alias cannot erase both distinct
+    links.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ambiguous: Optional[Iterable[str]] = None) -> None:
         self._buckets: dict[tuple, list[tuple]] = {}
+        self._ambiguous = frozenset(ambiguous or ())
 
     @staticmethod
     def _bucket(ends: tuple) -> tuple:
         (wing_a, room_a), (wing_b, room_b) = ends
         return _link_key(wing_a, wing_b, room_a, room_b)
 
+    def _endpoint_match(self, a: str, b: str) -> bool:
+        if not _rooms_match(a, b):
+            return False
+        ea, eb = _entity_room_name(a), _entity_room_name(b)
+        if ea is not None and ea in self._ambiguous:
+            return ea == eb
+        if eb is not None and eb in self._ambiguous:
+            return ea == eb
+        return True
+
     def contains(self, ends: tuple) -> bool:
         (wa, ra), (wb, rb) = ends
         for (wa2, ra2), (wb2, rb2) in self._buckets.get(self._bucket(ends), []):
-            if wa == wa2 and wb == wb2 and _rooms_match(ra, ra2) and _rooms_match(rb, rb2):
+            if (
+                wa == wa2
+                and wb == wb2
+                and self._endpoint_match(ra, ra2)
+                and self._endpoint_match(rb, rb2)
+            ):
                 return True
-            if wa == wb2 and wb == wa2 and _rooms_match(ra, rb2) and _rooms_match(rb, ra2):
+            if (
+                wa == wb2
+                and wb == wa2
+                and self._endpoint_match(ra, rb2)
+                and self._endpoint_match(rb, ra2)
+            ):
                 return True
         return False
 
     def add(self, ends: tuple) -> None:
         self._buckets.setdefault(self._bucket(ends), []).append(ends)
+
+
+def connection_spellings(tunnels: list, extra_entities: Iterable[str] = ()) -> list[str]:
+    """Spellings from complete endpoints, plus the full proposal candidate set."""
+    spellings = list(extra_entities)
+    for tunnel in tunnels:
+        if not isinstance(tunnel, dict):
+            continue
+        ends = tunnel_endpoints(tunnel)
+        if ends:
+            for _wing, room in ends:
+                name = _entity_room_name(room)
+                if name is not None:
+                    spellings.append(name)
+    return sorted(set(spellings))
+
+
+def connection_index(
+    tunnels: list, extra_entities: Iterable[str] = (), *, seed: bool = True
+) -> LinkIndex:
+    """Build spelling context before deciding whether any endpoint is an alias."""
+    index = LinkIndex(ambiguous_entity_spellings(connection_spellings(tunnels, extra_entities)))
+    if seed:
+        for tunnel in tunnels:
+            ends = tunnel_endpoints(tunnel) if isinstance(tunnel, dict) else None
+            if ends:
+                index.add(ends)
+    return index
 
 
 def propose_tunnels(
@@ -137,15 +232,10 @@ def propose_tunnels(
     from .palace_graph import ENTITY_TUNNEL_MIN_COUNT, entity_tunnel_candidates
 
     wings = {_norm_wing(str(w)) for w in existing_wings}
-    known = LinkIndex()
-    for t in existing_tunnels or []:
-        if isinstance(t, dict):
-            ends = tunnel_endpoints(t)
-            if ends:
-                known.add(ends)
     candidates = entity_tunnel_candidates(
         hallways, min_count=ENTITY_TUNNEL_MIN_COUNT if min_count is None else min_count
     )
+    known = connection_index(existing_tunnels or [], candidates)
     rows = []
     for entity, per_wing in candidates.items():
         # ``per_wing`` is keyed by normalized wing; membership must be too, or
@@ -203,8 +293,10 @@ def propose_tunnels(
     chosen.sort(key=lambda r: (-r["strength"], r["entity"], r["wing_a"], r["wing_b"]))
     return {
         "schema_version": PROPOSAL_SCHEMA_VERSION,
-        "planned_at": datetime.now(timezone.utc).isoformat(),
+        "planned_at": utc_now_iso(),
         "candidates": len(rows),
+        # Preserve names excluded by the cap/wing filter and existing aliases.
+        "entity_spellings": connection_spellings(existing_tunnels or [], candidates),
         "tunnels": chosen,
     }
 
@@ -216,10 +308,7 @@ def proposal_path(config: MempalaceConfig) -> str:
 def save_proposal(config: MempalaceConfig, plan: dict) -> str:
     path = proposal_path(config)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    atomic_write_json(path, plan, private=False, follow_symlinks=False)
     return path
 
 
@@ -249,17 +338,27 @@ def apply_proposal(plan: dict, config: Optional[MempalaceConfig] = None) -> int:
     """
     from .palace_graph import _load_tunnels, create_tunnel
 
-    known = LinkIndex()
-    for t in _load_tunnels(config):
-        if isinstance(t, dict):
-            ends = tunnel_endpoints(t)
-            if ends:
-                known.add(ends)
+    spellings = plan.get("entity_spellings")
+    if spellings is None:
+        if plan.get("schema_version") == PROPOSAL_SCHEMA_VERSION:
+            raise ValueError("tunnel proposal is missing entity_spellings; re-run propose")
+        # Older plans cannot recover names omitted during selection. Keep their
+        # existing compatibility behavior, but disclose that limitation.
+        logger.warning(
+            "Legacy tunnel proposal has no spelling context; re-run propose to refresh it"
+        )
+        spellings = []
+    if not isinstance(spellings, list) or any(not isinstance(s, str) for s in spellings):
+        raise ValueError("tunnel proposal has invalid entity_spellings")
+    known = connection_index(
+        _load_tunnels(config), [*spellings, *(row["entity"] for row in plan["tunnels"])]
+    )
     created = 0
     for row in plan["tunnels"]:
         room = f"entity:{row['entity']}"
         ends = ((_norm_wing(row["wing_a"]), room), (_norm_wing(row["wing_b"]), room))
         if known.contains(ends):
+            logger.info("Skipping approved tunnel %s: equivalent connection already exists", row)
             continue
         known.add(ends)
         create_tunnel(
@@ -285,7 +384,7 @@ def prune_tunnels(tunnels: list, existing_wings: Iterable[str]) -> tuple[list, d
     wings = {_norm_wing(str(w)) for w in existing_wings}
     generic = dangling = duplicates = 0
     kept: list = []
-    seen = LinkIndex()
+    seen = connection_index(tunnels, seed=False)
     for t in sorted(
         (t for t in tunnels if isinstance(t, dict)),
         key=lambda t: -int(t.get("access_count") or 0),
