@@ -346,14 +346,6 @@ def tool_memories_filed_away():
         }
     try:
         data = json.loads(ack_file.read_text(encoding="utf-8"))
-        ack_file.unlink(missing_ok=True)
-        msgs = data.get("msgs", 0)
-        return {
-            "status": "ok",
-            "message": f"\u2726 {msgs} messages tucked into drawers",
-            "count": msgs,
-            "timestamp": data.get("ts", None),
-        }
     except (json.JSONDecodeError, OSError):
         ack_file.unlink(missing_ok=True)
         return {
@@ -362,6 +354,32 @@ def tool_memories_filed_away():
             "count": 0,
             "timestamp": None,
         }
+
+    # A syntactically valid JSON root that is not an object -- ``null``, an
+    # array, a string, a number, or a boolean -- must take the same fail-soft
+    # path as malformed JSON. The call ``msgs = data.get("msgs", 0)`` below
+    # assumes a dict, so a non-object root would raise AttributeError *after*
+    # the ack marker has already been consumed: the caller cannot then retry,
+    # and the checkpoint is lost forever. A mid-write kill can leave the file
+    # in any of those shapes, and every one of them is "consumed but
+    # unreadable", so refuse the payload rather than crash after the unlink.
+    if not isinstance(data, dict):
+        ack_file.unlink(missing_ok=True)
+        return {
+            "status": "error",
+            "message": "\u2726 Journal entry filed in the palace",
+            "count": 0,
+            "timestamp": None,
+        }
+
+    ack_file.unlink(missing_ok=True)
+    msgs = data.get("msgs", 0)
+    return {
+        "status": "ok",
+        "message": f"\u2726 {msgs} messages tucked into drawers",
+        "count": msgs,
+        "timestamp": data.get("ts", None),
+    }
 
 
 # ==================== SETTINGS TOOLS ====================
