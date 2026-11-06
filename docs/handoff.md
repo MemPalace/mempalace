@@ -91,6 +91,19 @@ gateway, using the gateway's `COMMONPLACE_DATA` directory. This also works
 when the source model has hit its session limit: it reads the saved native
 transcript without calling that model.
 
+Find the workspace name or ID in the gateway's local data directory:
+
+```bash
+commonplace workspace list
+# For a different gateway data directory:
+commonplace --data /path/to/gateway-data workspace list
+```
+
+Use a printed ID with `--workspace` to avoid ambiguous names. `personal`
+in the examples is a workspace name, not an alias for your personal
+workspace; replace it with your actual name or ID. Missing or invalid
+workspace selections show the available local names and IDs.
+
 Claude Code → Codex:
 
 ```bash
@@ -115,6 +128,26 @@ and destination without saving a handoff or starting or settling a thread.
 `--workspace` can be omitted when `COMMONPLACE_WORKSPACE` or the local
 checkout map below selects one. `--data` before `handoff` selects another
 gateway data directory, as with the other local administration commands.
+
+To bind checkouts, create `~/.commonplace/handoff-client.json` on the source
+machine (this file is separate from the gateway data directory):
+
+```json
+{
+  "workspaces": {
+    "~/projects/example": "ws_REPLACE_WITH_PRINTED_ID",
+    "~/projects/example/other-checkout": "another-workspace-name"
+  }
+}
+```
+
+Keys are checkout directories; `~` is expanded. Values are Commonplace
+workspace names or IDs, not T3 project IDs. The most specific matching
+directory or ancestor wins. Selection order is `--workspace`, then
+`COMMONPLACE_WORKSPACE`, then a mapping for the source thread's checkout,
+then one for its project root. This uses the source thread's paths, not
+the shell's current directory. The map contains no credentials and does
+not enable handoff; enable the selected workspace or override separately.
 
 Manual handoff respects the same task → agent → workspace settings. Use
 `--agent <connection-name>` and `--task '#142'` when the source has those

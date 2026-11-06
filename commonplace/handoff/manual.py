@@ -66,6 +66,16 @@ def workspace_for(cwd):
     return max(matches, default=(0, ""))[1]
 
 
+def _workspace_hint(db):
+    choices = ", ".join(f"{row['name']!r} ({row['id']})" for row in db.workspaces())
+    if not choices:
+        return "no local workspaces; run `commonplace init` or `commonplace workspace add`"
+    return (
+        f"choose --workspace <ID> from: {choices}; "
+        "run `commonplace workspace list` to list names and IDs"
+    )
+
+
 class ManualHandoff:
     def __init__(self, service, *, t3=None, prompt_dir=None):
         self.service = service
@@ -206,7 +216,7 @@ def run_cli(args):
     from contextlib import ExitStack
 
     from commonplace import cli
-    from commonplace.control_db import Principal
+    from commonplace.control_db import ControlError, Principal
     from commonplace.policy import Policy
 
     from .db import HandoffDB
@@ -220,12 +230,16 @@ def run_cli(args):
     if not workspace_ref:
         source = t3.resolve(args.thread)
         workspace_ref = workspace_for(source.cwd) or workspace_for(source.workspace_root)
+    db = cli._db(args)
     if not workspace_ref:
         raise ManualHandoffError(
-            "choose --workspace or map the source checkout in handoff-client.json"
+            f"{_workspace_hint(db)}; or map the source checkout in "
+            "~/.commonplace/handoff-client.json (see docs/handoff.md)"
         )
-    db = cli._db(args)
-    workspace = db.workspace(workspace_ref)["id"]
+    try:
+        workspace = db.workspace(workspace_ref)["id"]
+    except ControlError as error:
+        raise ManualHandoffError(f"{error}; {_workspace_hint(db)}") from None
     user = cli._owner(db, args, workspace)
     principal = Principal(
         user_id=user["id"],

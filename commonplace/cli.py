@@ -541,7 +541,10 @@ def _handoff_parsers(sub):
     s.add_argument("--to", required=True)
     s.add_argument("--effort", default="")
     s.add_argument("--note", default="")
-    s.add_argument("--workspace")
+    s.add_argument(
+        "--workspace",
+        help="workspace name or ID (discover with `commonplace workspace list`)",
+    )
     s.add_argument("--agent", default="")
     s.add_argument("--task", default="")
     s.add_argument("--by")
