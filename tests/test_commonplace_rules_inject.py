@@ -5,7 +5,7 @@ import io
 import json
 import sqlite3
 import sys
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
@@ -529,25 +529,44 @@ def test_locked_store_stays_inside_overall_deadline(local, store):
     assert elapsed < 0.1
 
 
-@pytest.mark.timing
-def test_reconciliation_writer_also_uses_remaining_deadline(local):
+def test_reconciliation_writer_also_uses_remaining_deadline(local, monkeypatch):
+    now, waits, statements = [0.0], [], []
+    monkeypatch.setattr(checks, "monotonic", lambda: now[0])
     boards = BoardService(local.owner.ctx)
     boards.board_add(slug="ops", wing="shared")
     local.owner.create("*", "scoped", "limit", "board", "ops")
     assert quoted_rules(injected(local)) == ["scoped"]
     boards.board_add(slug="new", wing="shared")
-    # Measured at function level, outside with/try, so the timing-info step
-    # classifies a slow run as timing-only instead of a behaviour failure.
-    blocker = sqlite3.connect(local.directory / "rules.sqlite3", isolation_level=None)
-    blocker.execute("PRAGMA journal_mode=WAL")
-    blocker.execute("BEGIN IMMEDIATE")
-    start = perf_counter()
-    result = initialize(local)
-    elapsed = perf_counter() - start
-    blocker.rollback()
-    blocker.close()
-    assert result == LEGACY
-    assert elapsed < 0.1
+    connection = checks.connection
+    connect = sqlite3.connect
+
+    def tracked(*args, **kwargs):
+        if "mode=rw" in str(args[0]):
+            waits.append(kwargs["timeout"])
+        return connect(*args, **kwargs)
+
+    @contextmanager
+    def delayed(path, *, write=False, **kwargs):
+        if write:
+            # Spend half the budget on reads, then more before BEGIN IMMEDIATE.
+            now[0] += 0.04
+        with connection(path, write=write, **kwargs) as conn:
+            if write:
+                conn.set_trace_callback(statements.append)
+                now[0] += 0.02
+            yield conn
+
+    monkeypatch.setattr(checks.sqlite3, "connect", tracked)
+    monkeypatch.setattr(checks, "connection", delayed)
+    with closing(connect(local.directory / "rules.sqlite3", isolation_level=None)) as blocker:
+        blocker.execute("PRAGMA journal_mode=WAL")
+        blocker.execute("BEGIN IMMEDIATE")
+        assert initialize(local) == LEGACY
+        blocker.rollback()
+    assert waits == [pytest.approx(0.04)]
+    begin = statements.index("BEGIN IMMEDIATE")
+    assert statements[begin - 1].startswith("PRAGMA busy_timeout=")
+    assert 0 < int(statements[begin - 1].split("=")[1]) <= 20
     assert quoted_rules(injected(local)) == ["scoped"]
 
 
