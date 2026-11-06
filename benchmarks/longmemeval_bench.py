@@ -2367,6 +2367,23 @@ def build_palace_and_retrieve_palace(
 # =============================================================================
 
 
+def _llm_base_url(model):
+    """Route explicitly selected MiniMax models to their configured endpoint."""
+    if model.startswith("MiniMax"):
+        return os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.io/anthropic").rstrip("/")
+    return "https://api.anthropic.com"
+
+
+def _llm_options(model, max_tokens):
+    """Leave room for Flash's required adaptive reasoning before the short answer."""
+    if model == "MiniMax-M3.1-Flash":
+        return {
+            "max_tokens": max(max_tokens, 16384),
+            "thinking": {"type": "adaptive"},
+        }
+    return {"max_tokens": max_tokens}
+
+
 def diary_ingest_session(session, sess_id, api_key, model="claude-haiku-4-5-20251001"):
     """
     Call an LLM to extract topics and a summary from one session.
@@ -2411,13 +2428,13 @@ def diary_ingest_session(session, sess_id, api_key, model="claude-haiku-4-5-2025
     payload = json.dumps(
         {
             "model": model,
-            "max_tokens": 200,
+            **_llm_options(model, 200),
             "messages": [{"role": "user", "content": prompt}],
         }
     ).encode("utf-8")
 
     req = _urllib_request.Request(
-        "https://api.anthropic.com/v1/messages",
+        f"{_llm_base_url(model)}/v1/messages",
         data=payload,
         headers={
             "x-api-key": api_key,
@@ -2430,7 +2447,9 @@ def diary_ingest_session(session, sess_id, api_key, model="claude-haiku-4-5-2025
     try:
         with _urllib_request.urlopen(req, timeout=25) as resp:
             result = json.loads(resp.read())
-        raw = result["content"][0]["text"].strip()
+        raw = "".join(
+            b.get("text", "") for b in result["content"] if b.get("type") == "text"
+        ).strip()
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         data = json.loads(raw)
@@ -2837,11 +2856,11 @@ def llm_rerank(
         if api_key:
             headers["authorization"] = f"Bearer {api_key}"
     else:
-        url = "https://api.anthropic.com/v1/messages"
+        url = f"{_llm_base_url(model)}/v1/messages"
         payload = json.dumps(
             {
                 "model": model,
-                "max_tokens": 8,
+                **_llm_options(model, 8),
                 "messages": [{"role": "user", "content": prompt}],
             }
         ).encode("utf-8")
@@ -2867,7 +2886,9 @@ def llm_rerank(
                 if not raw:
                     raw = (msg.get("reasoning") or "").strip()
             else:
-                raw = result["content"][0]["text"].strip()
+                raw = "".join(
+                    b.get("text", "") for b in result["content"] if b.get("type") == "text"
+                ).strip()
             m = re.search(
                 r"\b(\d+)\b", raw[::-1]
             )  # take LAST integer (rerank models often reason first)
@@ -2889,10 +2910,12 @@ def llm_rerank(
     return rankings
 
 
-def _load_api_key(key_arg):
-    """Load API key from --llm-key arg or ANTHROPIC_API_KEY env var."""
+def _load_api_key(key_arg, model="", backend="anthropic"):
+    """Use an explicit key or the selected provider's environment variable."""
     if key_arg:
         return key_arg
+    if backend == "anthropic" and model.startswith("MiniMax"):
+        return os.environ.get("MINIMAX_API_KEY", "")
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if env_key:
         return env_key
@@ -2977,16 +3000,12 @@ def run_benchmark(
 
     api_key = ""
     if llm_rerank_enabled or mode == "diary":
-        api_key = _load_api_key(llm_key)
+        api_key = _load_api_key(llm_key, llm_model, "anthropic" if mode == "diary" else llm_backend)
         # Ollama backend doesn't require an Anthropic API key; a local/cloud Ollama
         # daemon with the requested model pulled is enough. Diary mode is always anthropic.
         needs_key = (llm_backend == "anthropic") or (mode == "diary")
         if needs_key and not api_key:
-            print(
-                "ERROR: --llm-rerank (anthropic backend) / --mode diary requires an API key. "
-                "Set ANTHROPIC_API_KEY or use --llm-key. For ollama backend, pass "
-                "--llm-backend ollama."
-            )
+            print("ERROR: --llm-rerank / --mode diary requires an API key for the selected model.")
             sys.exit(1)
 
     # Diary mode: pre-compute LLM topic extraction for ALL unique sessions upfront
@@ -3138,7 +3157,7 @@ def run_benchmark(
                 rankings,
                 corpus,
                 corpus_ids,
-                api_key,
+                _load_api_key(llm_key, llm_model, llm_backend),
                 top_k=rerank_pool,
                 model=llm_model,
                 backend=llm_backend,
@@ -3311,15 +3330,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm-key",
         default="",
-        help="Anthropic API key for LLM re-ranking. Falls back to ANTHROPIC_API_KEY env var.",
+        help="API key for LLM re-ranking. Falls back to MINIMAX_API_KEY or "
+        "ANTHROPIC_API_KEY for the selected model.",
     )
     parser.add_argument(
         "--llm-model",
         default="claude-haiku-4-5-20251001",
         help="Model for LLM re-ranking and diary ingest "
         "(default: claude-haiku-4-5-20251001). "
-        "Use 'claude-sonnet-4-6' for Sonnet comparison. "
-        "With --llm-backend ollama, use an Ollama model tag like 'minimax-m2.7:cloud'.",
+        "MiniMax models: MiniMax-M3.1-Flash (recommended), MiniMax-M3. "
+        "Set MINIMAX_API_KEY; MINIMAX_BASE_URL overrides the endpoint. "
+        "Explicit legacy/custom model IDs are passed through. "
+        "With --llm-backend ollama, use an installed Ollama model tag.",
     )
     parser.add_argument(
         "--llm-backend",
