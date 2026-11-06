@@ -366,6 +366,14 @@ TOOLS = {
                     "enum": ["search", "code"],
                     "description": "EmbeddingGemma 2 task prompt: general search (default) or native code retrieval.",
                 },
+                "expand_wings": {
+                    "type": "boolean",
+                    "description": (
+                        "Opt-in (default false). On a thin unfiltered baseline, also "
+                        "query the most structurally related wings and append their "
+                        "deduped hits after the baseline's."
+                    ),
+                },
                 "context": {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
