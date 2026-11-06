@@ -1598,7 +1598,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 def tool_move_drawers(drawer_ids: list, target_wing: str = None, target_room: str = None):
     """Move many drawers by ID in one call.
 
-    The batch contract mirrors ``tool_delete_drawers`` from #2572: a call is
+    The batch contract mirrors ``tool_delete_drawers``: a call is
     accepted only for a drawer-id list of size 1 to ``_BULK_DRAWER_MAX_IDS``;
     otherwise it returns ``{"error": ...}`` before any read/write. At least one
     of ``target_wing`` or ``target_room`` must be provided, and each provided
