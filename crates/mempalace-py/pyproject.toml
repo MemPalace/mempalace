@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "mempalace-native-core"
 dynamic = ["version"]
 description = "Optional native exact-vector accelerator for MemPalace"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 
 [tool.maturin]

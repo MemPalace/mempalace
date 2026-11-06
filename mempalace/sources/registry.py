@@ -38,6 +38,14 @@ _discovered = False
 _lock = Lock()
 
 
+def _register_builtins() -> None:
+    """Install first-party adapters lazily, preserving explicit overrides."""
+    from .media import MediaAdapter
+
+    with _lock:
+        _registry.setdefault(MediaAdapter.name, MediaAdapter)
+
+
 def register(name: str, adapter_cls: Type[BaseSourceAdapter]) -> None:
     """Register ``adapter_cls`` under ``name``.
 
@@ -61,6 +69,7 @@ def _discover_entry_points() -> None:
     global _discovered
     if _discovered:
         return
+    _register_builtins()
     with _lock:
         if _discovered:
             return

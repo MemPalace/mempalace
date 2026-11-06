@@ -2,7 +2,7 @@
 
 ``sync --apply`` removes a drawer whose source file is not at its path only
 when the palace can still see a source of its own, a regular file, in that
-same directory (#2320). A neighbour proves the directory is reachable. It
+same directory. A neighbour proves the directory is reachable. It
 does not prove it is the same directory the missing file was mined from, and
 three mount shapes turn that gap into deleted drawers:
 

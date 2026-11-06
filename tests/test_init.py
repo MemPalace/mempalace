@@ -8,7 +8,6 @@ import tempfile
 
 import pytest
 
-
 _LEAK_PREFIX = "/__mempalace_leak_test_sentinel__"
 
 

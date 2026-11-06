@@ -7,7 +7,6 @@ import pytest
 
 import mempalace.backends.chroma as chroma
 
-
 pytestmark = pytest.mark.skipif(
     struct.calcsize("P") != 8,
     reason="chroma-hnswlib v1 header counts use 64-bit size_t fields",

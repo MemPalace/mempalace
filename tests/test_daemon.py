@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -7,11 +8,9 @@ import threading
 import time
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace import daemon
-from mempalace import service
+from mempalace import daemon, service
 
 _LOCK_CONTENDER = """
 from mempalace.palace import MineAlreadyRunning, mine_palace_lock
@@ -309,6 +308,198 @@ def _start_server(tmp_path, monkeypatch, execute_fn):
             f"endpoint_exists={daemon.endpoint_path(str(palace)).exists()})"
         )
     return client, thread, palace, holders
+
+
+def _reset_lifecycle_logging(monkeypatch) -> None:
+    """Give each lifecycle-logging test a fresh handler set.
+
+    ``_ensure_lifecycle_logging`` attaches stdout/stderr StreamHandlers once
+    and guards on a module-level ``_lifecycle_logging_ready`` flag.  Tests
+    that want a deterministic baseline must:
+
+    1. Clear any existing handlers on the daemon logger (if it exists — on
+       pre-fix HEAD this logger does not yet exist).
+    2. Flip the ready flag back to False so the next call to
+       ``_ensure_lifecycle_logging`` from ``run_server`` re-attaches.
+
+    Uses ``raising=False`` for the monkeypatch so the reset works whether or
+    not the post-fix attributes are present (RED vs GREEN).
+    """
+    logger = getattr(daemon, "_LIFECYCLE_LOGGER", None)
+    if logger is not None:
+        logger.handlers = []
+    monkeypatch.setattr(daemon, "_lifecycle_logging_ready", False, raising=False)
+
+
+def test_run_server_routes_lifecycle_and_access_to_stdout(monkeypatch, tmp_path, capsys):
+    """#2475 regression — a foreground/serve daemon must emit lifecycle and
+    HTTP access lines to stdout, so a supervisor capturing stdout (launchd
+    ``StandardOutPath``) actually sees the log.
+
+    RED on current HEAD: ``_Handler.log_message`` was a deliberate no-op and
+    ``run_server`` had no startup log call at all, so ``capsys.readouterr()``
+    returns empty stdout for the daemon's own records.
+    GREEN after the fix: both the startup line and the HTTP access line arrive.
+
+    Background/launchd daemon-start semantics are unchanged — this exercises
+    the same code path, but the daemon logs to *its* stdout (which
+    ``_detached_kwargs`` already redirects to ``per-daemon.log``) rather than
+    to a new destination.
+    """
+    _reset_lifecycle_logging(monkeypatch)
+
+    def _noop(_ctx, *a, **k):
+        return None
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    monkeypatch.setattr(service, "execute_job", _noop)
+    holders = _capture_httpd(monkeypatch)
+
+    thread = threading.Thread(
+        target=lambda: daemon.run_server(palace_path=str(palace), port=0),
+        name="test-daemon-server",
+        daemon=True,
+    )
+    thread.start()
+    client = None
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        client = daemon.get_client_if_running(str(palace))
+        if client is not None:
+            break
+        time.sleep(0.05)
+    assert client is not None, "daemon did not come up in 30s"
+
+    # One authenticated request so the handler's ``log_message`` fires.
+    client.health()
+
+    out, err = capsys.readouterr()
+
+    # Startup lifecycle INFO — must land on stdout so launchd StandardOutPath
+    # has the line. This is the primary acceptance line from the task.
+    assert "daemon listening on" in out, (
+        f"expected 'daemon listening on' on stdout; got:\nstdout={out!r}\nstderr={err!r}"
+    )
+
+    # HTTP access line (log_message) — was a no-op before the fix, so this is
+    # the strongest RED→GREEN signal: it only shows up now that log_message
+    # routes to the daemon's own logger.
+    assert '"GET /health' in out, (
+        f"expected the /health access line on stdout; got:\nstdout={out!r}\nstderr={err!r}"
+    )
+
+    # Shutdown lifecycle INFO — the run_server finally emits it; it must be on
+    # stdout as well.
+    out_after, err_after = capsys.readouterr()
+    _stop_server(client, thread, holders)
+    out_final, err_final = capsys.readouterr()
+    assert "daemon shutting down" in (out_after + out_final), (
+        f"expected 'daemon shutting down' on stdout after stop; got:\n"
+        f"out={out_final!r}\nstderr={err_final!r}"
+    )
+
+
+def test_lifecycle_error_routes_to_stderr(monkeypatch, capsys):
+    """#2475 — ERROR-level daemon records must land on stderr, so launchd
+    ``StandardErrorPath`` captures them. (Routing complement to the stdout
+    test above: INFO→stdout, ERROR→stderr.)
+
+    Exercised by calling the daemon logger directly after ``_ensure_lifecycle_
+    logging`` has attached its handlers.
+
+    Extended after igorls's CHANGES_REQUESTED review: ``Handler.setLevel`` is
+    a *floor*, not a range, so the ERROR record also passed the stdout
+    handler's INFO floor and was emitted on BOTH streams — here and (in the
+    detached path) twice into the merged daemon.log. The ERROR text must be
+    absent from the captured stdout, not merely present on stderr.
+    """
+    _reset_lifecycle_logging(monkeypatch)
+    daemon._ensure_lifecycle_logging()
+
+    daemon._LIFECYCLE_LOGGER.info("info should not appear on stderr")
+    daemon._LIFECYCLE_LOGGER.error("error line for stderr capture")
+
+    _out, err = capsys.readouterr()
+
+    # The ERROR line routes to the stderr handler.
+    assert "error line for stderr capture" in err, (
+        f"expected the ERROR record on stderr; got:\nstderr={err!r}"
+    )
+
+    # AND the ERROR line must NOT land on stdout (level-floor leak).
+    assert "error line for stderr capture" not in _out, (
+        f"ERROR record leaked to stdout:\nstdout={_out!r}"
+    )
+
+    # And the INFO record must NOT land on stderr.
+    assert "info should not appear on stderr" not in err, (
+        f"INFO record leaked to stderr:\nstderr={err!r}"
+    )
+
+
+def test_lifecycle_stdout_handler_rejects_error(monkeypatch):
+    """#2475 (igorls review) — the stdout handler must carry an upper-bound
+    filter, not just a level floor: it rejects ERROR/CRITICAL records and
+    admits INFO/WARNING. Unit-level check of the handler filter itself,
+    independent of the end-to-end stream assertions above.
+
+    A handler filter that rejects ERROR and CRITICAL but accepts INFO will
+    correctly enforce the "stdout must never contain ERROR" contract.
+    """
+    _reset_lifecycle_logging(monkeypatch)
+    daemon._ensure_lifecycle_logging()
+
+    stdout_handler = daemon._LIFECYCLE_LOGGER.handlers[0]
+    stderr_handler = daemon._LIFECYCLE_LOGGER.handlers[1]
+
+    # ``Handler.filters`` may hold ``logging.Filter`` subclasses or plain
+    # callables — handle both uniformly.
+    def _accepts(f, record) -> bool:
+        return bool(f(record) if callable(f) else f.filter(record))
+
+    # Helper to build a log record at a given level
+    def _mk(level: int) -> logging.LogRecord:
+        return logging.LogRecord(
+            name=daemon._LIFECYCLE_LOGGER.name,
+            level=level,
+            pathname=__file__,
+            lineno=1,
+            msg="probe",
+            args=(),
+            exc_info=None,
+        )
+
+    # The stdout handler must explicitly reject ERROR and CRITICAL via a filter
+    assert not all(_accepts(f, _mk(logging.ERROR)) for f in stdout_handler.filters), (
+        "stdout handler must reject ERROR-level records via a filter"
+    )
+    assert not all(_accepts(f, _mk(logging.CRITICAL)) for f in stdout_handler.filters), (
+        "stdout handler must reject CRITICAL-level records via a filter"
+    )
+
+    # ...while admitting INFO and WARNING (the level floor still applies).
+    assert stdout_handler.level <= logging.INFO, (
+        f"stdout handler floor should be INFO, is {logging.getLevelName(stdout_handler.level)}"
+    )
+    assert stderr_handler.level >= logging.ERROR
+    assert all(
+        _accepts(f, _mk(logging.INFO)) and _accepts(f, _mk(logging.WARNING))
+        for f in stdout_handler.filters
+    ), "stdout handler must admit INFO and WARNING records"
+
+
+def test_reset_is_idempotent(monkeypatch):
+    """Re-attaching must not stack duplicate handlers (re-init after a test
+    reset shouldn't log the same record twice)."""
+    _reset_lifecycle_logging(monkeypatch)
+    daemon._ensure_lifecycle_logging()
+    n_first = len(daemon._LIFECYCLE_LOGGER.handlers)
+    _reset_lifecycle_logging(monkeypatch)
+    daemon._ensure_lifecycle_logging()
+    n_second = len(daemon._LIFECYCLE_LOGGER.handlers)
+    assert n_first == n_second == 2
 
 
 # --- ship-blocker regressions ---
@@ -956,8 +1147,7 @@ def test_token_file_is_owner_only(tmp_path, monkeypatch):
 
 
 def test_health_rejects_missing_and_wrong_token(tmp_path, monkeypatch):
-    from urllib import error as urlerror
-    from urllib import request as urlrequest
+    from urllib import error as urlerror, request as urlrequest
 
     client, thread, palace, holders = _start_server(
         tmp_path, monkeypatch, lambda k, p: {"success": True}
@@ -1210,6 +1400,9 @@ def test_run_mine_source_adapter_dispatches_through_adapter_runner(tmp_path, mon
         "source_path": "/source",
         "palace_path": str(palace.resolve()),
         "dry_run": True,
+        "project": None,
+        "related_drawer_id": None,
+        "explicit_palace": False,
     }
     assert out == {
         "success": True,
@@ -1220,6 +1413,34 @@ def test_run_mine_source_adapter_dispatches_through_adapter_runner(tmp_path, mon
     }
 
 
+def test_run_mine_source_adapter_keeps_the_cli_options(tmp_path, monkeypatch):
+    """A daemon adapter mine passes --palace, --wing and --related-drawer-id on.
+
+    Without the --palace flag the adapter resolves the knowledge graph as if no
+    palace was named, and can write facts into the home graph instead of the
+    named palace's own.
+    """
+    from mempalace import cli, service
+
+    received = {}
+    monkeypatch.setattr(cli, "mine_source_adapter", lambda **kwargs: received.update(kwargs))
+    palace = tmp_path / "palace"
+    service.run_mine(
+        {
+            "palace_path": str(palace),
+            "source": "/source",
+            "source_adapter": "media",
+            "wing": "photos",
+            "related_drawer_id": "drawer_x",
+            "explicit_palace": True,
+        }
+    )
+
+    assert received["explicit_palace"] is True
+    assert received["project"] == "photos"
+    assert received["related_drawer_id"] == "drawer_x"
+
+
 def test_run_mcp_tool_rejects_non_dict_arguments():
     from mempalace import service
 
@@ -1227,6 +1448,94 @@ def test_run_mcp_tool_rejects_non_dict_arguments():
     assert out["success"] is False
     assert "must be an object" in out["error"]
     assert out["exit_code"] == 2
+
+
+def test_run_mcp_tool_refuses_a_write_when_the_server_is_read_only(monkeypatch):
+    """mcp_tool jobs go through the dispatcher, so read-only mode refuses writes."""
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    called = {"n": 0}
+
+    def handler(**_arguments):
+        called["n"] += 1
+        return {"success": True}
+
+    real = mcp.TOOLS["mempalace_add_drawer"]
+    monkeypatch.setitem(
+        mcp.TOOLS,
+        "mempalace_add_drawer",
+        {**real, "handler": handler},
+    )
+    monkeypatch.setattr(mcp, "_READ_ONLY", True)
+
+    out = service.run_mcp_tool(
+        {
+            "name": "mempalace_add_drawer",
+            "arguments": {"wing": "w", "room": "r", "content": "must not be filed"},
+        }
+    )
+
+    assert called["n"] == 0
+    assert out["success"] is False
+    assert out["exit_code"] == 1
+    assert out["jsonrpc_code"] == -32003
+    assert "read-only" in out["error"]
+    assert out["tool"] == "mempalace_add_drawer"
+
+
+def test_run_mcp_tool_keeps_the_tool_exception_detail(monkeypatch):
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+
+    def handler(**_arguments):
+        raise ValueError("disk full")
+
+    monkeypatch.setattr(
+        mcp,
+        "TOOLS",
+        {"mempalace_add_drawer": {"handler": handler, "input_schema": {"properties": {}}}},
+    )
+    out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {}})
+
+    assert out["success"] is False
+    assert out["jsonrpc_code"] == -32000
+    assert out["error_class"] == "ValueError"
+    assert out["error"] == "disk full"
+
+
+def test_run_mcp_tool_defers_when_a_peer_writer_holds_the_palace(monkeypatch):
+    import mempalace.mcp_server as mcp
+    from mempalace import service
+    from mempalace.daemon import LOCK_REFUSAL_ERROR_CLASS
+
+    monkeypatch.setattr(
+        mcp,
+        "TOOLS",
+        {
+            "mempalace_add_drawer": {
+                "handler": lambda **kw: {"success": True},
+                "input_schema": {"properties": {}},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        mcp,
+        "_mcp_tool_preflight_refusal",
+        lambda req_id, tool_name: {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {
+                "code": -32001,
+                "message": "Peer MCP writer active",
+                "data": {"tool": tool_name, "failure_kind": "peer_contention"},
+            },
+        },
+    )
+    out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {}})
+
+    assert out["success"] is False
+    assert out["error_class"] == LOCK_REFUSAL_ERROR_CLASS
 
 
 def test_run_mcp_tool_dispatches_write_tool(monkeypatch):
@@ -1239,7 +1548,16 @@ def test_run_mcp_tool_dispatches_write_tool(monkeypatch):
         captured["arguments"] = arguments
         return {"success": True, "written": True}
 
-    monkeypatch.setattr(mcp, "TOOLS", {"mempalace_add_drawer": {"handler": fake_handler}})
+    monkeypatch.setattr(
+        mcp,
+        "TOOLS",
+        {
+            "mempalace_add_drawer": {
+                "handler": fake_handler,
+                "input_schema": {"type": "object", "properties": {"x": {"type": "integer"}}},
+            }
+        },
+    )
     out = service.run_mcp_tool({"name": "mempalace_add_drawer", "arguments": {"x": 1}})
     assert out["success"] is True
     assert out["written"] is True
@@ -1252,6 +1570,7 @@ def test_mcp_tool_knowledge_graph_writes_land_beside_the_daemons_palace(monkeypa
     tool it runs writes beside that palace, as a server started with
     ``--palace`` does, and not into the per-user default graph."""
     from _mcp_server_helpers import _keep_server_command_line_state
+
     import mempalace.mcp_server as mcp
     from mempalace import service
 
@@ -1314,7 +1633,14 @@ def test_execute_job_dispatches_diary_write_mcp_tool_and_unknown(monkeypatch):
 
     monkeypatch.setattr(mcp, "tool_diary_write", lambda **kw: {"success": True})
     monkeypatch.setattr(
-        mcp, "TOOLS", {"mempalace_add_drawer": {"handler": lambda **kw: {"success": True}}}
+        mcp,
+        "TOOLS",
+        {
+            "mempalace_add_drawer": {
+                "handler": lambda **kw: {"success": True},
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        },
     )
     assert service.execute_job("diary_write", {"entry": "x"})["success"] is True
     assert (
@@ -1478,7 +1804,12 @@ def test_run_mcp_tool_marks_bare_error_dict_as_failure(monkeypatch):
     monkeypatch.setattr(
         mcp,
         "TOOLS",
-        {"mempalace_create_tunnel": {"handler": lambda **kw: {"error": "bad endpoint"}}},
+        {
+            "mempalace_create_tunnel": {
+                "handler": lambda **kw: {"error": "bad endpoint"},
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        },
     )
     out = service.run_mcp_tool({"name": "mempalace_create_tunnel", "arguments": {}})
     assert out["success"] is False
@@ -1487,7 +1818,14 @@ def test_run_mcp_tool_marks_bare_error_dict_as_failure(monkeypatch):
 
     # A result with neither an explicit success flag nor an error is a success.
     monkeypatch.setattr(
-        mcp, "TOOLS", {"mempalace_create_tunnel": {"handler": lambda **kw: {"tunnel_id": "t1"}}}
+        mcp,
+        "TOOLS",
+        {
+            "mempalace_create_tunnel": {
+                "handler": lambda **kw: {"tunnel_id": "t1"},
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        },
     )
     out = service.run_mcp_tool({"name": "mempalace_create_tunnel", "arguments": {}})
     assert out["success"] is True
@@ -1509,10 +1847,51 @@ def test_get_client_if_running_uses_short_probe_timeout(monkeypatch):
 
     monkeypatch.setattr(daemon, "DaemonClient", _FakeClient)
 
-    assert daemon.HOOK_PROBE_TIMEOUT <= 0.5
+    assert daemon.HOOK_PROBE_TIMEOUT <= 0.15
     client = daemon.get_client_if_running("/p", health_timeout=daemon.HOOK_PROBE_TIMEOUT)
     assert client is not None
     assert captured["timeout"] == daemon.HOOK_PROBE_TIMEOUT
+
+
+def test_wedged_daemon_probe_stays_under_hook_budget(tmp_path, monkeypatch):
+    """A socket that accepts and never answers must not burn the 500ms budget."""
+    import socket
+
+    monkeypatch.setenv(daemon.STATE_ROOT_ENV, str(tmp_path / "state"))
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+
+    def _hang():
+        try:
+            conn, _addr = server.accept()
+            time.sleep(2)
+            conn.close()
+        except OSError:
+            pass
+
+    threading.Thread(target=_hang, daemon=True).start()
+    try:
+        daemon.ensure_token(str(palace))
+        endpoint = daemon.state_dir(str(palace)) / "endpoint.json"
+        endpoint.write_text(
+            json.dumps({"host": "127.0.0.1", "port": port, "pid": os.getpid()}),
+            encoding="utf-8",
+        )
+        started = time.perf_counter()
+        client = daemon.get_client_if_running(str(palace), health_timeout=daemon.HOOK_PROBE_TIMEOUT)
+        elapsed = time.perf_counter() - started
+    finally:
+        server.close()
+
+    assert client is None
+    assert daemon.HOOK_PROBE_TIMEOUT <= 0.15
+    assert elapsed < 0.5, f"probe used {elapsed:.3f}s of the 500ms hook budget"
+    # The timeout is the bound; allow a little scheduler slack, not 500ms.
+    assert elapsed < daemon.HOOK_PROBE_TIMEOUT + 0.2
 
 
 # --- _detached_kwargs ---

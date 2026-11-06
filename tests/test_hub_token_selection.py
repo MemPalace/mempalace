@@ -7,6 +7,7 @@ import urllib.request
 import pytest
 
 from mempalace import server_registry
+from mempalace.hub_client import HubClient
 
 
 @pytest.fixture
@@ -32,7 +33,6 @@ def test_palace_token_precedes_distinct_process_token(isolated_home, monkeypatch
         "palace-token",
         "process-token",
     )
-    assert server_registry.load_server_token(palace) == "palace-token"
 
 
 def test_process_token_is_fallback_without_palace_token(isolated_home, monkeypatch):
@@ -40,7 +40,6 @@ def test_process_token_is_fallback_without_palace_token(isolated_home, monkeypat
     monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "process-token")
 
     assert server_registry.load_server_tokens(palace) == ("process-token",)
-    assert server_registry.load_server_token(palace) == "process-token"
 
 
 def test_duplicate_tokens_are_attempted_once(isolated_home, monkeypatch):
@@ -55,7 +54,6 @@ def test_no_local_credentials_returns_empty_candidates(isolated_home):
     palace = str(isolated_home / "palace")
 
     assert server_registry.load_server_tokens(palace) == ()
-    assert server_registry.load_server_token(palace) == ""
 
 
 class _Response(io.BytesIO):
@@ -67,7 +65,7 @@ class _Response(io.BytesIO):
         return False
 
 
-def test_urlopen_retries_the_second_token_only_after_401(isolated_home, monkeypatch):
+def test_hub_retries_the_second_token_only_after_401(isolated_home, monkeypatch):
     palace = str(isolated_home / "palace")
     _write_palace_token(palace, "stale-token")
     monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
@@ -83,18 +81,12 @@ def test_urlopen_retries_the_second_token_only_after_401(isolated_home, monkeypa
                 {},
                 io.BytesIO(),
             )
-        return _Response(b"ok")
+        return _Response(b'{"ok": true}')
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    with server_registry.urlopen_with_server_tokens(
-        palace,
-        "http://127.0.0.1:8765/mcp",
-        data=b"{}",
-        headers={"Content-Type": "application/json"},
-        timeout=5,
-    ) as response:
-        assert response.read() == b"ok"
+    hub = HubClient(palace, {"host": "127.0.0.1", "port": 8765})
+    assert hub.post({}, timeout=5) == {"ok": True}
 
     assert attempted == [
         ("Bearer stale-token", 5),
@@ -115,7 +107,7 @@ def test_urlopen_retries_the_second_token_only_after_401(isolated_home, monkeypa
         urllib.error.URLError("connection reset"),
     ],
 )
-def test_urlopen_does_not_retry_non_401_or_transport_failures(isolated_home, monkeypatch, error):
+def test_hub_does_not_retry_non_401_or_transport_failures(isolated_home, monkeypatch, error):
     palace = str(isolated_home / "palace")
     _write_palace_token(palace, "first-token")
     monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "second-token")
@@ -128,11 +120,6 @@ def test_urlopen_does_not_retry_non_401_or_transport_failures(isolated_home, mon
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     with pytest.raises(type(error)):
-        server_registry.urlopen_with_server_tokens(
-            palace,
-            "http://127.0.0.1:8765/mcp",
-            data=b"{}",
-            timeout=5,
-        )
+        HubClient(palace, {"host": "127.0.0.1", "port": 8765}).post({}, timeout=5)
 
     assert attempted == ["Bearer first-token"]

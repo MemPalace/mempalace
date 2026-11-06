@@ -15,16 +15,17 @@ Public surface:
 """
 
 from .base import (
+    DRAWER_COUNT_ZERO,
     BackendClosedError,
     BackendError,
     BackendMismatchError,
     BaseBackend,
     BaseCollection,
     CollectionNotInitializedError,
-    DRAWER_COUNT_ZERO,
     DimensionMismatchError,
     DrawerCount,
     EmbedderIdentityMismatchError,
+    EmbeddingFunctionMismatchError,
     GetResult,
     HealthStatus,
     LexicalHit,
@@ -41,8 +42,6 @@ from .chroma import ChromaBackend, ChromaCollection
 from .milvus import MilvusBackend, MilvusCollection
 from .pgvector import PgVectorBackend, PgVectorCollection
 from .qdrant import QdrantBackend, QdrantCollection
-from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
-from .rust_exact import RustExactBackend, RustExactCollection
 from .registry import (
     available_backends,
     detect_backend_for_path,
@@ -54,6 +53,8 @@ from .registry import (
     resolve_backend_for_palace,
     unregister,
 )
+from .rust_exact import RustExactBackend, RustExactCollection
+from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
 
 register("rust_exact", RustExactBackend)
 
@@ -70,6 +71,7 @@ __all__ = [
     "DimensionMismatchError",
     "DrawerCount",
     "EmbedderIdentityMismatchError",
+    "EmbeddingFunctionMismatchError",
     "GetResult",
     "HealthStatus",
     "LexicalHit",

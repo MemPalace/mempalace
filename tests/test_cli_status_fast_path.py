@@ -1,5 +1,6 @@
 """Tests for miner.status() get_all_metadata() fast path (#2153)."""
 
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -46,7 +47,7 @@ class _LegacyCollection:
 @pytest.fixture
 def _stub_deps(monkeypatch):
     monkeypatch.setattr(
-        "mempalace.backends.chroma._sqlite_wing_room_counts",
+        "mempalace.backends.chroma_sqlite._sqlite_wing_room_counts",
         lambda palace_path, collection_name: None,
     )
     monkeypatch.setattr(
@@ -134,3 +135,61 @@ class TestFallback:
         out = capsys.readouterr().out
 
         assert "0 drawers" in out
+
+
+class TestLogicalCounts:
+    """Every fallback renders what the sqlite path renders: logical drawers."""
+
+    ROWS = [
+        ("root", {"wing": "w", "room": "r"}),
+        ("root_c0", {"wing": "w", "room": "r", "parent_drawer_id": "root"}),
+        ("root_c1", {"wing": "w", "room": "r", "parent_drawer_id": "root"}),
+        ("gone_c0", {"wing": "w", "room": "r", "parent_drawer_id": "gone"}),
+        ("gone_c1", {"wing": "w", "room": "r", "parent_entry_id": "gone"}),
+        ("both_c0", {"wing": "w", "room": "r", "parent_drawer_id": "both", "parent_entry_id": "x"}),
+        ("single", {"wing": "w", "room": "r"}),
+        ("blank", {"wing": "w", "room": "r", "parent_drawer_id": ""}),
+        ("reg", {"wing": "w", "room": "_registry", "ingest_mode": "registry"}),
+        ("sentinel", {"wing": "w", "room": "r", "is_sentinel": True}),
+    ]
+
+    def _status(self, col, monkeypatch, capsys):
+        from mempalace import miner
+
+        monkeypatch.setattr(miner, "_open_collection_or_explain", lambda p: col)
+        miner.status("/fake/palace")
+        return capsys.readouterr().out
+
+    def test_get_all_rows_collapses_a_root_and_its_chunks(self, _stub_deps, monkeypatch, capsys):
+        ids = [row[0] for row in self.ROWS]
+        metas = [row[1] for row in self.ROWS]
+
+        class _Collection:
+            def get_all_rows(self, where=None, include=None):
+                assert include == ["metadatas"]
+                return SimpleNamespace(ids=ids, metadatas=metas)
+
+        out = self._status(_Collection(), monkeypatch, capsys)
+        assert "5 drawers" in out
+        assert "_registry" not in out
+
+    def test_offset_loop_collapses_a_root_and_its_chunks(self, _stub_deps, monkeypatch, capsys):
+        ids = [row[0] for row in self.ROWS]
+        metas = [row[1] for row in self.ROWS]
+
+        class _Collection:
+            def count(self):
+                return len(ids)
+
+            def get(self, *, limit, offset, include):
+                return {
+                    "ids": ids[offset : offset + limit],
+                    "metadatas": metas[offset : offset + limit],
+                }
+
+        assert "5 drawers" in self._status(_Collection(), monkeypatch, capsys)
+
+    def test_metadata_only_counts_a_shared_parent_once(self, _stub_deps, monkeypatch, capsys):
+        # No ids: the legacy root reads as its own row, so root + 2 chunks is 2.
+        col = _make_collection_with_get_all([row[1] for row in self.ROWS])
+        assert "6 drawers" in self._status(col, monkeypatch, capsys)

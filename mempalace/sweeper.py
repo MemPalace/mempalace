@@ -42,12 +42,13 @@ import json
 import logging
 import stat
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Optional
 
+from .fsio import decode_source, encoding_metadata
 from .palace import get_collection
 from .source_identity import source_directory_identity
+from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,7 @@ def parse_claude_jsonl(path: str) -> Iterator[dict]:
           "timestamp":  str,   # ISO 8601
           "role":       "user" | "assistant",
           "content":    str,   # flattened text
+          "encoding":   str,   # codec the line decoded with
         }
 
     Non-message records (progress, file-history-snapshot, system,
@@ -113,8 +115,9 @@ def parse_claude_jsonl(path: str) -> Iterator[dict]:
     """
     if not stat.S_ISREG(Path(path).stat().st_mode):
         raise OSError(f"Refusing non-regular file: {path}")
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+    with open(path, "rb") as f:
+        for raw_line in f:
+            line, encoding = decode_source(raw_line)
             line = line.strip()
             if not line:
                 continue
@@ -149,6 +152,7 @@ def parse_claude_jsonl(path: str) -> Iterator[dict]:
                 "timestamp": timestamp,
                 "role": role,
                 "content": content,
+                "encoding": encoding,
             }
 
 
@@ -314,13 +318,14 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
             "message_uuid": rec["uuid"],
             "role": rec["role"],
             "source_file": source_label or jsonl_path,
-            "filed_at": datetime.now().isoformat(),
+            "filed_at": utc_now_iso(),
             "ingest_mode": "sweep",
         }
         # The directory this drawer's ``source_file`` sits in, so ``sync``
-        # decides a swept drawer by the same reading as a mined one (#2320).
+        # decides a swept drawer by the same reading as a mined one.
         if source_dir_ino:
             metadata["source_dir_ino"] = source_dir_ino
+        metadata.update(encoding_metadata(rec["encoding"]))
 
         batch_ids.append(drawer_id)
         batch_docs.append(document)

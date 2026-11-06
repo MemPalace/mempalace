@@ -12,9 +12,9 @@ import json
 import sys
 
 import pytest
+from _mcp_server_helpers import _UNLOADABLE_JSON_KINDS, _unloadable_json_line
 
 import mempalace.mcp_server as mcp
-from _mcp_server_helpers import _UNLOADABLE_JSON_KINDS, _unloadable_json_line
 
 
 def _run_loop(monkeypatch, lines):
