@@ -31,6 +31,7 @@ from mempalace._env import env_float, env_str, parse_bool
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.config import MempalaceConfig, normalize_wing_name
 from mempalace.fsio import decode_source
+from mempalace.normalize import codex_response_message
 from mempalace.timeutil import utc_now_iso
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
@@ -200,6 +201,8 @@ def _count_human_messages(transcript_path: str) -> int:
     if not path.is_file():
         return 0
     count = 0
+    codex_events = 0
+    codex_items = 0
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -225,12 +228,20 @@ def _count_human_messages(transcript_path: str) -> int:
                         if isinstance(payload, dict) and payload.get("type") == "user_message":
                             msg_text = payload.get("message", "")
                             if isinstance(msg_text, str) and "<command-message>" not in msg_text:
-                                count += 1
+                                codex_events += 1
+                    # Newer Codex rollouts may only record the turn as a
+                    # response_item message.
+                    elif entry.get("type") == "response_item":
+                        payload = entry.get("payload", {})
+                        if isinstance(payload, dict):
+                            turn = codex_response_message(payload)
+                            if turn and turn[0] == "user":
+                                codex_items += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
         return 0
-    return count
+    return count + (codex_events or codex_items)
 
 
 _state_dir_initialized = False

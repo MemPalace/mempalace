@@ -423,6 +423,44 @@ def test_codex_jsonl_skips_non_event_msg():
     assert "X" not in result.split("> Q")[0]
 
 
+def _codex_item(role, text, kind):
+    return json.dumps(
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": role, "content": [{"type": kind, "text": text}]},
+        }
+    )
+
+
+def test_codex_jsonl_response_item_only_rollout():
+    """Codex 0.166 rollouts can carry the turns only as response_item messages."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        _codex_item("developer", "sandbox rules", "input_text"),
+        _codex_item("user", "<environment_context>cwd</environment_context>", "input_text"),
+        _codex_item("user", "Q", "input_text"),
+        _codex_item("assistant", "A", "output_text"),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q" in result
+    assert "A" in result
+    assert "sandbox rules" not in result
+    assert "environment_context" not in result
+
+
+def test_codex_jsonl_prefers_event_msg_over_response_item():
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        _codex_item("user", "Q", "input_text"),
+        json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}}),
+        _codex_item("assistant", "A", "output_text"),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}}),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result.count("> Q") == 1
+
+
 def test_codex_jsonl_non_string_message():
     lines = [
         json.dumps({"type": "session_meta"}),
