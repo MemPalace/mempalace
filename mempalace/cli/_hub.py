@@ -26,6 +26,8 @@ def _search_args_forwardable(args) -> bool:
     """Return whether ``mempalace_search`` preserves this CLI search exactly."""
     if getattr(args, "include_media", False) or getattr(args, "query_task", "search") != "search":
         return False
+    if getattr(args, "json", False) or getattr(args, "source_file", None):
+        return False
     if not 1 <= args.results <= _HUB_SEARCH_MAX_RESULTS:
         return False
     if search_settings_overridden(_backend_arg(args)):
