@@ -1,6 +1,6 @@
 # MCP Tools Reference
 
-Detailed parameter schemas for all 47 MCP tools.
+Detailed parameter schemas for all 48 MCP tools.
 
 ## Palace — Read Tools
 
@@ -176,6 +176,22 @@ Delete many drawers by ID in one call. Irreversible. Each ID is removed the same
 
 ---
 
+### `mempalace_move_drawers`
+
+Move many drawers by ID in one call. Contract matches `mempalace_delete_drawers`: accepted input is 1 to 500 IDs, each ID returns one result in input order, and missing IDs become per-item errors while the batch continues.
+
+At least one target must be provided: `target_wing` and/or `target_room`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_ids` | array of strings | **Yes** | Drawer IDs to move (1 to 500) |
+| `target_wing` | string | No | Destination wing. Canonicalized like `mempalace_update_drawer`. If omitted, each drawer's wing is left as stored |
+| `target_room` | string | No | Destination room. If omitted, each drawer's room is left as stored |
+
+**Returns:** `{ results, count, moved, errors }` for an accepted call. Each result is `{ drawer_id, moved_ids, wing, room }` or `{ drawer_id, error }`. A rejected call returns `{ error }`.
+
+---
+
 ### `mempalace_mine`
 
 Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mode='convos'` also accepts a single conversation file. Wraps the same in-process miners the CLI uses; runs synchronously and returns the miner's summary as `output`. The palace write lock is automatic — a concurrent mine returns a structured already-running error. Orphan cleanup is separate (see `mempalace_sync`).
@@ -185,6 +201,7 @@ Mine a directory into the palace — the MCP equivalent of `mempalace mine`. `mo
 | `source` | string | **Yes** | Directory to mine, or one conversation file with `mode='convos'` |
 | `mode` | string | No | `projects` (code/docs, default), `convos` (chat transcripts), or `extract` (office docs; needs the `mempalace[extract]` extra) |
 | `wing` | string | No | Target wing (default: source directory name) |
+| `room` | string | No | Target room for `projects` mode; overrides per-file room routing (default: route each file by folder/filename/content). Rejected for other modes |
 | `agent` | string | No | Recorded on every drawer (default: `mempalace`) |
 | `limit` | integer | No | Max files to process (0 = all; default 0) |
 | `dry_run` | boolean | No | Report what would be filed without writing (default false) |

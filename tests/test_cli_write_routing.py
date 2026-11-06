@@ -221,6 +221,7 @@ def _mine_args(tmp_path, **overrides):
         "dir": str(tmp_path / "project"),
         "mode": "projects",
         "wing": None,
+        "room": None,
         "agent": "mempalace",
         "limit": 0,
         "dry_run": False,
@@ -266,6 +267,50 @@ def test_cmd_mine_prefer_submits_daemon_job(tmp_path):
         "background": False,
         "auto_start": True,
     }
+
+
+def test_cmd_mine_payload_carries_room_override(tmp_path):
+    """--room reaches the mine payload (call-level room override)."""
+    args = _mine_args(tmp_path, room="docs")
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch(
+            "mempalace.cli._submit_daemon_cli_job",
+        ) as submit,
+        patch(
+            "mempalace.miner.mine",
+        ),
+    ):
+        cli.cmd_mine(args)
+
+    _kind, payload, _submitted = submit.call_args.args
+    assert payload["room"] == "docs"
+
+
+def test_cmd_mine_payload_room_defaults_to_none(tmp_path):
+    """Without --room the payload carries room=None, so per-file routing stands."""
+    args = _mine_args(tmp_path)
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.PREFER),
+        ),
+        patch(
+            "mempalace.cli._submit_daemon_cli_job",
+        ) as submit,
+        patch(
+            "mempalace.miner.mine",
+        ),
+    ):
+        cli.cmd_mine(args)
+
+    _kind, payload, _submitted = submit.call_args.args
+    assert payload["room"] is None
 
 
 @pytest.mark.parametrize("palace", [None, "given"])
@@ -314,6 +359,43 @@ def test_cmd_mine_direct_preserves_direct_path(tmp_path):
 
     submit.assert_not_called()
     direct_mine.assert_called_once()
+
+
+def test_cmd_mine_direct_carries_room_override(tmp_path):
+    """--room is not dropped when the mine runs in this process."""
+    args = _mine_args(tmp_path, room="docs")
+
+    with (
+        patch(
+            "mempalace.cli._resolve_cli_write_routing_or_exit",
+            return_value=_route(WriteRoutingPolicy.DIRECT),
+        ),
+        patch("mempalace.cli._mine_args_forwardable", return_value=False),
+        patch("mempalace.miner.mine") as direct_mine,
+    ):
+        cli.cmd_mine(args)
+
+    assert direct_mine.call_args.kwargs["room"] == "docs"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"mode": "convos"}, {"mode": "extract"}, {"source": "media"}, {"room": "bad/room"}],
+)
+def test_cmd_mine_refuses_a_room_it_could_not_honor(tmp_path, capsys, overrides):
+    args = _mine_args(tmp_path, **{"room": "docs", **overrides})
+
+    with (
+        patch("mempalace.cli._resolve_cli_write_routing_or_exit") as routing,
+        patch("mempalace.miner.mine") as direct_mine,
+        pytest.raises(SystemExit) as exc,
+    ):
+        cli.cmd_mine(args)
+
+    assert exc.value.code == 2
+    assert "mempalace:" in capsys.readouterr().err
+    routing.assert_not_called()
+    direct_mine.assert_not_called()
 
 
 def test_daemon_submission_failure_never_falls_back_direct(

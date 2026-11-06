@@ -829,6 +829,7 @@ def tool_mine(
     limit: int = 0,
     dry_run: bool = False,
     extract: str = "exchange",
+    room: str = None,
     include_ignored: Optional[list[str]] = None,
     include_subagents: bool = False,
 ):
@@ -882,6 +883,18 @@ def tool_mine(
             "success": False,
             "error": f"invalid mode '{mode}'; expected one of: {', '.join(valid_modes)}",
         }
+
+    # ``room`` overrides per-file room routing. Only the projects miner routes
+    # by folder/filename/content — convos and extract have their own room
+    # semantics — so reject it elsewhere rather than silently ignoring it
+    # (mirroring run_mine's "supported only in projects mode" guard).
+    if room is not None:
+        if mode != "projects":
+            return {"success": False, "error": "mine room is supported only in projects mode"}
+        try:
+            room = sanitize_name(room, "room")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
 
     if include_ignored is not None and (
         not isinstance(include_ignored, list)
@@ -953,6 +966,7 @@ def tool_mine(
             limit=limit,
             dry_run=dry_run,
             **({"include_ignored": include_ignored} if include_ignored else {}),
+            **({"room": room} if room is not None else {}),
         )
 
     try:
@@ -1262,8 +1276,8 @@ _BULK_DRAWER_MAX_IDS = 500
 def _bulk_ids_error(drawer_ids, *, action: str):
     """Return an error dict when ``drawer_ids`` cannot be processed.
 
-    ``action`` is the noun in the oversized-list message ("fetch" or
-    "delete"). Returns None when the list holds 1 to ``_BULK_DRAWER_MAX_IDS``
+    ``action`` is the noun in the oversized-list message ("fetch", "delete"
+    or "move"). Returns None when the list holds 1 to ``_BULK_DRAWER_MAX_IDS``
     ids.
     """
     if not isinstance(drawer_ids, list):
@@ -1579,6 +1593,71 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         outcome = _embed_failure(e, success=False)
         _wal_result("update_drawer", outcome)
         return outcome
+
+
+def tool_move_drawers(drawer_ids: list, target_wing: str = None, target_room: str = None):
+    """Move many drawers by ID in one call.
+
+    The batch contract mirrors ``tool_delete_drawers``: a call is
+    accepted only for a drawer-id list of size 1 to ``_BULK_DRAWER_MAX_IDS``;
+    otherwise it returns ``{"error": ...}`` before any read/write. At least one
+    of ``target_wing`` or ``target_room`` must be provided, and each provided
+    target must be a string.
+
+    Results stay in input order. A missing drawer id is an item-level
+    ``{"drawer_id", "error"}`` and increments ``errors``; the batch continues.
+    A success item reports the moved physical ids and the resulting wing/room
+    for that logical drawer: ``{"drawer_id", "moved_ids", "wing", "room"}``.
+
+    ``target_room`` alone leaves each drawer's wing untouched, spelling
+    included; ``target_wing`` alone does the same for its room. Each id runs
+    through ``tool_update_drawer``, so a chunked logical drawer moves all its
+    rows and a physical chunk id moves that one row.
+    """
+    rejected = _bulk_ids_error(drawer_ids, action="move")
+    if rejected:
+        return rejected
+
+    if target_wing is None and target_room is None:
+        return {"error": "At least one target is required: pass target_wing and/or target_room"}
+    if target_wing is not None and not isinstance(target_wing, str):
+        return {"error": "target_wing must be a string"}
+    if target_room is not None and not isinstance(target_room, str):
+        return {"error": "target_room must be a string"}
+
+    col = _get_collection()
+    if not col:
+        return _collection_error_or_no_palace()
+
+    results = []
+    moved = 0
+    errors = 0
+    for drawer_id in drawer_ids:
+        try:
+            outcome = tool_update_drawer(drawer_id=drawer_id, wing=target_wing, room=target_room)
+            if not outcome.get("success"):
+                errors += 1
+                results.append(
+                    {"drawer_id": drawer_id, "error": outcome.get("error", "Unknown error")}
+                )
+                continue
+
+            moved += 1
+            moved_ids = outcome.get("chunk_ids") or [outcome.get("drawer_id", drawer_id)]
+            results.append(
+                {
+                    "drawer_id": drawer_id,
+                    "moved_ids": moved_ids,
+                    "wing": outcome["wing"],
+                    "room": outcome["room"],
+                }
+            )
+        except Exception as e:
+            errors += 1
+            results.append({"drawer_id": drawer_id, "error": str(e)})
+            logger.exception("tool_move_drawers: move failed for %s", drawer_id)
+
+    return {"results": results, "count": len(results), "moved": moved, "errors": errors}
 
 
 def tool_delete_drawers(drawer_ids: list):

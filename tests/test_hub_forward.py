@@ -1148,6 +1148,7 @@ class TestServeHttpRegistersServerinfo:
         assert observed["during"]["read_only"] is mcp_server._READ_ONLY
         assert "mine_include_ignored" in observed["during"]["capabilities"]
         assert "mine_include_subagents" in observed["during"]["capabilities"]
+        assert "mine_room" in observed["during"]["capabilities"]
         # After shutdown the record is gone — no stale forwarding target.
         assert server_registry.read_live_serverinfo(palace) is None
 
@@ -1180,6 +1181,34 @@ class TestCmdMineIntegration:
             "extract": "exchange",
             "include_ignored": [".agents/handoffs/note.md", "docs/private.md", "reports"],
         }
+
+    def test_room_routes_through_hub(self, isolated_home, tmp_path, fake_hub, monkeypatch):
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, capabilities=["mine_room"])
+        monkeypatch.setattr(miner, "mine", lambda **kw: pytest.fail("must not open a local writer"))
+        args = _mine_args(tmp_path / "project", palace=palace, mode="projects", room="docs")
+        cli.cmd_mine(args)
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"]["room"] == "docs"
+
+    def test_room_old_hub_refused_without_local_fallback(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(
+            miner, "mine", lambda **kw: pytest.fail("must not fall back to a local writer")
+        )
+        args = _mine_args(tmp_path / "project", palace=palace, mode="projects", room="docs")
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_mine(args)
+        assert exc.value.code == 1
+        assert fake_hub.requests == []
+        assert "--room" in capsys.readouterr().err
 
     def test_include_ignored_old_hub_refused_without_local_fallback(
         self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys

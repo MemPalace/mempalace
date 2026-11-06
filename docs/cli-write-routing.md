@@ -54,7 +54,7 @@ route; other ignored files remain excluded. Conversation mining with
 runs the mine.
 
 These overrides require a hub advertising the matching capability
-(`mine_include_ignored` or `mine_include_subagents`). If a running hub is
+(`mine_include_ignored`, `mine_include_subagents` or `mine_room`). If a running hub is
 older, the CLI asks you to upgrade MemPalace in the hub's environment and
 restart it before retrying. It does not drop the override, submit the mine, or
 attempt a competing local write. With no live hub, the existing local mining

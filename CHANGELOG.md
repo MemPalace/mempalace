@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `mempalace mine --room` and the `room` parameter of `mempalace_mine` file every
+  drawer of a projects-mode mine in one room instead of routing each file by
+  folder, filename and content. Other modes and source adapters refuse it.
+- `mempalace_move_drawers` moves 1 to 500 drawers to another wing and/or room in
+  one call, with per-item results. Each logical drawer moves with all its chunk
+  rows, and an omitted target leaves that field as stored.
+
 ### Fixed
 
 - Room names in `mempalace.yaml` are validated when the miner loads them, so a

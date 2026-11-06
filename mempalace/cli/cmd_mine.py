@@ -5,10 +5,28 @@ if __name__ != "mempalace.cli":
 from typing import Optional
 
 
+def _checked_mine_room(args, mode, source_adapter):
+    """Return a sanitized ``--room``, or exit 2 where it could only be dropped."""
+    room = getattr(args, "room", None)
+    if room is None:
+        return None
+    if mode != "projects" or source_adapter:
+        print("mempalace: --room is supported only in projects mode", file=sys.stderr)
+        sys.exit(2)
+    from ..config import sanitize_name
+
+    try:
+        return sanitize_name(room, "room")
+    except ValueError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     mode = getattr(args, "mode", None) or "projects"
     source_adapter = getattr(args, "source", None)
+    room = _checked_mine_room(args, mode, source_adapter)
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -17,6 +35,7 @@ def cmd_mine(args):
         "source": os.path.abspath(os.path.expanduser(args.dir)),
         "mode": mode,
         "wing": args.wing,
+        "room": room,
         "agent": args.agent,
         "limit": args.limit,
         "dry_run": args.dry_run,
@@ -120,7 +139,7 @@ def cmd_mine(args):
     # this is how the save hooks keep capturing transcripts on a machine
     # that runs `mempalace serve`.
     if _mine_args_forwardable(args, include_ignored) and _forward_mine_to_hub(
-        args, palace_path, include_ignored=include_ignored
+        args, palace_path, include_ignored=include_ignored, room=room
     ):
         return
 
@@ -172,6 +191,7 @@ def cmd_mine(args):
                 respect_gitignore=not args.no_gitignore,
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
+                **({"room": room} if room is not None else {}),
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this

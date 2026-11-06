@@ -55,6 +55,7 @@ TOOL_CAPABILITIES = {
     "mempalace_checkpoint": ("write", "mutating vector_write embedding_release"),
     "mempalace_delete_drawer": ("write", "mutating vector_write"),
     "mempalace_delete_drawers": ("write", "mutating vector_write"),
+    "mempalace_move_drawers": ("write", "mutating vector_write"),
     "mempalace_mine": ("maintenance", "mutating vector_write yielding"),
     "mempalace_delete_by_source": ("write", "mutating vector_write"),
     "mempalace_sync": ("maintenance", "mutating vector_write"),

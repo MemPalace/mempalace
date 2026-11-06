@@ -213,7 +213,7 @@ def _mine_args_forwardable(args, include_ignored) -> bool:
     return True
 
 
-def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> bool:
+def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None, room=None) -> bool:
     """Run this mine inside the palace's HTTP hub, if one is alive.
 
     A long-lived hub (``mempalace serve``) holds the MCP writer lease for
@@ -245,6 +245,7 @@ def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> boo
     for requested, capability, flag in (
         (include_ignored, "mine_include_ignored", "--include-ignored"),
         (include_subagents, "mine_include_subagents", "--include-subagents"),
+        (room, "mine_room", "--room"),
     ):
         if requested and capability not in hub.capabilities:
             print(
@@ -269,6 +270,8 @@ def _forward_mine_to_hub(args, palace_path: str, *, include_ignored=None) -> boo
         arguments["include_ignored"] = include_ignored
     if include_subagents:
         arguments["include_subagents"] = True
+    if room:
+        arguments["room"] = room
 
     print(f"mempalace: forwarding mine to palace hub {hub.base_url} (pid {hub.pid})")
     try:

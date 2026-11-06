@@ -718,6 +718,31 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
     return "general"
 
 
+def resolve_room(
+    filepath: Path,
+    content: str,
+    rooms: list,
+    project_path: Path,
+    call_room: str = None,
+    rule_room: str = None,
+) -> str:
+    """Resolve the room a file should be filed under.
+
+    Precedence, most specific first: an explicit call-level ``call_room`` (the
+    ``room=`` argument to :func:`mine`) beats a per-path ``rule_room`` from the
+    ``paths:`` config section, which beats :func:`detect_room` routing and its
+    ``"general"`` fallback.
+
+    ``rule_room`` is reserved for the per-path config form; it is unused today
+    and exists so that form can land without changing this call site.
+    """
+    if call_room:
+        return call_room
+    if rule_room:
+        return rule_room
+    return detect_room(filepath, content, rooms, project_path)
+
+
 # =============================================================================
 # CHUNKING
 # =============================================================================
@@ -1741,6 +1766,7 @@ def process_file(
     chunk_overlap: int = None,
     min_chunk_size: int = None,
     max_chunks_per_file: Optional[int] = None,
+    room_override: str = None,
     mined_mtimes: Optional[dict] = None,
     aaak_col=None,
 ) -> tuple:
@@ -1779,7 +1805,7 @@ def process_file(
     if len(content) < effective_min:
         return 0, "general", None
 
-    room = detect_room(filepath, content, rooms, project_path)
+    room = resolve_room(filepath, content, rooms, project_path, call_room=room_override)
     chunks = chunk_text(
         content,
         source_file,
@@ -2076,6 +2102,7 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    room: str = None,
 ):
     """Mine a project directory into the palace.
 
@@ -2090,6 +2117,11 @@ def mine(
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
     """
+    if room is not None:
+        from .config import sanitize_name
+
+        room = sanitize_name(room, "room")
+
     if dry_run:
         return _mine_impl(
             project_dir,
@@ -2102,6 +2134,7 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            room=room,
         )
 
     # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -2119,7 +2152,30 @@ def mine(
             include_ignored=include_ignored,
             files=files,
             max_chunks_per_file=max_chunks_per_file,
+            room=room,
         )
+
+
+def _print_mine_flags(
+    *,
+    dry_run: bool,
+    respect_gitignore: bool,
+    include_ignored: list,
+    room: str = None,
+) -> None:
+    """Print the conditional flags in the mine summary banner.
+
+    Extracted from :func:`_mine_impl` so these branches do not count against
+    that function's cyclomatic complexity.
+    """
+    if dry_run:
+        print("  DRY RUN -- nothing will be filed")
+    if not respect_gitignore:
+        print("  .gitignore: DISABLED")
+    if include_ignored:
+        print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
+    if room:
+        print(f"  Room override: {room}")
 
 
 def _mine_impl(
@@ -2133,6 +2189,7 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    room: str = None,
 ):
     from .config import MempalaceConfig
 
@@ -2175,12 +2232,12 @@ def _mine_impl(
     print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     print(f"  Device:  {device}")
-    if dry_run:
-        print("  DRY RUN -- nothing will be filed")
-    if not respect_gitignore:
-        print("  .gitignore: DISABLED")
-    if include_ignored:
-        print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
+    _print_mine_flags(
+        dry_run=dry_run,
+        respect_gitignore=respect_gitignore,
+        include_ignored=include_ignored,
+        room=room,
+    )
     print(f"{'-' * 55}\n")
 
     if not dry_run:
@@ -2211,7 +2268,7 @@ def _mine_impl(
         for i, filepath in enumerate(files, 1):
             collection, closets_col = _yield_and_reopen(palace_path, collection, closets_col)
             try:
-                drawers, room, skip_reason = process_file(
+                drawers, resolved_room, skip_reason = process_file(
                     filepath=filepath,
                     project_path=project_path,
                     collection=collection,
@@ -2229,6 +2286,7 @@ def _mine_impl(
                     # otherwise a malformed env var would emit its warning
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
+                    room_override=room,
                     mined_mtimes=mined_mtimes,
                 )
             except KeyboardInterrupt:
@@ -2252,7 +2310,7 @@ def _mine_impl(
                     files_skipped_chunk_cap += 1
             else:
                 total_drawers += drawers
-                room_counts[room] += 1
+                room_counts[resolved_room] += 1
                 files_mined += 1
                 if not dry_run:
                     print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")

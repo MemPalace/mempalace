@@ -1597,6 +1597,7 @@ def _serve_http(host: str, port: int) -> None:
                 capabilities=[
                     "mine_include_ignored",
                     "mine_include_subagents",
+                    "mine_room",
                     "search_cli_compatible",
                 ],
                 search_config_fingerprint=_config.search_config_fingerprint,

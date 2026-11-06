@@ -29,6 +29,7 @@ READ_ONLY_REFUSED = {
     "mempalace_kg_supersede",
     "mempalace_memories_filed_away",
     "mempalace_mine",
+    "mempalace_move_drawers",
     "mempalace_patch_submit",
     "mempalace_sync",
     "mempalace_task_create",
@@ -44,6 +45,20 @@ def test_read_only_refusals_are_pinned():
 
 def test_mutating_tools_are_pinned():
     assert mcp_server._MUTATING_TOOLS == MUTATING
+
+
+def test_move_drawers_takes_the_same_gates_as_delete_drawers():
+    name = "mempalace_move_drawers"
+    assert service.classify_tool(name) == "write"
+    assert name in tool_capabilities.MUTATING_TOOLS
+    assert name in tool_capabilities.VECTOR_WRITE_TOOLS
+    assert name in tool_capabilities.READ_ONLY_REFUSED_TOOLS
+    # It writes Chroma: the peer lease and the HTTP request lock both apply.
+    assert name not in tool_capabilities.PEER_WRITER_EXEMPT_TOOLS
+    assert name not in tool_capabilities.SQLITE_INTEGRITY_ALLOWED_TOOLS
+    assert name not in tool_capabilities.HTTP_LOCK_FREE_TOOLS
+    assert name not in tool_capabilities.HTTP_EMBEDDING_RELEASE_TOOLS
+    assert name not in tool_capabilities.HTTP_YIELDING_TOOLS
 
 
 def test_every_tool_has_a_capability():

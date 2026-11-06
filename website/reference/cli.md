@@ -67,6 +67,7 @@ mempalace mine <dir> --wing myapp
 | `--extract` | `exchange` | `exchange` or `general` (for convos mode) |
 | `--no-gitignore` | — | Don't respect .gitignore |
 | `--include-ignored` | — | Always scan these paths even if ignored |
+| `--room` | per-file routing | File every drawer in this room; projects mode only, refused with `--mode convos`, `--mode extract` or `--source` |
 
 Exits `1` when one or more files could not be mined (a stale-drawer purge failed). The summary shows `Files failed: N`, and stderr reports the failed files. Those files keep their existing drawers and are retried by the next mine.
 
@@ -233,7 +234,7 @@ mempalace rules --host mac --harness claude --project myapp
 mempalace rules --host windows --harness grok --project mempalace --mcp light
 ```
 
-`--mcp full` (default) names the 47-tool `mempalace-mcp` tools.
+`--mcp full` (default) names the 48-tool `mempalace-mcp` tools.
 `--mcp light` names the 3-tool triad. Prose is identical.
 
 ## `mempalace logstream`

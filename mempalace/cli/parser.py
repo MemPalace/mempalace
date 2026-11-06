@@ -203,6 +203,14 @@ def main():
     )
     p_mine.add_argument("--wing", default=None, help="Wing name (default: directory name)")
     p_mine.add_argument(
+        "--room",
+        default=None,
+        help=(
+            "Target room for projects mode; overrides per-file room routing "
+            "(default: route each file by folder/filename/content)"
+        ),
+    )
+    p_mine.add_argument(
         "--related-drawer-id",
         default=None,
         help="Associate media assets with an existing drawer (--source media only)",
@@ -451,7 +459,7 @@ def main():
         choices=["full", "light"],
         default="full",
         help=(
-            "Tool names in the block: 'full' (default, the 47-tool mempalace-mcp) or "
+            "Tool names in the block: 'full' (default, the 48-tool mempalace-mcp) or "
             "'light' (palace_query / palace_exec / palace_coordinate)"
         ),
     )
