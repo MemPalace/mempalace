@@ -64,8 +64,10 @@
   .rule-tiles { grid-template-columns: minmax(0, 1fr); }
   .rule-tile > header, .rule-row { padding: 12px; }
   .rules-view .opts, .rule-ask { display: flex; flex-wrap: wrap; align-items: center; }
-  .rules-view .opt, .rules-view .blockbtn, #head-actions [data-rule-action="new"] { min-height: 44px; justify-content: center; }
   .rule-fields { flex-direction: column; }
   .rule-fields label { min-width: 0; }
+}
+@media (max-width: 699px) {
+  .rules-view .opt, .rules-view .blockbtn, #head-actions [data-rule-action="new"] { min-height: 44px; justify-content: center; }
   .rules-view select, .rules-view input, .rule-text-button, .rule-summary { min-height: 44px; }
 }

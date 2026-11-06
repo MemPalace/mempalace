@@ -173,3 +173,28 @@ def test_layout(render, ui, app):
     csp = ui.csp_violations()
     assert not csp, f"CSP violations on {name}: {json.dumps(csp, ensure_ascii=False)}"
     assert not found, f"{name}: {json.dumps(found, ensure_ascii=False)}"
+
+
+@pytest.mark.parametrize("route", ["decide", "console", "rules"])
+def test_legacy_touch_targets(route, ui, app):
+    """Legacy controls follow the shell's phone breakpoint, including its upper edge."""
+    found = {}
+    for width in (390, 640, 641, 670, 699, 700):
+        page = ui.open(f"#/{route}", (width, 900))
+        targets = [issue for issue in page.evaluate(AA_JS, width) if issue.startswith("target ")]
+        shots.capture(page, f"legacy-touch-{route}", width)
+        if targets:
+            found[width] = targets
+    assert not found, f"{route}: {json.dumps(found, ensure_ascii=False)}"
+
+
+def test_tablet_board_header(ui, app):
+    page = ui.open("#/board/field-notes", (768, 1024))
+    title = page.locator("#title")
+    assert title.inner_text() == "Field notes"
+    assert title.evaluate("el => el.scrollWidth <= el.clientWidth"), "project title is truncated"
+    actions = page.locator("#head-actions > button:visible").evaluate_all(
+        "els => els.map(el => el.getBoundingClientRect().top)"
+    )
+    assert actions and max(actions) - min(actions) <= 1, "header actions wrap across rows"
+    shots.capture(page, "tablet-board-header", 768)

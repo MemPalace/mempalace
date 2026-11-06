@@ -226,6 +226,11 @@ kbd { font: 500 11px/16px var(--mono); color: var(--text-2); background: var(--s
 /* ---------- Header (all screens) ---------- */
 .shell .head h1#title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .shell .head .right { flex: 0 1 auto; min-width: 0; flex-wrap: wrap; align-items: center; }
+/* Tablet board titles get a full row before the header actions. */
+@media (min-width: 700px) and (max-width: 1023px) {
+  .shell[data-view="board"] .head { flex-wrap: wrap; }
+  .shell[data-view="board"] .head h1#title { flex-basis: 100%; }
+}
 @media (max-width: 699px) {
   .shell .head .right kbd { display: none; }
   /* The phone top bar already names the project (m1). */
