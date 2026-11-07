@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from mempalace import timeutil
 from mempalace.dynamics import (
     DEFAULT_STABILITY,
     DEFAULT_STRENGTH,
@@ -22,10 +23,10 @@ from mempalace.dynamics import (
     STABILITY_INCREMENT,
     STRENGTH_FLOOR,
     apply_decay,
+    effective_strength,
     initialize_dynamics_fields,
     potentiate,
 )
-
 
 # Fixed reference point so test arithmetic is exact.
 T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -309,3 +310,88 @@ class TestIntegrationScenarios:
             potentiate(conn, now=T0 + timedelta(minutes=minutes_offset))
         assert conn["stability"] == DEFAULT_STABILITY
         assert conn["access_count"] == 5
+
+
+class TestEffectiveStrength:
+    """Read-time decay: the same curve as apply_decay, computed when the
+    strength is read rather than written back."""
+
+    def test_matches_apply_decay_for_a_single_application(self):
+        """The two agree when decay is applied exactly once, which is the
+        only case where apply_decay is unambiguous."""
+        conn = _fresh_connection()
+        ten_days = T0 + timedelta(days=10)
+
+        read = effective_strength(conn, now=ten_days)
+
+        decayed = dict(conn)
+        apply_decay(decayed, now=ten_days)
+
+        assert read == pytest.approx(decayed["strength"])
+
+    def test_reading_does_not_change_the_connection(self):
+        """A read must not be able to alter a ranking."""
+        conn = _fresh_connection()
+        before = dict(conn)
+        effective_strength(conn, now=T0 + timedelta(days=3))
+        assert conn == before
+
+    def test_result_depends_only_on_elapsed_time(self):
+        """The property apply_decay does not have: reading at an
+        intermediate moment must not change the later answer.
+
+        With apply_decay, decaying at day 5 and again at day 10 yields
+        STRENGTH_FLOOR (0.05) rather than the 0.135335 a single application
+        at day 10 gives — so strength ends up depending on how often a
+        maintenance pass ran.
+        """
+        # Explicit stability: the default is 1.0 day, which over ten days
+        # decays below STRENGTH_FLOOR and would hide the property under the
+        # floor rather than demonstrate it.
+        conn = {"strength": 1.0, "stability": 5.0, "last_activated": T0.isoformat()}
+        day5 = T0 + timedelta(days=5)
+        day10 = T0 + timedelta(days=10)
+
+        direct = effective_strength(conn, now=day10)
+        effective_strength(conn, now=day5)
+        after_intermediate_read = effective_strength(conn, now=day10)
+
+        assert direct == pytest.approx(after_intermediate_read)
+        assert direct == pytest.approx(math.exp(-2))  # 0.135335
+
+    def test_missing_timestamp_returns_stored_strength(self):
+        """A record with an unparseable timestamp is a data-integrity issue,
+        not a reason to report it as forgotten."""
+        conn = {"strength": 2.0, "stability": 5.0, "last_activated": "not-a-date"}
+        assert effective_strength(conn, now=T0) == 2.0
+
+    def test_naive_now_is_read_as_local_time(self, monkeypatch):
+        """A caller passing datetime.now() gets local time, not a TypeError."""
+        zone = timezone(timedelta(hours=9))
+        monkeypatch.setattr(timeutil, "_LOCAL_TZ", zone)
+        conn = {"strength": 1.0, "stability": 5.0, "last_activated": T0.isoformat()}
+        later = T0 + timedelta(days=10)
+        naive = later.astimezone(zone).replace(tzinfo=None)
+
+        assert effective_strength(conn, now=naive) == pytest.approx(
+            effective_strength(conn, now=later)
+        )
+
+    @pytest.mark.parametrize("hours", [-3, 9, 14])
+    def test_naive_stored_timestamp_is_local_time(self, monkeypatch, hours):
+        """Tunnels written before timestamps were UTC hold naive local times;
+        reading them as UTC would skew decay by the zone offset."""
+        zone = timezone(timedelta(hours=hours))
+        monkeypatch.setattr(timeutil, "_LOCAL_TZ", zone)
+        naive_local = T0.astimezone(zone).replace(tzinfo=None).isoformat()
+        legacy = {"strength": 1.0, "stability": 5.0, "last_activated": naive_local}
+        current = {"strength": 1.0, "stability": 5.0, "last_activated": T0.isoformat()}
+        now = T0 + timedelta(days=10)
+
+        assert effective_strength(legacy, now=now) == pytest.approx(
+            effective_strength(current, now=now)
+        )
+
+    def test_never_below_the_floor(self):
+        conn = _fresh_connection()
+        assert effective_strength(conn, now=T0 + timedelta(days=3650)) == STRENGTH_FLOOR

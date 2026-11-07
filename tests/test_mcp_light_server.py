@@ -2,9 +2,30 @@
 test_mcp_light_server.py — Integration tests for Lightweight MemPalace MCP Server.
 """
 
+import io
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+from _mcp_server_helpers import _UNLOADABLE_JSON_KINDS, _unloadable_json_line
+
 from mempalace import mcp_light_server, mcp_server
+from mempalace.hub_client import HubClient
 from mempalace.palace_graph import invalidate_graph_cache
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _hub_forwarding_to(monkeypatch, forward):
+    """Route stdio dispatch to a live hub whose answers come from ``forward``."""
+    hub = HubClient("/p", {"host": "127.0.0.1", "port": 9})
+    monkeypatch.setattr(
+        hub, "post", lambda request, **kw: forward(hub.base_url, {}, request, hub.palace_path)
+    )
+    monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: hub)
 
 
 def _patch_light_server(monkeypatch, config, kg):
@@ -40,6 +61,10 @@ class TestLightMcpProtocol:
         tools = res["result"]["tools"]
         tool_names = [t["name"] for t in tools]
         assert tool_names == ["palace_query", "palace_exec", "palace_coordinate"]
+        coord_tool = next(t for t in tools if t["name"] == "palace_coordinate")
+        props = coord_tool["inputSchema"]["properties"]
+        for expected_prop in ("order", "limit", "preview", "since_created_at"):
+            assert expected_prop in props, f"Missing {expected_prop} in palace_coordinate schema"
 
     def test_tools_list_read_only(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
@@ -151,6 +176,23 @@ class TestPalaceExec:
         assert get_payload.get("room") == "test_room"
         assert "OAuth2 token rotation" in get_payload.get("content", "")
 
+    def test_write_releases_writer_lease(self, monkeypatch, config, collection, kg):
+        """The light server's writes take the peer-writer lease per call too."""
+        _patch_light_server(monkeypatch, config, kg)
+        mcp_server._release_mcp_writer_lock()
+        add_req = {
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_exec",
+                "arguments": 'ADD IN test_wing/test_room "lease release check" SOURCE lease.md',
+            },
+        }
+        res = mcp_light_server.handle_light_request(add_req)
+        assert json.loads(res["result"]["content"][0]["text"]).get("success") is True
+        assert mcp_server._MCP_WRITER_LOCK_CM is None
+
     def test_kg_add_and_query(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
         # 1. KG ADD
@@ -230,10 +272,27 @@ class TestPalaceCoordinate:
         task_event = payload.get("task", {})
         assert task_event.get("type") == "task.request"
 
-        # List events
+        # Append a second event
+        second_cmd = (
+            "EVENT APPEND type:status stream:project/mempalace room:status "
+            'from:windows:claude:mempalace to:windows:antigravity:mempalace body:"Task acknowledged"'
+        )
+        second_res = mcp_light_server.handle_light_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "tools/call",
+                "params": {"name": "palace_coordinate", "arguments": second_cmd},
+            }
+        )
+        second_payload = json.loads(second_res["result"]["content"][0]["text"])
+        assert second_payload.get("success") is True
+        second_event = second_payload["event"]
+
+        # 1. Default without cursor returns newest first
         list_req = {
             "jsonrpc": "2.0",
-            "id": 51,
+            "id": 52,
             "method": "tools/call",
             "params": {
                 "name": "palace_coordinate",
@@ -243,7 +302,55 @@ class TestPalaceCoordinate:
         list_res = mcp_light_server.handle_light_request(list_req)
         list_payload = json.loads(list_res["result"]["content"][0]["text"])
         events = list_payload.get("events", [])
-        assert len(events) >= 1
+        assert len(events) == 2
+        assert events[0]["id"] == second_event["id"]
+        assert events[1]["id"] == task_event["id"]
+
+        # 2. EVENT INBOX defaults to newest first and preview=True
+        inbox_req = {
+            "jsonrpc": "2.0",
+            "id": 53,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": "EVENT INBOX to:windows:claude:mempalace",
+            },
+        }
+        inbox_res = mcp_light_server.handle_light_request(inbox_req)
+        inbox_payload = json.loads(inbox_res["result"]["content"][0]["text"])
+        inbox_events = inbox_payload.get("events", [])
+        assert len(inbox_events) == 1
+        assert inbox_events[0]["id"] == task_event["id"]
+
+        # 3. Resuming with since_event_id returns forward chronological order
+        resume_req = {
+            "jsonrpc": "2.0",
+            "id": 54,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": f"EVENT LIST stream:project/mempalace since_id:{task_event['id']}",
+            },
+        }
+        resume_res = mcp_light_server.handle_light_request(resume_req)
+        resume_payload = json.loads(resume_res["result"]["content"][0]["text"])
+        assert len(resume_payload.get("events", [])) == 1
+        assert resume_payload["events"][0]["id"] == second_event["id"]
+
+        # 4. Uppercase ORDER DESC works cleanly
+        desc_req = {
+            "jsonrpc": "2.0",
+            "id": 55,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_coordinate",
+                "arguments": f"EVENT LIST stream:project/mempalace ORDER DESC since_id:{task_event['id']}",
+            },
+        }
+        desc_res = mcp_light_server.handle_light_request(desc_req)
+        desc_payload = json.loads(desc_res["result"]["content"][0]["text"])
+        assert len(desc_payload.get("events", [])) == 1
+        assert desc_payload["events"][0]["id"] == second_event["id"]
 
     def test_artifact_put_and_get(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
@@ -300,7 +407,7 @@ class TestLightMcpPreflightAndGates:
             called_args["apply"] = apply
             return {"synced": True}
 
-        monkeypatch.setattr(mcp_server, "tool_sync", mock_tool_sync)
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_sync"], "handler", mock_tool_sync)
         req = {
             "jsonrpc": "2.0",
             "id": 71,
@@ -381,7 +488,7 @@ class TestUnwrapAndStructuredMerge:
             captured.update(kwargs)
             return {"results": []}
 
-        monkeypatch.setattr(mcp_server, "tool_search", fake_search)
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_search"], "handler", fake_search)
         req = {
             "jsonrpc": "2.0",
             "id": 80,
@@ -440,7 +547,7 @@ class TestSearchEnrichment:
         monkeypatch.setattr(
             mcp_server,
             "tool_follow_tunnels",
-            lambda wing, room: [
+            lambda wing, room, record=True: [
                 {
                     "connected_wing": "guidelines",
                     "connected_room": "rx",
@@ -497,8 +604,6 @@ class TestHubDispatch:
         _patch_light_server(monkeypatch, config, kg)
         captured = {}
 
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
-
         def fake_forward(base_url, headers, request, palace_path):
             captured["name"] = request["params"]["name"]
             captured["arguments"] = request["params"]["arguments"]
@@ -508,7 +613,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": json.dumps({"ok": True})}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 90,
@@ -527,7 +632,6 @@ class TestHubDispatch:
     def test_tools_call_maps_sync_project_to_project_dir(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
         captured = {}
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             captured["name"] = request["params"]["name"]
@@ -538,7 +642,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": "{}"}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 91,
@@ -556,7 +660,6 @@ class TestHubDispatch:
 
     def test_taxonomy_in_wing_is_filtered_after_hub_rewrite(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             assert request["params"]["name"] == "mempalace_get_taxonomy"
@@ -568,7 +671,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": json.dumps(payload)}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 92,
@@ -581,7 +684,6 @@ class TestHubDispatch:
 
     def test_exec_add_resolves_unique_suffix_wing_before_forward(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
         monkeypatch.setattr(
             mcp_server,
             "tool_list_wings",
@@ -598,7 +700,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": "{}"}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 93,
@@ -617,13 +719,12 @@ class TestHubDispatch:
         _patch_light_server(monkeypatch, config, kg)
         monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
         forwarded = []
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             forwarded.append(request)
             return {"jsonrpc": "2.0", "id": request["id"], "result": {}}
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 94,
@@ -657,7 +758,6 @@ class TestHubDispatch:
     def test_tools_call_maps_kg_invalidate_valid_to_to_ended(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
         captured = {}
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             captured["name"] = request["params"]["name"]
@@ -668,7 +768,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": "{}"}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 96,
@@ -692,7 +792,6 @@ class TestHubDispatch:
     def test_tools_call_maps_traverse_to_registered_tool(self, monkeypatch, config, kg):
         _patch_light_server(monkeypatch, config, kg)
         captured = {}
-        monkeypatch.setattr(mcp_server, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
 
         def fake_forward(base_url, headers, request, palace_path):
             captured["name"] = request["params"]["name"]
@@ -703,7 +802,7 @@ class TestHubDispatch:
                 "result": {"content": [{"type": "text", "text": "{}"}]},
             }
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", fake_forward)
+        _hub_forwarding_to(monkeypatch, fake_forward)
         req = {
             "jsonrpc": "2.0",
             "id": 97,
@@ -714,3 +813,335 @@ class TestHubDispatch:
         assert captured["name"] == "mempalace_traverse"
         assert captured["arguments"]["start_room"] == "auth-flow"
         assert captured["arguments"]["max_hops"] == 3
+
+    def test_tools_list_schema_includes_hardened_fields(self, monkeypatch, config, kg):
+        _patch_light_server(monkeypatch, config, kg)
+        req = {"jsonrpc": "2.0", "id": 98, "method": "tools/list"}
+        res = mcp_light_server.handle_light_request(req)
+        tools = {t["name"]: t for t in res["result"]["tools"]}
+
+        exec_schema = tools["palace_exec"]["inputSchema"]["properties"]
+        assert "agent_name" in exec_schema
+        assert "entry" in exec_schema
+        assert "at" in exec_schema
+        assert "old_object" in exec_schema
+        assert "new_object" in exec_schema
+
+        assert "authorized mutations" in tools["palace_exec"]["description"]
+        assert "NEVER use palace_coordinate for reads" in tools["palace_query"]["description"]
+        assert "DO NOT use for reading memories" in tools["palace_coordinate"]["description"]
+
+    def test_palace_exec_structured_diary_write(self, monkeypatch, config, kg):
+        _patch_light_server(monkeypatch, config, kg)
+        req = {
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_exec",
+                "arguments": {
+                    "action": "diary_write",
+                    "agent_name": "medgemma",
+                    "entry": "Patient HbA1c 7.4% stable",
+                    "topic": "clinical",
+                },
+            },
+        }
+        res = mcp_light_server.handle_light_request(req)
+        assert res["id"] == 99
+        payload = json.loads(res["result"]["content"][0]["text"])
+        assert payload.get("success") is True or "drawer_id" in payload or "entry_id" in payload
+
+    def test_palace_exec_structured_kg_supersede(self, monkeypatch, config, kg):
+        _patch_light_server(monkeypatch, config, kg)
+        kg.add_triple("Max", "grade", "6", valid_from="2025-01-01")
+        req = {
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_exec",
+                "arguments": {
+                    "action": "kg_supersede",
+                    "subject": "Max",
+                    "predicate": "grade",
+                    "old_object": "6",
+                    "new_object": "7",
+                },
+            },
+        }
+        res = mcp_light_server.handle_light_request(req)
+        assert res["id"] == 100
+        payload = json.loads(res["result"]["content"][0]["text"])
+        assert payload.get("success") is True
+
+
+def test_light_server_help_lists_the_light_servers_own_options():
+    """``--help`` reaches the light server's parser (#2528).
+
+    It used to be answered while the light server was still importing the full
+    server, which parsed argv on import and printed its own options, including
+    an HTTP transport the light server rejects.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", "from mempalace.mcp_light_server import main; main()", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=str(REPO_ROOT),
+    )
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, output
+    assert "MemPalace Lightweight MCP Server" in output
+    assert "--transport" not in output
+
+
+def test_light_server_applies_the_flags_it_shares_with_the_full_server(monkeypatch, tmp_path):
+    """``--palace``, ``--backend`` and ``--read-only`` reach the state the tools read.
+
+    ``--palace`` also puts the knowledge graph beside that palace, as it does
+    for the full server.
+    """
+    from _mcp_server_helpers import _keep_server_command_line_state
+
+    _keep_server_command_line_state(monkeypatch)
+    for name in (
+        "_maybe_eager_warmup_embedder",
+        "_start_idle_exit_watchdog",
+        "_start_write_stall_watchdog",
+    ):
+        monkeypatch.setattr(mcp_server, name, lambda: None)
+    monkeypatch.setattr(mcp_light_server, "_restore_stdout", lambda: None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    palace = tmp_path / "palace"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mempalace-light-mcp",
+            "--palace",
+            str(palace),
+            "--backend",
+            "sqlite_exact",
+            "--read-only",
+        ],
+    )
+
+    mcp_light_server.main()
+
+    assert mcp_server._config.palace_path == str(palace)
+    assert mcp_server._READ_ONLY is True
+    assert os.environ["MEMPALACE_BACKEND"] == "sqlite_exact"
+    assert mcp_server._resolve_kg_path() == str(palace / "knowledge_graph.sqlite3")
+
+
+@pytest.mark.parametrize("kind", _UNLOADABLE_JSON_KINDS)
+def test_a_line_json_loads_rejects_does_not_end_the_light_server(monkeypatch, tmp_path, kind):
+    """json.loads raises RecursionError or ValueError here, not JSONDecodeError.
+
+    Either one used to end the server, and a parse failure used to produce no
+    reply. The bad line gets -32700 and the next request is still served.
+    """
+    from _mcp_server_helpers import _keep_server_command_line_state
+
+    _keep_server_command_line_state(monkeypatch)
+    for name in (
+        "_maybe_eager_warmup_embedder",
+        "_start_idle_exit_watchdog",
+        "_start_write_stall_watchdog",
+    ):
+        monkeypatch.setattr(mcp_server, name, lambda: None)
+    monkeypatch.setattr(mcp_light_server, "_restore_stdout", lambda: None)
+    lines = [_unloadable_json_line(kind), '{"jsonrpc": "2.0", "id": 2, "method": "ping"}']
+    monkeypatch.setattr(sys, "stdin", io.StringIO("".join(line + "\n" for line in lines)))
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "argv", ["mempalace-light-mcp", "--palace", str(tmp_path / "palace")])
+
+    mcp_light_server.main()
+
+    responses = [json.loads(line) for line in out.getvalue().splitlines() if line.strip()]
+    assert [response.get("id") for response in responses] == [None, 2]
+    assert responses[0]["error"]["code"] == -32700
+    assert responses[1]["result"] == {}
+
+
+def test_palace_allowlists_name_registered_tools_only():
+    """Every rewritten palace_* name is a real tool, and query cannot name a write."""
+    for mapping in (
+        mcp_light_server._QUERY_TARGET_TO_TOOL,
+        mcp_light_server._EXEC_ACTION_TO_TOOL,
+        mcp_light_server._COORD_ACTION_TO_TOOL,
+    ):
+        assert mapping
+        for tool_name in mapping.values():
+            assert tool_name in mcp_server.TOOLS
+    query_tools = set(mcp_light_server._QUERY_TARGET_TO_TOOL.values())
+    for forbidden in (
+        "mempalace_delete_drawer",
+        "mempalace_delete_by_source",
+        "mempalace_add_drawer",
+    ):
+        assert forbidden not in query_tools
+    assert mcp_light_server._COORD_ACTION_TO_TOOL["peers"] == "mempalace_mesh_peers"
+    assert mcp_light_server._COORD_ACTION_TO_TOOL["mesh_peers"] == "mempalace_mesh_peers"
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["delete_drawer", "delete_by_source", "add_drawer"],
+)
+def test_palace_query_rejects_write_targets_on_the_production_path(monkeypatch, target):
+    """The stdio rewrite is the path production runs. A read-only query must not
+    become mempalace_delete_drawer / delete_by_source / add_drawer."""
+    forwarded = []
+
+    def _forbid(request):
+        forwarded.append(request)
+        raise AssertionError(f"forwarded {request['params']['name']}")
+
+    monkeypatch.setattr(mcp_server, "_dispatch_stdio_request", _forbid)
+    for tool_attr in ("tool_delete_drawer", "tool_delete_by_source", "tool_add_drawer"):
+        monkeypatch.setattr(
+            mcp_server,
+            tool_attr,
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("handler ran")),
+        )
+
+    response = mcp_light_server.dispatch_light_stdio_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 41,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_query",
+                "arguments": {"target": target, "drawer_id": "drawer-1", "dry_run": False},
+            },
+        }
+    )
+
+    assert forwarded == []
+    assert response["id"] == 41
+    assert response["error"]["code"] == -32602
+    assert response["error"]["message"] == "unknown target"
+    assert (
+        mcp_light_server._classify_underlying_tool(
+            "palace_query", {"target": target, "drawer_id": "drawer-1"}
+        )
+        is None
+    )
+
+
+def test_palace_query_write_target_is_refused_on_the_handler_path_too():
+    """handle_light_request shares the allowlist, so the untested path cannot
+    dispatch a write the production rewrite refuses."""
+    response = mcp_light_server.handle_light_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_query",
+                "arguments": {"target": "delete_drawer", "drawer_id": "drawer-1"},
+            },
+        }
+    )
+    assert response["error"]["code"] == -32602
+    assert response["error"]["message"] == "unknown target"
+
+
+def test_palace_exec_unknown_action_is_not_a_tool_name(monkeypatch):
+    forwarded = []
+    monkeypatch.setattr(
+        mcp_server,
+        "_dispatch_stdio_request",
+        lambda request: forwarded.append(request["params"]["name"]),
+    )
+    response = mcp_light_server.dispatch_light_stdio_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 43,
+            "method": "tools/call",
+            "params": {"name": "palace_exec", "arguments": {"action": "drop_database"}},
+        }
+    )
+    assert forwarded == []
+    assert response["error"]["code"] == -32602
+    assert response["error"]["message"] == "unknown target"
+
+
+def test_palace_query_settings_forwards_no_arguments(monkeypatch):
+    """palace_query reads settings; a silent_save argument must not write config.json."""
+    captured = {}
+
+    def _capture(request):
+        captured.update(request["params"])
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {"content": [{"type": "text", "text": "{}"}]},
+        }
+
+    monkeypatch.setattr(mcp_server, "_dispatch_stdio_request", _capture)
+    mcp_light_server.dispatch_light_stdio_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 45,
+            "method": "tools/call",
+            "params": {
+                "name": "palace_query",
+                "arguments": {"target": "settings", "silent_save": False},
+            },
+        }
+    )
+    assert captured == {"name": "mempalace_hook_settings", "arguments": {}}
+
+
+def test_palace_coordinate_peers_rewrites_to_mesh_peers(monkeypatch):
+    captured = {}
+
+    def _capture(request):
+        captured["name"] = request["params"]["name"]
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {"content": [{"type": "text", "text": "{}"}]},
+        }
+
+    monkeypatch.setattr(mcp_server, "_dispatch_stdio_request", _capture)
+    response = mcp_light_server.dispatch_light_stdio_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 44,
+            "method": "tools/call",
+            "params": {"name": "palace_coordinate", "arguments": {"action": "peers"}},
+        }
+    )
+    assert response["id"] == 44
+    assert "error" not in response
+    assert captured["name"] == "mempalace_mesh_peers"
+
+
+def test_light_stdio_dispatch_exception_replies():
+    def _boom(_request):
+        raise RuntimeError("dispatch failed")
+
+    payload = mcp_server._stdio_reply('{"jsonrpc": "2.0", "id": 9, "method": "ping"}', _boom)
+    response = json.loads(payload)
+    assert response["id"] == 9
+    assert response["error"]["code"] == -32603
+    assert response["error"]["message"] == "Internal error"
+
+    notified = mcp_server._stdio_reply(
+        '{"jsonrpc": "2.0", "method": "notifications/cancelled"}', _boom
+    )
+    assert notified is None
+
+
+def test_light_stdio_parse_error_is_32700():
+    payload = mcp_server._stdio_reply("{", mcp_light_server.dispatch_light_stdio_request)
+    response = json.loads(payload)
+    assert response["id"] is None
+    assert response["error"]["code"] == -32700
+    assert response["jsonrpc"] == "2.0"

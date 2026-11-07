@@ -5,6 +5,7 @@ import json
 import pytest
 
 from mempalace import mcp_server as mcp, palace
+from mempalace.hub_client import HubClient
 
 
 @pytest.fixture
@@ -20,6 +21,7 @@ def isolated_writer(monkeypatch, tmp_path):
     ):
         monkeypatch.setattr(mcp, name, value)
     monkeypatch.setattr(mcp, "_discard_mcp_storage_handles", lambda: None)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_CALL_WAIT_SECONDS", 0)
     monkeypatch.delenv(mcp._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
     monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
     monkeypatch.delenv(palace._EXPLICIT_BACKEND_ENV, raising=False)
@@ -87,7 +89,7 @@ def test_light_dispatch_writes_and_reads_after_config_repair(isolated_writer, mo
     ):
         monkeypatch.setattr(mcp, name, None)
     monkeypatch.setattr(
-        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+        embedding_wrapper, "_embed_texts", lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts]
     )
 
     def call(name, arguments):
@@ -121,16 +123,15 @@ def test_light_dispatch_writes_and_reads_after_config_repair(isolated_writer, mo
 def test_light_hub_forward_does_not_acquire_local_writer(isolated_writer, monkeypatch):
     from mempalace import mcp_light_server
 
-    monkeypatch.setattr(mcp, "_hub_proxy_target", lambda: ("http://127.0.0.1:9", {}))
+    hub = HubClient("/p", {"host": "127.0.0.1", "port": 9})
+    monkeypatch.setattr(
+        hub, "post", lambda *a, **kw: {"jsonrpc": "2.0", "id": 1, "result": {"content": []}}
+    )
+    monkeypatch.setattr(mcp, "_hub_proxy_target", lambda: hub)
     monkeypatch.setattr(
         mcp,
         "_acquire_mcp_writer_lock",
         lambda: pytest.fail("Client must not acquire the hub's writer lease"),
-    )
-    monkeypatch.setattr(
-        mcp,
-        "_forward_request_to_hub",
-        lambda *a: {"jsonrpc": "2.0", "id": 1, "result": {"content": []}},
     )
     result = mcp_light_server.dispatch_light_stdio_request(
         {
@@ -149,3 +150,46 @@ def test_light_hub_forward_does_not_acquire_local_writer(isolated_writer, monkey
         }
     )
     assert "result" in result
+
+
+def test_peer_sync_thread_does_not_pollute_unrelated_palace(tmp_path, monkeypatch):
+    """Issue #2493: peer sync thread must not create or mutate other palaces."""
+    import threading
+
+    import mempalace.logsync as logsync_mod
+    from mempalace.config import MempalaceConfig
+
+    palace1 = tmp_path / "sync_palace"
+    palace1.mkdir()
+    monkeypatch.setenv("MEMPALACE_SYNC_INTERVAL", "0.01")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace1))
+    monkeypatch.setattr(mcp, "_config", MempalaceConfig(palace_path=palace1))
+
+    sync_round_completed = threading.Event()
+    original_sync_all = logsync_mod.sync_all
+
+    def _sync_all_wrapper(*args, **kwargs):
+        res = original_sync_all(*args, **kwargs)
+        sync_round_completed.set()
+        return res
+
+    monkeypatch.setattr("mempalace.logsync.sync_all", _sync_all_wrapper)
+
+    unrelated_palace = tmp_path / "unrelated_palace"
+    assert not unrelated_palace.exists()
+
+    thread = mcp._start_peer_sync_thread()
+    assert thread is not None
+
+    # Repoint _config to unrelated_palace AFTER thread starts on palace1
+    monkeypatch.setattr(mcp, "_config", MempalaceConfig(palace_path=unrelated_palace))
+
+    # Wait for the sync round to definitely complete
+    assert sync_round_completed.wait(timeout=5.0), "sync round never executed within deadline"
+
+    # Unrelated palace must remain absent!
+    assert not unrelated_palace.exists()
+
+    # Clean up thread
+    assert mcp._stop_peer_sync_thread(timeout=5.0)
+    assert not thread.is_alive()

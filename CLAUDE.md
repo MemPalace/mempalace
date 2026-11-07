@@ -13,7 +13,8 @@ The name comes from the ancient "method of loci" — the memory palace technique
 - **Wings** for broad categories (people, projects, topics)
 - **Rooms** for time-based groupings (days, sessions)
 - **Drawers** for full verbatim content (your exact words)
-- **AAAK compression** for the index layer — a compact symbolic format (via `dialect.py`) that lets an LLM scan thousands of entries instantly and know exactly which drawer to open
+- **Closets** for the index layer — compact pointer lines (`topic|entities|→drawer_ids`) that the project miner writes next to the drawers, so search knows which drawer to open
+- **AAAK** (`dialect.py`) — an experimental, lossy abbreviation format (entity codes, emotion markers) that any LLM reads without a decoder. Opt-in via `mempalace compress`; not the storage default, and never a stand-in for the verbatim drawer
 
 ## Design Principles
 
@@ -62,26 +63,24 @@ uv run ruff format --check .
 
 ```
 mempalace/
-├── mcp_server.py        # MCP server — all read/write tools
-├── cli.py               # CLI dispatcher
+├── mcp_server/          # MCP server package — tools, schemas, protocol, transports
+├── cli/                 # CLI package — commands, parser; public import is still mempalace.cli
 ├── config.py            # Configuration + input validation
 ├── miner.py             # Project file miner
 ├── convo_miner.py       # Conversation transcript miner
-├── searcher.py          # Semantic search (hybrid BM25 + vector)
+├── searcher/            # Hybrid search package; public import is still mempalace.searcher
 ├── knowledge_graph.py   # Temporal entity-relationship graph (SQLite)
-├── palace.py            # Shared palace operations
+├── palace/              # Palace ops package; public import is still mempalace.palace
 ├── palace_graph.py      # Room traversal + cross-wing tunnels
 ├── backends/            # Pluggable storage backends (ChromaDB default)
 │   ├── base.py          # Abstract interface — implement this for new backends
 │   └── chroma.py        # ChromaDB implementation
-├── dialect.py           # AAAK compression dialect
+├── dialect.py           # AAAK dialect (experimental, lossy, opt-in)
 ├── normalize.py         # Transcript format detection + normalization
 ├── entity_detector.py   # Auto-detect people/projects from content
 ├── entity_registry.py   # Entity storage and disambiguation
 ├── layers.py            # L0-L3 memory wake-up stack
-├── onboarding.py        # Interactive first-run setup
 ├── repair.py            # Palace repair and consistency checks
-├── dedup.py             # Deduplication
 ├── migrate.py           # ChromaDB version migration
 ├── spellcheck.py        # Auto-correct user messages
 ├── exporter.py          # Palace data export
@@ -102,7 +101,7 @@ hooks/                   # Claude Code hook scripts
 - **Formatter**: ruff format, double quotes
 - **Commits**: conventional commits (`fix:`, `feat:`, `test:`, `docs:`, `ci:`)
 - **Tests**: `tests/test_*.py`, fixtures in `tests/conftest.py`
-- **Coverage**: 85% threshold (80% on Windows due to ChromaDB file lock cleanup)
+- **Coverage**: pytest reads the gate from `pyproject.toml` (`[tool.coverage.report] fail_under`; on Windows, `[tool.mempalace.coverage] fail_under_windows`, because ChromaDB file-lock cleanup leaves lines unexecuted).
 
 ## Architecture
 
@@ -115,9 +114,12 @@ Palace structure:
     └── ROOM (day/topic)
           └── DRAWER (verbatim text chunk)
 
-Index layer (AAAK):
-  Compressed pointers → DRAWER locations
-  Scanned by LLM to find relevant drawers without reading all content
+Index layer (closets, regex-built by the project miner):
+  Pointer lines (topic|entities|→drawer_ids) → DRAWER locations
+  Search always queries drawers; closet hits boost ranking, never gate it
+
+AAAK (dialect.py, opt-in via `mempalace compress`):
+  Lossy abbreviation for LLM reading; drawers stay verbatim
 
 Knowledge Graph:
   ENTITY → PREDICATE → ENTITY (with valid_from / valid_to dates)
@@ -125,8 +127,9 @@ Knowledge Graph:
 
 ## Key Files for Common Tasks
 
-- **Adding an MCP tool**: `mempalace/mcp_server.py` — add handler function + TOOLS dict entry
-- **Changing search**: `mempalace/searcher.py`
+- **Adding an MCP tool**: handler in `mempalace/mcp_server/tools_*.py` + `TOOLS` entry in `mempalace/mcp_server/schemas.py` (public import path is still `mempalace.mcp_server`)
+- **Adding a CLI command**: handler in `mempalace/cli/cmd_*.py` + argparse in `mempalace/cli/parser.py` (public import path is still `mempalace.cli`)
+- **Changing search**: `mempalace/searcher/` (ranking, sqlite BM25, pipeline, CLI); public import is still `mempalace.searcher`
 - **Modifying mining**: `mempalace/miner.py` (project files) or `mempalace/convo_miner.py` (transcripts)
 - **Adding a storage backend**: subclass `mempalace/backends/base.py`, register in `backends/__init__.py`
 - **Input validation**: `mempalace/config.py` — `sanitize_name()` / `sanitize_content()`

@@ -4,8 +4,12 @@ import sys
 import uuid
 
 import pytest
-
-from _backend_conformance import assert_partition_isolation
+from _backend_conformance import (
+    assert_partition_isolation,
+    assert_update_skips_missing_ids,
+    assert_where_filters_conform,
+    assert_write_batch_validated,
+)
 
 from mempalace.backends import (
     BackendError,
@@ -258,17 +262,22 @@ def test_palace_wrapper_embeds_for_milvus(tmp_path, monkeypatch):
     import mempalace.backends.embedding_wrapper as embedding_wrapper
     from mempalace import palace
     from mempalace.backends import reset_backends
+    from mempalace.config import get_configured_collection_name
 
     monkeypatch.setattr(
         embedding_wrapper,
         "_embed_texts",
-        lambda texts: [[1.0, 0.0] for _ in texts],
+        lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts],
     )
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "milvus")
     monkeypatch.setenv("MEMPALACE_BACKEND", "milvus")
     reset_backends()
     try:
-        col = palace.get_collection(str(tmp_path / "wrapped"), "drawers", create=True)
+        col = palace.get_collection(
+            str(tmp_path / "wrapped"),
+            get_configured_collection_name(),
+            create=True,
+        )
         col.add(documents=["wrapped milvus document"], ids=["wrapped"], metadatas=[{"wing": "w"}])
         result = col.query(query_texts=["wrapped"], n_results=1)
         assert result.ids == [["wrapped"]]
@@ -286,6 +295,45 @@ def test_milvus_cross_palace_isolation_conformance(tmp_path):
             ref = PalaceRef(id=str(path), local_path=str(path))
             cols.append(backend.get_collection(palace=ref, collection_name="drawers", create=True))
         assert_partition_isolation(backend, cols[0], cols[1], embedding=[1.0, 0.0, 0.0, 0.0])
+    finally:
+        backend.close()
+
+
+def test_milvus_update_skips_missing_ids_conformance(tmp_path):
+    _require_milvus_lite()
+    backend = MilvusBackend()
+    try:
+        ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+        col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+        assert_update_skips_missing_ids(backend, col, embedding=[1.0, 0.0, 0.0, 0.0])
+    finally:
+        backend.close()
+
+
+def test_milvus_write_batch_validated_conformance(tmp_path):
+    _require_milvus_lite()
+    backend = MilvusBackend()
+    try:
+        ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+        col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+        assert_write_batch_validated(
+            backend, col, embedding=[1.0, 0.0, 0.0, 0.0], add_refuses_duplicates=True
+        )
+    finally:
+        backend.close()
+
+
+def test_milvus_where_filters_conformance(tmp_path):
+    """Milvus pushes ``where`` down; its ``field != value`` drops rows that lack
+    the field, so the missing-key ``$ne`` / ``$nin`` cases are skipped."""
+    _require_milvus_lite()
+    backend = MilvusBackend()
+    try:
+        ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+        col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+        assert_where_filters_conform(
+            backend, col, embedding=[1.0, 0.0, 0.0, 0.0], missing_key_matches_ne=False
+        )
     finally:
         backend.close()
 

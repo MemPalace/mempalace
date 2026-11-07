@@ -147,10 +147,11 @@ operations offline, with no writable service running.
 
 ## Follow-up PRs
 
-Hook-triggered writes now consume this policy; see
+Hook-triggered writes consume this policy; see
 `docs/hook-write-routing.md`.
 
-The remaining rollout PR will apply the policy to routine CLI writes.
+Routine CLI writes also consume this policy; see
+`docs/cli-write-routing.md`.
 
 Maintenance operations such as repair, migration, and index rebuild are not
 ordinary routed writes. They require a separate exclusive-maintenance policy.

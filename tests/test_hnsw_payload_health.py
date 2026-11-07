@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 
 from mempalace.backends.chroma import (
+    _CORRUPT_SUFFIX,
+    _DRIFT_SUFFIX,
     _HNSW_LINK_TO_DATA_MAX_RATIO,
     _hnsw_link_to_data_ratio,
     _segment_appears_healthy,
@@ -176,3 +178,120 @@ def test_quarantine_leaves_zero_byte_link_lists_with_valid_pickle(tmp_path):
 
     assert moved == []
     assert seg_dir.exists()
+
+
+# ── Regression cover for the #1710 cumulative-counter fix ─────────────
+#
+# _missing_dimensionality_appears_recoverable already requires
+# total_elements_added >= len(id_to_label) rather than ==, which is what
+# #1710 corrected: total_elements_added is hnswlib's cumulative add
+# counter and includes elements later deleted or replaced, so it is
+# legitimately greater on any palace that has removed a drawer.
+#
+# That fix landed without tests. These lock the behaviour in from both
+# sides, because the failure it prevents is expensive and silent: a
+# healthy index (183,009 consistent label pairs, 315 MB of vectors) gets
+# renamed to .corrupt over a recoverable missing dimensionality, Chroma
+# creates an empty replacement, and vector search quietly degrades.
+
+
+def _write_pickled_segment(seg_dir: Path, state: dict, *, payload: int = 4096) -> None:
+    import pickle
+
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    (seg_dir / "data_level0.bin").write_bytes(b"\0" * payload)
+    (seg_dir / "link_lists.bin").write_bytes(b"\0" * (payload // 8))
+    with open(seg_dir / "index_metadata.pickle", "wb") as f:
+        pickle.dump(state, f, pickle.HIGHEST_PROTOCOL)
+
+
+def _state(*, labels: int, total: int, dimensionality=None) -> dict:
+    return {
+        "dimensionality": dimensionality,
+        "total_elements_added": total,
+        "max_seq_id": None,
+        "id_to_label": {f"d-{i}": i for i in range(labels)},
+        "label_to_id": {i: f"d-{i}" for i in range(labels)},
+        "id_to_seq_id": {},
+    }
+
+
+def test_missing_dimensionality_recoverable_when_total_exceeds_labels(tmp_path):
+    """Deletions make total_elements_added > label count. Still recoverable."""
+    from mempalace.backends.chroma import _missing_dimensionality_appears_recoverable
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    state = _state(labels=183_009, total=188_220)
+    _write_pickled_segment(seg_dir, state)
+
+    assert _missing_dimensionality_appears_recoverable(state, state["id_to_label"], str(seg_dir))
+
+
+def test_missing_dimensionality_not_recoverable_when_total_below_labels(tmp_path):
+    """total < labels is genuinely impossible - stay unrecoverable."""
+    from mempalace.backends.chroma import _missing_dimensionality_appears_recoverable
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    state = _state(labels=100, total=40)
+    _write_pickled_segment(seg_dir, state)
+
+    assert not _missing_dimensionality_appears_recoverable(
+        state, state["id_to_label"], str(seg_dir)
+    )
+
+
+def test_quarantine_spares_healthy_index_with_cumulative_total(tmp_path):
+    """End-to-end: a post-deletion segment must NOT be quarantined."""
+    from mempalace.backends.chroma import quarantine_invalid_hnsw_metadata
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    _write_pickled_segment(seg_dir, _state(labels=183_009, total=188_220))
+
+    assert quarantine_invalid_hnsw_metadata(str(tmp_path)) == []
+    assert seg_dir.is_dir(), "healthy index was quarantined"
+
+
+def test_quarantine_still_catches_inconsistent_label_maps(tmp_path):
+    """Accepting a cumulative total must not spare a truly broken index."""
+    from mempalace.backends.chroma import quarantine_invalid_hnsw_metadata
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    state = _state(labels=100, total=120)
+    state["label_to_id"] = {i: f"WRONG-{i}" for i in range(100)}
+    _write_pickled_segment(seg_dir, state)
+
+    moved = quarantine_invalid_hnsw_metadata(str(tmp_path))
+    assert len(moved) == 1
+    assert not seg_dir.is_dir()
+
+
+DATA_BYTES = 100
+BLOATED_LINK_BYTES = int(DATA_BYTES * (_HNSW_LINK_TO_DATA_MAX_RATIO + 1))
+LIVE_SEGMENT_NAME = "seg-live"
+QUARANTINED_SEGMENT_NAME = "seg-quarantined"
+STAMP = "20261029-112208"
+
+
+def _palace_with_segments(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("sqlite placeholder")
+
+    quarantined_segment = palace / f"{QUARANTINED_SEGMENT_NAME}{_CORRUPT_SUFFIX}{STAMP}"
+    live_segment = palace / LIVE_SEGMENT_NAME
+    for segment in (quarantined_segment, live_segment):
+        _write_segment(segment, data_size=DATA_BYTES, link_size=BLOATED_LINK_BYTES)
+
+    return palace, quarantined_segment, live_segment
+
+
+def test_stale_scan_skips_corrupt(tmp_path):
+    """The stale scan leaves quarantined directories at their original names."""
+    palace, quarantined_segment, live_segment = _palace_with_segments(tmp_path)
+    moved_dirs = quarantine_stale_hnsw(palace)
+
+    assert len(moved_dirs) == 1
+    moved_segment = Path(moved_dirs[0])
+    assert moved_segment.name.startswith(f"{live_segment.name}{_DRIFT_SUFFIX}")
+    assert not live_segment.exists()
+    assert quarantined_segment.is_dir()

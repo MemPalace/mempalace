@@ -1,11 +1,15 @@
 """Public-interface tests for opt-in release awareness."""
 
 import json
+import os
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 
+import pytest
+
+from mempalace.fsio import read_published_bytes
 from mempalace.update_awareness import (
     cached_update_status,
     check_updates,
@@ -14,8 +18,21 @@ from mempalace.update_awareness import (
     schedule_update_check,
 )
 
-
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def finish_background_checks():
+    """Wait for any check a test scheduled.
+
+    The worker writes the cache before it releases the single-flight lock, so a
+    test that stops at "the cache has the new version" can leave the lock held
+    for the next test's ``schedule_update_check``.
+    """
+    yield
+    for thread in threading.enumerate():
+        if thread.name == "mempalace-update-check":
+            thread.join(timeout=5)
 
 
 def test_disabled_automatic_check_never_contacts_release_source(tmp_path):
@@ -238,7 +255,8 @@ def test_in_flight_check_cannot_restore_withdrawn_consent(tmp_path):
     release_fetch.set()
     deadline = time.monotonic() + 2
     cache_file = tmp_path / "updates-cache.json"
-    while "3.9.0" not in cache_file.read_text(encoding="utf-8"):
+    # The worker publishes over this file while the loop polls it.
+    while b"3.9.0" not in read_published_bytes(cache_file):
         assert time.monotonic() < deadline
         time.sleep(0.01)
 
@@ -246,3 +264,29 @@ def test_in_flight_check_cannot_restore_withdrawn_consent(tmp_path):
         "enabled": False,
         "installed": "3.8.0",
     }
+
+
+def test_a_reader_blocking_the_rename_does_not_drop_the_check(tmp_path, monkeypatch):
+    """On Windows a process reading the cache makes the rename fail briefly."""
+    from mempalace import fsio
+
+    configure_updates(config_dir=tmp_path, enabled=True, installer="uv-tool")
+    real_replace = os.replace
+    blocked = []
+
+    def replace(src, dst):
+        if str(dst).endswith("updates-cache.json") and len(blocked) < 2:
+            blocked.append(dst)
+            error = PermissionError(13, "The process cannot access the file")
+            error.winerror = 32
+            raise error
+        real_replace(src, dst)
+
+    monkeypatch.setattr(fsio.os, "replace", replace)
+
+    result = check_updates(config_dir=tmp_path, fetch_latest=lambda: "3.9.0", now=NOW)
+
+    assert blocked
+    assert result["latest"] == "3.9.0"
+    cache = json.loads((tmp_path / "updates-cache.json").read_text(encoding="utf-8"))
+    assert cache["latest"] == "3.9.0"

@@ -159,8 +159,9 @@ So there are two different parameters, and only one of them is a cursor:
   the id of the last event it processed.
 - **`before_event_id`** — strictly before that event in append order (`rowid < anchor`)
   for reverse / historical paging.
-- **`order`** — `'asc'` (oldest first, default) or `'desc'` (newest first, ideal for single-call
-  tail sweeps of recent inbox activity).
+- **`order`** — `'desc'` (newest first) when `since_event_id` is omitted;
+  `'asc'` (oldest first) when resuming from a cursor. Explicit `order` always
+  overrides. CLI `logstream events` is unchanged (`asc` unless you pass `--order`).
 - **`since_created_at`** — a time window (`>=`, inclusive; dedup by `id`).
   Good for "what happened today", wrong for resumption: a late-arriving peer
   event is already older than your high-water mark, so you skip it silently
@@ -170,7 +171,7 @@ So there are two different parameters, and only one of them is a cursor:
 
 | Mode | Best for | Mechanism |
 |---|---|---|
-| Inbox sweep | Session start, pre-task checks | `mempalace_event_list` + `to_agent` + `since_event_id`, `preview=true` |
+| Inbox sweep | Session start, pre-task checks | No cursor: newest-first (`EVENT INBOX` or list without `since_event_id`). Resume: `mempalace_event_list` + `to_agent` + `since_event_id`, `preview=true` (omit `order`) |
 | Background watcher | Being woken while you work | `mempalace logstream watch`, run as a background process |
 | Long-poll | Waiting on one correlation, in-turn | `mempalace_event_wait` — 60s default, 300s max, returns `timed_out` rather than erroring |
 | Server-Sent Events | Daemons, dashboards, live viewers | `GET /logstream/stream`, live-tail filters and `since_event_id` resume |
@@ -184,9 +185,9 @@ can treat process exit as "you have mail":
 
 ```bash
 mempalace logstream watch \
-  --agent mac-claude \
+  --agent mac:claude:myapp \
   --type task.request --type task.reply --type patch.ready \
-  --state-file ~/.mempalace/watch/mac-claude.json --json
+  --json
 ```
 
 `--agent` is shorthand for `--to-agent <id> --exclude-from-agent <id>`. That

@@ -33,7 +33,7 @@ Always prefer the CLI output over what is written here when the two disagree —
 
 ## Common operations
 
-These are the five operations users ask for most often. Each one wraps a single MemPalace CLI subcommand. The `mempalace instructions <name>` form returns the full, version-correct guidance.
+These are the six operations users ask for most often. Each one wraps a single MemPalace CLI subcommand. The `mempalace instructions <name>` form returns the full, version-correct guidance.
 
 ### `help` — discover what MemPalace can do
 
@@ -75,6 +75,14 @@ mempalace instructions status
 
 Use when the user asks "what's in my palace", "how big is my palace", or wants a summary of wings, rooms, and drawer counts.
 
+### `audit` — how well organized the palace is, plus a repair session
+
+```bash
+mempalace instructions audit
+```
+
+Use when the user asks how well organized or "messy" the palace is, why a scoped search or wake-up misses things, or wants to clean up wings, rooms, tunnels, hallways, or the knowledge graph. Read-only until the user decides each repair.
+
 ## MCP tools (preferred over CLI)
 
 Inside Antigravity, the MemPalace MCP server registers a rich set of tools. Use these instead of shelling out to the CLI for live operations (search, diary writes, drawer adds, knowledge graph queries, palace status). The MCP tools always reflect the current palace state without spawning a subprocess.
@@ -101,3 +109,24 @@ contacts PyPI but sends no palace content, identity, or telemetry. When
 from a local proxy's `updates.client`. Use the local update plan only for the
 client scope; a remote server update must be planned and authorized on the hub
 host by its operator. Never install an update without explicit user authorization.
+
+## Palace health: audit and repair session
+
+When the user asks how well organized the palace is, whether memory is
+"messy", why a scoped search or wake-up misses things, or invokes
+`/mempalace:audit`, run the audit and then offer a repair session:
+
+```bash
+mempalace instructions audit
+```
+
+Follow the returned instructions. In short: run `mempalace audit --json`
+(read-only, safe while the MCP server is running), present the five layer
+scores and findings, then walk the user through repairs **one structured
+question at a time** with a recommended option first: merging wings and
+rooms spelled two ways, folding stub wings, deleting tunnels on generic
+tokens and self-link hallways, agreeing a knowledge-graph predicate
+vocabulary, and deciding how to handle generic-room concentration on the
+next mine. Moves over deletions, numbers before actions, verbatim content
+always. Re-run the audit at the end and write a diary entry with the
+before and after scores and every decision made.

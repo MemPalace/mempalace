@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# MemPalace hook for the Codex plugin: `mempal-hook.sh <hook-name>`.
+# `mempalace hook run` does the work; mempal_hook_run.sh next to this file
+# picks the interpreter. A missing mempalace exits 1 so Codex reports it.
+set -uo pipefail
 HOOK_NAME="${1:?Usage: mempal-hook.sh <hook-name>}"
-INPUT_FILE=$(mktemp) || { echo "Failed to create temp file" >&2; exit 1; }
-cat > "$INPUT_FILE"
-cat "$INPUT_FILE" | mempalace hook run --hook "$HOOK_NAME" --harness codex
-EXIT_CODE=$?
-rm -f "$INPUT_FILE" 2>/dev/null
-exit $EXIT_CODE
+here="${BASH_SOURCE[0]%/*}"
+[ "$here" = "${BASH_SOURCE[0]}" ] && here=.
+exec "${BASH:-bash}" "$here/mempal_hook_run.sh" --on-missing=error --hook "$HOOK_NAME" --harness codex

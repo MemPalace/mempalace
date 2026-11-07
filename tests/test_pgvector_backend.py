@@ -3,10 +3,15 @@ import os
 import sys
 import threading
 import types
+from hashlib import sha256
 
 import pytest
-
-from _backend_conformance import assert_partition_isolation
+from _backend_conformance import (
+    assert_partition_isolation,
+    assert_update_skips_missing_ids,
+    assert_where_filters_conform,
+    assert_write_batch_validated,
+)
 
 from mempalace.backends import (
     BackendError,
@@ -15,18 +20,31 @@ from mempalace.backends import (
     DimensionMismatchError,
     PalaceRef,
     available_backends,
+    pgvector as pgvector_module,
 )
+from mempalace.backends._filters import matches_where
+from mempalace.backends._remote_common import as_vector_array
 from mempalace.backends.base import UnsupportedCapabilityError
 from mempalace.backends.pgvector import (
     PgVectorBackend,
     _PgVectorClient,
     _PgVectorConfig,
-    _matches_where,
+    _shared_namespace_key,
+    _shared_namespace_slug,
     _vector_distance,
-    _as_vector_array,
-    _strip_nul,
-    _json_dumps,
 )
+
+
+def _utc_form(value) -> bool:
+    """The real backend's UTC-suffix predicate on ``metadata->>field``."""
+    return isinstance(value, str) and (value.endswith("+00:00") or value[-1:] in ("Z", "z"))
+
+
+def _sql_text_key(value) -> tuple:
+    """``metadata->>field DESC NULLS LAST`` emulated: text order, missing last."""
+    if not isinstance(value, str) or not value:
+        return (0, "")
+    return (1, value)
 
 
 class _FakePgVectorClient:
@@ -44,6 +62,7 @@ class _FakePgVectorClient:
         self.tables: dict = {}
         self.query_calls: list = []
         self.scroll_calls: list = []
+        self.id_lookups: list = []
         self.facet_calls: list = []
         _FakePgVectorClient.instances.append(self)
 
@@ -72,11 +91,11 @@ class _FakePgVectorClient:
 
     def _filtered(self, table, where):
         rows = list(self.tables.get(table, {"rows": {}})["rows"].values())
-        return [row for row in rows if _matches_where(row.get("metadata") or {}, where)]
+        return [row for row in rows if matches_where(row.get("metadata") or {}, where)]
 
     def query_rows(self, table, *, vector, limit, where, with_embedding):
         self.query_calls.append(where)
-        q = _as_vector_array(vector)
+        q = as_vector_array(vector)
         scored = []
         for row in self._filtered(table, where):
             distance = _vector_distance(q, row.get("embedding"))
@@ -100,16 +119,53 @@ class _FakePgVectorClient:
         table,
         *,
         where=None,
+        ids=None,
         with_embedding=False,
         with_document=True,
         limit=None,
         offset=None,
+        order_field=None,
+        order_form=None,
     ):
         self.scroll_calls.append(
-            {"where": where, "limit": limit, "offset": offset, "with_document": with_document}
+            {
+                "where": where,
+                "limit": limit,
+                "offset": offset,
+                "with_document": with_document,
+                "order_field": order_field,
+                **({"order_form": order_form} if order_form is not None else {}),
+            }
         )
-        rows = self._filtered(table, where)
-        if limit is not None or offset:
+        if ids is not None:
+            self.id_lookups.append(list(ids))
+            store = self.tables.get(table, {"rows": {}})["rows"]
+            rows = [store[item] for item in ids if item in store]
+            rows = [row for row in rows if matches_where(row.get("metadata") or {}, where)]
+        else:
+            rows = self._filtered(table, where)
+        if order_field is not None:
+            if order_form is not None:
+                rows = [
+                    row
+                    for row in rows
+                    if _utc_form((row.get("metadata") or {}).get(order_field))
+                    == (order_form == "utc")
+                ]
+            # Mirror the real backend: ORDER BY metadata->>field DESC NULLS
+            # LAST, id — then LIMIT/OFFSET. Sorting by id first and then
+            # stable-sorting by the text reproduces that tiebreak.
+            rows = sorted(rows, key=lambda row: row["id"])
+            rows = sorted(
+                rows,
+                key=lambda row: _sql_text_key((row.get("metadata") or {}).get(order_field)),
+                reverse=True,
+            )
+            if offset:
+                rows = rows[offset:]
+            if limit is not None:
+                rows = rows[:limit]
+        elif limit is not None or offset:
             # Mirror the real backend: ORDER BY id, then LIMIT/OFFSET.
             rows = sorted(rows, key=lambda row: row["id"])
             if offset:
@@ -138,7 +194,7 @@ class _FakePgVectorClient:
                 rows.pop(doc_id, None)
             return
         for doc_id, row in list(rows.items()):
-            if _matches_where(row.get("metadata") or {}, where):
+            if matches_where(row.get("metadata") or {}, where):
                 rows.pop(doc_id, None)
 
     def count_rows(self, table):
@@ -172,6 +228,7 @@ def fake_pgvector(monkeypatch):
     monkeypatch.setattr(pgvector, "_PgVectorClient", _FakePgVectorClient)
     monkeypatch.delenv("MEMPALACE_PGVECTOR_DSN", raising=False)
     monkeypatch.delenv("MEMPALACE_PGVECTOR_NAMESPACE", raising=False)
+    monkeypatch.delenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", raising=False)
     return _FakePgVectorClient
 
 
@@ -347,6 +404,27 @@ def test_pgvector_cross_palace_isolation_conformance(tmp_path, fake_pgvector):
     assert_partition_isolation(backend, cols[0], cols[1], embedding=[1.0, 0.0])
 
 
+def test_pgvector_update_skips_missing_ids_conformance(tmp_path, fake_pgvector):
+    backend = PgVectorBackend()
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+    assert_update_skips_missing_ids(backend, col, embedding=[1.0, 0.0])
+
+
+def test_pgvector_where_filters_conformance(tmp_path, fake_pgvector):
+    backend = PgVectorBackend()
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+    assert_where_filters_conform(backend, col, embedding=[1.0, 0.0])
+
+
+def test_pgvector_write_batch_validated_conformance(tmp_path, fake_pgvector):
+    backend = PgVectorBackend()
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col = backend.get_collection(palace=ref, collection_name="drawers", create=True)
+    assert_write_batch_validated(backend, col, embedding=[1.0, 0.0], add_refuses_duplicates=True)
+
+
 def test_pgvector_namespace_isolation_conformance(tmp_path, fake_pgvector):
     """Shared per-PalaceRef.namespace isolation conformance — pgvector advertises
     ``supports_namespace_isolation`` (RFC 001 isolation contract)."""
@@ -369,6 +447,205 @@ def test_pgvector_namespace_isolation_conformance(tmp_path, fake_pgvector):
     assert "tenant_a" in col_a._table and "tenant_b" in col_b._table
     # Behaviour: a record under one namespace is invisible under the other.
     assert_partition_isolation(backend, col_a, col_b, embedding=[1.0, 0.0])
+
+
+def _shared_collection(backend, path, *, shared="fleet", namespace=None, name="drawers"):
+    ref = PalaceRef(id=str(path), local_path=str(path), namespace=namespace)
+    return backend.get_collection(
+        palace=ref,
+        collection_name=name,
+        create=True,
+        options={"shared_namespace": shared},
+    )
+
+
+def test_pgvector_table_name_unchanged_without_shared_namespace(tmp_path, fake_pgvector):
+    """Default path: the table name is still mempalace_<palace-path-hash>_<collection>.
+
+    Pinned literally so the backward-compatibility promise (existing palaces
+    keep resolving their existing tables, no migration) cannot regress silently.
+    """
+    _backend, col = _collection(tmp_path)
+    palace_hash = sha256(str(tmp_path).encode("utf-8")).hexdigest()[:16]
+    assert col._table == f"mempalace_{palace_hash}_drawers"
+    assert _PgVectorConfig.from_options().shared_namespace is None
+
+
+def test_pgvector_shared_namespace_is_path_independent(tmp_path, fake_pgvector):
+    """Two palace paths + one shared namespace resolve the SAME table.
+
+    This is the fleet case: the same logical palace opened from
+    /Users/... on a laptop and /srv/... on a server must not shard.
+    """
+    backend = PgVectorBackend()
+    tables = [
+        _shared_collection(backend, tmp_path / label)._table for label in ("node-a", "node-b")
+    ]
+    assert tables[0] == tables[1] == f"mempalace_{_shared_namespace_key('', 'fleet')}_drawers"
+    # No component of the name is derived from the local path.
+    for label in ("node-a", "node-b"):
+        path = tmp_path / label
+        assert sha256(str(path).encode("utf-8")).hexdigest()[:16] not in tables[0]
+
+
+def test_pgvector_shared_namespace_shares_rows_across_paths(tmp_path, fake_pgvector):
+    """Behaviour, not just naming: a row written from one path is readable from
+    the other once both nodes declare the same shared namespace."""
+    backend = PgVectorBackend()
+    col_a = _shared_collection(backend, tmp_path / "node-a")
+    col_b = _shared_collection(backend, tmp_path / "node-b")
+    col_a.add(
+        ids=["shared-1"],
+        documents=["memory written by node a"],
+        metadatas=[{"wing": "fleet"}],
+        embeddings=[[1.0, 0.0]],
+    )
+    assert col_b.count() == 1
+    assert col_b.get(ids=["shared-1"], include=["documents"]).documents == [
+        "memory written by node a"
+    ]
+
+
+def test_pgvector_shared_namespace_separates_distinct_namespaces(tmp_path, fake_pgvector):
+    """Different shared namespaces stay isolated even from one palace path."""
+    backend = PgVectorBackend()
+    col_a = _shared_collection(backend, tmp_path / "a", shared="fleet-one")
+    col_b = _shared_collection(backend, tmp_path / "b", shared="fleet-two")
+    assert col_a._table == f"mempalace_{_shared_namespace_key('', 'fleet_one')}_drawers"
+    assert col_b._table == f"mempalace_{_shared_namespace_key('', 'fleet_two')}_drawers"
+    assert_partition_isolation(backend, col_a, col_b, embedding=[1.0, 0.0])
+
+
+def test_pgvector_shared_namespace_keeps_tenant_namespace_partition(tmp_path, fake_pgvector):
+    """The fleet dimension is orthogonal to the tenant dimension: sharing tables
+    across hosts must not merge two PalaceRef namespaces."""
+    backend = PgVectorBackend()
+    col_a = _shared_collection(backend, tmp_path / "a", namespace="tenant-a")
+    col_b = _shared_collection(backend, tmp_path / "b", namespace="tenant-b")
+    assert col_a._table == (
+        f"mempalace_tenant_a_{_shared_namespace_key('tenant_a', 'fleet')}_drawers"
+    )
+    assert col_b._table == (
+        f"mempalace_tenant_b_{_shared_namespace_key('tenant_b', 'fleet')}_drawers"
+    )
+    assert_partition_isolation(backend, col_a, col_b, embedding=[1.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "fleet",
+        "Fleet",
+        "FLEET",
+        " fleet ",
+        "fleet\n",
+        "_fleet_",
+        "-fleet-",
+        "fleet/",
+        ":fleet",
+        "__fleet__",
+    ],
+)
+def test_pgvector_shared_namespace_normalization_equivalences(value):
+    """Case and separator spelling must not fork a fleet into two table sets."""
+    assert _shared_namespace_slug(value) == "fleet"
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("atk-fleet", "atk_fleet"),
+        ("atk fleet", "atk_fleet"),
+        ("atk.fleet", "atk_fleet"),
+        ("atk/fleet", "atk_fleet"),
+        ("atk:fleet", "atk_fleet"),
+        ("ATK  Fleet", "atk_fleet"),
+        # "_" folds like every other separator: a doubled underscore in one
+        # node's config must not silently shard the fleet.
+        ("atk__fleet", "atk_fleet"),
+        ("atk-_fleet", "atk_fleet"),
+        ("atk_-_fleet", "atk_fleet"),
+        ("fleet2", "fleet2"),
+        ("2fleet", "2fleet"),
+    ],
+)
+def test_pgvector_shared_namespace_separators_fold(value, expected):
+    assert _shared_namespace_slug(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "   ",
+        "___",
+        "---",
+        '"fleet"',
+        "fleet'; DROP TABLE mempalace_x; --",
+        "fleet;drop",
+        "flee\\t",
+        "fleet\x00",
+        "日本",
+        "фліт",
+        "🚀",
+    ],
+)
+def test_pgvector_shared_namespace_rejects_unsafe_values(value):
+    """Unsafe or empty-after-normalization values raise rather than being
+    scrubbed: two nodes must never quietly agree (or disagree) by accident."""
+    with pytest.raises(ValueError, match="pgvector_shared_namespace"):
+        _shared_namespace_slug(value)
+
+
+def test_pgvector_shared_namespace_rejects_non_string():
+    with pytest.raises(ValueError, match="pgvector_shared_namespace"):
+        _shared_namespace_slug(17)
+
+
+def test_pgvector_shared_namespace_respects_identifier_limit(tmp_path, fake_pgvector):
+    """A very long namespace stays inside Postgres' 63-byte identifier limit and
+    stays deterministic (hash of the normalized value, not of anything local)."""
+    long_one = "fleet-" + ("x" * 200)
+    long_two = "fleet-" + ("y" * 200)
+    slug = _shared_namespace_slug(long_one)
+    assert len(slug) <= 48
+    assert slug == _shared_namespace_slug(long_one.upper())
+    assert slug != _shared_namespace_slug(long_two)
+
+    backend = PgVectorBackend()
+    col_a = _shared_collection(backend, tmp_path / "a", shared=long_one)
+    col_b = _shared_collection(backend, tmp_path / "b", shared=long_one)
+    col_c = _shared_collection(backend, tmp_path / "c", shared=long_two)
+    assert len(col_a._table.encode("utf-8")) <= 63
+    assert col_a._table == col_b._table
+    assert col_a._table != col_c._table
+
+
+def test_pgvector_shared_namespace_resolved_from_options_env_and_config(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", "Env-Fleet")
+    assert _PgVectorConfig.from_options().shared_namespace == "env_fleet"
+    # An explicit backend option wins over the environment.
+    assert _PgVectorConfig.from_options({"shared_namespace": "opt-fleet"}).shared_namespace == (
+        "opt_fleet"
+    )
+    # Blank settings are treated as unset, not as an invalid namespace.
+    monkeypatch.setenv("MEMPALACE_PGVECTOR_SHARED_NAMESPACE", "   ")
+    assert _PgVectorConfig.from_options().shared_namespace is None
+
+
+def test_pgvector_shared_namespace_change_is_reported_as_target_mismatch(tmp_path, fake_pgvector):
+    """Turning a shared namespace on for a palace that already has data points at
+    different tables, so the marker must refuse rather than look empty."""
+    _backend, col = _collection(tmp_path)
+    col.upsert(ids=["a"], documents=["one"], metadatas=[{}], embeddings=[[1, 0]])
+    marker = json.loads((tmp_path / "pgvector_backend.json").read_text(encoding="utf-8"))
+    assert marker["pgvector"]["shared_namespace"] is None
+
+    backend2 = PgVectorBackend()
+    with pytest.raises(BackendMismatchError, match="table_prefix"):
+        _shared_collection(backend2, tmp_path)
 
 
 def test_pgvector_update_merges_documents_and_metadata(tmp_path, fake_pgvector):
@@ -418,7 +695,9 @@ def test_pgvector_get_unfiltered_page_pushes_limit_offset(tmp_path, fake_pgvecto
 
     # An unfiltered page is pushed to SQL as LIMIT/OFFSET instead of fetching
     # the whole table and slicing in Python (the O(rows x pages) path).
-    assert client.scroll_calls == [{"where": None, "limit": 2, "offset": 1, "with_document": True}]
+    assert client.scroll_calls == [
+        {"where": None, "limit": 2, "offset": 1, "with_document": True, "order_field": None}
+    ]
     # ORDER BY id, then OFFSET 1 LIMIT 2 -> b, c.
     assert page.ids == ["b", "c"]
 
@@ -437,9 +716,15 @@ def test_pgvector_get_filtered_page_stays_on_full_scan(tmp_path, fake_pgvector):
     page = col.get(where={"wing": "x"}, limit=1, offset=1, include=["metadatas"])
 
     # A filtered get keeps the full-scan path (no LIMIT/OFFSET pushed) so the
-    # exact _matches_where re-filter runs before pagination.
+    # exact matches_where re-filter runs before pagination.
     assert client.scroll_calls == [
-        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": True}
+        {
+            "where": {"wing": "x"},
+            "limit": None,
+            "offset": None,
+            "with_document": True,
+            "order_field": None,
+        }
     ]
     assert page.ids == ["c"]
 
@@ -458,7 +743,7 @@ def test_pgvector_get_offset_only_and_limit_only_push(tmp_path, fake_pgvector):
     client.scroll_calls.clear()
     page = col.get(offset=2, include=["metadatas"])
     assert client.scroll_calls == [
-        {"where": None, "limit": None, "offset": 2, "with_document": True}
+        {"where": None, "limit": None, "offset": 2, "with_document": True, "order_field": None}
     ]
     assert page.ids == ["c", "d"]
 
@@ -466,7 +751,7 @@ def test_pgvector_get_offset_only_and_limit_only_push(tmp_path, fake_pgvector):
     client.scroll_calls.clear()
     page = col.get(limit=2, include=["metadatas"])
     assert client.scroll_calls == [
-        {"where": None, "limit": 2, "offset": None, "with_document": True}
+        {"where": None, "limit": 2, "offset": None, "with_document": True, "order_field": None}
     ]
     assert page.ids == ["a", "b"]
 
@@ -486,7 +771,7 @@ def test_pgvector_get_negative_bounds_use_python_slice(tmp_path, fake_pgvector):
     # through to the unchanged full-scan + Python-slice path.
     page = col.get(offset=-1, include=["metadatas"])
     assert client.scroll_calls == [
-        {"where": None, "limit": None, "offset": None, "with_document": True}
+        {"where": None, "limit": None, "offset": None, "with_document": True, "order_field": None}
     ]
     assert page.ids == ["c"]
 
@@ -537,7 +822,7 @@ def test_pgvector_get_all_metadata_skips_document_column(tmp_path, fake_pgvector
 
     # Exactly one scroll, with_document=False (no document text on the wire).
     assert client.scroll_calls == [
-        {"where": None, "limit": None, "offset": None, "with_document": False}
+        {"where": None, "limit": None, "offset": None, "with_document": False, "order_field": None}
     ]
     # Returns just the metadata dicts (full set, any order — sort by wing+room for stability).
     metas_sorted = sorted(metas, key=lambda m: (m["wing"], m["room"]))
@@ -551,9 +836,9 @@ def test_pgvector_get_all_metadata_skips_document_column(tmp_path, fake_pgvector
 def test_pgvector_get_all_metadata_filtered_uses_fast_path(tmp_path, fake_pgvector):
     """Filtered get_all_metadata uses the single-pass metadata-only fast path.
 
-    ``_matches_where`` only reads ``metadata``, so we keep ``with_document=False``
+    ``matches_where`` only reads ``metadata``, so we keep ``with_document=False``
     and apply the post-filter locally on the metadata dicts. SQL pushdown still
-    happens when the filter is pushdownable; the local ``_matches_where`` re-runs
+    happens when the filter is pushdownable; the local ``matches_where`` re-runs
     for array/object semantics #1840's filtered path required.
     """
     _backend, col = _collection(tmp_path)
@@ -571,9 +856,411 @@ def test_pgvector_get_all_metadata_filtered_uses_fast_path(tmp_path, fake_pgvect
     # Exactly one scroll with with_document=False — pushdown forwards the
     # equality filter to SQL; no document text on the wire.
     assert client.scroll_calls == [
-        {"where": {"wing": "x"}, "limit": None, "offset": None, "with_document": False}
+        {
+            "where": {"wing": "x"},
+            "limit": None,
+            "offset": None,
+            "with_document": False,
+            "order_field": None,
+        }
     ]
     assert sorted(metas, key=lambda m: m["wing"]) == [{"wing": "x"}, {"wing": "x"}]
+
+
+def _fill_for_recency(col):
+    col.add(
+        ids=["old", "new", "middle", "undated"],
+        documents=["oldest drawer", "newest drawer", "middle drawer", "undated drawer"],
+        metadatas=[
+            {"wing": "x", "filed_at": "2024-01-01T00:00:00Z"},
+            {"wing": "y", "filed_at": "2026-08-06T00:00:00Z"},
+            {"wing": "x", "filed_at": "2025-05-05T00:00:00Z"},
+            {"wing": "x"},
+        ],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5], [0.2, 0.8]],
+    )
+
+
+def test_pgvector_advertises_recency_order_capability():
+    assert "supports_recency_order" in PgVectorBackend.capabilities
+
+
+def test_pgvector_get_recent_orders_newest_first_in_sql(tmp_path, fake_pgvector):
+    """The ordering is pushed into the scan, so no full table comes back."""
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=2)
+
+    assert page.ids == ["new", "middle"]
+    assert page.documents == ["newest drawer", "middle drawer"]
+    # One scan per timestamp form, ordered and limited by the database — not
+    # a full fetch + slice.
+    assert client.scroll_calls == [
+        {
+            "where": None,
+            "limit": 2,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "utc",
+        },
+        {
+            "where": None,
+            "limit": 2,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "other",
+        },
+    ]
+
+
+def test_pgvector_get_recent_sorts_missing_field_last(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    assert col.get_recent(limit=10).ids == ["new", "middle", "old", "undated"]
+
+
+@pytest.mark.parametrize("where", [None, {"$or": [{"wing": "x"}, {"wing": "y"}]}])
+def test_pgvector_get_recent_merges_naive_local_and_utc_by_instant(
+    tmp_path, fake_pgvector, monkeypatch, where
+):
+    """In UTC+9 an older writer's naive 10:00-10:40 values sort above a UTC
+    value 8h10m newer as text; the newest record must still come first."""
+    from datetime import timedelta, timezone
+
+    from mempalace import timeutil
+
+    monkeypatch.setattr(timeutil, "_LOCAL_TZ", timezone(timedelta(hours=9)))
+    _backend, col = _collection(tmp_path)
+    ids = [f"legacy_{i}" for i in range(5)] + ["utc_new"]
+    stamps = [f"2026-10-02T10:{i}0:00" for i in range(5)] + ["2026-10-02T09:50:00.000000+00:00"]
+    col.add(
+        ids=ids,
+        documents=[f"drawer {i}" for i in ids],
+        metadatas=[{"wing": "x", "filed_at": stamp} for stamp in stamps],
+        embeddings=[[1, 0]] * len(ids),
+    )
+
+    assert col.get_recent(limit=5, where=where).ids == [
+        "utc_new",
+        "legacy_4",
+        "legacy_3",
+        "legacy_2",
+        "legacy_1",
+    ]
+
+
+def test_pgvector_get_recent_pushes_down_equality_filter(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=10, where={"wing": "x"})
+
+    assert page.ids == ["middle", "old", "undated"]
+    assert client.scroll_calls == [
+        {
+            "where": {"wing": "x"},
+            "limit": 10,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "utc",
+        },
+        {
+            "where": {"wing": "x"},
+            "limit": 10,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "other",
+        },
+    ]
+
+
+def test_pgvector_get_recent_local_filter_still_orders(tmp_path, fake_pgvector):
+    """A filter pgvector cannot push exactly falls back to the local post-filter."""
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=2, where={"$or": [{"wing": "x"}, {"wing": "y"}]})
+
+    assert page.ids == ["new", "middle"]
+    # The predicate cannot ride along, but the ORDER BY and the LIMIT still
+    # do: one bounded page per timestamp form, not a fetch of the whole table.
+    assert client.scroll_calls == [
+        {
+            "where": None,
+            "limit": 500,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "utc",
+        },
+        {
+            "where": None,
+            "limit": 500,
+            "offset": None,
+            "with_document": True,
+            "order_field": "filed_at",
+            "order_form": "other",
+        },
+    ]
+
+
+def test_pgvector_get_recent_local_filter_does_not_fetch_whole_table(tmp_path, fake_pgvector):
+    """Reviewer scenario from #2168: 800 rows, an $or filter, limit=5.
+
+    The predicate is not pushdown-safe, so it is evaluated in Python — but the
+    scan that feeds it must still be bounded. Before the fix this issued one
+    LIMIT-less scroll and dragged all 800 rows over the wire to keep 5.
+    """
+    _backend, col = _collection(tmp_path)
+    rows = 800
+    col.add(
+        ids=[f"d{i:04d}" for i in range(rows)],
+        documents=[f"drawer {i}" for i in range(rows)],
+        # Every row matches the $or, so the first page already answers it.
+        metadatas=[
+            {"wing": "w1" if i % 2 else "w2", "filed_at": f"2026-01-01T00:00:{i % 60:02d}Z"}
+            for i in range(rows)
+        ],
+        embeddings=[[1, 0]] * rows,
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=5, where={"$or": [{"wing": "w1"}, {"wing": "w2"}]})
+
+    assert len(page.ids) == 5
+    # Every scroll carries a SQL LIMIT, and each timestamp form's walk
+    # requests a small multiple of the answer rather than the whole table.
+    assert client.scroll_calls, "expected at least one scroll"
+    assert all(call["limit"] is not None for call in client.scroll_calls)
+    for form in ("utc", "other"):
+        walk = [call for call in client.scroll_calls if call["order_form"] == form]
+        # One page suffices when the filter is not selective.
+        assert len(walk) == 1
+        assert walk[0]["limit"] < rows
+
+
+def test_pgvector_get_recent_local_filter_pages_until_enough_match(tmp_path, fake_pgvector):
+    """A selective filter walks further, still newest-first and still bounded."""
+    _backend, col = _collection(tmp_path)
+    rows = 1200
+    # Only the 3 oldest rows match, so the walk has to reach the far end.
+    col.add(
+        ids=[f"d{i:04d}" for i in range(rows)],
+        documents=[f"drawer {i}" for i in range(rows)],
+        metadatas=[
+            {"wing": "hit" if i < 3 else "miss", "filed_at": f"2026-01-01T00:00:00.{i:06d}Z"}
+            for i in range(rows)
+        ],
+        embeddings=[[1, 0]] * rows,
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=5, where={"$or": [{"wing": "hit"}, {"wing": "nobody"}]})
+
+    # Newest-first among the matches: d0002 was filed after d0001 after d0000.
+    assert page.ids == ["d0002", "d0001", "d0000"]
+    # Paged, every page bounded, and OFFSET advances rather than re-reading.
+    utc_walk = [call for call in client.scroll_calls if call["order_form"] == "utc"]
+    assert [call["limit"] for call in utc_walk] == [500, 500, 500]
+    assert [call["offset"] for call in utc_walk] == [None, 500, 1000]
+
+
+def test_pgvector_get_recent_local_filter_caps_pathological_scan(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """A filter matching nothing stops at the row cap instead of walking on."""
+    monkeypatch.setattr(pgvector_module, "_RECENT_SCAN_ROW_CAP", 20)
+    monkeypatch.setattr(pgvector_module, "_RECENT_SCAN_PAGE_MIN", 10)
+    _backend, col = _collection(tmp_path)
+    rows = 100
+    col.add(
+        ids=[f"d{i:04d}" for i in range(rows)],
+        documents=[f"drawer {i}" for i in range(rows)],
+        metadatas=[
+            {"wing": "miss", "filed_at": f"2026-01-01T00:00:{i % 60:02d}Z"} for i in range(rows)
+        ],
+        embeddings=[[1, 0]] * rows,
+    )
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(limit=5, where={"$or": [{"wing": "nope"}, {"wing": "nada"}]})
+
+    assert page.ids == []
+    # Two pages of 10 == the cap, then it stops. Not 100 rows.
+    utc_walk = [call for call in client.scroll_calls if call["order_form"] == "utc"]
+    assert sum(call["limit"] for call in utc_walk) == 20
+
+
+def test_pgvector_get_recent_local_filter_dedupes_rows_shifted_by_a_write(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """A row pushed across a page boundary by a concurrent insert is not returned twice.
+
+    OFFSET paging is only stable while the table is. Inserting a row that
+    sorts newer than the page boundary shifts everything below it down by one,
+    so the next OFFSET re-serves the last row of the previous page. The ``id``
+    dedupe is what keeps that out of the result.
+    """
+    # Force pages smaller than the limit so there is a boundary to shift across.
+    monkeypatch.setattr(pgvector_module, "_RECENT_SCAN_PAGE_MIN", 2)
+    monkeypatch.setattr(pgvector_module, "_RECENT_SCAN_PAGE_MAX", 2)
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=[f"d{i}" for i in range(6)],
+        documents=[f"drawer {i}" for i in range(6)],
+        metadatas=[{"wing": "hit", "filed_at": f"2026-01-0{i + 1}T00:00:00Z"} for i in range(6)],
+        embeddings=[[1, 0]] * 6,
+    )
+    client = fake_pgvector.instances[0]
+
+    real_scroll_rows = client.scroll_rows
+    inserted = {"done": False}
+
+    def _scroll_and_insert(table, **kwargs):
+        rows = real_scroll_rows(table, **kwargs)
+        if not inserted["done"]:
+            inserted["done"] = True
+            # Newest of all, so every page below shifts down by one row.
+            col.add(
+                ids=["intruder"],
+                documents=["filed mid-scan"],
+                metadatas=[{"wing": "hit", "filed_at": "2026-12-31T00:00:00Z"}],
+                embeddings=[[1, 0]],
+            )
+        return rows
+
+    monkeypatch.setattr(client, "scroll_rows", _scroll_and_insert)
+
+    page = col.get_recent(limit=6, where={"$or": [{"wing": "hit"}, {"wing": "nobody"}]})
+
+    assert len(page.ids) == len(set(page.ids)), page.ids
+    # Still newest-first over whatever the shifting scan managed to see.
+    assert page.ids[0] == "d5"
+
+
+def test_pgvector_get_recent_local_filter_projects_out_document(tmp_path, fake_pgvector):
+    """The post-filter reads only metadata, so unrequested documents stay off the wire."""
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    client = fake_pgvector.instances[0]
+    client.scroll_calls.clear()
+
+    page = col.get_recent(
+        limit=2, where={"$or": [{"wing": "x"}, {"wing": "y"}]}, include=["metadatas"]
+    )
+
+    assert page.ids == ["new", "middle"]
+    assert page.documents == []
+    assert all(call["with_document"] is False for call in client.scroll_calls)
+
+
+def test_pgvector_get_recent_honours_include_and_zero_limit(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    _fill_for_recency(col)
+    page = col.get_recent(limit=1, include=["metadatas"])
+    assert page.ids == ["new"]
+    assert page.documents == []
+    assert page.metadatas == [{"wing": "y", "filed_at": "2026-08-06T00:00:00Z"}]
+    assert col.get_recent(limit=0).ids == []
+
+
+def test_pgvector_get_recent_custom_order_field(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["written first", "written second"],
+        metadatas=[
+            {"filed_at": "2026-01-01T00:00:00Z", "authored_at": "2020-01-01T00:00:00Z"},
+            {"filed_at": "2025-01-01T00:00:00Z", "authored_at": "2024-01-01T00:00:00Z"},
+        ],
+        embeddings=[[1, 0], [0, 1]],
+    )
+    assert col.get_recent(limit=2, order_field="authored_at").ids == ["b", "a"]
+
+
+def test_pgvector_id_lookup_uses_the_primary_key():
+    """``get(ids=...)`` is a primary-key fetch, not a scan of the table.
+
+    ``id`` is the primary key, so ``id = ANY(%s)`` is an index lookup. The
+    unfiltered ``WHERE TRUE`` form is what used to read every row.
+    """
+    captured = {}
+
+    class _Recorder(_PgVectorClient):
+        def __init__(self):
+            self._config = None
+
+        def _execute(self, sql, params=None, *, fetch=False, many=False):
+            captured["sql"] = sql
+            captured["params"] = params
+            return []
+
+    _Recorder().scroll_rows("tbl", ids=["b", "a"])
+
+    assert "id = ANY(%s)" in captured["sql"]
+    assert captured["params"] == [["b", "a"]]
+
+    captured.clear()
+    assert _Recorder().scroll_rows("tbl", ids=[]) == []
+    assert captured == {}
+
+    _Recorder().scroll_rows("tbl", where={"wing": "x"}, ids=["b"])
+    assert "metadata @>" in captured["sql"]
+    assert "id = ANY(%s)" in captured["sql"]
+    assert captured["params"][-1] == ["b"]
+
+
+def test_pgvector_get_by_id_reads_only_the_requested_ids(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b", "c"],
+        documents=["alpha", "beta", "gamma"],
+        metadatas=[{"wing": "x"}, {"wing": "y"}, {"wing": "x"}],
+        embeddings=[[1, 0], [0, 1], [0.5, 0.5]],
+    )
+    client = fake_pgvector.instances[0]
+    client.id_lookups.clear()
+
+    got = col.get(ids=["b"], include=["documents"])
+
+    assert got.ids == ["b"]
+    assert got.documents == ["beta"]
+    assert client.id_lookups == [["b"]]
+
+
+def test_pgvector_scroll_rows_sql_orders_by_metadata_field():
+    """The generated SQL orders on the metadata key, with NULLS LAST and an id tiebreak."""
+    captured = {}
+
+    class _Recorder(_PgVectorClient):
+        def __init__(self):  # no connection
+            self._config = None
+
+        def _execute(self, sql, params=None, *, fetch=False, many=False):
+            captured["sql"] = sql
+            captured["params"] = params
+            return []
+
+    _Recorder().scroll_rows("tbl", limit=5, order_field="filed_at")
+
+    assert "ORDER BY metadata->>%s DESC NULLS LAST, id" in captured["sql"]
+    assert "LIMIT %s" in captured["sql"]
+    # Positional binding order matches the SQL text order: order key, then limit.
+    assert captured["params"] == ["filed_at", 5]
 
 
 def test_pgvector_delete_by_where_pushdown_and_local(tmp_path, fake_pgvector):
@@ -659,7 +1346,7 @@ def test_palace_wrapper_embeds_for_pgvector(tmp_path, monkeypatch, fake_pgvector
     from mempalace import palace
 
     monkeypatch.setattr(
-        embedding_wrapper, "_embed_texts", lambda texts: [[1.0, 0.0] for _ in texts]
+        embedding_wrapper, "_embed_texts", lambda texts, **_kwargs: [[1.0, 0.0] for _ in texts]
     )
     monkeypatch.setenv("MEMPALACE_BACKEND_EXPLICIT", "pgvector")
     monkeypatch.setenv("MEMPALACE_BACKEND", "pgvector")
@@ -917,164 +1604,128 @@ def _fake_upsert_client(monkeypatch):
     return client, captured
 
 
-def test_pgvector_upsert_strips_nul_bytes(monkeypatch):
-    """A NUL (0x00) byte in id/document/metadata must never reach Postgres.
+def test_pgvector_upsert_escapes_nul_bytes(monkeypatch):
+    """A NUL in a document is stored as a reversible escape, not deleted.
 
-    psycopg's text/jsonb dumpers reject NUL outright ("PostgreSQL text fields
-    cannot contain NUL (0x00) bytes"), which aborts the entire mine run (#1829)
-    when a single transcript captured a NUL in tool output. ChromaDB and the
-    SQLite backend store the byte verbatim, so pgvector strips it to keep the
-    same inputs ingestible. Strip, not reject: rejecting would re-abort the
-    mine or drop the drawer entirely (recall loss).
+    Postgres text cannot hold NUL. The id is rejected instead of rewritten.
+    The document and metadata values round-trip through the same escape
+    every backend uses. Chroma does not keep the raw byte either.
     """
+    from mempalace.stored_text import FLAG, StoredTextError, decode_record
+
     client, captured = _fake_upsert_client(monkeypatch)
+    with pytest.raises(StoredTextError):
+        client.upsert_rows(
+            "drawers",
+            [
+                {
+                    "id": "draw\x00er",
+                    "document": "before\x00after",
+                    "metadata": {},
+                    "embedding": [1.0, 0.0],
+                }
+            ],
+        )
+
     client.upsert_rows(
         "drawers",
         [
             {
-                "id": "draw\x00er",
+                "id": "drawer",
                 "document": "before\x00after",
-                "metadata": {"go\x00od": "v\x00w", "nested": ["a\x00b", 7]},
+                "metadata": {"good": "v\x00w", "nested": ["a\x00b", 7]},
                 "embedding": [1.0, 0.0],
                 "updated_at": "2026-06-20T00:00:00Z",
             }
         ],
     )
-
-    assert len(captured) == 1, "upsert_rows should bind exactly one row"
     row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
-
-    # No NUL survives into any text-bound parameter (id, document, metadata).
-    assert "\x00" not in row_id
-    assert "\x00" not in document
-    assert "\x00" not in metadata_json
-
-    # Stripping removes only the NUL; surrounding content is otherwise preserved.
+    for field in (row_id, document, metadata_json):
+        assert "\x00" not in field
+        field.encode("utf-8")
     assert row_id == "drawer"
-    assert document == "beforeafter"
-    assert json.loads(metadata_json) == {"good": "vw", "nested": ["ab", 7]}
+    assert json.loads(metadata_json)[FLAG] == 1
+    doc, meta = decode_record(document, json.loads(metadata_json))
+    assert doc == "before\x00after"
+    assert meta == {"good": "v\x00w", "nested": ["a\x00b", 7]}
 
 
-def test_strip_nul_helper():
-    """``_strip_nul`` removes NUL from strings, list/tuple items, and dict keys
-    and values; NUL-free input and non-string scalars are returned unchanged."""
-    assert _strip_nul("a\x00b") == "ab"
-    assert _strip_nul("clean") == "clean"
-    assert _strip_nul("") == ""
-    assert _strip_nul("\x00") == ""
-    # Keys, values, list items, and nested structures are all stripped.
-    assert _strip_nul({"k\x00": "v\x00", "n": [1, "x\x00y"]}) == {"k": "v", "n": [1, "xy"]}
-    assert _strip_nul([{"a\x00": "b\x00"}, "c\x00"]) == [{"a": "b"}, "c"]
-    # Tuples recurse too and stay tuples (defends direct callers that pass
-    # un-normalized metadata before the JSON round-trip).
-    assert _strip_nul(("a\x00b", 1, ["c\x00"])) == ("ab", 1, ["c"])
-    # Keys differing only by a NUL collapse, last wins (documented, harmless:
-    # real metadata keys are fixed field names, never NUL-only-distinguished).
-    assert _strip_nul({"a\x00": 1, "a": 2}) == {"a": 2}
-    # Non-string scalars pass through unchanged (bool stays bool, not int).
-    assert _strip_nul(7) == 7
-    assert _strip_nul(3.5) == 3.5
-    assert _strip_nul(True) is True
-    assert _strip_nul(None) is None
+def test_pgvector_upsert_escapes_lone_surrogates(monkeypatch):
+    """A lone surrogate is escaped, not replaced with U+FFFD, and ids are rejected."""
+    from mempalace.stored_text import StoredTextError, decode_record
 
-
-def test_pgvector_upsert_replaces_lone_surrogates(monkeypatch):
-    """A lone UTF-16 surrogate in id/document/metadata must never reach Postgres.
-
-    psycopg encodes text/jsonb parameters as UTF-8, and a lone surrogate has no
-    UTF-8 encoding, so it raises UnicodeEncodeError ("surrogates not allowed") and
-    aborts the entire mine run (the surrogate sibling of the NUL abort in #1829).
-    ChromaDB sanitizes document text via config.strip_lone_surrogates;
-    pgvector matches it (for document and metadata) by replacing the surrogate with
-    U+FFFD rather than dropping the drawer (recall loss) or re-aborting the mine.
-    """
-    # Build the surrogates with chr() so this source file stays valid UTF-8 (a raw
-    # lone surrogate has no UTF-8 encoding and would not parse).
-    hi, lo, s3, s4, s5 = (chr(c) for c in (0xD800, 0xDFFF, 0xD834, 0xDCA1, 0xDC00))
-    repl = chr(0xFFFD)
+    hi, lo, s4, s5 = (chr(c) for c in (0xD800, 0xDFFF, 0xDCA1, 0xDC00))
     client, captured = _fake_upsert_client(monkeypatch)
+    with pytest.raises(StoredTextError):
+        client.upsert_rows(
+            "drawers",
+            [{"id": f"draw{hi}er", "document": "x", "metadata": {}, "embedding": [1.0, 0.0]}],
+        )
     client.upsert_rows(
         "drawers",
         [
             {
-                "id": f"draw{hi}er",
+                "id": "drawer",
                 "document": f"before{lo}after",
-                "metadata": {f"go{s3}od": f"v{s4}w", "nested": [f"a{s5}b", 7]},
+                "metadata": {"good": f"v{s4}w", "nested": [f"a{s5}b", 7]},
                 "embedding": [1.0, 0.0],
                 "updated_at": "2026-06-20T00:00:00Z",
             }
         ],
     )
-
-    assert len(captured) == 1, "upsert_rows should bind exactly one row"
     row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
-
-    # Every text-bound parameter must now be UTF-8 encodable (what psycopg does to
-    # bind it); a surviving lone surrogate would raise here.
     for field in (row_id, document, metadata_json):
         field.encode("utf-8")
+        assert lo not in field and s4 not in field and s5 not in field
+    doc, meta = decode_record(document, json.loads(metadata_json))
+    assert doc == f"before{lo}after"
+    assert meta["good"] == f"v{s4}w"
+    assert meta["nested"] == [f"a{s5}b", 7]
 
-    # Surrogates are replaced with U+FFFD, not dropped: surrounding content stays
-    # and each lone surrogate maps to exactly one replacement character.
-    assert row_id == f"draw{repl}er"
-    assert document == f"before{repl}after"
-    assert json.loads(metadata_json) == {f"go{repl}od": f"v{repl}w", "nested": [f"a{repl}b", 7]}
 
+def test_pgvector_upsert_escapes_nul_and_surrogate_together(monkeypatch):
+    """One row can carry both a NUL and a lone surrogate and still round-trip."""
+    from mempalace.stored_text import decode_record
 
-def test_pgvector_upsert_strips_nul_and_surrogate_together(monkeypatch):
-    """A single row carrying *both* a NUL and a lone surrogate must come out
-    clean on every text-bound field.
-
-    This pins the composition of the two sibling fixes (#1829 NUL, #1833
-    surrogate), which edit the same ``upsert_rows`` binding: NUL is stripped
-    pre-serialization and the surrogate replaced post-serialization. A rebase
-    that kept only one strip would regress the other byte class silently, since
-    neither sibling test exercises both at once.
-    """
     sur = chr(0xD800)
-    repl = chr(0xFFFD)
     client, captured = _fake_upsert_client(monkeypatch)
     client.upsert_rows(
         "drawers",
         [
             {
-                "id": f"id\x00{sur}x",
+                "id": "drawer",
                 "document": f"doc\x00{sur}y",
-                "metadata": {f"k\x00{sur}": f"v\x00{sur}", "nested": [f"a\x00{sur}b", 7]},
+                "metadata": {"key": f"v\x00{sur}", "nested": [f"a\x00{sur}b", 7]},
                 "embedding": [1.0, 0.0],
                 "updated_at": "2026-06-20T00:00:00Z",
             }
         ],
     )
-
-    assert len(captured) == 1, "upsert_rows should bind exactly one row"
-    row_id, document, metadata_json = captured[0][0], captured[0][1], captured[0][2]
-
-    # Neither unstorable byte survives, and each bound field is UTF-8 encodable.
-    for field in (row_id, document, metadata_json):
+    document, metadata_json = captured[0][1], captured[0][2]
+    for field in (document, metadata_json):
         assert "\x00" not in field
         assert sur not in field
         field.encode("utf-8")
+    doc, meta = decode_record(document, json.loads(metadata_json))
+    assert doc == f"doc\x00{sur}y"
+    assert meta["key"] == f"v\x00{sur}"
+    assert meta["nested"] == [f"a\x00{sur}b", 7]
 
-    # NUL dropped, surrogate -> U+FFFD, surrounding content preserved.
-    assert row_id == f"id{repl}x"
-    assert document == f"doc{repl}y"
-    assert json.loads(metadata_json) == {f"k{repl}": f"v{repl}", "nested": [f"a{repl}b", 7]}
 
+def test_pgvector_write_uses_the_shared_escape_not_a_replacement_character():
+    """The pgvector docstring used to claim Chroma stores NUL verbatim.
 
-def test_strip_lone_surrogates_reuses_config_util():
-    """The pgvector write path strips surrogates via ``config.strip_lone_surrogates``
-    applied to id/document and the serialized metadata JSON (no pgvector-local
-    helper). End-to-end coverage is ``test_pgvector_upsert_replaces_lone_surrogates``;
-    the utility's own edge cases live in ``tests/test_clean_lone_surrogates.py``."""
-    from mempalace.config import strip_lone_surrogates
+    Both backends now escape it. ``strip_lone_surrogates`` is not the write path.
+    """
+    from mempalace.stored_text import decode_record, encode_record
 
-    # ensure_ascii=False leaves a metadata surrogate raw in the JSON, so a single
-    # pass over the serialized string cleans it (the property the write path relies on).
-    raw = _json_dumps({"k": f"v{chr(0xD800)}w"})
-    cleaned = strip_lone_surrogates(raw)
-    assert chr(0xD800) not in cleaned
-    assert json.loads(cleaned) == {"k": f"v{chr(0xFFFD)}w"}
+    original = f"v{chr(0xD800)}w\x00"
+    stored, meta = encode_record(original, None)
+    stored.encode("utf-8")
+    assert "\x00" not in stored
+    assert chr(0xD800) not in stored
+    assert chr(0xFFFD) not in stored
+    assert decode_record(stored, meta) == (original, {})
 
 
 def test_pgvector_backend_advertises_supports_metadata_facets():
@@ -1155,7 +1806,7 @@ def test_pgvector_facet_counts_empty_collection(tmp_path, fake_pgvector):
 
 def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvector):
     """Pushdown filters reach the SQL layer (proves the where path goes through
-    ``_where_to_sql``, not the local ``_matches_where`` post-filter)."""
+    ``_where_to_sql``, not the local ``matches_where`` post-filter)."""
     _backend, col = _collection(tmp_path)
     col.upsert(
         ids=["1"],
@@ -1169,3 +1820,254 @@ def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvecto
     _table, field, where, _limit = client.facet_calls[0]
     assert field == "room"
     assert where == {"wing": "engineering"}
+
+
+def _one_database(monkeypatch):
+    """Make the fake client behave like ONE Postgres server.
+
+    The stock fake gives every ``_PgVectorConfig`` its own private table store,
+    so two configurations whose table *names* collide still cannot see each
+    other's rows. That hides exactly the class of bug these tests exist to
+    catch, so share the store the way a real server does.
+    """
+    store: dict = {}
+    original_init = _FakePgVectorClient.__init__
+
+    def _init(self, config):
+        original_init(self, config)
+        self.tables = store
+
+    monkeypatch.setattr(_FakePgVectorClient, "__init__", _init)
+    return store
+
+
+def test_pgvector_shared_namespace_cannot_smear_into_tenant_namespace(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """The prefix is ``_``-joined and both namespace segments are variable
+    length, so ``acme`` + ``prod_fleet`` and ``acme_prod`` + ``fleet`` spell the
+    same readable prefix. They must still resolve to different tables: this is
+    the isolation boundary the backend advertises with
+    ``supports_namespace_isolation``, and a silent merge here is a cross-tenant
+    read, not just a shared palace.
+    """
+    _one_database(monkeypatch)
+    backend = PgVectorBackend()
+    col_a = _shared_collection(backend, tmp_path / "a", namespace="acme", shared="prod-fleet")
+    col_b = _shared_collection(backend, tmp_path / "b", namespace="acme-prod", shared="fleet")
+    assert col_a._table != col_b._table
+    assert_partition_isolation(backend, col_a, col_b, embedding=[1.0, 0.0])
+
+
+def test_pgvector_shared_namespace_cannot_hijack_a_default_palace(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """A shared namespace occupies the slot a palace-path hash normally fills.
+    Spelling one as a palace hash must not resolve to that palace's tables.
+    """
+    _one_database(monkeypatch)
+    backend = PgVectorBackend()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    victim_hash = sha256(str(victim).encode("utf-8")).hexdigest()[:16]
+    col_victim = backend.get_collection(
+        palace=PalaceRef(id=str(victim), local_path=str(victim)),
+        collection_name="drawers",
+        create=True,
+    )
+    col_other = _shared_collection(backend, tmp_path / "other", shared=victim_hash)
+    assert col_other._table != col_victim._table
+    assert_partition_isolation(backend, col_victim, col_other, embedding=[1.0, 0.0])
+
+
+def test_pgvector_shared_namespace_underscore_spelling_does_not_shard(
+    tmp_path, fake_pgvector, monkeypatch
+):
+    """``atk-fleet``, ``atk__fleet`` and ``atk fleet`` are one fleet.
+
+    Folding ``-`` but not ``_`` meant a doubled underscore on one node silently
+    produced a private table set, which is the failure this setting exists to
+    prevent.
+    """
+    _one_database(monkeypatch)
+    backend = PgVectorBackend()
+    tables = {
+        spelling: _shared_collection(backend, tmp_path / str(index), shared=spelling)._table
+        for index, spelling in enumerate(("atk-fleet", "atk__fleet", "atk fleet", "ATK--Fleet"))
+    }
+    assert len(set(tables.values())) == 1, tables
+
+
+class _DropOnceCursor:
+    """Raises a server-drop error on the first execute, then succeeds."""
+
+    def __init__(self, conn, exc_factory):
+        self._conn = conn
+        self._exc_factory = exc_factory
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        if self._conn.should_drop:
+            self._conn.should_drop = False
+            self._conn.closed = True
+            raise self._exc_factory()
+        return None
+
+    def executemany(self, sql, params=None):
+        return self.execute(sql, params)
+
+    def fetchall(self):
+        return [(1,)]
+
+
+class _DropOnceConn:
+    def __init__(self, exc_factory, drop=False):
+        self.closed = False
+        self.broken = False
+        self.should_drop = drop
+        self._exc_factory = exc_factory
+        self.rolled_back = 0
+
+    def cursor(self):
+        return _DropOnceCursor(self, self._exc_factory)
+
+    def commit(self):
+        return None
+
+    def rollback(self):
+        self.rolled_back += 1
+
+    def close(self):
+        self.closed = True
+
+
+def _install_fake_psycopg(monkeypatch, conns):
+    """Serve ``conns`` in order from a fake ``psycopg.connect``."""
+    import sys
+    import types
+
+    handed_out = []
+    fake_psycopg = types.ModuleType("psycopg")
+
+    def fake_connect(dsn):
+        conn = conns[len(handed_out)]
+        handed_out.append(conn)
+        return conn
+
+    fake_psycopg.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+    return handed_out
+
+
+class _AdminShutdown(Exception):
+    """Stand-in for psycopg's 57P01 (``terminating connection ...``)."""
+
+    sqlstate = "57P01"
+
+
+class _UniqueViolation(Exception):
+    """Stand-in for a statement-level failure that leaves the connection usable."""
+
+    sqlstate = "23505"
+
+
+def test_execute_retries_once_after_admin_shutdown(monkeypatch):
+    """A Postgres restart kills the pooled connection; the next query must not
+    surface it. Retry on a fresh connection instead (#57P01)."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    dropped = _DropOnceConn(_AdminShutdown, drop=True)
+    fresh = _DropOnceConn(_AdminShutdown, drop=False)
+    handed_out = _install_fake_psycopg(monkeypatch, [dropped, fresh])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    assert client._execute("SELECT 1", fetch=True) == [(1,)]
+
+    assert len(handed_out) == 2, "expected a reconnect after the drop"
+    assert dropped.closed, "stale connection should be discarded"
+    assert client._conn is fresh
+
+
+def test_execute_retries_when_handle_is_closed_without_sqlstate(monkeypatch):
+    """A mid-query TCP drop arrives with no SQLSTATE; the closed handle is the
+    only signal, and it must still trigger the retry."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    class _BareDropError(Exception):
+        pass
+
+    dropped = _DropOnceConn(_BareDropError, drop=True)
+    fresh = _DropOnceConn(_BareDropError, drop=False)
+    handed_out = _install_fake_psycopg(monkeypatch, [dropped, fresh])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    assert client._execute("SELECT 1", fetch=True) == [(1,)]
+    assert len(handed_out) == 2
+
+
+def test_execute_does_not_retry_statement_level_errors(monkeypatch):
+    """A constraint violation leaves the connection usable. Retrying would run
+    the same failing statement twice; it must propagate on the first attempt."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    class _AliveConn(_DropOnceConn):
+        def cursor(self):
+            class _Cur:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def execute(self, sql, params=None):
+                    raise _UniqueViolation("duplicate key")
+
+                def fetchall(self):  # pragma: no cover - never reached
+                    return []
+
+            return _Cur()
+
+    conn = _AliveConn(_UniqueViolation)
+    handed_out = _install_fake_psycopg(monkeypatch, [conn])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    with pytest.raises(BackendError, match="pgvector query failed"):
+        client._execute("INSERT ...")
+
+    assert len(handed_out) == 1, "a live connection must not be discarded"
+    assert conn.rolled_back == 1
+    assert not conn.closed
+
+
+def test_execute_surfaces_a_second_drop_as_backend_error(monkeypatch):
+    """Two drops in a row is a real outage, not a stale pooled handle. It must
+    reach the caller as the BackendError they already handle."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    first = _DropOnceConn(_AdminShutdown, drop=True)
+    second = _DropOnceConn(_AdminShutdown, drop=True)
+    handed_out = _install_fake_psycopg(monkeypatch, [first, second])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    with pytest.raises(BackendError, match="after reconnect"):
+        client._execute("SELECT 1", fetch=True)
+
+    assert len(handed_out) == 2, "exactly one retry, no retry storm"
+
+
+def test_execute_retry_covers_executemany(monkeypatch):
+    """``upsert_rows`` goes through ``many=True``; the retry must cover it too."""
+    from mempalace.backends.pgvector import _PgVectorClient, _PgVectorConfig
+
+    dropped = _DropOnceConn(_AdminShutdown, drop=True)
+    fresh = _DropOnceConn(_AdminShutdown, drop=False)
+    handed_out = _install_fake_psycopg(monkeypatch, [dropped, fresh])
+
+    client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
+    client._execute("INSERT ...", [(1,), (2,)], many=True)
+    assert len(handed_out) == 2

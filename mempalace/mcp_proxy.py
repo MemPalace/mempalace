@@ -23,18 +23,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import urllib.error
 
-from .hub_client import HUB_FORWARD_ENV, HUB_PROXY_TIMEOUT_S, discover_hub
-
+from .hub_client import (
+    FORWARD_ERRORS,
+    SEARCH_TOOL_NAMES,
+    HubClient,
+    proxy_error_response,
+    search_settings_overridden,
+)
+from .stored_text import dumps_client
 from .update_awareness import cached_update_status, schedule_update_check
 
 logger = logging.getLogger(__name__)
-
-# Shared with the in-server forwarder and the CLI forwarder.
-_HUB_FORWARD_ENV = HUB_FORWARD_ENV
-_HUB_PROXY_TIMEOUT_S = HUB_PROXY_TIMEOUT_S
 
 _DEGRADED_NOTICE = (
     "MemPalace is running WITHOUT its shared hub. This session is now serving "
@@ -68,7 +71,14 @@ def _is_plain_stdio_invocation(argv: list) -> bool:
             i += 1
             continue
         if arg in allowed_flags:
-            i += 2
+            # The server's parser exits on --palace or --backend without a value
+            # (--collection it does not define, and skips). The local fallback
+            # would only parse this once the hub is gone, ending the session; the
+            # full server refuses it at startup instead.
+            valueless = i + 1 >= len(argv) or argv[i + 1].startswith("-")
+            if valueless and arg != "--collection":
+                return False
+            i += 1 if valueless else 2
             continue
         if any(arg.startswith(flag + "=") for flag in allowed_flags):
             i += 1
@@ -77,13 +87,20 @@ def _is_plain_stdio_invocation(argv: list) -> bool:
     return True
 
 
+def _flag_value(argv: list, flag: str):
+    for i, arg in enumerate(argv):
+        if arg == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
 def _palace_path(argv: list):
     """Resolve the palace path without importing the server."""
-    for i, arg in enumerate(argv):
-        if arg == "--palace" and i + 1 < len(argv):
-            return argv[i + 1]
-        if arg.startswith("--palace="):
-            return arg.split("=", 1)[1]
+    palace = _flag_value(argv, "--palace")
+    if palace:
+        return palace
     try:
         from .config import MempalaceConfig
 
@@ -91,29 +108,6 @@ def _palace_path(argv: list):
     except Exception:
         logger.debug("palace path unresolved; serving locally", exc_info=True)
         return None
-
-
-def _hub_target(palace_path):
-    """Return ``(base_url, headers)`` for a live hub serving our palace, else None."""
-    return discover_hub(palace_path)
-
-
-def _forward(base_url: str, headers: dict, request: dict, palace_path: str):
-    """POST one JSON-RPC request to the hub; None for notifications (202)."""
-    from . import server_registry
-
-    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    with server_registry.urlopen_with_server_tokens(
-        palace_path,
-        f"{base_url}/mcp",
-        data=body,
-        headers=headers,
-        timeout=_HUB_PROXY_TIMEOUT_S,
-    ) as resp:
-        raw = resp.read()
-    if not raw:
-        return None
-    return json.loads(raw.decode("utf-8"))
 
 
 def _annotate_degraded(response):
@@ -138,7 +132,9 @@ def _annotate_degraded(response):
 
 def _annotate_forwarded_update_status(request: dict, response):
     """Attach this proxy runtime's cached state beside the hub's state."""
-    params = request.get("params") or {}
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
     if request.get("method") != "tools/call" or params.get("name") != "mempalace_status":
         return response
 
@@ -168,6 +164,32 @@ def _annotate_forwarded_update_status(request: dict, response):
     return response
 
 
+def _import_server():
+    """Import the full server, and hand stdout back if the import fails.
+
+    The import moves fd 1 onto stderr before anything in it that can fail, and
+    only the server's own _restore_stdout undoes that. A failed import takes
+    that function with it, so every answer this process wrote afterwards would
+    reach stderr instead of the client.
+    """
+    try:
+        saved_fd = os.dup(1)
+    except OSError:
+        saved_fd = None
+    saved_stdout = sys.stdout
+    try:
+        from . import mcp_server
+    except BaseException:
+        if saved_fd is not None:
+            os.dup2(saved_fd, 1)
+        sys.stdout = saved_stdout
+        raise
+    finally:
+        if saved_fd is not None:
+            os.close(saved_fd)
+    return mcp_server
+
+
 class _LocalServer:
     """Lazily-imported full server, plus the background services it expects.
 
@@ -177,89 +199,142 @@ class _LocalServer:
 
     def __init__(self):
         self._module = None
-
-    @property
-    def loaded(self) -> bool:
-        return self._module is not None
+        self._load_error: BaseException | None = None
 
     def load(self):
+        if self._load_error is not None:
+            raise self._load_error
         if self._module is None:
             logger.warning(
                 "MemPalace hub unavailable; serving this session locally. "
                 "Loading the local storage stack (this process will grow)."
             )
-            from . import mcp_server
+            try:
+                mcp_server = _import_server()
 
-            # Importing the server installs its stdio protection: os.dup2(2, 1)
-            # plus sys.stdout = sys.stderr, so stray library prints cannot
-            # corrupt JSON-RPC. That also redirects *our* responses to stderr —
-            # fd 1 itself is moved, so holding a reference to the old object is
-            # not enough. _restore_stdout undoes both levels, exactly as the
-            # server's own stdio loop does before it starts answering.
-            mcp_server._restore_stdout()
-            if hasattr(sys.stdout, "reconfigure"):
-                try:
-                    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-                except (AttributeError, OSError):
-                    pass
+                # Importing the server installs its stdio protection: os.dup2(2, 1)
+                # plus sys.stdout = sys.stderr, so stray library prints cannot
+                # corrupt JSON-RPC. That also redirects *our* responses to stderr —
+                # fd 1 itself is moved, so holding a reference to the old object is
+                # not enough. _restore_stdout undoes both levels, exactly as the
+                # server's own stdio loop does before it starts answering.
+                mcp_server._restore_stdout()
+                if hasattr(sys.stdout, "reconfigure"):
+                    try:
+                        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+                    except (AttributeError, OSError):
+                        pass
 
-            for start in (
-                mcp_server._start_idle_exit_watchdog,
-                mcp_server._start_write_stall_watchdog,
-            ):
-                try:
-                    start()
-                except Exception:
-                    logger.debug("local service %s failed to start", start, exc_info=True)
-            self._module = mcp_server
+                # This path never runs the server's main(), so apply the flags main()
+                # would have applied. After the stdout restore: a refused flag raises,
+                # and the proxy keeps answering over stdout.
+                args = mcp_server._parse_args(sys.argv[1:])
+                mcp_server._apply_server_flags(
+                    palace=args.palace, backend=args.backend, read_only=args.read_only
+                )
+
+                for start in (
+                    mcp_server._start_idle_exit_watchdog,
+                    mcp_server._start_write_stall_watchdog,
+                ):
+                    try:
+                        start()
+                    except Exception:
+                        logger.debug("local service %s failed to start", start, exc_info=True)
+                self._module = mcp_server
+            except BaseException as exc:
+                # The server's own import dups stdout before it can fail, and a
+                # failed import drops the module without closing that dup.
+                # Remember the failure so the next request does not dup again.
+                self._load_error = exc
+                raise
         return self._module
 
 
-def _proxy_error(request: dict, base_url: str, exc: Exception):
-    """Mirror the in-server proxy failure shape for a request we must not replay."""
+def _proxy_error(request: dict, base_url: str, exc: Exception, local_error=None):
+    """The in-server proxy failure for a request we must not replay.
+
+    ``local_error`` is why this process could not serve the request either.
+    """
+    response = proxy_error_response(request, base_url, exc)
+    if response is not None and local_error is not None:
+        response["error"]["data"]["local_server"] = f"could not start: {local_error}"
+    return response
+
+
+def _json_rpc_error(req_id, code: int, message: str) -> dict:
+    """Mirrors the server's helper of that name; importing it would load the storage stack."""
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+def _local_server_error(request: dict, exc: Exception):
+    """Answer a request only this process could serve, once its local server could not start."""
     if request.get("id") is None:
         return None
-    return {
-        "jsonrpc": "2.0",
-        "id": request.get("id"),
-        "error": {
-            "code": -32000,
-            "message": f"palace hub proxy failed: {exc}",
-            "data": {
-                "hub": base_url,
-                "hint": (
-                    "The palace hub did not complete this request. Mutating tools "
-                    "are not replayed locally — the hub may still be executing the "
-                    "call. Check the hub process, then retry."
-                ),
-            },
-        },
-    }
+    return _json_rpc_error(
+        request.get("id"),
+        -32000,
+        f"MemPalace hub unavailable and the local server could not start: {exc}",
+    )
 
 
-def _handle(request: dict, palace_path, local: _LocalServer):
+def _search_stays_local(request: dict, backend) -> bool:
+    """A search whose settings this session chose itself, which the hub may not share."""
+    if request.get("method") != "tools/call":
+        return False
+    params = request.get("params")
+    if not isinstance(params, dict) or params.get("name") not in SEARCH_TOOL_NAMES:
+        return False
+    return search_settings_overridden(backend)
+
+
+def _handle(request: dict, palace_path, local: _LocalServer, backend=None):
     """Route one request: live hub first, this process otherwise."""
-    target = _hub_target(palace_path)
-    if target is not None:
-        base_url, headers = target
+    if not isinstance(request, dict):
+        # What the full server answers it with.
+        return _json_rpc_error(None, -32600, "Invalid Request")
+    if _search_stays_local(request, backend):
+        # The hub is fine; this one search just runs with this session's settings.
         try:
-            return _annotate_forwarded_update_status(
-                request, _forward(base_url, headers, request, palace_path)
-            )
-        except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-            # Reaching the hub and getting an HTTP error means it may have run
-            # the call; so does any mid-flight failure on a mutating tool.
-            # Neither may be replayed here.
             module = local.load()
+        except Exception as exc:
+            logger.error("Local server could not start: %s", exc)
+            return _local_server_error(request, exc)
+        return module.handle_request(request)
+    hub = HubClient.discover(palace_path)
+    if hub is not None:
+        base_url = hub.base_url
+        try:
+            return _annotate_forwarded_update_status(request, hub.post(request))
+        except FORWARD_ERRORS as exc:
+            # Reaching the hub and getting an HTTP error means it may have run
+            # the call; so does any mid-flight failure on a mutating tool, an
+            # answer that broke off (IncompleteRead, BadStatusLine) included.
+            # Neither may be replayed here, and nothing can be when the local
+            # server cannot start.
+            try:
+                module = local.load()
+            except Exception as load_exc:
+                logger.error(
+                    "Hub at %s failed (%s), and the local server could not start: %s",
+                    base_url,
+                    exc,
+                    load_exc,
+                )
+                return _proxy_error(request, base_url, exc, local_error=load_exc)
             if isinstance(exc, urllib.error.HTTPError) or module._request_is_mutating(request):
                 return _proxy_error(request, base_url, exc)
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
             return _annotate_degraded(module.handle_request(request))
-    module = local.load()
+    try:
+        module = local.load()
+    except Exception as exc:
+        logger.error("Local server could not start: %s", exc)
+        return _local_server_error(request, exc)
     return _annotate_degraded(module.handle_request(request))
 
 
-def _run_proxy_loop(palace_path) -> None:
+def _run_proxy_loop(palace_path, backend=None) -> None:
     for stream in (sys.stdin, sys.stdout):
         if hasattr(stream, "reconfigure"):
             try:
@@ -285,14 +360,31 @@ def _run_proxy_loop(palace_path) -> None:
 
         payload = None
         try:
-            response = _handle(json.loads(line), palace_path, local)
-            if response is not None:
-                payload = json.dumps(response, ensure_ascii=False)
+            request = json.loads(line)
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
-            continue
+        except Exception as exc:
+            # Whatever json.loads rejects, nesting too deep to parse included,
+            # leaves the id unknowable: the answer carries a null one, as the
+            # hub's HTTP transport answers it.
+            logger.error("Server error: %s", exc)
+            payload = dumps_client(_json_rpc_error(None, -32700, "Parse error"))
+        else:
+            try:
+                response = _handle(request, palace_path, local, backend)
+                if response is not None:
+                    payload = dumps_client(response)
+            except KeyboardInterrupt:
+                break
+            except Exception:
+                # The client gets the full server's generic -32603, so the
+                # traceback is the only record of what failed.
+                logger.exception("Server error")
+                req_id = request.get("id") if isinstance(request, dict) else None
+                if req_id is None:
+                    # A notification is owed no response, failure included.
+                    continue
+                payload = dumps_client(_json_rpc_error(req_id, -32603, "Internal error"))
 
         if payload is None:
             continue
@@ -320,10 +412,10 @@ def main() -> None:
         return mcp_server.main()
 
     palace_path = _palace_path(argv)
-    if _hub_target(palace_path) is None:
+    if HubClient.discover(palace_path) is None:
         from . import mcp_server
 
         return mcp_server.main()
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-    _run_proxy_loop(palace_path)
+    _run_proxy_loop(palace_path, _flag_value(argv, "--backend"))

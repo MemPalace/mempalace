@@ -10,7 +10,9 @@ For each conversation:
 1. Ingest all sessions into a fresh MemPal palace
 2. For each QA pair, query the palace
 3. Score retrieval recall (did we find the evidence dialog?)
-4. Score F1 (optional, if --llm is provided)
+
+On LoCoMo, --llm-rerank only reorders the selected results. Retrieval recall
+checks which evidence IDs are present, so changing their order cannot change it.
 
 Usage:
     python benchmarks/locomo_bench.py /path/to/locomo/data/locomo10.json
@@ -23,14 +25,13 @@ import os
 import sys
 import json
 import re
-import string
 import shutil
 import tempfile
 import argparse
 import urllib.request
 import urllib.error
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime
 
 import chromadb
@@ -87,35 +88,6 @@ CATEGORIES = {
     4: "Open-domain",
     5: "Adversarial",
 }
-
-
-# =============================================================================
-# METRICS (from LoCoMo's evaluation.py)
-# =============================================================================
-
-
-def normalize_answer(s):
-    """Normalize answer for F1 comparison."""
-    s = s.replace(",", "")
-    s = re.sub(r"\b(a|an|the|and)\b", " ", s)
-    s = " ".join(s.split())
-    s = "".join(ch for ch in s if ch not in string.punctuation)
-    return s.lower().strip()
-
-
-def f1_score(prediction, ground_truth):
-    """Token-level F1 with normalization."""
-    pred_tokens = normalize_answer(prediction).split()
-    truth_tokens = normalize_answer(ground_truth).split()
-    if not pred_tokens or not truth_tokens:
-        return float(pred_tokens == truth_tokens)
-    common = Counter(pred_tokens) & Counter(truth_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / len(pred_tokens)
-    recall = num_same / len(truth_tokens)
-    return (2 * precision * recall) / (precision + recall)
 
 
 # =============================================================================
@@ -443,34 +415,6 @@ def _assign_room(session_text, api_key, model="claude-haiku-4-5-20251001"):
     return "general"
 
 
-def _route_question(question, api_key, model="claude-haiku-4-5-20251001"):
-    """Ask LLM which 1-2 rooms a question is about. Returns list of room names."""
-    prompt = (
-        f"Which 1 or 2 rooms from the list below does this question relate to?\n"
-        f"Reply with ONLY room name(s), comma-separated if two, nothing else.\n\n"
-        f"Rooms:\n{_PALACE_ROOM_LIST}\n\n"
-        f"Question: {question}"
-    )
-    raw = _llm_call(prompt, api_key, model=model, max_tokens=40)
-    raw_lower = raw.lower()
-    found = []
-    for room in PALACE_ROOMS:
-        if room in raw_lower:
-            found.append(room)
-        if len(found) >= 2:
-            break
-    if not found:
-        # fallback: partial word match
-        for part in re.split(r"[,\s]+", raw_lower):
-            part = part.strip("_").strip()
-            for room in PALACE_ROOMS:
-                if part and part in room and room not in found:
-                    found.append(room)
-                if len(found) >= 2:
-                    break
-    return found or PALACE_ROOMS  # if routing fails, search everywhere
-
-
 def palace_assign_rooms(sessions, sample_id, api_key, cache, model="claude-haiku-4-5-20251001"):
     """
     Assign each session to a palace room. Uses cache to avoid re-calling LLM.
@@ -522,6 +466,7 @@ def llm_rerank_locomo(
     """
     Ask LLM to pick the single most relevant document for this question.
     Returns reordered retrieved_ids with the best candidate first.
+    The retrieved ID set is unchanged, so this cannot change retrieval recall.
 
     Supports backend="anthropic" (default) or "ollama" (OpenAI-compat endpoint).
     """
@@ -988,7 +933,7 @@ def run_benchmark(
 
 
 def compute_retrieval_recall(retrieved_ids, evidence_ids):
-    """What fraction of evidence dialog IDs were retrieved?"""
+    """Fraction of evidence IDs retrieved, independent of result order."""
     if not evidence_ids:
         return 1.0
     found = sum(1 for eid in evidence_ids if eid in retrieved_ids)
@@ -1038,7 +983,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--limit", type=int, default=0, help="Limit to N conversations")
     parser.add_argument("--out", default=None, help="Output JSON file path")
-    parser.add_argument("--llm-rerank", action="store_true", help="Use LLM to rerank top results")
+    parser.add_argument(
+        "--llm-rerank",
+        action="store_true",
+        help="Use an LLM to reorder the already-selected results (ordering only; "
+        "does not change Avg Recall, which ignores result order)",
+    )
     parser.add_argument(
         "--llm-model",
         default="claude-sonnet-4-6",
