@@ -141,7 +141,10 @@ def _get_client():
     # both stored and current values are 0 on the first call after deletion,
     # making inode_changed and mtime_changed both False.
     if not os.path.isfile(db_path) and _collection_cache is not None:
-        _close_session_client()
+        # A dropped client can retain the shared System after this owner
+        # closes. Evict it too: its SQLite pool still targets the renamed DB
+        # and cannot safely open connections at the now-missing path.
+        _force_chroma_cache_reset()
         _collection_cache = None
         _collection_cache_backend = None
         _collection_cache_palace = None

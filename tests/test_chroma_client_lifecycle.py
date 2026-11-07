@@ -238,6 +238,46 @@ backend.close()
     )
 
 
+def test_session_evicts_dropped_system_before_opening_missing_database(tmp_path):
+    _run_probe(
+        tmp_path,
+        """
+import json
+from mempalace import mcp_server
+from mempalace.backends import embedding_wrapper
+from mempalace.config import MempalaceConfig
+embedding_wrapper._embed_texts = lambda texts, **kw: [[1., 0.] for _ in texts]
+path = paths[0]
+config = root / 'config'
+config.mkdir()
+(config / 'config.json').write_text(json.dumps({'palace_path': path}))
+mcp_server._config = MempalaceConfig(config_dir=str(config))
+assert mcp_server._get_collection().count() == 1
+old_client = mcp_server._client_cache
+old_system = old_client._system
+lost = ChromaBackend.make_client(path)
+lost = None
+os.rename(path, path + '.old')
+original_client = chroma.chromadb.PersistentClient
+def checked_client(*args, **kwargs):
+    # Force the state check before Chroma can reuse an idle SQLite connection
+    # and hide that its System still points at the renamed database.
+    assert SharedSystemClient._identifier_to_system.get(path) is not old_system, 'renamed database System was reused'
+    return original_client(*args, **kwargs)
+chroma.chromadb.PersistentClient = checked_client
+try:
+    fresh = mcp_server._get_client()
+    assert old_client._closed
+    assert fresh._system is not old_system
+    assert fresh.count_collections() == 0
+    assert Path(path, 'chroma.sqlite3').is_file()
+finally:
+    chroma.chromadb.PersistentClient = original_client
+    mcp_server._drop_session_client_for_system_reset()
+""",
+    )
+
+
 def test_session_closes_dropped_client_across_external_rebuild(tmp_path):
     _run_probe(
         tmp_path,

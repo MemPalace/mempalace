@@ -52,6 +52,16 @@ entry was written.
 
 - Rules initialization deliberately returns the legacy response when its deadline expires, even after rendering; the 500-rule incomplete marker is checked with a fixed clock, separately from the unchanged informational 25 ms added p95 budget.
 
+### Chroma session rebuilds
+
+- If a session's cached palace database disappears, invalidate that palace's shared Chroma System before constructing another client.
+
+- Closing only the session owner leaves a System retained by dropped clients; its SQLite pool still targets the renamed database and may fail when it opens a connection.
+
+- The reset uses the existing palace-scoped lifecycle path.
+
+- The collection configuration repair remains unchanged and still adds missing `_type` markers.
+
 ### Release email login readiness
 
 - The disposable release journey considers email login ready only after authenticated identity checks and the signed-in Board region appears; step failure reports retain exception messages with shared credential redaction.
