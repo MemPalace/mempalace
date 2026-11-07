@@ -1,6 +1,7 @@
 """ChromaDB-backed MemPalace storage backend (RFC 001 reference implementation)."""
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1714,6 +1715,110 @@ def _missing_dimensionality_appears_recoverable(
         return False
 
 
+# Stability gate for the invalid-metadata quarantine. A torn read of
+# ``index_metadata.pickle`` fails with whatever the half-written opcodes
+# happen to produce (``AttributeError`` in the reported reproduction, a
+# different class at the next torn offset), so no exception allowlist can
+# tell "corrupt file" from "file being rewritten right now". Only a file
+# that stays byte-identical across every check below may be quarantined
+# for a load failure; a file that moves is left alone for the next open
+# to re-check once it has settled.
+_HNSW_METADATA_STABILITY_ATTEMPTS = 6
+_HNSW_METADATA_STABILITY_DELAY_SECONDS = 0.05
+
+
+def _is_transient_hnsw_metadata_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` is a known-transient metadata-read failure.
+
+    ``EOFError``/``OSError`` and truncated-pickle ``UnpicklingError``s mean
+    the read itself was cut short, not that the settled bytes are bad, so
+    they skip quarantine immediately with no stability delay.
+    """
+    if isinstance(exc, (EOFError, OSError)):
+        return True
+    return isinstance(exc, pickle.UnpicklingError) and (
+        "truncated" in str(exc).lower() or "ran out of input" in str(exc).lower()
+    )
+
+
+def _hnsw_metadata_snapshot(meta_path: str) -> tuple[tuple[int, int, int], str]:
+    """Return ``(_stat_signature, sha256 hexdigest)`` for ``meta_path``.
+
+    The hash is the stronger half of the snapshot: a rewrite can land with
+    the same size and a coarse mtime, but the bytes still differ. A file
+    that vanished mid-read yields the "absent" signature with an empty
+    digest, which never equals a snapshot of present bytes.
+    """
+    try:
+        with open(meta_path, "rb") as handle:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError:
+        return _stat_signature(meta_path), ""
+    return _stat_signature(meta_path), digest.hexdigest()
+
+
+def _load_hnsw_metadata_stable(meta_path: str, *, sleep=time.sleep) -> tuple[str, object]:
+    """Load ``index_metadata.pickle`` once it has proved stable, or explain why not.
+
+    Returns ``(outcome, value)`` where ``outcome`` is one of:
+
+    ``"loaded"`` — value is the unpickled payload. The caller still
+        validates its shape; a settled file that loads is not evidence of
+        corruption either way.
+    ``"transient"`` — the read failed with a known-transient error; value
+        is None and the caller must skip quarantine, with no delay spent.
+    ``"uncertain"`` — the file changed during the stability checks, so a
+        rewrite is in progress; value is None and the caller must NOT
+        quarantine this pass. This is an explicit result, never an
+        exception the guard could misread as corruption.
+    ``"corrupt"`` — value is the quarantine reason: the file stayed
+        byte-identical across every stability check and still failed to
+        load. Identical bytes load deterministically, so the repeated
+        failure is the same failure, not a fresh torn read.
+
+    The ``sleep`` parameter exists so tests can drive the retry loop
+    without waiting out the real delay; production callers leave it alone.
+    """
+    try:
+        return "loaded", _SafePersistentDataUnpickler.load(meta_path)
+    except Exception as exc:
+        if _is_transient_hnsw_metadata_error(exc):
+            logger.debug(
+                "Skipping invalid-HNSW quarantine for transient metadata read in %s",
+                meta_path,
+                exc_info=True,
+            )
+            return "transient", None
+        failure = exc
+
+    snapshot = _hnsw_metadata_snapshot(meta_path)
+    for _ in range(_HNSW_METADATA_STABILITY_ATTEMPTS):
+        sleep(_HNSW_METADATA_STABILITY_DELAY_SECONDS)
+        next_snapshot = _hnsw_metadata_snapshot(meta_path)
+        if next_snapshot != snapshot:
+            logger.debug(
+                "Skipping invalid-HNSW quarantine for changing metadata in %s: "
+                "index_metadata.pickle changed during the stability checks",
+                meta_path,
+            )
+            return "uncertain", None
+        try:
+            return "loaded", _SafePersistentDataUnpickler.load(meta_path)
+        except Exception as exc:
+            if _is_transient_hnsw_metadata_error(exc):
+                logger.debug(
+                    "Skipping invalid-HNSW quarantine for transient metadata read in %s",
+                    meta_path,
+                    exc_info=True,
+                )
+                return "transient", None
+            failure = exc
+            snapshot = next_snapshot
+    return "corrupt", f"invalid index_metadata.pickle: {failure}"
+
+
 def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     """Quarantine segment dirs whose ``index_metadata.pickle`` is unreadable or invalid.
 
@@ -1744,27 +1849,13 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
             continue
 
         reason = None
-        try:
-            persisted = _SafePersistentDataUnpickler.load(meta_path)
-        except (EOFError, OSError):
-            logger.debug(
-                "Skipping invalid-HNSW quarantine for transient metadata read in %s",
-                meta_path,
-                exc_info=True,
-            )
+        outcome, value = _load_hnsw_metadata_stable(meta_path)
+        if outcome in ("transient", "uncertain"):
             continue
-        except pickle.UnpicklingError as exc:
-            if "truncated" in str(exc).lower() or "ran out of input" in str(exc).lower():
-                logger.debug(
-                    "Skipping invalid-HNSW quarantine for transient metadata read in %s",
-                    meta_path,
-                    exc_info=True,
-                )
-                continue
-            reason = f"invalid index_metadata.pickle: {exc}"
-        except Exception as exc:
-            reason = f"invalid index_metadata.pickle: {exc}"
+        if outcome == "corrupt":
+            reason = value
         else:
+            persisted = value
             if not isinstance(persisted, dict) and not (
                 hasattr(persisted, "dimensionality") or hasattr(persisted, "id_to_label")
             ):
