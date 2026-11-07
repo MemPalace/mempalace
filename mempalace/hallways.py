@@ -1315,9 +1315,27 @@ def _prune_spelling_hallways_locked(config, apply: bool) -> dict:
     }
 
 
-def delete_hallway(hallway_id: str, config=None) -> bool:
+def get_hallway(hallway_id, config=None):
+    return next((h for h in list_hallways(config=config) if h.get("id") == hallway_id), None)
+
+
+def delete_hallway(hallway_id: str, config=None, *, allow=None) -> bool:
     """Remove one hallway record by id. Returns True if a record was removed."""
     with _hallway_file_lock(config), _writing(config) as conn:
+        if allow is not None:
+            row = conn.execute("SELECT record FROM hallways WHERE id=?", (hallway_id,)).fetchone()
+            if row is None:
+                return False
+            record = json.loads(row[0])
+            wing, rooms = record.get("wing"), record.get("rooms") or [""]
+            if (
+                not isinstance(wing, str)
+                or not isinstance(rooms, list)
+                or not all(isinstance(r, str) for r in rooms)
+            ):
+                return False
+            if not {(wing, r) for r in rooms}.issubset({tuple(p) for p in allow}):
+                return False
         return conn.execute("DELETE FROM hallways WHERE id = ?", (hallway_id,)).rowcount > 0
 
 

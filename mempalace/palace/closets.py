@@ -248,7 +248,15 @@ def open_aaak_collection(palace_path: str):
         return None
 
 
-def purge_source_closets(palace_path: str, source_file: str, *, commit: bool = True) -> int:
+def purge_source_closets(
+    palace_path: str,
+    source_file: str,
+    *,
+    commit: bool = True,
+    allow_rooms=None,
+    roomless_ids=None,
+    roomless_check=None,
+) -> int:
     """Count, and with ``commit`` delete, the closets of ``source_file``.
 
     Closets are keyed by source, not by drawer, so they go whenever a drawer
@@ -262,9 +270,21 @@ def purge_source_closets(palace_path: str, source_file: str, *, commit: bool = T
     if closets_col is None:
         return 0
     try:
-        ids = closets_col.get(where={"source_file": source_file}, include=[]).get("ids") or []
-        if commit and ids:
-            closets_col.delete(where={"source_file": source_file})
+        if allow_rooms is None:
+            ids = closets_col.get(where={"source_file": source_file}, include=[]).get("ids") or []
+            if commit and ids:
+                closets_col.delete(where={"source_file": source_file})
+        else:
+            rows = _derived_rows(closets_col, source_file)
+            ids = [
+                rid
+                for rid, meta in rows
+                if _derived_allowed(
+                    "closet", rid, meta, None, allow_rooms, roomless_ids, roomless_check
+                )
+            ]
+            if commit:
+                _delete_derived_ids(closets_col, ids)
         return len(ids)
     except Exception as exc:
         logger.warning("Closet purge failed for %s: %s", source_file, exc)
@@ -281,6 +301,9 @@ def drawers_removed(
     revision_source=None,
     aaak_col=None,
     reraise=(),
+    allow_rooms=None,
+    roomless_ids=None,
+    roomless_check=None,
 ) -> dict:
     """Purge what was derived from drawers just deleted or rewritten.
 
@@ -294,16 +317,31 @@ def drawers_removed(
     when revisions were.
     """
     result = {}
+    scope = (
+        {}
+        if allow_rooms is None
+        else {
+            "allow_rooms": allow_rooms,
+            "roomless_ids": roomless_ids,
+            "roomless_check": roomless_check,
+        }
+    )
     if closet_sources:
         result["closets_deleted"] = sum(
-            purge_source_closets(palace_path, source) for source in dict.fromkeys(closet_sources)
+            purge_source_closets(palace_path, source, **scope)
+            for source in dict.fromkeys(closet_sources)
         )
     if aaak_ids or aaak_source:
         try:
             if aaak_col is None and palace_path:
                 aaak_col = open_aaak_collection(palace_path)
             if aaak_col is not None:
-                _delete_aaak_rows(aaak_col, aaak_ids, aaak_source)
+                _delete_aaak_rows(
+                    aaak_col,
+                    aaak_ids,
+                    aaak_source,
+                    **scope,
+                )
         except reraise:
             raise
         except Exception:
@@ -316,7 +354,10 @@ def drawers_removed(
 
     try:
         result["revisions_deleted"] = purge_drawer_revisions(
-            palace_path, drawer_ids=revision_ids or (), source_file=revision_source
+            palace_path,
+            drawer_ids=revision_ids or (),
+            source_file=revision_source,
+            **scope,
         )
     except Exception as exc:
         logger.exception("Revision purge failed after a drawer delete")
@@ -325,7 +366,65 @@ def drawers_removed(
     return result
 
 
-def _delete_aaak_rows(aaak_col, drawer_ids, source_file, batch_size: int = 500) -> None:
+def _derived_rows(col, source_file, drawer_ids=(), batch_size=1000):
+    """Metadata-only enumeration; every scoped purge deletes explicit ids."""
+    rows = {}
+    if source_file is not None:
+        offset = 0
+        while True:
+            page = col.get(
+                where={"source_file": source_file},
+                include=["metadatas"],
+                limit=batch_size,
+                offset=offset,
+            )
+            ids = page.get("ids") or []
+            rows.update(zip(ids, page.get("metadatas") or [{} for _ in ids]))
+            if len(ids) < batch_size:
+                break
+            offset += len(ids)
+    drawer_ids = list(drawer_ids)
+    for start in range(0, len(drawer_ids), 500):
+        page = col.get(ids=drawer_ids[start : start + 500], include=["metadatas"])
+        rows.update(zip(page.get("ids") or [], page.get("metadatas") or []))
+    return [(rid, meta if isinstance(meta, dict) else {}) for rid, meta in rows.items()]
+
+
+def _derived_allowed(kind, rid, meta, drawer_id, allow_rooms, roomless_ids, roomless_check):
+    if allow_rooms is None:
+        return True
+    pair = (meta.get("wing"), meta.get("room"))
+    if all(isinstance(v, str) for v in pair):
+        return pair in allow_rooms
+    if kind + ":" + str(rid) not in (roomless_ids or ()):
+        return False
+    return roomless_check is None or roomless_check(kind, rid, meta, drawer_id, None)
+
+
+def _delete_derived_ids(col, ids):
+    ids = list(ids)
+    for start in range(0, len(ids), 500):
+        col.delete(ids=ids[start : start + 500])
+
+
+def _delete_aaak_rows(
+    aaak_col,
+    drawer_ids,
+    source_file,
+    batch_size: int = 500,
+    *,
+    allow_rooms=None,
+    roomless_ids=None,
+    roomless_check=None,
+) -> None:
+    if allow_rooms is not None:
+        ids = [
+            rid
+            for rid, meta in _derived_rows(aaak_col, source_file, drawer_ids)
+            if _derived_allowed("aaak", rid, meta, rid, allow_rooms, roomless_ids, roomless_check)
+        ]
+        _delete_derived_ids(aaak_col, ids)
+        return
     # A summary quotes its drawer, so it goes by the drawer's id or its whole file.
     ids = set()
     drawer_ids = list(dict.fromkeys(drawer_ids))

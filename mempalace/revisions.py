@@ -112,6 +112,10 @@ def purge_drawer_revisions(
     palace_path: str,
     drawer_ids=(),
     source_file: str | None = None,
+    *,
+    allow_rooms=None,
+    roomless_ids=None,
+    roomless_check=None,
 ) -> int:
     """Remove the revisions of deleted drawers and return how many went.
 
@@ -127,10 +131,19 @@ def purge_drawer_revisions(
     if not path.exists():
         return 0
     with _revisions_lock(path):
-        return _purge_locked(path, set(drawer_ids), source_file)
+        return _purge_locked(
+            path, set(drawer_ids), source_file, allow_rooms, roomless_ids, roomless_check
+        )
 
 
-def _purge_locked(path: Path, ids: set, source_file: str | None) -> int:
+def _purge_locked(
+    path: Path,
+    ids: set,
+    source_file: str | None,
+    allow_rooms=None,
+    roomless_ids=None,
+    roomless_check=None,
+) -> int:
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
@@ -145,9 +158,21 @@ def _purge_locked(path: Path, ids: set, source_file: str | None) -> int:
         if not isinstance(row, dict):
             continue
         meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        if row.get("drawer_id") in ids or (
+        matches = row.get("drawer_id") in ids or (
             source_file is not None and meta.get("source_file") == source_file
-        ):
+        )
+        permitted = True
+        if allow_rooms is not None:
+            pair = (meta.get("wing"), meta.get("room"))
+            if all(isinstance(v, str) for v in pair):
+                permitted = pair in allow_rooms
+            else:
+                permitted = "revision:" + str(row.get("revision_id")) in (roomless_ids or ())
+                if permitted and roomless_check is not None:
+                    permitted = roomless_check(
+                        "revision", row["revision_id"], meta, row.get("drawer_id"), row
+                    )
+        if matches and permitted:
             removed += 1
         else:
             kept.append(line)

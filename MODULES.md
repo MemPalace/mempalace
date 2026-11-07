@@ -32,6 +32,7 @@ Format (read by `commonplace orch docs-check`):
   - The system-wide decisions, numbers, stores, residuals and waiver list (`SYSTEM.md`) and this ownership map.
 
 - **Promises:**
+  - Thread mutation rules and accepted provenance/read residuals are recorded below as separate additions.
 
   - Every root and `commonplace/` entry has exactly one owner block with all five fields; `SYSTEM.md` changes with every change that `docs-check` covers, unless a base-listed waiver applies.
 
@@ -188,6 +189,7 @@ Format (read by `commonplace orch docs-check`):
   - The memory engine: verbatim drawers, mining, search, knowledge graph, storage backends and the MCP server; plus the reviewed seed card list.
 
 - **Promises:**
+  - Scoped KG writes recheck provenance snapshots in-lock; source/id deletes use authorized rooms and explicit ids, and missing optional closets count as zero.
 
   - User content is stored verbatim; ingest is append-only; search returns original words; nothing leaves the machine unless the user configured a provider.
 
@@ -240,6 +242,7 @@ Format (read by `commonplace orch docs-check`):
   - A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
 
 - **Tests:**
+  - Thread-boundary integration tests exercise real separate workspace workers; focused scope tests cover stale snapshots, optional collections, malformed probes, decoding and response caches.
 
   - Release helper regressions simulate the old app disappearing before the signed-in board arrives and verify useful exception messages without credentials in JSON or Markdown reports.
 
@@ -262,6 +265,7 @@ Format (read by `commonplace orch docs-check`):
   - The gateway (the only way into a workspace), the control database, principals, token policy, the extension seam and one memory worker per workspace.
 
 - **Promises:**
+  - Gateway mutation scopes and provenance lookups follow the principal workspace; hidden targets use absent replies, and client-supplied scopes cannot widen access.
 
   - Every request resolves to one principal or none; scopes, wings and trust are checked before any tool runs; tokens are stored hashed; writes are audited.
 
@@ -457,6 +461,7 @@ Format (read by `commonplace orch docs-check`):
   - Agent context handoff to a fresh agent and append-only native session continuity.
 
 - **Promises:**
+  - Provenance uses one bounded decoder and response-local access caches; extraction by a non-reader leaves the source cursor untouched.
 
   - A handoff never loses the source thread; continuity is append-only and resumable.
 

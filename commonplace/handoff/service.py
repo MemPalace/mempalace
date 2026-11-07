@@ -106,6 +106,7 @@ class HandoffService:
         events,
         call_tool=None,
         save_fact=None,
+        can_read=None,
         prompt_dir: str = "",
     ):
         self.control_db = control_db
@@ -115,6 +116,7 @@ class HandoffService:
         self.events = events
         self.call_tool = call_tool
         self.save_fact = save_fact
+        self.can_read = can_read
         self.prompt_dir = prompt_dir
         self.db.set_document_store(store_for)
         self._mirror_lock = threading.Lock()
@@ -308,6 +310,7 @@ class HandoffService:
                     stored.workspace_id != principal.workspace_id
                     or not principal.policy.has_scope("threads:read")
                     or not principal.policy.can_read_wing(stored.wing)
+                    or (self.can_read is not None and not self.can_read(principal, stored.id))
                 ):
                     return
                 store = self.store_for(stored.workspace_id)

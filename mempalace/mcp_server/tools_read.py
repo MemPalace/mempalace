@@ -1005,11 +1005,18 @@ def tool_list_tunnels(wing: str = None):
     return list_tunnels(wing)
 
 
-def tool_delete_tunnel(tunnel_id: str):
+def tool_delete_tunnel(tunnel_id: str, thread_scope: dict = None):
     """Delete an explicit tunnel by its ID."""
     if not tunnel_id or not isinstance(tunnel_id, str):
         return {"error": "tunnel_id is required"}
-    return delete_tunnel(tunnel_id)
+    try:
+        scope = _delete_scope(thread_scope, "tunnel")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if scope == "probe":
+        target = next((t for t in list_tunnels() if t.get("id") == tunnel_id), None)
+        return {"probe": target}
+    return delete_tunnel(tunnel_id, expect=scope)
 
 
 def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
@@ -1034,11 +1041,24 @@ def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
     }
 
 
-def tool_delete_hallway(hallway_id: str):
+def tool_delete_hallway(hallway_id: str, thread_scope: dict = None):
     """Delete a hallway record by its ID."""
     if not hallway_id or not isinstance(hallway_id, str):
         return {"error": "hallway_id is required"}
-    return {"deleted": delete_hallway(hallway_id)}
+    try:
+        scope = _delete_scope(thread_scope, "hallway")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if scope == "probe":
+        from ..hallways import get_hallway
+
+        record = get_hallway(hallway_id)
+        return {
+            "probe": {"wing": record.get("wing"), "rooms": record.get("rooms", [])}
+            if record
+            else None
+        }
+    return {"deleted": delete_hallway(hallway_id, allow=None if scope is None else scope["pairs"])}
 
 
 def tool_follow_tunnels(wing: str, room: str, record: bool = True):

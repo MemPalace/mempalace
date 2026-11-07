@@ -685,6 +685,18 @@ class ThreadStore:
                 ).fetchone()
             )
 
+    def by_source_family(self, workspace_id: str, base: str) -> list[StoredThread]:
+        """Exact source plus literal hash variants; no wildcard or case folding."""
+        prefix = base + "#sha256:"
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM threads WHERE workspace_id=? AND "
+                "(source_thread_id = ? COLLATE BINARY OR "
+                "substr(source_thread_id,1,length(?)) = ? COLLATE BINARY) ORDER BY id",
+                (workspace_id, base, prefix, prefix),
+            ).fetchall()
+            return [_stored_thread(row) for row in rows]
+
     def list_source_range(self, workspace_id, prefix, *, after=None, limit):
         """Page a literal source namespace in binary identity order."""
         if not prefix.endswith(":"):

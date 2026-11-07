@@ -145,6 +145,70 @@ def tool_kg_query(
     return _with_kg_notice(payload)
 
 
+def _kg_mutation_scope(
+    thread_scope,
+    kind,
+    subject,
+    predicate,
+    objects,
+    wing,
+    sensitivities,
+    single_valued=False,
+    valid_from=None,
+    source_thread=None,
+    source_url=None,
+):
+    from ..knowledge_graph import valid_fact_entries
+
+    if thread_scope is None:
+        return None, None
+    if not isinstance(thread_scope, dict):
+        return None, {"success": False, "error": "thread_scope is invalid"}
+    if set(thread_scope) == {"allow"} and valid_fact_entries(thread_scope["allow"]):
+        return thread_scope["allow"], None
+    if (
+        thread_scope.get("probe") is not True
+        or set(thread_scope) - {"probe", "after", "closet"}
+        or (thread_scope.get("after") is not None and not isinstance(thread_scope["after"], str))
+        or ("closet" in thread_scope and not isinstance(thread_scope["closet"], str))
+    ):
+        return None, {"success": False, "error": "thread_scope is invalid"}
+    page = _call_kg(
+        lambda kg: kg.mutation_candidates(
+            kind,
+            subject,
+            predicate,
+            objects,
+            wing,
+            sensitivities,
+            after=thread_scope.get("after"),
+            single_valued=single_valued,
+            valid_from=valid_from,
+            source_thread=source_thread,
+            source_url=source_url,
+        ),
+        read=True,
+    )
+    result = {"success": True, "probe": page}
+    if "closet" in thread_scope:
+        # Internal citation probe, no collection creation and no content returned.
+        from ..backends.base import CollectionNotInitializedError
+        from ..palace import get_closets_collection
+
+        try:
+            col = get_closets_collection(_config.palace_path, create=False)
+        except CollectionNotInitializedError:
+            col = None
+        found = (
+            col.get(ids=[thread_scope["closet"]], include=["metadatas"]) if col is not None else {}
+        )
+        metas = found.get("metadatas") or []
+        meta = metas[0] if metas else {}
+        pair = [meta.get("wing"), meta.get("room")]
+        result["cited"] = {"closet": pair if all(isinstance(x, str) for x in pair) else None}
+    return None, result
+
+
 def tool_kg_add(
     subject: str,
     predicate: str,
@@ -161,6 +225,7 @@ def tool_kg_add(
     wing: str = None,
     sensitivity: str = None,
     sensitivities: list = None,
+    thread_scope: dict = None,
 ):
     """Add a relationship to the knowledge graph.
 
@@ -189,6 +254,12 @@ def tool_kg_add(
         _, sensitivities = visibility(None, sensitivities)
     except ValueError as e:
         return {"success": False, "error": str(e)}
+
+    allow, scoped_reply = _kg_mutation_scope(
+        thread_scope, "add", subject, predicate, [object], wing, sensitivities
+    )
+    if scoped_reply is not None:
+        return scoped_reply
 
     _wal_log(
         "kg_add",
@@ -228,6 +299,7 @@ def tool_kg_add(
                 wing=wing,
                 sensitivity=sensitivity,
                 sensitivities=sensitivities,
+                allow=allow,
             )
         )
     except Exception as e:
@@ -265,6 +337,7 @@ def tool_kg_save(
     sensitivity: str = None,
     sensitivities: list = None,
     single_valued: bool = None,
+    thread_scope: dict = None,
 ):
     """Save a fact, merging it into the same open fact or replacing a single value.
 
@@ -288,6 +361,22 @@ def tool_kg_save(
         return {"success": False, "error": str(e)}
     if single_valued is None:
         single_valued = predicate.lower().replace(" ", "_") in _config.single_valued_predicates
+
+    allow, scoped_reply = _kg_mutation_scope(
+        thread_scope,
+        "save",
+        subject,
+        predicate,
+        [object],
+        wing,
+        sensitivities,
+        single_valued=single_valued,
+        valid_from=valid_from,
+        source_thread=source_thread,
+        source_url=source_url,
+    )
+    if scoped_reply is not None:
+        return scoped_reply
 
     _wal_log(
         "kg_save",
@@ -326,6 +415,7 @@ def tool_kg_save(
                 wing=wing,
                 sensitivity=sensitivity,
                 sensitivities=sensitivities,
+                allow=allow,
                 single_valued=single_valued,
             )
         )
@@ -375,6 +465,7 @@ def tool_kg_invalidate(
     ended: str = None,
     wing: str = None,
     sensitivities: list = None,
+    thread_scope: dict = None,
 ):
     """Mark a fact as no longer true.
 
@@ -397,6 +488,12 @@ def tool_kg_invalidate(
 
     resolved_ended = ended or date.today().isoformat()
 
+    allow, scoped_reply = _kg_mutation_scope(
+        thread_scope, "invalidate", subject, predicate, [object], wing, sensitivities
+    )
+    if scoped_reply is not None:
+        return scoped_reply
+
     _wal_log(
         "kg_invalidate",
         {
@@ -416,6 +513,7 @@ def tool_kg_invalidate(
             ended=resolved_ended,
             wing=wing,
             sensitivities=sensitivities,
+            allow=allow,
         )
     )
     return _with_kg_notice(
@@ -441,6 +539,7 @@ def tool_kg_supersede(
     wing: str = None,
     sensitivity: str = None,
     sensitivities: list = None,
+    thread_scope: dict = None,
 ):
     """Atomically replace one fact with another at a single shared boundary.
 
@@ -467,6 +566,12 @@ def tool_kg_supersede(
         _, sensitivities = visibility(None, sensitivities)
     except ValueError as e:
         return {"success": False, "error": str(e)}
+
+    allow, scoped_reply = _kg_mutation_scope(
+        thread_scope, "supersede", subject, predicate, [old_object, new_object], wing, sensitivities
+    )
+    if scoped_reply is not None:
+        return scoped_reply
 
     _wal_log(
         "kg_supersede",
@@ -503,6 +608,7 @@ def tool_kg_supersede(
             wing=wing,
             sensitivity=sensitivity,
             sensitivities=sensitivities,
+            allow=allow,
         )
     )
     return _with_kg_notice(

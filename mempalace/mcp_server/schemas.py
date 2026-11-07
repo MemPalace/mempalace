@@ -86,6 +86,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "subject": {"type": "string", "description": "The entity doing/being something"},
                 "predicate": {
                     "type": "string",
@@ -157,6 +158,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "subject": {"type": "string", "description": "The entity doing/being something"},
                 "predicate": {"type": "string", "description": "The relationship type"},
                 "object": {"type": "string", "description": "The entity being connected to"},
@@ -207,6 +209,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "subject": {"type": "string", "description": "Entity"},
                 "predicate": {"type": "string", "description": "Relationship"},
                 "object": {"type": "string", "description": "Connected entity"},
@@ -236,6 +239,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "subject": {"type": "string", "description": "The entity whose fact is changing"},
                 "predicate": {
                     "type": "string",
@@ -414,6 +418,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "tunnel_id": {"type": "string", "description": "Tunnel ID to delete"},
             },
             "required": ["tunnel_id"],
@@ -449,6 +454,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "hallway_id": {"type": "string", "description": "Hallway ID to delete"},
             },
             "required": ["hallway_id"],
@@ -773,6 +779,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "source_file": {
                     "type": "string",
                     "description": "Exact source_file metadata value to remove (e.g. the full path that was mined)",

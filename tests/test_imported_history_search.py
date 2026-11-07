@@ -747,7 +747,11 @@ def test_imported_search_r15_member_cannot_find_owner_derived_fact(world):
     assert not quoted(value, reply)  # RED
 
 
-def test_imported_search_r16_cli_search_excludes_mirror_copies(world):
+@pytest.mark.parametrize(
+    "wing", ["private_threads", "Private-Threads", "wing_private_threads", "private threads"]
+)
+@pytest.mark.parametrize("scope", ["see_all", "scoped"])
+def test_imported_search_r16_cli_search_excludes_mirror_copies(world, wing, scope):
     w = world
     body = "zqimportprivateclibody"
     text = words("climirror") + " " + body
@@ -765,7 +769,16 @@ def test_imported_search_r16_cli_search_excludes_mirror_copies(world):
         },
     )
     assert status == 200 and tool_value(reply).get("success"), reply
-    _, token = operator(w, user=member(w))
+    _, token = operator(
+        w,
+        user=member(w),
+        policy=Policy.build(
+            profile="full",
+            scopes=["memory:read", "private:read", "threads:read"],
+            read_wings=["*"] if scope == "see_all" else ["shared", "private_threads"],
+            trust="standard",
+        ),
+    )
     status, reply = rpc(
         w, token, "mempalace_search", {"query": "zqimportpubliccli", "cli_compatible": True}
     )
@@ -774,7 +787,7 @@ def test_imported_search_r16_cli_search_excludes_mirror_copies(world):
     replies = []
     for args in (
         {"query": text.split()[0], "cli_compatible": True},
-        {"query": text.split()[0], "wing": "private_threads", "cli_compatible": True},
+        {"query": text.split()[0], "wing": wing, "cli_compatible": True},
     ):
         status, reply = rpc(w, token, "mempalace_search", args)
         assert status == 200

@@ -377,6 +377,10 @@ class Mediator:
             for t in tools
             if t.get("name") not in local_names and policy.tool_visible(t.get("name"))
         ]
+        visible = copy.deepcopy(visible)
+        for tool in visible:
+            for key in ("inputSchema", "input_schema"):
+                tool.get(key, {}).get("properties", {}).pop("thread_scope", None)
         for name in sorted(local_names):
             tool = extensions.get(name)
             if policy.tool_visible(name) and tool.usable_by(principal, self.gateway):
@@ -468,6 +472,7 @@ class Mediator:
                 response["result"]["content"].append({"type": "text", "text": rule_check.notice})
             return response
 
+        args.pop("thread_scope", None)
         rule = TOOL_RULES[name][1]
         notes: list = []
         try:
@@ -548,6 +553,12 @@ class Mediator:
         return None
 
     def _before_all_wings(self, principal, name, args, notes):
+        if name == "mempalace_delete_by_source":
+            return self._scope_delete_by_source(principal, name, args)
+        if name == "mempalace_delete_tunnel":
+            return self._scope_delete_tunnel(principal, args)
+        if name == "mempalace_delete_hallway":
+            return self._scope_delete_hallway(principal, name, args)
         if name == "mempalace_checkpoint":
             items = args.get("items")
             for item in items if isinstance(items, list) else ():
@@ -759,21 +770,212 @@ class Mediator:
             # Only facts this token could read count as the same fact or can
             # be changed, so a write never reveals or touches a hidden one.
             args["sensitivities"] = policy.fact_sensitivities()
-            drawer_id = args.get("source_drawer_id")
-            if drawer_id:
-                drawer_wing = self._drawer_wings(principal, [drawer_id]).get(drawer_id)
-                if drawer_wing is None or not policy.can_read_wing(drawer_wing):
-                    raise Hidden({"success": False, "error": f"Drawer not found: {drawer_id}"})
-        if name == "mempalace_kg_invalidate":
-            return None
-        floor = _fact_floor(args)
-        try:
-            raised = strictest(args.get("sensitivity"), floor)
-        except ValueError as exc:
-            raise Denied(str(exc)) from None
-        if args.get("sensitivity") not in (None, "", raised):
-            notes.append(f"sensitivity raised to {raised!r}")
-        args["sensitivity"] = raised
+        if name != "mempalace_kg_invalidate":
+            floor = _fact_floor(args)
+            try:
+                raised = strictest(args.get("sensitivity"), floor)
+            except ValueError as exc:
+                raise Denied(str(exc)) from None
+            if args.get("sensitivity") not in (None, "", raised):
+                notes.append(f"sensitivity raised to {raised!r}")
+            args["sensitivity"] = raised
+        self._check_provenance(principal, name, args)
+        checked = self._scope_kg_write(principal, name, args)
+        if checked is not None:
+            return checked
+        return None
+
+    def _check_provenance(self, principal, name, args):
+        from .handoff.mirror_access import reader, unreadable_room
+        from .handoff.provenance_refs import PROVENANCE_FIELDS, REFUSE
+
+        access = reader(self.gateway, principal)
+        for field in sorted(PROVENANCE_FIELDS):
+            raw = args.get(field)
+            if raw is None:
+                continue
+            error = {
+                "success": False,
+                "error": f"Drawer not found: {raw}"
+                if field == "source_drawer_id"
+                else "Source not found",
+            }
+            parsed = access.parse(raw)
+            if parsed is REFUSE or not all(access.reference(t) for t in parsed.tokens):
+                raise Hidden(error)
+            if field == "source_drawer_id":
+                try:
+                    wing = self._drawer_wings(principal, [parsed.text]).get(parsed.text)
+                except Hidden:
+                    raise Hidden(error) from None
+                if wing is None or not principal.policy.can_read_wing(wing):
+                    raise Hidden(error)
+            if field == "source_closet":
+                reply = self.workers.call_tool(
+                    principal,
+                    name,
+                    {**args, "thread_scope": {"probe": True, "closet": parsed.text}},
+                )
+                pair = reply.get("cited", {}).get("closet") if isinstance(reply, dict) else None
+                if (
+                    not isinstance(pair, list)
+                    or len(pair) != 2
+                    or not all(isinstance(v, str) for v in pair)
+                    or not principal.policy.can_read_wing(pair[0])
+                    or unreadable_room(access, *pair)
+                ):
+                    raise Hidden(error)
+
+    def _scope_kg_write(self, principal, name, args):
+        from .handoff.mirror_access import fact_visible, reader, valid_fact_page
+
+        access, after, allowed = reader(self.gateway, principal), None, []
+        while True:
+            result = self.workers.call_tool(
+                principal, name, {**args, "thread_scope": {"probe": True, "after": after}}
+            )
+            if (
+                isinstance(result, dict)
+                and result.get("success") is False
+                and isinstance(result.get("error"), str)
+            ):
+                return {"respond": result}
+            page = result.get("probe") if isinstance(result, dict) else None
+            if not valid_fact_page(page, after):
+                raise Denied("could not check what this changes")
+            allowed.extend(f for f in page["facts"] if fact_visible(f, access))
+            after = page["next"]
+            if after is None:
+                break
+        args["thread_scope"] = {"allow": allowed}
+        return None
+
+    def _scope_delete_by_source(self, principal, name, args):
+        from .handoff.mirror_access import reader, unreadable_room
+
+        access = reader(self.gateway, principal)
+        result = self.workers.call_tool(principal, name, {**args, "thread_scope": {"probe": True}})
+        if (
+            isinstance(result, dict)
+            and result.get("success") is False
+            and isinstance(result.get("error"), str)
+        ):
+            return {"respond": result}
+        probe = result.get("probe") if isinstance(result, dict) else None
+        if (
+            not isinstance(probe, dict)
+            or not isinstance(probe.get("pairs"), list)
+            or not isinstance(probe.get("roomless"), list)
+            or not all(
+                isinstance(p, list) and len(p) == 2 and all(isinstance(v, str) for v in p)
+                for p in probe["pairs"]
+            )
+        ):
+            raise Denied("could not check what this changes")
+
+        def visible(pair):
+            return principal.policy.can_read_wing(pair[0]) and not unreadable_room(access, *pair)
+
+        pairs = [p for p in probe["pairs"] if visible(p)]
+        ids, expected = [], {}
+        for row in probe["roomless"]:
+            if (
+                not isinstance(row, dict)
+                or row.get("kind") not in {"revision", "closet", "aaak"}
+                or not isinstance(row.get("id"), str)
+                or not isinstance(row.get("expect"), str)
+                or not isinstance(row.get("tokens"), list)
+                or not all(isinstance(t, str) for t in row["tokens"])
+                or type(row.get("refused")) is not bool
+                or "drawer_id" not in row
+                or row["drawer_id"] is not None
+                and not isinstance(row["drawer_id"], str)
+            ):
+                raise Denied("could not check what this changes")
+            drawer = row.get("drawer")
+            if (
+                isinstance(drawer, list)
+                and len(drawer) == 2
+                and all(isinstance(v, str) for v in drawer)
+            ):
+                allowed = visible(drawer)
+            elif drawer == "missing":
+                allowed = (
+                    not row["refused"]
+                    and bool(row["tokens"])
+                    and all(access.reference(t) for t in row["tokens"])
+                )
+            elif drawer == "error":
+                allowed = False
+            else:
+                raise Denied("could not check what this changes")
+            if allowed:
+                key = row["kind"] + ":" + row["id"]
+                ids.append(key)
+                expected[key] = row["expect"]
+        args["thread_scope"] = {"allow": {"pairs": pairs, "roomless_ids": ids, "expect": expected}}
+        return None
+
+    def _scope_delete_tunnel(self, principal, args):
+        from .handoff.mirror_access import reader, unreadable_room
+
+        missing = {"deleted": args.get("tunnel_id")}
+        rows = self.workers.call_tool(principal, "mempalace_list_tunnels", {})
+        if not isinstance(rows, list):
+            raise Denied("could not check what this changes")
+        target = next(
+            (r for r in rows if isinstance(r, dict) and r.get("id") == args.get("tunnel_id")), None
+        )
+        if target is None:
+            raise Hidden(missing)
+        access = reader(self.gateway, principal)
+        for key in ("source", "target"):
+            endpoint = target.get(key)
+            if not isinstance(endpoint, dict) or not all(
+                isinstance(endpoint.get(k), str) for k in ("wing", "room")
+            ):
+                raise Hidden(missing)
+            if not principal.policy.can_read_wing(endpoint["wing"]) or unreadable_room(
+                access, endpoint["wing"], endpoint["room"]
+            ):
+                raise Hidden(missing)
+            if endpoint.get("drawer_id"):
+                try:
+                    wing = self._drawer_wings(principal, [endpoint["drawer_id"]]).get(
+                        endpoint["drawer_id"]
+                    )
+                except (Hidden, Denied):
+                    raise Hidden(missing) from None
+                if wing is None or not principal.policy.can_read_wing(wing):
+                    raise Hidden(missing)
+        args["thread_scope"] = {"allow": {key: target[key] for key in ("source", "target")}}
+        return None
+
+    def _scope_delete_hallway(self, principal, name, args):
+        from .handoff.mirror_access import reader, unreadable_room
+
+        result = self.workers.call_tool(principal, name, {**args, "thread_scope": {"probe": True}})
+        if isinstance(result, dict) and isinstance(result.get("error"), str):
+            return {"respond": result}
+        if not isinstance(result, dict) or "probe" not in result:
+            raise Denied("could not check what this changes")
+        record = result["probe"]
+        if record is None:
+            raise Hidden({"deleted": False})
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("wing"), str)
+            or not isinstance(record.get("rooms"), list)
+            or not all(isinstance(r, str) for r in record["rooms"])
+        ):
+            raise Denied("could not check what this changes")
+        access = reader(self.gateway, principal)
+        pairs = [[record["wing"], r] for r in record["rooms"] or [""]]
+        if any(
+            not principal.policy.can_read_wing(w) or unreadable_room(access, w, r) for w, r in pairs
+        ):
+            raise Hidden({"deleted": False})
+        args["thread_scope"] = {"allow": {"pairs": pairs}}
         return None
 
     def _pin_write_wing(self, policy: Policy, args: dict, wing, notes: list) -> None:
@@ -796,6 +998,17 @@ class Mediator:
         policy = principal.policy
         if not isinstance(response, dict) or "result" not in response or policy.sees_all_wings:
             return response
+        if rule == "drawer_write":
+            result = _tool_result(response)
+
+            def remove_count(node):
+                if isinstance(node, dict):
+                    return {k: remove_count(v) for k, v in node.items() if k != "closets_deleted"}
+                if isinstance(node, list):
+                    return [remove_count(v) for v in node]
+                return node
+
+            return _replace_result(response, remove_count(result))
         if rule == "add_drawer" and not policy.can_read_wing(args.get("wing") or ""):
             # A retry into a wing the caller can't read must not show whose
             # chat the first copy came from.

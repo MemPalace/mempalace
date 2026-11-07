@@ -784,6 +784,7 @@ def test_committed_fact_result_and_audit_survive_hidden_echo(world):
         "sources": [{"source_thread": world.thread.id}],
     }
     workers = Mock(post=Mock(return_value=_tool_response(1, committed)))
+    workers.call_tool.return_value = {"success": True, "probe": {"facts": [], "next": None}}
     mediator = Mediator(Mock(), workers)
     mediator.gateway = world.gateway
     mediator._audit = Mock()

@@ -1163,7 +1163,196 @@ def tool_mine(
             _invalidate_overview_caches()
 
 
-def tool_delete_by_source(source_file: str, dry_run: bool = True):
+def _delete_scope(scope, kind):
+    """Strictly validate the internal delete contract; None is local/unscoped."""
+    if scope is None:
+        return None
+    if not isinstance(scope, dict):
+        raise ValueError("thread_scope is invalid")
+    if scope == {"probe": True} and scope.get("probe") is True:
+        return "probe"
+    if set(scope) != {"allow"} or not isinstance(scope["allow"], dict):
+        raise ValueError("thread_scope is invalid")
+    allow = scope["allow"]
+    if kind == "tunnel":
+        if set(allow) != {"source", "target"} or not all(isinstance(allow[k], dict) for k in allow):
+            raise ValueError("thread_scope is invalid")
+    else:
+        keys = {"pairs", "roomless_ids", "expect"} if kind == "source" else {"pairs"}
+        if (
+            set(allow) != keys
+            or not isinstance(allow.get("pairs"), list)
+            or not all(
+                isinstance(p, list) and len(p) == 2 and all(isinstance(v, str) for v in p)
+                for p in allow["pairs"]
+            )
+        ):
+            raise ValueError("thread_scope is invalid")
+        if kind == "source" and (
+            not isinstance(allow["roomless_ids"], list)
+            or not all(isinstance(v, str) for v in allow["roomless_ids"])
+            or not isinstance(allow["expect"], dict)
+            or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in allow["expect"].items()
+            )
+        ):
+            raise ValueError("thread_scope is invalid")
+    return allow
+
+
+def _source_drawer_state(col, drawer_id):
+    if not drawer_id:
+        return "missing"
+    try:
+        record = _collection_logical_drawer_record(col, drawer_id)
+        if record is None:
+            return "missing"
+        meta = record["metadata"]
+        pair = [meta.get("wing"), meta.get("room")]
+        return pair if all(isinstance(v, str) for v in pair) else "error"
+    except Exception:
+        return "error"
+
+
+def _roomless_snapshot(kind, rid, meta, drawer_id, drawer, row=None):
+    payload = [kind, rid, meta, drawer_id, drawer, row]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _source_delete_inventory(col, source_file):
+    from commonplace.handoff.provenance_refs import REFUSE, refs
+
+    from ..backends.base import CollectionNotInitializedError
+    from ..palace import _derived_rows, get_closets_collection, open_aaak_collection
+    from ..revisions import load_drawer_revisions
+
+    drawers = _derived_rows(col, source_file)
+    drawer_ids = [rid for rid, _ in drawers]
+    try:
+        closets = get_closets_collection(_config.palace_path, create=False)
+    except CollectionNotInitializedError:
+        closets = None
+    aaak = open_aaak_collection(_config.palace_path)
+    kinds = {
+        "closet": _derived_rows(closets, source_file) if closets is not None else [],
+        "aaak": _derived_rows(aaak, source_file, drawer_ids) if aaak is not None else [],
+    }
+    revisions = [
+        r
+        for r in load_drawer_revisions(_config.palace_path)
+        if r.get("drawer_id") in drawer_ids
+        or (r.get("metadata") or {}).get("source_file") == source_file
+    ]
+    kinds["revision"] = [(r["revision_id"], r.get("metadata") or {}) for r in revisions]
+    revision_rows = {r["revision_id"]: r for r in revisions}
+    pairs, roomless = set(), []
+    for _, meta in drawers:
+        pair = (meta.get("wing"), meta.get("room"))
+        if all(isinstance(v, str) for v in pair):
+            pairs.add(pair)
+    for kind, rows in kinds.items():
+        for rid, meta in rows:
+            pair = (meta.get("wing"), meta.get("room"))
+            if all(isinstance(v, str) for v in pair):
+                pairs.add(pair)
+                continue
+            row = revision_rows.get(rid) if kind == "revision" else None
+            drawer_id = row.get("drawer_id") if row is not None else rid if kind == "aaak" else None
+            drawer = _source_drawer_state(col, drawer_id)
+            parsed = refs(meta.get("source_file"))
+            roomless.append(
+                {
+                    "kind": kind,
+                    "id": rid,
+                    "drawer_id": drawer_id,
+                    "drawer": drawer,
+                    "tokens": [] if parsed is REFUSE else list(parsed.tokens),
+                    "refused": parsed is REFUSE,
+                    "expect": _roomless_snapshot(kind, rid, meta, drawer_id, drawer, row),
+                }
+            )
+    return drawers, {"pairs": [list(p) for p in sorted(pairs)], "roomless": roomless}
+
+
+def _scoped_delete_by_source(col, source_file, dry_run, scope):
+    from ..palace import _delete_derived_ids, _derived_rows, drawers_removed, purge_source_closets
+
+    if scope == "probe":
+        _, probe = _source_delete_inventory(col, source_file)
+        return {"success": True, "probe": probe}
+    allow_rooms = {tuple(p) for p in scope["pairs"]}
+    roomless_ids = set(scope["roomless_ids"])
+
+    def unchanged(kind, rid, meta, drawer_id, row):
+        key = kind + ":" + str(rid)
+        return key in roomless_ids and scope["expect"].get(key) == _roomless_snapshot(
+            kind, rid, meta, drawer_id, _source_drawer_state(col, drawer_id), row
+        )
+
+    drawers = [
+        (rid, meta)
+        for rid, meta in _derived_rows(col, source_file)
+        if (meta.get("wing"), meta.get("room")) in allow_rooms
+    ]
+    sample = []
+    for _, meta in drawers:
+        pair = {"wing": meta["wing"], "room": meta["room"]}
+        if pair not in sample and len(sample) < 5:
+            sample.append(pair)
+    count = len(drawers)
+    if dry_run:
+        closets = purge_source_closets(
+            _config.palace_path,
+            source_file,
+            commit=False,
+            allow_rooms=allow_rooms,
+            roomless_ids=roomless_ids,
+            roomless_check=unchanged,
+        )
+        return {
+            "success": True,
+            "dry_run": True,
+            "source_file": source_file,
+            "match_count": count,
+            "closet_match_count": closets,
+            "sample": sample,
+            "hint": (
+                "No drawers were deleted. Re-run with dry_run=false to remove "
+                f"these {count} drawer(s) and {closets} index entr(y/ies)."
+            )
+            if count
+            else "No drawers match this source_file.",
+        }
+    if not count:
+        return {"success": True, "dry_run": False, "source_file": source_file, "deleted": 0}
+    _wal_log(
+        "delete_by_source", {"source_file": source_file, "match_count": count, "sample": sample}
+    )
+    # Recheck revision rows under their lock while every current drawer still exists.
+    # HTTP's palace write lease covers this entire call, including other index rows.
+    purged = drawers_removed(
+        _config.palace_path,
+        aaak_ids=[rid for rid, _ in drawers],
+        aaak_source=source_file,
+        closet_sources=[source_file],
+        revision_ids=[rid for rid, _ in drawers],
+        revision_source=source_file,
+        allow_rooms=allow_rooms,
+        roomless_ids=roomless_ids,
+        roomless_check=unchanged,
+    )
+    _delete_derived_ids(col, [rid for rid, _ in drawers])
+    _invalidate_overview_caches()
+    return {
+        "success": True,
+        "dry_run": False,
+        "source_file": source_file,
+        "deleted": count,
+        **purged,
+    }
+
+
+def tool_delete_by_source(source_file: str, dry_run: bool = True, thread_scope: dict = None):
     """Delete every drawer whose ``source_file`` metadata matches exactly.
 
     Bulk cleanup for benchmark/eval files (ShareGPT dumps,
@@ -1192,9 +1381,17 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     # rows mined from non-ASCII paths that arrived via a cp1252 stdin.
     source_file = strip_lone_surrogates(source_file)
 
+    try:
+        scope = _delete_scope(thread_scope, "source")
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
+
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
+
+    if scope is not None:
+        return _scoped_delete_by_source(col, source_file, dry_run, scope)
 
     where = {"source_file": source_file}
     try:

@@ -886,10 +886,14 @@ def list_tunnels(wing: str = None):
     return tunnels
 
 
-def delete_tunnel(tunnel_id: str):
+def delete_tunnel(tunnel_id: str, *, expect=None):
     """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
     with mine_lock(_get_tunnel_file()):
         tunnels = _load_tunnels(for_write=True)
+        if expect is not None:
+            target = next((t for t in tunnels if t.get("id") == tunnel_id), None)
+            if target is None or {k: target.get(k) for k in ("source", "target")} != expect:
+                return {"deleted": tunnel_id}
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
         _save_tunnels(tunnels)
     return {"deleted": tunnel_id}
