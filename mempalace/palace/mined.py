@@ -67,6 +67,7 @@ def _is_comparable(meta: dict, extract_mode: Optional[str] = None) -> bool:
 _MINED_SCAN_KEYS = (
     "source_file",
     "source_mtime",
+    "source_fingerprint",
     "chunk_total",
     "extract_mode",
     "ingest_mode",
@@ -163,6 +164,7 @@ def file_already_mined(
     source_file: str,
     check_mtime: bool = False,
     extract_mode: Optional[str] = None,
+    check_source_fingerprint: bool = False,
 ) -> bool:
     """Check if a file has already been filed in the palace.
 
@@ -174,17 +176,15 @@ def file_already_mined(
         missing or older than the current revision
       - `check_mtime=True` and the file's mtime differs from the stored one
 
-    When check_mtime=True (used by the project miner, and by the convo
-    miner's in-lock recheck), also re-mines on content change. Conversation
-    transcripts are NOT assumed immutable: a Claude Code session keeps
-    appending to its own file while active, and /compact or /clear can
-    rewrite one in place. The convo miner's bulk skip-check uses
-    prefetch_mined_set()'s stored mtimes instead of calling this function
-    per file (same mtime-aware decision, without the O(n) per-file query
-    cost); this function's check_mtime=True path remains its per-file,
-    lock-held race-condition recheck. The project miner skips a file
-    without calling this only when prefetch_complete_mtimes() proves this
-    would return True.
+    With check_source_fingerprint=True, the currentness check requires an
+    exact source fingerprint instead of the legacy mtime tolerance. Rows
+    without it are re-mined once to record a verified source snapshot.
+
+    The project miner uses check_mtime=True, skipping this call only when
+    prefetch_complete_mtimes() proves it would return True for the file.
+    The conversation miner uses check_source_fingerprint=True for this
+    lock-held recheck and requests the same fingerprints from
+    prefetch_mined_set() for its bulk skip-check.
 
     When extract_mode is set (used by convo miner), idempotency is scoped to
     that extraction mode so exchange-mode and general-mode drawers can coexist
@@ -206,14 +206,19 @@ def file_already_mined(
     read error that answered False would re-file the source as unmined.
     """
     current_mtime = None
+    current_fingerprint = None
+    check_mtime = check_mtime or check_source_fingerprint
     if check_mtime:
         try:
-            current_mtime = os.path.getmtime(source_file)
+            if check_source_fingerprint:
+                current_fingerprint = source_fingerprint(os.stat(source_file))
+            else:
+                current_mtime = os.path.getmtime(source_file)
         except OSError:
             return False
     # A source can hold several stored groups, one per mining pass, so every
     # matching drawer is walked and the answer is decided after the walk:
-    # get() ordering is undefined. Per stored_mtime group: [drawers seen,
+    # get() ordering is undefined. Per source-state group: [drawers seen,
     # largest chunk_total, whether some drawer has no chunk_total].
     groups: dict = {}
     unprovable = False
@@ -242,10 +247,16 @@ def file_already_mined(
             if not _meta_is_current(meta, extract_mode):
                 continue
             stored_mtime = meta.get("source_mtime")
-            if check_mtime and (stored_mtime is None or abs(stored_mtime - current_mtime) >= 0.001):
+            if check_source_fingerprint:
+                if meta.get("source_fingerprint") != current_fingerprint:
+                    continue
+            elif check_mtime and (
+                stored_mtime is None or abs(stored_mtime - current_mtime) >= 0.001
+            ):
                 continue
             chunk_total = meta.get("chunk_total")
-            entry = groups.setdefault(stored_mtime, [0, 0, False])
+            state_key = meta.get("source_fingerprint") if check_source_fingerprint else stored_mtime
+            entry = groups.setdefault(state_key, [0, 0, False])
             entry[0] += 1
             if chunk_total is None:
                 # No completion marker (legacy rows, sentinels): trusted.
@@ -266,24 +277,23 @@ _PREFETCH_SCOPE_THRESHOLD = 50
 
 
 def prefetch_mined_set(
-    collection, extract_mode: Optional[str] = None, source_files: Optional[list] = None
-) -> dict[str, Optional[float]]:
-    """Pre-fetch source_file -> stored source_mtime for files already mined
+    collection,
+    extract_mode: Optional[str] = None,
+    source_files: Optional[list] = None,
+    *,
+    source_fingerprints: bool = False,
+) -> dict[str, Optional[Union[float, str]]]:
+    """Pre-fetch source_file -> stored source state for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
     ChromaDB query per file.
 
-    Return type is a dict rather than a bare set so callers get mtime
-    awareness "for free": conversation transcripts are not immutable once
-    mined (a Claude Code session keeps appending to the same file while
-    active, and /compact or /clear can rewrite one in place), so "we've
-    seen this source_file before" is not sufficient to skip it -- the caller
-    must also confirm its current on-disk mtime still matches what was
-    stored. `if src in mined_set` still means the same thing as the old
-    set-based return (dict `in` checks keys); a caller that wants staleness
-    detection reads `mined_set[src]` and compares against
-    os.path.getmtime(src) itself. `None` means either no mtime was ever
-    stored (drawers written before this field existed) or getmtime failed
-    when the drawer was written -- both should be treated as stale.
+    The default values are stored mtimes. Callers compare each value with
+    os.path.getmtime(src); membership alone does not establish freshness.
+    None means no verified state was stored and must be treated as stale.
+
+    With source_fingerprints=True, values and completion groups use exact
+    source fingerprints instead. Missing fingerprints return None so callers
+    re-mine legacy files rather than trusting a possibly stale mtime.
 
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
@@ -310,7 +320,7 @@ def prefetch_mined_set(
     omitted, the behaviour is unchanged: a bulk sweep still benefits more
     from one full scan than from many filtered queries.
     """
-    # Per source_file: per stored_mtime group -> [count, largest chunk_total,
+    # Per source_file: per source-state group -> [count, largest chunk_total,
     # whether some drawer has no chunk_total]. A source is only "mined" once
     # some group is complete, and never while any of its rows is unprovable.
     groups: dict[str, dict] = {}
@@ -332,9 +342,12 @@ def prefetch_mined_set(
             return
         if not _meta_is_current(meta, extract_mode):
             return
-        stored_mtime = meta.get("source_mtime")
-        mtime_key = float(stored_mtime) if stored_mtime is not None else None
-        entry = groups.setdefault(src, {}).setdefault(mtime_key, [0, 0, False])
+        if source_fingerprints:
+            state_key = meta.get("source_fingerprint")
+        else:
+            stored_mtime = meta.get("source_mtime")
+            state_key = float(stored_mtime) if stored_mtime is not None else None
+        entry = groups.setdefault(src, {}).setdefault(state_key, [0, 0, False])
         entry[0] += 1
         chunk_total = meta.get("chunk_total")
         if chunk_total is None:
@@ -369,14 +382,14 @@ def prefetch_mined_set(
     else:
         _scan_all()
 
-    mined: dict[str, Optional[float]] = {}
-    for src, by_mtime in groups.items():
+    mined: dict[str, Optional[Union[float, str]]] = {}
+    for src, by_state in groups.items():
         if src in unprovable:
             continue
-        for mtime_key, (count, largest, untracked) in by_mtime.items():
+        for state_key, (count, largest, untracked) in by_state.items():
             # Legacy / registry rows carry no completion marker: trusted.
             if untracked or count >= largest:
-                mined[src] = mtime_key
+                mined[src] = state_key
                 break
     return mined
 

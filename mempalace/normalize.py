@@ -27,6 +27,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional, Tuple
 
+from ._source_state import SourceChangedDuringReadError
 from .fsio import read_source_text
 
 
@@ -149,15 +150,17 @@ def strip_noise(text: str) -> str:
 _MAX_TRANSCRIPT_BYTES = 500 * 1024 * 1024  # 500 MB safety limit
 
 
-def _read_transcript_file(filepath: str) -> str:
+def _read_transcript_file(filepath: str, *, source_metadata: Optional[dict] = None) -> str:
     """Read a transcript source file with the same safety checks normalize()
     and normalize_conversations() both need: no symlinks, regular files only,
     size-capped, BOM-tolerant.
     """
-    return _read_transcript_file_with_mtime(filepath)[0]
+    return _read_transcript_file_with_mtime(filepath, source_metadata=source_metadata)[0]
 
 
-def _read_transcript_file_with_mtime(filepath: str) -> Tuple[str, float]:
+def _read_transcript_file_with_mtime(
+    filepath: str, *, source_metadata: Optional[dict] = None
+) -> Tuple[str, float]:
     """``_read_transcript_file`` plus the mtime from the ``fstat`` taken
     before the read. A stat after the read can record an mtime for bytes
     the read never saw, and the next mine then skips the appended tail.
@@ -166,7 +169,11 @@ def _read_transcript_file_with_mtime(filepath: str) -> Tuple[str, float]:
     on the run as ``encoding``.
     """
     try:
-        text, encoding, mtime = read_source_text(filepath, max_bytes=_MAX_TRANSCRIPT_BYTES)
+        text, encoding, mtime = read_source_text(
+            filepath, max_bytes=_MAX_TRANSCRIPT_BYTES, source_metadata=source_metadata
+        )
+    except SourceChangedDuringReadError:
+        raise
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     run = _NORMALIZE_RUN.get()
@@ -202,18 +209,23 @@ def normalize(filepath: str) -> str:
     return content
 
 
-def normalize_conversations(filepath: str) -> list:
+def normalize_conversations(filepath: str, *, source_metadata: Optional[dict] = None) -> list:
     """Like normalize(), but keeps each conversation in a bundle export (a
     Claude.ai privacy export, a ChatGPT ``conversations.json``) as a separate
     string instead of joining them into one. Non-bundle formats normalize to a
     one-element list.
+
+    When supplied, source_metadata receives the source state verified before
+    and after reading. Persist it with the content rather than statting again.
     """
-    return normalize_conversations_with_mtime(filepath)[0]
+    return normalize_conversations_with_mtime(filepath, source_metadata=source_metadata)[0]
 
 
-def normalize_conversations_with_mtime(filepath: str) -> Tuple[list, float]:
+def normalize_conversations_with_mtime(
+    filepath: str, *, source_metadata: Optional[dict] = None
+) -> Tuple[list, float]:
     """``normalize_conversations`` plus the mtime of the bytes it read."""
-    content, mtime = _read_transcript_file_with_mtime(filepath)
+    content, mtime = _read_transcript_file_with_mtime(filepath, source_metadata=source_metadata)
     return _split_conversations(content, filepath), mtime
 
 

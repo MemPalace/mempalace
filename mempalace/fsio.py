@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Tuple, Union
 
+from ._source_state import SourceChangedDuringReadError, source_fingerprint
 from .timeutil import filename_stamp
 
 PathLike = Union[str, os.PathLike]
@@ -534,18 +535,35 @@ def open_source_file(path: PathLike) -> Tuple[int, os.stat_result]:
     return fd, st
 
 
-def read_source_text(path: PathLike, *, max_bytes: int) -> Tuple[str, str, float]:
+def read_source_text(
+    path: PathLike, *, max_bytes: int, source_metadata: Optional[dict] = None
+) -> Tuple[str, str, float]:
     """Read a source file whole: ``(text, encoding, mtime)``.
 
     The mtime comes from the ``fstat`` taken before the read, so a caller
     never stamps text with the mtime of a later append. Newlines are
     read as in text mode; see ``decode_source`` for the decoding. Raises
     ``OSError`` for a symlink, a non-regular file, or more than ``max_bytes``.
+
+    When supplied, ``source_metadata`` receives the descriptor's mtime and
+    fingerprint only after its state is verified unchanged across the read.
+    An unstable read raises ``SourceChangedDuringReadError`` without updating
+    that metadata, so the caller can preserve its previous stored snapshot.
     """
     fd, st = open_source_file(path)
     with os.fdopen(fd, "rb") as handle:
         if st.st_size > max_bytes:
             raise OSError(f"file too large ({st.st_size // (1024 * 1024)} MB)")
-        raw = handle.read()
+        # The file can grow after fstat. Bound the actual read as well, with
+        # one extra byte to distinguish an exact-limit file from overflow.
+        raw = handle.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise OSError(f"file too large (exceeds {max_bytes} bytes)")
+        if source_metadata is not None:
+            fingerprint = source_fingerprint(st)
+            if source_fingerprint(os.fstat(handle.fileno())) != fingerprint:
+                raise SourceChangedDuringReadError(f"Source changed while reading {path}")
     text, encoding = decode_source(raw, universal_newlines=True)
+    if source_metadata is not None:
+        source_metadata.update(source_mtime=st.st_mtime, source_fingerprint=fingerprint)
     return text, encoding, st.st_mtime
