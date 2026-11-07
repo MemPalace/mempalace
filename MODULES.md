@@ -252,6 +252,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Runner-start void tests cover both orchestration switches, retired keys, lease/start ordering, rollback, capacity and owner authority.
 
+  - Owner summary edits freeze the injection clock; forced-expiry coverage preserves exact injection, accepted status and unchanged rule sequence.
+
   - Shared-proposal acceptance freezes the injection clock; a forced-expiry regression exercises the functional test and checks verbatim delivery to both agents after owner acceptance.
 
 - **How it fails:**

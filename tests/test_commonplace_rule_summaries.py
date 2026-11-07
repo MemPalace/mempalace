@@ -8,7 +8,7 @@ import pytest
 from commonplace import sessions
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.policy import Policy
-from commonplace.rules import RuleService, RuleStore
+from commonplace.rules import RuleService, RuleStore, checks
 from commonplace.rules.service import instructions_for
 from tests._commonplace_helpers import hub_fixture  # noqa: F401
 from tests.test_commonplace_boards import api, mcp
@@ -94,7 +94,11 @@ def test_agent_mcp_summary_omitted_preserved_and_explicitly_cleared(hub, fresh):
     ]
 
 
-def test_owner_rest_summary_updates_leave_injection_and_acceptance_unchanged(hub, fresh):
+def test_owner_rest_summary_updates_leave_injection_and_acceptance_unchanged(
+    hub, fresh, monkeypatch
+):
+    # Summary edits and verbatim injection must not depend on scheduler delays.
+    monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
     text = "Keep the exact rule text.\n  Preserve its spacing and context."
     status, current = api(
         hub,
