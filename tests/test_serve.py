@@ -263,3 +263,22 @@ def test_tls_requires_both_cert_and_key(isolated_home, capture_exec, tmp_path):
     cert.write_text("x")
     with pytest.raises(SystemExit):
         cli.cmd_serve(_serve_args(isolated_home, tls_cert=str(cert), tls_key=None))
+
+
+def test_child_never_imports_from_the_working_directory(isolated_home, capture_exec):
+    """The server child runs the installed package, not a cwd ``mempalace/``.
+
+    ``serve`` runs from wherever the operator stands, which may be an untrusted
+    checkout. ``python -m mempalace.mcp_server`` would import a ``mempalace/``
+    planted there first; the launcher drops the cwd entry and PYTHONSAFEPATH
+    keeps 3.11+ from adding it at all.
+    """
+    with pytest.raises(_ExecCalled):
+        cli.cmd_serve(_serve_args(isolated_home))
+    argv = capture_exec["argv"]
+    assert "-m" not in argv
+    assert argv[1] == "-c"
+    assert "runpy.run_module('mempalace.mcp_server'" in argv[2]
+    assert "del sys.path[0]" in argv[2]
+    assert argv[3:7] == ["--transport", "http", "--host", "127.0.0.1"]
+    assert capture_exec["env"]["PYTHONSAFEPATH"] == "1"

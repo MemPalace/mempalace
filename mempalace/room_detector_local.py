@@ -17,6 +17,7 @@ from pathlib import Path
 
 import yaml
 
+from .fsio import atomic_write_text, is_regular_or_absent
 from .project_config import find_project_config
 from .timeutil import filename_stamp
 
@@ -378,12 +379,20 @@ def save_config(project_dir: str, project_name: str, rooms: list):
                 file=sys.stderr,
             )
     # Opening a pre-existing FIFO for writing blocks in the kernel until a
-    # reader appears. Only a regular file is a valid config target; refuse
-    # loudly rather than park ``init`` with no output.
-    if config_path.exists() and not config_path.is_file():
+    # reader appears, and opening a symbolic link writes through it: in a
+    # checkout the user did not author, ``mempalace.yaml`` linked at a file
+    # in their home would be replaced by this write. Only a regular file (or
+    # nothing) is a valid config target, decided by ``lstat`` so a link is
+    # seen as a link; refuse loudly rather than park ``init`` with no output
+    # or write somewhere else. The publish never follows a link either.
+    if not is_regular_or_absent(config_path):
         raise OSError(f"Refusing to write config: {config_path} is not a regular file")
-    with open(config_path, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    atomic_write_text(
+        config_path,
+        yaml.dump(config, default_flow_style=False, sort_keys=False),
+        private=False,
+        follow_symlinks=False,
+    )
 
     print(f"\n  Config saved: {config_path}")
     print("\n  Next step:")

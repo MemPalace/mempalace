@@ -4,7 +4,6 @@ if __name__ != "mempalace.cli":
 
 
 def cmd_init(args):
-    import json
     from pathlib import Path
 
     from ..entity_detector import confirm_entities
@@ -157,28 +156,7 @@ def cmd_init(args):
             from ..project_config import ENTITIES_FILENAME
 
             project_path = Path(args.dir).expanduser().resolve()
-            entities_path = project_path / ENTITIES_FILENAME
-            # Opening a pre-existing FIFO for writing blocks in the kernel
-            # until a reader appears. Only a regular file is a valid target
-            # for the per-project audit trail; the global registry merge
-            # below is unaffected either way.
-            if entities_path.exists() and not entities_path.is_file():
-                print(
-                    f"  ! Not writing entities: {entities_path} is not a regular file",
-                    file=sys.stderr,
-                )
-            elif _is_dialect_entity_config(entities_path):
-                # Same name as the AAAK entity codes ``mempalace compress``
-                # reads; those are the user's own, so they are not replaced.
-                print(
-                    f"  ! Not writing entities: {entities_path} holds AAAK entity "
-                    "codes for `mempalace compress`",
-                    file=sys.stderr,
-                )
-            else:
-                with open(entities_path, "w", encoding="utf-8") as f:
-                    json.dump(confirmed, f, indent=2, ensure_ascii=False)
-                print(f"  Entities saved: {entities_path}")
+            _save_project_entities(project_path / ENTITIES_FILENAME, confirmed)
 
             from ..config import normalize_wing_name
             from ..miner import add_to_known_entities
@@ -252,6 +230,40 @@ def _is_dialect_entity_config(path) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(data, dict) and "entities" in data and "people" not in data
+
+
+def _save_project_entities(entities_path, confirmed: dict) -> None:
+    """Write the confirmed entities to ``<project>/entities.json``, or say why not.
+
+    The per-project copy is an audit trail the user can inspect or hand-edit;
+    the global registry merge that follows is unaffected either way. Opening
+    a pre-existing FIFO for writing blocks in the kernel until a reader
+    appears, and opening a symbolic link writes through it: the project may
+    be a checkout the user did not author, where ``entities.json`` linked at
+    a file in their home would be replaced by this write. Only a regular file
+    (or nothing) is written, decided by ``lstat`` so a link is seen as a link,
+    and the publish never follows a link either.
+    """
+    import sys
+
+    from ..fsio import atomic_write_json, is_regular_or_absent
+
+    if not is_regular_or_absent(entities_path):
+        print(
+            f"  ! Not writing entities: {entities_path} is not a regular file",
+            file=sys.stderr,
+        )
+    elif _is_dialect_entity_config(entities_path):
+        # Same name as the AAAK entity codes ``mempalace compress``
+        # reads; those are the user's own, so they are not replaced.
+        print(
+            f"  ! Not writing entities: {entities_path} holds AAAK entity "
+            "codes for `mempalace compress`",
+            file=sys.stderr,
+        )
+    else:
+        atomic_write_json(entities_path, confirmed, private=False, follow_symlinks=False)
+        print(f"  Entities saved: {entities_path}")
 
 
 def _format_size_mb(num_bytes: int) -> str:

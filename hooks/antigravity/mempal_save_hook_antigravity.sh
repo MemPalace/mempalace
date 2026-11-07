@@ -216,23 +216,25 @@ mempal_log "stop" "$CONVERSATION_ID" "TRIGGERING SAVE wing=$WING transcript_dir=
 # shell that owns the mine — no sibling-PID `wait` hazard, no polling
 # loop.
 #
-# We invoke mempalace as `"$MEMPAL_PYTHON_BIN" -m mempalace` rather than
-# the bare `mempalace` console script so a user with the package
-# installed only inside a venv (and the venv's bin/ not on the hook's
-# PATH, e.g. `uv tool install` in some distributions, or a manually
-# managed virtualenv) still hits a working mine. MEMPAL_PYTHON honours
-# user override; sees ``mempalace/__main__.py`` which dispatches to
-# ``mempalace.cli:main`` — identical to the console script.
+# We invoke mempalace through `"$MEMPAL_PYTHON_BIN"` (mempal_run_mempalace
+# in lib/common.sh) rather than the bare `mempalace` console script so a
+# user with the package installed only inside a venv (and the venv's
+# bin/ not on the hook's PATH, e.g. `uv tool install` in some
+# distributions, or a manually managed virtualenv) still hits a working
+# mine. MEMPAL_PYTHON honours user override; the launcher runs
+# ``mempalace/__main__.py`` which dispatches to ``mempalace.cli:main`` —
+# identical to the console script — without importing from the
+# workspace, which may be an untrusted checkout.
 mempal_log "stop" "$CONVERSATION_ID" "spawning background mine wing=$WING transcript_dir=$TRANSCRIPT_DIR"
 (
-    if "$MEMPAL_PYTHON_BIN" -m mempalace --version >/dev/null 2>&1; then
-        "$MEMPAL_PYTHON_BIN" -m mempalace mine "$TRANSCRIPT_DIR" \
+    if mempal_run_mempalace --version >/dev/null 2>&1; then
+        mempal_run_mempalace mine "$TRANSCRIPT_DIR" \
             --mode convos \
             --wing "$WING" \
             >> "$MEMPAL_AGY_LOG" 2>&1 < /dev/null
         mempal_log "stop" "$CONVERSATION_ID" "background mine finished wing=$WING"
     else
-        mempal_log "stop" "$CONVERSATION_ID" "ERROR: mempalace is not runnable via $MEMPAL_PYTHON_BIN -m mempalace; install mempalace or set MEMPAL_PYTHON"
+        mempal_log "stop" "$CONVERSATION_ID" "ERROR: mempalace is not runnable via $MEMPAL_PYTHON_BIN; install mempalace or set MEMPAL_PYTHON"
     fi
     rm -f "$PENDING_FILE" 2>/dev/null
 ) >/dev/null 2>&1 < /dev/null &

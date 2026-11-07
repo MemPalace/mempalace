@@ -221,10 +221,15 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
         return False
     gitignore = project_path / ".gitignore"
     # ``exists()`` is true for a FIFO, and both the read below and the append
-    # at the end of this function would block in the kernel on one. Decide by
-    # type instead: an absent file still yields "" as before, a regular one
-    # is read, and anything else is left untouched.
-    if gitignore.exists() and not gitignore.is_file():
+    # at the end of this function would block in the kernel on one. It also
+    # follows a symbolic link, and the project may be a checkout the user
+    # does not control: a ``.gitignore`` linked at a file in their home would
+    # be appended to through the link. Decide by ``lstat`` type instead: an
+    # absent file still yields "" as before, a regular one is read, and
+    # anything else is left untouched.
+    from ..fsio import is_regular_or_absent
+
+    if not is_regular_or_absent(gitignore):
         return False
     # Force UTF-8: Windows defaults to GBK and chokes on non-ASCII .gitignore
     # comments, killing auto-init even though the file is valid UTF-8.

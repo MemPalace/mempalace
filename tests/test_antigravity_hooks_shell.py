@@ -31,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOKS_DIR = REPO_ROOT / "hooks" / "antigravity"
 SAVE_HOOK = HOOKS_DIR / "mempal_save_hook_antigravity.sh"
 WAKE_HOOK = HOOKS_DIR / "mempal_wake_hook_antigravity.sh"
+COMMON_SH = HOOKS_DIR / "lib" / "common.sh"
 COMMON_LIB = HOOKS_DIR / "lib" / "common.sh"
 
 # Skip the entire module on Windows — bash 3.2+ is required.
@@ -413,13 +414,14 @@ def test_common_sh_parser_omits_sentinel_on_malformed_json(tmp_path: Path) -> No
 
 
 def test_save_hook_missing_mempalace_python_module_does_not_crash(tmp_path: Path) -> None:
-    """When the resolved Python interpreter cannot run `-m mempalace`, fail open.
+    """When the resolved Python interpreter cannot run mempalace, fail open.
 
-    The save hook now invokes mempalace via ``"$MEMPAL_PYTHON_BIN"
-    -m mempalace mine ...`` rather than the bare ``mempalace`` console
-    script. If MEMPAL_PYTHON points at an interpreter that doesn't
-    have the package installed, the hook must log the failure and
-    still emit ``{}`` — never crash, never block the user.
+    The save hook invokes mempalace through ``"$MEMPAL_PYTHON_BIN"``
+    (``mempal_run_mempalace`` in lib/common.sh) rather than the bare
+    ``mempalace`` console script. If MEMPAL_PYTHON points at an
+    interpreter that doesn't have the package installed, the hook must
+    log the failure and still emit ``{}`` — never crash, never block
+    the user.
     """
     state = tmp_path / "state"
     home = tmp_path / "home"
@@ -427,14 +429,14 @@ def test_save_hook_missing_mempalace_python_module_does_not_crash(tmp_path: Path
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text("{}\n", encoding="utf-8")
     # Point MEMPAL_PYTHON at a stub interpreter that has no mempalace
-    # package installed — `python -m mempalace --version` will fail.
+    # package installed — the `mempalace --version` probe will fail.
     stub = tmp_path / "stub_python"
     stub.write_text(
         "#!/bin/sh\n"
-        "# Minimal python stub: rejects every -m invocation so the\n"
+        "# Minimal python stub: rejects every mempalace launch so the\n"
         '# hook hits the "module unrunnable" branch.\n'
         'case "$*" in\n'
-        '    *"-m mempalace"*) exit 1 ;;\n'
+        '    *"run_module(\\"mempalace\\""*) exit 1 ;;\n'
         '    *) exec /usr/bin/env python3 "$@" ;;\n'
         "esac\n",
         encoding="utf-8",
@@ -462,25 +464,54 @@ def test_save_hook_missing_mempalace_python_module_does_not_crash(tmp_path: Path
 
 
 def test_save_hook_uses_python_module_invocation(tmp_path: Path) -> None:
-    """The save hook source MUST invoke mempalace via `-m mempalace`.
+    """The save hook MUST run mempalace through $MEMPAL_PYTHON_BIN, safely.
 
     Locks in the gemini-code-assist fix so a future edit doesn't
     silently regress to the bare ``mempalace`` console-script call,
-    which fails when the user's PATH doesn't expose the venv bin.
+    which fails when the user's PATH doesn't expose the venv bin — and
+    the follow-up that replaced ``-m mempalace`` with the launcher in
+    lib/common.sh, because ``-m`` imports from the workspace first.
     """
     body = SAVE_HOOK.read_text(encoding="utf-8")
-    assert '"$MEMPAL_PYTHON_BIN" -m mempalace' in body, (
-        "save hook should invoke mempalace via $MEMPAL_PYTHON_BIN -m mempalace, "
-        "not the bare `mempalace` console script. The bare invocation breaks "
-        "when the venv's bin/ isn't on the hook's PATH."
+    assert "mempal_run_mempalace mine " in body, (
+        "save hook should invoke mempalace via mempal_run_mempalace (which runs "
+        "$MEMPAL_PYTHON_BIN without importing from the workspace), not the bare "
+        "`mempalace` console script. The bare invocation breaks when the venv's "
+        "bin/ isn't on the hook's PATH."
     )
+    # `python -m mempalace` from the workspace runs a mempalace/ package
+    # planted in an untrusted checkout. The hooks never spell it.
+    for script in (SAVE_HOOK, WAKE_HOOK, COMMON_SH):
+        code = "\n".join(
+            line
+            for line in script.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+        assert "-m mempalace" not in code, (
+            f"{script.name} runs `-m mempalace`; use mempal_run_mempalace / the launcher"
+        )
+        assert "'-m', 'mempalace'" not in code, f"{script.name} runs -m mempalace"
     # Also verify the bare invocation is gone (defense-in-depth).
     # Allow `mempalace` to appear in comments / strings, but not as
     # the start of a `nohup ... mempalace mine` command.
     assert "nohup mempalace " not in body, (
-        "bare `nohup mempalace ...` invocation found; should be "
-        '`nohup "$MEMPAL_PYTHON_BIN" -m mempalace ...`'
+        "bare `nohup mempalace ...` invocation found; should be `nohup mempal_run_mempalace ...`"
     )
+
+
+def test_common_sh_keeps_the_workspace_off_sys_path() -> None:
+    """Every interpreter the hooks start must ignore a package planted in the cwd.
+
+    PYTHONSAFEPATH covers Python 3.11+; the launcher drops the empty
+    sys.path entry ``-c`` adds, which covers 3.10.
+    """
+    common = COMMON_SH.read_text(encoding="utf-8")
+    assert "export PYTHONSAFEPATH=1" in common
+    assert 'if sys.path and sys.path[0] == "": del sys.path[0]' in common
+    assert 'runpy.run_module("mempalace", run_name="__main__", alter_sys=True)' in common
+    wake = WAKE_HOOK.read_text(encoding="utf-8")
+    assert "if sys.path and sys.path[0] == '': del sys.path[0]" in wake
+    assert "[sys.executable, '-c', safe_main, 'wake-up'" in wake
 
 
 def test_save_hook_backgrounds_probe_mine_and_cleanup_in_one_subshell(tmp_path: Path) -> None:
@@ -509,9 +540,10 @@ def test_save_hook_backgrounds_probe_mine_and_cleanup_in_one_subshell(tmp_path: 
         "the `kill -0` watcher should have been retired when probe+mine+cleanup "
         "were folded into a single background subshell."
     )
-    # Probe still happens (just inside the subshell now) and uses -m.
-    assert '"$MEMPAL_PYTHON_BIN" -m mempalace --version' in body, (
-        "the runnability probe must still run via $MEMPAL_PYTHON_BIN -m mempalace"
+    # Probe still happens (just inside the subshell now) and goes through
+    # the safe launcher.
+    assert "if mempal_run_mempalace --version" in body, (
+        "the runnability probe must still run via mempal_run_mempalace"
     )
     # The whole block is backgrounded: a subshell close followed by the
     # detach redirection + `&`.
@@ -543,10 +575,10 @@ def test_save_hook_returns_before_slow_version_probe(tmp_path: Path) -> None:
     stub = tmp_path / "slow_python"
     stub.write_text(
         "#!/bin/sh\n"
-        "# Stub python: any -m mempalace call sleeps 3s, simulating a\n"
+        "# Stub python: any mempalace launch sleeps 3s, simulating a\n"
         "# heavy cold-start import. Everything else proxies to python3.\n"
         'case "$*" in\n'
-        '    *"-m mempalace"*) sleep 3; exit 0 ;;\n'
+        '    *"run_module(\\"mempalace\\""*) sleep 3; exit 0 ;;\n'
         '    *) exec /usr/bin/env python3 "$@" ;;\n'
         "esac\n",
         encoding="utf-8",
@@ -620,18 +652,19 @@ def test_save_hook_helper_uses_temp_and_mv(tmp_path: Path) -> None:
 
 
 def test_wake_hook_uses_sys_executable_module_invocation(tmp_path: Path) -> None:
-    """The wake hook's inner Python must invoke mempalace via sys.executable -m.
+    """The wake hook's inner Python must invoke mempalace via sys.executable.
 
     Same rationale as the save hook fix: the bare ``mempalace``
     console script fails when the venv's bin/ isn't on the hook's
-    PATH. Using ``[sys.executable, '-m', 'mempalace', ...]`` binds
-    the call to the same interpreter that resolved MEMPAL_PYTHON.
+    PATH. Using ``[sys.executable, '-c', safe_main, ...]`` binds the
+    call to the same interpreter that resolved MEMPAL_PYTHON, and the
+    launcher (rather than ``-m``) keeps the workspace off sys.path.
     """
     body = WAKE_HOOK.read_text(encoding="utf-8")
-    assert "sys.executable, '-m', 'mempalace'" in body, (
-        "wake hook should invoke mempalace via [sys.executable, '-m', 'mempalace', ...], "
-        "not ['mempalace', ...]. The bare invocation breaks when the venv's bin/ "
-        "isn't on the hook's PATH."
+    assert "[sys.executable, '-c', safe_main, 'wake-up'" in body, (
+        "wake hook should invoke mempalace via [sys.executable, '-c', safe_main, ...], "
+        "not ['mempalace', ...] or -m. The bare invocation breaks when the venv's bin/ "
+        "isn't on the hook's PATH; -m imports from the workspace."
     )
     assert "['mempalace', 'wake-up'" not in body, (
         "bare ['mempalace', 'wake-up', ...] invocation found in wake hook"

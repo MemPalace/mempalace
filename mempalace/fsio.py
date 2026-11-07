@@ -549,3 +549,20 @@ def read_source_text(path: PathLike, *, max_bytes: int) -> Tuple[str, str, float
         raw = handle.read()
     text, encoding = decode_source(raw, universal_newlines=True)
     return text, encoding, st.st_mtime
+
+
+def is_regular_or_absent(path: PathLike) -> bool:
+    """Whether ``path`` is a regular file or nothing at all.
+
+    Tells a writer that opening ``path`` creates or replaces a file of its
+    own: a symbolic link (dangling or not), a directory, a FIFO or a device
+    there is not. ``exists()`` and ``is_file()`` follow links, so they cannot
+    make that distinction; this uses ``lstat``.
+    """
+    try:
+        st = os.lstat(str(path))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode)

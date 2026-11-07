@@ -127,7 +127,9 @@ def cmd_serve(args):
 
     # Build the child environment. Token rides in the env (never argv) so it
     # stays out of the process table.
-    env = dict(os.environ)
+    from .._proc import safe_child_env, safe_module_argv
+
+    env = safe_child_env()
     env["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:
         env["MEMPALACE_BACKEND"] = str(backend).strip().lower()
@@ -136,17 +138,12 @@ def cmd_serve(args):
     if not token and not local_only and tokenless:
         env["MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN"] = "1"
 
-    child = [
-        sys.executable,
-        "-m",
-        "mempalace.mcp_server",
-        "--transport",
-        "http",
-        "--host",
-        host,
-        "--port",
-        str(port),
-    ]
+    # `serve` is run from wherever the operator stands, which may be an
+    # untrusted checkout: the child runs the installed package, never a
+    # ``mempalace/`` planted in the working directory.
+    child = safe_module_argv(
+        "mempalace.mcp_server", "--transport", "http", "--host", host, "--port", str(port)
+    )
     if backend:
         child += ["--backend", str(backend).strip().lower()]
     child += ["--palace", palace_path]
