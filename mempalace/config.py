@@ -1490,6 +1490,27 @@ class MempalaceConfig:
         return max(1, parsed)
 
     @property
+    def entity_tunnels(self):
+        """Whether the miner derives cross-wing entity tunnels.
+
+        Default is ``True`` — any entity with hallways in this wing AND
+        another wing produces a ``kind="entity"`` tunnel at mine time. Set
+        ``false`` to stop deriving new entity tunnels; existing tunnels are
+        left untouched (remove them explicitly with
+        ``mempalace tunnels prune --yes``), and explicit
+        ``mempalace tunnels propose --yes`` keeps working. Reads
+        ``MEMPALACE_ENTITY_TUNNELS`` env first, then the ``entity_tunnels``
+        config-file value, then ``True``. An unrecognised value falls
+        through to the default rather than raising, mirroring
+        :attr:`hooks_auto_save`.
+        """
+        flag = env_flag("MEMPALACE_ENTITY_TUNNELS")
+        if flag is not None:
+            return flag
+        parsed = parse_bool(self._file_config.get("entity_tunnels"))
+        return True if parsed is None else parsed
+
+    @property
     def hallway_min_count(self):
         """Minimum co-occurrence count required to materialize a within-wing
         hallway between two entities.

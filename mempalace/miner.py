@@ -2481,16 +2481,25 @@ def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
 
     Returns the number of tunnels created or refreshed. Zero means no
     eligible entity exists in this wing yet (or no hallway records do).
+    Returns ``0`` without touching the hallway store when the
+    ``entity_tunnels`` config knob is off — the gate lives here, in the
+    automatic miner path, and NOT in ``palace_graph.entity_tunnels_for_wing``,
+    so explicit ``mempalace tunnels propose --yes`` keeps working.
     """
+    from .config import MempalaceConfig
     from .hallways import entity_strength_records
     from .palace_graph import entity_tunnels_for_wing
 
+    cfg = config or MempalaceConfig()
+    if not cfg.entity_tunnels:
+        return 0
+
     # Not every hallway of the palace: the tunnels read one strength per
     # (wing, entity), so the store hands over only that.
-    hallways = entity_strength_records(config=config)
+    hallways = entity_strength_records(config=cfg)
     if not hallways:
         return 0
-    created = entity_tunnels_for_wing(wing, hallways, config=config)
+    created = entity_tunnels_for_wing(wing, hallways, config=cfg)
     return len(created)
 
 
