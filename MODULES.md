@@ -207,6 +207,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - The revoked-token socket guard observes the completed server-side 401, no body reads and no route dispatch, including a forced close before upload finishes.
+
   - Lease regressions retain started jobs beyond an hour while their cards remain doing with the machine worker, and release capacity on completion, reassignment or a terminal job state without taking a boards write lock.
 
   - Tests use temporary directories, loopback servers and synthetic names; they make no external network calls.
