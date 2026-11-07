@@ -1692,9 +1692,14 @@ class Gateway:
                 try:
                     super().server_close()
                 finally:
-                    email_auth = getattr(gateway, "email_auth", None)
-                    if email_auth is not None:
-                        email_auth.close()
+                    try:
+                        email_auth = getattr(gateway, "email_auth", None)
+                        if email_auth is not None:
+                            email_auth.close()
+                    finally:
+                        github = getattr(gateway, "github", None)
+                        if github is not None:
+                            github.close()
 
         server = Server((host, port), _GatewayHandler)
         server.gateway = self

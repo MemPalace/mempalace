@@ -27,6 +27,7 @@ import re
 import secrets
 import sqlite3
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Optional
@@ -358,6 +359,7 @@ class ControlDB:
         *,
         personal: bool = False,
         initial_space_pending: bool = False,
+        conn=None,
     ) -> str:
         owner = self.user(owner_ref)
         name = name.strip()
@@ -366,7 +368,7 @@ class ControlDB:
         wid = _new_id("ws")
         now = _iso(_now())
         # A new workspace adds stores to the data tree: never during a backup cut.
-        with GATE.creating(), self._lock, self._tx() as conn:
+        with GATE.creating(), self._lock, self._tx() if conn is None else nullcontext(conn) as conn:
             conn.execute(
                 "INSERT INTO workspaces(id, name, personal_of, initial_space_pending, created_at) "
                 "VALUES (?,?,?,?,?)",

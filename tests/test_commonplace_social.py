@@ -428,7 +428,7 @@ def test_open_signup_creates_user_personal_workspace_identity_and_session(
         monkeypatch.setenv("COMMONPLACE_SIGNUP", signup)
     calls = []
 
-    def assign_signup_plan(db, uid, workspace_id, *, via):
+    def assign_signup_plan(db, uid, workspace_id, *, via, conn=None):
         assert db.user(uid)["id"] == uid
         assert db.workspace(workspace_id)["personal_of"] == uid
         calls.append((db, uid, workspace_id, via))

@@ -19,6 +19,10 @@ from commonplace.workers import WorkerSupervisor
 # A new registered route must be deliberately classified here. Prefix entries
 # include methods without an implemented action: authentication still runs first.
 EXACT = {
+    ("GET", "/api/github"): "authenticated",
+    ("POST", "/api/github/connect"): "authenticated",
+    ("POST", "/api/github/confirm"): "authenticated",
+    ("DELETE", "/api/github"): "authenticated",
     ("GET", "/api/settings/orchestration"): "authenticated",
     ("PUT", "/api/settings/orchestration"): "authenticated",
     ("GET", "/api/holds"): "authenticated",

@@ -21,12 +21,36 @@ CREATE TABLE IF NOT EXISTS user_identities (
     PRIMARY KEY(provider, subject)
 );
 CREATE INDEX IF NOT EXISTS user_identities_user ON user_identities(user_id);
+CREATE TABLE IF NOT EXISTS github_account_owners (
+    subject TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id)
+);
 """
 
 
 def ensure_schema(db) -> None:
     with db._lock:
         db._conn.executescript(SCHEMA)
+        with db._tx() as conn:
+            for row in conn.execute(
+                "SELECT subject,user_id FROM user_identities WHERE provider='github'"
+            ).fetchall():
+                reserve_github_owner(conn, row["subject"], row["user_id"])
+
+
+def reserve_github_owner(conn, subject, uid):
+    """Never transfer a GitHub subject, including legacy login identities."""
+    for query in (
+        "SELECT user_id FROM github_account_owners WHERE subject=?",
+        "SELECT user_id FROM user_identities WHERE provider='github' AND subject=?",
+    ):
+        row = conn.execute(query, (str(subject),)).fetchone()
+        if row is not None and row["user_id"] != uid:
+            raise SignInError("github_owner")
+    conn.execute(
+        "INSERT OR IGNORE INTO github_account_owners(subject,user_id) VALUES (?,?)",
+        (str(subject), uid),
+    )
 
 
 def signup_enabled() -> bool:
@@ -77,7 +101,7 @@ def complete_signin(gateway, provider: str, profile: Profile, *, signup: bool) -
 
 
 def _resolve(db, provider: str, profile: Profile, *, signup: bool) -> tuple[str, str | None]:
-    with db._lock:
+    with db._lock, db._tx() as conn:
         known = db._conn.execute(
             "SELECT u.* FROM user_identities i JOIN users u ON u.id = i.user_id "
             "WHERE i.provider = ? AND i.subject = ?",
@@ -86,6 +110,8 @@ def _resolve(db, provider: str, profile: Profile, *, signup: bool) -> tuple[str,
         if known is not None:
             if known["disabled_at"]:
                 raise SignInError("disabled")
+            if provider == "github":
+                reserve_github_owner(conn, profile.subject, known["id"])
             db._conn.execute(
                 "UPDATE user_identities SET last_used_at = ? WHERE provider = ? AND subject = ?",
                 (iso(), provider, profile.subject),
@@ -100,6 +126,12 @@ def _resolve(db, provider: str, profile: Profile, *, signup: bool) -> tuple[str,
             ).fetchone()
             if user is not None:
                 break
+        if provider == "github":
+            owner = conn.execute(
+                "SELECT user_id FROM github_account_owners WHERE subject=?", (profile.subject,)
+            ).fetchone()
+            if owner is not None and (user is None or owner["user_id"] != user["id"]):
+                raise SignInError("github_owner")
         created_workspace = None
         if user is not None:
             if user["disabled_at"]:
@@ -111,13 +143,15 @@ def _resolve(db, provider: str, profile: Profile, *, signup: bool) -> tuple[str,
             try:
                 uid = db.create_user(profile.emails[0], profile.name)
                 workspace_id = db.create_workspace(
-                    profile.emails[0], uid, personal=True, initial_space_pending=True
+                    profile.emails[0], uid, personal=True, initial_space_pending=True, conn=conn
                 )
-                plans.assign_signup_plan(db, uid, workspace_id, via=provider)
+                plans.assign_signup_plan(db, uid, workspace_id, via=provider, conn=conn)
                 created_workspace = workspace_id
             except ControlError:
                 raise SignInError("failed") from None
             db.audit(action="user.create", decision="ok", user_id=uid, reason=provider)
+        if provider == "github":
+            reserve_github_owner(conn, profile.subject, uid)
         now = iso()
         db._conn.execute(
             "INSERT INTO user_identities(provider, subject, user_id, created_at, last_used_at) VALUES (?,?,?,?,?)",

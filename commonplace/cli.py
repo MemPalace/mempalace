@@ -615,11 +615,14 @@ def cmd_serve(args) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     db = _db(args)
-    if not db.has_users():
-        raise ControlError("not set up: run `commonplace init` first")
-    supervisor = WorkerSupervisor(str(_data_dir(args)), idle_stop_s=args.idle_minutes * 60)
-    Gateway(db, supervisor).serve(args.host, args.port)
-    return 0
+    try:
+        if not db.has_users():
+            raise ControlError("not set up: run `commonplace init` first")
+        supervisor = WorkerSupervisor(str(_data_dir(args)), idle_stop_s=args.idle_minutes * 60)
+        Gateway(db, supervisor).serve(args.host, args.port)
+        return 0
+    finally:
+        db.close()
 
 
 def add_webhook_commands(sub):

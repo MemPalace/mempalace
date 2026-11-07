@@ -39,8 +39,9 @@ MODULES = (
     "commonplace.oauth",
     "commonplace.web",
     "commonplace.voice",
-    "commonplace.social",
     "commonplace.email_auth",
+    # Email admission must stop before GitHub shutdown waits for the SQL lock.
+    "commonplace.social",
     "commonplace.handoff.extension",
     "commonplace.import_tools",
     "commonplace.runner",

@@ -463,10 +463,11 @@ function needsView() {
   }
   const shown = JSON.stringify([state.needs, state.boards.map((board) => board.slug)]);
   if (shown === state.needsShown) return;
-  state.needsShown = shown; state.needsLoading = true;
+  state.needsShown = shown; state.needsLoading = state.githubCard == null;
   const ui = state.needsUI;
   // A card that left the queue (declined, answered) is not reopened by the refresh.
-  const selected = needsCards().some((card) => card.number === state.selected) ? state.selected : undefined;
+  const selected = state.githubCard ?? (needsCards().some((card) => card.number === state.selected) ? state.selected : undefined);
+  state.githubCard = null;
   void ui.show({ needs: state.needs, boards: state.boards, selected }).finally(() => { if (state.needsUI === ui) state.needsLoading = false; });
 }
 const hhmm = (at) => { const date = new Date(at); return Number.isFinite(date.getTime()) ? `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}` : ""; };
@@ -1513,6 +1514,7 @@ root.addEventListener("click", async (event) => {
     else if (action === "handoff") handoffForm(state.card);
     else if (action === "new-board") openOnboarding();
     else if (action === "logout") {
+      state.needsUI?.stop(); state.needsUI = null;
       voice.stop();
       clearWorkbenchChat();
       await api("/app/logout", { method: "POST" }); state.me = null; state.drafts.clear(); signin();
@@ -1735,7 +1737,7 @@ async function poll() {
   }
 }
 document.addEventListener("visibilitychange", () => { if (document.hidden) queueFlush(true); schedule(document.hidden ? 30000 : 0); });
-document.addEventListener("session-expired", () => { clearWorkbenchChat(); state.me = null; state.drafts.clear(); clearTimeout(timer); state.queue = null; state.error = ""; signin(); });
+document.addEventListener("session-expired", () => { state.needsUI?.stop(); state.needsUI = null; clearWorkbenchChat(); state.me = null; state.drafts.clear(); clearTimeout(timer); state.queue = null; state.error = ""; signin(); });
 window.addEventListener("hashchange", route);
 window.addEventListener("pagehide", () => { clearAgentSecret(root); queueFlush(true); speech.stop(); voice.stop(); });
 window.addEventListener("online", () => { state.pollFails = 0; queueNoteOffline(); if (state.me) schedule(0); });
@@ -1763,6 +1765,12 @@ async function boot() {
     params.delete("w");
     const search = params.toString();
     history.replaceState(history.state, "", `${location.pathname}${search ? `?${search}` : ""}${moved ? "#/" : location.hash}`);
+  }
+  if (location.hash === "#/needs" && /^[1-9]\d*$/.test(params.get("github_card") || "")) {
+    state.githubCard = Number(params.get("github_card"));
+    params.delete("github_card");
+    const search = params.toString();
+    history.replaceState(history.state, "", `${location.pathname}${search ? `?${search}` : ""}${location.hash}`);
   }
   await route();
   if (moved) showError("This card is in another workspace. Sign out, then sign in again to open it.");

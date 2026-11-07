@@ -7,6 +7,7 @@ import os
 import stat
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -88,10 +89,10 @@ def set_plan(db, user_id: str, name: str, *, actor: str) -> None:
         db.audit(action="plan.set", decision="ok", user_id=actor, reason=name, target_ids=[user_id])
 
 
-def assign_signup_plan(db, user_id: str, workspace_id: str, *, via: str) -> None:
+def assign_signup_plan(db, user_id: str, workspace_id: str, *, via: str, conn=None) -> None:
     if not enabled():
         return
-    with db._lock, db._tx() as conn:
+    with db._lock, db._tx() if conn is None else nullcontext(conn) as conn:
         result = conn.execute(
             "INSERT OR IGNORE INTO account_plans(user_id, plan, set_by, set_at) VALUES (?,?,?,?)",
             (user_id, FREE.name, f"signup:{via}", _now().isoformat()),

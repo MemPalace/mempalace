@@ -129,6 +129,17 @@ class SignIn:
                 },
             )
             return
+        if path == "/app/auth/github/callback":
+            try:
+                connect = query(h.path).get("state", "").startswith("gc1_")
+            except OAuthError:
+                connect = False
+            if connect:
+                if h.command != "GET":
+                    send_json(h, 405, {"error": "use GET"})
+                    return
+                gateway.github.callback(h)
+                return
         parts = path.removeprefix("/app/auth/").split("/")
         provider = self.providers.get(parts[0])
         if provider is None or len(parts) > 2 or len(parts) == 2 and parts[1] != "callback":
@@ -270,5 +281,8 @@ def install(gateway):
         providers=configured(),
         signup=accounts.signup_enabled(),
     )
+    from .. import github
+
+    github.install(gateway)
     for method in ("GET", "POST"):
         gateway.add_prefix_route(method, "/app/auth/", lambda h: gateway.sign_in.handle(gateway, h))
