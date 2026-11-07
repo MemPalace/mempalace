@@ -49,7 +49,9 @@ def connection_view(row):
             "started_by",
         )
     }
-    view["read_wings"] = list(Policy.from_json(row["policy"]).read_wings)
+    policy = Policy.from_json(row["policy"])
+    view["read_wings"] = list(policy.read_wings)
+    view["import_read"] = policy.has_scope(import_grant.READER_SCOPE)
     return view
 
 
@@ -78,6 +80,15 @@ def _update_read_wings(gateway, h, principal, row, data):
     )
 
 
+def _consents(data, db, principal):
+    if any(key in data and type(data[key]) is not bool for key in ("import", "import_read")):
+        raise ValueError()
+    grants = data.get("import", False), data.get("import_read", False)
+    if any(grants) and not import_grant.eligible(db, principal.user_id, principal.workspace_id):
+        raise PermissionError()
+    return grants
+
+
 def install(gateway):
     def manage(h):
         from commonplace.control_db import RunnerLinkedError
@@ -95,20 +106,19 @@ def install(gateway):
             except ValueError:
                 return
             if (
-                set(data) - {"name", "client", "parent", "read_wings", "import"}
+                set(data) - {"name", "client", "parent", "read_wings", "import", "import_read"}
                 or not isinstance(data.get("name"), str)
                 or not isinstance(data.get("client", "generic"), str)
                 or ("parent" in data and not isinstance(data["parent"], str))
             ):
                 send_json(h, 400, {"error": "Use an agent name, client and optional parent"})
                 return
-            if "import" in data and type(data["import"]) is not bool:
-                send_json(h, 400, {"error": "Import consent must be a boolean"})
+            try:
+                grant_import, grant_read = _consents(data, gateway.db, principal)
+            except ValueError:
+                send_json(h, 400, {"error": "Import and reader consent must be booleans"})
                 return
-            grant_import = data.get("import", False)
-            if grant_import and not import_grant.eligible(
-                gateway.db, principal.user_id, principal.workspace_id
-            ):
+            except PermissionError:
                 send_json(h, 403, {"error": import_grant.OWNER_ONLY_TEXT})
                 return
             try:
@@ -137,9 +147,12 @@ def install(gateway):
                     expires_days=TOKEN_DAYS,
                     policy=Policy.build(
                         profile="slim",
-                        scopes=("memory:read", "memory:write", import_grant.IMPORT_SCOPE)
-                        if grant_import
-                        else None,
+                        scopes=(
+                            "memory:read",
+                            "memory:write",
+                            *((import_grant.IMPORT_SCOPE,) if grant_import else ()),
+                            *((import_grant.READER_SCOPE,) if grant_read else ()),
+                        ),
                         read_wings=read_wings,
                         write_wing="inbox",
                         trust="untrusted",

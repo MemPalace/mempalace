@@ -306,7 +306,9 @@ or captured text has been indexed.
 ### Browse the original imports
 
 Sign in to your personal workspace, then call `GET /api/imports` with your
-session cookie. Agent tokens cannot list imports. ACL imports are not listed;
+session cookie. Separately consented reader tokens may also list their account's
+connection-route imports. Other agent tokens receive 404 `{"error":"not found"}`;
+a missing token receives 401. ACL imports are not listed;
 their upload response already returns the stored ID.
 
 The response is `{"imports": [...], "next": null}`. Each row contains
@@ -511,3 +513,26 @@ established here. On the ACL route, `prefix_work` exposes `previous_rows`,
 `previous_source_bytes` and `readback_rows` for later measurement of this
 reconstruction only; these are not total database I/O or peak-memory metrics.
 Grant responses omit `prefix_work`.
+
+
+### Agent access to imported views
+
+`memory:import` remains write-only. A new independent, unticked reader consent
+issues `memory:import:read` with `memory:read`; see
+[agent connections](agent-connections.md#allow-an-agent-to-read-imported-history).
+It covers past and future connection-route imports from this account's other
+connections, including multipart transcripts, Grok facts and native memory files.
+It excludes full-ACL imports, other accounts/workspaces and live captures.
+Read-wing restrictions do not gate these views, but explicit search filters do.
+
+Reader listing, metadata, message ranges, recall and chains describe the bounded
+import view. A shared holder's later capture tail does not increase message
+counts, hashes, snippets or returned words. Reads perform no adoption or reindex.
+Search uses bounded indexed candidates and exact-view matches when a mirror
+cannot prove a complete stored range. Unknown, stale or mixed provenance hides
+the candidate. Startup uses the same live authority within its existing deadline.
+
+To stop access, revoke the old connection and reconnect with the reader box
+unticked. Imports remain stored. Rotating a token keeps its consent; refreshing
+with fewer scopes narrows descendants only, leaving earlier access tokens and
+the connection policy unchanged until revocation.

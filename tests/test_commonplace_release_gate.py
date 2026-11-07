@@ -365,6 +365,6 @@ def test_grant_import_check_uses_public_routes_and_detects_regressions(monkeypat
                 asyncio.run(journey.grant_import_no_duplicates())
         else:
             detail = asyncio.run(journey.grant_import_no_duplicates())
-            assert "accepted=1" in detail and "403" in detail
+            assert "accepted=1" in detail and "404" in detail
             assert len(reads) == 2
             assert reads[0] == reads[1]

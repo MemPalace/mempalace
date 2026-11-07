@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from .continuity_schema import archive_segments
@@ -44,6 +45,23 @@ class View:
         return list(self._rows[start : end + 1 if end is not None else None])
 
 
+@dataclass(frozen=True)
+class ImportView(View):
+    # Complete stored archive-segment ranges, never caller-provided metadata.
+    ranges: tuple[tuple[str, int, int], ...] = ()
+
+    def proves(self, source_id, start, end):
+        if type(start) is not int or type(end) is not int or start < 0 or end < start:
+            return False
+        cursor = start
+        for lo, hi in sorted((lo, hi) for source, lo, hi in self.ranges if source == source_id):
+            if lo <= cursor <= hi:
+                cursor = hi + 1
+            if cursor > end:
+                return True
+        return False
+
+
 def _slice(rows, source, start, end):
     """Keep whole archive segments; reparse only pieces cut at byte boundaries."""
     result = []
@@ -66,6 +84,24 @@ def _slice(rows, source, start, end):
     return result
 
 
+@contextmanager
+def _reader_locks(*locks):
+    from .rules import checks
+
+    acquired = []
+    try:
+        for lock in locks:
+            if not lock.acquire(timeout=checks.remaining(1.0)):
+                raise TimeoutError("Import view unavailable")
+            acquired.append(lock)
+        checks.remaining(0)
+        yield
+        checks.remaining(0)
+    finally:
+        for lock in reversed(acquired):
+            lock.release()
+
+
 class PrivateReader:
     def __init__(self, db, store_for):
         self._db = db
@@ -78,6 +114,142 @@ class PrivateReader:
             return True
         filer = filing_user(self._db, stored)
         return filer == principal.user_id if filer is not None else principal.role == "owner"
+
+    def import_view(self, principal, stored):
+        """Resolve only the immutable filer's import, without adoption or writes.
+
+        A holder may grow through capture. Its physical room is never the view:
+        only complete archive ranges inside this import's offset prove a mirror.
+        """
+        from .continuity_schema import MARKER
+        from .handoff.recall import ThreadNotFound, _filer_matches
+
+        def missing():
+            raise ThreadNotFound("thread not found")
+
+        if (
+            stored.workspace_id != principal.workspace_id
+            or stored.wing != "private_chats"
+            or not stored.source_thread_id.startswith("import-private:")
+            or not _filer_matches(principal, stored, reader=True)
+        ):
+            missing()
+        store = self._store_for(stored.workspace_id)
+        with _reader_locks(self._db._lock, store._lock):
+            row = self._db._conn.execute(
+                "SELECT s.*, g.holder_stored_id, g.source, g.user_id AS group_user "
+                "FROM sync_streams s JOIN sync_groups g "
+                "ON g.group_id=s.group_id AND g.workspace_id=s.workspace_id "
+                "WHERE s.workspace_id=? AND s.stream_id=? AND s.own_stored_id=?",
+                (stored.workspace_id, stored.source_thread_id, stored.id),
+            ).fetchone()
+            own_rows = store.messages(stored.id)
+            if not own_rows or len(own_rows) != stored.message_count:
+                missing()
+            if row is None:
+                # Markers, missing continuity rows and partially committed holders
+                # cannot be mistaken for standalone imported archives.
+                controlled = self._db._conn.execute(
+                    "SELECT 1 FROM sync_groups WHERE workspace_id=? AND holder_stored_id=? "
+                    "UNION ALL SELECT 1 FROM sync_streams WHERE workspace_id=? "
+                    "AND (own_stored_id=? OR fork_stored_id=?) LIMIT 1",
+                    (stored.workspace_id, stored.id, stored.workspace_id, stored.id, stored.id),
+                ).fetchone()
+                if (
+                    controlled
+                    or any(m.name == MARKER for m in own_rows)
+                    or not archive_segments(own_rows)
+                ):
+                    missing()
+                return ImportView(tuple(own_rows), ((stored.id, 0, own_rows[-1].seq),))
+            if (
+                row["kind"] != "import"
+                or row["user_id"] != principal.user_id
+                or row["group_user"] != principal.user_id
+                or type(row["offset"]) is not int
+                or row["offset"] < 0
+            ):
+                missing()
+            holder = store.get(row["holder_stored_id"])
+            fork = store.get(row["fork_stored_id"]) if row["fork_stored_id"] else None
+            if holder is None or row["fork_stored_id"] and fork is None:
+                missing()
+            rows, ranges = [], []
+
+            def add(thread, start, end):
+                if (
+                    thread.workspace_id != stored.workspace_id
+                    or thread.wing != "private_chats"
+                    or not (
+                        thread.source_thread_id.startswith("import-private:")
+                        and _filer_matches(principal, thread, reader=True)
+                        or filing_user(self._db, thread) == principal.user_id
+                    )
+                ):
+                    missing()
+                source_rows = store.messages(thread.id)
+                segments = archive_segments(source_rows)
+                size = sum(len(seg.raw) for seg in segments)
+                if not 0 <= start <= end <= size or len(source_rows) != thread.message_count:
+                    missing()
+                position = 0
+                for seg in segments:
+                    upper = position + len(seg.raw)
+                    if start <= position and upper <= end:
+                        ranges.append((thread.id, seg.start_row, seg.end_row))
+                    position = upper
+                rows.extend(_slice(source_rows, row["source"], start, end))
+
+            offset = row["offset"]
+            boundary = row["fork_offset"] if fork else offset
+            if type(boundary) is not int or not 0 <= boundary <= offset:
+                missing()
+            # Legacy archives remain verbatim and must agree with the group's
+            # prefix; a missing/inconsistent mapping never expands authority.
+            if row["legacy"]:
+                old = b"".join(seg.raw for seg in archive_segments(own_rows))
+                base = b"".join(seg.raw for seg in archive_segments(store.messages(holder.id)))
+                if not base.startswith(old) or len(old) > boundary:
+                    missing()
+                add(stored, 0, len(old))
+                add(holder, len(old), boundary)
+            else:
+                add(holder, 0, boundary)
+            if fork:
+                add(fork, 0, offset - boundary)
+            if not rows:
+                missing()
+            return ImportView(tuple(replace(m, seq=i) for i, m in enumerate(rows)), tuple(ranges))
+
+    def imports_for_source(self, principal, source_id, *, limit=100):
+        """Bounded point lookups; never scan the account's unrelated streams."""
+        with _reader_locks(self._db._lock):
+            rows = self._db._conn.execute(
+                "SELECT own_stored_id FROM sync_streams INDEXED BY sync_streams_own "
+                "WHERE own_stored_id=? AND workspace_id=? AND user_id=? AND kind='import' "
+                "UNION ALL "
+                "SELECT own_stored_id FROM sync_streams INDEXED BY sync_streams_fork "
+                "WHERE fork_stored_id=? AND workspace_id=? AND user_id=? AND kind='import' "
+                "UNION ALL "
+                "SELECT s.own_stored_id FROM sync_groups AS g INDEXED BY sync_groups_holder "
+                "JOIN sync_streams AS s INDEXED BY sync_streams_reader "
+                "ON s.workspace_id=g.workspace_id AND s.user_id=g.user_id "
+                "AND s.kind='import' AND s.group_id=g.group_id "
+                "WHERE g.workspace_id=? AND g.user_id=? AND g.holder_stored_id=? LIMIT ?",
+                (
+                    source_id,
+                    principal.workspace_id,
+                    principal.user_id,
+                    source_id,
+                    principal.workspace_id,
+                    principal.user_id,
+                    principal.workspace_id,
+                    principal.user_id,
+                    source_id,
+                    limit,
+                ),
+            ).fetchall()
+        return list(dict.fromkeys(row[0] for row in rows))
 
     def view(self, stored) -> View | None:
         if stored.wing != "private_chats" or not stored.message_count:

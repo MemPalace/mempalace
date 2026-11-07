@@ -474,6 +474,7 @@ class Mediator:
 
         args.pop("thread_scope", None)
         rule = TOOL_RULES[name][1]
+        import_filters = dict(args)
         notes: list = []
         try:
             _check_argument_types(args)
@@ -509,6 +510,39 @@ class Mediator:
                     args["drawer_id"] = unhide.get(args.get("drawer_id"), args.get("drawer_id"))
                 notes.append(f"{len(unhide)} hidden drawer(s) answered as missing")
 
+        if rule == "search":
+            try:
+                recall = self._reader_recall(principal)
+                from .policy import canonical_wing
+
+                wing = import_filters.get("wing")
+                wings = import_filters.get("wings")
+                selected = (not wing or canonical_wing(wing) == "private_chats") and (
+                    wings is None or any(canonical_wing(w) == "private_chats" for w in wings)
+                )
+                if selected and recall is not None and recall.import_reader(principal):
+                    result = _tool_result(response)
+                    if isinstance(result, dict) and not result.get("error"):
+                        candidates = recall.import_candidates(
+                            principal,
+                            import_filters.get("query", ""),
+                            limit=max(1, min(int(import_filters.get("limit", 5)), 100)),
+                        )
+                        if import_filters.get("room"):
+                            candidates = [
+                                row for row in candidates if row["room"] == import_filters["room"]
+                            ]
+                        if any(
+                            import_filters.get(key) for key in ("since", "before", "source_file")
+                        ):
+                            candidates = []  # No unproved date/source metadata may widen an explicit filter.
+                        result = dict(result)
+                        result["results"] = [*result.get("results", []), *candidates]
+                        result.pop("total", None)
+                        response = _replace_result(response, result)
+            except Exception as exc:
+                # Optional import search fails closed; preserve ordinary results.
+                logger.error("Imported-history search failed (%s)", type(exc).__name__)
         from .handoff.mirror_access import gate
 
         committed_result = None
@@ -569,8 +603,52 @@ class Mediator:
     def _before_wing_list(self, principal, name, args, notes):
         return None
 
+    def _reader_recall(self, principal):
+        """Startup reuses only an already opened store and preserves live eligibility."""
+        if not principal.policy.has_scope("memory:import:read"):
+            return None
+        from .handoff.recall import Recall
+        from .rules import checks
+
+        ctx = getattr(self.gateway, "handoff", None)
+        if ctx is None:
+            return None
+        recall = ctx.recall
+        if checks._deadline.get() is not None:
+            checks.remaining(0)
+            store = ctx._stores.get(principal.workspace_id)
+            if store is None:
+                return None
+            recall = Recall(
+                lambda _: store, private=recall._private, import_eligible=recall._import_eligible
+            )
+        return recall
+
     def _before_read_wing(self, principal, name, args, notes):
         policy = principal.policy
+        if (
+            canonical_wing(args.get("wing") or "") == "private_chats"
+            and policy.has_scope("memory:import:read")
+            and name in ("mempalace_list_drawers", "mempalace_list_rooms")
+        ):
+            recall = self._reader_recall(principal)
+            drawers = (
+                []
+                if recall is None
+                else recall.import_listing(
+                    principal,
+                    limit=max(1, min(int(args.get("limit", 20)), 100)),
+                    offset=max(0, min(int(args.get("offset", 0)), 100)),
+                    room=args.get("room"),
+                )
+            )
+            if args.get("since") or args.get("before"):
+                drawers = []  # An unproved date cannot match an explicit window.
+            if name == "mempalace_list_rooms":
+                return {
+                    "respond": {"wing": "private_chats", "rooms": {d["room"]: 1 for d in drawers}}
+                }
+            return {"respond": {"drawers": drawers, "count": len(drawers)}}
         if policy.sees_all_wings:
             return None
         wing = args.get("wing")
@@ -601,6 +679,12 @@ class Mediator:
             requested = [w for w in requested if policy.can_read_wing(w)]
             args["wings"] = requested
         wing = args.get("wing")
+        if (
+            wing
+            and canonical_wing(wing) == "private_chats"
+            and principal.policy.has_scope("memory:import:read")
+        ):
+            return {"respond": {"query": args.get("query", ""), "results": [], "facts": []}}
         if wing and not policy.sees_all_wings and not policy.can_read_wing(wing):
             raise Denied(f"this connection can't read wing {wing!r}")
         fact_result = (
@@ -656,6 +740,52 @@ class Mediator:
             return {"facts": [], "facts_error": "unavailable"}
 
     def _before_drawer_read(self, principal, name, args, notes):
+        ids = _drawer_ids(args)
+        if ids and any(i.startswith("imported:") for i in ids):
+            recall = self._reader_recall(principal)
+            items = []
+            for drawer_id in ids:
+                try:
+                    if drawer_id.startswith("imported:"):
+                        if recall is None:
+                            raise LookupError()
+                        item = recall.import_drawer(principal, drawer_id)
+                    else:
+                        response = self.workers.post(
+                            principal,
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 1,
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "mempalace_get_drawer",
+                                    "arguments": {"drawer_id": drawer_id},
+                                },
+                            },
+                        )
+                        item = _tool_result(
+                            self._after(
+                                principal,
+                                "mempalace_get_drawer",
+                                "drawer_read",
+                                {"drawer_id": drawer_id},
+                                response,
+                            )
+                        )
+                except Exception:
+                    item = {"drawer_id": drawer_id, "error": f"Drawer not found: {drawer_id}"}
+                items.append(item)
+            return {
+                "respond": (
+                    {
+                        "results": items,
+                        "count": len(items),
+                        "errors": sum(bool(i.get("error")) for i in items),
+                    }
+                    if "drawer_ids" in args
+                    else items[0]
+                )
+            }
         return None  # Checked on the way out, so a hidden drawer reads as missing.
 
     def _before_drawer_write(self, principal, name, args, notes):
@@ -1022,12 +1152,25 @@ class Mediator:
         result = _tool_result(response)
         if result is None:
             return response
+        import_allowed = None
+        recall = self._reader_recall(principal)
+        if recall is not None:
+            from .handoff.mirror_access import gate
+
+            result = gate(self.gateway, principal, rule, result)
+
+            def import_allowed(node):
+                try:
+                    return recall.import_record_allowed(principal, node)
+                except Exception:
+                    return False
+
         if rule == "wing_list":
             cleaned = _filter_wing_keys(result, policy)
         elif name == "mempalace_get_drawers":
-            cleaned = _filter_drawer_batch(result, policy)
+            cleaned = _filter_drawer_batch(result, policy, import_allowed)
         else:
-            cleaned = _scrub(result, policy.can_read_wing)
+            cleaned = _scrub(result, policy.can_read_wing, import_allowed)
             if cleaned is _DROP:
                 missing = args.get("drawer_id") if rule == "drawer_read" else None
                 cleaned = (
@@ -1204,7 +1347,7 @@ def _target_ids(args: dict, result) -> list:
     return ids
 
 
-def _scrub(node, can_read: Callable[[str], bool]):
+def _scrub(node, can_read: Callable[[str], bool], import_allowed=None):
     """``node`` without anything from an unreadable wing.
 
     A list drops the items that carry one. Any other object that carries one,
@@ -1212,17 +1355,22 @@ def _scrub(node, can_read: Callable[[str], bool]):
     """
     if isinstance(node, dict):
         wing = node.get("wing")
-        if isinstance(wing, str) and wing and not can_read(wing):
+        if (
+            isinstance(wing, str)
+            and wing
+            and not can_read(wing)
+            and not (import_allowed is not None and import_allowed(node))
+        ):
             return _DROP
         out = {}
         for key, value in node.items():
-            cleaned = _scrub(value, can_read)
+            cleaned = _scrub(value, can_read, import_allowed)
             if cleaned is _DROP:
                 return _DROP
             out[key] = cleaned
         return out
     if isinstance(node, list):
-        return [c for c in (_scrub(v, can_read) for v in node) if c is not _DROP]
+        return [c for c in (_scrub(v, can_read, import_allowed) for v in node) if c is not _DROP]
     return node
 
 
@@ -1256,13 +1404,13 @@ def _filter_wing_keys(result, policy: Policy):
     return {"error": "not found", "denied": True}
 
 
-def _filter_drawer_batch(result, policy: Policy):
+def _filter_drawer_batch(result, policy: Policy, import_allowed=None):
     if not isinstance(result, dict) or not isinstance(result.get("results"), list):
-        return _scrub(result, policy.can_read_wing)
+        return _scrub(result, policy.can_read_wing, import_allowed)
     items = []
     errors = 0
     for item in result["results"]:
-        cleaned = _scrub(item, policy.can_read_wing)
+        cleaned = _scrub(item, policy.can_read_wing, import_allowed)
         if cleaned is _DROP:
             drawer_id = item.get("drawer_id") if isinstance(item, dict) else None
             errors += 1

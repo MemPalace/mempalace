@@ -807,3 +807,19 @@ old thread and the successor reference or URL.
   when the gateway starts again) and with several gateways on one control
   database. A webhook receiver may still see one delivery twice if the
   hub crashed after the receiver accepted it; deduplicate by delivery id.
+
+
+## Imported-history reader exception
+
+`memory:import:read` with `memory:read`, granted by a new explicit unticked owner
+consent, allows REST reads of the filer's connection-route private imports only.
+It does not grant `threads:read`, private-wing access or handoff authority.
+MCP thread tools keep their existing `threads:read` requirement. See
+[reader consent](agent-connections.md#allow-an-agent-to-read-imported-history).
+
+Recall and REST share exact account/workspace checks and live personal-owner
+eligibility. A shared holder or fork contributes only the imported prefix and
+bounded suffix; a capture ID is never authorized by its imported ancestor.
+Counts, ranges and hashes describe the view. Mirror words require authoritative
+source and complete range proof, including the recall path; mixed or unknown
+chunks are hidden. Refusals use the missing-thread response.

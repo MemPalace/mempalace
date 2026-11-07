@@ -23,7 +23,7 @@ ACCESS_SECONDS = 3600
 REFRESH_SECONDS = 90 * 86400
 CODE_SECONDS = 300
 REQUEST_SECONDS = 600
-SCOPES = ("memory:read", "memory:write", "memory:import")
+SCOPES = ("memory:read", "memory:write", "memory:import", "memory:import:read")
 OAUTH_DEFAULT_SCOPES = ("memory:read", "memory:write")
 
 SCHEMA = """

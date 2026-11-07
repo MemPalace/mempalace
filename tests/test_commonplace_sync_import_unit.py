@@ -19,6 +19,7 @@ import pytest
 import commonplace
 from commonplace import import_grant, imports, ingest_cadence, plans, sync_protocol
 from commonplace.control_db import ControlDB, Principal
+from commonplace.handoff.recall import Recall
 from commonplace.handoff.thread_store import ThreadStore, canonical_sha256
 from commonplace.handoff.transcripts import parse
 from commonplace.import_sources import parse_import
@@ -98,6 +99,7 @@ def unit(tmp_path, monkeypatch):
         return store
 
     ctx.store_for = store_for
+    ctx.recall = Recall(store_for)
     ctx.has_threads = lambda workspace: bool(
         store.list_source_range(workspace, "import-private:", limit=1)
     )

@@ -336,11 +336,17 @@ class _API:
 
     def thread(self, principal, thread_id: str):
         record = self.ctx.recall.thread(principal, thread_id)
-        if record.workspace_id != principal.workspace_id or not principal.policy.can_read_wing(
-            record.wing
-        ):
+        if not self._thread_row_readable(principal, record):
             _missing()
         return record
+
+    def _thread_row_readable(self, principal, record):
+        return record.workspace_id == principal.workspace_id and (
+            principal.policy.has_scope(SCOPE_THREADS_READ)
+            and principal.policy.can_read_wing(record.wing)
+            or principal.policy.has_scope("memory:import:read")
+            and self.ctx.recall.can_read(principal, record.id)
+        )
 
     def dispatch(self, handler, principal, path: str, query: dict):
         method = handler.command
@@ -425,7 +431,12 @@ class _API:
         _missing()
 
     def threads(self, handler, principal, parts: list[str], query: dict):
-        self.require(principal, SCOPE_THREADS_READ)
+        # The row authorization below also admits separately consented import views.
+        if not principal.policy.has_scope(SCOPE_THREADS_READ) and not (
+            principal.policy.has_scope("memory:import:read")
+            and self.ctx.recall.import_reader(principal)
+        ):
+            _missing()
         method = handler.command
         thread_id = parts[0]
         action = parts[1] if len(parts) == 2 else ""
@@ -451,9 +462,7 @@ class _API:
         if action == "chain":
             chain = []
             for row in self.ctx.recall.chain(principal, thread_id):
-                if row.workspace_id != principal.workspace_id or not principal.policy.can_read_wing(
-                    row.wing
-                ):
+                if not self._thread_row_readable(principal, row):
                     break
                 chain.append({**_public(row), "provenance": thread_provenance(row)})
             return 200, chain

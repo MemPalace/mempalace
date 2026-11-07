@@ -743,6 +743,21 @@ class ThreadStore:
                 Chunk(row["idx"], row["seq_start"], row["seq_end"], row["text"]) for row in rows
             ]
 
+    def import_source_candidates(self, workspace_id, query, *, limit=100):
+        """FTS candidates only; the caller must prove each account's bounded view."""
+        tokens = query.split()
+        if not tokens or not self._fts_enabled or "\x00" in query:
+            return []
+        match = " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+        with self._lock, self._search_snapshot(True):
+            rows = self._conn.execute(
+                "SELECT DISTINCT t.id FROM chunks_fts JOIN chunks c ON c.rowid=chunks_fts.rowid "
+                "JOIN threads t ON t.id=c.thread_id WHERE chunks_fts MATCH ? "
+                "AND t.workspace_id=? AND t.wing='private_chats' LIMIT ?",
+                (match, workspace_id, limit),
+            ).fetchall()
+        return [row[0] for row in rows]
+
     def search(self, stored_ids: list[str], query: str, limit: int = 8) -> list[RecallHit]:
         """BM25 over the chunks of ``stored_ids``. Any query text is safe
         (quoted for FTS5, never a syntax error). Best first. Scores are

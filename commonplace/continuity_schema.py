@@ -21,6 +21,8 @@ _DDL = (
         session_bytes INTEGER, session_sha256 TEXT, part_format TEXT,
         final INTEGER NOT NULL DEFAULT 0, legacy INTEGER NOT NULL DEFAULT 0,
         listed_messages INTEGER, PRIMARY KEY(workspace_id,stream_id))""",
+    "CREATE INDEX IF NOT EXISTS sync_groups_holder ON sync_groups(workspace_id,user_id,holder_stored_id)",
+    "CREATE INDEX IF NOT EXISTS sync_streams_reader ON sync_streams(workspace_id,user_id,kind,group_id)",
     "CREATE INDEX IF NOT EXISTS sync_streams_own ON sync_streams(own_stored_id)",
     "CREATE INDEX IF NOT EXISTS sync_streams_fork ON sync_streams(fork_stored_id)",
     """CREATE TABLE IF NOT EXISTS sync_parts (

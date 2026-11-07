@@ -6,7 +6,6 @@ from urllib.parse import quote
 
 import pytest
 
-from commonplace import imports
 from commonplace.handoff.thread_store import ThreadStore
 from commonplace.import_sources import parse_import
 from tests.test_commonplace_email_auth import fresh as fresh
@@ -55,8 +54,8 @@ def test_import_list_refuses_agent_tokens(journey):
     plain = journey.pat(grant=False)["token"]
     for token in (grant, oauth["access_token"], plain):
         status, _, raw = journey.request("/api/imports", token=token)
-        assert status == 403
-        assert json.loads(raw) == {"error": "Sign in to list your imports"}
+        assert status == 404
+        assert json.loads(raw) == {"error": "not found"}
     status, _, _ = journey.request("/api/imports")
     assert status == 401
 
@@ -115,13 +114,15 @@ def test_list_source_range_boundaries(tmp_path):
 
 
 def test_import_list_paging_filters_after_page(journey, monkeypatch):
-    assert hasattr(imports, "readable")
     # fresh enables plans and journey pins the clock: one POST avoids cadence refusal.
     assert journey.upload(batch("A", "B", "C", "D"), token=journey.pat()["token"])["accepted"] == 4
     rows = listing(journey, owner=journey.owner)["imports"]
     allowed = {r["stored_thread_id"] for r in rows[::2]}
-    original = imports.readable
-    monkeypatch.setattr(imports, "readable", lambda p, r: r.id in allowed and original(p, r))
+    recall = journey.client.gateway.handoff.recall
+    original = recall.can_read
+    monkeypatch.setattr(
+        recall, "can_read", lambda p, identity: identity in allowed and original(p, identity)
+    )
     for limit in (1, 2):
         cursor = None
         seen = []

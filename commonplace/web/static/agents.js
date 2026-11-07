@@ -2,6 +2,8 @@ import { api, escape as e, elapsed } from "./api.js";
 
 const clients = [["claude-code", "Claude Code"], ["codex", "Codex"], ["cursor", "Cursor"], ["generic", "Generic MCP / Grok"]];
 const importConsent = "Import your past AI conversations and memory files into this workspace, word for word. This import permission cannot read stored threads or change existing memories, rules or settings. Sending exactly the same import again adds no duplicates.";
+const readerConsent = "Allow this agent to read and search your past and future conversations and memory files imported through the connection import route in this workspace, including imports from your other connections. Imports through the signed-in/full-ACL route, live session captures and other people's history are excluded. To stop access, revoke this connection.";
+const readerDetail = "Includes multipart conversations, Grok facts and native memory files, regardless of read-wing selection. Revoke the old connection, then reconnect with this box unticked.";
 const options = (selected) => clients.map(([id, name]) => `<option value="${id}" ${id === selected ? "selected" : ""}>${name}</option>`).join("");
 const active = (c) => c.auth === "pat" && !c.revoked_at;
 const parents = (rows) => '<option value="">Top-level agent</option>' + rows.filter((c) => active(c) && (!c.expires_at || Date.parse(c.expires_at) > Date.now())).map((c) => `<option value="${e(c.id)}">${e(c.name)}</option>`).join("");
@@ -17,12 +19,12 @@ function readAccess(c, wings) {
 }
 
 function agentRows(rows, wings = []) {
-  return rows.map((c) => `<div class="setting-row"><span>${e(c.name)}<br><small>${e(c.client)} · ${c.revoked_at ? "Revoked" : c.expires_at && Date.parse(c.expires_at) <= Date.now() ? "Expired" : c.last_used_at ? usedText(c.last_used_at) : "Unused"}</small></span>${active(c) ? `${readAccess(c, wings)}<button type="button" data-action="agent-rotate" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Rotate</button><button type="button" data-action="agent-revoke" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Revoke</button>` : ""}</div>`).join("") || '<p class="message">No agents connected</p>';
+  return rows.map((c) => `<div class="setting-row"><span>${e(c.name)}<br><small>${e(c.client)} · ${c.revoked_at ? "Revoked" : c.expires_at && Date.parse(c.expires_at) <= Date.now() ? "Expired" : c.last_used_at ? usedText(c.last_used_at) : "Unused"}</small></span>${active(c) ? `${readAccess(c, wings)}${c.import_read ? `<small>Imported history: allowed. ${e(readerDetail)}</small>` : ""}<button type="button" data-action="agent-rotate" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Rotate</button><button type="button" data-action="agent-revoke" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Revoke</button>` : ""}</div>`).join("") || '<p class="message">No agents connected</p>';
 }
 
 export function agentsView(payload) {
   const rows = payload.connections || [];
-  return `<section class="settings-section agents-settings"><h2>Agents</h2><div data-agent-reveal></div><form class="agent-form" data-form="agent"><label>Name<input name="name" required maxlength="120" autocomplete="off"></label><label>Client<select name="client">${options("claude-code")}</select></label><label class="agent-consent"><input type="checkbox" name="import">${e(importConsent)}</label><details><summary>Restrict access or set a parent</summary><label>Read wings (comma separated)<input name="read_wings" autocomplete="off"></label><label>Parent<select name="parent">${parents(rows)}</select></label></details><button class="blockbtn" data-agent-mutation>Create token</button></form><div data-agent-list>${agentRows(rows, payload.wings || [])}</div></section>`;
+  return `<section class="settings-section agents-settings"><h2>Agents</h2><div data-agent-reveal></div><form class="agent-form" data-form="agent"><label>Name<input name="name" required maxlength="120" autocomplete="off"></label><label>Client<select name="client">${options("claude-code")}</select></label><label class="agent-consent"><input type="checkbox" name="import">${e(importConsent)}</label><label class="agent-consent"><input type="checkbox" name="import_read">${e(readerConsent)}</label><small>${e(readerDetail)}</small><details><summary>Restrict access or set a parent</summary><label>Read wings (comma separated)<input name="read_wings" autocomplete="off"></label><label>Parent<select name="parent">${parents(rows)}</select></label></details><button class="blockbtn" data-agent-mutation>Create token</button></form><div data-agent-list>${agentRows(rows, payload.wings || [])}</div></section>`;
 }
 
 export function clientConfig(client, url, token) {
@@ -71,6 +73,7 @@ async function mutation(section, run) {
 export async function createAgent(form) {
   const section = form.closest(".agents-settings"), data = Object.fromEntries(new FormData(form));
   data.import = form.elements.namedItem("import").checked;
+  data.import_read = form.elements.namedItem("import_read").checked;
   if (!data.parent) delete data.parent;
   if (data.read_wings.trim()) data.read_wings = data.read_wings.split(",").map((wing) => wing.trim());
   else delete data.read_wings;

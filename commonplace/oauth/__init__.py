@@ -230,6 +230,15 @@ def _show_authorize(gateway, h, *, status=200):
                 )
             else:
                 consent = f"<p>{escape(import_grant.OWNER_ONLY_TEXT)}</p>"
+        if import_grant.READER_SCOPE in parameters["scope"].split():
+            if import_grant.eligible(gateway.db, principal.user_id, principal.workspace_id):
+                consent += (
+                    '<label><input type="checkbox" name="grant_import_read" value="1"> '
+                    f"{escape(import_grant.READER_TEXT)}</label>"
+                    f"<small>{escape(import_grant.READER_DETAIL)}</small>"
+                )
+            else:
+                consent += f"<p>{escape(import_grant.OWNER_ONLY_TEXT)}</p>"
         content = (
             f"<h1>{escape(client['client_name'])}</h1><p>{escape(workspace)}</p>"
             f'<form method="post" action="{action}">{hidden}{consent}'
@@ -306,6 +315,11 @@ def _submit_authorize(gateway, h):
                 "memory:write",
             }.issubset(parameters["scope"].split()):
                 location = _response(parameters, error="invalid_scope")
+            elif (
+                import_grant.READER_SCOPE in parameters["scope"].split()
+                and "memory:read" not in parameters["scope"].split()
+            ):
+                location = _response(parameters, error="invalid_scope")
             elif data["decision"] == "deny":
                 location = _response(parameters, error="access_denied")
             else:
@@ -315,6 +329,11 @@ def _submit_authorize(gateway, h):
                     and import_grant.eligible(db, principal.user_id, principal.workspace_id)
                 ):
                     granted.remove(import_grant.IMPORT_SCOPE)
+                if import_grant.READER_SCOPE in granted and not (
+                    data.get("grant_import_read") == "1"
+                    and import_grant.eligible(db, principal.user_id, principal.workspace_id)
+                ):
+                    granted.remove(import_grant.READER_SCOPE)
                 if not granted:
                     location = _response(parameters, error="invalid_scope")
                 else:

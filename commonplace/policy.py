@@ -28,6 +28,7 @@ SCOPES = (
     "memory:read",
     "memory:write",
     "memory:import",
+    "memory:import:read",
     "memory:delete",
     "skills:read",
     "kg:read",
@@ -187,7 +188,8 @@ DEFAULT_SCOPES = {
 
 # Trust caps what scopes can do, whatever the token holds.
 # Untrusted writes go to the inbox for review; the graph has no inbox yet.
-# Untrusted tokens never read stored agent threads nor hand off.
+# Untrusted tokens cannot read general agent threads or hand off.
+# Separately consented imported-history views do not confer threads:read.
 _UNTRUSTED_BLOCKED = frozenset(
     {"memory:delete", "private:write", "kg:write", "threads:read", "handoff:write", "admin"}
 )

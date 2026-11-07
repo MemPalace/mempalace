@@ -10,6 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Add separate, unticked reader consent for connection-route imported history.
+  Import remains write-only; existing tokens retain their scopes. Consented
+  reads are bounded to the exact filer's imports and exclude capture tails.
+
+
 - Imported history and active captured sessions become searchable in Memory after background indexing. Existing imports are indexed automatically; untouched older captures require an operator `commonplace search-index run --workspace WORKSPACE_ID --captures`. Index bytes count toward plan storage; indexing pauses 16 MiB before the limit. Owners can check `GET /api/search-index`; operators can use `commonplace search-index status` ([guide](docs/one-time-import.md#indexing-progress-and-storage)).
 
 - Optional Commonplace live sync joins native session imports and captures, with a durable local outbox, private session reads, plan cadence and explicitly enabled user services ([guide](docs/live-sync.md)).
@@ -35,6 +40,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   and user-level hooks correctly. Status also tolerates a deleted working directory.
 
 ### Changed
+
+- Imported-history listing and thread reads without reader consent return 404
+  instead of 403. Connection imports use `import-private:<user>:<source>:<id>`;
+  incomplete three-part identities are refused rather than granted reader access.
 
 - Structured mirror copies of private stored threads, facts derived from them, and their
   tunnel previews are returned only to callers who can read their source thread. This

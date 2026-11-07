@@ -97,3 +97,57 @@ before dismissing it.
 For instruction pointers and selected local-file migration, see
 [Agent onboarding](agent-onboarding.md). For running a local instance, see
 [Local client setup](commonplace-client-setup.md).
+
+
+## Allow an agent to read imported history
+
+Reading is a separate, unticked consent. The import checkbox remains write-only.
+The reader checkbox says:
+
+> Allow this agent to read and search your past and future conversations and memory files imported through the connection import route in this workspace, including imports from your other connections. Imports through the signed-in/full-ACL route, live session captures and other people's history are excluded. To stop access, revoke this connection.
+
+This includes multipart conversations, Grok facts and native memory files.
+It applies regardless of the connection's read-wing selection. Explicit search
+filters still select results: `private_chats` includes imported views; other
+wings exclude them. A mirror wing grants no access of its own.
+
+A signed-in personal-workspace owner may create a PAT with
+`{"name":"history-reader","import_read":true}`. `import_read` must be a JSON
+boolean. Absent or false grants no reader permission; strings, numbers and null
+are refused. `import` and `import_read` are independent. Submission rechecks
+personal ownership. The PAT retains its slim profile, untrusted status, normal
+read wings and inbox writes.
+
+OAuth clients must request `memory:read memory:import:read` and the person must
+separately tick the reader checkbox on that authorization form. An unsolicited
+tick or an unticked request grants no reader scope. Fresh authorizations require
+fresh consent. Authorization-server metadata advertises the scope; resource
+metadata, registration defaults and all profile defaults remain unchanged.
+
+| Explicit permission | Additional authority |
+| --- | --- |
+| `memory:import` + `memory:read` + `memory:write` | File private imports; no stored-history reads |
+| `memory:import:read` + `memory:read` | Discover, search and read this account's connection-route import views in this workspace |
+| Both consents | Both independent capabilities |
+
+Reader consent grants no import writes, general thread access, private-wing
+access, knowledge-graph access or trust increase. REST import listing and thread
+metadata/messages/recall/chain accept authorized import views. Memory read tools
+and startup use the same boundary. MCP `thread_get`, `thread_recall` and
+`thread_chain` continue to require `threads:read` and remain hidden from readers.
+The slim tool profile also retains its existing singular drawer reads.
+
+Imports are bound to the exact filing account and workspace. Shared session
+holders expose only bytes that the import accepted. Later live captures,
+capture forks, other accounts, full-ACL imports and unrelated private memories
+remain excluded. A later import can extend the authorized view. Unknown or
+inconsistent provenance is hidden as missing.
+
+The connection displays **Imported history: allowed** beside Revoke. To withdraw
+consent: **Revoke the old connection, then reconnect with this box unticked.**
+Revocation stops every token of the connection; rotation preserves consent.
+Imports and previously returned text remain. Membership and personal ownership
+are checked on subsequent reads. Refresh scope narrowing affects descendants,
+not earlier access tokens or the connection's stored policy. Revoke the
+connection to stop all authority immediately. CLI token creation, parent
+relationships, wing edits and upgrades never confer reader consent.

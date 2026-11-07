@@ -16,7 +16,6 @@ from . import continuity_schema, import_grant, ingest_cadence, plans, sync_proto
 from .capture import PRIVATE_WING
 from .handoff.api import _object, _query, _read_json, _RequestError, _text
 from .handoff.models import THREADS_WING
-from .handoff.recall import readable
 from .handoff.thread_store import ThreadConflict, ThreadStorageLimit, canonical_sha256
 from .http_util import log_failure
 from .import_parts import append_part, native_records, validate_part
@@ -147,8 +146,8 @@ def register(ctx):
             principal = ctx.gateway.principal_for(handler)
             if principal is None:
                 raise _RequestError(401, "Sign in")
-            if not principal.person:
-                raise _RequestError(403, "Sign in to list your imports")
+            if not principal.person and not ctx.recall.import_reader(principal):
+                raise _RequestError(404, "not found")
             query = parse_qs(urlsplit(handler.path).query, keep_blank_values=True)
             try:
                 limit = int(_query(query, "limit", "50"))
@@ -165,9 +164,12 @@ def register(ctx):
             )
             result = {"imports": [], "next": None}
             result["imports"] = [
-                _import_row(row, listed_messages(ctx.control_db, row))
+                _import_row(
+                    ctx.recall.thread(principal, row.id),
+                    listed_messages(ctx.control_db, row) if principal.person else None,
+                )
                 for row in rows
-                if readable(principal, row)
+                if ctx.recall.can_read(principal, row.id)
             ]
             if len(rows) == limit:
                 result["next"] = _encode_cursor(rows[-1])

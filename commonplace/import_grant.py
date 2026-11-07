@@ -6,6 +6,17 @@ import hashlib
 import json
 
 IMPORT_SCOPE = "memory:import"
+READER_SCOPE = "memory:import:read"
+READER_TEXT = (
+    "Allow this agent to read and search your past and future conversations and memory files "
+    "imported through the connection import route in this workspace, including imports from "
+    "your other connections. Imports through the signed-in/full-ACL route, live session captures "
+    "and other people's history are excluded. To stop access, revoke this connection."
+)
+READER_DETAIL = (
+    "Includes multipart conversations, Grok facts and native memory files, regardless of read-wing "
+    "selection. Revoke the old connection, then reconnect with this box unticked."
+)
 GRANT_PREFIX = "import-private"
 SCOPE_TEXT = (
     "Import your past AI conversations and memory files into this workspace, word for word. "
@@ -56,3 +67,26 @@ def request_digest(route: str, data) -> str:
         "utf-8", errors="surrogatepass"
     )
     return hashlib.sha256(route.encode() + b"\n" + encoded).hexdigest()
+
+
+def reader_eligible(db, principal) -> bool:
+    """Recheck connection policy and membership without widening token-local scopes."""
+    if principal.person or principal.auth not in ("pat", "oauth"):
+        return False
+    from .rules import checks
+
+    if not db._lock.acquire(timeout=checks.remaining(1.0)):
+        return False
+    try:
+        live = db.authenticate_connection(principal.connection_id)
+        return bool(
+            live is not None
+            and live.auth == principal.auth
+            and live.user_id == principal.user_id
+            and live.workspace_id == principal.workspace_id
+            and live.policy.has_scope(READER_SCOPE)
+            and live.policy.has_scope("memory:read")
+            and eligible(db, principal.user_id, principal.workspace_id)
+        )
+    finally:
+        db._lock.release()

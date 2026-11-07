@@ -305,7 +305,9 @@ def test_as_metadata_lists_import(journey):
     status, _, raw = journey.request("/.well-known/oauth-authorization-server")
     assert status == 200
     assert b"memory:import" in raw
-    assert set(json.loads(raw)["scopes_supported"]) == set(IMPORT_SCOPES.split())
+    assert set(json.loads(raw)["scopes_supported"]) == set(
+        (IMPORT_SCOPES + " memory:import:read").split()
+    )
 
 
 def test_consent_import_box_unticked_and_optional(journey):

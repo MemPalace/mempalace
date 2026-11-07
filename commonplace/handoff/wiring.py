@@ -106,12 +106,13 @@ def install(gateway, data_dir=None, **_ignored) -> HandoffContext:
     ctx.handoff_db = HandoffDB(gateway.db)
     ctx.events = Events(gateway.db, ctx.handoff_db)
     ctx.settings = SettingsService(ctx.handoff_db, ctx.events)
-    from commonplace import continuity_read
+    from commonplace import continuity_read, import_grant
 
     ctx.recall = Recall(
         ctx.store_for,
         call_tool=ctx.call_tool,
         private=continuity_read.PrivateReader(gateway.db, ctx.store_for),
+        import_eligible=lambda principal: import_grant.reader_eligible(gateway.db, principal),
     )
     ctx.service = HandoffService(
         control_db=gateway.db,

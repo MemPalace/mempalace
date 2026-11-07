@@ -59,7 +59,7 @@ def test_u5_b_grant_filer(world):
     w.store.threads[w.thread.id] = replace(w.thread, source_thread_id="import-private:other:source")
     assert search(w) == []
     w.store.threads[w.thread.id] = replace(
-        w.thread, source_thread_id=f"import-private:{w.principal.user_id}:source"
+        w.thread, source_thread_id=f"import-private:{w.principal.user_id}:source:identity"
     )
     assert search(w)
     w.private.view.assert_not_called()
@@ -828,3 +828,50 @@ def test_owner_cli_search_also_excludes_mirrors(world, wing):
         workers.call_tool.assert_not_called()
     else:
         assert workers.call_tool.call_args.args[2]["wings"] == ["shared"]
+
+
+@pytest.mark.parametrize("person", [False, True])
+def test_legacy_import_owner_read_compatibility(world, person):
+    w = world
+    w.private.view.return_value = None
+    w.principal = replace(w.principal, role="owner", person=person)
+    legacy = replace(
+        w.thread,
+        wing="private_chats",
+        source_thread_id=f"import-private:{w.principal.user_id}:source",
+    )
+    w.store.threads[legacy.id] = legacy
+    recall = w.gateway.handoff.recall
+    assert recall.can_read(w.principal, legacy.id)
+    assert recall.thread(w.principal, legacy.id) == legacy
+    assert search(w)
+    for denied in (
+        replace(w.principal, user_id="other"),
+        replace(w.principal, workspace_id="other"),
+        replace(w.principal, policy=replace(w.principal.policy, scopes=("memory:read",))),
+        replace(w.principal, policy=replace(w.principal.policy, read_wings=("shared",))),
+    ):
+        assert not recall.can_read(denied, legacy.id)
+    assert w.store.threads[legacy.id] == legacy
+
+
+def test_import_listing_filters_before_pagination(world, monkeypatch):
+    w = world
+    recall = w.gateway.handoff.recall
+    rows = [stored(i) for i in range(1, 5)]
+    w.store.threads.update({row.id: row for row in rows})
+    w.store.list_source_range = Mock(side_effect=lambda *a, limit: rows[:limit])
+    monkeypatch.setattr(recall, "import_reader", lambda _: True)
+
+    def view(principal, row):
+        from commonplace.handoff.recall import ThreadNotFound
+
+        if row == rows[0]:
+            raise ThreadNotFound("thread not found")
+        return row
+
+    monkeypatch.setattr(recall, "_import_view", view)
+    monkeypatch.setattr(recall, "_view_drawer", lambda row, view: row.id)
+    assert recall.import_listing(w.principal, limit=1, offset=1) == [rows[2].id]
+    assert recall.import_listing(w.principal, room=rows[-1].id, limit=1) == [rows[-1].id]
+    assert recall.import_listing(w.principal, room=rows[-1].id, offset=1, limit=1) == []

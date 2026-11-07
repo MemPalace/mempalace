@@ -391,11 +391,14 @@ class Journey:
             denied = await bearer.get(
                 self.instance.origin + "/api/imports", headers={"Authorization": "Bearer " + token}
             )
-            checked_json(denied.status_code, None, "GET", "/api/imports", 403)
+            checked_json(denied.status_code, None, "GET", "/api/imports", 404)
+            require(
+                denied.json() == {"error": "not found"}, "Bearer listing exposed import metadata"
+            )
         return (
             "First import and immediate exact retry: HTTP 200, completed, accepted=1, "
             "errors=0; one unchanged owner-listed thread, exact UTF-8 archive and words; "
-            "bearer listing HTTP 403"
+            "bearer listing HTTP 404"
         )
 
     async def card_owner_decision(self):

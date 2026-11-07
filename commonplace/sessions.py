@@ -62,7 +62,7 @@ def ensure_schema(db: ControlDB) -> None:
 def person_policy() -> Policy:
     return Policy.build(
         profile="full",
-        scopes=[s for s in SCOPES if s not in ("admin", "memory:import")],
+        scopes=[s for s in SCOPES if s not in ("admin", "memory:import", "memory:import:read")],
         read_wings=["*"],
         write_wings=["*"],
         trust="trusted",

@@ -151,6 +151,8 @@ def cmd_token_add(args) -> int:
     db = _db(args)
     from .bridge import CLIENT_PRESETS, DEFAULT_CLIENT_PRESET
 
+    if "memory:import:read" in (_csv(args.scopes) or []):
+        raise ValueError("Imported history requires explicit browser reader consent")
     defaults = CLIENT_PRESETS.get(args.client, DEFAULT_CLIENT_PRESET)
 
     def value(name, fallback):

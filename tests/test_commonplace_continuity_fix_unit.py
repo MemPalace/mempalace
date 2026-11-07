@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from commonplace import capture, continuity as core, imports
+from commonplace.handoff.recall import Recall
 from commonplace.handoff.thread_store import ThreadConflict
 from commonplace.import_grant import grant_id
 from commonplace.import_parts import append_part
@@ -103,6 +104,7 @@ def test_fix6_legacy_multipart_listing_grows_by_own_submission_formula(env):
     ctx = SimpleNamespace(
         control_db=e.db,
         store_for=lambda ws: e.store,
+        recall=Recall(lambda ws: e.store),
         gateway=SimpleNamespace(
             principal_for=lambda h: principal,
             add_route=lambda method, path, handler: routes.__setitem__((method, path), handler),
@@ -238,6 +240,7 @@ def test_fix3_preupgrade_legacy_replay_keeps_count_until_new_bytes(env, marker_t
     ctx = SimpleNamespace(
         control_db=e.db,
         store_for=lambda ws: e.store,
+        recall=Recall(lambda ws: e.store),
         gateway=SimpleNamespace(
             principal_for=lambda h: principal,
             add_route=lambda method, path, handler: routes.__setitem__((method, path), handler),

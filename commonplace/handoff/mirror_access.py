@@ -13,27 +13,70 @@ _DROP = object()
 _THREAD_ROOM = re.compile(r"thr_[0-9a-f]+\Z")
 
 
-class _Reader:
+class _ResponseAccess:
+    """Live authority cached for one outgoing response, including startup clones."""
+
     def __init__(self, gateway, principal):
         self.gateway, self.principal = gateway, principal
-        self.allowed, self.parsed, self.private = {}, {}, {}
+        self.rooms, self.records, self.parsed, self.private = {}, {}, {}, {}
 
-    def __call__(self, room):
-        if room not in self.allowed:
-            self.allowed[room] = False
+    def recall(self):
+        ctx = self.gateway.handoff
+        recall = ctx.recall
+        if checks._deadline.get() is not None:
+            checks.remaining(0)
+            store = ctx._stores.get(self.principal.workspace_id)
+            if store is None:
+                return None
+            recall = Recall(
+                lambda _: store, private=recall._private, import_eligible=recall._import_eligible
+            )
+        return recall
+
+    def can_read(self, room):
+        if room not in self.rooms:
+            self.rooms[room] = False
             try:
-                ctx = self.gateway.handoff
-                recall = ctx.recall
-                if checks._deadline.get() is not None:
-                    checks.remaining(0)
-                    store = ctx._stores.get(self.principal.workspace_id)
-                    if store is None:
-                        return False
-                    recall = Recall(lambda _workspace: store, private=recall._private)
-                self.allowed[room] = recall.can_read(self.principal, room)
+                recall = self.recall()
+                self.rooms[room] = recall is not None and recall.can_read(self.principal, room)
             except Exception:
                 pass
-        return self.allowed[room]
+        return self.rooms[room]
+
+    def ordinary_record(self, node):
+        try:
+            recall = self.recall()
+            return recall is not None and recall.ordinary_record(self.principal, node.get("room"))
+        except Exception:
+            return False
+
+    def preview_allowed(self, node):
+        """A readable endpoint never proves the preview drawer's source range."""
+        if "drawer_preview" not in node and not (
+            node.get("drawer_id") and "connected_wing" in node
+        ):
+            return True
+        wing, room = node.get("drawer_wing"), node.get("drawer_room")
+        sensitive = (
+            isinstance(wing, str) and canonical_wing(wing) in (MIRROR_WING, "private_chats")
+        ) or _thread_id(room)
+        return not sensitive or self.ordinary_record({"room": room})
+
+    def import_allowed(self, node):
+        key = id(node)
+        if key not in self.records:
+            self.records[key] = False
+            try:
+                recall = self.recall()
+                self.records[key] = recall is not None and recall.import_record_allowed(
+                    self.principal, node
+                )
+            except Exception:
+                pass
+        return self.records[key]
+
+    def __call__(self, room):
+        return self.can_read(room)
 
     def parse(self, value):
         if not isinstance(value, str):
@@ -72,7 +115,7 @@ class _Reader:
 
 def reader(gateway, principal):
     """Access and provenance caches live for one request/response only."""
-    return _Reader(gateway, principal)
+    return _ResponseAccess(gateway, principal)
 
 
 def unreadable_room(can_read, wing, room):
@@ -157,17 +200,47 @@ def scrub_provenance(node, access):
 
 def gate(gateway, principal, rule, result):
     """Scrub mirror words, caching access decisions only within this response."""
-    can_read = reader(gateway, principal)
+    access = reader(gateway, principal)
+    can_read = access
+    import_allowed = access.import_allowed
+    reader_recall = access.recall
+    reader_scope = principal.policy.has_scope("memory:import:read")
 
     def scrub(node):
         if isinstance(node, dict):
             fact = _is_fact(node)
+            if reader_scope and not access.preview_allowed(node):
+                return _DROP
+            import_row = False
+            if (
+                reader_scope
+                and not fact
+                and not access.ordinary_record(node)
+                and any(key in node for key in ("drawer_id", "text", "content"))
+                and (
+                    node.get("wing") in ("private_threads", "private_chats")
+                    or _thread_id(node.get("room"))
+                )
+            ):
+                import_row = import_allowed(node)
+                if not import_row:
+                    return _DROP
+                # Return only proved words and structural provenance. Arbitrary
+                # labels, previews and links cannot piggyback on a safe range.
+                node = _proved_record(node)
             if fact:
-                node = _scrub_fact(node, can_read, can_read)
+                proved = _reader_fact(node, reader_recall, principal) if reader_scope else set()
+                if proved is None:
+                    return _DROP
+                node = _scrub_fact(
+                    node, lambda source: source in proved or can_read(source), access
+                )
                 if node is _DROP:
                     return _DROP
-            node = scrub_provenance(node, can_read)
-            if unreadable_room(can_read, None if fact else node.get("wing"), node.get("room")):
+            node = scrub_provenance(node, access)
+            if not import_row and unreadable_room(
+                can_read, None if fact else node.get("wing"), node.get("room")
+            ):
                 return _DROP
             if "connected_wing" in node and unreadable_room(
                 can_read, node.get("connected_wing"), node.get("connected_room")
@@ -229,6 +302,46 @@ def gate(gateway, principal, rule, result):
     if cleaned is _DROP:
         return _dropped_result(rule, result)
     return _filter_fact_links(cleaned)
+
+
+def _proved_record(node):
+    out = {k: node[k] for k in ("drawer_id", "wing", "room", "text", "content") if k in node}
+    for key in ("score", "similarity", "distance"):
+        if type(node.get(key)) in (int, float):
+            out[key] = node[key]
+    metadata = node.get("metadata") or {}
+    if str(node.get("drawer_id", "")).startswith("imported:"):
+        out["metadata"] = {
+            k: metadata[k] for k in ("source_thread", "import_view_sha256") if k in metadata
+        }
+    else:
+        source = node.get("source_path") or node.get("source_file") or metadata.get("source_file")
+        out["source_path"] = source
+        out["metadata"] = {"source_file": source, "source_thread": node["room"]}
+    return out
+
+
+def _reader_fact(node, reader_recall, principal):
+    """Only view-bearing sources require every-source proof; ordinary facts retain their gate."""
+    try:
+        recall = reader_recall()
+        if recall is None:
+            return None
+        proved = set()
+        for source, row in _fact_sources(node):
+            if recall.ordinary_record(principal, source):
+                continue
+            if not recall.proves_import(
+                principal,
+                source,
+                row.get("source_seq_start", row.get("seq_start")),
+                row.get("source_seq_end", row.get("seq_end")),
+            ):
+                return None
+            proved.add(source)
+        return proved
+    except Exception:
+        return None
 
 
 def _recount(original, cleaned):
