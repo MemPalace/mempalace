@@ -3,11 +3,24 @@ if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
 
+_MIN_RERANK_POOL = 50
+"""Floor for the rerank pool, independent of the requested limit.
+
+A pool that scales only with ``n_results`` starves at small limits: on a
+corpus with many near-duplicate machine-text chunks, those chunks fill a
+15-candidate pool (``n_results=5``) before a more distinctive drawer is
+retrieved, so the re-ranker never sees the best match and the result set
+becomes a function of the caller's ``limit``. See #2175.
+"""
+
+
 def _candidate_pool_size(n_results: int, date_window_active: bool) -> int:
     """Rerank-pool size for the drawer vector query.
 
     Without a date window this is the historical ``n_results * 3``
-    over-fetch. With one, the window filters the pool AFTER retrieval
+    over-fetch, floored at ``_MIN_RERANK_POOL`` so that a small ``n_results``
+    cannot shrink the pool below the depth the re-ranker needs to reach past
+    near-duplicate chunks. With a date window, the window filters the pool AFTER retrieval
     (ChromaDB rejects string operands for ``$gte``/``$lt``, so ``filed_at``
     can't be range-filtered server-side), and a narrow window over a large
     palace would starve a 3x pool even though matching drawers exist —
@@ -19,7 +32,7 @@ def _candidate_pool_size(n_results: int, date_window_active: bool) -> int:
     capped result is never silent.
     """
     if not date_window_active:
-        return n_results * 3
+        return max(n_results * 3, _MIN_RERANK_POOL)
     return max(min(n_results * 15, 500), n_results)
 
 
