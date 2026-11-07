@@ -57,7 +57,7 @@ const root = document.querySelector("#root");
 const state = {
   me: null, boards: [], needs: {}, cards: [], children: [], open: [], card: null, route: "#/", base: "#/",
   selected: null, backlog: false, drafts: new Map(), pending: new Set(), seq: 0, panelRequest: 0, refreshRequest: 0,
-  screen: 0, error: "", pollError: false, loading: false,
+  screen: 0, renderPending: null, error: "", pollError: false, loading: false,
   chat: [], linked: [], chatBoard: null, chatCursor: 0, spaceTab: "chat", chatTasks: new Map(),
   chatHasMore: false, chatLoading: false, chatObserver: null, chatVisible: new Set(), chatTaskRequests: new Map(),
   toggled: new Set(), expandedChildren: new Set(), rulesWaiting: 0, chatTimes: new Map(),
@@ -977,6 +977,7 @@ function consoleScreen() {
 async function refresh({ background = false, events = [] } = {}) {
   if (!state.me) return;
   const epoch = state.screen, request = ++state.refreshRequest;
+  if (!background) state.renderPending = epoch;
   const current = () => epoch === state.screen && request === state.refreshRequest;
   try {
     const [boards, needs, rules] = await Promise.all([api("/api/boards"), api("/api/needs-me"), api(state.base === "#/rules" ? "/api/rules" : "/api/rules/count").catch((error) => { if (state.base === "#/rules") throw error; return null; })]);
@@ -1008,6 +1009,8 @@ async function refresh({ background = false, events = [] } = {}) {
         }
       }
     }
+    // The latest refresh inherits any foreground render it superseded on this screen.
+    if (state.renderPending === epoch) { background = false; state.renderPending = null; }
     const saved = remember(), play = capture(state.base);
     navigation();
     if (state.base.startsWith("#/board/")) boardView();
@@ -1048,6 +1051,7 @@ async function refresh({ background = false, events = [] } = {}) {
     return true;
   } catch (error) {
     if (!current() || !state.me) return;
+    state.renderPending = null;
     if (state.base === "#/rules") rulesUI.force = false;
     showError(error.message);
     if (!root.querySelector("#content").children.length) root.querySelector("#content").innerHTML = message(error.message, true);

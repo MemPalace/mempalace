@@ -269,6 +269,14 @@ appears in the owner queue again without changing its stored words or audit log.
 
   - The tool list does change: the `orch_*` tools are listed on every workspace, so a config can be proposed before one exists (see Residuals).
 
+### Foreground refresh rendering
+
+- A background workspace refresh that supersedes a pending foreground render inherits that render on the same screen.
+
+- Navigation epochs reject stale reads and Settings completions; ordinary events leave an already rendered Settings view intact.
+
+- A current request failure clears the pending render; a later background refresh retains its usual form-preservation policy.
+
 ### Starts on a configured board
 
 - Every config-driven start runs one fenced transaction (`BEGIN IMMEDIATE` on `runner.sqlite3`): resolve and hash, refuse under the restore flag or for a `plan`-labelled card (`plan_pending`), look up the existing step (or, for a person, the runner's own request key), check the cap, insert.
@@ -435,6 +443,13 @@ appears in the owner queue again without changing its stored words or audit log.
   keys after a crash can create additional children.
 
 - `runner.sqlite3`: runner jobs with pinned launch role; orchestrator configs, cursors, leases, steps, journal, retry attempts, restore flag
+### Foreground refresh rendering
+
+- A background workspace refresh that supersedes a pending foreground render inherits that render on the same screen.
+
+- Navigation epochs reject stale reads and Settings completions; ordinary events leave an already rendered Settings view intact.
+
+- A current request failure clears the pending render; a later background refresh retains its usual form-preservation policy.
 
 ### Webhook dispatcher recovery
 
