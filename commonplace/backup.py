@@ -595,10 +595,11 @@ def _backup_locked(data_dir, dest_dir) -> dict:
             shutil.rmtree(partial)
 
 
-def _ancestors(proc_root) -> set:
-    """This process's pid and every parent pid up to init."""
+def _ancestors(proc_root=None, *, pid=None) -> set:
+    """A process's pid and parent chain in the scanned /proc (default: self)."""
+    proc_root = _PROC_ROOT if proc_root is None else proc_root
     pids = set()
-    pid = os.getpid()
+    pid = os.getpid() if pid is None else pid
     while pid > 0 and pid not in pids:
         pids.add(pid)
         try:

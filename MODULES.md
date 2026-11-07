@@ -262,6 +262,7 @@ Format (read by `commonplace orch docs-check`):
 - **Owns:**
 
   - Synthetic legacy safety-stop cases and explicitly classified transcript-only fixture updates.
+  - `tests/test_backup_online_processes.py` reproduces separate backup/gateway ancestry and preserves foreign-writer and paused-worker refusals using a synthetic `/proc`.
   - The canonical Space REST matrix and base-captured profile/tool schemas.
 
   - `tests/test_commonplace_subagent_asks.py` covers released-card questions and coordinator routing, answers, escalation and recovery.
@@ -824,6 +825,8 @@ Format (read by `commonplace orch docs-check`):
   - A backup copies every SQLite file with a manifest; an online backup runs beside the serving gateway without stopping or replacing it and publishes only after the run is committed.
 
   - Its enumeration tolerates SQLite sidecars disappearing during commit or connection cleanup, while missing user files and unsafe paths still fail closed.
+
+  - Online writer scans exempt the gateway's ancestor chain from the same `/proc` tree, alongside the backup's own ancestry; unrelated writers remain refused even with identical supervisor arguments.
 
   - A restore publishes a verified copy into a new directory and never overwrites; the restore marker blocks config-driven work until the owner acknowledges.
 

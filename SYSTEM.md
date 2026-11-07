@@ -632,6 +632,8 @@ appears in the owner queue again without changing its stored words or audit log.
 
 - Backups copy every SQLite file in the data directory (`commonplace/backup.py`).
 
+- Online writer scans resolve the gateway PID's ancestor chain in the scanned `/proc`, so inherited data settings on supervisors do not falsely block a backup started separately from the gateway. Unrelated writers, including identical wrapper commands, remain refused; worker PID exemptions still end after pause. Offline scans retain only the backup's own ancestry exemption.
+
 - Online enumeration permits only SQLite sidecars (`-wal`, `-shm`, `-journal`) to disappear between listing and metadata lookup: the live gateway may remove them even while file creation is frozen, and snapshots omit them.
 
 - Missing user files, symlinks and special files still abort the backup; offline enumeration remains strict.

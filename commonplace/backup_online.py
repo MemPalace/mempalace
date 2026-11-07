@@ -29,11 +29,11 @@ Staging
 
 The cut
     1. Preflight: ``hello`` (protocol, same data directory, no live or
-       starting successor), ``/proc`` scan (gateway and workers exempt),
+       starting successor), ``/proc`` scan (gateway, its ancestors and workers exempt),
        encrypted databases refused, rollback-journal databases at most
        ``ROLLBACK_MAX_BYTES``, disk reserve, copy probe and pause estimate.
     2. ``pause`` (up to ``PAUSE_TRIES`` on ``no_drain``), ``/proc`` scan with
-       only the gateway exempt, ``freeze``.
+       only the gateway and its ancestors exempt, ``freeze``.
     3. Enumerate the tree. Worker files are those in the resolved active
        generation's ``palace``, ``home`` and ``config``. Seam ``enumerated``.
     4. Barrier: ``BEGIN IMMEDIATE`` with no busy wait on every other database,
@@ -100,6 +100,7 @@ from .backup import (
     LOCK_NAME,
     STAGING_NAME,
     BackupError,
+    _ancestors,
     _encrypted_database,
     _file_entry,
     _inside,
@@ -264,7 +265,10 @@ class _Gateway:
         return info
 
     def exempt(self, *, workers: bool) -> set:
-        pids = {self.info.get("gateway_pid")}
+        gateway_pid = self.info.get("gateway_pid")
+        # An exec-created backup need not descend from the gateway's init or
+        # launcher. Those supervisors inherit its argv/environment too.
+        pids = _ancestors(pid=int(gateway_pid)) if gateway_pid is not None else set()
         if workers:
             pids.update(self.info.get("worker_pids") or ())
         return {int(pid) for pid in pids if pid is not None}
