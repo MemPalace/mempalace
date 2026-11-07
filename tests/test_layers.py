@@ -71,6 +71,39 @@ def test_layer0_strips_whitespace(tmp_path):
     assert text == "Hello world"
 
 
+@pytest.fixture(params=["cp950", "cp1252"])
+def windows_locale_open(request, monkeypatch):
+    """Make an encoding-less text ``open()`` in layers decode like a Windows machine."""
+    import builtins
+
+    import mempalace.layers as layers_module
+
+    real_open = builtins.open
+
+    def open_(file, mode="r", buffering=-1, encoding=None, *args, **kwargs):
+        if "b" not in mode and encoding is None:
+            encoding = request.param
+        return real_open(file, mode, buffering, encoding, *args, **kwargs)
+
+    monkeypatch.setattr(layers_module, "open", open_, raising=False)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    ["I am Atlas, assistant for Zoë and José.", "我是小助手，替王小明記事。"],
+)
+def test_layer0_reads_utf8_identity_under_windows_locale(tmp_path, windows_locale_open, identity):
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_text(identity, encoding="utf-8")
+    assert Layer0(identity_path=str(identity_file)).render() == identity
+
+
+def test_layer0_drops_utf8_bom(tmp_path):
+    identity_file = tmp_path / "identity.txt"
+    identity_file.write_bytes("\ufeffI am Atlas.".encode("utf-8"))
+    assert Layer0(identity_path=str(identity_file)).render() == "I am Atlas."
+
+
 def test_layer0_default_path():
     layer = Layer0()
     expected = os.path.expanduser("~/.mempalace/identity.txt")
@@ -183,6 +216,45 @@ def test_layer1_truncates_long_snippets():
         result = layer.generate()
 
     assert "..." in result
+
+
+def _layer1_story(docs, metas, max_chars=Layer1.MAX_CHARS):
+    mock_col = _mock_chromadb_for_layer(docs, metas)
+    with (
+        patch("mempalace.layers.MempalaceConfig") as mock_cfg,
+        patch("mempalace.layers._get_collection", return_value=mock_col),
+        patch.object(Layer1, "MAX_CHARS", max_chars),
+    ):
+        mock_cfg.return_value.palace_path = "/fake"
+        return Layer1(palace_path="/fake").generate()
+
+
+def test_layer1_long_room_name_cannot_crowd_out_the_story():
+    from mempalace.config import MAX_NAME_LENGTH
+
+    long_room = "0" * 5000
+    result = _layer1_story(
+        ["first memory", "second memory"], [{"room": long_room}, {"room": "second-room"}]
+    )
+    assert "first memory" in result
+    assert "second memory" in result
+    assert "0" * (MAX_NAME_LENGTH + 1) not in result
+
+
+def test_layer1_cap_covers_room_lines():
+    rooms = ["a" * 60, "b" * 60]
+    result = _layer1_story(["x", "y"], [{"room": room} for room in rooms], max_chars=100)
+    assert rooms[0] in result
+    assert rooms[1] not in result
+    assert "more in L3 search" in result
+
+
+def test_layer1_renders_a_room_name_stored_with_newlines():
+    """Palaces mined before room names were validated can still hold one."""
+    result = _layer1_story(["a memory"], [{"room": "notes\n## x"}])
+    assert "a memory" in result
+    assert "[notes ## x]" in result
+    assert "\n## x" not in result
 
 
 def test_layer1_respects_max_chars():

@@ -2953,6 +2953,98 @@ def test_rebuild_from_sqlite_in_place_archives_when_opted_in(tmp_path):
     assert rebuilt.count() == 15
 
 
+def _seed_palace_with_logstream_event(palace):
+    from mempalace.logstream import Logstream
+
+    rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(3)]
+    _seed_palace(palace, "mempalace_drawers", rows)
+    with Logstream(db_path=str(palace / "logstream.sqlite3")) as ls:
+        return ls.append_event(
+            type="task.request",
+            stream="project/garden",
+            room="delegation",
+            from_agent="alice",
+            body="Water the tomatoes before nine.",
+        )
+
+
+def test_rebuild_from_sqlite_in_place_keeps_logstream_events(tmp_path):
+    """An in-place rebuild re-embeds drawers; it must not leave the
+    coordination log behind in the archive (#2746)."""
+    from mempalace.logstream import Logstream
+
+    palace = tmp_path / "palace"
+    event = _seed_palace_with_logstream_event(palace)
+
+    counts = repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+    assert counts["mempalace_drawers"] == 3
+
+    with Logstream(db_path=str(palace / "logstream.sqlite3")) as ls:
+        events = ls.list_events()
+    assert [e["id"] for e in events] == [event["id"]]
+    assert events[0]["body"] == "Water the tomatoes before nine."
+
+
+def test_rebuild_from_sqlite_in_place_keeps_replica_id(tmp_path):
+    """The replica id names this machine's copy of the palace and must not
+    be re-minted by a rebuild (#2746)."""
+    from mempalace.replica import get_replica_id
+
+    palace = tmp_path / "palace"
+    _seed_palace_with_logstream_event(palace)
+    replica_before = get_replica_id(str(palace))
+
+    repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    assert get_replica_id(str(palace)) == replica_before
+
+
+def test_preserve_logstream_and_replica_folds_open_wal_and_copies_replica(tmp_path):
+    """An open writer's WAL is folded into one consistent logstream.sqlite3
+    via the SQLite backup API without copying torn -wal/-shm sidecars."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+
+    ls = sqlite3.connect(str(src / "logstream.sqlite3"))
+    ls.execute("PRAGMA journal_mode=WAL")
+    ls.execute("PRAGMA wal_autocheckpoint=0")
+    ls.execute("CREATE TABLE t (v TEXT)")
+    ls.execute("INSERT INTO t VALUES ('only in the wal')")
+    ls.commit()
+    (src / "replica.json").write_text('{"replica_id": "rep-1"}', encoding="utf-8")
+    try:
+        copied = repair._preserve_logstream_and_replica(str(src), str(dest))
+    finally:
+        ls.close()
+
+    assert copied == ["logstream.sqlite3", "replica.json"]
+    assert not (dest / "logstream.sqlite3-wal").exists()
+    assert not (dest / "logstream.sqlite3-shm").exists()
+    with closing(sqlite3.connect(str(dest / "logstream.sqlite3"))) as conn:
+        assert conn.execute("SELECT v FROM t").fetchone() == ("only in the wal",)
+    assert (dest / "replica.json").read_text(encoding="utf-8") == '{"replica_id": "rep-1"}'
+
+
+def test_preserve_logstream_and_replica_unreadable_fallback_and_symlink_skip(tmp_path):
+    """Unreadable logstream bytes fall back to raw copy; symlinks are skipped."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("secret", encoding="utf-8")
+
+    (src / "logstream.sqlite3").write_text("ls-raw-bytes", encoding="utf-8")
+    (src / "replica.json").symlink_to(outside)
+
+    copied = repair._preserve_logstream_and_replica(str(src), str(dest))
+
+    assert copied == ["logstream.sqlite3"]
+    assert (dest / "logstream.sqlite3").read_text(encoding="utf-8") == "ls-raw-bytes"
+    assert not (dest / "replica.json").exists()
+
+
 def test_rebuild_from_sqlite_in_place_refuses_without_archive_flag(tmp_path):
     """Source == dest without archive flag must abort untouched. The
     most catastrophic possible regression of this code path is silently

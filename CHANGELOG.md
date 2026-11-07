@@ -16,6 +16,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   on which read path surfaced it. The three keys now carry the stored values on every
   fact those reads return, and no existing key changes. (#2749)
 
+### Fixed
+
+- The `wing` in `mempalace.yaml` is validated when a project is mined, so a
+  cloned repository's config cannot hang the miner with a yaml alias structure
+  or file drawers under unsafe text, a number or a list. A rejected name becomes
+  its wing slug, with a warning, and a config with no usable wing, including one
+  with no `wing` key, uses the directory's wing instead of failing. Valid names
+  and `--wing` are unchanged. Drawers already filed under the old spelling stay
+  there, and a wing filter finds both by slug. A wing with no slug, such as
+  `+++`, stays reachable by that name or an unfiltered search.
+- Room names in `mempalace.yaml` are validated when the miner loads them, so a
+  cloned repository's config cannot put newlines or other unsafe text into
+  drawer metadata and wake-up output. A rejected name such as `c++` becomes its
+  slug, with a warning. A room with no usable name is skipped, and its files go
+  to the other rooms or `general`. Every file is still mined, and stored drawers
+  are not changed.
+- The L1 size cap now holds for room lines. A room name already in a palace
+  stays on one line in wake-up and Hermes output, and a long one is shortened
+  instead of crowding out the story.
+
 ---
 
 ## [3.12.0] — 2026-10-31

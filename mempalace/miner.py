@@ -556,6 +556,47 @@ def _apply_exclude_patterns_to_prescanned_files(
 # =============================================================================
 
 
+def _valid_room_name(value) -> str | None:
+    """``value`` as ``sanitize_name`` returns it, or None when it is rejected."""
+    from .config import sanitize_name
+
+    try:
+        return sanitize_name(value, "room")
+    except ValueError:
+        return None
+
+
+def _clean_room_names(rooms: list, source: str) -> list:
+    """``rooms`` with names that are safe to store on drawers and print.
+
+    A project config can arrive with a cloned repository, and room names reach
+    wake-up text. A rejected name becomes its slug, as ``rooms.py`` does for
+    proposed names, and keeps its config spelling as ``match_name``, so files
+    route exactly as before and only the stored name changes. With no usable slug
+    the room is dropped and its files fall through to the other rooms or
+    ``general``. Either way the file is still mined. Only scalars are turned into
+    text, because yaml aliases can build a small value whose text form is
+    exponentially large.
+    """
+    clean = []
+    for room in rooms:
+        raw = room.get("name") if isinstance(room, dict) else None
+        name = _valid_room_name(raw)
+        if name is None:
+            from .rooms import slugify_room
+
+            text = str(raw) if isinstance(raw, (str, int, float)) else ""
+            name = _valid_room_name(slugify_room(text)) if text else None
+            outcome = f"using '{name}'" if name else "skipping that room"
+            shown = ascii(text[:80]) if text else f"of type {type(raw).__name__}"
+            print(f"  Invalid room name {shown} in {source}: {outcome}.", file=sys.stderr)
+            if name:
+                clean.append({**room, "name": name, "match_name": text})
+        else:
+            clean.append({**room, "name": name})
+    return clean
+
+
 def load_config(project_dir: str) -> dict:
     """Load the project config from ``project_dir``.
 
@@ -594,7 +635,10 @@ def load_config(project_dir: str) -> dict:
             ],
         }
     with open(config_path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    if isinstance(config, dict) and isinstance(config.get("rooms"), list):
+        config["rooms"] = _clean_room_names(config["rooms"], config_path.name)
+    return config
 
 
 # =============================================================================
@@ -624,6 +668,14 @@ def _name_matches(a: str, b: str) -> bool:
     return b in _tokens(a) or a in _tokens(b)
 
 
+def _match_name(room: dict) -> str:
+    """The spelling ``room`` routes by, which is never a slug made from it.
+
+    A slug can be as short as ``c``, and content scoring would count that letter.
+    """
+    return room.get("match_name", room["name"])
+
+
 def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -> str:
     """
     Route a file to the right room.
@@ -641,19 +693,19 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
     path_parts = relative.replace("\\", "/").split("/")
     for part in path_parts[:-1]:  # skip filename itself
         for room in rooms:
-            candidates = [room["name"].lower()] + [k.lower() for k in room.get("keywords", [])]
+            candidates = [_match_name(room).lower()] + [k.lower() for k in room.get("keywords", [])]
             if any(_name_matches(part, c) for c in candidates):
                 return room["name"]
 
     # Priority 2: filename matches room name
     for room in rooms:
-        if _name_matches(filename, room["name"]):
+        if _name_matches(filename, _match_name(room)):
             return room["name"]
 
     # Priority 3: keyword scoring from room keywords + name
     scores = defaultdict(int)
     for room in rooms:
-        keywords = room.get("keywords", []) + [room["name"]]
+        keywords = room.get("keywords", []) + [_match_name(room)]
         for kw in keywords:
             count = content_lower.count(kw.lower())
             scores[room["name"]] += count
@@ -2070,6 +2122,30 @@ def mine(
         )
 
 
+def _project_wing(raw, project_path: Path) -> str:
+    """The wing a project config names, safe to store on drawers and print.
+
+    The config can arrive with a cloned repository. A valid name is kept as
+    written. A rejected one becomes the one wing slug, and with nothing usable
+    the project falls back to the wing it has without a config. Drawers already
+    filed under the old spelling stay there. ``wing_aliases`` links the two by
+    slug, so a name with no slug (``+++``) stays reachable only by that name or an
+    unfiltered search. Only scalars are turned into text, because yaml aliases can
+    build a small value whose text form is exponentially large.
+    """
+    from .config import normalize_wing_name, sanitize_name
+
+    try:
+        return sanitize_name(raw, "wing")
+    except ValueError:
+        pass
+    text = str(raw) if isinstance(raw, (str, int, float)) else ""
+    wing = normalize_wing_name(text) or normalize_wing_name(project_path.name) or "project"
+    shown = ascii(text[:80]) if text else f"of type {type(raw).__name__}"
+    print(f"  Invalid wing {shown} in project config: using {ascii(wing)}.", file=sys.stderr)
+    return wing
+
+
 def _mine_impl(
     project_dir: str,
     palace_path: str,
@@ -2093,7 +2169,7 @@ def _mine_impl(
     cfg_chunk_overlap = palace_config.chunk_overlap
     cfg_min_chunk_size = palace_config.min_chunk_size
 
-    wing = wing_override or config["wing"]
+    wing = wing_override or _project_wing(config.get("wing"), project_path)
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
     exclude_patterns = config.get("exclude_patterns", [])
 

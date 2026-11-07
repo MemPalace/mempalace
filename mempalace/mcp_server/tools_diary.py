@@ -25,13 +25,13 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
         topic = sanitize_name(topic, "topic")
+        if wing:
+            wing = canonical_wing(wing, "wing")
+        else:
+            wing = f"wing_{normalize_wing_name(agent_name) or agent_name}"
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    if wing:
-        wing = sanitize_name(wing)
-    else:
-        wing = f"wing_{normalize_wing_name(agent_name) or agent_name}"
     room = "diary"
     col = _get_collection(create=True)
     if not col:
