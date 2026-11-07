@@ -548,6 +548,44 @@ class TestSearchCLI:
         # rather than a hard-coded "cosine=".
         assert "cosine_sim=" in first_block
 
+    def test_search_json_output_is_valid_json(self, fake_palace_path, capsys):
+        """--json must emit parseable JSON — requires json in the
+        searcher namespace (cli_search.py is exec'd into the package
+        globals). Regression: the split branch lost the __init__ import
+        and json.dumps NameError'd at runtime."""
+        import json as _json
+
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "documents": [["foo bar baz drawer body"]],
+            "metadatas": [[{"source_file": "a.md", "wing": "w", "room": "r"}]],
+            "distances": [[0.4]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("foo bar baz", fake_palace_path, json_output=True)
+        payload = _json.loads(capsys.readouterr().out)
+        assert payload["query"] == "foo bar baz"
+        assert payload["results"][0]["source_file"] == "a.md"
+        assert payload["results"][0]["text"] == "foo bar baz drawer body"
+
+    def test_search_json_output_empty_results(self, fake_palace_path, capsys):
+        """--json with no hits emits an empty results array, not the
+        human-readable "No results found" line."""
+        import json as _json
+
+        mock_col = MagicMock()
+        mock_col.metadata = {"hnsw:space": "cosine"}
+        mock_col.query.return_value = {
+            "documents": [[]],
+            "metadatas": [[]],
+            "distances": [[]],
+        }
+        with patch("mempalace.searcher.get_collection", return_value=mock_col):
+            search("nothing", fake_palace_path, json_output=True)
+        payload = _json.loads(capsys.readouterr().out)
+        assert payload == {"query": "nothing", "results": []}
+
     def test_search_warns_when_palace_uses_wrong_distance_metric(self, fake_palace_path, capsys):
         """Legacy palaces created without `hnsw:space=cosine` silently
         use L2, which breaks similarity interpretation. CLI must warn
