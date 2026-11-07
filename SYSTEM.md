@@ -561,7 +561,13 @@ appears in the owner queue again without changing its stored words or audit log.
 
   - A grant or requester revocation that commits between that snapshot and the in-lock insert is not re-read; the start can still be inserted.
 
-  - The runner re-checks the requester and grants at `starting`, so the job is refused before launch.
+  - The runner re-checks requester, grants and binding epoch at `starting`, including idempotent retry. Each job snapshots the validated machine epoch; legacy jobs have NULL snapshots and are refused.
+
+  - Topic/wing reset, worker rotation and revoke increment the machine epoch once. Same-provider confirmation and project-only edits preserve it; changing an attested provider returns 409 `provider_change_requires_reset` until explicit reset and owner review.
+
+  - Board prechecks finish before runner admission; fresh control authority is then held through the guarded starting write and runner commit in both switch modes. A committed reset before the write refuses; one after the write leaves starting work to become uncertain at the next sweep, retaining capacity and never relaunching. Owner resolution takes runner first, then control audit.
+
+  - Stop old hub processes before upgrading/restarting: old reset writers do not increment epochs, so mixed-version writers cannot uphold this fence.
 
 - **Same-second ties are listed.**
 

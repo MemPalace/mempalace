@@ -38,7 +38,7 @@ JSON_KEYS = ("projects", "topics", "wings", "requesters", "binding_topics")
 RESET = (
     "binding_state='unbound', binding_topics=NULL, binding_provider_instance_id=NULL, "
     "binding_worker_connection_id=NULL, binding_attested_by=NULL, "
-    "binding_attested_at=NULL, binding_grant_version=NULL"
+    "binding_attested_at=NULL, binding_grant_version=NULL, binding_epoch=binding_epoch+1"
 )
 
 
@@ -67,6 +67,7 @@ def ensure(db):
                 max_starts_per_hour INTEGER NOT NULL DEFAULT 6 CHECK(max_starts_per_hour BETWEEN 1 AND 30),
                 enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
                 grant_version INTEGER NOT NULL DEFAULT 1,
+                binding_epoch INTEGER NOT NULL DEFAULT 1,
                 binding_state TEXT NOT NULL DEFAULT 'unbound'
                     CHECK(binding_state IN ('unbound','owner_attested')),
                 binding_topics TEXT, binding_provider_instance_id TEXT,
@@ -78,6 +79,17 @@ def ensure(db):
             CREATE UNIQUE INDEX IF NOT EXISTS runner_machines_label
                 ON runner_machines(workspace_id, label) WHERE revoked_at IS NULL;
         """)
+        db._conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {row[1] for row in db._conn.execute("PRAGMA table_info(runner_machines)")}
+            if "binding_epoch" not in columns:
+                db._conn.execute(
+                    "ALTER TABLE runner_machines ADD COLUMN binding_epoch INTEGER NOT NULL DEFAULT 1"
+                )
+            db._conn.execute("COMMIT")
+        except BaseException:
+            db._conn.execute("ROLLBACK")
+            raise
 
 
 def _owner(owner):
@@ -324,6 +336,11 @@ def attest(db, owner, machine_id, binding):
         provider = binding["provider_instance_id"]
         if not isinstance(provider, str) or not PROVIDER.fullmatch(provider):
             raise ValueError("invalid provider_instance_id")
+        if (
+            row["binding_state"] == "owner_attested"
+            and provider != row["binding_provider_instance_id"]
+        ):
+            raise Conflict("provider_change_requires_reset")
         now = control_db._iso(control_db._now())
         _write(
             db,

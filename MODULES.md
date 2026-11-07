@@ -228,7 +228,7 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_commonplace_subagent_asks.py` covers released-card questions and coordinator routing, answers, escalation and recovery.
 
-  - Shared fixtures and harnesses and every test file not listed in another block.
+  - Shared fixtures and harnesses and every test file not listed in another block, including binding-epoch migration, direct fences, lock-entry instrumentation and bounded reset races.
 
   - Subagent question routing, proposal/release prerequisites and recipient authority regressions.
 
@@ -404,9 +404,11 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/runner/`, `docs/runner.md`
 - **Owns:**
 
-  - Machine enrollment and grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
+  - Machine enrollment, binding epoch migrations and immutable job epoch snapshots, grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
 
 - **Promises:**
+
+  - Reset-before-start is refused in both orchestration modes, including retry; runner admission precedes control authority held through commit. Owner resolution audits under runner-first ordering.
 
   - Started jobs retain machine in-flight capacity and per-machine project exclusion while their cards remain doing with the machine worker; a terminal job state or a changed card state or assignee releases capacity, using read-only boards access.
 
@@ -419,11 +421,13 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - A reset invalidates queued/leased snapshots; previously starting work becomes uncertain and retains capacity. A bound provider change requires explicit reset before reattestation.
+
   - A lost launch result becomes `uncertain` and waits for a person; a revoked machine cancels queued jobs on the next sweep; a busy queue refuses with `busy`.
 
 - **Tests:**
 
-  - The `tests/test_runner_` files, `tests/test_orch_runner.py`, `tests/test_orch_acceptance.py`.
+  - The `tests/test_runner_` files (including binding migration, reset races, direct fences and lock-order instrumentation), `tests/test_orch_runner.py`, `tests/test_orch_acceptance.py`.
 
 
 ## orch

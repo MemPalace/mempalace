@@ -2,7 +2,6 @@
 
 import json
 import sqlite3
-from contextlib import nullcontext
 from urllib.parse import parse_qs, urlsplit
 
 from commonplace.boards._http import HTTPError, send_json
@@ -106,6 +105,9 @@ def _starting_check(gateway, machine, row):
         return "machine_disabled"
     if machine["binding_state"] != "owner_attested":
         return "binding_not_attested"
+    problem = jobs.binding_problem(machine, row, starting=True)
+    if problem:
+        return problem
     principal = _starting_principal(gateway, machine, row)
     if principal is None or not predicate.requester_ok(gateway, principal, machine):
         return "requester_invalid"
@@ -183,65 +185,65 @@ def register(gateway):
             principal = gateway.principal_for(h)
             if principal is None:
                 raise HTTPError(404, "not found")
-            on = orch.enabled(gateway.db, principal.workspace_id)
-            # Enabled admissions avoid holding control while waiting on runner locks.
-            # A concurrent switch flip can still reach the legacy off-path lock order.
-            with nullcontext() if on else gateway.db._lock:
-                principal = gateway.principal_for(h)
-                machine = _machine(gateway, principal)
-                if machine is None:
-                    raise HTTPError(404, "not found")
-                url = urlsplit(h.path)
-                action = url.path.removeprefix("/api/runner/")
-                if (h.command, action) not in {
-                    ("GET", "jobs"),
-                    *(("POST", key) for key in BODY_KEYS),
-                }:
-                    raise HTTPError(404, "not found")
-                store = jobs.open_store(gateway, principal.workspace_id)
-                if h.command == "GET":
-                    payload = _listing(store, machine, url.query)
+            # Fail closed on settings, then release control before runner/board work.
+            # Starting and lease acquire runner first and retain fresh control authority
+            # through their guarded write and runner commit.
+            orch.enabled(gateway.db, principal.workspace_id)
+            principal = gateway.principal_for(h)
+            machine = _machine(gateway, principal)
+            if machine is None:
+                raise HTTPError(404, "not found")
+            url = urlsplit(h.path)
+            action = url.path.removeprefix("/api/runner/")
+            if (h.command, action) not in {
+                ("GET", "jobs"),
+                *(("POST", key) for key in BODY_KEYS),
+            }:
+                raise HTTPError(404, "not found")
+            store = jobs.open_store(gateway, principal.workspace_id)
+            if h.command == "GET":
+                payload = _listing(store, machine, url.query)
+            else:
+                body = _body(h, action)
+                if url.query:
+                    raise HTTPError(400, "invalid query")
+                if action == "lease":
+                    row = jobs.lease(store, machine)
+                    if row is None:
+                        h.send_response(204)
+                        h.send_header("Content-Length", "0")
+                        h.send_header("Cache-Control", "no-store")
+                        h.end_headers()
+                        return
+                elif action == "renew":
+                    row = jobs.renew(store, machine, **body)
+                elif action == "starting":
+                    with store.connection() as conn:
+                        candidate = jobs._fenced(conn, machine["id"], body["lease_token"])
+                    board_refusal = _starting_board_check(gateway, machine, candidate, store)
+
+                    def validate(row):
+                        with gateway.db._lock:
+                            current = registry.get_machine(
+                                gateway.db, principal.workspace_id, machine["id"]
+                            )
+                            return _starting_check(gateway, current, row) or board_refusal
+
+                    row = jobs.starting(
+                        store,
+                        machine,
+                        **body,
+                        validate=validate,
+                    )
                 else:
-                    body = _body(h, action)
-                    if url.query:
-                        raise HTTPError(400, "invalid query")
-                    if action == "lease":
-                        row = jobs.lease(store, machine)
-                        if row is None:
-                            h.send_response(204)
-                            h.send_header("Content-Length", "0")
-                            h.send_header("Cache-Control", "no-store")
-                            h.end_headers()
-                            return
-                    elif action == "renew":
-                        row = jobs.renew(store, machine, **body)
-                    elif action == "starting":
-                        with store.connection() as conn:
-                            candidate = jobs._fenced(conn, machine["id"], body["lease_token"])
-                        board_refusal = _starting_board_check(gateway, machine, candidate, store)
+                    row = jobs.result(store, machine, **body)
+                payload = jobs.job_object(row, tokens=action == "lease")
+                if action == "lease" and row["config_version"] is not None:
+                    from commonplace.orch import runner_bridge
 
-                        def validate(row):
-                            with gateway.db._lock:
-                                current = registry.get_machine(
-                                    gateway.db, principal.workspace_id, machine["id"]
-                                )
-                                return _starting_check(gateway, current, row) or board_refusal
-
-                        row = jobs.starting(
-                            store,
-                            machine,
-                            **body,
-                            validate=validate,
-                        )
-                    else:
-                        row = jobs.result(store, machine, **body)
-                    payload = jobs.job_object(row, tokens=action == "lease")
-                    if action == "lease" and row["config_version"] is not None:
-                        from commonplace.orch import runner_bridge
-
-                        # Pinned prompt, workflow and model of a config-driven start.
-                        with store.connection() as conn:
-                            payload.update(runner_bridge.launch_fields(conn, row))
+                    # Pinned prompt, workflow and model of a config-driven start.
+                    with store.connection() as conn:
+                        payload.update(runner_bridge.launch_fields(conn, row))
             send_json(h, 200, payload)
         except HTTPError as exc:
             send_json(h, exc.status, {"error": str(exc)})

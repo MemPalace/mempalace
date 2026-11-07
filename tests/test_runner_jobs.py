@@ -245,14 +245,16 @@ def test_l4_concurrent_leases(signup_hub, owners):  # noqa: F811
 
 @pytest.fixture
 def started_capacity(tmp_path, monkeypatch):
+    from threading import RLock
+
     from commonplace.projects import orchestration
-    from commonplace.runner import jobs
+    from commonplace.runner import jobs, registry
 
     monkeypatch.setattr(orchestration, "enabled", lambda db, ws: False)
     monkeypatch.setattr(jobs, "_sweep", lambda store: None)
     gw = SimpleNamespace(
         workspace_dir=lambda ws: str(tmp_path),
-        db=SimpleNamespace(connection=lambda ref, ws: {"name": "worker"}),
+        db=SimpleNamespace(_lock=RLock(), connection=lambda ref, ws: {"name": "worker"}),
     )
     store = jobs.JobStore(gw, "ws")
     boards = connect(str(tmp_path / "boards.sqlite3"), isolation_level=None)
@@ -269,7 +271,13 @@ def started_capacity(tmp_path, monkeypatch):
         "max_in_flight": 1,
         "max_starts_per_hour": 30,
         "grant_version": 1,
+        "binding_epoch": 1,
+        "enabled": 1,
+        "revoked_at": None,
     }
+    # Supply control authority as well as a caller snapshot. Mutating machine in
+    # the tests changes this authoritative fixture too; lease must reread it.
+    monkeypatch.setattr(registry, "get_machine", lambda db, ws, ref: dict(machine))
     for n in (1, 2):
         jobs.create(
             store,

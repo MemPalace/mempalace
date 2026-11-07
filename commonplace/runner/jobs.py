@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import secrets
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS runner_jobs (
  id TEXT PRIMARY KEY,
  task_number INTEGER NOT NULL, board_slug TEXT NOT NULL,
  machine_id TEXT NOT NULL, project TEXT NOT NULL, topic TEXT NOT NULL,
- grant_version INTEGER NOT NULL, runtime_mode TEXT NOT NULL,
+ grant_version INTEGER NOT NULL, binding_epoch INTEGER, runtime_mode TEXT NOT NULL,
  requested_by TEXT NOT NULL, request_key TEXT, request_hash TEXT,
  state TEXT NOT NULL CHECK (state IN
  ('queued','leased','starting','started','failed','uncertain','cancelled')),
@@ -65,6 +65,7 @@ CONFIG_COLUMNS = {
     "model_provider": "TEXT",
     "model": "TEXT",
 }
+SNAPSHOT_COLUMNS = {"binding_epoch": "INTEGER"}
 # Conflict messages of create/create_in and the stable refusal code of each.
 CONFLICT_CODES = {
     "request_key reused with different arguments": "request_conflict",
@@ -124,13 +125,13 @@ class JobStore:
 def _migrate(conn):
     """Add the config run-record columns to a runner_jobs table that lacks them."""
     columns = {row[1] for row in conn.execute("PRAGMA table_info(runner_jobs)")}
-    missing = [name for name in CONFIG_COLUMNS if name not in columns]
+    missing = [name for name in (CONFIG_COLUMNS | SNAPSHOT_COLUMNS) if name not in columns]
     if not missing:
         return
     conn.execute("BEGIN IMMEDIATE")
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(runner_jobs)")}
-        for name, datatype in CONFIG_COLUMNS.items():
+        for name, datatype in (CONFIG_COLUMNS | SNAPSHOT_COLUMNS).items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE runner_jobs ADD COLUMN {name} {datatype}")
         conn.execute("COMMIT")
@@ -211,14 +212,23 @@ def sweep(store, db, ws):
             machine = machines.get(row["machine_id"])
             disabled = machine is None or machine["revoked_at"] or not machine["enabled"]
             unbound = not disabled and machine["binding_state"] != "owner_attested"
+            stale = not disabled and (
+                row["binding_epoch"] is None or row["binding_epoch"] != machine["binding_epoch"]
+            )
             values = None
-            if row["state"] in ("queued", "leased") and (disabled or unbound):
+            if row["state"] in ("queued", "leased") and (disabled or unbound or stale):
                 values = {
                     "state": "cancelled",
-                    "outcome_code": ("machine_revoked" if disabled else "binding_not_attested"),
+                    "outcome_code": (
+                        "machine_revoked"
+                        if disabled
+                        else "binding_not_attested"
+                        if unbound
+                        else "binding_epoch_changed"
+                    ),
                 }
             elif row["state"] == "starting" and (
-                disabled or _after(row["starting_at"], 120) <= now
+                disabled or unbound or stale or _after(row["starting_at"], 120) <= now
             ):
                 values = {"state": "uncertain"}
             elif row["state"] == "leased" and row["lease_until"] <= now:
@@ -371,8 +381,8 @@ def create_in(
     job = "job_" + secrets.token_hex(8)
     conn.execute(
         "INSERT INTO runner_jobs(id,task_number,board_slug,machine_id,project,topic,"
-        "grant_version,runtime_mode,requested_by,request_key,request_hash,state,created_at,updated_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)",
+        "grant_version,binding_epoch,runtime_mode,requested_by,request_key,request_hash,state,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'queued',?,?)",
         (
             job,
             task_number,
@@ -381,6 +391,7 @@ def create_in(
             project,
             topic,
             machine["grant_version"],
+            machine["binding_epoch"],
             runtime_mode,
             requested_by,
             request_key,
@@ -405,16 +416,17 @@ def lease(store, machine):
     on = orch.enabled(store.gateway.db, store.workspace_id)
     workers = orch.workers(store.gateway.db, store.workspace_id) if on else frozenset()
     _sweep(store)
-    if machine["binding_state"] != "owner_attested":
-        return None
     # Resolve control data before taking the runner write lock.
     worker = store.gateway.db.connection(machine["worker_connection_id"], store.workspace_id)
     assignee = "conn:" + worker["name"]
     now = _now()
     with (
-        orch.admission(store.gateway, store.workspace_id, store=store)
-        if on
-        else store.transaction() as conn
+        ExitStack() as authority,
+        (
+            orch.admission(store.gateway, store.workspace_id, store=store)
+            if on
+            else store.transaction()
+        ) as conn,
     ):
         in_flight = conn.execute(
             "SELECT project,state,board_slug,task_number FROM runner_jobs WHERE machine_id=? AND "
@@ -465,6 +477,17 @@ def lease(store, machine):
                         return None
                     capped_boards.add(row["board_slug"])
                     continue
+            authority.enter_context(store.gateway.db._lock)
+            current = registry.get_machine(store.gateway.db, store.workspace_id, machine["id"])
+            refusal = binding_problem(current, row)
+            if refusal:
+                _update(conn, row, dict(state="cancelled", outcome_code=refusal, updated_at=now))
+                authority.pop_all().close()
+                continue
+            # A switch flip requires another admission pass; never use an OFF read
+            # as authority for an ON lease. Release control only after commit.
+            if orch.enabled(store.gateway.db, store.workspace_id) != on:
+                return None
             return _update(
                 conn,
                 row,
@@ -489,19 +512,36 @@ def renew(store, machine, lease_token):
         return _update(conn, row, dict(lease_until=_after(now, 60), updated_at=now), token=True)
 
 
+def binding_problem(machine, row, *, starting=False):
+    if machine is None or machine["revoked_at"] or not machine["enabled"]:
+        return "machine_disabled" if starting else "machine_revoked"
+    if machine["binding_state"] != "owner_attested":
+        return "binding_not_attested"
+    if row["binding_epoch"] is None or row["binding_epoch"] != machine["binding_epoch"]:
+        return "binding_epoch_changed"
+    return None
+
+
 def starting(store, machine, lease_token, *, validate):
-    """validate(row) returns a refusal code or None; called before the guarded write."""
+    """Serialize fresh control validation through the guarded write and commit."""
     _sweep(store)
     now = _now()
     refusal = None
-    with store.transaction() as conn:
+    with ExitStack() as authority, store.transaction() as conn:
         row = _fenced(conn, machine["id"], lease_token)
-        if row["state"] == "starting" and row["thread_id"] is None and row["outcome_code"] is None:
-            return dict(row)
-        if row["state"] != "leased":
+        retry = (
+            row["state"] == "starting" and row["thread_id"] is None and row["outcome_code"] is None
+        )
+        if row["state"] != "leased" and not retry:
             raise Conflict("start is not leased")
-        refusal = validate(row)
-        if refusal is None and _hourly(conn, machine, now):
+        authority.enter_context(store.gateway.db._lock)
+        current = registry.get_machine(store.gateway.db, store.workspace_id, machine["id"])
+        refusal = validate(row) or binding_problem(current, row, starting=True)
+        if retry:
+            if refusal:
+                raise Conflict(refusal)
+            return dict(row)
+        if refusal is None and _hourly(conn, current, now):
             refusal = "busy"
         values = (
             dict(state="cancelled", outcome_code=refusal)
@@ -509,7 +549,6 @@ def starting(store, machine, lease_token, *, validate):
             else dict(state="starting", starting_at=now)
         )
         updated = _update(conn, row, {**values, "updated_at": now}, token=True)
-    # A refusal must commit its cancellation before the 409 reaches the caller.
     if refusal:
         raise Conflict(refusal)
     return updated
@@ -593,8 +632,8 @@ def cancel(store, job, principal, *, conn=None, now=None, actor=None):
         return _update(conn, row, values)
 
 
-def resolve(store, job, principal, outcome, thread_id=None):
-    """Caller holds the control transaction and writes its audit before this update."""
+def resolve(store, job, principal, outcome, thread_id=None, *, conn=None):
+    """Owner caller audits first, using its runner-first transaction when supplied."""
     if not (principal.person and principal.role == "owner"):
         raise ToolError("no: a signed-in workspace owner is required")
     if outcome not in ("started", "failed"):
@@ -605,9 +644,10 @@ def resolve(store, job, principal, outcome, thread_id=None):
         raise ValueError("invalid thread_id")
     if outcome == "failed" and thread_id is not None:
         raise ValueError("thread_id is only valid for started")
-    _sweep(store)
+    if conn is None:
+        _sweep(store)
     now = _now()
-    with store.transaction() as conn:
+    with nullcontext(conn) if conn is not None else store.transaction() as conn:
         row = _row(conn, job)
         if row["state"] != "uncertain":
             raise Conflict("start is not uncertain")

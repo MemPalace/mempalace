@@ -177,7 +177,7 @@ def card_start_resolve(ctx, job, outcome, thread_id=None):
     ):
         raise ToolError("no: invalid resolution")
     store = _store(ctx)
-    with ctx.db._lock, ctx.db._tx():
+    with store.transaction() as conn, ctx.db._lock, ctx.db._tx():
         ctx.db.audit(
             action="runner.resolve",
             decision="allow",
@@ -187,7 +187,7 @@ def card_start_resolve(ctx, job, outcome, thread_id=None):
             auth=ctx.principal.auth,
             target_ids=(job,),
         )
-        row = jobs.resolve(store, job, ctx.principal, outcome, thread_id)
+        row = jobs.resolve(store, job, ctx.principal, outcome, thread_id, conn=conn)
     return {key: row[key] for key in ("state", "thread_id", "resolved_by", "resolved_at")}
 
 
