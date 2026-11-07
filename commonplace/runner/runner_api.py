@@ -1,6 +1,8 @@
 """Machine-only HTTP endpoints; no launch commands or user content cross this API."""
 
 import json
+import sqlite3
+from contextlib import nullcontext
 from urllib.parse import parse_qs, urlsplit
 
 from commonplace.boards._http import HTTPError, send_json
@@ -79,21 +81,32 @@ def _config_job_check(store, card, row):
         return runner_bridge.config_problem(conn, row)
 
 
-def _starting_check(gateway, machine, row, store=None):
+def _starting_principal(gateway, machine, row):
+    ref = row["requested_by"]
+    try:
+        if ref.startswith("user:"):
+            return person_principal(gateway.db, ref[5:], machine["workspace_id"])
+        if ref.startswith("conn:"):
+            return gateway.db.authenticate_connection(ref[5:])
+    except ControlError:
+        pass
+    return None
+
+
+def _starting_check(gateway, machine, row):
+    """Control authority only; safe inside the runner transaction/control lock."""
+    from commonplace.projects import orchestration as orch
+
+    try:
+        # Re-read the switch here so a read failure still refuses the transition.
+        orch.enabled(gateway.db, machine["workspace_id"])
+    except orch.SettingsUnavailable:
+        return "settings_unavailable"
     if not machine["enabled"] or machine["revoked_at"]:
         return "machine_disabled"
     if machine["binding_state"] != "owner_attested":
         return "binding_not_attested"
-    ref = row["requested_by"]
-    try:
-        if ref.startswith("user:"):
-            principal = person_principal(gateway.db, ref[5:], machine["workspace_id"])
-        elif ref.startswith("conn:"):
-            principal = gateway.db.authenticate_connection(ref[5:])
-        else:
-            principal = None
-    except ControlError:
-        principal = None
+    principal = _starting_principal(gateway, machine, row)
     if principal is None or not predicate.requester_ok(gateway, principal, machine):
         return "requester_invalid"
     if (
@@ -103,12 +116,27 @@ def _starting_check(gateway, machine, row, store=None):
         or jobs.MODES.index(row["runtime_mode"]) > jobs.MODES.index(machine["max_runtime_mode"])
     ):
         return "grant_changed"
+    return None
+
+
+def _starting_board_check(gateway, machine, row, store):
+    """Build services and validate cards before acquiring the runner transaction."""
+    from commonplace.projects import orchestration as orch
+
+    on = orch.enabled(gateway.db, machine["workspace_id"])
+    principal = _starting_principal(gateway, machine, row)
+    if principal is None:
+        return "requester_invalid"
     service = BoardService(ToolContext(principal=principal, gateway=gateway))
     try:
         with service.store.connection() as conn:
             card = task_row(conn, row["task_number"])
             require_visible(card, principal)
             board = service._board(conn, card["board"])
+            if on and row["config_version"] is None:
+                refusal = orch.requester_refusal(gateway, principal, board)
+                if refusal:
+                    return refusal
             if row["config_version"] is not None:
                 refusal = _config_job_check(store, card, row)
                 if refusal is not None:
@@ -150,8 +178,15 @@ def _listing(store, machine, query):
 def register(gateway):
     def route(h):
         try:
-            # The control lock keeps the grant stable through the guarded transition.
-            with gateway.db._lock:
+            from commonplace.projects import orchestration as orch
+
+            principal = gateway.principal_for(h)
+            if principal is None:
+                raise HTTPError(404, "not found")
+            on = orch.enabled(gateway.db, principal.workspace_id)
+            # Enabled admissions avoid holding control while waiting on runner locks.
+            # A concurrent switch flip can still reach the legacy off-path lock order.
+            with nullcontext() if on else gateway.db._lock:
                 principal = gateway.principal_for(h)
                 machine = _machine(gateway, principal)
                 if machine is None:
@@ -181,11 +216,22 @@ def register(gateway):
                     elif action == "renew":
                         row = jobs.renew(store, machine, **body)
                     elif action == "starting":
+                        with store.connection() as conn:
+                            candidate = jobs._fenced(conn, machine["id"], body["lease_token"])
+                        board_refusal = _starting_board_check(gateway, machine, candidate, store)
+
+                        def validate(row):
+                            with gateway.db._lock:
+                                current = registry.get_machine(
+                                    gateway.db, principal.workspace_id, machine["id"]
+                                )
+                                return _starting_check(gateway, current, row) or board_refusal
+
                         row = jobs.starting(
                             store,
                             machine,
                             **body,
-                            validate=lambda row: _starting_check(gateway, machine, row, store),
+                            validate=validate,
                         )
                     else:
                         row = jobs.result(store, machine, **body)
@@ -199,11 +245,18 @@ def register(gateway):
             send_json(h, 200, payload)
         except HTTPError as exc:
             send_json(h, exc.status, {"error": str(exc)})
+        except sqlite3.OperationalError as exc:
+            orch.require_lock_timeout(exc)
+            send_json(h, 409, {"error": "busy"})
         except jobs.Conflict as exc:
             send_json(h, 409, {"error": str(exc)})
         except ToolError as exc:
             message = str(exc).removeprefix("no: ")
-            send_json(h, 404 if message == "start not found" else 403, {"error": message})
+            send_json(
+                h,
+                getattr(exc, "status", 404 if message == "start not found" else 403),
+                {"error": message},
+            )
         except ValueError as exc:
             send_json(h, 400, {"error": str(exc)})
 

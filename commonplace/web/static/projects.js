@@ -398,6 +398,8 @@ export async function mountProject(host, { slug, api, e, settings = false, curre
   if (!active()) return;
 
   function renderMain() {
+    const trust = host.querySelector("[data-project-trust]");
+    if (trust) mountOrchestratorTrust(trust, {project, api, e, current: active});
     host.querySelector("[data-project-heading]").innerHTML = mainHTML(project, e, { notAnswering });
     const hint = host.querySelector("[data-project-notice]");
     if (hint) { hint.hidden = project.main.connected; hint.textContent = notice; }
@@ -634,11 +636,12 @@ export async function mountChatAnswers(host, { project, api, e, current = () => 
 }
 
 export function mountAgentLimit(host, { project, api, e, current = () => true, onSaved = () => {} }) {
-  let value = project.limits?.max_agents ?? null, busy = false, status = "";
+  let explicit = project.limits?.max_agents ?? null;
+  let value = explicit ?? project.orchestration?.default_max_agents ?? null, busy = false, status = "";
   const active = () => current() && host.isConnected;
   function render() {
     if (!active()) return;
-    host.innerHTML = `<div class="inline-row"><span id="project-max-agents">Max agents working at once</span><div class="stepper" role="group" aria-labelledby="project-max-agents"><button type="button" aria-label="One fewer" data-limit-step="-1" ${!project.can_configure || busy || value === null || value <= 1 ? "disabled" : ""}>−</button><output aria-live="polite" data-limit-value>${value === null ? "No limit" : value}</output><button type="button" aria-label="One more" data-limit-step="1" ${!project.can_configure || busy || value === 20 ? "disabled" : ""}>+</button></div><span class="set-note">Extra cards wait in Todo.</span>${project.can_configure && value !== null ? '<button type="button" class="btn ghost" data-limit-clear>Remove limit</button>' : ""}</div><p role="status" data-limit-status>${e(status)}</p>`;
+    host.innerHTML = `<div class="inline-row"><span id="project-max-agents">Max agents working at once</span><div class="stepper" role="group" aria-labelledby="project-max-agents"><button type="button" aria-label="One fewer" data-limit-step="-1" ${!project.can_configure || busy || value === null || value <= 1 ? "disabled" : ""}>−</button><output aria-live="polite" data-limit-value>${value === null ? "No limit" : value}</output><button type="button" aria-label="One more" data-limit-step="1" ${!project.can_configure || busy || value === 20 ? "disabled" : ""}>+</button></div><span class="set-note">Extra cards wait in Todo.</span>${project.can_configure && explicit !== null ? `<button type="button" class="btn ghost" data-limit-clear>${project.orchestration ? "Use default" : "Remove limit"}</button>` : ""}</div><p role="status" data-limit-status>${e(status)}</p>`;
     host.querySelectorAll("[data-limit-step]").forEach(button => {
       button.onclick = () => save(value === null ? 1 : value + Number(button.getAttribute("data-limit-step")));
     });
@@ -650,7 +653,7 @@ export function mountAgentLimit(host, { project, api, e, current = () => true, o
     busy = true; status = ""; render();
     try {
       const result = await api(`/api/projects/${encodeURIComponent(project.board)}/limits`, {method: "PUT", body: {max_agents: next}});
-      if (active()) { value = result.limits.max_agents; status = savedAt(); onSaved(); }
+      if (active()) { explicit = result.limits.max_agents; value = explicit ?? result.orchestration?.default_max_agents ?? null; status = savedAt(); onSaved(); }
     } catch { if (active()) status = "Could not save maximum agents"; }
     finally { busy = false; render(); }
   }
@@ -755,7 +758,7 @@ function installProjectStyles() {
 
 export function projectSettingsHTML(project, e, {origin = "", restart = false} = {}) {
   const back = settingsOrigin(project.board, origin);
-  return `<section class="workbench-project" aria-labelledby="project-settings-title"><header class="project-top"><h1 id="project-settings-title">${e(project.name)}<span class="title-sub"> <span class="desk-only">Project </span>settings</span></h1><span class="saved" role="status" data-project-saved>Changes save automatically</span><a class="btn back" data-project-back href="${e(back.href)}"${back.href.startsWith("#/board/") && !back.href.endsWith("/chat") ? ' data-keys="G B"' : ""}>${back.label}</a></header><div class="settings"><div class="settings-inner"><section class="set-sec"><h2>Orchestrator</h2><p class="lead">The project's lead agent: it reads chat and turns requests into cards. With no agent connected, chat requests wait.</p><div class="orch-card${restart ? " warn" : ""}" data-project-heading></div><p data-project-notice hidden></p><p role="status" data-project-connect-status></p>${restart ? '<div class="restart-box"><h3>How to restart the agent</h3><ol><li>Check that the agent app is open and the computer is awake.</li><li>Quit the agent app and start it again. It reconnects with the same setup.</li><li>Check that the computer can still reach this Commonplace (same network or VPN).</li></ol><button type="button" class="btn primary" data-project-check>Check again</button><p role="status" data-project-check-status></p></div>' : ""}<p class="phone-note set-note">Connect an agent on a computer.</p></section><section class="set-sec"><h2>Chat answers</h2><div data-project-chat></div></section><section class="set-sec"><h2>Agents</h2><div data-project-limit></div><div data-project-agents></div><p class="phone-note set-note">To connect or disconnect an agent, open Settings on a computer. Agents run there.</p></section><section class="set-sec"><h2>Project memory</h2><div data-project-memory></div></section><details class="set-sec"><summary>Agent models</summary>${modelsHTML(project, e)}</details></div></div></section>`;
+  return `<section class="workbench-project" aria-labelledby="project-settings-title"><header class="project-top"><h1 id="project-settings-title">${e(project.name)}<span class="title-sub"> <span class="desk-only">Project </span>settings</span></h1><span class="saved" role="status" data-project-saved>Changes save automatically</span><a class="btn back" data-project-back href="${e(back.href)}"${back.href.startsWith("#/board/") && !back.href.endsWith("/chat") ? ' data-keys="G B"' : ""}>${back.label}</a></header><div class="settings"><div class="settings-inner"><section class="set-sec"><h2>Orchestrator</h2><p class="lead">The project's lead agent: it reads chat and turns requests into cards. With no agent connected, chat requests wait.</p><div class="orch-card${restart ? " warn" : ""}" data-project-heading></div><p data-project-notice hidden></p><p role="status" data-project-connect-status></p><div data-project-trust></div>${restart ? '<div class="restart-box"><h3>How to restart the agent</h3><ol><li>Check that the agent app is open and the computer is awake.</li><li>Quit the agent app and start it again. It reconnects with the same setup.</li><li>Check that the computer can still reach this Commonplace (same network or VPN).</li></ol><button type="button" class="btn primary" data-project-check>Check again</button><p role="status" data-project-check-status></p></div>' : ""}<p class="phone-note set-note">Connect an agent on a computer.</p></section><section class="set-sec"><h2>Chat answers</h2><div data-project-chat></div></section><section class="set-sec"><h2>Agents</h2><div data-project-limit></div><div data-project-agents></div><p class="phone-note set-note">To connect or disconnect an agent, open Settings on a computer. Agents run there.</p></section><section class="set-sec"><h2>Project memory</h2><div data-project-memory></div></section><details class="set-sec"><summary>Agent models</summary>${modelsHTML(project, e)}</details></div></div></section>`;
 }
 
 export async function mountProjectAgents(host, {project, api, e, current, onUpdate}) {
@@ -799,6 +802,73 @@ export async function mountProjectAgents(host, {project, api, e, current, onUpda
         finally { busy = false; render(); }
       };
     });
+  }
+  render();
+}
+
+let orchestrationSheet;
+function installOrchestrationStyles() {
+  if (orchestrationSheet || !globalThis.document?.adoptedStyleSheets) return;
+  orchestrationSheet = new CSSStyleSheet();
+  orchestrationSheet.replaceSync(`
+    .orchestration-controls label {display:flex;align-items:center;gap:8px;margin:8px 0;font-size:14px;line-height:1.5;min-height:32px}
+    .orchestration-controls input[type=checkbox] {appearance:auto;flex:none;width:18px;height:18px;min-height:0;padding:0;margin:0;box-shadow:none;accent-color:var(--strong)}
+    .orchestration-controls p {font-size:14px;line-height:1.5;margin:8px 0}
+    @media(max-width:699px) {.orchestration-controls label {min-height:44px}}
+  `);
+  document.adoptedStyleSheets = [...document.adoptedStyleSheets, orchestrationSheet];
+}
+
+export function mountWorkspaceOrchestration(host, {api, e, enabled, current = () => true}) {
+  installOrchestrationStyles();
+  let busy = false, status = "";
+  const active = () => current() && host.isConnected;
+  function render() {
+    if (!active()) return;
+    host.innerHTML = `<div class="orchestration-controls"><label><input type="checkbox" data-orchestration-enabled ${enabled ? "checked" : ""} ${busy ? "disabled" : ""}> Orchestrators manage agent starts</label><p>Only each project's orchestrator can request agent starts. Projects default to three agents at once. Turning this off removes trust and runner access granted to project seats.</p><p role="status">${e(status)}</p></div>`;
+    host.querySelector("[data-orchestration-enabled]").onchange = async event => {
+      const next = event.target.checked;
+      if (busy || !active()) return;
+      busy = true; status = ""; render();
+      try {
+        const result = await api("/api/settings/orchestration", {method: "PUT", body: {enabled: next}});
+        if (active()) { enabled = result.enabled; status = "Saved"; }
+      } catch { if (active()) status = "Could not save orchestration settings"; }
+      finally { busy = false; render(); }
+    };
+  }
+  render();
+}
+
+export function mountOrchestratorTrust(host, {project, api, e, current = () => true}) {
+  installOrchestrationStyles();
+  const active = () => current() && host.isConnected;
+  const orchestration = project.orchestration;
+  if (!orchestration || !project.can_configure || !project.main.connected) { host.replaceChildren(); return; }
+  let trusted = orchestration.trusted, busy = false, status = "";
+  const machines = orchestration.machines || [];
+  function render() {
+    if (!active()) return;
+    host.innerHTML = `<details class="orchestration-controls"><summary>Orchestrator start permissions</summary><p>Trust lets this seat request starts on selected machines, read permitted project data and repository rules, release and approve cards, annotate cards and stamp trusted submissions. It can view start status and cancel its own starts. It cannot create boards or launch handoffs.</p>${machines.map(m => `<label><input type="checkbox" data-trust-machine value="${e(m.id)}" ${busy ? "disabled" : ""}> ${e(m.label)}</label>`).join("")}<p><label><input type="checkbox" data-trust-confirm ${busy ? "disabled" : ""}> I approve these permissions</label></p><button type="button" class="btn" data-trust-grant ${busy || !machines.length ? "disabled" : ""}>Trust and allow starts</button>${trusted ? `<button type="button" class="btn ghost" data-trust-remove ${busy ? "disabled" : ""}>Remove trust</button>` : ""}<p role="status">${e(status)}</p></details>`;
+    host.querySelector("[data-trust-grant]").onclick = () => {
+      const selected = [...host.querySelectorAll("[data-trust-machine]:checked")].map(input => input.value);
+      if (!host.querySelector("[data-trust-confirm]").checked || !selected.length) {
+        host.querySelector("[role=status]").textContent = "Select machines and approve the permissions first";
+        return;
+      }
+      return save({confirm: true, machines: selected});
+    };
+    const remove = host.querySelector("[data-trust-remove]");
+    if (remove) remove.onclick = () => save({trusted: false});
+  }
+  async function save(body) {
+    if (busy || !active()) return;
+    busy = true; status = ""; render();
+    try {
+      const result = await api(`/api/projects/${encodeURIComponent(project.board)}/orchestrator/trust`, {method: "POST", body});
+      if (active()) { trusted = result.trusted; orchestration.trusted = trusted; status = "Saved"; }
+    } catch { if (active()) status = "Could not save orchestrator permissions"; }
+    finally { busy = false; render(); }
   }
   render();
 }

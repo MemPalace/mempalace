@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS runner_jobs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS runner_jobs_one_active ON runner_jobs(task_number)
  WHERE state IN ('queued','leased','starting','uncertain');
+CREATE INDEX IF NOT EXISTS runner_jobs_board_state ON runner_jobs(board_slug,state);
 CREATE UNIQUE INDEX IF NOT EXISTS runner_jobs_request
  ON runner_jobs(task_number,requested_by,request_key) WHERE request_key IS NOT NULL;
 """
@@ -279,9 +280,17 @@ def create(
 
     requested_by is user:<id> or conn:<connection_id>, never a connection name.
     """
+    from commonplace.projects import orchestration as orch
+
+    on = orch.enabled(store.gateway.db, store.workspace_id)
+    workers = orch.workers(store.gateway.db, store.workspace_id) if on else frozenset()
     _sweep(store)
     now = _now()
-    with store.transaction() as conn:
+    with (
+        orch.admission(store.gateway, store.workspace_id, store=store)
+        if on
+        else store.transaction() as conn
+    ):
         return create_in(
             conn,
             now=now,
@@ -294,6 +303,13 @@ def create(
             runtime_mode=runtime_mode,
             request_key=request_key,
             person=person,
+            admission_check=(
+                lambda: orch.check_start(
+                    store.gateway, store.workspace_id, conn, board_slug, task_number, workers, now
+                )
+            )
+            if on
+            else None,
         )
 
 
@@ -311,6 +327,7 @@ def create_in(
     request_key=None,
     person=False,
     config=None,
+    admission_check=None,
 ):
     """``create`` on the caller's open ``BEGIN IMMEDIATE`` connection.
 
@@ -349,6 +366,8 @@ def create_in(
     ).fetchone()[0]
     if queued >= QUEUE_LIMIT or _hourly(conn, machine, now):
         raise Conflict("busy")
+    if admission_check is not None:
+        admission_check()
     job = "job_" + secrets.token_hex(8)
     conn.execute(
         "INSERT INTO runner_jobs(id,task_number,board_slug,machine_id,project,topic,"
@@ -381,11 +400,19 @@ def create_in(
 
 
 def lease(store, machine):
+    from commonplace.projects import orchestration as orch
+
+    on = orch.enabled(store.gateway.db, store.workspace_id)
+    workers = orch.workers(store.gateway.db, store.workspace_id) if on else frozenset()
     _sweep(store)
     if machine["binding_state"] != "owner_attested":
         return None
     now = _now()
-    with store.transaction() as conn:
+    with (
+        orch.admission(store.gateway, store.workspace_id, store=store)
+        if on
+        else store.transaction() as conn
+    ):
         in_flight = conn.execute(
             "SELECT project FROM runner_jobs WHERE machine_id=? AND "
             "(state IN ('leased','starting','uncertain') OR (state='started' AND started_at>?))",
@@ -394,30 +421,42 @@ def lease(store, machine):
         if len(in_flight) >= machine["max_in_flight"]:
             return None
         projects = {r["project"] for r in in_flight}
-        row = next(
-            (
-                r
-                for r in conn.execute(
-                    "SELECT * FROM runner_jobs WHERE machine_id=? AND state='queued' ORDER BY created_at,rowid",
-                    (machine["id"],),
-                )
-                if r["project"] not in projects
-            ),
-            None,
-        )
-        if row is None:
-            return None
-        return _update(
-            conn,
-            row,
-            dict(
-                state="leased",
-                lease_token=secrets.token_urlsafe(32),
-                lease_until=_after(now, 60),
-                attempt=row["attempt"] + 1,
-                updated_at=now,
-            ),
-        )
+        capped_boards = set()
+        for row in conn.execute(
+            "SELECT * FROM runner_jobs WHERE machine_id=? AND state='queued' ORDER BY created_at,rowid",
+            (machine["id"],),
+        ):
+            if row["project"] in projects or row["board_slug"] in capped_boards:
+                continue
+            if on:
+                try:
+                    orch.check_start(
+                        store.gateway,
+                        store.workspace_id,
+                        conn,
+                        row["board_slug"],
+                        row["task_number"],
+                        workers,
+                        now,
+                        lease=True,
+                    )
+                except orch.AdmissionRefused as exc:
+                    if exc.code != "project_limit":
+                        return None
+                    capped_boards.add(row["board_slug"])
+                    continue
+            return _update(
+                conn,
+                row,
+                dict(
+                    state="leased",
+                    lease_token=secrets.token_urlsafe(32),
+                    lease_until=_after(now, 60),
+                    attempt=row["attempt"] + 1,
+                    updated_at=now,
+                ),
+            )
+        return None
 
 
 def renew(store, machine, lease_token):

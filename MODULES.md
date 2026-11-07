@@ -30,7 +30,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `AGENTS.md`, `CHANGELOG.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `HUB-DESIGN.md`, `INSPIRATION-REPOS.md`, `LICENSE`, `MISSION.md`, `PRODUCT-DESIGN.md`, `README.md`, `REPORT.md`, `ROADMAP.md`, `SECURITY.md`, `openarena-claim.txt`, `design/`, `docs/`
 - **Owns:** Contributor and agent instructions, the mission and design notes, user and operator documentation, release history, the licence and the security policy.
-- **Promises:** Documentation describes shipped behaviour; design notes are marked as proposals. Public text uses synthetic names only and carries no secrets or private hosts.
+- **Promises:** Documentation describes shipped behaviour; design notes are marked as proposals. Project documentation explains opt-in start authority, shared admission, seat consent and the card-webhook delivery residual. Public text uses synthetic names only and carries no secrets or private hosts.
 - **How it fails:** Text drifts from code silently; nothing executes most of it. Broken commands in docs surface only when someone follows them.
 - **Tests:** `tests/test_commonplace_public_surface.py`, `tests/test_commonplace_legal_pages.py` and the documentation checks in `tests/test_commonplace_release_gate.py`.
 
@@ -88,7 +88,7 @@ Format (read by `commonplace orch docs-check`):
 - **Owns:** Shared fixtures and harnesses and every test file not listed in another block.
 - **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls. Restricted-origin content-edit regressions verify audit attribution and unchanged release and claim state through both public routes.
 - **How it fails:** A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
-- **Tests:** The suite itself under the coverage gate; `tests/test_commonplace_webhooks.py::test_dispatcher_thread_survives_an_unexpected_pass_error` checks that an unexpected delivery-pass error is logged without its private message and the dispatcher retries while staying alive.
+- **Tests:** The suite itself under the coverage gate; `tests/test_commonplace_webhooks.py::test_dispatcher_thread_survives_an_unexpected_pass_error` checks that an unexpected delivery-pass error is logged without its private message and the dispatcher retries while staying alive. `tests/test_projects_phase_b.py` and `tests/test_projects_admission.py` keep paired pin/head assertions and independent runner-lock coverage.
 
 ## hub-core
 
@@ -118,7 +118,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `commonplace/boards/`, `commonplace/events.py`, `commonplace/webhooks.py`, `commonplace/holds.py`, `commonplace/callstack.py`
 - **Owns:** Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
-- **Promises:** Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval. Trusted agents and authorized board coordinators may edit only the title/body of unassigned restricted-origin todo cards without releasing the origin or changing claim authority.
+- **Promises:** Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval. Trusted agents and authorized board coordinators may edit only the title/body of unassigned restricted-origin todo cards without releasing the origin or changing claim authority. With workspace orchestration enabled, claims hold runner admission through board commit and person assignments or handoffs cannot reserve a busy agent.
 - **How it fails:** A swallowed emission loses a notification but not the change (the trigger sweep reads `task_events`); webhook delivery retries and records failures. Each unexpected dispatcher-pass exception is contained and logged without its private message, then waits on the stop event for 5 s, doubling after consecutive errors up to 300 s, before continuing. A successful pass resets the backoff; stopping interrupts the wait, and a closed database still ends the dispatcher.
 - **Tests:** `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`, `tests/test_commonplace_webhooks.py`.
 
@@ -126,7 +126,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `commonplace/runner/`, `docs/runner.md`
 - **Owns:** Machine enrollment and grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
-- **Promises:** A start needs a person owner or a listed trusted PAT and a card the worker could claim; one active start per card; an uncertain launch is never re-queued; on a configured board `card_start` is person-owner only, starts are fenced and capped, and the lease payload carries the pinned message and model.
+- **Promises:** A start needs a person owner or a listed trusted PAT and a card the worker could claim; one active start per card; an uncertain launch is never re-queued; on a configured board `card_start` is person-owner only, starts are fenced and capped, and the lease payload carries the pinned message and model. Opt-in orchestration requires the active coordinator for unconfigured PAT requests, reserves project capacity when starts are queued, and admits leases using active slots under the shared runner lock.
 - **How it fails:** A lost launch result becomes `uncertain` and waits for a person; a revoked machine cancels queued jobs on the next sweep; a busy queue refuses with `busy`.
 - **Tests:** The `tests/test_runner_` files, `tests/test_orch_runner.py`, `tests/test_orch_acceptance.py`.
 
@@ -134,7 +134,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `commonplace/orch/`, `docs/orchestrator.md`, `tests/_orch_helpers.py`, `tests/test_orch_acceptance.py`, `tests/test_orch_schema.py`, `tests/test_orch_store.py`, `tests/test_orch_durable.py`, `tests/test_orch_runner.py`, `tests/test_orch_surfaces.py`, `tests/test_orch_checks.py`, `tests/test_orch_plan_gate.py`, `tests/test_docs_obligations.py`
 - **Owns:** The planner grammar, including leading numeric labels and repository-relative existing test-file mappings; the orchestrator config format and its versions and experiments, config-driven starts, triggers, leases, the journal, resume, the restore flag and acknowledgement, `plan-check` and `docs-check`.
-- **Promises:** Only owner-accepted versions run; every config-driven start is one fenced, capped transaction; a retry returns the stored job; external effects are never re-issued by the hub; after a restore nothing config-driven runs until the owner acknowledges; boards without a `[runner]` config behave as before.
+- **Promises:** Only owner-accepted versions run; every config-driven start is one fenced, capped transaction; a retry returns the stored job; external effects are never re-issued by the hub; after a restore nothing config-driven runs until the owner acknowledges. Configured starts share project admission with claims and plain jobs when workspace orchestration is enabled; boards without a `[runner]` config retain earlier behavior with the workspace switch off.
 - **How it fails:** Refusals become coded misses shown on resume; an unproven external effect becomes `needs_person`; infrastructure errors leave the trigger cursor in place for the next sweep.
 - **Tests:** The `tests/test_orch_` files listed in Paths and `tests/test_docs_obligations.py`; R22 in `tests/test_orch_checks.py` covers misplaced labels, missing files, accepted label forms and repository-root resolution. R1, R1b, R1d, R1e, R8b, R10a and R11e map to `tests/test_orch_acceptance.py`.
 
@@ -142,7 +142,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `commonplace/projects/`, `commonplace/plans.py`
 - **Owns:** Project orchestrator seats, project model choices, project limits, project wings and optional hosted plans.
-- **Promises:** Only a signed-in owner changes models or limits; `max_agents` counts distinct connection assignees; model resolution goes project, then workspace, then the runner default.
+- **Promises:** Only a signed-in owner changes models or limits; `max_agents` counts distinct connection assignees with orchestration off; opt-in orchestration shares card/job admission accounting, default cap 3, owner-only settings and atomic seat trust; model resolution goes project, then workspace, then the runner default.
 - **How it fails:** An unresolved model refuses a config-driven start before insert; a limit change does not stop work already started.
 - **Tests:** The `tests/test_projects_` files, `tests/test_commonplace_plans.py`.
 
@@ -213,7 +213,7 @@ Format (read by `commonplace orch docs-check`):
 ## web-and-console
 
 - **Paths:** `commonplace/web/`, `commonplace/console/`
-- **Owns:** The cookie-authenticated web app and the live console.
+- **Owns:** The cookie-authenticated web app and the live console, including the owner orchestration switch, project seat-consent controls and default agent-limit display.
 - **Promises:** The web app calls the same services as REST; it shows only what the signed-in person may read.
 - **How it fails:** Rendering errors surface in the browser; the server state is unaffected.
 - **Tests:** The `tests/test_workbench_` files, the `tests/test_console_` files and the `tests/test_commonplace_console_` files.

@@ -271,26 +271,39 @@ def _active(db, owner, machine_id):
 def patch(db, owner, machine_id, grant):
     _owner(owner)
     with db._lock, db._tx():
-        row = _active(db, owner, machine_id)
+        return patch_in(db, owner, machine_id, grant)
+
+
+def patch_in(db, owner, machine_id, grant, *, remove_requester=None):
+    """Patch inside the caller's control transaction; removal preserves stale peers."""
+    _owner(owner)
+    row = (
+        _active(db, owner, machine_id)
+        if remove_requester is None
+        else get_machine(db, owner.workspace_id, machine_id)
+    )
+    if remove_requester is None:
         data = _grant(db, owner, grant)
-        reset = any(
-            key in data and data[key] != json.loads(row[key]) for key in ("topics", "wings")
+    else:
+        data = {
+            "requesters": [ref for ref in json.loads(row["requesters"]) if ref != remove_requester]
+        }
+    reset = any(key in data and data[key] != json.loads(row[key]) for key in ("topics", "wings"))
+    if "wings" in data:
+        db._conn.execute(
+            "UPDATE connections SET policy=? WHERE id=?",
+            (_worker_policy(data["wings"]).to_json(), row["worker_connection_id"]),
         )
-        if "wings" in data:
-            db._conn.execute(
-                "UPDATE connections SET policy=? WHERE id=?",
-                (_worker_policy(data["wings"]).to_json(), row["worker_connection_id"]),
-            )
-        data.update(
-            grant_version=row["grant_version"] + 1,
-            updated_by=owner.user_id,
-            updated_at=control_db._iso(control_db._now()),
-        )
-        _write(db, row["id"], data)
-        if reset:
-            db._conn.execute(f"UPDATE runner_machines SET {RESET} WHERE id=?", (row["id"],))
-        _audit(db, owner, "patch", row["id"], reset=reset)
-        return get_machine(db, owner.workspace_id, row["id"])
+    data.update(
+        grant_version=row["grant_version"] + 1,
+        updated_by=owner.user_id,
+        updated_at=control_db._iso(control_db._now()),
+    )
+    _write(db, row["id"], data)
+    if reset:
+        db._conn.execute(f"UPDATE runner_machines SET {RESET} WHERE id=?", (row["id"],))
+    _audit(db, owner, "patch", row["id"], reset=reset)
+    return get_machine(db, owner.workspace_id, row["id"])
 
 
 def attest(db, owner, machine_id, binding):
@@ -398,3 +411,19 @@ def revoke(db, owner, machine_id):
 
 def worker_principal(db, machine):
     return db.authenticate_connection(machine["worker_connection_id"])
+
+
+def seat_trust_in(db, owner, seat_cid, trusted):
+    """Change only the trust bit of an active project seat, inside a control txn."""
+    _owner(owner)
+    row = db.connection(seat_cid, owner.workspace_id)
+    principal = db.authenticate_connection(seat_cid)
+    seat = db._conn.execute(
+        "SELECT 1 FROM project_orchestrators WHERE workspace_id=? AND connection_id=?",
+        (owner.workspace_id, seat_cid),
+    ).fetchone()
+    if principal is None or not seat or getattr(principal, "runner", None) is not None:
+        raise Conflict("seat is not active")
+    policy = json.loads(row["policy"])
+    policy["trust"] = "trusted" if trusted else "standard"
+    db._conn.execute("UPDATE connections SET policy=? WHERE id=?", (json.dumps(policy), seat_cid))

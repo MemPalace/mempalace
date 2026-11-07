@@ -85,6 +85,10 @@ def card_start(
         raise ToolError("no: runtime mode not allowed")
     if config_ref is not None and (not isinstance(config_ref, str) or not config_ref):
         raise ToolError("no: invalid config_ref")
+    from commonplace.projects import orchestration as orch
+
+    # Fail closed on a settings read error before resolving the start.
+    orch.enabled(ctx.db, ctx.principal.workspace_id)
     machine = registry.get_machine(ctx.db, ctx.principal.workspace_id, machine)
     if machine is None or not machine["enabled"] or machine["revoked_at"]:
         raise ToolError("no: machine not found")
@@ -121,6 +125,12 @@ def card_start(
             request_key=request_key,
             config_ref=config_ref,
         )
+    from commonplace.projects import orchestration as orch
+
+    if orch.enabled(ctx.db, ctx.principal.workspace_id):
+        refusal = orch.requester_refusal(ctx.gateway, ctx.principal, board)
+        if refusal:
+            raise orch.AdmissionRefused(refusal)
     if config_ref is not None:
         raise ToolError("no: config_ref needs a board with an orchestrator config")
     runtime_mode = "approval-required" if runtime_mode is None else runtime_mode

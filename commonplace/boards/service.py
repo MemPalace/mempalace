@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from time import monotonic
 from urllib.parse import urlparse
@@ -734,14 +734,34 @@ class BoardService:
 
     @contextmanager
     def transaction(self):
+        from commonplace.projects import orchestration as orch
+
         self.pending = []
         conflict = None
-        with self.store.transaction() as conn:
-            try:
-                yield conn
-            except VersionClash as exc:
-                # System expiries precede the version check; publish that current card.
-                conflict = exc
+        try:
+            self._orchestration_on = orch.enabled(self.ctx.db, self.principal.workspace_id)
+        except orch.SettingsUnavailable as exc:
+            self._orchestration_on = exc
+        self._workers = (
+            orch.workers(self.ctx.db, self.principal.workspace_id)
+            if self._orchestration_on is True
+            else frozenset()
+        )
+        self._is_seat = (
+            orch.seat_connection(
+                self.ctx.db, self.principal.workspace_id, self.principal.connection_id
+            )
+            if self._orchestration_on is True and not self.principal.person
+            else False
+        )
+        self._admission_conn = None
+        # Commit/rollback boards before releasing the admission lock.
+        with ExitStack() as self._admissions:
+            with self.store.transaction() as conn:
+                try:
+                    yield conn
+                except VersionClash as exc:
+                    conflict = exc
         for kind, subject, data, actor in self.pending:
             try:
                 events.emit(
@@ -1006,6 +1026,8 @@ class BoardService:
 
     def _add_board(self, conn, *, slug, name=None, wing=None, repo=None, bootstrap=False):
         p = self.principal
+        if self._is_seat:
+            raise ToolError("no: seat_cannot_create_boards")
         if not bootstrap and not p.person and p.policy.trust != "trusted":
             raise ToolError("no: only an owner or trusted connection can create a board")
         slug = validate_text(slug, "slug", required=True, limit=100)
@@ -1245,6 +1267,24 @@ class BoardService:
                         "agents_working": len(limits.working(conn, board["id"])),
                     }
                 )
+                if self._orchestration_on is True:
+                    from commonplace.projects import orchestration as orch
+                    from commonplace.runner import jobs
+
+                    with jobs.open_store(
+                        self.ctx.gateway, self.principal.workspace_id
+                    ).connection() as runner:
+                        used = orch.usage(
+                            conn,
+                            runner,
+                            board_id=board["id"],
+                            board_slug=board["slug"],
+                            workers=self._workers,
+                            now=jobs._now(),
+                            # The board shows active usage; queued jobs reserve at create.
+                            lease=True,
+                        )
+                        result[-1].update(max_agents=used.cap, used=used.used)
             return result
 
     def board_add(self, slug, name=None, wing=None, repo=None):
@@ -1675,6 +1715,13 @@ class BoardService:
             return None
         return row["id"] if row is not None else None
 
+    def _check_busy_assignment(self, conn, board, assignee):
+        if self.principal.person and self._orchestration_on is True:
+            from commonplace.projects.orchestration import AdmissionRefused, busy_agent
+
+            if busy_agent(conn, board["id"], assignee):
+                raise AdmissionRefused("agent_busy")
+
     def _new_card(
         self,
         conn,
@@ -1721,6 +1768,7 @@ class BoardService:
             raise ToolError("no: claim must be a boolean")
         if assignee is not None:
             assignee = self._work_actor(assignee, board)
+            self._check_busy_assignment(conn, board, assignee)
         child = None
         if assignee and assignee.startswith("conn:") and assignee != p.actor:
             try:
@@ -1771,7 +1819,7 @@ class BoardService:
         if status == "doing":
             from commonplace.projects import limits
 
-            limits.check(conn, board, assignee)
+            limits.check(conn, board, assignee, service=self)
         self._planner_card_check(conn, board["id"], p.actor, status, body)
         until = self._until(board) if status == "doing" and assignee.startswith("conn:") else None
         position = conn.execute(
@@ -2065,7 +2113,7 @@ class BoardService:
             self._write(b, row=row, claiming=True)
             from commonplace.projects import limits
 
-            limits.check(conn, b, self.principal.actor)
+            limits.check(conn, b, self.principal.actor, service=self, card_id=row["id"])
             self._set(
                 conn,
                 row,
@@ -2475,7 +2523,7 @@ class BoardService:
                 if status == "doing":
                     from commonplace.projects import limits
 
-                    limits.check(conn, board, self.principal.actor)
+                    limits.check(conn, board, self.principal.actor, service=self, card_id=row["id"])
                     updates["assignee"] = self.principal.actor
                     updates["claim_until"] = None if self.principal.person else self._until(board)
                 else:
@@ -2565,6 +2613,7 @@ class BoardService:
         if not self.principal.person and _waiting_on_person(row):
             raise ToolError("no: waiting on a person, they must answer via decide")
         target = self._work_actor(to, board)
+        self._check_busy_assignment(conn, board, target)
         person = target is not None and target.startswith("user:")
         if row["status"] == "todo" and not person and not self.principal.person:
             raise ToolError("no: take this card before handing it off")

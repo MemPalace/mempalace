@@ -42,8 +42,31 @@ def working(conn, board_id):
     }
 
 
-def check(conn, board, actor):
+def check(conn, board, actor, *, service=None, card_id=None):
     """Call inside the card's write transaction, before admitting an agent."""
+    if service is not None:
+        from commonplace.projects import orchestration as orch
+        from commonplace.runner import jobs
+
+        state = service._orchestration_on
+        if isinstance(state, Exception):
+            raise state
+        if state:
+            if service._admission_conn is None:
+                service._admission_conn = service._admissions.enter_context(
+                    orch.admission(service.ctx.gateway, service.principal.workspace_id)
+                )
+            used = orch.usage(
+                conn,
+                service._admission_conn,
+                board_id=board["id"],
+                board_slug=board["slug"],
+                workers=service._workers,
+                now=jobs._now(),
+            )
+            if actor and actor.startswith("conn:"):
+                orch.admit(used, actor, card_id)
+            return
     if not actor or not actor.startswith("conn:"):
         return
     cap = get(conn, board["id"])["max_agents"]

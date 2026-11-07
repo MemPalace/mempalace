@@ -95,6 +95,9 @@ class Plan:
     refusal: str | None  # card/grant/machine refusal, applied to new inserts only
     requested_by: str
     person: bool
+    orchestration_on: bool = False
+    workers: frozenset = frozenset()
+    workspace_dir: str | None = None
 
     @property
     def role(self) -> schema.Role:
@@ -236,6 +239,10 @@ def prepare(
     person: bool,
 ) -> Plan:
     """Read the control snapshot of one start (before ``fenced_start``)."""
+    from commonplace.projects import orchestration as orch
+
+    on = orch.enabled(gateway.db, workspace_id)
+    workers = orch.workers(gateway.db, workspace_id) if on else frozenset()
     config = version.config()
     role = config.runner_role
     if config.runner is None or role is None:
@@ -272,6 +279,9 @@ def prepare(
         else card_refusal(gateway, machine, card_row, board_row, principal, config),
         requested_by=requested_by,
         person=person,
+        orchestration_on=on,
+        workers=workers,
+        workspace_dir=gateway.workspace_dir(workspace_id),
     )
 
 
@@ -392,7 +402,27 @@ def _fenced(conn, plan, *, path, role, step_key, epoch, token, request_key, now,
     if plan.refusal is not None:
         raise StartRefused(plan.refusal, f"card is not startable: {plan.refusal}")
     # 4. cap.
-    if _cap_count(conn, plan, now) >= plan.cap:
+    if plan.orchestration_on:
+        from commonplace.projects import orchestration as orch
+
+        with orch.board_read(plan.workspace_dir) as boards:
+            used = orch.usage(
+                boards,
+                conn,
+                board_id=plan.board_id,
+                board_slug=plan.board,
+                workers=plan.workers,
+                now=now,
+            )
+            used = orch.Usage(
+                used.slots,
+                orch.effective_cap(boards, plan.board_id, plan.config.max_agents, on=True),
+            )
+            try:
+                orch.admit(used, None, plan.card)
+            except orch.AdmissionRefused as exc:
+                raise StartRefused(exc.code, str(exc).removeprefix("no: ")) from None
+    elif _cap_count(conn, plan, now) >= plan.cap:
         raise StartRefused("at_cap", f"the board is at its cap of {plan.cap} agents")
     # 5. insert.
     try:
@@ -481,8 +511,14 @@ def fenced_start(
         event=trigger.event if trigger else None,
         request_key=request_key,
     )
+    from commonplace.projects import orchestration as orch
+
     refusal = None
-    with store.transaction() as conn:
+    with (
+        orch.admission(store.gateway, store.workspace_id, store=store)
+        if plan.orchestration_on
+        else store.transaction() as conn
+    ):
         if trigger is not None:
             # First statement in the lock: the pair the sweep recorded must still hold.
             if orch_store.cursor_in(conn, plan.board) != (trigger.cursor, trigger.gen):

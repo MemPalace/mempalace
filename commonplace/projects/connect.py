@@ -164,6 +164,83 @@ def connect(
         "wing": wing,
         "setup": {"webhook_add": {"events": "space_message", "board": board}},
     }
+    from commonplace.projects import orchestration
+
+    if orchestration.enabled(db, ws):
+        result["setup"]["webhook_add"]["events"] = "space_message,card.created"
     if "warning" in configured:
         result["warning"] = configured["warning"]
     return (201 if minted else 200), result
+
+
+def _demote_in(db, principal, cid):
+    import json
+
+    from commonplace.runner import registry
+
+    # Demotion must also clean revoked seats and machines, without validating peers.
+    row = db.connection(cid, principal.workspace_id)
+    policy = json.loads(row["policy"])
+    policy["trust"] = "standard"
+    db._conn.execute("UPDATE connections SET policy=? WHERE id=?", (json.dumps(policy), cid))
+    for machine in registry.machines(db, principal.workspace_id):
+        if cid in json.loads(machine["requesters"]):
+            registry.patch_in(db, principal, machine["id"], {}, remove_requester=cid)
+
+
+def demote_workspace_in(db, principal):
+    rows = db._conn.execute(
+        "SELECT connection_id FROM project_orchestrators WHERE workspace_id=? AND connection_id IS NOT NULL",
+        (principal.workspace_id,),
+    ).fetchall()
+    for row in rows:
+        _demote_in(db, principal, row["connection_id"])
+
+
+def trust(gateway, principal, board, body):
+    import json
+
+    from commonplace.projects import orchestration as orch
+    from commonplace.runner import registry
+
+    if not principal.person or principal.role != "owner":
+        raise ProjectDenied("Only workspace owners can trust an orchestrator")
+    demoting = isinstance(body, dict) and body == {"trusted": False}
+    if not demoting and (
+        not isinstance(body, dict)
+        or set(body) != {"confirm", "machines"}
+        or body["confirm"] is not True
+        or not isinstance(body["machines"], list)
+        or not body["machines"]
+        or any(not isinstance(m, str) for m in body["machines"])
+    ):
+        raise ValueError("Confirm trust and select machines")
+    db = gateway.db
+    with db._lock, db._tx():
+        if not orch.enabled(db, principal.workspace_id):
+            raise orch.AdmissionRefused("orchestration_off")
+        seat = ensure_main(db, principal.workspace_id, board)
+        if seat.connection_id is None:
+            raise registry.Conflict("Connect the seat first")
+        if demoting:
+            _demote_in(db, principal, seat.connection_id)
+        else:
+            registry.seat_trust_in(db, principal, seat.connection_id, True)
+            for ref in dict.fromkeys(body["machines"]):
+                machine = registry._active(db, principal, ref)
+                if not machine["enabled"]:
+                    raise registry.Conflict("machine is disabled")
+                requesters = list(
+                    dict.fromkeys([*json.loads(machine["requesters"]), seat.connection_id])
+                )
+                registry.patch_in(db, principal, machine["id"], {"requesters": requesters})
+        db.audit(
+            action="project.orchestrator.trust",
+            decision="allow",
+            workspace_id=principal.workspace_id,
+            user_id=principal.user_id,
+            connection_id=seat.connection_id,
+            auth=principal.auth,
+            target_ids=(seat.connection_id,),
+        )
+    return {"trusted": not demoting}

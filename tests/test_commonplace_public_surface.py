@@ -1,10 +1,10 @@
 """Complete installed route inventory and real-HTTP public-boundary probes."""
 
-import http.client
 import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from http import client as http_client
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -19,6 +19,8 @@ from commonplace.workers import WorkerSupervisor
 # A new registered route must be deliberately classified here. Prefix entries
 # include methods without an implemented action: authentication still runs first.
 EXACT = {
+    ("GET", "/api/settings/orchestration"): "authenticated",
+    ("PUT", "/api/settings/orchestration"): "authenticated",
     ("GET", "/api/holds"): "authenticated",
     ("POST", "/api/holds"): "authenticated",
     ("GET", "/.well-known/oauth-protected-resource"): "public",
@@ -133,7 +135,7 @@ BUILTIN = {
 
 
 def request(surface, method="GET", path="/api/me", *, headers=None, body=None, source=None):
-    conn = http.client.HTTPConnection("127.0.0.1", surface.port, timeout=5, source_address=source)
+    conn = http_client.HTTPConnection("127.0.0.1", surface.port, timeout=5, source_address=source)
     try:
         conn.request(method, path, body, headers or {})
         response = conn.getresponse()
@@ -438,9 +440,11 @@ def test_rate_limits_default_on_and_explicit_off(make_surface, monkeypatch):
     assert not surface.gateway.limiter._buckets
 
 
-@pytest.mark.parametrize("host", ["cmmn.dev", "CMMN.DEV.:443", "app.cmmn.dev:8765", "[::1]:8765"])
+@pytest.mark.parametrize(
+    "host", ["agent.example", "AGENT.EXAMPLE.:443", "app.agent.example:8765", "[::1]:8765"]
+)
 def test_allowed_host_normalization(make_surface, monkeypatch, host):
-    monkeypatch.setenv("COMMONPLACE_ALLOWED_HOSTS", "cmmn.dev, app.cmmn.dev, [::1]")
+    monkeypatch.setenv("COMMONPLACE_ALLOWED_HOSTS", "agent.example, app.agent.example, [::1]")
     surface = make_surface()
     assert request(surface, "GET", "/app/", headers={"Host": host})[0] == 200
 
@@ -449,26 +453,26 @@ def test_allowed_host_normalization(make_surface, monkeypatch, host):
     "host",
     [
         "attacker.example",
-        "cmmn.dev.attacker.example",
-        "cmmn.dev@attacker.example",
-        "cmmn.dev:bad",
-        "cmmn.dev:0",
-        "cmmn.dev:65536",
-        "cmmn.dev:",
-        "cmmn.dev/path",
-        "cmmn.dev#x",
-        "cmmn.dev?x",
-        "cmmn.dev#",
-        "cmmn.dev?",
-        "cmmn.dev\\evil",
-        "cmmn.dev ",
+        "agent.example.attacker.example",
+        "agent.example@attacker.example",
+        "agent.example:bad",
+        "agent.example:0",
+        "agent.example:65536",
+        "agent.example:",
+        "agent.example/path",
+        "agent.example#x",
+        "agent.example?x",
+        "agent.example#",
+        "agent.example?",
+        "agent.example\\evil",
+        "agent.example ",
         "[::1]:bad",
         "[::1]evil",
-        "cmmn.dev..",
+        "agent.example..",
     ],
 )
 def test_host_mismatch_or_malformed_is_421(make_surface, monkeypatch, host):
-    monkeypatch.setenv("COMMONPLACE_ALLOWED_HOSTS", "cmmn.dev, [::1]")
+    monkeypatch.setenv("COMMONPLACE_ALLOWED_HOSTS", "agent.example, [::1]")
     surface = make_surface()
     assert hardened(request(surface, headers={"Host": host})) == 421
     for path in ("/health", "/healthz"):
@@ -476,7 +480,7 @@ def test_host_mismatch_or_malformed_is_421(make_surface, monkeypatch, host):
 
 
 def test_health_exempt_from_rate_limits_and_host_check(make_surface, monkeypatch):
-    monkeypatch.setenv("COMMONPLACE_ALLOWED_HOSTS", "cmmn.dev")
+    monkeypatch.setenv("COMMONPLACE_ALLOWED_HOSTS", "agent.example")
     surface = make_surface()
     for _ in range(35):
         assert request(surface, "GET", "/health", headers={"Host": "other"})[0] == 200
@@ -484,8 +488,8 @@ def test_health_exempt_from_rate_limits_and_host_check(make_surface, monkeypatch
 
 
 def test_metadata_challenge_and_app_links_use_production_config(surface, monkeypatch):
-    monkeypatch.setattr(urls, "AGENT_URL", "https://cmmn.dev")
-    monkeypatch.setattr(urls, "APP_URL", "https://app.cmmn.dev")
+    monkeypatch.setattr(urls, "AGENT_URL", "https://agent.example")
+    monkeypatch.setattr(urls, "APP_URL", "https://app.agent.example")
     attacker = {"Host": "attacker.example", "X-Forwarded-Host": "attacker.example"}
     for path in (
         "/.well-known/oauth-protected-resource",
@@ -498,17 +502,19 @@ def test_metadata_challenge_and_app_links_use_production_config(surface, monkeyp
         for value in data.values():
             for item in value if isinstance(value, list) else [value]:
                 if isinstance(item, str) and item.startswith("http"):
-                    assert item == "https://cmmn.dev" or item.startswith("https://cmmn.dev/")
+                    assert item == "https://agent.example" or item.startswith(
+                        "https://agent.example/"
+                    )
     response = request(surface, "POST", "/mcp", headers=attacker)
     assert hardened(response) == 401
     assert (
         response[1]["WWW-Authenticate"]
-        == 'Bearer resource_metadata="https://cmmn.dev/.well-known/oauth-protected-resource"'
+        == 'Bearer resource_metadata="https://agent.example/.well-known/oauth-protected-resource"'
     )
     link = urls.share_link(surface.db, surface.workspace, "/app/#/card/1")
     response = request(surface, "GET", urlsplit(link).path, headers=attacker)
     assert hardened(response) == 302
-    assert response[1]["Location"] == "https://app.cmmn.dev/app/#/card/1"
+    assert response[1]["Location"] == "https://app.agent.example/app/#/card/1"
 
 
 @pytest.mark.parametrize(
@@ -526,7 +532,7 @@ def test_metadata_challenge_and_app_links_use_production_config(surface, monkeyp
     ],
 )
 def test_oversized_body_rejected_at_http_boundary_before_reading(surface, path, cap):
-    conn = http.client.HTTPConnection("127.0.0.1", surface.port, timeout=5)
+    conn = http_client.HTTPConnection("127.0.0.1", surface.port, timeout=5)
     try:
         conn.putrequest("POST", path)
         conn.putheader("Content-Length", str(cap + 1))
@@ -547,7 +553,7 @@ def test_oversized_body_rejected_at_http_boundary_before_reading(surface, path, 
     ],
 )
 def test_ambiguous_body_framing_is_closed(surface, headers):
-    conn = http.client.HTTPConnection("127.0.0.1", surface.port, timeout=5)
+    conn = http_client.HTTPConnection("127.0.0.1", surface.port, timeout=5)
     try:
         conn.putrequest("POST", "/api/memory")
         for key, value in headers:
@@ -688,7 +694,7 @@ def test_host_normalizer_validates_ports_and_ipv6():
 
 def test_keepalive_request_reauthenticates_after_revocation(surface):
     cid, _raw, auth = token(surface)
-    conn = http.client.HTTPConnection("127.0.0.1", surface.port, timeout=5)
+    conn = http_client.HTTPConnection("127.0.0.1", surface.port, timeout=5)
     try:
         headers = {**auth, "Content-Type": "application/json"}
         conn.request("POST", "/mcp", b"{}", headers)
@@ -703,11 +709,11 @@ def test_keepalive_request_reauthenticates_after_revocation(surface):
         conn.close()
 
 
-@pytest.mark.parametrize("hosts", [[], ["cmmn.dev", "attacker.example"]])
+@pytest.mark.parametrize("hosts", [[], ["agent.example", "attacker.example"]])
 def test_missing_or_duplicate_host_is_421(make_surface, monkeypatch, hosts):
-    monkeypatch.setenv("COMMONPLACE_ALLOWED_HOSTS", "cmmn.dev")
+    monkeypatch.setenv("COMMONPLACE_ALLOWED_HOSTS", "agent.example")
     surface = make_surface()
-    conn = http.client.HTTPConnection("127.0.0.1", surface.port, timeout=5)
+    conn = http_client.HTTPConnection("127.0.0.1", surface.port, timeout=5)
     try:
         conn.putrequest("GET", "/app/", skip_host=True)
         for host in hosts:
