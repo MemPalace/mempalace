@@ -40,6 +40,10 @@ entry was written.
 
 - The duration assertion is outside loops so a slow host produces an informational timing failure while incorrect flags remain blocking.
 
+### Rules initialization timing checks
+
+- Rules initialization tests check remaining SQLite wait budgets with a fake clock; wall-clock budgets stay in separate timing-marked tests.
+
 ### Restricted-origin card content
 
 - Trusted agents and authorized board coordinators may update only the title and body of an unassigned todo card marked as restricted-origin.

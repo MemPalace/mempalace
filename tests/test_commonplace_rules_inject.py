@@ -513,6 +513,51 @@ def test_sql_work_is_interrupted_and_expired_transaction_rolls_back(local):
     assert local.rules.store.seq == before
 
 
+@pytest.mark.parametrize("store", ["rules", "boards"])
+def test_locked_store_uses_remaining_deadline(local, store, monkeypatch):
+    BoardService(local.owner.ctx).board_add(slug="ops", wing="shared")
+    local.owner.create("*", "visible", "limit")
+    path = local.directory / f"{store}.sqlite3"
+    now, waits, statements, opened = [0.0], [], [], []
+    monkeypatch.setattr(checks, "monotonic", lambda: now[0])
+    connection = checks.connection
+    connect = sqlite3.connect
+
+    def tracked(database, *args, **kwargs):
+        opened.append(database)
+        waits.append((kwargs["timeout"], checks._deadline.get() - now[0]))
+        conn = connect(database, *args, **kwargs)
+
+        def trace(sql):
+            if sql.startswith("PRAGMA busy_timeout="):
+                statements.append((int(sql.split("=")[1]), checks._deadline.get() - now[0]))
+            now[0] += 0.001
+
+        conn.set_trace_callback(trace)
+        return conn
+
+    @contextmanager
+    def delayed(path, **kwargs):
+        # Spend part of the overall budget before every connection attempt.
+        now[0] += 0.01
+        with connection(path, **kwargs) as conn:
+            yield conn
+
+    with closing(connect(path, isolation_level=None)) as blocker:
+        blocker.execute("PRAGMA journal_mode=DELETE")
+        blocker.execute("BEGIN EXCLUSIVE")
+        monkeypatch.setattr(checks.sqlite3, "connect", tracked)
+        monkeypatch.setattr(checks, "connection", delayed)
+        assert initialize(local) == LEGACY
+        blocker.rollback()
+
+    assert any(path.as_uri() in database for database in opened)
+    assert waits
+    assert all(0 < timeout <= remaining < 0.08 for timeout, remaining in waits)
+    assert statements
+    assert all(0 <= milliseconds <= remaining * 1000 for milliseconds, remaining in statements)
+
+
 @pytest.mark.timing
 @pytest.mark.parametrize("store", ["rules", "boards"])
 def test_locked_store_stays_inside_overall_deadline(local, store):
