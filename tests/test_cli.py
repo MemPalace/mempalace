@@ -1379,6 +1379,20 @@ def test_main_wakeup_dispatches():
         mock_cmd.assert_called_once()
 
 
+def test_main_brief_dispatches_with_palace_after_subcommand():
+    with (
+        patch(
+            "sys.argv",
+            ["mempalace", "brief", "--wing", "project", "--room", "backend", "--palace", "/p"],
+        ),
+        patch("mempalace.cli.cmd_brief") as mock_cmd,
+    ):
+        main()
+        mock_cmd.assert_called_once()
+        args = mock_cmd.call_args[0][0]
+        assert (args.wing, args.room, args.palace) == ("project", "backend", "/p")
+
+
 def test_main_split_dispatches():
     with (
         patch("sys.argv", ["mempalace", "split", "/chats"]),

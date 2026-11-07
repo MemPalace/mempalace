@@ -687,7 +687,7 @@ class MemoryStack:
         """Compressed overview of a wing/room - deduplicated top drawers."""
         # Use L2 to get drawers but with more results for broader coverage
         raw = self.l2.retrieve(wing=wing, room=room, n_results=n_results)
-        if raw.startswith("No ") or raw.startswith("Retrieval error"):
+        if raw.startswith(("No ", "Retrieval error", "## Palace is busy")):
             return raw
 
         # Parse the L2 output to get individual drawer lines
