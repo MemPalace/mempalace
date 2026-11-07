@@ -1816,6 +1816,79 @@ class BoardService:
             if busy_agent(conn, board["id"], assignee):
                 raise AdmissionRefused("agent_busy")
 
+    def _owner_assignment(self, assignee):
+        return bool(
+            self.principal.person
+            and self.principal.role == "owner"
+            and assignee
+            and assignee.startswith("conn:")
+        )
+
+    def _start_assignment(self, card):
+        """After the claim commits, use the configured start path or record a reason."""
+        if card["status"] != "doing" or not self._owner_assignment(card["assignee"]):
+            return card
+        from commonplace.orch import runner_bridge
+        from commonplace.projects import orchestration
+        from commonplace.runner import jobs, registry
+
+        try:
+            if not orchestration.enabled(self.ctx.db, self.principal.workspace_id):
+                reason = "orchestration_disabled"
+            elif not runner_bridge.configured(
+                self.ctx.gateway, self.principal.workspace_id, card["board"]
+            ):
+                reason = "not_configured"
+            else:
+                version = runner_bridge.resolve_version(
+                    self.ctx.gateway, self.principal.workspace_id, card["board"]
+                )
+                config = version.config()
+                machine = registry.get_machine(
+                    self.ctx.db, self.principal.workspace_id, config.runner.machine
+                )
+                worker = (
+                    self.ctx.db.authenticate_connection(machine["worker_connection_id"])
+                    if machine is not None
+                    else None
+                )
+                if worker is None:
+                    reason = "machine_unavailable"
+                elif worker.actor != card["assignee"]:
+                    reason = "assignee_not_runner_worker"
+                else:
+                    with self.store.connection() as conn:
+                        row = task_row(conn, card["number"])
+                        board = conn.execute(
+                            "SELECT * FROM boards WHERE id=?", (row["board_id"],)
+                        ).fetchone()
+                    _, job = runner_bridge.person_start(
+                        self.ctx,
+                        jobs.open_store(self.ctx.gateway, self.principal.workspace_id),
+                        machine=machine,
+                        card_row=dict(row),
+                        board_row=dict(board),
+                        project=config.runner.project,
+                        topic=config.runner_role.topic,
+                        config_ref="live",
+                        request_key=f"assignment:{card['number']}:{card['version']}",
+                    )
+                    reason = None
+        except ToolError as exc:
+            reason = getattr(exc, "code", None) or getattr(exc, "reason", None) or str(exc)
+        except Exception as exc:
+            log_failure(logger, "assigned card start failed", exc)
+            reason = "start_unavailable"
+        message = f"Start blocked: {reason}" if reason else f"Start queued: {job['job_id']}"
+        with self.transaction() as conn:
+            row, _ = self._get(conn, card["number"])
+            # Do not overwrite a concurrent holder's update with an old start report.
+            if row["version"] == card["version"]:
+                self._set(conn, row, {"status_line": message}, release_origin=False)
+                self._log(conn, row["id"], "edit", reason=message)
+                self._emit(conn, row["id"], "card.updated")
+            return self._card(conn, task_row(conn, row["id"]), self.principal)
+
     def _new_card(
         self,
         conn,
@@ -1887,6 +1960,7 @@ class BoardService:
         if (
             claim
             or status == "doing"
+            or (status == "todo" and self._owner_assignment(assignee))
             or (not p.person and assignee == p.actor and status == "todo")
         ):
             assignee = assignee or p.actor
@@ -1972,6 +2046,9 @@ class BoardService:
         )
         self._log(conn, number, "add", to_status=status)
         self._emit(conn, number, "card.created")
+        if status == "doing" and self._owner_assignment(assignee):
+            self._log(conn, number, "claim", to_status="doing", target=assignee)
+            self._emit(conn, number, "card.claimed", to="doing")
         if status == "review":
             self._log(
                 conn,
@@ -2002,7 +2079,7 @@ class BoardService:
             b = self._board(conn, board, create=True)
             self._write(b, submission=True)
             self._expire(conn, b)
-            return self._new_card(
+            result = self._new_card(
                 conn,
                 b,
                 title=title,
@@ -2014,6 +2091,7 @@ class BoardService:
                 parent=parent,
                 claim=claim,
             )
+        return self._start_assignment(result)
 
     def task_approve(self, task, approve=_UNSET, version=None, reason=None, escalate=False):
         with self.transaction() as conn:
@@ -2206,8 +2284,15 @@ class BoardService:
                         break
                 if row is None:
                     return None
-            available = row["status"] == "todo" or (
-                row["status"] == "backlog" and self._backlog_available(row)
+            held = (
+                task is not None
+                and row["status"] == "doing"
+                and row["assignee"] == self.principal.actor
+            )
+            available = (
+                held
+                or row["status"] == "todo"
+                or (row["status"] == "backlog" and self._backlog_available(row))
             )
             if (
                 not available
@@ -2218,6 +2303,8 @@ class BoardService:
             ):
                 raise ToolError("no: card is not available to take")
             self._write(b, row=row, claiming=True)
+            if held:
+                return self._card(conn, row, self.principal)
             from commonplace.projects import limits
 
             limits.check(conn, b, self.principal.actor, service=self, card_id=row["id"])
@@ -2746,11 +2833,16 @@ class BoardService:
             )
         if options and not person:
             raise ToolError("no: options require a person")
-        status = "review" if person else "todo"
+        assigned = row["status"] == "todo" and self._owner_assignment(target)
+        status = "review" if person else "doing" if assigned else "todo"
         target = ask_to or target
+        if assigned:
+            from commonplace.projects import limits
+
+            limits.check(conn, board, target, service=self, card_id=row["id"])
         updates = {
             "status": status,
-            "claim_until": None,
+            "claim_until": self._until(board) if assigned else None,
             "assignee": None if person else target,
             "ask": note if person else None,
             "ask_options": json.dumps(options),
@@ -2793,13 +2885,19 @@ class BoardService:
         )
         if person:
             self._emit(conn, row["id"], "card.review_needed", return_to=updates["return_to"])
+        if assigned:
+            self._log(
+                conn, row["id"], "claim", from_status=row["status"], to_status=status, target=target
+            )
+            self._emit(conn, row["id"], "card.claimed", **{"from": row["status"], "to": status})
         return self._card(conn, task_row(conn, row["id"]), self.principal)
 
     def task_handoff(self, task, to, note, options=None, version=None, context=None):
         with self.transaction() as conn:
             row, board = self._get(conn, task)
             self._version(conn, row, version)
-            return self._handoff(conn, row, board, to, note, options, context)
+            result = self._handoff(conn, row, board, to, note, options, context)
+        return self._start_assignment(result)
 
     def ask(self, question, options=None, board=None, task=None, context=""):
         with self.transaction() as conn:

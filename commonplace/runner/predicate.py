@@ -52,9 +52,10 @@ def startable(gateway, machine, row, board) -> None:
     service = BoardService(ToolContext(worker, gateway))
     if _waiting_on_person(row):
         raise Refused("waiting_on_person")
-    if row["status"] != "todo":
+    own_claim = row["status"] == "doing" and row["assignee"] == worker.actor
+    if row["status"] != "todo" and not own_claim:
         raise Refused("not_todo")
-    if row["assignee"] is not None:
+    if row["assignee"] not in (None, worker.actor):
         raise Refused("assigned")
     if row["proposal_status"] in ("pending", "rejected"):
         raise Refused("proposal_open")

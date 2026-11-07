@@ -249,6 +249,9 @@ Format (read by `commonplace orch docs-check`):
 
   - The revoked-token socket guard observes the completed server-side 401, no body reads and no route dispatch, including a forced close before upload finishes.
   - The seat webhook replay checks actual worker completion with orchestration off and on, retains card-created notifications when enabled, and verifies message filtering and unchanged subscriptions on reconnect.
+  - Reassignment regressions keep doing-card handoffs unclaimed and avoid queued replacement starts until the receiver takes the card.
+
+  - Manual-assignment regressions cover the statechart claim replay, configured worker starts, visible blocked-start reasons, project admission, busy agents and restricted-origin release.
 
   - Lease regressions retain started jobs beyond an hour while their cards remain doing with the machine worker, and release capacity on completion, reassignment or a terminal job state without taking a boards write lock.
 
@@ -392,6 +395,14 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Owner assignments to active agent connections claim the card with a lease and a claim event.
+
+  - Immediate assignment claims apply to todo cards; handoffs of doing cards return to todo without starting the replacement worker.
+
+  - After commit they request the configured worker start, or persist a visible reason that it could not start; concurrent card updates are preserved.
+
+  - Explicit takes of an already held card return that claim without renewing it.
+
   - Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval.
 
   - Trusted agents and authorized board coordinators may edit only the title/body of unassigned restricted-origin todo cards without releasing the origin or changing claim authority.
@@ -429,6 +440,9 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Reset-before-start is refused in both orchestration modes, including retry; runner admission precedes control authority held through commit. Owner resolution audits under runner-first ordering.
+  - A machine may start a todo card reserved for its own worker or a doing card already held by that worker.
+
+  - Other assignees, waiting-person gates and unreleased origins remain refused.
 
   - Started jobs retain machine in-flight capacity and per-machine project exclusion while their cards remain doing with the machine worker; a terminal job state or a changed card state or assignee releases capacity, using read-only boards access.
 
@@ -458,6 +472,8 @@ Format (read by `commonplace orch docs-check`):
   - The planner grammar, including leading numeric labels and repository-relative existing test-file mappings; the orchestrator config format and its versions and experiments, config-driven starts, triggers, leases, the journal, resume, the restore flag and acknowledgement, `plan-check` and `docs-check`.
 
 - **Promises:**
+
+  - Owner-assigned runner work uses the existing configured person-start fence; agent-authored todo reservations still produce an assigned-card trigger miss for a different worker.
 
   - Only owner-accepted versions run; every config-driven start is one fenced, capped transaction; a retry returns the stored job; external effects are never re-issued by the hub; after a restore nothing config-driven runs until the owner acknowledges.
 

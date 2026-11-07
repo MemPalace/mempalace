@@ -130,6 +130,10 @@ configs. No deployment, replacement importer or memory-coverage completion is cl
 
 - Rejected-proposal handoffs retain the proposal-approval guard before origin authorization.
 
+### Owner manual assignment starts
+
+- **Manual assignments.** An owner assignment to an active agent connection claims the card immediately, including project admission and the busy-agent guard. With orchestration enabled, an assignment to the configured machine's worker requests a fresh start through the owner orchestrator path. A disabled switch, missing runner config, a different worker or a refused start leaves an explicit reason in the card's status line. Assignment never bypasses origin release. The worker can confirm its existing claim with an explicit take without a second claim event or lease renewal.
+
 ### Privacy scanner timing checks
 
 - Large-input and delimiter-heavy near-miss correctness checks run in the behaviour suite without measuring time.
@@ -700,3 +704,7 @@ appears in the owner queue again without changing its stored words or audit log.
 - Owner-approved waiver ids, one per line as `W<n>: <scope>`.
 
 - None are approved yet.
+
+### Reassigning active work
+
+- **Claim boundary.** Immediate owner-assignment claims apply only when handing off a todo card. Reassigning doing work, including a stuck card from needs-me, returns it to todo with no lease or automatic start so the receiver can explicitly claim it.

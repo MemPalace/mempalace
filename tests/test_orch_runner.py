@@ -710,7 +710,7 @@ def test_r18b_assigned_todo_card_is_a_miss(world):
     """R18b: an assigned todo card -> miss assigned; the cursor moves past it; an edit
     of a todo card that stays in todo does not fire."""
     world.configure()
-    card = world.card(assignee="conn:orch-b")
+    card = world.card(by=world.a, assignee="conn:orch-b")
     world.sweep()
     assert [(m["card"], m["code"]) for m in world.misses()] == [(card, "assigned")]
     assert world.jobs_for(card) == []

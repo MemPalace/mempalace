@@ -1584,7 +1584,9 @@ def test_handoff_respects_todo_reservations(hub, env, standard_agent, surface, r
             card["number"], reply="Continue Which approach should we take?", then="return"
         )
     else:
-        card = owner.task_add(
+        # Agent reservations remain todo; owner assignments claim immediately.
+        creator = service(hub, hub.db.authenticate_token(hub.owner_token("reservation-author")))
+        card = creator.task_add(
             title="Reserved",
             board="work",
             assignee=person.actor if reserved_for == "owner" else agent.actor,

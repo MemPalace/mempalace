@@ -146,6 +146,7 @@ def _run(ctx, name, args):
         return (
             f"#{result['number']} added to {result['status']} on {result['board']}"
             + parent_line(result)
+            + (f"\n{result['status_line']}" if result.get("status_line") else "")
         )
     if name == "task_take_next":
         if result is None:
@@ -199,6 +200,11 @@ def _run(ctx, name, args):
         f"ok #{result['number']} {result['status']}"
         + (f"  until {result['claim_until']}" if result["claim_until"] else "")
         + parent_line(result)
+        + (
+            f"\n{result['status_line']}"
+            if name == "task_handoff" and result.get("status_line")
+            else ""
+        )
         + ("\n" + approval_note if approval_note else "")
     )
 
