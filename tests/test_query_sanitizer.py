@@ -84,6 +84,21 @@ class TestQuestionExtraction:
         assert result["was_sanitized"] is True
         assert "MemPalace" in result["clean_query"] or "database" in result["clean_query"].lower()
 
+    def test_question_followed_by_more_text_on_the_same_line(self):
+        # Nothing ends the line with "?", so only the sentence-level check can find it.
+        system_prompt = "You are a helpful assistant. " * 12
+        query = system_prompt + "What did we decide about the auth flow? Thanks for helping."
+        result = sanitize_query(query)
+        assert result["method"] == "question_extraction"
+        assert result["clean_query"] == "What did we decide about the auth flow?"
+
+    def test_fullwidth_question_followed_by_more_text_on_the_same_line(self):
+        system_prompt = "あなたは役に立つアシスタントです。" * 15
+        query = system_prompt + "認証フローについて何を決めましたか？よろしくお願いします。"
+        result = sanitize_query(query)
+        assert result["method"] == "question_extraction"
+        assert result["clean_query"] == "認証フローについて何を決めましたか？"
+
 
 class TestTailSentence:
     """Step 3: Extract the last meaningful sentence when no question mark found."""

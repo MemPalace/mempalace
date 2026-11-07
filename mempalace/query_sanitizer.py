@@ -33,6 +33,9 @@ QUOTE_CHARS = {"'", '"'}
 
 # Sentence splitter: split on . ! ? (including fullwidth) and newlines
 _SENTENCE_SPLIT = re.compile(r"[.!?。！？\n]+")
+# Sentence matcher: like _SENTENCE_SPLIT, but each sentence keeps its own
+# terminator, so a sentence that ends in a question mark can still be told apart.
+_SENTENCE_WITH_TERMINATOR = re.compile(r"[^.!?。！？\n]+[.!?。！？]*")
 
 # Question detector: ends with ? or ？ (possibly with trailing whitespace/quotes)
 _QUESTION_MARK = re.compile(r'[?？]\s*["\']?\s*$')
@@ -143,7 +146,7 @@ def sanitize_query(raw_query: str) -> dict:
 
     # --- Step 2: Question extraction ---
     # Split into sentences and find ones ending with ?
-    sentences = [s.strip() for s in _SENTENCE_SPLIT.split(raw_query) if s.strip()]
+    sentences = [s.strip() for s in _SENTENCE_WITH_TERMINATOR.findall(raw_query) if s.strip()]
 
     # Also split on newlines to catch questions on their own line
     all_segments = []
