@@ -236,6 +236,7 @@ def _register_builtins() -> None:
     from .pgvector import PgVectorBackend
     from .qdrant import QdrantBackend
     from .sqlite_exact import SQLiteExactBackend
+    from .turso import TursoBackend
 
     # Use setdefault semantics so a caller that pre-registered for tests wins.
     if "chroma" not in _registry:
@@ -248,6 +249,8 @@ def _register_builtins() -> None:
         _registry["sqlite_exact"] = SQLiteExactBackend
     if "pgvector" not in _registry:
         _registry["pgvector"] = PgVectorBackend
+    if "turso" not in _registry:
+        _registry["turso"] = TursoBackend
 
 
 _register_builtins()
