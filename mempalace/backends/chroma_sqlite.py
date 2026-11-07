@@ -613,10 +613,10 @@ def get_parentless_chunk_group_stats(palace_path: str, collection_name: str) -> 
     (distinct parent ids, falling back to the row's own id), ``chunks``
     counts physical rows carrying a parent link, ``rows`` counts physical
     embedding rows, and ``parentless_chunk_groups`` counts distinct logical
-    chunk groups with no physical parent row. The units match
-    ``DrawerCount(drawers, chunks, rows)`` from unmerged PR #2545, which
-    owns the logical-counting abstraction; this probe only reports the
-    numbers. A row carrying both parent keys is attributed to
+    chunk groups with no physical parent row. The units are logical drawers,
+    chunks, and physical rows; this probe only reports the numbers and does
+    not define what counts as a logical drawer. A row carrying both parent
+    keys is attributed to
     ``parent_drawer_id``, matching drawer resolution. Registry rows and
     sentinels are excluded, as in :func:`_sqlite_wing_room_counts`.
 
