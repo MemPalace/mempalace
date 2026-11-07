@@ -364,6 +364,16 @@ def main():
         "--config", default=None, help="Entity config JSON (e.g. entities.json)"
     )
 
+    # brief
+    p_brief = sub.add_parser("brief", help="Condensed overview of a wing or room")
+    p_brief.add_argument("--wing", default=None, help="Wing to summarize")
+    p_brief.add_argument("--room", default=None, help="Room to summarize")
+    p_brief.add_argument(
+        "--palace",
+        default=argparse.SUPPRESS,
+        help="Palace path; may be passed before or after the subcommand",
+    )
+
     # wake-up
     p_wakeup = sub.add_parser("wake-up", help="Show L0 + L1 wake-up context (~600-900 tokens)")
     p_wakeup.add_argument("--wing", default=None, help="Wake-up for a specific project/wing")
@@ -1189,6 +1199,7 @@ def main():
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,
+        "brief": cmd_brief,
         "sweep": cmd_sweep,
         "sync": cmd_sync,
         "mcp": cmd_mcp,
