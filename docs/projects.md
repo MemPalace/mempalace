@@ -31,6 +31,10 @@ Register a `space_message` webhook for the project if the agent should wake
 when someone posts; Connect supplies setup details but does not subscribe it.
 Without a webhook, the agent reads messages on its next check.
 
+Connect additionally recommends `card.moved` so worker completions and other card
+moves can wake the seat. Connect and reconnect neither register nor modify
+webhooks; existing users must explicitly update their subscriptions for card moves.
+
 The header shows the main orchestrator and its connection state. “Token
 created · no agent has used it yet” means the credentials exist but no agent has
 used them; it reads “connected” only after an agent has. Private status stays private. An unconnected seat leaves release and
@@ -144,5 +148,7 @@ A settings read failure refuses admission with `settings_unavailable`; an absent
 table means off.
 
 With orchestration on, Connect suggests `space_message,card.created` subscriptions.
+The recommendation also includes `card.moved`; pass the three events as the array
+`["space_message", "card.moved", "card.created"]`.
 Without a runner or a subscribed card webhook, new work waits for the seat's next
 session; this switch does not run the orchestrator continuously.

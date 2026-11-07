@@ -162,12 +162,12 @@ def connect(
         "mcp_url": urls.AGENT_URL + "/mcp",
         "board": board,
         "wing": wing,
-        "setup": {"webhook_add": {"events": "space_message", "board": board}},
+        "setup": {"webhook_add": {"events": ["space_message", "card.moved"], "board": board}},
     }
     from commonplace.projects import orchestration
 
     if orchestration.enabled(db, ws):
-        result["setup"]["webhook_add"]["events"] = "space_message,card.created"
+        result["setup"]["webhook_add"]["events"].append("card.created")
     if "warning" in configured:
         result["warning"] = configured["warning"]
     return (201 if minted else 200), result

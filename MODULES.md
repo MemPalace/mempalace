@@ -62,6 +62,7 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Imported-history consent: Imported-history documentation distinguishes write-only import from the independent reader scope and explains exclusions and revocation.
+  - Project setup documentation also explains the recommended card-move webhook and explicit updates for existing subscriptions.
 
   - Documentation describes shipped behaviour; design notes are marked as proposals.
 
@@ -235,6 +236,7 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - The revoked-token socket guard observes the completed server-side 401, no body reads and no route dispatch, including a forced close before upload finishes.
+  - The seat webhook replay checks actual worker completion with orchestration off and on, retains card-created notifications when enabled, and verifies message filtering and unchanged subscriptions on reconnect.
 
   - Lease regressions retain started jobs beyond an hour while their cards remain doing with the machine worker, and release capacity on completion, reassignment or a terminal job state without taking a boards write lock.
 
@@ -473,6 +475,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Connect recommends a board-scoped subscription to `space_message` and `card.moved`, retaining `card.created` with orchestration enabled, without creating or modifying webhooks.
+
   - Only a signed-in owner changes models or limits; `max_agents` counts distinct connection assignees with orchestration off; opt-in orchestration shares card/job admission accounting, default cap 3, owner-only settings and atomic seat trust; model resolution goes project, then workspace, then the runner default.
 
 - **How it fails:**
@@ -671,6 +675,7 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Imported-history consent: The owner form offers independent unticked import and reader checkboxes and displays reader authority beside Revoke.
+  - The Connect checklist renders the supplied webhook event recommendation, including card moves and optional card creation, with escaped values.
 
   - The web app calls the same services as REST; it shows only what the signed-in person may read.
 

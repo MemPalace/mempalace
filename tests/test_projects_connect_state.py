@@ -63,3 +63,25 @@ assert.match(html, /<input data-project-token value="synthetic-once-token" reado
 assert.match(ui.PROJECT_COPY.allowShared, /read and (write|change)/i, 'allow-shared names its scope');
 assert.match(ui.sharedWingHTML({}, e), /data-wing-choice="shared">[^<]*read and (write|change)[^<]*all shared memory/i);
 """)
+
+
+def test_connect_result_shows_recommended_webhook_events():
+    _run(r"""
+const result = {token: 'synthetic-once-token', mcp_url: 'http://localhost/mcp', board: 'alpha',
+  setup: {webhook_add: {events: ['space_message', 'card.moved'], board: 'alpha'}}};
+const html = ui.connectResultHTML(result, e);
+const step = html.match(/<li\b[^>]*data-connect-step="webhook"[^>]*>[\s\S]*?<\/li>/);
+assert.ok(step, 'the dialog has a webhook step');
+assert.ok(step[0].includes(e(JSON.stringify(result.setup.webhook_add.events))),
+  'the hint preserves the recommended event array');
+assert.match(step[0], /and board alpha/);
+const enabledEvents = ['space_message', 'card.moved', 'card.created'];
+const enabled = ui.connectResultHTML({...result,
+  setup: {webhook_add: {events: enabledEvents, board: 'alpha'}}}, e);
+assert.ok(enabled.includes(e(JSON.stringify(enabledEvents))),
+  'orchestration retains both card-created and completion recommendations');
+const unsafe = ui.connectResultHTML({...result,
+  setup: {webhook_add: {events: ['<unsafe>'], board: '<board>'}}}, e);
+assert.doesNotMatch(unsafe, /<unsafe>|<board>/);
+assert.match(unsafe, /&lt;unsafe&gt;/);
+""")

@@ -137,6 +137,18 @@ If a routed coordinator becomes unavailable or is replaced, the pending ask
 appears in the owner queue again without changing its stored words or audit log.
 
 
+### Project seat wake recommendations
+
+- Connect recommends a board-scoped webhook for `space_message` and `card.moved`, so messages and worker completion moves can wake the orchestrator.
+
+- Setup is advisory: Connect and reconnect neither register nor modify subscriptions.
+
+- Existing users must explicitly update their webhooks to receive card moves.
+
+- Message coordinator filtering and reply-loop suppression still apply.
+
+- With orchestration enabled, the recommendation also retains `card.created`.
+
 ### Restricted-origin card content
 
 - Trusted agents and authorized board coordinators may update only the title and body of an unassigned todo card marked as restricted-origin.

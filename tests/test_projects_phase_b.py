@@ -555,10 +555,17 @@ def test_head_seed_schema_matches_module():
 
 def test_head_connect_hint_and_trust_failures(projects_hub):
     h = projects_hub
-    assert h.connect(h.owner, "work")[1]["setup"]["webhook_add"]["events"] == "space_message"
+    assert h.connect(h.owner, "work")[1]["setup"]["webhook_add"]["events"] == [
+        "space_message",
+        "card.moved",
+    ]
     m = trust_setup(h)
     connected = h.connect(h.owner, "work")[1]
-    assert connected["setup"]["webhook_add"]["events"] == "space_message,card.created"
+    assert connected["setup"]["webhook_add"]["events"] == [
+        "space_message",
+        "card.moved",
+        "card.created",
+    ]
     assert trust(h, {"confirm": True, "machines": ["mach_0000000000000000"]})[0] == 404
     from commonplace.sessions import person_principal
 

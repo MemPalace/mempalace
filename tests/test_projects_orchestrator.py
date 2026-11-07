@@ -85,7 +85,10 @@ def test_connect_mints_scoped_token_once_and_sets_coordinator(projects_hub):
     token, connection = body["token"], body["connection"]
     assert body["mcp_url"].endswith("/mcp") and connection["name"] == "orchestrator:alpha"
     assert body["board"] == "alpha" and body["wing"] == "alpha"
-    assert body["setup"]["webhook_add"] == {"events": "space_message", "board": "alpha"}
+    assert body["setup"]["webhook_add"] == {
+        "events": ["space_message", "card.moved"],
+        "board": "alpha",
+    }
     assert h.coordinator("alpha") == "conn:orchestrator:alpha"
     principal = h.gateway.authenticate("Bearer " + token)
     assert principal.policy.trust == "standard" and principal.policy.tools == "standard"
