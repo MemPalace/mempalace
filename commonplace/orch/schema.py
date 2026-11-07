@@ -104,6 +104,11 @@ CODES = frozenset(
         "unknown_workflow",
         "unknown_mcp",
         "parent_cycle",
+        "area_duplicate",
+        "area_kind",
+        "area_parent",
+        "area_main",
+        "area_runner",
         "harness_not_allowed",
         "runner_harness_not_t3",
         "runner_role_incomplete",  # runner role lacks topic or model_role
@@ -148,6 +153,7 @@ class Role:
     skills: tuple[Skill, ...] = ()
     mcps: tuple[str, ...] = ()
     connections: tuple[str, ...] = ()
+    area: str | None = None
 
 
 @dataclass(frozen=True)
@@ -240,6 +246,7 @@ TEMPLATE_DIR = Path(__file__).with_name("templates")
 _TOP_KEYS = ("schema", "project", "limits", "roles", "workflows", "mcps", "runner", "triggers")
 _ROLE_KEYS = (
     "kind",
+    "area",
     "parent",
     "harness",
     "topic",
@@ -504,7 +511,16 @@ def _role(name: str, value: object, workflows: Mapping, mcps: Mapping) -> Role:
             raise ConfigError(
                 "harness_not_allowed", f"{path}.harness", "must be one of: " + ", ".join(HARNESSES)
             )
+    area = None
+    if "area" in body:
+        area = _str(body["area"], f"{path}.area", NAME)
+        if kind != "sub-orchestrator":
+            raise ConfigError("area_kind", f"{path}.kind", "an area needs a sub-orchestrator")
+        for required in ("parent", "topic"):
+            if required not in body:
+                raise ConfigError("missing_key", f"{path}.{required}", "required for an area")
     return Role(
+        area=area,
         name=name,
         kind=kind,
         parent=_str(body["parent"], f"{path}.parent", NAME) if "parent" in body else None,
@@ -533,10 +549,35 @@ def _check_parents(roles: Mapping[str, Role]) -> None:
         while current.parent is not None:
             if current.parent in seen:
                 raise ConfigError(
-                    "parent_cycle", f"roles.{role.name}.parent", "parents form a cycle"
+                    "parent_cycle",
+                    f"roles.{role.name}.parent",
+                    "parents form a cycle",
                 )
             seen.add(current.parent)
             current = roles[current.parent]
+
+
+def _check_areas(roles: Mapping[str, Role]) -> None:
+    areas = [role for role in roles.values() if role.area is not None]
+    if not areas:
+        return
+    seen = set()
+    for role in areas:
+        if role.area in seen:
+            raise ConfigError(
+                "area_duplicate", f"roles.{role.name}.area", "area is already declared"
+            )
+        seen.add(role.area)
+    if len(areas) > 8:
+        raise ConfigError("too_many", "roles", "at most 8 areas")
+    mains = [role for role in roles.values() if role.kind == "orchestrator"]
+    if len(mains) != 1 or mains[0].parent is not None:
+        raise ConfigError("area_main", "roles", "areas need exactly one parentless orchestrator")
+    for role in areas:
+        if role.parent != mains[0].name:
+            raise ConfigError(
+                "area_parent", f"roles.{role.name}.parent", "area must be directly under main"
+            )
 
 
 def _roles(value: object, workflows: Mapping, mcps: Mapping) -> dict[str, Role]:
@@ -546,6 +587,7 @@ def _roles(value: object, workflows: Mapping, mcps: Mapping) -> dict[str, Role]:
     _names(table, "roles", MAX_ROLES)
     roles = {name: _role(name, body, workflows, mcps) for name, body in table.items()}
     _check_parents(roles)
+    _check_areas(roles)
     return roles
 
 
@@ -572,6 +614,8 @@ def _runner(value: object, roles: Mapping[str, Role]) -> Runner:
             f"roles.{role.name}",
             "the runner role needs topic and model_role",
         )
+    if role.area is not None:
+        raise ConfigError("area_runner", "runner.role", "an area cannot be the runner")
     return runner
 
 
@@ -720,7 +764,7 @@ def role_instructions(config: Config, role: str) -> str:
 
 def _role_dict(role: Role) -> dict[str, Any]:
     out: dict[str, Any] = {"kind": role.kind}
-    for key in ("parent", "harness", "topic", "model_role", "workflow", "prompt"):
+    for key in ("parent", "harness", "topic", "model_role", "workflow", "prompt", "area"):
         value = getattr(role, key)
         if value is not None:
             out[key] = value
@@ -743,7 +787,7 @@ def _mcp_dict(mcp: Mcp) -> dict[str, Any]:
 def _role_lines(role: Role) -> list[str]:
     facts = [
         f"{key}: `{value}`"
-        for key in ("parent", "harness", "topic", "model_role", "workflow")
+        for key in ("parent", "harness", "topic", "model_role", "workflow", "area")
         if (value := getattr(role, key)) is not None
     ]
     lines = [f"- {', '.join(facts)}"] if facts else []

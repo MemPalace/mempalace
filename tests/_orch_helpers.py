@@ -217,3 +217,12 @@ def seed_config(
         "cursor": cursor,
         "gen": gen,
     }
+
+
+def seed_accepted_area(workspace_dir, board, body, *, version, channel="live"):
+    """Seed a preview topology in temporary stores; production acceptance stays blocked.
+
+    Reuse the transactional seed's supersede/insert and parent metadata, without
+    changing the trigger cursor. Callers provide a fresh board-wide version.
+    """
+    return seed_config(workspace_dir, board, body, version=version, channel=channel, arm=False)

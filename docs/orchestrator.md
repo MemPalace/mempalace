@@ -78,6 +78,21 @@ most 16 roles, and a prompt is at most 32 KiB.
 | `triggers` (`card.todo`, live), `limits.max_agents`, planner `connections` | **Enforced** (below). |
 | other roles, `skills`, `mcps` | **Advisory.** Rendered for sessions to read. |
 
+### Area preview slice 1, preview-only
+
+`roles.<name>.area` declares a distinct name matching `[a-z0-9-]{1,32}`,
+with at most eight areas. Each area role must be a `sub-orchestrator` with
+`topic` and `parent`, directly under the sole, parentless `orchestrator`.
+That main role may have any valid name. Parent references and cycles are checked
+before area topology. Area roles cannot be the runner. Configs without areas
+keep their existing graph rules and model slots.
+
+Parsing, rendering, diffing and proposals preserve areas. Acceptance and direct
+writes refuse every area-bearing config, including experiment channels, with
+`area_not_supported` (HTTP 400). The refusal preserves proposals and accepted
+versions, cursors, leases, jobs and events. No area seats, tokens, subscriptions
+or runtime are created; activation belongs to a later slice.
+
 Model routing has two slots, `main` and `worker`, set per project by the owner
 (`PUT /api/projects/<board>/models`).
 
@@ -92,7 +107,9 @@ Only the owner accepts or rejects, or writes an accepted version directly.
 Channels are `live` and `exp:<name>` (at most 8 experiments per board;
 `orch exp retire` closes one). An experiment may change only `prompt`,
 `workflow`/`workflows`, `topic`, `model_role` and `skills`; any other
-difference is refused. Experiments run through `orch_card_start(config_ref=
+difference is refused. In particular, `area`, `parent` and `kind` are frozen;
+an unchanged area allows prompt edits to be proposed, but remains preview-only
+and cannot be accepted. Experiments run through `orch_card_start(config_ref=
 "exp:<name>")` or an owner's `card_start(config_ref=…)`; triggers always use
 live. Only accepted versions run.
 

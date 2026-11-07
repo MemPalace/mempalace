@@ -737,6 +737,10 @@ class Store:
         except schema.ConfigError as exc:
             raise _config_error(exc) from None
         self._check(board, config, connections)
+        if any(role.area is not None for role in config.roles.values()):
+            raise OrchError(
+                "area_not_supported", "area configs are preview-only", path="roles", status=400
+            )
         previous = accepted_in(conn, board, channel)
         cursor = gen = None
         if channel != LIVE:
