@@ -30,6 +30,8 @@ def quoted(value):
 
 def line(c):
     result = f"#{c['number']} {c['status']} need:{c['need']}  {quoted(c['title'])}"
+    if c.get("task_type"):
+        result += f" type:{c['task_type']}"
     result += parent_line(c)
     if c["assignee"]:
         result += f"  {c['assignee']}"
@@ -373,6 +375,10 @@ def register_tools():
                 **TASK,
                 "description": "Parent card on this board; only sub-actors can specify a card created by or assigned to their top-level actor.",
             },
+            "task_type": {
+                "type": ["string", "null"],
+                "description": "Owner person only; empty string clears. Omit to preserve the type.",
+            },
             "labels": ARRAY,
             "blocked_by": {
                 "type": "array",
@@ -414,6 +420,10 @@ def register_tools():
             "pr_head": {
                 "type": "string",
                 "description": "Full lowercase commit SHA for the reported PR head.",
+            },
+            "task_type": {
+                "type": ["string", "null"],
+                "description": "Owner person only; empty string clears. Omit to preserve the type.",
             },
             "labels": ARRAY,
             "blocked_by": {

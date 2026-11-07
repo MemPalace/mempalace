@@ -16,6 +16,7 @@ from .display import need_for, plan_waiting
 
 STATUSES = ("backlog", "todo", "doing", "review", "done")
 TASK_COLUMNS = {
+    "task_type": "TEXT NOT NULL DEFAULT ''",
     "parent_number": "INTEGER REFERENCES tasks(id)",
     "message_id": "INTEGER REFERENCES space_messages(id)",
     "repo": "TEXT",
@@ -202,6 +203,7 @@ def card(conn, row, principal=None, *, release=None, approver=None) -> dict:
         "board": row["board"],
         "title": row["title"],
         "body": row["body"],
+        "task_type": row["task_type"],
         "status": row["status"],
         "assignee": row["assignee"],
         "claim_until": row["claim_until"],
@@ -213,7 +215,7 @@ def card(conn, row, principal=None, *, release=None, approver=None) -> dict:
         **{
             key: row[key] if key in row.keys() else None
             for key in TASK_COLUMNS
-            if key not in ("labels", "parent_number", "pr_repo")
+            if key not in ("labels", "parent_number", "pr_repo", "task_type")
         },
         "labels": json.loads(row["labels"] or "[]"),
         "links": len(BoardStore.links(conn, row["id"], principal)),

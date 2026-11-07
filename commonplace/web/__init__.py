@@ -204,9 +204,10 @@ def install(gateway):
             },
         )
 
-    from . import agents
+    from . import agents, task_types
 
     agents.install(gateway)
+    task_types.install(gateway)
 
     gateway.add_route("GET", "/app/login", login)
     gateway.add_route("POST", "/app/logout", logout)

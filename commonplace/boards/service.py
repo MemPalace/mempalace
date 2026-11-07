@@ -16,6 +16,7 @@ from commonplace.control_db import ControlError
 from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
 
+from . import task_types
 from .digest import digest
 from .display import (
     _waiting_on_person as _display_waiting,
@@ -957,6 +958,7 @@ class BoardService:
             "number": number,
             "parent": row["parent_number"],
             "title": row["title"],
+            "task_type": row["task_type"],
             "status": row["status"],
             "assignee": row["assignee"],
             "ask_to": row["ask_to"],
@@ -1342,6 +1344,18 @@ class BoardService:
         ):
             raise ToolError("no: recipient must be an active connection able to work on this board")
         return recipient.actor
+
+    def _type_holder(self, actor):
+        p = self.principal
+        if actor == p.actor and p.person:
+            return p
+        if not actor or not actor.startswith("conn:"):
+            return None
+        matches = [r for r in self.ctx.db.connections(p.workspace_id) if r["name"] == actor[5:]]
+        if len(matches) != 1:
+            return None
+        holder = self.ctx.db.authenticate_connection(matches[0]["id"])
+        return holder if holder and holder.workspace_id == p.workspace_id else None
 
     def _until(self, board):
         return (datetime.now(timezone.utc) + timedelta(minutes=board["claim_minutes"])).strftime(
@@ -2057,8 +2071,11 @@ class BoardService:
         message_id=None,
         parent=None,
         claim=False,
+        task_type=task_types.UNSET,
+        type_holder=None,
     ):
         p = self.principal
+        label = "" if task_type is task_types.UNSET else task_types.owner_value(p, task_type)
         if message_id is not None:
             if (
                 isinstance(message_id, bool)
@@ -2140,6 +2157,7 @@ class BoardService:
                 )
             status, assignee = "backlog", p.actor if proposal else assignee
         if status == "doing":
+            task_types.require(conn, label, type_holder)
             from commonplace.projects import limits
 
             limits.check(conn, board, assignee, service=self)
@@ -2187,7 +2205,7 @@ class BoardService:
         number = cur.lastrowid
         conn.execute(
             "UPDATE tasks SET claim_until=?,heartbeat_at=?,agent_parent=?,proposal_status=?,"
-            "proposed_to=?,review_kind=? WHERE id=?",
+            "proposed_to=?,review_kind=?,task_type=? WHERE id=?",
             (
                 until,
                 at if until else None,
@@ -2195,6 +2213,7 @@ class BoardService:
                 "pending" if proposal else None,
                 p.parent_agent if proposal else None,
                 "decision" if ask is not None else None,
+                label,
                 number,
             ),
         )
@@ -2229,7 +2248,17 @@ class BoardService:
         parent=None,
         claim=False,
         blocked_by=_UNSET,
+        task_type=task_types.UNSET,
     ):
+        if task_type is not task_types.UNSET:
+            task_types.owner_value(self.principal, task_type)
+        type_holder = (
+            self._type_holder(
+                self._actor(assignee) if assignee is not None else self.principal.actor
+            )
+            if task_type is not task_types.UNSET and task_type != ""
+            else None
+        )
         with self.transaction() as conn:
             b = self._board(conn, board, create=True)
             self._write(b, submission=True)
@@ -2247,6 +2276,8 @@ class BoardService:
                 message_id=message_id,
                 parent=parent,
                 claim=claim,
+                task_type=task_type,
+                type_holder=type_holder,
             )
             if blocked_by is not _UNSET:
                 from commonplace.boards.store import CardRefused, set_blockers
@@ -2407,9 +2438,15 @@ class BoardService:
         )
 
     def task_take_next(self, board=None, task=None):
+        type_holder = self._type_holder(self.principal.actor)
         top = self._top_level_taker()
         narrow = _restricted(self.principal) and not top
         with self.transaction() as conn:
+            type_labels = (
+                task_types.allowed(conn, type_holder.connection_id)
+                if type_holder and not type_holder.person
+                else None
+            )
             if task is not None:
                 row, b = self._get(conn, task)
                 if board is not None and self._board(conn, board)["id"] != b["id"]:
@@ -2449,7 +2486,9 @@ class BoardService:
                 )
                 for found in candidates:
                     candidate = task_row(conn, found["id"])
-                    if self._claimable_origin(candidate):
+                    if self._claimable_origin(candidate) and task_types.eligible(
+                        conn, candidate["task_type"], type_holder, labels=type_labels
+                    ):
                         row = candidate
                         break
                 if row is None:
@@ -2476,6 +2515,7 @@ class BoardService:
             self._write(b, row=row, claiming=True)
             if held:
                 return self._card(conn, row, self.principal)
+            task_types.require(conn, row["task_type"], type_holder, labels=type_labels)
             from commonplace.projects import limits
 
             try:
@@ -2797,8 +2837,36 @@ class BoardService:
 
             split.check_label_update(conn, board, self.principal, row, labels)
 
+    def _update_acquisition_actor(self, row, args):
+        # Owner status changes start reserved typed work for its assigned holder.
+        if (
+            self.principal.person
+            and self.principal.role == "owner"
+            and args.get("task_type", row["task_type"])
+            and row["assignee"]
+        ):
+            return row["assignee"]
+        return self.principal.actor
+
+    def _update_type_holder(self, task, args):
+        if args.get("status") != "doing":
+            return None, None
+        # Resolve control identity before taking the board write transaction.
+        with self.store.connection() as conn:
+            prospective = task_row(conn, task)
+            require_visible(prospective, self.principal)
+            actor = self._update_acquisition_actor(prospective, args)
+        return actor, self._type_holder(actor)
+
     def task_update(self, task, *, version=None, **args):
+        type_updates = {
+            key: task_types.owner_value(self.principal, value)
+            for key, value in args.items()
+            if key == "task_type"
+        }
+        prospective_actor, type_holder = self._update_type_holder(task, args)
         permitted = {
+            "task_type",
             "title",
             "body",
             "labels",
@@ -2847,7 +2915,7 @@ class BoardService:
             self._holder(
                 row,
                 completing=args.get("status") == "done",
-                editing=bool(set(args) & {"title", "body", "labels", "blocked_by"})
+                editing=bool(set(args) & {"title", "body", "labels", "blocked_by", "task_type"})
                 and not content_edit,
                 reopening=set(args) == {"status"} and args["status"] == "todo",
                 annotating=bool(set(args) - {"status"})
@@ -2876,7 +2944,7 @@ class BoardService:
                 raise ToolError("no: card is waiting on a person")
             if "lesson" in args and args.get("status", row["status"]) != "done":
                 raise ToolError("no: a lesson requires status done")
-            updates = {}
+            updates = dict(type_updates)
             self._update_waiting(conn, row, args)
             if "labels" in args:
                 labels = args["labels"]
@@ -2901,7 +2969,7 @@ class BoardService:
             updates.update(
                 self._holder_pr_reset(
                     row,
-                    self.principal.actor
+                    self._update_acquisition_actor(row, args)
                     if args.get("status") == "doing" and row["status"] != "doing"
                     else row["assignee"],
                 )
@@ -2929,11 +2997,17 @@ class BoardService:
                         ask=None, ask_options=None, ask_to=None, return_to=None, review_context=None
                     )
                 if status == "doing":
+                    holder_actor = self._update_acquisition_actor(row, args)
+                    # A concurrent reassignment must not inherit the resolved grant.
+                    holder = type_holder if holder_actor == prospective_actor else None
+                    task_types.require(conn, updates.get("task_type", row["task_type"]), holder)
                     from commonplace.projects import limits
 
-                    limits.check(conn, board, self.principal.actor, service=self, card_id=row["id"])
-                    updates["assignee"] = self.principal.actor
-                    updates["claim_until"] = None if self.principal.person else self._until(board)
+                    limits.check(conn, board, holder_actor, service=self, card_id=row["id"])
+                    updates["assignee"] = holder_actor
+                    updates["claim_until"] = (
+                        None if holder_actor.startswith("user:") else self._until(board)
+                    )
                 else:
                     updates["assignee"] = (
                         (self.principal.actor if row["status"] == "review" else row["assignee"])
@@ -3011,7 +3085,19 @@ class BoardService:
                 self._emit(conn, row["id"], "card.review_needed", return_to=self.principal.actor)
             return self._card(conn, task_row(conn, row["id"]), self.principal)
 
-    def _handoff(self, conn, row, board, to, note, options=None, context=None, *, ask_to=None):
+    def _handoff(
+        self,
+        conn,
+        row,
+        board,
+        to,
+        note,
+        options=None,
+        context=None,
+        *,
+        ask_to=None,
+        type_holder=None,
+    ):
         if row["proposal_status"] in ("pending", "rejected"):
             raise ToolError(
                 "no: proposal needs parent approval with task_approve before work starts"
@@ -3039,6 +3125,11 @@ class BoardService:
         status = "review" if person else "doing" if assigned else "todo"
         target = ask_to or target
         if assigned:
+            task_types.require(
+                conn,
+                row["task_type"],
+                type_holder if type_holder and type_holder.actor == target else None,
+            )
             from commonplace.projects import limits
 
             limits.check(conn, board, target, service=self, card_id=row["id"])
@@ -3095,10 +3186,17 @@ class BoardService:
         return self._card(conn, task_row(conn, row["id"]), self.principal)
 
     def task_handoff(self, task, to, note, options=None, version=None, context=None):
+        type_holder = (
+            self._type_holder(self._actor(to))
+            if self.principal.person and self.principal.role == "owner"
+            else None
+        )
         with self.transaction() as conn:
             row, board = self._get(conn, task)
             self._version(conn, row, version)
-            result = self._handoff(conn, row, board, to, note, options, context)
+            result = self._handoff(
+                conn, row, board, to, note, options, context, type_holder=type_holder
+            )
         return self._start_assignment(result)
 
     def ask(self, question, options=None, board=None, task=None, context=""):
@@ -3275,6 +3373,7 @@ class BoardService:
         repo=None,
         branch=None,
         pr_url=None,
+        task_type=task_types.UNSET,
     ):
         """Owner's explicit import API; repeat (board, title) imports are no-ops."""
         _owner(self.principal)
@@ -3308,6 +3407,7 @@ class BoardService:
                 title=title,
                 body=body,
                 labels=labels,
+                task_type=task_type,
                 status="backlog" if status == "backlog" else "todo",
             )
             updates = {"status": status}

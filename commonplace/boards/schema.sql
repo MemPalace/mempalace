@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_number INTEGER REFERENCES tasks(id),     -- always the top-level card on this board
     title         TEXT NOT NULL,
     body          TEXT NOT NULL DEFAULT '',
+    task_type     TEXT NOT NULL DEFAULT '',
     status        TEXT NOT NULL
                   CHECK (status IN ('backlog', 'todo', 'doing', 'review', 'done')),
     position      REAL NOT NULL,                    -- float, so a drag rewrites one row
@@ -179,3 +180,10 @@ CREATE TRIGGER IF NOT EXISTS rules_visibility_board_repos_update AFTER UPDATE ON
 BEGIN UPDATE meta SET value=(random() & 0x7fffffffffffffff) | 1 WHERE key='visibility'; END;
 CREATE INDEX IF NOT EXISTS space_messages_by_connection ON space_messages(stamp_connection, id, board_id);
 CREATE INDEX IF NOT EXISTS task_events_output_by_connection ON task_events(stamp_connection, id, task_id) WHERE kind IN ('comment', 'handoff', 'ask');
+
+-- Stable IDs belong to the control database; grants never cross workspaces.
+CREATE TABLE IF NOT EXISTS connection_task_types (
+    connection_id TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    PRIMARY KEY (connection_id, task_type)
+);

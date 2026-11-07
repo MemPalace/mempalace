@@ -2,6 +2,7 @@
 
 import json
 
+from commonplace.boards import task_types
 from commonplace.boards.service import BoardService, _waiting_on_person
 from commonplace.extensions import ToolContext, ToolError
 
@@ -68,6 +69,8 @@ def startable(gateway, machine, row, board) -> None:
         raise Refused("proposal_open")
     if not service._claimable_origin(row):
         raise Refused("origin_not_released")
+    if not task_types.read_eligible(service.ctx.workspace_dir(), row["task_type"], worker):
+        raise Refused("task_type_not_allowed")
     try:
         service._write(board, row=row, claiming=True)
     except ToolError:

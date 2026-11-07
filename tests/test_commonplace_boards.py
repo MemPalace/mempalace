@@ -21,7 +21,7 @@ from tests._commonplace_helpers import (
 )
 
 CARD_KEYS = set(
-    "escalated_to review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number pr_state pr_head pr_reported_at checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id restricted".split()
+    "task_type escalated_to review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number pr_state pr_head pr_reported_at checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id restricted".split()
 )
 
 
