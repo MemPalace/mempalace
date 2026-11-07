@@ -19,6 +19,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   those found through the candidate-name fallback, and no existing key changes.
   `kg_timeline` and `query_relationship` facts gain the `id`. (#2184)
 
+### Fixed
+
+- Room names in `mempalace.yaml` are validated when the miner loads them, so a
+  cloned repository's config cannot put newlines or other unsafe text into
+  drawer metadata and wake-up output. A rejected name such as `c++` becomes its
+  slug, with a warning. A room with no usable name is skipped, and its files go
+  to the other rooms or `general`. Every file is still mined, and stored drawers
+  are not changed.
+- The L1 size cap now holds for room lines. A room name already in a palace
+  stays on one line in wake-up and Hermes output, and a long one is shortened
+  instead of crowding out the story.
+
 ---
 
 ## [3.12.0] — 2026-10-31

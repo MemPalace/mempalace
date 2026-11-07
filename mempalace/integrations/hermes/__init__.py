@@ -72,6 +72,7 @@ from typing import Any, Dict, List, Optional
 
 from mempalace import paths
 from mempalace.config import (
+    MAX_NAME_LENGTH,
     MempalaceConfig,
     sanitize_iso_temporal,
     sanitize_kg_value,
@@ -152,7 +153,10 @@ def _l1_story_from_collection(
     lines = ["## L1 -- ESSENTIAL STORY"]
     total = 0
     for room, entries in sorted(by_room.items()):
-        room_line = f"\n[{room}]"
+        room_line = f"\n[{' '.join(str(room).split())[:MAX_NAME_LENGTH]}]"
+        if total + len(room_line) > max_chars:
+            lines.append("  ... (more in L3 search)")
+            break
         lines.append(room_line)
         total += len(room_line)
         for _imp, meta, doc in entries:

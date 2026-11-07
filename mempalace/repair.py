@@ -2273,6 +2273,41 @@ def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> li
     return [filename]
 
 
+def _preserve_logstream_and_replica(source_palace: str, dest_palace: str) -> list[str]:
+    """Copy the logstream database and replica identity into a rebuilt palace.
+
+    Neither file is derived from chroma.sqlite3, so a rebuild cannot
+    reconstruct them. Left behind, the rebuilt palace starts with an empty
+    coordination log and mints a new replica id on next use.
+    """
+    from .logstream import LOGSTREAM_DB_FILENAME
+    from .replica import REPLICA_FILENAME
+
+    if os.path.abspath(source_palace) == os.path.abspath(dest_palace):
+        return []
+
+    copied: list[str] = []
+
+    ls_src = os.path.join(source_palace, LOGSTREAM_DB_FILENAME)
+    ls_dst = os.path.join(dest_palace, LOGSTREAM_DB_FILENAME)
+    if not os.path.islink(ls_src) and os.path.isfile(ls_src):
+        os.makedirs(dest_palace, exist_ok=True)
+        _copy_sqlite_db(ls_src, ls_dst)
+        copied.append(LOGSTREAM_DB_FILENAME)
+
+    rep_src = os.path.join(source_palace, REPLICA_FILENAME)
+    rep_dst = os.path.join(dest_palace, REPLICA_FILENAME)
+    if not os.path.islink(rep_src) and os.path.isfile(rep_src):
+        os.makedirs(dest_palace, exist_ok=True)
+        _copy_file_no_follow(rep_src, rep_dst, replace=True)
+        copied.append(REPLICA_FILENAME)
+
+    if copied:
+        print(" Preserved logstream and replica identity: " + ", ".join(copied))
+
+    return copied
+
+
 def rebuild_from_sqlite(
     source_palace: str,
     dest_palace: str,
@@ -2684,6 +2719,7 @@ def _rebuild_from_sqlite_locked(
 
     os.makedirs(dest_palace, exist_ok=True)
     _preserve_knowledge_graph_sqlite(source_palace, dest_palace)
+    _preserve_logstream_and_replica(source_palace, dest_palace)
 
     # Backend lifetime is wrapped in try/finally so the dest palace's
     # PersistentClient handle (opened lazily inside ``create_collection``

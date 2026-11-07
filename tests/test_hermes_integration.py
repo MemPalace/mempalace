@@ -1134,6 +1134,58 @@ def test_tool_search_leaves_a_clean_query_alone(provider, integration_module, mo
     assert "sanitizer" not in result
 
 
+def test_l1_story_long_room_name_cannot_crowd_out_the_story(integration_module):
+    class _Col:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"documents": [], "metadatas": []}
+            return {
+                "documents": ["first memory", "second memory"],
+                "metadatas": [
+                    {"room": "0" * 5000, "filed_at": "2026-10-01"},
+                    {"room": "second-room", "filed_at": "2026-10-01"},
+                ],
+            }
+
+    story = integration_module._l1_story_from_collection(_Col())
+    assert "first memory" in story
+    assert "second memory" in story
+    assert "0" * 129 not in story
+
+
+def test_l1_story_keeps_a_room_label_on_one_line(integration_module):
+    class _Col:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"documents": [], "metadatas": []}
+            return {
+                "documents": ["a memory"],
+                "metadatas": [{"room": "notes\n## x", "filed_at": "2026-10-01"}],
+            }
+
+    story = integration_module._l1_story_from_collection(_Col())
+    assert "[notes ## x]" in story
+    assert "\n## x" not in story
+
+
+def test_l1_story_cap_covers_room_lines(integration_module):
+    rooms = ["a" * 60, "b" * 60]
+
+    class _Col:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"documents": [], "metadatas": []}
+            return {
+                "documents": ["x", "y"],
+                "metadatas": [{"room": room, "filed_at": "2026-10-01"} for room in rooms],
+            }
+
+    story = integration_module._l1_story_from_collection(_Col(), max_chars=100)
+    assert rooms[0] in story
+    assert rooms[1] not in story
+    assert "more in L3 search" in story
+
+
 def test_l1_story_reports_an_unreadable_collection(integration_module, monkeypatch):
     """A collection that cannot be read is not "No memories yet"."""
     import sqlite3
