@@ -242,10 +242,8 @@ def test_old_writer_after_fallback_repairs_alignment_even_at_version_one(tmp_pat
         reopened.close()
 
 
-@pytest.mark.parametrize(
-    "query,expected_plan", [("alpha", "scope AS MATERIALIZED"), ("rare", "CROSS JOIN")]
-)
-def test_hybrid_plans_match_original(query, expected_plan):
+@pytest.mark.parametrize("query", ["alpha", "rare"])
+def test_fts_identity_ranking_matches_original(query):
     store = ThreadStore(":memory:")
     try:
         ids = [
@@ -266,7 +264,7 @@ def test_hybrid_plans_match_original(query, expected_plan):
         hits = store.search(ids, query, 1)
         store._conn.set_trace_callback(None)
         assert hits == old_search(store, ids, query, 1)
-        assert any(expected_plan in sql for sql in statements)
+        assert any(sql.startswith("WITH ranked AS MATERIALIZED") for sql in statements)
         assert_alignment(store)
     finally:
         store.close()
@@ -339,9 +337,8 @@ def test_gateway_stays_open_across_legacy_and_no_fts_writes(tmp_path, first_sear
         gateway.close()
 
 
-@pytest.mark.parametrize("plan", ["scope AS MATERIALIZED", "CROSS JOIN"])
 @pytest.mark.parametrize("readonly", [False, True])
-def test_identity_fallback_reruns_full_scope_before_limit(tmp_path, plan, readonly):
+def test_identity_fallback_reruns_full_scope_before_limit(tmp_path, readonly):
     from commonplace.handoff.thread_store_migrate import read_store
 
     path = tmp_path / "threads.sqlite3"
@@ -359,16 +356,16 @@ def test_identity_fallback_reruns_full_scope_before_limit(tmp_path, plan, readon
     store._conn.execute("UPDATE chunks_fts SET rowid=100 WHERE rowid=1")
     store._conn.execute("UPDATE chunks_fts SET rowid=1 WHERE rowid=2")
     store._conn.execute("UPDATE chunks_fts SET rowid=2 WHERE rowid=100")
-    scope = [ids[1], ids[2]] + ([ids[3]] if plan == "CROSS JOIN" else [])
-    expected = old_search(store, scope, "secret", 1)
-    assert len(expected) == 1 and expected[0].stored_thread_id == ids[2]
+    scope = [ids[0], ids[2]]
+    expected = old_search(store, scope, "secret", 2)
+    assert len(expected) == 2 and expected[0].stored_thread_id == ids[2]
     if readonly:
         store.close()
         before = path.read_bytes()
         with read_store(path) as reader:
             statements = []
             reader._conn.set_trace_callback(statements.append)
-            assert reader.search(scope, "secret", 1) == expected
+            assert reader.search(scope, "secret", 2) == expected
             assert reader.search([ids[1]], "secret") == []
             assert reader._conn.total_changes == 0
             assert not hasattr(reader, "_fts_verified_version")
@@ -378,8 +375,8 @@ def test_identity_fallback_reruns_full_scope_before_limit(tmp_path, plan, readon
         try:
             statements = []
             store._conn.set_trace_callback(statements.append)
-            assert store.search(scope, "secret", 1) == expected
-            assert any(plan in sql for sql in statements)
+            assert store.search(scope, "secret", 2) == expected
+            assert any(sql.startswith("WITH ranked AS MATERIALIZED") for sql in statements)
             assert store._fts_verified_version is None
         finally:
             store.close()
@@ -387,7 +384,7 @@ def test_identity_fallback_reruns_full_scope_before_limit(tmp_path, plan, readon
 
 @pytest.mark.skipif(not hasattr(sqlite3.Connection, "setlimit"), reason="Python 3.11+ API")
 @pytest.mark.parametrize("query", ["alpha", "rare", "absent"])
-def test_single_global_probe_uses_largest_nonempty_batch(query):
+def test_ranking_batches_need_no_global_match_probe(query):
     store = ThreadStore(":memory:")
     try:
         ids = []
@@ -415,11 +412,9 @@ def test_single_global_probe_uses_largest_nonempty_batch(query):
         store._conn.set_trace_callback(None)
         assert hits == old_search(store, scope, query, 3)
         probes = [sql for sql in statements if sql.startswith("SELECT count(*) FROM (SELECT 1")]
-        assert len(probes) == 1
-        assert "LIMIT 6)" in probes[0]
-        if query == "rare":
-            assert any("scope AS MATERIALIZED" in sql for sql in statements)
-            assert any("CROSS JOIN" in sql for sql in statements)
+        assert probes == []
+        ranked = [sql for sql in statements if sql.startswith("WITH ranked AS MATERIALIZED")]
+        assert bool(ranked) == (query != "absent")
         statements.clear()
         store._conn.set_trace_callback(statements.append)
         assert store.search(["missing"], query) == []

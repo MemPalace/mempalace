@@ -799,62 +799,35 @@ class ThreadStore:
         if not hasattr(self, "_fts_verified_version"):
             return self._search_fts_logical(stored_ids, tokens, limit)
         match = " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
-        batch_size = max(1, min(500, self._sqlite_limit("SQLITE_LIMIT_VARIABLE_NUMBER", 999) - 2))
-        batches = []
+        batch_size = max(1, min(500, self._sqlite_limit("SQLITE_LIMIT_VARIABLE_NUMBER", 999) - 3))
+        rows = []
         for offset in range(0, len(stored_ids), batch_size):
             ids = stored_ids[offset : offset + batch_size]
             placeholders = ",".join("?" for _ in ids)
-            chunk_count = self._conn.execute(
-                f"SELECT coalesce(sum(chunk_count), 0) FROM threads WHERE id IN ({placeholders})",
-                ids,
-            ).fetchone()[0]
-            if not chunk_count:
+            # FTS5's rank iterator scores without reading stored text. Find a
+            # cutoff first, then read identity/tie keys only at or above it.
+            # Include the whole boundary tie before applying the stable limit.
+            scores = self._conn.execute(
+                "SELECT rank FROM chunks_fts "
+                f"WHERE chunks_fts MATCH ? AND thread_id IN ({placeholders}) "
+                "AND rank MATCH 'bm25()' ORDER BY rank LIMIT ?",
+                (match, *ids, limit),
+            ).fetchall()
+            if not scores:
                 continue
-            batches.append((ids, chunk_count))
-        if not batches:
-            return []
-        # One probe capped at the largest scope preserves every batch's plan
-        # decision, including smaller batches whose own cap would saturate.
-        match_count = self._conn.execute(
-            "SELECT count(*) FROM (SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?)",
-            (match, max(chunk_count for _, chunk_count in batches)),
-        ).fetchone()[0]
-        rows = []
-        for ids, chunk_count in batches:
-            placeholders = ",".join("?" for _ in ids)
-            if match_count < chunk_count:
-                scope_sql = ""
-                rank_sql = (
-                    "FROM chunks_fts CROSS JOIN chunks AS s ON s.rowid=chunks_fts.rowid "
-                    f"WHERE chunks_fts MATCH ? AND s.thread_id IN ({placeholders}) "
-                    "ORDER BY bm25(chunks_fts), s.thread_id, s.idx LIMIT ?"
-                )
-                parameters = (match, *ids, limit)
-            else:
-                # Covering primary-key metadata avoids payload reads for common
-                # terms. AS MATERIALIZED requires SQLite 3.35+ and prevents the
-                # planner from moving chunk payload lookups ahead of LIMIT.
-                scope_sql = (
-                    "scope AS MATERIALIZED ("
-                    "SELECT rowid AS chunk_rowid, thread_id, idx FROM chunks "
-                    f"WHERE thread_id IN ({placeholders})), "
-                )
-                rank_sql = (
-                    "FROM chunks_fts JOIN scope ON scope.chunk_rowid=chunks_fts.rowid "
-                    "WHERE chunks_fts MATCH ? "
-                    "ORDER BY bm25(chunks_fts), scope.thread_id, scope.idx LIMIT ?"
-                )
-                parameters = (*ids, match, limit)
+            cutoff = scores[-1][0]
+            # Materialize the top rowids before any canonical chunk lookup.
             selected = self._conn.execute(
-                "WITH " + scope_sql + "ranked AS MATERIALIZED ("
-                "SELECT chunks_fts.rowid AS chunk_rowid, -bm25(chunks_fts) AS score "
-                + rank_sql
-                + ") "
+                "WITH ranked AS MATERIALIZED ("
+                "SELECT chunks_fts.rowid AS chunk_rowid, -rank AS score "
+                "FROM chunks_fts "
+                f"WHERE chunks_fts MATCH ? AND rank <= ? AND thread_id IN ({placeholders}) "
+                "AND rank MATCH 'bm25()' ORDER BY rank, thread_id, idx LIMIT ?) "
                 "SELECT c.thread_id, c.idx, c.seq_start, c.seq_end, c.text, ranked.score, "
                 "(c.thread_id IS f.thread_id AND c.idx IS f.idx) AS aligned "
-                "FROM ranked JOIN chunks AS c ON c.rowid=ranked.chunk_rowid "
+                "FROM ranked LEFT JOIN chunks AS c ON c.rowid=ranked.chunk_rowid "
                 "JOIN chunks_fts AS f ON f.rowid=ranked.chunk_rowid",
-                parameters,
+                (match, cutoff, *ids, limit),
             ).fetchall()
             if any(not row["aligned"] for row in selected):
                 self._fts_verified_version = None

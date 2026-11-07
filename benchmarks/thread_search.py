@@ -1,92 +1,100 @@
-"""Synthetic rank-first comparison: uv run python -m benchmarks.thread_search."""
+"""Synthetic ThreadStore ranking benchmark; timings are informational.
+
+Run: uv run --extra dev python benchmarks/thread_search.py --output result.json
+Use the identical command on both revisions, then compare the complete `results`
+lists. The default corpus approximates 130 chats / 112k 800-character chunks;
+no transcript files or external services are used. Includes common/rare terms,
+random scopes, limits and exact ties. p50/p95 measure warm-cache search only.
+"""
+
+from __future__ import annotations
 
 import argparse
-import math
+import json
 import random
-import sqlite3
 import statistics
 import sys
 import tempfile
 import time
+from dataclasses import asdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _thread_search_oracle import old_search
-from commonplace.handoff.models import ThreadMessage
 from commonplace.handoff.thread_store import ThreadStore
+
+
+def populate(store, chats, chunks):
+    rng = random.Random(36)
+    ids = [f"thread-{i:03}" for i in range(chats)]
+    with store._transaction():
+        for thread_id in reversed(ids):
+            store._conn.execute(
+                "INSERT INTO threads VALUES (?, 'synthetic', ?, '', ?, ?, '', '', '', '')",
+                (thread_id, thread_id, chunks, chunks),
+            )
+            rows = []
+            for idx in reversed(range(chunks)):
+                # A repeated row creates ties whose rowids oppose logical order.
+                text = (
+                    "common identical tie"
+                    if idx % 10 == 0
+                    else " ".join(
+                        ["common", f"rare{rng.randrange(2000)}"]
+                        + [f"word{rng.randrange(200)}" for _ in range(100)]
+                    )
+                )
+                text = (text + " " * 800)[:800]
+                rows.append((thread_id, idx, idx, idx, text))
+            store._conn.executemany("INSERT INTO chunks VALUES (?,?,?,?,?)", rows)
+        store._repair_fts()
+    return ids
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runs", type=int, default=50)
-    parser.add_argument("--threads", type=int, default=130)
-    parser.add_argument("--chunks-per-thread", type=int, default=193)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--chats", type=int, default=130)
+    parser.add_argument("--chunks", type=int, default=862)
+    parser.add_argument("--queries", type=int, default=240)
     args = parser.parse_args()
-    rng = random.Random(36)
-    with tempfile.TemporaryDirectory() as directory:
-        store = ThreadStore(str(Path(directory) / "threads.sqlite3"))
-        ids = []
-        for thread in range(args.threads):
-            # Each message occupies one chunk, with realistic payload lengths.
-            messages = [
-                ThreadMessage(
-                    i,
-                    "user",
-                    "message",
-                    ("raretoken " if thread == 0 and i < 10 else "")
-                    + " ".join(
-                        rng.choices(
-                            ["needle", "alpha", "beta", "gamma", "delta"], k=400
-                        )
-                    ),
-                    raw="",
-                )
-                for i in range(args.chunks_per_thread)
-            ]
-            ids.append(
-                store.store("synthetic", str(thread), messages, actor="benchmark").id
-            )
-        print(
-            f"SQLite {sqlite3.sqlite_version}; chunks={store._conn.execute('SELECT count(*) FROM chunks').fetchone()[0]}; limit=8; runs={args.runs}"
-        )
-        store._conn.execute("PRAGMA user_version=0")
-        store.close()
-        started = time.perf_counter()
-        store = ThreadStore(str(Path(directory) / "threads.sqlite3"))
-        print(
-            f"aligned legacy migration: {(time.perf_counter() - started) * 1000:.2f} ms; writes={store._conn.total_changes}"
-        )
-        for scope_name, scope in [
-            ("all-thread", ids),
-            ("one-thread", ids[:1]),
-            ("chain", ids[:50]),
-        ]:
-            for workload, queries in [
-                ("common", ["needle", "alpha beta", "gamma"]),
-                ("rare", ["raretoken"]),
-            ]:
-                timings = {"old": [], "new": []}
-                for run in range(args.runs + 5):
-                    query = queries[run % len(queries)]
-                    assert old_search(store, scope, query) == store.search(scope, query)
-                    # Alternate execution order to reduce cache/order bias.
-                    for name in ["old", "new"] if run % 2 else ["new", "old"]:
-                        function = (
-                            old_search
-                            if name == "old"
-                            else lambda s, ids, q: s.search(ids, q)
-                        )
-                        start = time.perf_counter()
-                        function(store, scope, query)
-                        elapsed = (time.perf_counter() - start) * 1000
-                        if run >= 5:
-                            timings[name].append(elapsed)
-                for name, samples in timings.items():
-                    print(
-                        f"{scope_name} {workload} {name}: p50={statistics.median(samples):.2f} ms p95={sorted(samples)[math.ceil(0.95 * len(samples)) - 1]:.2f} ms"
-                    )
-        store.close()
+    rng = random.Random(3600)
+    with tempfile.TemporaryDirectory() as temporary:
+        store = ThreadStore(str(Path(temporary) / "threads.sqlite3"))
+        try:
+            ids = populate(store, args.chats, args.chunks)
+            cases = []
+            for i in range(args.queries):
+                scope = ids if i % 3 else rng.sample(ids, rng.randint(1, len(ids)))
+                query = [
+                    "common",
+                    "identical tie",
+                    f"word{rng.randrange(200)}",
+                    f"rare{rng.randrange(2000)}",
+                    "absent",
+                    '" OR common',
+                ][i % 6]
+                cases.append((scope, query, rng.choice([1, 8, 19, 50])))
+            for scope, query, limit in cases[:12]:
+                store.search(scope, query, limit)
+            times, results = [], []
+            for scope, query, limit in cases:
+                started = time.perf_counter()
+                hits = store.search(scope, query, limit)
+                times.append((time.perf_counter() - started) * 1000)
+                results.append([asdict(hit) for hit in hits])
+            report = {
+                "chats": args.chats,
+                "chunks": args.chats * args.chunks,
+                "text_bytes": args.chats * args.chunks * 800,
+                "queries": len(cases),
+                "p50_ms": statistics.median(times),
+                "p95_ms": sorted(times)[int(len(times) * 0.95) - 1],
+            }
+            args.output.write_text(json.dumps({**report, "results": results}) + "\n")
+            print(json.dumps(report, indent=2))
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":
