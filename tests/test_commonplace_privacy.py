@@ -130,19 +130,34 @@ def test_ordinary_design_paragraph():
     assert scan(paragraph) == []
 
 
-@pytest.mark.timing
-def test_speed_on_10kb_and_delimiter_heavy_near_misses():
-    samples = [
-        ("A normal engineering note about token handling and builds. " * 180)[:10240],
-        ("curl " + "x|" * 100 + " api_key=" + "a" * 199 + " ") * 45,
+_NEAR_MISS_CASES = [
+    (("A normal engineering note about token handling and builds. " * 180)[:10240], []),
+    (("curl " + "x|" * 100 + " api_key=" + "a" * 199 + " ") * 45, []),
+    (
         (("doctor token akia ghp_ sk-ant- cmmn_ xox eyJ :// " * 205) + "diagnose")[:10240],
-    ]
-    for text in samples:
+        ["health"],
+    ),
+]
+
+
+def test_speed_on_10kb_and_delimiter_heavy_near_misses():
+    for text, expected in _NEAR_MISS_CASES:
+        assert scan(text) == expected
+
+
+@pytest.mark.timing
+@pytest.mark.parametrize(
+    "text",
+    [text for text, _ in _NEAR_MISS_CASES],
+    ids=["10kb", "delimiters", "token-prefixes"],
+)
+def test_scan_near_miss_time_budget(text):
+    scan(text)
+    start = time.perf_counter()
+    for _ in range(20):
         scan(text)
-        start = time.perf_counter()
-        for _ in range(20):
-            scan(text)
-        assert (time.perf_counter() - start) / 20 < 0.02
+    # Keep the clock assertion outside loops for timing-only classification.
+    assert (time.perf_counter() - start) / 20 < 0.02
 
 
 def test_debugging_words_are_not_health():

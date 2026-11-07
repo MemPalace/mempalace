@@ -25,6 +25,14 @@ An inactive card's holder may update only its status line without release;
 this does not activate, claim or approve the card. Rejected-proposal handoffs
 retain the proposal-approval guard before origin authorization.
 
+### Privacy scanner timing checks
+
+Large-input and delimiter-heavy near-miss correctness checks run in the
+behaviour suite without measuring time. Each input also retains a separate
+`timing`-marked check of the 20 ms average scan budget over 20 iterations.
+The duration assertion is outside loops so a slow host produces an
+informational timing failure while incorrect flags remain blocking.
+
 ### Restricted-origin card content
 
 Trusted agents and authorized board coordinators may update only the title
