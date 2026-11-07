@@ -3,7 +3,14 @@
 import json
 import logging
 
-from commonplace.extensions import ALL_PROFILES, WORK_PROFILES, LocalTool, ToolError, register
+from commonplace.extensions import (
+    ALL_PROFILES,
+    WORK_PROFILES,
+    LocalTool,
+    ToolContext,
+    ToolError,
+    register,
+)
 from commonplace.http_util import log_failure
 
 from .display import card_url, people
@@ -230,9 +237,9 @@ def add(
                 "Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. "
                 "callstack takes the JSON from python -m commonplace.callstack.",
                 "task_handoff": "Hand off work with a note, or ask a person and end the turn.",
-                "ask": "Ask the workspace owner and end the turn.",
-                "decide": "Only a signed-in workspace owner may answer a review and return, release, close or park the card. An agent cannot relay approval. Pass the version you read to reject decisions on an edited card.",
-                "needs_me": "Read the visible decision queue (owners or trusted, unrestricted member connections; read only).",
+                "ask": "Ask and end the turn. Subagent questions go to the live board coordinator when available; otherwise the owner.",
+                "decide": "Answer a review as its owner or addressed live coordinator. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
+                "needs_me": "Read the visible decision queue. Live coordinators also receive subagent questions addressed to them.",
             }[name],
             input_schema={
                 "type": "object",
@@ -248,6 +255,12 @@ def add(
             owner_only=owner,
             available=available,
         )
+    )
+
+
+def receives_asks(principal, gateway):
+    return bool(
+        BoardService(ToolContext(principal=principal, gateway=gateway)).coordinated_ask_boards()
     )
 
 
@@ -385,15 +398,17 @@ def register_tools():
             "version": {"type": "integer"},
             "choice": STRING,
             "reply": STRING,
-            "then": {"type": "string", "enum": ["return", "todo", "done", "backlog"]},
+            "then": {"type": "string", "enum": ["return", "todo", "done", "backlog", "escalate"]},
         },
         ("task",),
-        owner=True,
+        available=lambda p, gateway: p.role == "owner" or receives_asks(p, gateway),
         trusted=True,
         write=True,
     )
     add(
         "needs_me",
         {"format": {"type": "string", "enum": ["list", "digest"]}},
-        available=lambda p, _gateway: p.role == "owner" or _trusted_agent(p),
+        available=lambda p, gateway: (
+            p.role == "owner" or _trusted_agent(p) or receives_asks(p, gateway)
+        ),
     )

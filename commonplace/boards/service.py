@@ -289,9 +289,17 @@ def _stuck(row, cutoff):
     )
 
 
-def needs_me(store, principal, *, release=None, names=None, supervisors=None) -> dict:
+def needs_me(
+    store, principal, *, release=None, names=None, supervisors=None, coordinated=(), ask_owner=None
+) -> dict:
     """Decision queue: asks, done_review, backlog_from_agents, ready_to_merge, stale, count."""
-    _owner(principal, trusted_read=True)
+    owner_queue = True
+    try:
+        _owner(principal, trusted_read=True)
+    except ToolError:
+        if not coordinated:
+            raise
+        owner_queue = False
     result = {
         key: []
         for key in (
@@ -319,8 +327,20 @@ def needs_me(store, principal, *, release=None, names=None, supervisors=None) ->
         for row in rows:
             if not principal.policy.can_read_wing(row["board_wing"]):
                 continue
+            own_ask = (
+                bool(coordinated)
+                and row["board_id"] in coordinated
+                and row["ask_to"] == principal.actor
+                and row["review_kind"] == "decision"
+            )
+            if not owner_queue and not own_ask:
+                continue
             kind = None
-            addressed = row["ask_to"] in (None, f"user:{principal.user_id}")
+            addressed = (
+                row["ask_to"] in (None, f"user:{principal.user_id}")
+                or own_ask
+                or (ask_owner is not None and ask_owner(row) == f"user:{principal.user_id}")
+            )
             if row["status"] == "review" and addressed:
                 kind = (
                     "done_review"
@@ -351,7 +371,7 @@ def needs_me(store, principal, *, release=None, names=None, supervisors=None) ->
                 continue
             item = card(conn, row, principal, release=release)
             actions = []
-            recipient = "you" if principal.person else "the owner"
+            recipient = "you" if principal.person or own_ask else "the owner"
             if kind in ("asks", "done_review"):
                 asker = actor(row["return_to"] or row["created_by"])
                 ask_line = (row["ask"] or "").split("\n", 1)[0]
@@ -410,7 +430,9 @@ def needs_me(store, principal, *, release=None, names=None, supervisors=None) ->
                 why += " Escalated to the owner."
                 if handoff and handoff["reason"]:
                     why += " Reason: " + json.dumps(handoff["reason"], ensure_ascii=False)
-            item.update(why=why, actions=actions if principal.person else [])
+            if own_ask:
+                actions = ["answer", "escalate"]
+            item.update(why=why, actions=actions if principal.person or own_ask else [])
             result[kind].append(item)
     result["count"] = len({c["number"] for bucket in result.values() for c in bucket})
     return result
@@ -464,6 +486,48 @@ class BoardService:
             except (ControlError, ValueError, TypeError):
                 cache[key] = None
         return cache[key]
+
+    def _ask_coordinator(self, board):
+        ref = board["coordinator"] or ""
+        if not ref.startswith("conn:"):
+            return None
+        q = self._live_connection(ref[5:])
+        if (
+            q is not None
+            and _can_coordinate(q, board["wing"])
+            and q.policy.tool_visible("decide")
+            and q.policy.tool_visible("needs_me")
+        ):
+            return q
+        return None
+
+    def _ask_owner(self, row):
+        """Recover a routed question when its addressed coordinator stops being available."""
+        if (
+            row["status"] == "review"
+            and row["review_kind"] == "decision"
+            and (row["ask_to"] or "").startswith("conn:")
+        ):
+            q = self._ask_coordinator(
+                {"coordinator": row["board_coordinator"], "wing": row["board_wing"]}
+            )
+            if q is None or q.actor != row["ask_to"]:
+                return self._owner_actor()
+        return None
+
+    def coordinated_ask_boards(self):
+        """Boards whose live ask recipient is this connection, using current policy."""
+        if self.principal.person:
+            return ()
+        with self.store.connection() as conn:
+            return tuple(
+                b["id"]
+                for b in conn.execute(
+                    "SELECT * FROM boards WHERE archived=0 AND coordinator=?",
+                    (self.principal.actor,),
+                )
+                if self._ask_coordinator(b) is not None
+            )
 
     def _release_candidates(self, row):
         cache = getattr(self, "_projection_cache", None)
@@ -2260,7 +2324,8 @@ class BoardService:
             old == "review"
             and not self.principal.person
             and (
-                not (row["ask_to"] or "").startswith("conn:")
+                (row["review_kind"] == "decision" and self.principal.parent_agent)
+                or not (row["ask_to"] or "").startswith("conn:")
                 or any((row[key] or "").startswith("user:") for key in ("assignee", "return_to"))
             )
         ):
@@ -2657,7 +2722,7 @@ class BoardService:
                 self._emit(conn, row["id"], "card.review_needed", return_to=self.principal.actor)
             return self._card(conn, task_row(conn, row["id"]), self.principal)
 
-    def _handoff(self, conn, row, board, to, note, options=None, context=None):
+    def _handoff(self, conn, row, board, to, note, options=None, context=None, *, ask_to=None):
         if row["proposal_status"] in ("pending", "rejected"):
             raise ToolError(
                 "no: proposal needs parent approval with task_approve before work starts"
@@ -2682,6 +2747,7 @@ class BoardService:
         if options and not person:
             raise ToolError("no: options require a person")
         status = "review" if person else "todo"
+        target = ask_to or target
         updates = {
             "status": status,
             "claim_until": None,
@@ -2694,6 +2760,8 @@ class BoardService:
                 sorted(set(json.loads(row["flags"] or "[]")) | set(flags_for(note, context)))
             ),
         }
+        if ask_to is not None:
+            updates["review_kind"] = "decision"
         if not person:
             updates.update(self._holder_pr_reset(row, target))
         updates["review_context"] = (
@@ -2740,7 +2808,16 @@ class BoardService:
                 if board is not None and self._board(conn, board)["id"] != b["id"]:
                     raise ToolError("no: card not found")
                 return self._handoff(
-                    conn, row, b, self._owner_actor(), question, options, context or None
+                    conn,
+                    row,
+                    b,
+                    self._owner_actor(),
+                    question,
+                    options,
+                    context or None,
+                    ask_to=(q.actor if (q := self._ask_coordinator(b)) else None)
+                    if self.principal.parent_agent
+                    else None,
                 )
             b = self._board(conn, board, create=True)
             self._write(b, submission=True)
@@ -2754,19 +2831,51 @@ class BoardService:
                 status="review",
                 ask=question,
                 options=choices(options),
-                target=self._owner_actor(),
+                target=(q.actor if (q := self._ask_coordinator(b)) else self._owner_actor())
+                if self.principal.parent_agent
+                else self._owner_actor(),
             )
 
     def decide(self, task, choice=None, reply=None, then="return", version=None):
         with self.transaction() as conn:
             row, board = self._get(conn, task)
-            _owner(self.principal)
-            if not self.principal.person:
-                raise ToolError("no: only a signed-in workspace owner can answer this")
+            p = self.principal
+            coordinator = self._ask_coordinator(board)
+            addressed = (
+                not p.person
+                and coordinator is not None
+                and coordinator.actor == p.actor == row["ask_to"]
+                and row["review_kind"] == "decision"
+            )
+            if not addressed:
+                _owner(p)
+                if not p.person:
+                    raise ToolError("no: only a signed-in workspace owner can answer this")
             self._write(board)
             self._version(conn, row, version)
             if row["status"] != "review":
                 raise ToolError("no: card is not in review")
+            if then == "escalate":
+                if not addressed or choice is not None:
+                    raise ToolError(
+                        "no: only the addressed coordinator may escalate without a choice"
+                    )
+                reason = validate_text(reply, "escalation reason", required=True)
+                target = self._owner_actor()
+                self._set(conn, row, {"ask_to": target, "escalated_to": target})
+                self._log(
+                    conn,
+                    row["id"],
+                    "handoff",
+                    reason=reason,
+                    target=target,
+                    from_status="review",
+                    to_status="review",
+                )
+                self._emit(
+                    conn, row["id"], "card.review_needed", ask_to=target, return_to=row["return_to"]
+                )
+                return self._card(conn, task_row(conn, row["id"]), p)
             if then not in ("return", "todo", "done", "backlog"):
                 raise ToolError("no: invalid decision destination")
             if choice is not None:
@@ -2787,6 +2896,7 @@ class BoardService:
                 "ask": None,
                 "ask_options": None,
                 "ask_to": None,
+                "escalated_to": None,
                 "review_context": None,
                 "return_to": row["return_to"] if then == "return" else None,
                 "done_at": now() if status == "done" else None,
@@ -2829,6 +2939,8 @@ class BoardService:
                 release=self._needs_person_release,
                 names=lambda text: people(self.ctx, text),
                 supervisors=self._supervisors,
+                coordinated=self.coordinated_ask_boards(),
+                ask_owner=self._ask_owner,
             )
             approvals = (
                 self.approvals_for_me()
