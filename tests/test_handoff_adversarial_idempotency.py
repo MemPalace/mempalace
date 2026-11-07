@@ -128,7 +128,9 @@ class Harness:
 
 
 @pytest.fixture
-def harness(tmp_path):
+def harness(tmp_path, monkeypatch):
+    # Admit the deliberate sixteen-request burst before testing idempotency.
+    monkeypatch.setattr(ThreadingHTTPServer, "request_queue_size", 64)
     instance = Harness(tmp_path)
     try:
         yield instance

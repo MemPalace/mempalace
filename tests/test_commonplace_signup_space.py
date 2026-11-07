@@ -201,8 +201,9 @@ def test_agents_keep_space_creation_authority_and_child_approval(signup):
         client, None, path + "/approve", "POST", {"reason": "synthetic reason"}, token=parent
     )
     assert status == 200 and approved["proposal_status"] == "approved"
-    # The owning top-level agent releases its child's work (owner decision 3 Nov 14:17).
-    assert approved["approved_by"] == "conn:parent"
+    assert approved["approved_by"] is None and approved["status"] == "backlog"
+    status, approved = api(client, cookie, path + "/approve", "POST", {})
+    assert status == 200 and approved["approved_by"].startswith("user:")
     status, claimed = api(
         client,
         None,

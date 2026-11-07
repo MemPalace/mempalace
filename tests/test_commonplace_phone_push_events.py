@@ -6,9 +6,11 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
-from commonplace import events
+from commonplace import events, sessions
+from commonplace.policy import Policy
 from tests.phone_push_harness import (
     agent,
     api,
@@ -34,7 +36,7 @@ OPTIONS = ["Continue", "Revise"]
 
 
 def worker(hub, owner, name="worker", *, parent=None):
-    result = agent(hub, owner, name, parent=parent)
+    result = agent(hub, owner, name, parent=parent, unrestricted=parent is None)
     result.name = name
     return result
 
@@ -691,7 +693,24 @@ def test_t20_multi_owner_done_and_nonentering_edits(hub, signup, monkeypatch):
 
 
 def proposal(hub, owner, name):
-    parent = worker(hub, owner, name + "-parent")
+    person = sessions.session_principal(hub.db, sessions.cookie_value(owner))
+    parent_name = name + "-parent"
+    cid, token = hub.db.create_token(
+        name=parent_name,
+        client="generic",
+        actor=person.user_id,
+        user_ref=person.user_id,
+        workspace_ref=person.workspace_id,
+        policy=Policy.build(
+            profile="full",
+            trust="standard",
+            scopes=["memory:read", "memory:write"],
+            read_wings=["shared"],
+            write_wings=["shared"],
+        ),
+    )
+    parent = SimpleNamespace(id=cid, token=token, name=parent_name)
+    call(hub, owner, "PATCH", "/api/boards/commonplace", {"coordinator": "conn:" + parent_name})
     parent_card = create(hub, owner, actor=parent)
     child = worker(hub, owner, name + "-child", parent=parent.id)
     card = create(hub, owner, actor=child, parent=parent_card["number"])

@@ -37,11 +37,10 @@ def unconfigured(monkeypatch):
 def ask(hub, owner, worker):
     code, card = api(
         hub,
-        None,
+        owner,
         "POST",
         "/api/boards/commonplace/cards",
-        {"title": "A decision to make"},
-        token=worker.token,
+        {"title": "A decision to make", "assignee": worker.id},
     )
     assert code == 201, card
     number = card["number"]

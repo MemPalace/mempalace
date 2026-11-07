@@ -11,7 +11,7 @@ import pytest
 from commonplace import urls
 from commonplace.boards import service as board_service
 from tests.phone_push_harness import (
-    agent,
+    agent as make_agent,
     api,
     cli,
     clock,
@@ -27,6 +27,11 @@ from tests.phone_push_harness import (
     s1_counter,
     signup as signup,
 )
+
+
+def agent(hub, owner, name):
+    # Notification delivery is tested independently of restricted-origin intake.
+    return make_agent(hub, owner, name, unrestricted=True)
 
 
 def create(hub, owner=None, *, worker=None, **data):

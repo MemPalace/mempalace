@@ -55,9 +55,9 @@ def test_deep_actors_roll_up_four_children_and_agents_still_see_them(hub, env): 
         deeper.task_add(title="Test the counts", board="work"),
     ]
     for child in children[:2]:
-        top.task_approve(child["number"], reason="synthetic reason")
+        owner.task_approve(child["number"], reason="synthetic reason")
     for child in children[2:]:
-        sub.task_approve(child["number"], reason="synthetic reason")
+        owner.task_approve(child["number"], reason="synthetic reason")
     for worker, child in ((sub, children[0]), (deeper, children[2])):
         worker.task_update(child["number"], status="done")
     assert {c["parent"] for c in children} == {parent["number"]}
@@ -208,7 +208,7 @@ def test_chat_linked_children_keep_asks_and_answer_history(hub, env):  # noqa: F
     parent = top.task_add(title="Parent", board="work", message_id=message["id"])
     _, _, sub = actor(hub, "worker", parent=principal.connection_id)
     child = sub.task_add(title="Child approval", board="work", message_id=message["id"])
-    top.task_approve(child["number"], reason="synthetic reason")
+    owner.task_approve(child["number"], reason="synthetic reason")
     sub.ask(
         'Ship <script> & "original"?',
         ["Ship", "Wait"],
@@ -322,7 +322,7 @@ def test_child_asks_stay_in_needs_me_and_refresh_parent_count(hub, env):  # noqa
     parent = top.task_add(title="Parent", board="work")
     _, _, sub = actor(hub, "worker", parent=principal.connection)
     child = sub.task_add(title="Pick the release", board="work")
-    top.task_approve(child["number"], reason="synthetic reason")
+    owner.task_approve(child["number"], reason="synthetic reason")
     child = sub.ask(
         "Pick the release? Which approach should we take?",
         ["Now", "Later"],

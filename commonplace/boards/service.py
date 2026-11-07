@@ -568,6 +568,8 @@ class BoardService:
     def _needs_person_release(self, row):
         if "escalated_to" in row.keys() and row["escalated_to"]:
             return True
+        if self._awaits_origin_release(row):
+            return self._live_coordinator(row) is None
         if not (
             _plan_waiting(row)
             or (row["status"] == "backlog" and row["proposal_status"] == "pending")
@@ -620,7 +622,7 @@ class BoardService:
             f"SELECT t.*, b.slug AS board,b.wing AS board_wing,{coordinator} AS board_coordinator "
             "FROM tasks t JOIN boards b ON b.id=t.board_id WHERE t.id>? AND t.status!='done' "
             + escalated
-            + "AND (t.proposal_status='pending' OR (t.status IN ('todo','doing') AND t.labels LIKE '%\"plan\"%')) "
+            + "AND (t.proposal_status='pending' OR ((t.restricted_origin=1 OR t.agent_parent IS NOT NULL) AND t.status IN ('backlog','todo')) OR (t.status IN ('todo','doing') AND t.labels LIKE '%\"plan\"%')) "
             f"AND (t.proposed_to=? OR t.created_by IN ({placeholders}) OR {coordinator}=?) ORDER BY t.id LIMIT 50"
         )
         cap = 60 if budget == "session" else 200
@@ -640,7 +642,11 @@ class BoardService:
                         break
                     checked += 1
                     role = self._approval_role(p, row)
-                    if role and (row["proposal_status"] == "pending" or _plan_waiting(row)):
+                    if role and (
+                        row["proposal_status"] == "pending"
+                        or _plan_waiting(row)
+                        or (self._awaits_origin_release(row) and self._can_release_origin(p, row))
+                    ):
                         item = self._card(conn, row, approval_role=role)
                         item.update(
                             approval_role=role,
@@ -706,13 +712,19 @@ class BoardService:
     def _card(self, conn, row, principal=None, *, approval_role=None):
         q = principal or self.principal
         with self._projection():
-            return card(
+            result = card(
                 conn,
                 row,
                 q,
                 release=self._needs_person_release,
                 approver=lambda row: approval_role or self._approval_role(q, row),
             )
+            if self._restricted_origin(row):
+                result["restricted"] = True
+            if self._awaits_origin_release(row):
+                if q.person or row["proposal_status"] != "pending":
+                    result["can_approve"] = self._can_release_origin(q, row)
+            return result
 
     def _legacy_restricted_origin(self, row):
         if row["stamp_trust"] not in ("trusted", "standard"):
@@ -907,6 +919,32 @@ class BoardService:
         except (ControlError, ValueError, TypeError):
             return False
 
+    def _live_coordinator(self, row):
+        actor = row["board_coordinator"] or ""
+        if actor.startswith("conn:"):
+            q = self._live_connection(actor[5:])
+            if q is not None and _can_coordinate(q, row["board_wing"]):
+                return q
+        return None
+
+    @staticmethod
+    def _restricted_origin(row):
+        return row["restricted_origin"] != 0 or row["agent_parent"] is not None
+
+    def _awaits_origin_release(self, row):
+        return (
+            self._restricted_origin(row)
+            and row["status"] in ("backlog", "todo")
+            and row["proposal_status"] != "rejected"
+            and not self._origin_released(row)
+        )
+
+    def _can_release_origin(self, q, row):
+        coordinator = self._live_coordinator(row)
+        if coordinator is not None:
+            return q.actor == coordinator.actor and self._coordinates(q, row)
+        return q.person and q.role == "owner"
+
     def _origin_released(self, row):
         actor = row["approved_by"]
         if not actor or row["proposal_status"] == "rejected":
@@ -942,23 +980,14 @@ class BoardService:
             return False
 
     def _available_origin(self, row):
-        p = self.principal
         return (
-            (p.person and p.role == "owner")
-            or row["restricted_origin"] == 0
-            or (self._own_card(row) and row["created_by"] == p.actor)
-            or (
-                row["assignee"] == p.actor
-                and p.parent_agent is not None
-                and p.parent_agent == row["created_by"]
-            )
+            not self._restricted_origin(row)
             or self._origin_released(row)
+            or (self.principal.person and self._can_release_origin(self.principal, row))
         )
 
     def _claimable_origin(self, row):
-        return self._available_origin(row) or (
-            self._top_level_taker() and self._top_level_origin(row)
-        )
+        return self._available_origin(row)
 
     def _write(self, board, *, submission=False, row=None, claiming=False, content_edit=False):
         p = self.principal
@@ -1172,7 +1201,8 @@ class BoardService:
             release_origin
             and self.principal.person
             and self.principal.role == "owner"
-            and row["restricted_origin"] == 1
+            and self._restricted_origin(row)
+            and self._can_release_origin(self.principal, row)
             and updates.get("status") in ("todo", "doing")
         ):
             updates["approved_by"] = self.principal.actor
@@ -1809,13 +1839,14 @@ class BoardService:
             ).fetchone()
             parent_number = parent_card[0] if parent_card else None
         proposal = bool(p.parent_agent and not p.person)
-        if proposal:
-            # A child cannot escape approval by requesting another lane or an owner ask.
+        restricted_origin = not p.person and (_restricted(p) or proposal)
+        if restricted_origin:
+            # Neither a child nor a restricted creator may escape release at creation.
             if ask is not None:
                 raise ToolError(
                     "no: create a proposal for your orchestrator before asking the owner"
                 )
-            status, assignee = "backlog", p.actor
+            status, assignee = "backlog", p.actor if proposal else assignee
         if status == "doing":
             from commonplace.projects import limits
 
@@ -1849,7 +1880,7 @@ class BoardService:
                 p.user_id,
                 None if p.person else p.connection,
                 p.policy.trust,
-                int(_restricted(p)),
+                int(restricted_origin),
                 at,
                 at,
                 p.actor,
@@ -1936,8 +1967,15 @@ class BoardService:
                     "the signed-in workspace owner may approve proposals"
                 )
             plan = _plan_waiting(row)
+            release = self._restricted_origin(row) and not self._origin_released(row)
+            can_release = self._can_release_origin(p, row)
+            if release and owner and not can_release and approve is not False and not escalate:
+                raise ToolError(
+                    "no: the live board coordinator must release restricted-origin work"
+                )
             if not (
                 plan
+                or (can_release and self._awaits_origin_release(row))
                 or row["proposal_status"] == "pending"
                 or (owner and row["proposal_status"] == "rejected")
             ):
@@ -1988,19 +2026,24 @@ class BoardService:
                 else:
                     changes.update(status="backlog", claim_until=None, claim_from=None)
             else:
-                changes.update(
-                    proposal_status="approved" if approve else "rejected",
-                    status="todo" if approve else "backlog",
-                )
+                changes["status"] = "todo" if approve else "backlog"
+                if row["proposal_status"] is not None:
+                    changes["proposal_status"] = "approved" if approve else "rejected"
                 if approve:
                     changes["labels"] = json.dumps(
                         [label for label in json.loads(row["labels"] or "[]") if label != "plan"]
                     )
-            if approve and not self._origin_released(row):
+            if (
+                approve
+                and not self._origin_released(row)
+                and (not self._restricted_origin(row) or can_release)
+            ):
                 candidate = dict(row)
                 candidate.update(approved_by=p.actor, proposal_status="approved")
                 if self._origin_released(candidate):
                     changes["approved_by"] = p.actor
+            if approve and release and "approved_by" not in changes:
+                changes["status"] = "backlog"
             self._set(conn, row, changes, release_origin=False)
             status = changes.get("status", row["status"])
             self._log(
@@ -2193,6 +2236,16 @@ class BoardService:
             raise ToolError(
                 "no: proposal needs parent approval with task_approve before work starts"
             )
+        if (
+            old == "todo"
+            and status == "doing"
+            and _restricted(self.principal)
+            and self._top_level_taker()
+            and row["assignee"] == self.principal.actor
+            and row["created_by"] != self.principal.actor
+            and self._origin_released(row)
+        ):
+            raise ToolError("no: claim this card with task_take_next")
         if status in ("todo", "doing") and not self._available_origin(row):
             if (
                 status == "doing"
@@ -2432,7 +2485,10 @@ class BoardService:
                 and row["assignee"] is None
                 and (_trusted_agent(self.principal) or self._coordinates(self.principal, row))
             )
-            self._write(board, row=row, content_edit=content_edit)
+            inactive_annotation = (
+                set(args) == {"status_line"} and row["status"] == "backlog" and self._own_card(row)
+            )
+            self._write(board, row=row, content_edit=content_edit or inactive_annotation)
             self._version(conn, row, version)
             if set(args) - permitted or (
                 "reason" in args
@@ -2602,14 +2658,14 @@ class BoardService:
             return self._card(conn, task_row(conn, row["id"]), self.principal)
 
     def _handoff(self, conn, row, board, to, note, options=None, context=None):
-        self._write(board, row=row)
-        if row["status"] not in ("todo", "doing"):
-            raise ToolError("no: only todo or doing cards can be handed off")
-        self._holder(row)
         if row["proposal_status"] in ("pending", "rejected"):
             raise ToolError(
                 "no: proposal needs parent approval with task_approve before work starts"
             )
+        self._write(board, row=row)
+        if row["status"] not in ("todo", "doing"):
+            raise ToolError("no: only todo or doing cards can be handed off")
+        self._holder(row)
         if not self.principal.person and _waiting_on_person(row):
             raise ToolError("no: waiting on a person, they must answer via decide")
         target = self._work_actor(to, board)

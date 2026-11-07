@@ -79,6 +79,26 @@ def coordinator(hub, fresh, *, parent=None):
     return k
 
 
+def released_card(fresh, creator, **kwargs):
+    """Downstream coordination checks start from explicitly released work."""
+    card = creator.work.task_add(**kwargs)
+    if card["restricted"]:
+        fresh.owner.task_approve(card["number"])
+        if kwargs.get("claim"):
+            creator.work.task_take_next(task=card["number"])
+        card = creator.work.task_show(card["number"])
+    return card
+
+
+def legacy_handoff(who, number, to="anyone"):
+    """Historical unreleased todo reservation, no longer reachable by a new card."""
+    with who.work.store.transaction() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='todo',assignee=?,claim_until=NULL WHERE id=?",
+            (None if to == "anyone" else to, number),
+        )
+
+
 def assert_nonholder_refused(hub, fresh, who, number):
     before = fresh.owner.task_show(number)
     for body in (
@@ -112,7 +132,11 @@ def test_top_level_assigns_to_another_top_level(hub, fresh, shape):
         {"title": "Independent work", "assignee": b.principal.actor},
     )
     assert status == 201, card
-    assert card["status"] == "todo" and card["assignee"] == b.principal.actor
+    assert card["status"] == ("backlog" if shape in RESTRICTED else "todo")
+    assert card["assignee"] == b.principal.actor
+    if shape in RESTRICTED:
+        assert not mcp(hub, b.token, "task_take_next", task=card["number"])[0]
+        fresh.owner.task_approve(card["number"])
     take(hub, b)
     assert b.work.task_show(card["number"])["status"] == "doing"
     if shape in RESTRICTED:
@@ -133,7 +157,7 @@ def test_handoff_receiver_claims_and_keeps_working(hub, fresh, shape):
     """P2: the first take is paired red; subsequent checks are head continuations."""
     a, b = agent(fresh, "a", shape), agent(fresh, "b", shape)
     c, outsider = agent(fresh, "c", shape), fresh.connect("outsider")
-    card = a.work.task_add(board="work", title="Shared workstream", claim=True)
+    card = released_card(fresh, a, board="work", title="Shared workstream", claim=True)
     number = card["number"]
     handoff(a, number, b.principal.actor)
     take(hub, b, number)  # First regression assertion, before any new holder path.
@@ -176,7 +200,7 @@ def test_handoff_receiver_claims_and_keeps_working(hub, fresh, shape):
 def test_unreserved_top_level_card_in_shared_queue(hub, fresh, shape):
     """P3: shared queue and the claim-time wing/trust bypass."""
     a, b = agent(fresh, "a", shape), agent(fresh, "b", shape)
-    number = a.work.task_add(board="work", title="Available work", claim=True)["number"]
+    number = released_card(fresh, a, board="work", title="Available work", claim=True)["number"]
     handoff(a, number)
     ok, reply = mcp(hub, b.token, "task_take_next", board="work")
     assert ok and f"#{number}" in reply, reply
@@ -193,10 +217,12 @@ def test_owning_root_approves_and_rejects_descendant_proposals(hub, fresh, shape
     number = proposed(child)
     status, card = change(hub, fresh, root.token, number, "POST", "/approve")
     assert status == 200, card
-    assert card["approved_by"] == root.principal.actor
+    assert card["approved_by"] is None and card["status"] == "backlog"
+    fresh.owner.task_approve(number)
     nested = proposed(grandchild)
     status, card = change(hub, fresh, root.token, nested, "POST", "/approve")
-    assert status == 200 and card["approved_by"] == root.principal.actor, card
+    assert status == 200 and card["approved_by"] is None, card
+    fresh.owner.task_approve(nested)
     take(hub, child, number)
     handoff(child, number, receiver.principal.actor)
     take(hub, receiver, number)
@@ -281,8 +307,7 @@ def test_holder_fails_closed_when_creator_revoked(hub, fresh, shape):
     """P8: paired red at first take; revocation/recovery are head continuations."""
     a, b = agent(fresh, "a", shape), agent(fresh, "b", shape)
     number = a.work.task_add(board="work", title="Revocable work", claim=True)["number"]
-    handoff(a, number, b.principal.actor)
-    take(hub, b, number)
+    legacy_handoff(a, number, b.principal.actor)
     hub.db.revoke(a.id, actor=fresh.user, workspace_ref=fresh.workspace)
     before = fresh.owner.task_show(number)
     with pytest.raises(ToolError, match="restricted-origin"):
@@ -308,7 +333,9 @@ def test_restricted_child_handoff_of_top_level_created_work(hub, fresh):
     a = agent(fresh, "a")
     child = agent(fresh, "child", parent=a.id)
     receiver = agent(fresh, "receiver")
-    card = a.work.task_add(board="work", title="Delegated work", assignee=child.principal.actor)
+    card = released_card(
+        fresh, a, board="work", title="Delegated work", assignee=child.principal.actor
+    )
     take(hub, child, card["number"])
     handoff(child, card["number"])
     take(hub, receiver, card["number"])
@@ -352,7 +379,7 @@ def person_review(who, number):
 def test_person_review_holder_feedback_without_decision_rights(hub, fresh):
     """P10: first take is old-red; feedback is a head-only continuation."""
     a, b = agent(fresh, "a"), agent(fresh, "b")
-    number = a.work.task_add(board="work", title="Reviewable work", claim=True)["number"]
+    number = released_card(fresh, a, board="work", title="Reviewable work", claim=True)["number"]
     handoff(a, number, b.principal.actor)
     take(hub, b, number)
     reviewed = person_review(b, number)
@@ -388,6 +415,7 @@ def test_root_release_keeps_existing_nonholder_annotations(hub, fresh):
     number = proposed(child)
     status, reply = change(hub, fresh, root.token, number, "POST", "/approve")
     assert status == 200, reply
+    fresh.owner.task_approve(number)
     take(hub, child, number)
     handoff(child, number)
     status, reply = change(hub, fresh, other.token, number, status_line="Released work annotation")
@@ -399,7 +427,7 @@ def test_unreleased_nonholder_edits_and_member_claim_are_refused(hub, fresh):
     a = agent(fresh, "a")
     other = fresh.connect("other")
     number = a.work.task_add(board="work", title="Protected work", claim=True)["number"]
-    handoff(a, number)
+    legacy_handoff(a, number)
     assert_nonholder_refused(hub, fresh, other, number)
     member = hub.db.create_user("member@example.test")
     hub.db.add_member(fresh.workspace, member, "member", actor=fresh.user)
@@ -414,7 +442,7 @@ def test_creator_self_marker_does_not_release_own_origin(hub, fresh):
     """A historical self marker grants no owning-root release."""
     a = agent(fresh, "a")
     number = a.work.task_add(board="work", title="Self marker", claim=True)["number"]
-    handoff(a, number)
+    legacy_handoff(a, number)
     # Test-only historical marker; ordinary approval refuses creator self-release.
     with a.work.store.transaction() as conn:
         conn.execute("UPDATE tasks SET approved_by=? WHERE id=?", (a.principal.actor, number))
@@ -430,7 +458,7 @@ def test_subagent_takers_gain_no_top_level_authority(hub, fresh, shape):
     a, root = agent(fresh, "a"), fresh.connect("root")
     child = agent(fresh, "child", shape, parent=root.id)
     number = a.work.task_add(board="work", title="Top-level work", claim=True)["number"]
-    handoff(a, number)
+    legacy_handoff(a, number)
     before = fresh.owner.task_show(number)
     with pytest.raises(ToolError):
         child.work.task_take_next(task=number)
@@ -482,8 +510,8 @@ def test_unrelated_release_and_cross_root_parent_are_refused(hub, fresh):
     assert fresh.owner.task_show(number) == before
     approved = allowed(lambda: mid.work.task_approve(number, reason="synthetic reason"))
     assert approved["approved_by"] is None
-    take(hub, child, number)
-    handoff(child, number)
+    assert child.work.task_show(number)["status"] == "backlog"
+    legacy_handoff(child, number)
     before = fresh.owner.task_show(number)
     for who in (unrelated, sibling):
         with pytest.raises(ToolError):
@@ -508,6 +536,9 @@ def test_pending_release_lapses_live(hub, fresh, authority):
     receiver = agent(fresh, "receiver")
     number = proposed(child)
     allowed(lambda: root.work.task_approve(number, reason="synthetic reason"))
+    # The parent is the appointed board coordinator for this release.
+    fresh.owner.board_set("work", root.principal.actor)
+    root.work.task_approve(number, reason="Release coordinated work")
     take(hub, child, number)
     handoff(child, number)
     if authority == "root":
@@ -517,6 +548,7 @@ def test_pending_release_lapses_live(hub, fresh, authority):
         # Test-only historical marker, not a normal-route release on the base.
         with child.work.store.transaction() as conn:
             conn.execute("UPDATE tasks SET approved_by=? WHERE id=?", (k.principal.actor, number))
+        hub.db.revoke(k.id, actor=fresh.user, workspace_ref=fresh.workspace)
         status, reply = api(hub, fresh.cookie, "PATCH", "/api/boards/work", {"coordinator": None})
         assert status == 200, reply
     before = fresh.owner.task_show(number)
@@ -533,7 +565,7 @@ def test_creator_revocation_and_historical_name_reuse_fail_closed(hub, fresh, re
     numbers = []
     for target in ("anyone", b.principal.actor):
         number = a.work.task_add(board="work", title="Old work", claim=True)["number"]
-        handoff(a, number, target)
+        legacy_handoff(a, number, target)
         numbers.append(number)
     hub.db.revoke(a.id, actor=fresh.user, workspace_ref=fresh.workspace)
     with pytest.raises(ControlError, match="already exists"):
@@ -564,7 +596,7 @@ def test_creator_revocation_and_historical_name_reuse_fail_closed(hub, fresh, re
 @pytest.mark.parametrize("kind", ["ask", "handoff", "completion"])
 def test_person_decisions_stay_protected_on_base_reachable_cards(hub, fresh, kind):
     """N9: all decision negatives run without a head-only holder setup."""
-    a, b = agent(fresh, "a"), agent(fresh, "b")
+    a, b = agent(fresh, "a", ("trusted", "shared")), agent(fresh, "b")
     if kind == "ask":
         card = allowed(
             lambda: a.work.ask(
@@ -647,7 +679,7 @@ def test_rejected_reapproval_stays_owner_only(hub, fresh, authority):
 @pytest.mark.parametrize("shape", RESTRICTED)
 def test_reserved_restricted_update_names_claim_route(hub, fresh, shape):
     a, b = agent(fresh, "a", shape), agent(fresh, "b", shape)
-    number = a.work.task_add(board="work", title="Reserved work", claim=True)["number"]
+    number = released_card(fresh, a, board="work", title="Reserved work", claim=True)["number"]
     handoff(a, number, b.principal.actor)
     before = fresh.owner.task_show(number)
     with pytest.raises(ToolError) as exc:
@@ -671,7 +703,7 @@ def test_restricted_update_keeps_release_message(hub, fresh, kind):
     a, b = agent(fresh, "a"), agent(fresh, "b")
     who = agent(fresh, "child", parent=b.id) if kind == "subagent" else b
     number = a.work.task_add(board="work", title="Protected work", claim=True)["number"]
-    handoff(a, number, a.principal.actor if kind == "other" else who.principal.actor)
+    legacy_handoff(a, number, a.principal.actor if kind == "other" else who.principal.actor)
     if kind == "waiting":
         # Test-only legacy todo reservation waiting on a person.
         with a.work.store.transaction() as conn:

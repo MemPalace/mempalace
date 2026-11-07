@@ -148,17 +148,20 @@ def test_default_inbox_reservation_requires_owner_release_for_other_agents(hub, 
     creator = fresh.connect("inbox-agent", client="chatgpt", trust=trust)
     created = add(hub, creator)
     number = created["number"]
-    assert created["status"] == "todo" and created["assignee"] == creator.principal.actor
+    assert created["status"] == "backlog" and created["assignee"] == creator.principal.actor
     refused_claims(hub, fresh.second, created)
+    refused_claims(hub, creator, created)
+    ok, reply = mcp(hub, fresh.second.token, "task_update", task=number, status="doing")
+    assert not ok, reply
+    assert show(hub, creator, number) == created
+    status, approved = api(hub, fresh.cookie, "POST", f"/api/cards/{number}/approve", {})
+    assert status == 200 and approved["approved_by"] == f"user:{fresh.user}"
     assert mcp(hub, creator.token, "task_take_next", task=number)[0]
     assert mcp(
         hub, creator.token, "task_handoff", task=number, to="anyone", note="Ready for shared work."
     )[0]
     released = show(hub, creator, number)
     assert released["status"] == "todo" and released["assignee"] is None
-    ok, reply = mcp(hub, fresh.second.token, "task_update", task=number, status="doing")
-    assert not ok, reply
-    assert show(hub, creator, number) == released
     assert mcp(hub, fresh.second.token, "task_take_next", task=number)[0]
     # Owner-release protection stays on child-created work approved by a
     # restricted intermediate parent, rather than a top-level creator.
@@ -172,18 +175,17 @@ def test_default_inbox_reservation_requires_owner_release_for_other_agents(hub, 
     number = proposal["number"]
     assert mcp(hub, mid.token, "task_approve", task=number, reason="synthetic reason")[0]
     assert show(hub, child, number)["approved_by"] is None
-    assert mcp(hub, child.token, "task_take_next", task=number)[0]
-    assert mcp(
-        hub, child.token, "task_handoff", task=number, to="anyone", note="Ready for approval."
-    )[0]
+    refused_claims(hub, child, show(hub, child, number))
     released = show(hub, child, number)
     refused_claims(hub, fresh.second, released)
+    status, approved = api(hub, fresh.cookie, "POST", f"/api/cards/{number}/approve", {})
+    assert status == 200 and approved["approved_by"] == f"user:{fresh.user}"
     status, approved = api(
         hub,
         fresh.cookie,
         "POST",
         f"/api/cards/{number}/handoff",
-        {"version": released["version"], "to": "anyone", "note": "Approved for shared work."},
+        {"version": approved["version"], "to": "anyone", "note": "Approved for shared work."},
     )
     assert status == 200 and approved["approved_by"] == f"user:{fresh.user}"
     assert mcp(hub, fresh.second.token, "task_take_next", task=number)[0]
@@ -212,6 +214,14 @@ def test_person_reserved_work_and_reviews_are_not_available(hub, fresh, protecti
 
 @pytest.mark.parametrize("reject", [False, True], ids=["pending", "rejected"])
 def test_child_proposals_require_the_direct_parents_approval(hub, fresh, reject):
+    status, body = api(
+        hub,
+        fresh.cookie,
+        "PATCH",
+        "/api/boards/work",
+        {"coordinator": fresh.first.principal.actor},
+    )
+    assert status == 200, body
     child = fresh.connect("child", parent=fresh.first.principal.connection_id)
     proposed = add(hub, child, claim=True)
     number = proposed["number"]

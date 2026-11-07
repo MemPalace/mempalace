@@ -332,6 +332,7 @@ def test_unsupervised_stuck_card_reason_and_each_action_resolves(hub, fresh, mon
 
 def test_only_unreleasable_proposals_reach_the_owner(hub, fresh):
     parent = fresh.connect("parent")
+    coordinator(hub, fresh, parent)
     parent_card = parent.work.task_add(board="work", title="Parent task")
     child = fresh.connect("child", parent=parent.id)
     proposal = child.work.task_add(
@@ -383,6 +384,7 @@ def test_release_authority_uses_live_write_read_predicates(hub, fresh):
     root = fresh.connect("root")
     middle = fresh.connect("middle", parent=root.id, scopes=["memory:read"])
     grandchild = fresh.connect("grandchild", parent=middle.id)
+    coordinator(hub, fresh, root)
     second = grandchild.work.task_add(board="work", title="Grandchild proposal")
     absent(owner_items(hub, fresh), second["number"])
 

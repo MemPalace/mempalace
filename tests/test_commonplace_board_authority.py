@@ -71,15 +71,12 @@ def test_parent_approval_does_not_release_restricted_origin(fresh, trust, wing):
     proposal = child.work.task_add(board="work", title="Child follow-up")
     approved = parent.work.task_approve(proposal["number"], reason="synthetic reason")
     assert approved["proposal_status"] == "approved"
-    held = child.work.task_take_next(task=proposal["number"])
-    assert held["status"] == "doing"  # Approval still authorizes the child's own work.
-    child.work.task_handoff(proposal["number"], receiver.principal.actor, "Continue this work")
+    assert approved["status"] == "backlog" and approved["approved_by"] is None
+    with pytest.raises(ToolError):
+        child.work.task_take_next(task=proposal["number"])
     with pytest.raises(ToolError):
         receiver.work.task_take_next(task=proposal["number"])
-    with pytest.raises(ToolError):
-        receiver.work.task_update(proposal["number"], status="doing")
     assert receiver.work.task_take_next(board="work") is None
-    assert fresh.owner.task_show(proposal["number"])["approved_by"] is None
 
 
 @pytest.mark.parametrize("approver", ["owner", "trusted-parent"])
@@ -89,6 +86,8 @@ def test_authorized_approval_releases_restricted_work(fresh, approver):
     receiver = fresh.connect("receiver")
     proposal = child.work.task_add(board="work", title="Approved follow-up")
     authority = fresh.owner if approver == "owner" else parent.work
+    if approver == "trusted-parent":
+        fresh.owner.board_set("work", parent.principal.actor)
     approved = authority.task_approve(proposal["number"], reason="synthetic reason")
     assert approved["approved_by"] == authority.principal.actor
     child.work.task_take_next(task=proposal["number"])
@@ -243,7 +242,11 @@ def test_restricted_parent_can_assign_own_work_directly_to_child(fresh, route):
         )
     else:
         assigned = parent.work.task_add(board="work", title="Delegated work", claim=True)
+        fresh.owner.task_approve(assigned["number"])
+        parent.work.task_take_next(task=assigned["number"])
         parent.work.task_handoff(assigned["number"], child.principal.actor, "Take this workstream")
+    if route == "create":
+        fresh.owner.task_approve(assigned["number"])
     held = child.work.task_take_next(task=assigned["number"])
     assert held["status"] == "doing" and held["proposal_status"] is None
     assert child.work.task_update(assigned["number"], status="done")["status"] == "done"
@@ -308,6 +311,7 @@ def test_unrestricted_standard_parent_releases(fresh):
     top = fresh.connect("root-standard")
     parent = fresh.connect("parent-standard", parent=top.id, trust="standard")
     child = fresh.connect("child-standard", parent=parent.id, trust="untrusted", write_wing="inbox")
+    fresh.owner.board_set("work", parent.principal.actor)
     proposal = child.work.task_add(board="work", title="Synthetic standard parent release")
     result = parent.work.task_approve(proposal["number"], reason="synthetic reason")
     assert result["approved_by"] == parent.principal.actor

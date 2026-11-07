@@ -65,6 +65,7 @@ def pending_question(fresh, actor="creator"):
     worker = getattr(fresh, actor).service
     card = worker.task_add(title="Decision required", body=REVIEW_CONTEXT, board="work")
     if card["proposal_status"] == "pending":
+        fresh.owner.board_set("work", fresh.creator.service.principal.actor)
         fresh.creator.service.task_approve(card["number"], reason="synthetic reason")
     return worker.ask(REVIEW_QUESTION, REVIEW_OPTIONS, task=card["number"], context=REVIEW_CONTEXT)
 
@@ -177,6 +178,7 @@ def test_ordinary_agent_work_does_not_require_a_person(fresh, actor):
     for destination in ("todo", "doing"):
         card = worker.task_add(title="Ordinary work", status="backlog", board="work")
         if card["proposal_status"] == "pending":
+            fresh.owner.board_set("work", fresh.creator.service.principal.actor)
             fresh.creator.service.task_approve(card["number"], reason="synthetic reason")
         worker.task_update(card["number"], status=destination)
         assert worker.task_update(card["number"], status="done")["status"] == "done"
@@ -184,6 +186,7 @@ def test_ordinary_agent_work_does_not_require_a_person(fresh, actor):
 
 @pytest.mark.parametrize("surface", ["mcp", "rest"])
 def test_pending_child_proposal_requires_real_parent_approval(hub, fresh, surface):
+    fresh.owner.board_set("work", fresh.creator.service.principal.actor)
     child = fresh.subagent.service
     proposed = child.task_add(title="Proposed work", board="work", claim=True)
     number = proposed["number"]

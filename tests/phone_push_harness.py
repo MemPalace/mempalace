@@ -19,8 +19,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from commonplace import urls, webhooks
+from commonplace import sessions, urls, webhooks
 from commonplace.boards import display, service as board_service
+from commonplace.policy import Policy
 from tests.test_commonplace_signup_space import fresh as fresh, remote as remote, signup as signup
 
 
@@ -178,7 +179,26 @@ def clock(monkeypatch, iso):
     monkeypatch.setattr(display, "stale_before", frozen)
 
 
-def agent(hub, owner, name, *, parent=None):
+def agent(hub, owner, name, *, parent=None, unrestricted=False):
+    if unrestricted:
+        cookie = owner if isinstance(owner, str) else owner.cookie
+        person = sessions.session_principal(hub.db, sessions.cookie_value(cookie))
+        cid, token = hub.db.create_token(
+            name=name,
+            client="generic",
+            actor=person.user_id,
+            user_ref=person.user_id,
+            workspace_ref=person.workspace_id,
+            parent=parent if isinstance(parent, str) or parent is None else parent.id,
+            policy=Policy.build(
+                profile="full",
+                trust="standard",
+                scopes=["memory:read", "memory:write"],
+                read_wings=["shared"],
+                write_wings=["shared"],
+            ),
+        )
+        return SimpleNamespace(id=cid, token=token)
     data = {"name": name}
     if parent is not None:
         data["parent"] = parent if isinstance(parent, str) else parent.id

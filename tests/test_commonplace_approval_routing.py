@@ -239,6 +239,7 @@ def test_r13(hub, fresh):
     t = fresh.connect("root")
     p = fresh.connect("parent", parent=t.id, trust="standard")
     c = fresh.connect("child", parent=p.id, trust="untrusted", write_wing="inbox")
+    fresh.owner.board_set("work", coordinator=p.principal.actor)
     row = c.work.task_add(board="work", title="Synthetic restricted proposal")
     assert approve_compat(hub, p, row["number"])[0]
     assert fresh.owner.task_show(row["number"])["approved_by"] == p.principal.actor  # RED
@@ -262,8 +263,9 @@ def test_r16(hub, fresh):
         board="work", title="Synthetic child plan", assignee=c.principal.actor, labels=["plan"]
     )
     ok, _ = approve_compat(hub, t, row["number"])
-    assert ok  # RED
-    assert fresh.owner.task_show(row["number"])["approved_by"] is None
+    assert not ok
+    shown = fresh.owner.task_show(row["number"])
+    assert shown["approved_by"] is None and shown["status"] == "backlog"
 
 
 def test_r16b(hub, fresh):
@@ -278,7 +280,9 @@ def test_r16b(hub, fresh):
     with t.work.store.transaction() as conn:
         conn.execute("UPDATE tasks SET restricted_origin=1 WHERE id=?", (row["number"],))
     approve_compat(hub, t, row["number"])
-    assert fresh.owner.task_show(row["number"])["approved_by"] == t.principal.actor  # RED
+    shown = fresh.owner.task_show(row["number"])
+    assert shown["approved_by"] is None and shown["status"] == "backlog"
+    assert fresh.owner.task_approve(row["number"])["approved_by"] == fresh.owner.principal.actor
 
 
 def test_r17(hub, fresh):
@@ -322,7 +326,8 @@ def test_r19(hub, fresh):
         board="work", title="Synthetic self plan", assignee=k.principal.actor, labels=["plan"]
     )
     ok, text = approve_compat(hub, k, row["number"])
-    assert fresh.owner.task_show(row["number"])["need"] == "you"  # RED
+    assert fresh.owner.task_show(row["number"])["need"] == "idle"
+    assert not fresh.owner.task_show(row["number"])["can_approve"]
     assert not ok and "direct parent" in text
     w = fresh.connect("worker")
     with pytest.raises(ToolError):
@@ -485,9 +490,14 @@ def test_guard(hub, fresh, monkeypatch, case):
     elif case == "g03":
         creator = fresh.connect("restricted-creator", trust="untrusted", write_wing="inbox")
         row = creator.work.task_add(board="work", title="Synthetic root claim", claim=True)
-        creator.work.task_handoff(row["number"], "anyone", "Synthetic shared queue")
+        # A historical todo card also requires release before any top-level claim.
+        with creator.work.store.transaction() as conn:
+            conn.execute(
+                "UPDATE tasks SET status='todo',assignee=NULL WHERE id=?", (row["number"],)
+            )
         claimer = fresh.connect("top-level-claimer")
-        claimer.work.task_take_next(task=row["number"])
+        with pytest.raises(ToolError):
+            claimer.work.task_take_next(task=row["number"])
         ok, text = approve_compat(hub, claimer, row["number"])
         assert not ok and "direct parent" in text
         second = fresh.connect("second-worker")
@@ -498,8 +508,8 @@ def test_guard(hub, fresh, monkeypatch, case):
         ok, text = approve_compat(hub, a, row["number"])
         assert not ok and "direct parent" in text
     elif case == "g04":
-        assert row["number"] not in numbers(fresh.owner.needs_me(), "backlog_from_agents")
-        assert fresh.owner.task_show(row["number"])["need"] == "plan"
+        assert row["number"] in numbers(fresh.owner.needs_me(), "backlog_from_agents")
+        assert fresh.owner.task_show(row["number"])["need"] == "you"
     elif case == "g05":
         from tests._commonplace_helpers import REVIEW_CONTEXT, REVIEW_OPTIONS, REVIEW_QUESTION
 
@@ -546,7 +556,7 @@ def test_guard(hub, fresh, monkeypatch, case):
             row = child.work.task_add(board="work", title="Synthetic authority")
         assert approve_compat(hub, a, row["number"])[0]
         assert fresh.owner.task_show(row["number"])["approved_by"] == (
-            None if case == "g14" else a.principal.actor
+            a.principal.actor if case == "g12" else None
         )
     elif case == "g15":
         k = fresh.connect("coordinator")
@@ -577,7 +587,9 @@ def test_g_reject(hub, fresh):
     row = x.work.task_add(board="work", title="Synthetic restricted proposal")
     approve_compat(hub, k, row["number"], approve=False)
     assert fresh.owner.task_show(row["number"])["approved_by"] is None
-    fresh.owner.task_update(row["number"], status="todo")
+    with pytest.raises(ToolError, match="restricted-origin"):
+        fresh.owner.task_update(row["number"], status="todo")
+    assert approve_compat(hub, k, row["number"])[0]
     child = fresh.connect("child", parent=x.id)
     with pytest.raises(ToolError):
         child.work.task_take_next(task=row["number"])

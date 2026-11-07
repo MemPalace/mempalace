@@ -12,7 +12,12 @@ def unclaimed_restricted_card(fresh):
     card = creator.work.task_add(
         board="work", title="Original title", body="Original body", claim=True
     )
-    creator.work.task_handoff(card["number"], "anyone", "Available for coordination")
+    # Persisted pre-release todo card, as created by older servers.
+    with creator.work.store.transaction() as conn:
+        conn.execute(
+            "UPDATE tasks SET status='todo',assignee=NULL,claim_until=NULL WHERE id=?",
+            (card["number"],),
+        )
     current = fresh.owner.task_show(card["number"])
     assert current["status"] == "todo" and current["assignee"] is None
     assert current["restricted"] and current["approved_by"] is None
@@ -81,8 +86,8 @@ def test_other_connections_cannot_edit_restricted_content(fresh, hub, trust, win
 
 @pytest.mark.parametrize("authority", ["trusted", "coordinator"])
 def test_content_edit_exception_does_not_allow_other_updates(fresh, hub, authority):
-    before = unclaimed_restricted_card(fresh)
     who = editor(fresh, authority)
+    before = unclaimed_restricted_card(fresh)
     for extra in (
         {"status": "doing"},
         {"status": "todo"},

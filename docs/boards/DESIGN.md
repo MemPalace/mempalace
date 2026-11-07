@@ -20,7 +20,7 @@ This builds on PRODUCT-DESIGN.md §10 and keeps all of it: kanzo's design and no
 2. Two agents never work on the same card.
 3. Everything waiting on Avery is on one screen, oldest first, and each item takes one decision.
 4. Every card, move and comment shows who did it, stamped by the server.
-5. Every agent owns work by default. Self-created child proposals require their parent, top-level agent, board coordinator or owner; memory trust and private-scope boundaries remain intact.
+5. Cards created by subagents or restricted agents stay inactive until the board coordinator releases them, or the owner does so when no coordinator is live. Memory trust and private-scope boundaries remain intact.
 
 **Non-goals for v1:** sub-tasks, due dates, labels, estimates, swimlanes, per-board permissions beyond the wing, the sealed tier for boards, starting agents from a card (that is module A).
 
@@ -32,8 +32,8 @@ backlog │ todo │ doing │ review │ done
 
 | Column | Holds | Who puts cards here |
 |---|---|---|
-| `backlog` | Ideas and child proposals marked pending or rejected. | Any agent on purpose; children automatically pending parent approval |
-| `todo` | Ready work, optionally assigned. | All top-level agents by default, people, parent-approved child proposals |
+| `backlog` | Ideas, unreleased restricted-origin cards and child proposals marked pending or rejected. | Any agent on purpose; restricted agents and children automatically await release |
+| `todo` | Ready work, optionally assigned. | Unrestricted top-level agents, people and released restricted-origin cards |
 | `doing` | Held by exactly one actor. An agent's hold expires. | `task_take_next`, `task_update status=doing`, self-assigned creation or a person dragging a card |
 | `review` | An open ask to a person: a question, or finished work to check. | `ask`, `task_update`, or `task_handoff` to a person |
 | `done` | Closed. Never deleted. | The holder, a person, or a decision |
@@ -54,7 +54,7 @@ backlog │ todo │ doing │ review │ done
 
 The full table of who may make each move is in [API.md](API.md#move-rules). Three rules carry the design:
 
-- **Every agent can create, claim and maintain its own cards.** Pending child proposals require `task_approve` by their parent, top-level agent, board coordinator or owner; only a signed-in owner can recover or dismiss a rejection. An unrestricted parent may release restricted origin at standard trust; restricted parents cannot. Agents cannot approve cards they hold. Orchestrators handle approvals each heartbeat with a reason or escalate to the owner. Other holders and person decisions stay protected. Trusted unrestricted writers retain shared backlog pickup; memory inbox routing never forces a top-level card into backlog.
+- **Restricted-origin work waits for release.** Cards created by a subagent or a restricted agent start in backlog even when creation requests a claim or doing status. Neither the creator, an assignee nor another top-level agent may activate or claim them before release. A live board coordinator owns release; the signed-in owner may release only when no coordinator is configured or live. `task_approve` also releases restricted-origin cards without a pending proposal and records the actor and reason in the audit log. Parent and top-level proposal approval remains available, but approval without release leaves the card inactive. Rejections and person decisions stay protected. Trusted unrestricted writers retain shared backlog pickup.
 - **Only the holder changes a `doing` card.** Others can comment.
 - **Cards are never deleted.** Closing one with a reason is a move to `done`. The event log is append-only (enforced by triggers in `schema.sql`).
 
@@ -175,7 +175,7 @@ All from PRODUCT-DESIGN.md §6–§10, nothing new:
 - **Expiry:** a claim past `claim_until` keeps its assignee and is shown as expired on the next board call, with one `expire` event.
 - **Move rules:** every row of the API.md table, allowed and refused, over MCP and over HTTP, against the same service code.
 - **Canary:** a board, card, comment and ask in a forbidden wing never appear in any tool reply or HTTP response for a scoped token.
-- **Backlog guard:** a pending child proposal cannot be taken or promoted before parent, top-level agent, board coordinator or owner approval.
+- **Backlog guard:** a pending child proposal needs approval; every restricted-origin card also needs coordinator release, or owner release when no coordinator is live, before activation or claiming.
 - **B's done test** (PRODUCT-DESIGN.md §15) extended: the winning agent hands the card to Avery with options, he decides on the Decide screen, and the same agent's next `task_take_next` returns it with the decision.
 
 ## Decisions

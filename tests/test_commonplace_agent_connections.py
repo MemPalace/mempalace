@@ -116,6 +116,7 @@ def test_fresh_user_creates_connects_and_claims_without_admin(hub, fresh):
     failed, text = tool(hub, token, "task_add", title="First task")
     assert not failed
     number = int(re.search(r"#(\d+)", text)[1])
+    BoardService(fresh.ctx).task_approve(number)
     failed, text = tool(hub, token, "task_take_next", task=number)
     assert not failed
     card = BoardService(fresh.ctx).task_show(number)
@@ -162,8 +163,11 @@ def test_rotation_preserves_actor_claims_and_policy_then_revocation_is_immediate
     caplog.set_level(logging.DEBUG, logger="commonplace")
     created = create(hub, fresh)
     cid, old = created["connection"]["id"], created["token"]
-    failed, _ = tool(hub, old, "task_add", title="Keep my claim", claim=True)
+    failed, text = tool(hub, old, "task_add", title="Keep my claim", claim=True)
     assert not failed
+    number = int(re.search(r"#(\d+)", text)[1])
+    BoardService(fresh.ctx).task_approve(number)
+    assert not tool(hub, old, "task_take_next", task=number)[0]
     policy = hub.db.connection(cid, fresh.workspace)["policy"]
     path = f"/api/connections/{cid}"
     status, headers, rotated = http(hub, "POST", path + "/rotate", cookie=fresh.cookie, body={})
@@ -201,6 +205,7 @@ def test_second_user_cannot_list_rotate_revoke_or_read_the_first_users_data(hub,
     created = create(hub, fresh)
     cid, first = created["connection"]["id"], created["token"]
     assert not tool(hub, first, "task_add", title="FIRST_USER_CARD_CANARY")[0]
+    BoardService(fresh.ctx).task_approve(1)
     other = signup(hub, "second@example.test")
     second = create(hub, other)["token"]
     _, _, listed = http(hub, "GET", cookie=other.cookie)
@@ -236,6 +241,9 @@ def test_child_proposals_still_need_parent_approval_after_parent_rotation(hub, f
     assert not tool(hub, rotated["token"], "task_approve", task=number, reason="synthetic reason")[
         0
     ]
+    assert tool(hub, child["token"], "task_take_next", task=number)[0]
+    assert BoardService(fresh.ctx).task_show(number)["approved_by"] is None
+    BoardService(fresh.ctx).task_approve(number)
     assert not tool(hub, child["token"], "task_take_next", task=number)[0]
 
 

@@ -346,6 +346,8 @@ def test_snapshot_served_state_and_no_binding_served_or_events(local, monkeypatc
 
 
 def test_rules_version_and_served_are_one_snapshot_during_concurrent_edit(local, monkeypatch):
+    # Logical snapshot consistency must not depend on scheduler delays.
+    monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
     current = local.owner.create("*", "old words", "limit")
     local.owner.set_check("*", "enforce")
     snapshot = local.rules.rules_get(effective=True, format="md")
@@ -597,7 +599,9 @@ def test_500_rule_initialize_p95_over_empty_store(local, record_property):
     assert populated - empty < 0.025
 
 
-def test_existing_worker_instructions_share_budget_and_remain_unchanged(local):
+def test_existing_worker_instructions_share_budget_and_remain_unchanged(local, monkeypatch):
+    # Deadline/fail-open behavior has separate coverage; isolate composition here.
+    monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
     local.owner.create("*", "accepted", "limit")
     local.worker.response["result"]["instructions"] = "Worker instructions: café."
     original = copy.deepcopy(local.worker.response)

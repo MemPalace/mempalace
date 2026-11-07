@@ -54,7 +54,15 @@ def test_brand_new_workspace_default_client_owns_work(hub, capsys, client, membe
     ok, reply = mcp(hub, token, "task_add", title="Implement the requested change", status="todo")
     assert ok, reply
     number = int(re.search(r"#(\d+)", reply)[1])
-    assert worker.task_show(number)["status"] == "todo"
+    owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
+    restricted = agent.policy.trust == "untrusted" or agent.policy.write_wing in (
+        "inbox",
+        "wing_inbox",
+    )
+    assert worker.task_show(number)["status"] == ("backlog" if restricted else "todo")
+    if restricted:
+        assert not mcp(hub, token, "task_take_next", task=number)[0]
+        owner.task_approve(number)
     assert agent.parent_agent is None
     assert mcp(hub, token, "task_update", task=number, status="doing")[0]
     assert mcp(hub, token, "task_update", task=number, status_line=CONTEXT)[0]
@@ -70,8 +78,11 @@ def test_brand_new_workspace_default_client_owns_work(hub, capsys, client, membe
     assert mcp(hub, token, "task_update", task=number, status="done")[0]
     assert worker.task_show(number)["status"] == "done"
     ok, reply = mcp(hub, token, "task_add", title="Next workstream", assignee="self")
-    assert ok and "doing" in reply
-    next_card = worker.task_list(mine=True)[0]
+    assert ok and ("backlog" if restricted else "doing") in reply
+    next_card = worker.task_list(mine=True, status="backlog" if restricted else "doing")[0]
+    if restricted:
+        owner.task_approve(next_card["number"])
+        next_card = worker.task_take_next(task=next_card["number"])
     assert next_card["assignee"] == agent.actor and next_card["claim_until"]
 
 
@@ -103,13 +114,16 @@ def test_explicit_grok_overrides_and_legacy_own_backlog(hub, capsys):
     assert worker.principal.policy.trust == "trusted"
     assert worker.principal.policy.tools == "standard"
     worker.board_add(slug="project")
-    created = worker.task_add(title="Direct to todo", board="project", status="todo")
-    assert created["status"] == "todo"
+    created = worker.task_add(title="Restricted inbox work", board="project", status="todo")
+    assert created["status"] == "backlog"
     with worker.store.transaction() as conn:
         conn.execute(
             "UPDATE tasks SET status='backlog',restricted_origin=1 WHERE id=?", (created["number"],)
         )
-    assert worker.task_update(created["number"], status="todo")["status"] == "todo"
+    with pytest.raises(ToolError, match="restricted-origin"):
+        worker.task_update(created["number"], status="todo")
+    owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
+    owner.task_approve(created["number"])
     assert (
         worker.task_update(created["number"], status="doing")["assignee"] == worker.principal.actor
     )
@@ -119,6 +133,8 @@ def test_explicit_grok_overrides_and_legacy_own_backlog(hub, capsys):
 def test_direct_parent_creates_child_cards_and_approves_proposals(hub):
     parent_id, parent_token, parent = actor(hub, "orchestrator")
     root = parent.task_add(title="Main workstream", claim=True)
+    owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
+    owner.board_set("commonplace", parent.principal.actor)
     child_id, child_token, child = actor(hub, "builder", parent=parent_id)
     _, unrelated_token, unrelated = actor(hub, "unrelated")
     assert child.principal.parent_agent == parent.principal.actor
@@ -175,6 +191,7 @@ def test_rejection_owner_fallback_and_nested_parent(hub):
     )
     assert nested.task_update(proposal["number"], status="doing")["status"] == "doing"
     assert nested.task_update(proposal["number"], status="done")["status"] == "done"
+    person.board_set("commonplace", root.principal.actor)
     proposal = nested.task_add(title="Root release")
     assert (
         root.task_approve(proposal["number"], reason="synthetic reason")["approved_by"]
@@ -346,6 +363,9 @@ def test_inbox_memory_links_renew_only_the_held_card(hub):
     )
     worker = service(hub, hub.db.authenticate_token(token))
     created = worker.task_add(title="Linked work", claim=True)
+    owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
+    owner.task_approve(created["number"])
+    worker.task_take_next(task=created["number"])
     with worker.store.transaction() as conn:
         conn.execute(
             "UPDATE tasks SET claim_until='2000-01-01T00:00:00Z' WHERE id=?", (created["number"],)
@@ -385,7 +405,7 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     creator = service(hub, hub.db.authenticate_token(token))
     created = creator.task_add(title="Untrusted workstream")
     number = created["number"]
-    assert created["status"] == "todo" and created["assignee"] == creator.principal.actor
+    assert created["status"] == "backlog" and created["assignee"] == creator.principal.actor
     with creator.store.connection() as conn:
         assert (
             conn.execute("SELECT restricted_origin FROM tasks WHERE id=?", (number,)).fetchone()[0]
@@ -395,8 +415,7 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     other = service(hub, hub.db.authenticate_token(other_token))
     assert other.task_take_next() is None
     assert not mcp(hub, other_token, "task_take_next", task=number)[0]
-    creator.task_take_next(task=number)
-    creator.task_handoff(number, to="anyone", note="Ready for the shared queue")
+    assert not mcp(hub, token, "task_take_next", task=number)[0]
     assert not mcp(hub, other_token, "task_update", task=number, status="doing")[0]
     assert not mcp(hub, token, "task_update", task=number, approved_by="owner")[0]
     member = hub.db.create_user("member@example.com")
@@ -405,6 +424,11 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     with pytest.raises(ToolError, match="owner release"):
         person.task_update(number, status="doing")
     assert creator.task_show(number)["approved_by"] is None
+    assert other.task_take_next() is None
+    owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
+    owner.task_approve(number)
+    creator.task_take_next(task=number)
+    creator.task_handoff(number, to="anyone", note="Ready for the shared queue")
     queued = other.task_take_next()
     assert queued is not None
     assert queued["number"] == number
@@ -430,14 +454,15 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     proposal = child.task_add(title="Restricted child work")
     number = proposal["number"]
     assert mid.task_approve(number, reason="synthetic reason")["approved_by"] is None
-    child.task_take_next(task=number)
-    child.task_handoff(number, to="anyone", note="Ready for approval")
+    with pytest.raises(ToolError):
+        child.task_take_next(task=number)
     assert not mcp(hub, other_token, "task_take_next", task=number)[0]
     assert not mcp(hub, other_token, "task_update", task=number, status="doing")[0]
     assert other.task_take_next() is None
     with pytest.raises(ToolError, match="owner release"):
         person.task_update(number, status="doing")
     owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
+    owner.task_approve(number)
     owner.task_handoff(number, to="anyone", note="Approved for the shared queue")
     assert child.task_show(number)["approved_by"] == owner.principal.actor
     assert other.task_take_next()["number"] == number
@@ -471,6 +496,8 @@ def test_decision_context_preserves_progress_body_and_history(hub):
 def test_restricted_child_can_claim_after_direct_parent_approval(hub):
     parent_id, _, parent = actor(hub, "parent")
     parent.task_add(title="Parent workstream", claim=True)
+    owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
+    owner.board_set("commonplace", parent.principal.actor)
     from commonplace.policy import Policy
 
     _, token = hub.db.create_token(

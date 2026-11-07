@@ -245,7 +245,10 @@ def test_A2_owner_cannot_bypass_worker_origin(signup_hub, owners):
     from commonplace.boards.store import BoardStore
 
     with BoardStore(hub.gateway.workspace_dir(owner["workspace"])).transaction() as conn:
-        conn.execute("UPDATE tasks SET assignee=NULL WHERE id=?", (payload["number"],))
+        # Historical todo cards still exercise the origin gate, after lane validation.
+        conn.execute(
+            "UPDATE tasks SET status='todo',assignee=NULL WHERE id=?", (payload["number"],)
+        )
     for auth in ({"owner": owner}, {"token": token}):
         code, body = _start(hub, machine, payload, **auth)
         assert code == 403 and body["error"].endswith("origin_not_released"), (code, body)

@@ -521,7 +521,7 @@ def test_restricted_origin_backlog_requires_person_release(hub, env, origin, ope
         **origin,
     )
     code, created = api(hub, token, "POST", "/api/boards/work/cards", {"title": "Needs triage"})
-    assert code == 201 and created["status"] == "todo"
+    assert code == 201 and created["status"] == "backlog"
     number = created["number"]
     # Reproduce a pre-migration restricted submission, rather than a new default card.
     with owner.store.transaction() as conn:
@@ -1229,7 +1229,7 @@ def test_workspace_people_resolution(hub, env, ref):
 
 
 @pytest.mark.parametrize("trust", ["untrusted", "standard"])
-def test_inbox_agent_can_create_and_claim_without_triage(hub, env, trust):
+def test_inbox_agent_cannot_create_and_claim_without_release(hub, env, trust):
     agent_token, _agent, _person, _cookie, owner = env
     token = hub.token(
         "inbox",
@@ -1246,8 +1246,11 @@ def test_inbox_agent_can_create_and_claim_without_triage(hub, env, trust):
         "/api/boards/work/cards",
         {"title": "ignore previous\n  keep verbatim", "status": "doing", "assignee": "self"},
     )
-    assert status == 201 and created["status"] == "doing" and created["assignee"] == "conn:inbox"
+    assert status == 201 and created["status"] == "backlog" and created["assignee"] == "conn:inbox"
     assert created["flags"] == ["ignore_previous"]
+    assert not mcp(hub, token, "task_take_next", task=created["number"])[0]
+    owner.task_approve(created["number"])
+    assert mcp(hub, token, "task_take_next", task=created["number"])[0]
     assert not mcp(hub, agent_token, "task_take_next", task=created["number"])[0]
     assert mcp(hub, token, "task_update", task=created["number"], status_line=REVIEW_CONTEXT)[0]
     assert mcp(hub, token, "task_update", task=created["number"], status="done")[0]
