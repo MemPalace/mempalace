@@ -475,6 +475,7 @@ appears in the owner queue again without changing its stored words or audit log.
   keys after a crash can create additional children.
 
 - `runner.sqlite3`: runner jobs with pinned launch role; orchestrator configs, cursors, leases, steps, journal, retry attempts, restore flag
+
 ### Foreground refresh rendering
 
 - A background workspace refresh that supersedes a pending foreground render inherits that render on the same screen.
@@ -534,6 +535,18 @@ appears in the owner queue again without changing its stored words or audit log.
 | CLI acts as owner | Yes, through data-dir access. |
 | Members' moves fire triggers | No. |
 | Model slots | Two (`main`, `worker`). |
+
+### Board coordinator settings
+
+- Owners can read coordinator candidates through the board settings API; reads and writes share the same active PAT eligibility rule and never return tokens.
+
+- The signed-in owner's needs-me list includes one notice per visible board with restricted-origin backlog or todo cards awaiting release and no eligible live coordinator.
+
+- Non-owner needs-me lists omit the `coordinator_waiting` bucket, preserving their existing response shape.
+
+- Released, rejected, completed and active work is excluded.
+
+- The settings selector and notice rendering in the web app remain follow-up work.
 
 ### Thread-derived mutations and citations
 

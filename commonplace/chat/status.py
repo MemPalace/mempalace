@@ -44,7 +44,7 @@ def snapshot(gateway, principal, board: str) -> dict:
         for items in groups.values()
         if isinstance(items, list)
         for item in items
-        if item["board"] == board
+        if "number" in item and item["board"] == board
     }
     config = settings.front(gateway.db, principal.workspace_id, board)
     mode = (

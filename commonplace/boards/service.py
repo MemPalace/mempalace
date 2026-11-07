@@ -1631,6 +1631,66 @@ class BoardService:
             "affected": affected,
         }
 
+    def _coordinator_candidates(self, wing):
+        """Share current PAT eligibility between settings reads and writes."""
+        return [
+            p
+            for c in self.ctx.db.connections(self.principal.workspace_id)
+            if c["auth"] == "pat"
+            and (p := self.ctx.db.authenticate_connection(c["id"])) is not None
+            and _can_coordinate(p, wing)
+        ]
+
+    def board_coordinator(self, board):
+        _owner(self.principal)
+        with self.store.connection() as conn:
+            b = self._board(conn, board)
+            return {
+                "board": b["slug"],
+                "coordinator": b["coordinator"],
+                "candidates": [
+                    {
+                        "name": p.connection,
+                        "actor": p.actor,
+                        "current": p.actor == b["coordinator"],
+                    }
+                    for p in self._coordinator_candidates(b["wing"])
+                ],
+            }
+
+    def _coordinator_waiting(self):
+        if not self.principal.person or self.principal.role != "owner":
+            return []
+        waiting = {}
+        live = {}
+        with self.store.connection() as conn:
+            rows = conn.execute(
+                "SELECT t.*,b.slug AS board,b.wing AS board_wing,"
+                "b.coordinator AS board_coordinator FROM tasks t "
+                "JOIN boards b ON b.id=t.board_id "
+                "WHERE b.archived=0 AND t.status IN ('backlog','todo') AND t.restricted_origin=1 "
+                "AND coalesce(t.proposal_status,'')!='rejected' ORDER BY b.slug,t.id"
+            ).fetchall()
+            for row in rows:
+                if not self.principal.policy.can_read_wing(row["board_wing"]):
+                    continue
+                board = row["board"]
+                if board not in live:
+                    live[board] = any(
+                        p.actor == row["board_coordinator"]
+                        for p in self._coordinator_candidates(row["board_wing"])
+                    )
+                if not live[board] and not self._origin_released(row):
+                    waiting[board] = waiting.get(board, 0) + 1
+        return [
+            {
+                "board": board,
+                "count": count,
+                "message": f"{count} cards wait for a coordinator: set one in board settings",
+            }
+            for board, count in waiting.items()
+        ]
+
     def board_set(self, board, coordinator):
         _owner(self.principal)
         with self.transaction() as conn:
@@ -1639,15 +1699,7 @@ class BoardService:
             actor = None
             if coordinator is not None:
                 actor = self._actor(coordinator)
-                candidates = [
-                    self.ctx.db.authenticate_connection(c["id"])
-                    for c in self.ctx.db.connections(self.principal.workspace_id)
-                    if c["auth"] == "pat"
-                ]
-                if not any(
-                    p is not None and p.actor == actor and _can_coordinate(p, b["wing"])
-                    for p in candidates
-                ):
+                if not any(p.actor == actor for p in self._coordinator_candidates(b["wing"])):
                     raise ToolError(
                         "no: coordinator must be an active agent with access to this board"
                     )
@@ -3360,6 +3412,8 @@ class BoardService:
             if groups["approvals_truncated"]:
                 result["text"] += "\n" + APPROVALS_TRUNCATED
             return result
+        if self.principal.role == "owner":
+            groups["coordinator_waiting"] = self._coordinator_waiting()
         return groups
 
     def seed_card(

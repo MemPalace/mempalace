@@ -108,6 +108,11 @@ def open_cards(cards, limit=None):
 
 def _space_route(service, h, parts, method):
     """Space chat and board settings routes; None when the path is not one of them."""
+    if len(parts) == 3 and parts[2] == "coordinator" and method == "GET":
+        p = service.principal
+        if not p.person and not p.policy.tool_visible("board_set"):
+            raise HTTPError(403, "tool not allowed for this connection")
+        return 200, service.board_coordinator(parts[1])
     tool = None
     if len(parts) == 2 and method == "PATCH":
         tool = "board_set"
