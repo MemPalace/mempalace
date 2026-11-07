@@ -150,6 +150,87 @@ def test_r21_a_documented_change_passes(repo, capsys):
     assert docs_check.check(repo, base, "HEAD") == []
 
 
+def _list_modules():
+    """Independent topics have separate insertion positions, including blank separators."""
+    return MODULES.replace(
+        "- **Promises:** They exist.",
+        "- **Promises:**\n\n  - Fixtures exist.\n\n  - Servers use loopback.\n\n"
+        "  - Names are synthetic.",
+    ).replace(
+        "- **Tests:** The suite.",
+        "- **Tests:**\n\n  - Fixture tests.\n\n  - Server tests.\n\n  - Name tests.",
+    )
+
+
+def test_r21_sub_bullets_accept_updates_but_require_the_tests_block(repo):
+    repo, _base = repo
+    modules = _list_modules()
+    base = _commit(repo, {"MODULES.md": modules}, "list format")
+    _commit(
+        repo,
+        {"tests/test_new.py": "def test_new(): pass\n", "SYSTEM.md": SYSTEM + "\n- New check.\n"},
+    )
+    assert docs_check.check(repo, base, "HEAD") == [
+        "module 'rest' changed ('tests/test_new.py') but its MODULES.md block did not"
+    ]
+    _commit(
+        repo,
+        {
+            "MODULES.md": modules.replace(
+                "  - Fixture tests.", "  - New test.\n\n  - Fixture tests."
+            )
+        },
+    )
+    assert docs_check.check(repo, base, "HEAD") == []
+
+
+@pytest.mark.parametrize("field", ["Promises", "Tests"])
+def test_r21_sub_bullets_reject_empty_items(field):
+    if field == "Promises":
+        modules = MODULES.replace("- **Promises:** It works.", "- **Promises:**\n  - ")
+    else:
+        modules = MODULES.replace("- **Tests:** The suite.", "- **Tests:**\n  - ")
+    problems = docs_check.parse_modules(modules).problems
+    assert any(f"empty {field} list item" in problem for problem in problems), problems
+
+
+@pytest.mark.parametrize("field", ["Promises", "Tests"])
+def test_r21_different_doc_topics_merge_without_conflict(repo, field):
+    repo, _base = repo
+    modules = _list_modules()
+    system = "# System\n\n- Fixtures are isolated.\n\n- Servers use loopback.\n\n- Names are synthetic.\n"
+    base = _commit(repo, {"MODULES.md": modules, "SYSTEM.md": system}, "topic lists")
+    first, last = (
+        ("Fixtures exist.", "Names are synthetic.")
+        if field == "Promises"
+        else ("Fixture tests.", "Name tests.")
+    )
+    for branch, anchor, decision in [
+        ("fixture-topic", first, "Fixtures are isolated."),
+        ("name-topic", last, "Names are synthetic."),
+    ]:
+        _git(repo, "checkout", "-q", "-b", branch, base)
+        _commit(
+            repo,
+            {
+                f"tests/test_{branch.replace('-', '_')}.py": "def test_topic(): pass\n",
+                "MODULES.md": modules.replace(
+                    f"  - {anchor}", f"  - {branch} coverage.\n\n  - {anchor}"
+                ),
+                "SYSTEM.md": system.replace(
+                    f"- {decision}", f"- {branch} decision.\n\n- {decision}"
+                ),
+            },
+            branch,
+        )
+        assert docs_check.check(repo, base, "HEAD") == []
+    _git(repo, "merge", "--no-ff", "--no-edit", "fixture-topic")
+    assert docs_check.check(repo, base, "HEAD") == []
+    for filename in ("MODULES.md", "SYSTEM.md"):
+        merged = (repo / filename).read_text()
+        assert "fixture-topic" in merged and "name-topic" in merged
+
+
 def test_r21_nothing_changed_passes(repo):
     repo, base = repo
     assert docs_check.check(repo, base, base) == []

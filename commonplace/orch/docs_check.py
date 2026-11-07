@@ -4,7 +4,8 @@
 base of ``base`` and ``head`` and exits 1 when:
 
 - ``MODULES.md`` is missing at ``head``, or a block lacks one of the fields **Paths**,
-  **Owns**, **Promises**, **How it fails**, **Tests**, or has one empty;
+  **Owns**, **Promises**, **How it fails**, **Tests**, or has one empty (including
+  empty indented list items); fields accept inline text or blank-separated sub-bullets;
 - an entry of the repository root or of ``commonplace/`` is not listed exactly once
   (``commonplace/`` itself is split into its entries), or a path is listed twice;
 - a changed path is owned by no block (longest listed path wins; a directory ends in
@@ -95,8 +96,12 @@ def parse_modules(text: str) -> Modules:
                 problems.append(f"block '{current.name}' has field {last_field} twice")
             current.fields[last_field] = match.group(2).strip()
         elif last_field and line.startswith((" ", "\t")) and line.strip():
-            current.fields[last_field] = (current.fields[last_field] + " " + line.strip()).strip()
-        elif not line.strip():
+            item = line.strip()
+            if item in {"-", "*", "+"}:
+                problems.append(f"block '{current.name}' has an empty {last_field} list item")
+            else:
+                current.fields[last_field] = (current.fields[last_field] + " " + item).strip()
+        elif line.strip():
             last_field = None
     close()
     owners: dict[str, str] = {}

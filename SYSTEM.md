@@ -14,159 +14,201 @@ entry was written.
 
 ### Restricted-origin release
 
-Cards created by subagents or restricted agents start inactive in backlog,
-including create-and-claim requests. Activation and claiming require release
-by the board's live coordinator, or by the signed-in workspace owner when no
-coordinator is configured or live. `task_approve` supports both pending proposals
-and unreleased restricted submissions, with an audit entry and an `approved_by`
-release marker. Nonproposal releases leave `proposal_status` unset. Proposal approval
-by a parent alone does not activate the card without that release.
-An inactive card's holder may update only its status line without release;
-this does not activate, claim or approve the card. Rejected-proposal handoffs
-retain the proposal-approval guard before origin authorization.
+- Cards created by subagents or restricted agents start inactive in backlog, including create-and-claim requests.
+
+- Activation and claiming require release by the board's live coordinator, or by the signed-in workspace owner when no coordinator is configured or live.
+
+- `task_approve` supports both pending proposals and unreleased restricted submissions, with an audit entry and an `approved_by` release marker.
+
+- Nonproposal releases leave `proposal_status` unset.
+
+- Proposal approval by a parent alone does not activate the card without that release.
+
+- An inactive card's holder may update only its status line without release; this does not activate, claim or approve the card.
+
+- Rejected-proposal handoffs retain the proposal-approval guard before origin authorization.
 
 ### Privacy scanner timing checks
 
-Large-input and delimiter-heavy near-miss correctness checks run in the
-behaviour suite without measuring time. Each input also retains a separate
-`timing`-marked check of the 20 ms average scan budget over 20 iterations.
-The duration assertion is outside loops so a slow host produces an
-informational timing failure while incorrect flags remain blocking.
+- Large-input and delimiter-heavy near-miss correctness checks run in the behaviour suite without measuring time.
+
+- Each input also retains a separate `timing`-marked check of the 20 ms average scan budget over 20 iterations.
+
+- The duration assertion is outside loops so a slow host produces an informational timing failure while incorrect flags remain blocking.
 
 ### Restricted-origin card content
 
-Trusted agents and authorized board coordinators may update only the title
-and body of an unassigned todo card marked as restricted-origin. Board write
-access and proposal approval remain required. Each edit records its actor in
-the existing audit log; it neither releases the origin nor changes claiming,
-activation, reservation or other update permissions.
+- Trusted agents and authorized board coordinators may update only the title and body of an unassigned todo card marked as restricted-origin.
+
+- Board write access and proposal approval remain required.
+
+- Each edit records its actor in the existing audit log; it neither releases the origin nor changes claiming, activation, reservation or other update permissions.
 
 ### Optional agent orchestration
 
-- **Default off.** The workspace owner explicitly enables orchestration; absent
-  settings mean off. A settings read error refuses admission. Off retains the
-  existing claim/start behavior and board JSON shape.
-- **One project count.** Claims, queued starts, leases and configured starts share
-  a runner transaction. Ordinary agents count by connection, workers by card;
-  card/job overlaps count once. Default cap is 3; project rows override it,
-  configured boards use the smaller config/row cap. Board `used` shows active slots,
-  excluding the queued reservations counted at start creation.
-- **Authority.** Unconfigured starts require the active board coordinator PAT or
-  a signed-in owner. Owners separately trust seats and grant machines atomically;
-  switching off demotes all seats and removes only their requester ids. Trusted
-  seats cannot create boards. Connect alone never grants this trust.
-- **Lock order.** Control snapshots precede waits. Claims hold boards RESERVED then
-  runner admission until board commit; runner admissions read boards SHARED.
-- **Residual.** Without a runner or subscribed `card.created` webhook, a new card
-  waits for the orchestrator's next session. An always-running orchestrator is
-  separate work. Splitting and inbox behavior are not introduced by this switch.
+- **Default off.**
+
+  - The workspace owner explicitly enables orchestration; absent settings mean off.
+
+  - A settings read error refuses admission.
+
+  - Off retains the existing claim/start behavior and board JSON shape.
+
+- **One project count.**
+
+  - Claims, queued starts, leases and configured starts share a runner transaction.
+
+  - Ordinary agents count by connection, workers by card; card/job overlaps count once.
+
+  - Default cap is 3; project rows override it, configured boards use the smaller config/row cap.
+
+  - Board `used` shows active slots, excluding the queued reservations counted at start creation.
+
+- **Authority.**
+
+  - Unconfigured starts require the active board coordinator PAT or a signed-in owner.
+
+  - Owners separately trust seats and grant machines atomically; switching off demotes all seats and removes only their requester ids.
+
+  - Trusted seats cannot create boards.
+
+  - Connect alone never grants this trust.
+
+- **Lock order.**
+
+  - Control snapshots precede waits.
+
+  - Claims hold boards RESERVED then runner admission until board commit; runner admissions read boards SHARED.
+
+- **Residual.**
+
+  - Without a runner or subscribed `card.created` webhook, a new card waits for the orchestrator's next session.
+
+  - An always-running orchestrator is separate work.
+
+  - Splitting and inbox behavior are not introduced by this switch.
 
 ### Orchestrator config as code
 
-- **The store is the source of truth.** Each board has versioned orchestrator
-  configs (`v<n>`, with parent version, channel, source ref and sha256) in the
-  workspace's `runner.sqlite3`. `.commonplace/orchestrator.toml` in a repo is
-  only a proposal; `orch submit` proposes it and the owner approves its sha256.
-- **The owner approves every change.** Wing writers propose; only `orch_owner`
-  accepts, rejects, retires an experiment, forces a lease, voids a step or
-  acknowledges a restore. `orch_owner` is a signed-in person with role owner, or
-  the local CLI (data-dir access). Agent tokens with an owner role are refused.
-- **Channels.** `live` and `exp:<name>`. An experiment may change only
-  `prompt`, `workflow`/`workflows`, `topic`, `model_role` and `skills`. Triggers
-  always use live. Only accepted versions run.
-- **What is enforced.** For the runner role: the launch message
-  (`SPAWN_MESSAGE` + prompt + workflow steps), `harness = "t3"`, the topic (grant
-  checks), `model_role` (resolved once at insert and pinned on the job),
-  `runner.machine`/`project`/`runtime_mode` (grant checks), `card.todo`
-  triggers, `limits.max_agents` and planner `connections`. Every other role,
-  `skills` and `mcps` are advisory: rendered for sessions to read.
-- **Boards without an accepted live `[runner]` config behave exactly as
-  before.** No new columns change their digest, no sweep scans them, no lease
-  exists for them. The tool list does change: the `orch_*` tools are listed on
-  every workspace, so a config can be proposed before one exists (see
-  Residuals).
+- **The store is the source of truth.**
+
+  - Each board has versioned orchestrator configs (`v<n>`, with parent version, channel, source ref and sha256) in the workspace's `runner.sqlite3`.
+
+  - `.commonplace/orchestrator.toml` in a repo is only a proposal; `orch submit` proposes it and the owner approves its sha256.
+
+- **The owner approves every change.**
+
+  - Wing writers propose; only `orch_owner` accepts, rejects, retires an experiment, forces a lease, voids a step or acknowledges a restore.
+
+  - `orch_owner` is a signed-in person with role owner, or the local CLI (data-dir access).
+
+  - Agent tokens with an owner role are refused.
+
+- **Channels.**
+
+  - `live` and `exp:<name>`.
+
+  - An experiment may change only `prompt`, `workflow`/`workflows`, `topic`, `model_role` and `skills`.
+
+  - Triggers always use live.
+
+  - Only accepted versions run.
+
+- **What is enforced.**
+
+  - For the runner role: the launch message (`SPAWN_MESSAGE` + prompt + workflow steps), `harness = "t3"`, the topic (grant checks), `model_role` (resolved once at insert and pinned on the job), `runner.machine`/`project`/`runtime_mode` (grant checks), `card.todo` triggers, `limits.max_agents` and planner `connections`.
+
+  - Every other role, `skills` and `mcps` are advisory: rendered for sessions to read.
+
+- **Boards without an accepted live `[runner]` config behave exactly as before.**
+
+  - No new columns change their digest, no sweep scans them, no lease exists for them.
+
+  - The tool list does change: the `orch_*` tools are listed on every workspace, so a config can be proposed before one exists (see Residuals).
 
 ### Starts on a configured board
 
-- Every config-driven start runs one fenced transaction (`BEGIN IMMEDIATE` on
-  `runner.sqlite3`): resolve and hash, refuse under the restore flag or for a
-  `plan`-labelled card (`plan_pending`), look up the existing step (or, for a
-  person, the runner's own request key), check the cap, insert. A same-step
-  retry returns the stored job; any mismatch is a 409 with the stored step.
-- `card_start` on a configured board is person-owner only; every other caller
-  gets `no: use orch_card_start`. Cancelling a job that belongs to a step is
-  person-owner only.
-- The cap counts distinct cards: queued, leased, starting or uncertain jobs;
-  jobs started within `STARTED_HOLD_SECONDS`; and `doing` cards with any
-  connection assignee. The limit is `min(config.max_agents,
-  project_limits.max_agents)` when both are set.
-- A `plan`-labelled card never starts from config until the plan is approved;
-  the plan-approval row fires the trigger once. The plan is also re-checked when
-  the runner reports `starting`; a refused job ends `cancelled` with outcome
-  `plan_pending`.
+- Every config-driven start runs one fenced transaction (`BEGIN IMMEDIATE` on `runner.sqlite3`): resolve and hash, refuse under the restore flag or for a `plan`-labelled card (`plan_pending`), look up the existing step (or, for a person, the runner's own request key), check the cap, insert.
+
+- A same-step retry returns the stored job; any mismatch is a 409 with the stored step.
+
+- `card_start` on a configured board is person-owner only; every other caller gets `no: use orch_card_start`.
+
+- Cancelling a job that belongs to a step is person-owner only.
+
+- The cap counts distinct cards: queued, leased, starting or uncertain jobs; jobs started within `STARTED_HOLD_SECONDS`; and `doing` cards with any connection assignee.
+
+- The limit is `min(config.max_agents, project_limits.max_agents)` when both are set.
+
+- A `plan`-labelled card never starts from config until the plan is approved; the plan-approval row fires the trigger once.
+
+- The plan is also re-checked when the runner reports `starting`; a refused job ends `cancelled` with outcome `plan_pending`.
 
 ### Triggers
 
-- Only boards with an accepted live `[runner]` config are swept. The sweep
-  reads committed `task_events` after a per-board cursor; it fires on a move
-  into `todo` from another status (add, move, decide) and on the plan-approval
-  row.
-- The cursor is armed in two steps because board events and the cursor live in
-  different files: a configuring accept commits the cursor as NULL with a new
-  generation, then arming sets it to `COALESCE(MAX(task_events.id), 0)` only if
-  the generation is unchanged. A NULL cursor is never swept. Events before
-  arming are skipped (never replayed).
-- Every candidate is re-checked against the recorded `(cursor, gen)` as the
-  first statement inside its fenced transaction; the job or the coded miss and
-  the cursor advance commit together. Only infrastructure errors leave the
-  cursor where it was.
-- Before the fenced transaction the sweep's only `runner.sqlite3` write is the
-  arming update of an unset cursor: it opens the orchestrator store without
-  creating tables or converting a restore marker.
-- The actor is rebuilt from the event stamps and must pass `requester_ok`;
-  a member's move does not start work.
+- Only boards with an accepted live `[runner]` config are swept.
+
+- The sweep reads committed `task_events` after a per-board cursor; it fires on a move into `todo` from another status (add, move, decide) and on the plan-approval row.
+
+- The cursor is armed in two steps because board events and the cursor live in different files: a configuring accept commits the cursor as NULL with a new generation, then arming sets it to `COALESCE(MAX(task_events.id), 0)` only if the generation is unchanged.
+
+- A NULL cursor is never swept.
+
+- Events before arming are skipped (never replayed).
+
+- Every candidate is re-checked against the recorded `(cursor, gen)` as the first statement inside its fenced transaction; the job or the coded miss and the cursor advance commit together.
+
+- Only infrastructure errors leave the cursor where it was.
+
+- Before the fenced transaction the sweep's only `runner.sqlite3` write is the arming update of an unset cursor: it opens the orchestrator store without creating tables or converting a restore marker.
+
+- The actor is rebuilt from the event stamps and must pass `requester_ok`; a member's move does not start work.
 
 ### Durable orchestrator
 
-- One lease per `(board, role)`; the token is returned once and stored as
-  `sha256(token + incarnation)`. Expiry only fences; it never moves cards.
+- One lease per `(board, role)`; the token is returned once and stored as `sha256(token + incarnation)`.
+
+- Expiry only fences; it never moves cards.
+
 - The journal records `intent → started → waiting → done | failed | in_doubt`.
-  External effects (merge, gate, thread launch, card move) are never re-issued
-  by the hub; a successor checks the truth source first, and an unproven effect
-  becomes `needs_person`.
+
+- External effects (merge, gate, thread launch, card move) are never re-issued by the hub; a successor checks the truth source first, and an unproven effect becomes `needs_person`.
+
 - One gate per `(board, repo, PR, head)` across roles unless the owner voids it.
-- `orch_resume` returns a checkpoint (open steps, `in_doubt`, `needs_person`,
-  holds, next, jobs, misses) plus the unstarted `todo` cards of each configured
-  board: no active job and no job started strictly after the card's latest
-  firing event (a start in the same second as the event does not count).
+
+- `orch_resume` returns a checkpoint (open steps, `in_doubt`, `needs_person`, holds, next, jobs, misses) plus the unstarted `todo` cards of each configured board: no active job and no job started strictly after the card's latest firing event (a start in the same second as the event does not count).
 
 ### Webhook dispatcher recovery
 
-Each delivery pass contains unexpected errors from reconciliation, due-delivery
-lookup and delivery. An error is logged without its private message and the
-dispatcher waits on its stop event before continuing: 5 s initially, doubling
-after consecutive errors to a 300 s cap. A successful pass resets the backoff;
-stopping interrupts the wait. A closed-database `sqlite3.ProgrammingError` still
-ends the dispatcher, and exit always removes its event listener. This keeps a
-temporary failure from silently ending background delivery.
+- Each delivery pass contains unexpected errors from reconciliation, due-delivery lookup and delivery.
+
+- An error is logged without its private message and the dispatcher waits on its stop event before continuing: 5 s initially, doubling after consecutive errors to a 300 s cap.
+
+- A successful pass resets the backoff; stopping interrupts the wait.
+
+- A closed-database `sqlite3.ProgrammingError` still ends the dispatcher, and exit always removes its event listener.
+
+- This keeps a temporary failure from silently ending background delivery.
 
 ### Design before code
 
-- A planner role must include `design_before_code`. On a configured board,
-  approving a `plan` card runs `orch plan-check` on its body; only
-  `task_approve` removes the `plan` label; a planner connection's card must pass
-  plan-check before it reaches `todo` or `done`.
-- Plan-check G3 requires each numeric line in (a) to lead with M, T, G,
-  MEASURED, TARGET or GUESS after indentation and an optional Markdown list marker.
-  G7 requires each mapped test file to exist within the current repository root
-  at check time; `tests/test_orch_acceptance.py` is allowed. The root is the
-  nearest enclosing Git checkout, or the current directory outside a checkout.
-  Absolute paths and paths resolving outside the root are refused.
-- `orch_card_start(board, role, card, step_key, epoch, token, config_ref?)` uses
-  `role` to identify the lease and step lineage. Acceptance cases R1, R1b, R1d,
-  R1e, R8b, R10a and R11e live in `tests/test_orch_acceptance.py`.
-- `SYSTEM.md` and `MODULES.md` are kept current by `docs-check`, which runs in
-  the test suite.
+- A planner role must include `design_before_code`.
+
+- On a configured board, approving a `plan` card runs `orch plan-check` on its body; only `task_approve` removes the `plan` label; a planner connection's card must pass plan-check before it reaches `todo` or `done`.
+
+- Plan-check G3 requires each numeric line in (a) to lead with M, T, G, MEASURED, TARGET or GUESS after indentation and an optional Markdown list marker.
+
+- G7 requires each mapped test file to exist within the current repository root at check time; `tests/test_orch_acceptance.py` is allowed.
+
+- The root is the nearest enclosing Git checkout, or the current directory outside a checkout.
+
+- Absolute paths and paths resolving outside the root are refused.
+
+- `orch_card_start(board, role, card, step_key, epoch, token, config_ref?)` uses `role` to identify the lease and step lineage.
+
+- Acceptance cases R1, R1b, R1d, R1e, R8b, R10a and R11e live in `tests/test_orch_acceptance.py`.
+
+- `SYSTEM.md` and `MODULES.md` are kept current by `docs-check`, which runs in the test suite.
 
 ### Defaults chosen for slice 1
 
@@ -213,29 +255,29 @@ temporary failure from silently ending background delivery.
 | `runner.sqlite3` | workspace | runner jobs; orchestrator configs, cursors, leases, steps, journal, restore flag | yes |
 | palace and other workspace SQLite files | workspace | verbatim memory, indexes, threads | yes |
 
-Backups copy every SQLite file in the data directory (`commonplace/backup.py`).
-Online enumeration permits only SQLite sidecars (`-wal`, `-shm`, `-journal`)
-to disappear between listing and metadata lookup: the live gateway may remove
-them even while file creation is frozen, and snapshots omit them. Missing user
-files, symlinks and special files still abort the backup; offline enumeration
-remains strict.
-The gateway names the workspace path when entering the creation gate: an
-existing directory lookup can finish inside a writer transaction while frozen,
-so it cannot deadlock against the backup's all-database barrier. Creating a new
-workspace directory still waits for thaw.
-`restore()` publishes a verified copy into a new directory and leaves a restore
-marker there.
+- Backups copy every SQLite file in the data directory (`commonplace/backup.py`).
 
-Deploy (`deploy/commonplace/deploy.sh`) requires a new successful backup invocation,
-a fresh snapshot and backup verification before any Compose call. A transient
-sleep service with `After=<backup>.service` keeps the backup unit referenced from
-before invocation capture through validation, independently of an enabled timer.
-The ordering dependency does not trigger a backup; it prevents garbage collection
-from discarding even a fast oneshot's invocation and execution time. The holder
-uses `Type=exec`, is stopped before Compose, and is released by EXIT and signal
-traps on failure or timeout. Missing proof always refuses deployment. SIGKILL or
-a shell crash can leave a holder that the operator must stop before retrying;
-see the deployment runbook.
+- Online enumeration permits only SQLite sidecars (`-wal`, `-shm`, `-journal`) to disappear between listing and metadata lookup: the live gateway may remove them even while file creation is frozen, and snapshots omit them.
+
+- Missing user files, symlinks and special files still abort the backup; offline enumeration remains strict.
+
+- The gateway names the workspace path when entering the creation gate: an existing directory lookup can finish inside a writer transaction while frozen, so it cannot deadlock against the backup's all-database barrier.
+
+- Creating a new workspace directory still waits for thaw.
+
+- `restore()` publishes a verified copy into a new directory and leaves a restore marker there.
+
+- Deploy (`deploy/commonplace/deploy.sh`) requires a new successful backup invocation, a fresh snapshot and backup verification before any Compose call.
+
+- A transient sleep service with `After=<backup>.service` keeps the backup unit referenced from before invocation capture through validation, independently of an enabled timer.
+
+- The ordering dependency does not trigger a backup; it prevents garbage collection from discarding even a fast oneshot's invocation and execution time.
+
+- The holder uses `Type=exec`, is stopped before Compose, and is released by EXIT and signal traps on failure or timeout.
+
+- Missing proof always refuses deployment.
+
+- SIGKILL or a shell crash can leave a holder that the operator must stop before retrying; see the deployment runbook.
 
 ## Restore runbook
 
@@ -262,86 +304,129 @@ see the deployment runbook.
 
 ## Residuals
 
-Accepted, known gaps. Each is a reason a check can pass while the system is
-still wrong.
+- Accepted, known gaps.
 
-- **Same OS user.** Anyone who runs as the service's OS user can use the CLI
-  (which is `orch_owner`) and read the data directory.
-- **Restore outside `restore()`.** A hand-copied data directory or a deleted
-  `runner.sqlite3` carries no restore marker: the journal resets and nothing is
-  blocked.
-- **Effects after T.** After a restore, effects made after the backup time are
-  unknown to the journal; the truth checks in step 5 are the only guard.
-- **Outside the journal.** External effects and gate runs started outside the
-  journal are invisible to resume.
-- **Revocation window on trigger starts.** The trigger's requester and grants
-  are read in a control snapshot before the fenced transaction. A grant or
-  requester revocation that commits between that snapshot and the in-lock
-  insert is not re-read; the start can still be inserted. The runner re-checks
-  the requester and grants at `starting`, so the job is refused before launch.
-- **Same-second ties are listed.** Job starts and board events are stamped
-  in whole seconds, so a start in the same second as a card's latest firing
-  event cannot be ordered against it. Resume lists such a card as unstarted;
-  it may be a false positive.
-- **Skipped events.** Board events committed between a configuring accept (or
-  a restore acknowledgement) and arming are skipped, not replayed. Resume lists
-  the affected `todo` cards as unstarted.
-- **Refused triggers are not retried.** A `todo` card whose trigger start is
-  refused (`busy`, `at_cap`, `started_recently` or any other code) is a final
-  miss: the cursor moves past it and nothing re-fires it, even after the queue
-  drains or a slot frees up. It shows in the checkpoint's unstarted list and
-  as a miss; move the card out of `todo` and back to retry.
-- **Orchestrator tools on every workspace.** The `orch_*` tools appear in the
-  tool list on every workspace, also where no board has a config (runner
-  children never see them; owner-only tools are listed for owners only).
-  Without a config only proposing and reading do anything.
-- **Docs-check checks change, not accuracy.** It refuses a touched module
-  whose block did not change and a change without a `SYSTEM.md` edit
-  (whitespace-only edits do not count); it never judges whether the new text
-  is right.
-- **Cap overshoot.** The cap reads card state from `boards.sqlite3` as a
-  snapshot, so a concurrent claim outside the runner can overshoot it. Started
-  jobs hold machine in-flight capacity and per-machine project exclusion only
-  while their cards are doing with that machine's worker as assignee, even
-  after an hour. A terminal job state, a card leaving doing, or reassignment
-  releases that capacity. The lease resolves the worker identity before its
-  runner transaction and reads cards through the read-only boards helper inside
-  it, without constructing BoardService/BoardStore or acquiring a boards write
-  lock. Card state can change after that read; the next lease reads it again.
-- **D1 shared worker PAT.** All runner children use the machine's worker PAT,
-  so per-child provenance and per-child limits are not available.
-- **D2 launch shape.** Whether T3 accepts `modelSelection` at runtime is
-  unverified; when it is given, effort comes from T3's defaults.
-- **D3 thread-list keys.** An empty thread list is no proof that a launch did
-  not happen; such steps go to `needs_person`.
-- **Plaintext job lease tokens.** The runner's job lease token is stored in
-  `runner_jobs` and in the machine journal (pre-existing).
-- **Waiver list.** Approval of the waiver list below is a manual owner review.
+- Each is a reason a check can pass while the system is still wrong.
+
+- **Same OS user.**
+
+  - Anyone who runs as the service's OS user can use the CLI (which is `orch_owner`) and read the data directory.
+
+- **Restore outside `restore()`.**
+
+  - A hand-copied data directory or a deleted `runner.sqlite3` carries no restore marker: the journal resets and nothing is blocked.
+
+- **Effects after T.**
+
+  - After a restore, effects made after the backup time are unknown to the journal; the truth checks in step 5 are the only guard.
+
+- **Outside the journal.**
+
+  - External effects and gate runs started outside the journal are invisible to resume.
+
+- **Revocation window on trigger starts.**
+
+  - The trigger's requester and grants are read in a control snapshot before the fenced transaction.
+
+  - A grant or requester revocation that commits between that snapshot and the in-lock insert is not re-read; the start can still be inserted.
+
+  - The runner re-checks the requester and grants at `starting`, so the job is refused before launch.
+
+- **Same-second ties are listed.**
+
+  - Job starts and board events are stamped in whole seconds, so a start in the same second as a card's latest firing event cannot be ordered against it.
+
+  - Resume lists such a card as unstarted; it may be a false positive.
+
+- **Skipped events.**
+
+  - Board events committed between a configuring accept (or a restore acknowledgement) and arming are skipped, not replayed.
+
+  - Resume lists the affected `todo` cards as unstarted.
+
+- **Refused triggers are not retried.**
+
+  - A `todo` card whose trigger start is refused (`busy`, `at_cap`, `started_recently` or any other code) is a final miss: the cursor moves past it and nothing re-fires it, even after the queue drains or a slot frees up.
+
+  - It shows in the checkpoint's unstarted list and as a miss; move the card out of `todo` and back to retry.
+
+- **Orchestrator tools on every workspace.**
+
+  - The `orch_*` tools appear in the tool list on every workspace, also where no board has a config (runner children never see them; owner-only tools are listed for owners only).
+
+  - Without a config only proposing and reading do anything.
+
+- **Docs-check checks change, not accuracy.**
+
+  - It refuses a touched module whose block did not change and a change without a `SYSTEM.md` edit (whitespace-only edits do not count); it never judges whether the new text is right.
+
+- **Cap overshoot.**
+
+  - The cap reads card state from `boards.sqlite3` as a snapshot, so a concurrent claim outside the runner can overshoot it.
+
+  - Started jobs hold machine in-flight capacity and per-machine project exclusion only while their cards are doing with that machine's worker as assignee, even after an hour.
+
+  - A terminal job state, a card leaving doing, or reassignment releases that capacity.
+
+  - The lease resolves the worker identity before its runner transaction and reads cards through the read-only boards helper inside it, without constructing BoardService/BoardStore or acquiring a boards write lock.
+
+  - Card state can change after that read; the next lease reads it again.
+
+- **D1 shared worker PAT.**
+
+  - All runner children use the machine's worker PAT, so per-child provenance and per-child limits are not available.
+
+- **D2 launch shape.**
+
+  - Whether T3 accepts `modelSelection` at runtime is unverified; when it is given, effort comes from T3's defaults.
+
+- **D3 thread-list keys.**
+
+  - An empty thread list is no proof that a launch did not happen; such steps go to `needs_person`.
+
+- **Plaintext job lease tokens.**
+
+  - The runner's job lease token is stored in `runner_jobs` and in the machine journal (pre-existing).
+
+- **Waiver list.**
+
+  - Approval of the waiver list below is a manual owner review.
 
 ## Open dependencies (D1–D3)
 
-These are owner decisions or captures tracked in `docs/runner.md` ("Owner
-checklists"). Until each is closed, the residual above stands.
+- These are owner decisions or captures tracked in `docs/runner.md` ("Owner checklists").
 
-- **D1 worker identity.** "Attested, not verified" or a dedicated provider
-  instance per worker; stronger identity needs a per-thread credential.
-- **D2 launch shape.** One real launch capture settles the result fields, the
-  workspace strategy and `modelSelection`.
-- **D3 recovery.** The thread-list keys must be captured before any automatic
-  reconcile; until then `uncertain` and unproven launches go to a person.
+- Until each is closed, the residual above stands.
+
+- **D1 worker identity.**
+
+  - "Attested, not verified" or a dedicated provider instance per worker; stronger identity needs a per-thread credential.
+
+- **D2 launch shape.**
+
+  - One real launch capture settles the result fields, the workspace strategy and `modelSelection`.
+
+- **D3 recovery.**
+
+  - The thread-list keys must be captured before any automatic reconcile; until then `uncertain` and unproven launches go to a person.
 
 ## Keeping this file current
 
-`commonplace orch docs-check --base <ref> --head <ref>` exits non-zero on a
-changed path no `MODULES.md` block owns, a touched module whose block did not
-change, no change to this file (a whitespace-only edit is no change), an
-empty or missing block, a bad ref or any error. The test suite runs it
-against the merge base with the development branch and fails closed when the
-base is missing. The only exception is a
-commit trailer `Docs-waiver: W<n>` whose id is listed below **in the base
-commit**; an id added in the same change does not count.
+- Add a NEW bullet next to the related decision, number, store or residual; do
+  not extend a shared paragraph or collect unrelated additions at one section end.
+  Keep each topic on its own lines, separated by blank lines. Independent
+  insertion positions merge cleanly; edits at the same position can still conflict.
+  In `MODULES.md`, add a NEW indented sub-bullet to each touched module block
+  instead of extending its **Promises** or **Tests** line.
+
+- `commonplace orch docs-check --base <ref> --head <ref>` exits non-zero on a changed path no `MODULES.md` block owns, a touched module whose block did not change, no change to this file (a whitespace-only edit is no change), an empty or missing block, a bad ref or any error.
+
+- The test suite runs it against the merge base with the development branch and fails closed when the base is missing.
+
+- The only exception is a commit trailer `Docs-waiver: W<n>` whose id is listed below **in the base commit**; an id added in the same change does not count.
 
 ## Waivers
 
-Owner-approved waiver ids, one per line as `W<n>: <scope>`. None are approved
-yet.
+- Owner-approved waiver ids, one per line as `W<n>: <scope>`.
+
+- None are approved yet.
