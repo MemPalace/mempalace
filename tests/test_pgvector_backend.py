@@ -105,22 +105,27 @@ class _FakePgVectorClient:
         table,
         *,
         where=None,
+        ids=None,
         with_embedding=False,
         with_document=True,
         limit=None,
         offset=None,
         order_field=None,
     ):
-        self.scroll_calls.append(
-            {
-                "where": where,
-                "limit": limit,
+        call = {
+            "where": where,
+            "limit": limit,
                 "offset": offset,
                 "with_document": with_document,
-                "order_field": order_field,
-            }
-        )
+            "order_field": order_field,
+        }
+        if ids is not None:
+            call["ids"] = ids
+        self.scroll_calls.append(call)
         rows = self._filtered(table, where)
+        if ids is not None:
+            keep = {str(doc_id) for doc_id in ids}
+            rows = [row for row in rows if row["id"] in keep]
         if order_field is not None:
             # Mirror the real backend: ORDER BY metadata->>field DESC NULLS
             # LAST, id — then LIMIT/OFFSET. Sorting by id first and then
@@ -1945,3 +1950,71 @@ def test_execute_retry_covers_executemany(monkeypatch):
     client = _PgVectorClient(_PgVectorConfig(dsn="postgresql://localhost/unused", namespace=None))
     client._execute("INSERT ...", [(1,), (2,)], many=True)
     assert len(handed_out) == 2
+
+
+def test_pgvector_get_pushes_ids_to_scroll(tmp_path, fake_pgvector):
+    """col.get(ids=[...]) must pass ids through to scroll_rows — a by-id fetch
+    must never scroll the whole table and filter in Python. Regression test:
+    the palace write path calls get(ids=[id], include=[]) for idempotency and
+    post-write verification, and at corpus scale a bare scroll made every
+    write spend ~10s of SQL plus ~20s of Python-side JSONB decode per call."""
+    backend, col = _collection(tmp_path)
+    col.add(
+        ids=["a", "b"],
+        documents=["alpha note", "beta note"],
+        metadatas=[{"wing": "w"}, {"wing": "w"}],
+        embeddings=[[1, 0], [0, 1]],
+    )
+    client = _FakePgVectorClient.instances[-1]
+    client.scroll_calls.clear()
+
+    result = col.get(ids=["a"], include=[])
+
+    assert result.ids == ["a"]
+    assert len(client.scroll_calls) == 1
+    assert client.scroll_calls[0]["ids"] == ["a"]
+
+
+def test_pgvector_scroll_rows_sql_pushes_ids():
+    """The generated SQL filters id = ANY(%s) so Postgres does the narrowing,
+    with the id list bound after where-predicates and before limit/offset."""
+    captured = {}
+
+    class _Recorder(_PgVectorClient):
+        def __init__(self):  # no connection
+            self._config = None
+
+        def _execute(self, sql, params=None, *, fetch=False, many=False):
+            captured["sql"] = sql
+            captured["params"] = params
+            return []
+
+    _Recorder().scroll_rows("tbl", ids=["a", "b"], limit=3)
+
+    assert "id = ANY(%s)" in captured["sql"]
+    assert "LIMIT %s" in captured["sql"]
+    # Positional binding order matches the SQL text order: id list, then limit.
+    assert captured["params"] == [["a", "b"], 3]
+
+
+def test_pgvector_scroll_rows_sql_ids_after_where():
+    """Where-predicates bind before the id list — the clause is appended to the
+    existing where_sql, so its params must land after the predicate params."""
+    captured = {}
+
+    class _Recorder(_PgVectorClient):
+        def __init__(self):  # no connection
+            self._config = None
+
+        def _execute(self, sql, params=None, *, fetch=False, many=False):
+            captured["sql"] = sql
+            captured["params"] = params
+            return []
+
+    _Recorder().scroll_rows("tbl", where={"wing": "devin"}, ids=["x"], offset=2)
+
+    sql = captured["sql"]
+    assert sql.index("metadata @>") < sql.index("id = ANY(%s)")
+    assert captured["params"][1] == ["x"]
+    assert captured["params"][2] == 2
+    assert len(captured["params"]) == 3

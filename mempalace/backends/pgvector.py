@@ -892,6 +892,7 @@ class _PgVectorClient:
         table: str,
         *,
         where: Optional[dict] = None,
+        ids: Optional[list] = None,
         with_embedding: bool = False,
         with_document: bool = True,
         limit: Optional[int] = None,
@@ -901,6 +902,9 @@ class _PgVectorClient:
         qi = _quote_identifier(table)
         params: list = []
         where_sql = _where_to_sql(where, params) if where else "TRUE"
+        if ids is not None:
+            where_sql = f"({where_sql}) AND id = ANY(%s)"
+            params.append([str(doc_id) for doc_id in ids])
         # Project NULL into the document slot when the caller only needs
         # metadata (e.g. mempalace_status's wing/room tally). Keeps the
         # positional _row parser unchanged — document remains record[1] —
@@ -1122,6 +1126,7 @@ class PgVectorCollection(BaseCollection):
         self,
         *,
         where=None,
+        ids=None,
         with_embedding=False,
         with_document=True,
         limit=None,
@@ -1136,6 +1141,7 @@ class PgVectorCollection(BaseCollection):
         return self._client.scroll_rows(
             self._table,
             where=where,
+            ids=ids,
             with_embedding=with_embedding,
             with_document=with_document,
             limit=limit,
@@ -1182,7 +1188,7 @@ class PgVectorCollection(BaseCollection):
         _validate_where(where)
         _validate_where(where_document)
         pushdown = None if _requires_local_filter(where, where_document) else where
-        rows = self._scroll(where=pushdown, with_embedding=with_embedding)
+        rows = self._scroll(where=pushdown, ids=ids, with_embedding=with_embedding)
         id_set = set(ids) if ids is not None else None
         return [
             row
