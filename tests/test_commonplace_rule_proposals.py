@@ -12,7 +12,7 @@ from commonplace import extensions, sessions
 from commonplace.boards import BoardService
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.policy import Policy
-from commonplace.rules import RuleService, render
+from commonplace.rules import RuleService, checks, render
 from commonplace.rules.service import instructions_for
 from tests._commonplace_helpers import hub_fixture  # noqa: F401
 from tests.test_commonplace_boards import api, mcp
@@ -68,7 +68,9 @@ def fresh(hub):
     )
 
 
-def test_fresh_user_mcp_shared_proposal_needs_one_owner_acceptance(hub, fresh):
+def test_fresh_user_mcp_shared_proposal_needs_one_owner_acceptance(hub, fresh, monkeypatch):
+    # Proposal acceptance and verbatim text must not depend on scheduler delays.
+    monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
     schema = extensions.get("rules_publish").input_schema["properties"]["agent"]
     assert schema == {"type": "string", "enum": ["self", "*"], "default": "self"}
     ok, reply = mcp(hub, fresh.token, "rules_publish", rules=[rule()], agent="*")
