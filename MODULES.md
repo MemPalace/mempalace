@@ -125,6 +125,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Release email login waits for the accessible signed-in Board region after identity checks; step failure details retain exception messages through the shared credential redactor.
+
   - Scripts are run by hand or by the release process; none runs on import or ships in the package.
 
   - Benchmarks are informational and never gate a change.
@@ -235,6 +237,8 @@ Format (read by `commonplace orch docs-check`):
   - A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
 
 - **Tests:**
+
+  - Release helper regressions simulate the old app disappearing before the signed-in board arrives and verify useful exception messages without credentials in JSON or Markdown reports.
 
   - The suite itself under the coverage gate; `tests/test_commonplace_webhooks.py::test_dispatcher_thread_survives_an_unexpected_pass_error` checks that an unexpected delivery-pass error is logged without its private message and the dispatcher retries while staying alive.
 

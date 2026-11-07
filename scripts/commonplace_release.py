@@ -19,6 +19,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import quote
 
+from commonplace.redact import redact
 from scripts.commonplace_release_support import (
     Blocked,
     Report,
@@ -115,7 +116,7 @@ async def email_login(page, instance, email, *, signup=False):
     require(bool(me.get("workspace")), "Fresh signup did not create a personal workspace")
     if signup:
         require(me.get("actor") == "user:" + me["user"], "Signup did not create a person session")
-    await page.locator(".app").wait_for()
+    await page.get_by_role("region", name="Board", exact=True).wait_for()
     return me
 
 
@@ -198,7 +199,8 @@ class Journey:
             row.status, row.detail = "FAIL", str(exc)
         except Exception as exc:
             # SDK/browser exceptions can contain bearer headers and login URLs.
-            row.status, row.detail = "FAIL", f"{type(exc).__name__}; inspect screenshot"
+            row.status, row.detail = "FAIL", f"{type(exc).__name__}: {exc}"
+        row.detail = redact(row.detail)[0]
         if (
             self.page is not None
             and not row.screenshot

@@ -52,6 +52,10 @@ entry was written.
 
 - Rules initialization deliberately returns the legacy response when its deadline expires, even after rendering; the 500-rule incomplete marker is checked with a fixed clock, separately from the unchanged informational 25 ms added p95 budget.
 
+### Release email login readiness
+
+- The disposable release journey considers email login ready only after authenticated identity checks and the signed-in Board region appears; step failure reports retain exception messages with shared credential redaction.
+
 ### Restricted-origin release
 
 - Cards created by subagents or restricted agents start inactive in backlog, including create-and-claim requests.

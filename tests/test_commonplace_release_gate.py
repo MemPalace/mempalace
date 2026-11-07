@@ -1,14 +1,18 @@
 """Fast release-gate helper checks; full browser/MCP evidence is a separate run."""
 
+import asyncio
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
 
-from scripts.commonplace_release import CHECKS, main
+from scripts.commonplace_release import CHECKS, Journey, email_login, main
 from scripts.commonplace_release_support import (
     Blocked,
     Mailbox,
@@ -132,6 +136,124 @@ def test_runner_cannot_report_success_after_only_one_finished_check(tmp_path, mo
     output = tmp_path / "report"
     assert main(["--output", str(output)]) == 1
     assert not json.loads((output / "report.json").read_text())["passed"]
+
+
+@pytest.mark.parametrize("signup", [False, True])
+def test_email_login_waits_through_stale_app_until_signed_in_board(signup):
+    email, origin = "signup-release@example.test", "http://127.0.0.1:1234"
+    me = {"email": email, "user": "new-person", "actor": "user:new-person", "workspace": "new"}
+    states = [{".app"}]
+    seen = []
+
+    async def confirm():
+        # Confirmation replaces the old app; the board arrives after the shell.
+        states[:] = [set(), {".shell"}, {".shell", "board"}]
+
+    async def send_mail():
+        instance.mail.send(email, "link", origin + "/app/auth/email/verify?t=synthetic-link")
+
+    class DOMLocator:
+        def __init__(self, key):
+            self.key = key
+
+        async def wait_for(self):
+            for state in states:
+                seen.append(state)
+                if self.key in state:
+                    return
+            raise TimeoutError("Signed-in DOM never matched the requested locator")
+
+    field = SimpleNamespace(
+        count=AsyncMock(return_value=1),
+        fill=AsyncMock(),
+        locator=lambda _: SimpleNamespace(
+            get_by_role=lambda _: SimpleNamespace(click=AsyncMock(side_effect=send_mail))
+        ),
+    )
+
+    def by_role(role, *, name, exact):
+        if (role, name) == ("textbox", "Email"):
+            return field
+        if (role, name) == ("button", "Sign in"):
+            return SimpleNamespace(click=AsyncMock(side_effect=confirm))
+        if (role, name) == ("region", "Board"):
+            return DOMLocator("board")
+        raise AssertionError(f"Unexpected role: {role}, {name}")
+
+    responses = iter([202, 200, 303])
+
+    @asynccontextmanager
+    async def expect_response(predicate):
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(SimpleNamespace(status=next(responses)))
+        yield SimpleNamespace(value=future)
+
+    page = SimpleNamespace(
+        url=origin + "/app/",
+        goto=AsyncMock(),
+        wait_for_load_state=AsyncMock(),
+        wait_for_url=AsyncMock(),
+        get_by_role=by_role,
+        locator=DOMLocator,
+        expect_response=expect_response,
+        context=SimpleNamespace(
+            request=SimpleNamespace(
+                get=AsyncMock(return_value=SimpleNamespace(status=401)),
+                fetch=AsyncMock(
+                    return_value=SimpleNamespace(status=200, json=AsyncMock(return_value=me))
+                ),
+            )
+        ),
+    )
+    instance = SimpleNamespace(origin=origin, mail=Mailbox())
+    report = Report(["email_signup"])
+    journey = Journey(None, instance, None, report)
+    journey.screenshot = AsyncMock(return_value="email_signup.png")
+
+    async def login():
+        identity = await email_login(page, instance, email, signup=signup)
+        assert "board" in seen[-1], "Login returned before the signed-in board appeared"
+        assert identity == me
+
+    asyncio.run(journey.check("email_signup", login))
+    assert report.results["email_signup"].status == "PASS", report.results["email_signup"].detail
+    assert seen == [set(), {".shell"}, {".shell", "board"}]
+
+
+@pytest.mark.parametrize("exception", [TimeoutError, RuntimeError, AssertionError, Blocked])
+def test_step_failure_reports_real_message_without_credentials(exception):
+    report = Report(["email_signup"])
+    journey = Journey(None, None, None, report)
+    message = (
+        "Board did not appear after confirmation\n"
+        "Authorization: Bearer synthetic-bearer-value\n"
+        "Cookie: cmmn_session=synthetic-session-value\n"
+        "http://127.0.0.1/app/auth/email/verify?t=synthetic-login-value\n"
+        "http://127.0.0.1/callback?code=synthetic-code-value&state=synthetic-state-value\n"
+        + "cmmn_"
+        + "x" * 43
+    )
+
+    async def fail():
+        raise exception(message)
+
+    asyncio.run(journey.check("email_signup", fail))
+    row = report.results["email_signup"]
+    assert row.status == ("BLOCKED" if exception is Blocked else "FAIL")
+    assert "Board did not appear after confirmation" in row.detail
+    if exception in (TimeoutError, RuntimeError):
+        assert exception.__name__ in row.detail
+    for rendered in (json.dumps(report.payload()), report.markdown()):
+        for secret in (
+            "synthetic-bearer-value",
+            "synthetic-session-value",
+            "synthetic-login-value",
+            "synthetic-code-value",
+            "synthetic-state-value",
+            "cmmn_" + "x" * 43,
+        ):
+            assert secret not in rendered
+        assert "[redacted:" in rendered
 
 
 def test_report_distinguishes_protocol_assertions_and_multiple_visual_captures():
