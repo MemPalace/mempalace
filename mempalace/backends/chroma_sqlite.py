@@ -595,6 +595,83 @@ def _wal_pending_ids(palace_path: str, collection_name: str) -> Optional[set]:
     return _read_db(palace_path, read)
 
 
+def get_parentless_chunk_group_stats(palace_path: str, collection_name: str) -> Optional[dict]:
+    """Logical-vs-physical chunk accounting for one collection.
+
+    Chunked drawers are stored as physical ``<drawer_id>_chunk_NNNNNN``
+    rows only: no writer upserts a row under the logical drawer id, so a
+    chunked drawer's parent embedding row never exists. That is the storage
+    contract (see ``tool_add_drawer``), not a lost write — readers resolve a
+    logical drawer through the ``parent_drawer_id`` / ``parent_entry_id``
+    join (``_logical_chunk_group``), never by assuming
+    ``embedding_id == drawer_id``. Audit chunked drawers by that join: a
+    parentless chunk group is expected, not evidence of an uncommitted
+    write.
+
+    Returns ``{"drawers": ..., "chunks": ..., "rows": ...,
+    "parentless_chunk_groups": ...}``: ``drawers`` counts logical drawers
+    (distinct parent ids, falling back to the row's own id), ``chunks``
+    counts physical rows carrying a parent link, ``rows`` counts physical
+    embedding rows, and ``parentless_chunk_groups`` counts distinct logical
+    chunk groups with no physical parent row. The units match
+    ``DrawerCount(drawers, chunks, rows)`` from unmerged PR #2545, which
+    owns the logical-counting abstraction; this probe only reports the
+    numbers. A row carrying both parent keys is attributed to
+    ``parent_drawer_id``, matching drawer resolution. Registry rows and
+    sentinels are excluded, as in :func:`_sqlite_wing_room_counts`.
+
+    Read-only, pure sqlite. ``None`` when the database is missing, the
+    collection is not bootstrapped, or any sqlite error makes the counts
+    untrustworthy, so callers omit the diagnostic instead of reporting a
+    wrong one.
+    """
+
+    def read(conn):
+        if not _has_collection(conn, collection_name):
+            return None
+        row = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS rows,
+                COUNT(DISTINCT COALESCE(parent, eid)) AS drawers,
+                COUNT(parent) AS chunks,
+                COUNT(DISTINCT CASE
+                    WHEN parent IS NOT NULL AND parent NOT IN (
+                        SELECT e2.embedding_id
+                        FROM embeddings e2
+                        JOIN segments s2 ON e2.segment_id = s2.id
+                            AND s2.scope = 'METADATA'
+                        JOIN collections c2 ON s2.collection = c2.id
+                        WHERE c2.name = ?
+                          AND e2.embedding_id IS NOT NULL
+                    ) THEN parent
+                END) AS parentless_chunk_groups
+            FROM (
+                SELECT e.embedding_id AS eid,
+                       COALESCE(pd.string_value, pe.string_value) AS parent
+                {_DRAWERS_SQL}
+                LEFT JOIN embedding_metadata pd
+                    ON pd.id = e.id AND pd.key = 'parent_drawer_id'
+                LEFT JOIN embedding_metadata pe
+                    ON pe.id = e.id AND pe.key = 'parent_entry_id'
+                WHERE c.name = ? AND {not_bookkeeping_sql(conn)}
+            )
+            """,
+            (collection_name, collection_name),
+        ).fetchone()
+        if row is None:
+            return None
+        rows, drawers, chunks, parentless = (int(v) for v in row)
+        return {
+            "drawers": drawers,
+            "chunks": chunks,
+            "rows": rows,
+            "parentless_chunk_groups": parentless,
+        }
+
+    return _read_db(palace_path, read, busy=True)
+
+
 def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optional[bool]:
     """Whether ``collection_name`` holds any drawer, read from chroma.sqlite3.
 
