@@ -105,6 +105,20 @@ class DaemonError(RuntimeError):
     """Raised when daemon client operations fail."""
 
 
+class DaemonWaitTimeout(DaemonError):
+    """Raised when a wait runs out before the job it waits on ends.
+
+    The daemon keeps the job and still runs it in turn, so a caller that only
+    waited to report the outcome must not count this as a failure. ``state`` is
+    the job's last seen state, ``queued`` or ``running``.
+    """
+
+    def __init__(self, job_id: str, state: str):
+        super().__init__(f"timed out waiting for job {job_id}")
+        self.job_id = job_id
+        self.state = state
+
+
 def _now() -> str:
     return utc_now_iso()
 
@@ -1242,7 +1256,7 @@ class DaemonClient:
             if stop_on_lock_deferral and job_deferred_by_lock(job):
                 return job
             if time.monotonic() >= deadline:
-                raise DaemonError(f"timed out waiting for job {job_id}")
+                raise DaemonWaitTimeout(job_id, job["state"])
             time.sleep(0.2)
 
     def shutdown(self) -> dict[str, Any]:
