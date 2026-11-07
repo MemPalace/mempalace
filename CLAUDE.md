@@ -85,7 +85,7 @@ mempalace/
 ├── migrate.py           # ChromaDB version migration
 ├── spellcheck.py        # Auto-correct user messages
 ├── exporter.py          # Palace data export
-├── hooks_cli.py         # Hook management CLI
+├── hooks_cli/           # Hook runtime package; public import is still mempalace.hooks_cli
 ├── query_sanitizer.py   # Prompt contamination prevention
 ├── split_mega_files.py  # Split concatenated transcript files
 └── version.py           # Single source of truth for version

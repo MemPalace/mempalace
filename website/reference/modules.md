@@ -27,7 +27,7 @@ mempalace/
 │   ├── general_extractor.py   ← 5-type memory extraction
 │   ├── split_mega_files.py    ← transcript splitting
 │   ├── spellcheck.py          ← optional spell checking
-│   ├── hooks_cli.py           ← hook logic
+│   ├── hooks_cli/             ← hook runtime (stop, session, precompact)
 │   ├── instructions_cli.py    ← skill instructions
 │   └── version.py             ← version string
 ├── benchmarks/                ← reproducible benchmark runners
