@@ -289,7 +289,13 @@ def test_imported_search_r06_acl_import_mcp_session_start(world, monkeypatch):
     assert "Relevant memories" in "\n".join(strings(reply))
 
 
-def test_imported_search_r07_acl_import_startup_injection(world, monkeypatch):
+def test_imported_search_r07_acl_import_startup_injection(
+    world,
+    monkeypatch,
+    functional_worker_transport,  # noqa: F811
+):
+    # A fixed clock still leaves an 80 ms wall-clock worker socket timeout.
+    # Use the functional I/O allowance while retaining logical deadline checks.
     w = world
     text = words("startup")
     status, result = imported(w, text)

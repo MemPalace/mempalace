@@ -234,6 +234,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The 500-rule initialization checks separate deterministic truncation behavior from the unchanged informational p95 budget; a fake-clock regression covers empty injection after deadline expiry.
 
+  - Imported startup recall freezes logical expiry and uses the functional worker allowance; a delayed real search regression retains ACL filtering and exact JSON-quoted imported text.
+
   - Runner-start void tests cover both orchestration switches, retired keys, lease/start ordering, rollback, capacity and owner authority.
 
   - Shared-proposal acceptance freezes the injection clock; a forced-expiry regression exercises the functional test and checks verbatim delivery to both agents after owner acceptance.
