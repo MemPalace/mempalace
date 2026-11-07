@@ -648,6 +648,7 @@ class AnthropicProvider(LLMProvider):
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         timeout: int = 120,
+        max_tokens: int = 2048,
         **_: object,
     ):
         if api_key:
@@ -664,6 +665,7 @@ class AnthropicProvider(LLMProvider):
             timeout=timeout,
             api_key_source=source,
         )
+        self.max_tokens = max_tokens
 
     def check_available(self) -> tuple[bool, str]:
         if not self.api_key:
@@ -687,7 +689,7 @@ class AnthropicProvider(LLMProvider):
             sys_prompt += "\n\nRespond with valid JSON only, no prose."
         body = {
             "model": self.model,
-            "max_tokens": 2048,
+            "max_tokens": self.max_tokens,
             "temperature": 0.1,
             "system": sys_prompt,
             "messages": [{"role": "user", "content": user}],
@@ -699,6 +701,13 @@ class AnthropicProvider(LLMProvider):
         data = post_json(
             f"{self.endpoint}/v1/messages", body, headers=headers, timeout=self.timeout
         )
+        # A truncated answer otherwise surfaces as a JSON parse error in the
+        # caller, which does not say what to change (issue #2940).
+        if data.get("stop_reason") == "max_tokens":
+            raise LLMError(
+                "Anthropic response was truncated at "
+                f"max_tokens={self.max_tokens}; raise max_tokens or send a smaller request"
+            )
         try:
             text = "".join(
                 b.get("text", "") for b in data.get("content", []) or [] if b.get("type") == "text"
