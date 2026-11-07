@@ -521,7 +521,9 @@ class _Cut:
         return roots
 
     def _walk(self) -> _Tree:
-        files, dirs = _inventory(self.root, exclude=(FENCE_NAME, STAGING_NAME))
+        files, dirs = _inventory(
+            self.root, exclude=(FENCE_NAME, STAGING_NAME), volatile_suffixes=SIDECARS
+        )
         workers = self._worker_roots()
         tree = _Tree(dirs=dirs)
         for path in files:

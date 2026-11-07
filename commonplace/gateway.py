@@ -1268,7 +1268,7 @@ class Gateway:
         from .admission import GATE
 
         path = self.supervisor.workspace_dir(workspace_id)
-        with GATE.creating():
+        with GATE.creating(path):
             path.mkdir(parents=True, exist_ok=True)
         return str(path)
 

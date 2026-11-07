@@ -217,8 +217,12 @@ def _verify_offline(root: Path, exempt=()) -> None:
             raise BackupError(f"cannot verify whether process {proc.name} uses this data") from exc
 
 
-def _inventory(root: Path, exclude=()) -> tuple[list[Path], list[Path]]:
-    """Regular files and directories of ``root``; ``exclude`` lists skipped relative paths."""
+def _inventory(root: Path, exclude=(), *, volatile_suffixes=()) -> tuple[list[Path], list[Path]]:
+    """List regular files/directories; tolerate vanished ``volatile_suffixes`` only.
+
+    ``exclude`` lists skipped relative paths. Online callers may opt in to
+    SQLite sidecar cleanup racing the listing; offline inventories stay strict.
+    """
     files, dirs = [], []
     skipped = {Path(LOCK_NAME), Path("manifest.json"), *(Path(name) for name in exclude)}
 
@@ -237,7 +241,12 @@ def _inventory(root: Path, exclude=()) -> tuple[list[Path], list[Path]]:
                 and relative.parts[2:] == ("home", ".cache", "chroma")
             ):
                 continue
-            mode = path.lstat().st_mode
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                if path.name.endswith(volatile_suffixes):
+                    continue
+                raise
             if stat.S_ISLNK(mode):
                 raise BackupError(f"refusing symlink in data directory: {relative}")
             if stat.S_ISDIR(mode):
