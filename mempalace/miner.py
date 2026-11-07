@@ -2122,6 +2122,30 @@ def mine(
         )
 
 
+def _project_wing(raw, project_path: Path) -> str:
+    """The wing a project config names, safe to store on drawers and print.
+
+    The config can arrive with a cloned repository. A valid name is kept as
+    written. A rejected one becomes the one wing slug, and with nothing usable
+    the project falls back to the wing it has without a config. Drawers already
+    filed under the old spelling stay there. ``wing_aliases`` links the two by
+    slug, so a name with no slug (``+++``) stays reachable only by that name or an
+    unfiltered search. Only scalars are turned into text, because yaml aliases can
+    build a small value whose text form is exponentially large.
+    """
+    from .config import normalize_wing_name, sanitize_name
+
+    try:
+        return sanitize_name(raw, "wing")
+    except ValueError:
+        pass
+    text = str(raw) if isinstance(raw, (str, int, float)) else ""
+    wing = normalize_wing_name(text) or normalize_wing_name(project_path.name) or "project"
+    shown = ascii(text[:80]) if text else f"of type {type(raw).__name__}"
+    print(f"  Invalid wing {shown} in project config: using {ascii(wing)}.", file=sys.stderr)
+    return wing
+
+
 def _mine_impl(
     project_dir: str,
     palace_path: str,
@@ -2145,7 +2169,7 @@ def _mine_impl(
     cfg_chunk_overlap = palace_config.chunk_overlap
     cfg_min_chunk_size = palace_config.min_chunk_size
 
-    wing = wing_override or config["wing"]
+    wing = wing_override or _project_wing(config.get("wing"), project_path)
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
     exclude_patterns = config.get("exclude_patterns", [])
 
