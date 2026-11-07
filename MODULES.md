@@ -191,6 +191,10 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
   - Scoped KG writes recheck provenance snapshots in-lock; source/id deletes use authorized rooms and explicit ids, and missing optional closets count as zero.
 
+  - Direct B2 providers reject malformed metadata with encryption errors; marked-workspace refusals retain an explicit locked diagnostic.
+
+  - Operator-blind token-slot primitives accept strict versioned token/grant envelopes only; opt-in B3 metadata stays locked before any B2 key provider or database open.
+
   - User content is stored verbatim; ingest is append-only; search returns original words; nothing leaves the machine unless the user configured a provider.
 
 - **How it fails:**
@@ -248,6 +252,9 @@ Format (read by `commonplace orch docs-check`):
   - Thread-boundary integration tests exercise real separate workspace workers; focused scope tests cover stale snapshots, optional collections, malformed probes, decoding and response caches.
 
   - Release helper regressions simulate the old app disappearing before the signed-in board arrives and verify useful exception messages without credentials in JSON or Markdown reports.
+  - Marked backup classification and snapshots use live synthetic B2 controls; direct-provider and version guards have observed base AssertionError regressions.
+
+  - Synthetic token-slot proofs bind every envelope context field, reject operator/recovery wraps and test marked-workspace connection and backup refusal with an unmarked SQLCipher control.
 
   - The suite itself under the coverage gate; `tests/test_commonplace_webhooks.py::test_dispatcher_thread_survives_an_unexpected_pass_error` checks that an unexpected delivery-pass error is logged without its private message and the dispatcher retries while staying alive.
 

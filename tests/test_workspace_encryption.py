@@ -695,3 +695,161 @@ def test_encrypted_snapshot_refuses_wal_written_after_checkpoint(workspace, monk
     assert not target.exists()
     with closing(crypto.connect(source)) as conn:
         assert conn.execute("SELECT content FROM fixture").fetchone() == ("late committed WAL row",)
+
+
+def test_b3_marker_never_uses_v1_provider(workspace):
+    """The same synthetic B2 bytes open before, but never after, the marker."""
+    data, _, wid, *_ = workspace
+    enable(workspace)
+    active = workspace_path(data, wid)
+    source = active / "guard.sqlite3"
+    with closing(crypto.connect(source)) as conn, conn:
+        conn.execute("CREATE TABLE fixture(content BLOB)")
+        conn.execute("INSERT INTO fixture VALUES (?)", (b"exact\x00synthetic",))
+    with closing(crypto.connect(source)) as conn:
+        assert conn.execute("SELECT content FROM fixture").fetchone()[0] == b"exact\x00synthetic"
+    config = active / "workspace.json"
+    settings = json.loads(config.read_text())
+    settings["encryption"]["key_mode"] = "token-v2"
+    config.write_text(json.dumps(settings))
+    before = source.read_bytes()
+    blocked = False
+    try:
+        with closing(crypto.connect(source)):
+            pass
+    except crypto.EncryptionError:
+        blocked = True
+    assert blocked, "B3 marker reached the operator-held B2 provider"
+    assert source.read_bytes() == before
+
+
+@pytest.mark.parametrize("mode", ["token-v2", "unknown", None, False])
+@pytest.mark.parametrize("operation", ["connect", "snapshot", "classify"])
+def test_unsupported_key_modes_refuse_backup_and_connect(workspace, tmp_path, mode, operation):
+    from commonplace import backup as backups
+
+    data, _, wid, *_ = workspace
+    enable(workspace)
+    directory = workspace_path(data, wid)
+    source = directory / "source.sqlite3"
+    with closing(crypto.connect(source)) as conn, conn:
+        conn.execute("CREATE TABLE fixture(content BLOB)")
+        conn.execute("INSERT INTO fixture VALUES (?)", (b"exact synthetic\x00payload",))
+    with closing(crypto.connect(source)) as conn:
+        assert (
+            conn.execute("SELECT content FROM fixture").fetchone()[0]
+            == b"exact synthetic\x00payload"
+        )
+    assert backups._encrypted_database(source)
+    target = tmp_path / "snapshot.sqlite3"
+    backups._snapshot(source, target)
+    assert target.read_bytes() == source.read_bytes()
+    target.unlink()
+    before = source.read_bytes()
+    config = directory / "workspace.json"
+    settings = json.loads(config.read_text())
+    settings["encryption"]["key_mode"] = mode
+    config.write_text(json.dumps(settings))
+    blocked = False
+    try:
+        if operation == "connect":
+            with closing(crypto.connect(source)):
+                pass
+        elif operation == "snapshot":
+            backups._snapshot(source, target)
+        else:
+            backups._encrypted_database(source)
+    except crypto.EncryptionError:
+        blocked = True
+    assert blocked, f"marked workspace reached B2 through {operation}"
+    assert not target.exists()
+    assert source.read_bytes() == before
+
+
+@pytest.mark.parametrize("provider", ["wrap", "unwrap", "workspace"])
+def test_b3_direct_v1_providers_refuse_before_keys(workspace, monkeypatch, provider):
+    data, _, wid, server, _, slots = workspace
+    enable(workspace)
+    directory = workspace_path(data, wid)
+    _, info = crypto.encryption_settings(directory / "source.sqlite3")
+    record = json.loads((slots / (wid + ".json")).read_text())
+    wrapping = server.read_bytes()  # Synthetic fixture only.
+    key = crypto.workspace_key(directory, info)
+    assert crypto.unwrap_key(record, wrapping, info, "server") == key
+    assert crypto.wrap_key(key, wrapping, info, "server")
+    marked = dict(info, key_mode="token-v2")
+    key_reads = []
+    protected_key = crypto.protected_key
+
+    def observe_key_read(path):
+        key_reads.append(path)
+        return protected_key(path)
+
+    monkeypatch.setattr(crypto, "protected_key", observe_key_read)
+    blocked = False
+    try:
+        if provider == "wrap":
+            crypto.wrap_key(key, wrapping, marked, "server")
+        elif provider == "unwrap":
+            crypto.unwrap_key(record, wrapping, marked, "server")
+        else:
+            crypto.workspace_key(directory, marked)
+    except crypto.EncryptionError:
+        blocked = True
+    assert blocked, f"marked workspace reached direct B2 {provider}"
+    assert not key_reads, "marked provider read operator wrapping keys before refusing"
+
+
+def test_b3_settings_refuse_during_classification(encryption_metadata):
+    directory, config, info = encryption_metadata
+    info["key_mode"] = "token-v2"
+    config.write_text(json.dumps({"encryption": info}))
+    with pytest.raises(crypto.EncryptionError):
+        crypto.encryption_settings(directory / "content.sqlite3")
+
+
+@pytest.mark.parametrize("provider", ["wrap", "unwrap"])
+@pytest.mark.parametrize("info", [None, [], "invalid", 2])
+def test_invalid_direct_provider_metadata_is_encryption_error(provider, info):
+    blocked = False
+    try:
+        if provider == "wrap":
+            crypto.wrap_key(b"s" * 32, b"w" * 32, info, "server")
+        else:
+            crypto.unwrap_key({}, b"w" * 32, info, "server")
+    except crypto.EncryptionError:
+        blocked = True
+    except (TypeError, AttributeError):
+        pass
+    assert blocked, "malformed metadata did not produce EncryptionError"
+
+
+@pytest.mark.parametrize("provider", ["wrap", "unwrap"])
+def test_version_two_direct_provider_refused(encryption_metadata, provider):
+    _, _, info = encryption_metadata
+    key = b"s" * 32
+    wrapped = crypto.wrap_key(key, key, info, "server")
+    record = dict(info, algorithm="AES-256-GCM", slots={"server": wrapped})
+    assert crypto.unwrap_key(record, key, info, "server") == key
+    info = dict(info, version=2)
+    blocked = False
+    try:
+        if provider == "wrap":
+            crypto.wrap_key(key, key, info, "server")
+        else:
+            crypto.unwrap_key(record, key, info, "server")
+    except crypto.EncryptionError:
+        blocked = True
+    assert blocked, "B2 direct provider accepted version two metadata"
+
+
+def test_b3_marker_has_locked_diagnostic(encryption_metadata):
+    directory, config, info = encryption_metadata
+    info["key_mode"] = "token-v2"
+    config.write_text(json.dumps({"encryption": info}))
+    message = ""
+    try:
+        crypto.connect(directory / "source.sqlite3")
+    except crypto.EncryptionError as exc:
+        message = str(exc)
+    assert "B3 remains locked" in message

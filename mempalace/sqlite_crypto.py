@@ -66,6 +66,14 @@ def validate_database_paths(directory, paths):
         seen.add(name)
 
 
+def _require_v1(info):
+    """B3 has no production unlock path; never consult operator-held keys."""
+    if not isinstance(info, dict):
+        raise EncryptionError("Invalid workspace encryption metadata")
+    if "key_mode" in info or info.get("version", 1) != 1:
+        raise EncryptionError("Unsupported workspace key mode; B3 remains locked")
+
+
 def encryption_settings(path):
     """Find the nearest workspace settings, rejecting malformed opt-in metadata."""
     if path is None:
@@ -97,9 +105,10 @@ def encryption_settings(path):
             ):
                 raise ValueError
             validate_database_paths(directory, info.get("database_paths"))
-            return directory, info
         except (OSError, ValueError, TypeError, KeyError):
             raise EncryptionError("Invalid workspace encryption settings") from None
+        _require_v1(info)
+        return directory, info
     return None
 
 
@@ -140,6 +149,7 @@ def _aad(info, slot):
 
 
 def wrap_key(key, wrapping_key, info, slot):
+    _require_v1(info)
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     nonce = os.urandom(12)
@@ -150,6 +160,7 @@ def wrap_key(key, wrapping_key, info, slot):
 
 
 def unwrap_key(record, wrapping_key, info, slot):
+    _require_v1(info)
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -174,6 +185,7 @@ def unwrap_key(record, wrapping_key, info, slot):
 
 
 def workspace_key(directory, info):
+    _require_v1(info)
     key_store = os.environ.get("COMMONPLACE_KEY_STORE")
     wrapping_file = os.environ.get("COMMONPLACE_WRAPPING_KEY_FILE")
     slot = os.environ.get("COMMONPLACE_KEY_SLOT", "server")
