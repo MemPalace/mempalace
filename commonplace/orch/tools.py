@@ -531,7 +531,8 @@ OPERATIONS = {
         True,
         False,
         "As the lease holder, start the config's runner role on a card. The same step key "
-        "returns the stored job; config_ref is live or exp:<name>.",
+        "returns the stored job unless voided (step_voided, 409); a fresh start needs a new "
+        "key and normal admission. config_ref is live or exp:<name>.",
     ),
     "orch_journal_intent": (
         journal_intent,
@@ -606,7 +607,9 @@ OPERATIONS = {
         "write",
         True,
         True,
-        "Void a journal step and its gate (signed-in workspace owner only).",
+        "Owner/local void: retire runner-start keys and cancel only queued/leased jobs; "
+        "launched jobs and history remain. Repeats preserve the first void; each successful "
+        "call emits a feed notification. Gate void allows a new attempt under a new key.",
     ),
     "orch_checkpoint": (
         checkpoint,

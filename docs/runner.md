@@ -37,7 +37,11 @@ runner. Boards without one behave exactly as described above.
 - **Requests.** `card_start` (MCP and `POST /api/card-starts`) is accepted only
   from the person owner; a coordinator PAT gets `no: use orch_card_start` and
   uses the orchestrator lease instead. Cancelling a job that belongs to an
-  orchestrator step is person-owner only.
+  orchestrator step through `card_start_cancel` is person-owner only.
+  Separately, an owner or the local CLI can void the step: this atomically
+  cancels a queued or leased job and permanently retires the old step key.
+  Starting, uncertain and started jobs are left untouched; a fresh attempt
+  needs a new key and ordinary admission ([orchestrator.md](orchestrator.md)).
 - **Triggers.** A card that enters `todo` on the board is started without a
   request, by the event's actor if it passes the same requester check. A
   refusal is recorded as a coded miss, not retried.

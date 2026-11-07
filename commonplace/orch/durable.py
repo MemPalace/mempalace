@@ -19,8 +19,8 @@ current epoch and token for writes. Forcing a lease and voiding a step need
 Journal (holder only): steps keyed by ``(board, role, step_key)`` with states
 ``intent -> started -> waiting -> done | failed | in_doubt`` and
 ``in_doubt -> done | failed | needs_person`` (``needs_person -> done | failed`` only with
-hub-verified evidence). Runner-start steps follow their job (``JOB_STEP_STATE``). At each
-new epoch, steps of an external kind still open from an older epoch become ``in_doubt``:
+hub-verified evidence). Unvoided runner-start steps follow their job
+(``JOB_STEP_STATE``). At each new epoch, steps of an external kind still open from an older epoch become ``in_doubt``:
 the hub never re-issues an external effect.
 
 Evidence: ``runner_job`` (the hub checks that the job belongs to this step, card and
@@ -29,7 +29,10 @@ board), ``card_state`` (the hub reads the card; ``done`` needs the card in ``don
 
 Gates: one attempt per ``(board, repo, PR, head)`` across roles, whatever its verdict
 (``gate_pass``, ``gate_fail``, ``gate_error``, ``gate_budget``), until the owner voids
-the gate's step. The verdict is attested by the lease holder.
+the gate's step. The verdict is attested by the lease holder. Runner-start void
+permanently retires the key while preserving its history and linked job. Only
+queued/leased jobs are cancelled atomically with void; launched jobs are untouched.
+A new attempt needs a new key and ordinary admission.
 
 Checkpoint: derived from the journal, the jobs and the board, never stored: open steps,
 ``in_doubt``, ``needs_person``, holds, ``next``, jobs, gates, misses, the read-only card
@@ -1006,20 +1009,37 @@ def gate_record(
 
 
 def void_step(ctx: ToolContext, board: str, role: str, step_key: str, *, now=None) -> dict:
-    """Owner voids a step (and its gate, so that head may be gated again under a new
-    step key). Idempotent. Returns the step."""
+    """Owner/local void retires runner-start keys and cancels only queued/leased jobs.
+
+    Gate void permits a new attempt under a new key. History and launched jobs
+    remain; repeats preserve the first actor/time and write nothing.
+    """
     now = _clock(now)
     orch_store.require_owner(ctx.principal)
     _check_role(role)
     _check_step_key(step_key)
     st = _open(ctx)
     actor = _actor_ref(ctx.principal)
+    job_store = jobs.open_store(ctx.gateway, ctx.principal.workspace_id)
     with st.transaction() as conn:
         step = step_in(conn, board=board, role=role, step_key=step_key)
         if step is None:
             raise DurableError("step_not_found", 404, "step not found")
         if step["voided"]:
             return step
+        if step["kind"] == "runner_start" and step["job_id"] is not None:
+            job = conn.execute(
+                "SELECT state FROM runner_jobs WHERE id=?", (step["job_id"],)
+            ).fetchone()
+            if job is not None and job["state"] in ("queued", "leased"):
+                jobs.cancel(
+                    job_store,
+                    step["job_id"],
+                    ctx.principal,
+                    conn=conn,
+                    now=now,
+                    actor=actor,
+                )
         conn.execute(
             "UPDATE orch_steps SET voided_at=?, voided_by=?, updated_at=? "
             "WHERE board=? AND role=? AND step_key=?",

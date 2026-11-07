@@ -16,8 +16,9 @@ is read **before** the transaction (``Plan``, lock order as ``jobs.sweep``). Ins
 in this order: (trigger only) the ``(cursor, gen)`` re-check as the first statement;
 0. resolved model + request hash; 1. lease (orch), restore flag, accepted version still
 current, ``plan`` label -> ``plan_pending``; 2. existing step (orch) or existing keyed
-job (person with a ``request_key``, trigger): an exact match returns the stored job, a
-mismatch is a 409; then card/grant refusals; 4. the cap; 5. ``jobs.create_in`` and (orch)
+job (person with a ``request_key``, trigger): a voided runner-start key refuses
+``step_voided`` before matching; an unvoided exact match returns the stored job,
+a mismatch is a 409; then card/grant refusals; 4. the cap; 5. ``jobs.create_in`` and (orch)
 the step row, the lease re-check and renewal; (trigger) the cursor advance with the job
 or the miss row. A refusal after a write rolls back to a savepoint, so nothing partial
 is ever committed.
@@ -375,6 +376,13 @@ def _fenced(conn, plan, *, path, role, step_key, epoch, token, request_key, now,
     if path == "orch":
         stored = durable.step_in(conn, board=plan.board, role=role, step_key=step_key)
         if stored is not None:
+            if stored["kind"] == "runner_start" and stored["voided"]:
+                raise StartRefused(
+                    "step_voided",
+                    "runner-start key was retired by the owner",
+                    status=409,
+                    step=stored,
+                )
             if stored["card"] == plan.card and stored["request_hash"] == digest:
                 return Outcome(200, _job(conn, stored["job_id"]), stored)
             raise StartRefused(
@@ -616,12 +624,13 @@ def orch_card_start(
 
     ``role`` is the lease's role (the step owner); the job runs ``[runner].role`` with
     the pinned prompt, workflow, topic and model. Returns ``launch_reply``: ``status``
-    201 (new job) or 200 (same step retried: the stored job, whoever requested it),
+    201 (new job) or 200 (unvoided step retried: the stored job, whoever requested it),
     ``job``, ``step``, ``config`` and ``model``. Refusals raise ``StartRefused`` (codes:
     ``invalid_step_key``, ``invalid_request_key``, ``board_not_found``,
     ``card_not_found``, ``unknown_role``, ``not_allowed``, ``not_configured``,
     ``fenced``, ``restore_pending``, ``config_changed``, ``plan_pending``,
-    ``model_unresolved``, ``step_conflict``, card codes, ``at_cap``, ``active_start``,
+    ``model_unresolved``, ``step_conflict``, ``step_voided``, card codes, ``at_cap``
+    (switch off), ``project_limit`` (switch on), ``active_start``,
     ``started_recently``, ``busy``) or pass ``OrchError``s of ``resolve_in`` through."""
     principal = ctx.principal
     if getattr(principal, "runner", None) is not None:

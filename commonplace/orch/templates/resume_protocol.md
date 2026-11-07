@@ -11,4 +11,4 @@ Resume protocol. Your session can end at any moment; the orchestrator journal on
    Only when the check shows the effect did not happen may you issue it again.
 5. One gate per board, repository, pull request and head. A failed gate is final for that head; push a new head instead of asking again.
 6. Wait in slices of at most 10 minutes and send `orch_heartbeat` between slices, so the lease does not expire while you wait. If the lease is lost or fenced, stop writing and call `orch_resume` again; a lost token means waiting for expiry or an owner force.
-7. Start cards only through `orch_card_start` with a stable step key for the step; a retry with the same key returns the same job.
+7. Start cards only through `orch_card_start` with a stable step key for the step; an unvoided retry with the same key returns the same job. A voided runner-start key is permanently retired (`step_voided`, 409). A fresh attempt needs a new key and all existing admission checks. Void cancels only queued/leased jobs; it cannot stop or prove completion of launched work. Check uncertain outcomes separately; empty thread search proves nothing.

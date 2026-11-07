@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import secrets
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -554,12 +554,26 @@ def result(store, machine, lease_token, outcome, thread_id=None, code=None):
         return _update(conn, row, values, token=True)
 
 
-def cancel(store, job, principal):
-    _sweep(store)
-    now = _now()
-    with store.transaction() as conn:
+def cancel(store, job, principal, *, conn=None, now=None, actor=None):
+    """Cancel through the normal guards, optionally in an owner void transaction.
+
+    The internal form requires orch_owner and the void actor. Its caller already
+    holds the runner write lock: no sweep, nested writer or control reads here.
+    The standalone form retains its signed-in-owner/requester authority.
+    """
+    internal = conn is not None
+    if internal:
+        from commonplace.orch.store import require_owner
+
+        require_owner(principal)
+        if actor is None:
+            raise ValueError("void cancellation needs its actor")
+    else:
+        _sweep(store)
+    now = now or _now()
+    with nullcontext(conn) if internal else store.transaction() as conn:
         row = _row(conn, job)
-        owner = principal.person and principal.role == "owner"
+        owner = internal or (principal.person and principal.role == "owner")
         if row["step_key"] is not None and not owner:
             # An orchestrator step's start: only a signed-in workspace owner cancels it.
             raise ToolError("no: only a workspace owner may cancel an orchestrator start")
@@ -571,7 +585,7 @@ def cancel(store, job, principal):
             raise Conflict("start is already finished")
         values = dict(
             cancel_requested_at=row["cancel_requested_at"] or now,
-            cancelled_by=requester_ref(principal),
+            cancelled_by=actor if internal else requester_ref(principal),
             updated_at=now,
         )
         if row["state"] in ("queued", "leased"):

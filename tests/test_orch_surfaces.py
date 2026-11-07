@@ -700,3 +700,28 @@ def test_rest_writes_run_the_rules_check_and_are_audited_by_name(env, monkeypatc
     assert seen == ["orch_config_propose"]
     status, _body = env.rest("GET", f"boards/{BOARD}/configs", token=env.a_token)
     assert status == 200 and seen == ["orch_config_propose"]
+
+
+def test_repeat_void_has_one_journal_event_and_two_feed_notifications(env):
+    ok, lease = env.mcp(env.a_token, "orch_resume", board=BOARD, role=ROLE)
+    assert ok
+    ok, _ = env.mcp(
+        env.a_token,
+        "orch_journal_intent",
+        board=BOARD,
+        role=ROLE,
+        epoch=lease["epoch"],
+        token=lease["token"],
+        step_key="h1",
+        kind="hold",
+    )
+    assert ok
+    first = tools.void_step(env.ctx(env.owner), BOARD, ROLE, "h1")
+    second = tools.void_step(env.ctx(env.local()), BOARD, ROLE, "h1")
+    assert first == second
+    with env.runner_db() as conn:
+        rows = conn.execute("SELECT * FROM orch_journal WHERE event='void'").fetchall()
+    assert len(rows) == 1
+    feed = [e for e in env.events() if e["kind"] == "orch.step.voided"]
+    assert len(feed) == 2
+    assert all(e["data"] == {"board": BOARD, "role": ROLE, "step_key": "h1"} for e in feed)

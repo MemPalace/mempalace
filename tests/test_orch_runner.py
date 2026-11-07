@@ -1320,3 +1320,284 @@ def test_r2_stalled_launch_is_uncertain_in_doubt_and_never_redone(
         hub.port, "GET", f"/api/card-starts?task={card['number']}", cookie=owner["cookie"]
     )
     assert status == 200 and len(rows) == 1, (status, rows)
+
+
+# ------------------------------------------------------- runner-start void contract
+
+
+@pytest.fixture(params=[False, True], ids=["switch-off", "switch-on"])
+def void_world(world, request):
+    from commonplace.projects import orchestration
+
+    orchestration.set_enabled(world.db, world.owner, request.param)
+    world.orchestration_on = request.param
+    return world
+
+
+def start_result(fn, *args, **kwargs):
+    """Capture refusals so a wrong code/admission fails as a test-body assertion."""
+    try:
+        return None, fn(*args, **kwargs)
+    except runner_bridge.StartRefused as exc:
+        return exc.code, exc
+
+
+def void_start(world, principal=None, **kwargs):
+    return durable.void_step(world.ctx(principal or world.owner), BOARD, ROLE, "s1", **kwargs)
+
+
+def prepare_void_job(world, state="queued", *, max_agents=3):
+    card, other = world.card(), world.card()
+    world.configure(max_agents=max_agents)
+    lease = world.claim(world.a)
+    reply = world.orch_start(world.a, lease, card, "s1")
+    payload = None
+    if state != "queued":
+        payload = world.lease()
+        assert payload["job_id"] == reply["job"]["job_id"]
+    if state in ("starting", "uncertain", "started"):
+        status, body = world.machine_call("starting", {"lease_token": payload["lease_token"]})
+        assert status == 200, body
+    if state in ("uncertain", "started", "failed"):
+        body = {"lease_token": payload["lease_token"], "outcome": state}
+        if state == "started":
+            body["thread_id"] = "synthetic-thread"
+        elif state == "failed":
+            body["code"] = "t3_missing"
+        status, result = world.machine_call("result", body)
+        assert status == 200, result
+    if state == "cancelled":
+        jobs.cancel(world.js, reply["job"]["job_id"], world.owner)
+    assert world.jobs_for(card)[0]["state"] == state
+    return card, other, lease, payload
+
+
+def test_voided_runner_start_rejects_old_key_then_allows_new_key(void_world):
+    w = void_world
+    card, _, lease, _ = prepare_void_job(w)
+    old = w.jobs_for(card)[0]
+    step = void_start(w)
+    code, result = start_result(w.orch_start, w.a, lease, card, "s1")
+    assert code == "step_voided"
+    assert result.status == 409 and result.details["step"] == step
+    assert step["job_id"] == old["id"]
+    fresh = w.orch_start(w.a, lease, card, "s2")
+    assert fresh["status"] == 201 and fresh["job"]["job_id"] != old["id"]
+    again = w.orch_start(w.a, lease, card, "s2")
+    assert (again["status"], again["job"]["job_id"]) == (200, fresh["job"]["job_id"])
+    assert [s["step_key"] for s in w.steps()] == ["s1", "s2"]
+    assert len(w.jobs_for(card)) == 2
+
+
+def test_voided_runner_start_refusal_precedes_changed_request(void_world):
+    w = void_world
+    card, other, lease, _ = prepare_void_job(w)
+    step = void_start(w)
+    before = (w.steps(), w.all_jobs())
+    code, result = start_result(w.orch_start, w.a, lease, other, "s1")
+    assert code == "step_voided"
+    assert result.status == 409 and result.details["step"] == step
+    assert (w.steps(), w.all_jobs()) == before
+    assert step["card"] == card
+
+
+@pytest.mark.parametrize("state", ["queued", "leased"])
+@pytest.mark.parametrize("actor", ["person", "local"])
+def test_void_cancels_unstarted_runner_job(void_world, state, actor):
+    import dataclasses
+
+    w = void_world
+    card, _, _, payload = prepare_void_job(w, state)
+    principal = (
+        w.owner
+        if actor == "person"
+        else dataclasses.replace(
+            w.owner, person=False, auth="local", connection_id="", connection="cli"
+        )
+    )
+    before = w.jobs_for(card)[0]
+    step = void_start(w, principal)
+    job = w.jobs_for(card)[0]
+    assert job["state"] == "cancelled"
+    assert job["cancelled_by"] == step["voided_by"] == durable._actor_ref(principal)
+    assert job["cancel_requested_at"] == step["voided_at"]
+    assert job["request_hash"] == before["request_hash"]
+    assert step["job_id"] == job["id"] and job["step_key"] == "s1"
+    assert void_start(w, principal) == step
+    assert w.jobs_for(card)[0] == job
+    # (a) lease -> void -> starting: the saved token is fenced before spawn.
+    if payload:
+        status, body = w.machine_call("starting", {"lease_token": payload["lease_token"]})
+        assert status == 409 and "start is not leased" in str(body)
+    # (c) void -> lease: there is no queued job left to launch.
+    assert jobs.lease(w.js, w.machine()) is None
+
+
+@pytest.mark.parametrize("state", ["starting", "uncertain", "started", "failed", "cancelled"])
+def test_runner_start_void_preserves_job_and_is_idempotent(void_world, monkeypatch, state):
+    w = void_world
+    card, _, lease, _ = prepare_void_job(w, state)
+    durable.journal_record(
+        w.ctx(w.a),
+        BOARD,
+        ROLE,
+        lease["epoch"],
+        lease["token"],
+        "s1",
+        "in_doubt",
+        evidence={"type": "holder_attested", "note": "Synthetic launch evidence."},
+    )
+    before_job, before_step = w.jobs_for(card)[0], w.steps()[0]
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("void must not cancel or resolve a job past the launch boundary")
+
+    monkeypatch.setattr(jobs, "cancel", forbidden)
+    monkeypatch.setattr(jobs, "resolve", forbidden)
+    # (b) starting -> void: the raw job remains untouched.
+    first = void_start(w)
+    second = void_start(w, now=jobs._after(first["voided_at"], 1))
+    assert first == second and w.jobs_for(card)[0] == before_job
+    after = w.steps()[0]
+    for key in ("state", "code", "evidence", "job_id", "request_hash", "created_at", "epoch"):
+        assert after[key] == before_step[key]
+    assert len(w.rows("SELECT * FROM orch_journal WHERE event='void'")) == 1
+    checkpoint = durable.checkpoint(w.ctx(w.owner), BOARD, ROLE)
+    assert [(j["id"], j["state"]) for j in checkpoint["jobs"]] == [(before_job["id"], state)]
+    assert all(not checkpoint[k] for k in ("open", "in_doubt", "needs_person", "finished"))
+    code, result = start_result(w.orch_start, w.a, lease, card, "s2")
+    expected = {
+        "starting": "active_start",
+        "uncertain": "active_start",
+        "started": "started_recently",
+    }.get(state)
+    assert code == expected
+    if expected:
+        assert result.status == 409 and len(w.steps()) == 1
+    else:
+        assert result["status"] == 201
+    if state == "started":
+        owner_lease = w.claim(w.owner, force=True)
+        code, result = start_result(w.orch_start, w.owner, owner_lease, card, "s3")
+        assert code == "started_recently" and result.status == 409
+        assert w.jobs_for(card)[0] == before_job
+
+
+@pytest.mark.parametrize("state", ["started", "queued", "leased"])
+def test_voided_job_keeps_its_cap_slot(void_world, state):
+    w = void_world
+    card, other, lease, _ = prepare_void_job(w, state, max_agents=1)
+    before = w.jobs_for(card)[0]
+    assert w.board_row()["slug"] == BOARD
+    with BoardStore(w.gw.workspace_dir(w.ws)).connection() as conn:
+        row = conn.execute("SELECT status,assignee FROM tasks WHERE id=?", (card,)).fetchone()
+        assert tuple(row) == ("todo", None)
+    void_start(w)
+    code, result = start_result(w.orch_start, w.a, lease, other, "s2")
+    if state == "started":
+        assert code == ("project_limit" if w.orchestration_on else "at_cap")
+        assert result.status == 409
+        assert w.jobs_for(card)[0] == before and w.jobs_for(other) == []
+        assert [s["step_key"] for s in w.steps()] == ["s1"]
+    else:
+        assert code is None
+        assert result["status"] == 201 and w.jobs_for(card)[0]["state"] == "cancelled"
+
+
+@pytest.mark.parametrize("actor", ["trusted", "owner-pat", "child"])
+def test_runner_start_void_is_owner_only(void_world, monkeypatch, actor):
+    import dataclasses
+
+    w = void_world
+    prepare_void_job(w)
+    principal = {
+        "trusted": w.a,
+        "owner-pat": dataclasses.replace(w.a, role="owner"),
+        "child": dataclasses.replace(w.owner, runner=w.machine_id),
+    }[actor]
+    before = (w.steps(), w.all_jobs(), w.rows("SELECT * FROM orch_journal"))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("unauthorized void reached cancel")
+
+    monkeypatch.setattr(jobs, "cancel", forbidden)
+    with pytest.raises(orch_store.OrchError) as info:
+        void_start(w, principal)
+    assert info.value.code == "owner_only" and info.value.status == 403
+    assert (w.steps(), w.all_jobs(), w.rows("SELECT * FROM orch_journal")) == before
+
+
+@pytest.mark.parametrize("condition", ["cap", "fenced", "restore", "plan", "requester", "machine"])
+def test_new_key_after_void_keeps_admission_checks(void_world, condition):
+    w = void_world
+    card, other, lease, _ = prepare_void_job(w, "cancelled", max_agents=1)
+    void_start(w)
+    principal = w.a
+    expected = condition
+    if condition == "cap":
+        w.orch_start(w.a, lease, other, "occupant")
+        expected = "project_limit" if w.orchestration_on else "at_cap"
+    elif condition == "fenced":
+        w.claim(w.owner, force=True)
+    elif condition == "restore":
+        w.flag_restore()
+        expected = "restore_pending"
+    elif condition == "plan":
+        w.update(card, labels=["plan"])
+        expected = "plan_pending"
+    elif condition == "requester":
+        principal = w.unlisted
+        expected = "not_allowed"
+    elif condition == "machine":
+        registry.revoke(w.db, w.owner, w.machine_id)
+        expected = "machine_unavailable"
+    before = w.steps()
+    code, result = start_result(w.orch_start, principal, lease, card, "s2")
+    assert code == expected
+    assert result.status in (403, 409) and w.steps() == before
+    assert not any(j["step_key"] == "s2" for j in w.all_jobs())
+
+
+def test_voided_gate_key_keeps_step_conflict(void_world, monkeypatch):
+    w = void_world
+    card = w.card()
+    w.configure()
+    lease = w.claim(w.a)
+    durable.gate_open(
+        w.ctx(w.a),
+        BOARD,
+        ROLE,
+        lease["epoch"],
+        lease["token"],
+        "s1",
+        repo="example/repo",
+        pr=1,
+        head="a" * 40,
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("gate void must not cancel jobs")
+
+    monkeypatch.setattr(jobs, "cancel", forbidden)
+    step = void_start(w)
+    code, result = start_result(w.orch_start, w.a, lease, card, "s1")
+    assert code == "step_conflict" and result.status == 409
+    assert result.details["step"] == step and w.all_jobs() == []
+
+
+@pytest.mark.parametrize("state", ["queued", "leased"])
+def test_void_cancel_and_marker_roll_back_together(void_world, monkeypatch, state):
+    w = void_world
+    prepare_void_job(w, state)
+    before = (w.steps(), w.all_jobs(), w.rows("SELECT * FROM orch_journal"))
+    real_log = durable._log
+
+    def fail_log(*args, **kwargs):
+        if args[5] == "void":
+            raise RuntimeError("synthetic post-cancel failure")
+        return real_log(*args, **kwargs)
+
+    monkeypatch.setattr(durable, "_log", fail_log)
+    with pytest.raises(RuntimeError, match="synthetic post-cancel failure"):
+        void_start(w)
+    assert (w.steps(), w.all_jobs(), w.rows("SELECT * FROM orch_journal")) == before

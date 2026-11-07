@@ -107,6 +107,7 @@ live. Only accepted versions run.
 | `card_start` and cancel on a configured board | the person owner |
 | trigger start | the actor of the board event, if it passes `requester_ok` |
 
+Runner children cannot exercise owner authority.
 Agent tokens with an owner role are not the owner. The project's Connect seat
 (standard trust) cannot hold a lease.
 
@@ -132,11 +133,15 @@ Inside it, in this order:
    token and expiry.
 3. **Look up** the existing step `(board, role, step_key)`; a person call with a
    `request_key` looks up the runner's own `(card, requester, request_key)`
-   instead. If the card and hash match, the stored job is returned; any mismatch
-   is a 409 with the stored step or job.
+   instead. A voided `runner_start` key is permanently retired: `step_voided`
+   (409) wins over matching or changed requests. Other kinds retain
+   `step_conflict`. For an unvoided exact match the stored job is returned;
+   any mismatch is a 409 with the stored step or job.
 4. **Cap.** Count distinct cards with a queued, leased, starting or uncertain
    job, with a job started within the last hour, or in `doing` with a
-   connection assignee. Refuse at `min(max_agents, project limit)`.
+   connection assignee. Refuse at `min(max_agents, project limit)` with
+   `at_cap` when workspace orchestration is off, or `project_limit` when on.
+   Voided steps do not exempt their jobs from capacity accounting.
 5. **Insert** the step row and the runner job, with the existing guards: one
    active start per card, and a non-person start within 24 h is refused
    `started_recently`. The request key is `orch:<role>:<step_key>`;
@@ -144,6 +149,19 @@ Inside it, in this order:
 
 The runner lease payload of a config-driven job carries `message` (the launch
 message above) and `modelSelection`, and the runner sends both to T3.
+
+Void does not launch work or replay triggers. It cannot stop a launched thread
+or prove its completion; uncertain outcomes still need separate owner truth
+checks and resolution. One active job per card blocks concurrent starts. After
+24 hours a non-person start may become eligible on a todo, unassigned card even
+if the earlier thread still runs. Capacity counts cards rather than threads;
+started jobs age out after one hour unless the doing/connection slot still
+counts (with orchestration on, the recent-start hold covers todo/doing cards
+and ordinary connection slots also count). Neither rule proves completion.
+Triggers use independent `trig:<event>` keys, and owner `card_start` ignores
+step keys and the non-person 24-hour rule. A pending, unswept todo event can
+start the card on the next sweep after void frees its queued job. The active
+and recent-start guards still apply. These are existing limits of admission.
 
 ## Triggers
 
@@ -180,6 +198,19 @@ failed after commit is still found.
   `in_doubt` moves on to `done`, `failed` or `needs_person`. A job maps to its
   step as: queued, leased or starting → `waiting`; started → `done`;
   uncertain → `in_doubt`; failed or cancelled → `failed`.
+- **Void.** Only the signed-in owner (excluding runner children) or local CLI
+  may void a step. A gate void permits another gate attempt under a new key.
+  A runner-start void permanently retires its key and keeps its request, job
+  link, state, evidence and history. In the same transaction, it cancels only
+  a linked `queued` or `leased` job through the normal cancellation logic.
+  `starting`, `uncertain`, `started`, failed and cancelled jobs are untouched,
+  with no cancel request or reconciliation. Repeats preserve the first actor
+  and timestamp, write no job or journal rows, and return the same step.
+  There is one journal void event; each successful tool call, including a
+  repeat, emits an `orch.step.voided` feed notification. Checkpoint `jobs`
+  keeps linked statuses while active journal lists omit voided steps.
+  A fresh attempt requires an explicit new key and all existing admission
+  checks, including the non-person rules for owner `orch_card_start` calls.
 - **Evidence.** `runner_job` (the hub checks the job belongs to this step,
   card and board), `card_state` (the hub reads the card) and `holder_attested`
   (stored, never acted on).

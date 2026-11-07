@@ -225,6 +225,9 @@ Format (read by `commonplace orch docs-check`):
 
   - The 500-rule initialization checks separate deterministic truncation behavior from the unchanged informational p95 budget; a fake-clock regression covers empty injection after deadline expiry.
 
+  - Runner-start void tests cover both orchestration switches, retired keys, lease/start ordering, rollback, capacity and owner authority.
+
+
 - **How it fails:**
 
   - A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
@@ -348,6 +351,9 @@ Format (read by `commonplace orch docs-check`):
 
   - Opt-in orchestration requires the active coordinator for unconfigured PAT requests, reserves project capacity when starts are queued, and admits leases using active slots under the shared runner lock.
 
+  - Owner/local step void cancels only queued or leased jobs atomically through cancellation logic; standalone cancel authority and launch-state handling stay unchanged.
+
+
 - **How it fails:**
 
   - A lost launch result becomes `uncertain` and waits for a person; a revoked machine cancels queued jobs on the next sweep; a busy queue refuses with `busy`.
@@ -370,9 +376,19 @@ Format (read by `commonplace orch docs-check`):
 
   - Configured starts share project admission with claims and plain jobs when workspace orchestration is enabled; boards without a `[runner]` config retain earlier behavior with the workspace switch off.
 
+  - The stored-job retry above applies only to unvoided steps.
+
+  - Voided runner-start keys are retired with `step_voided`; history and linked job statuses remain visible, and a new key needs normal admission.
+
+  - First void and queued/leased cancellation share one transaction; repeats preserve actor/time and one journal event while tools emit per-call feed notifications.
+
+
 - **How it fails:**
 
   - Refusals become coded misses shown on resume; an unproven external effect becomes `needs_person`; infrastructure errors leave the trigger cursor in place for the next sweep.
+
+  - Void cannot stop launched threads or prove completion; existing active/recent-start and per-switch capacity guards still apply, and a pending todo trigger may run on a later sweep.
+
 
 - **Tests:**
 
