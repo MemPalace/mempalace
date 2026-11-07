@@ -12,6 +12,10 @@ entry was written.
 
 ## Decisions
 
+### Rules initialization deadline
+
+- Rules initialization deliberately returns the legacy response when its deadline expires, even after rendering; the 500-rule incomplete marker is checked with a fixed clock, separately from the unchanged informational 25 ms added p95 budget.
+
 ### Restricted-origin release
 
 - Cards created by subagents or restricted agents start inactive in backlog, including create-and-claim requests.

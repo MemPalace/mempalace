@@ -572,6 +572,25 @@ def test_reconciliation_writer_also_uses_remaining_deadline(local, monkeypatch):
     assert quoted_rules(injected(local)) == ["scoped"]
 
 
+def populate_500_rules(store):
+    with store.transaction() as conn:
+        conn.executemany(
+            "INSERT INTO rules(agent,key,text,kind,scope,status,source,seq,created_at,updated_at,updated_by) "
+            "VALUES ('*',?,?,'limit','global','accepted','owner',0,'now','now','owner')",
+            [(f"rule-{i}", f"Rule {i}: keep exact words.") for i in range(500)],
+        )
+
+
+def test_500_rule_initialize_marks_incomplete(local, monkeypatch):
+    monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
+    populate_500_rules(local.rules.store)
+    text = injected(local)
+    assert "incomplete" in text
+    assert text.splitlines()[3] == CURRENT_READ
+    assert 0 < len(quoted_rules(text)) < 500
+    assert render.length(text) <= render.INSTRUCTIONS_BUDGET
+
+
 @pytest.mark.timing
 def test_500_rule_initialize_p95_over_empty_store(local, record_property):
     store = local.rules.store
@@ -585,13 +604,7 @@ def test_500_rule_initialize_p95_over_empty_store(local, record_property):
         return sorted(samples)[18]
 
     empty = measure()
-    with store.transaction() as conn:
-        conn.executemany(
-            "INSERT INTO rules(agent,key,text,kind,scope,status,source,seq,created_at,updated_at,updated_by) "
-            "VALUES ('*',?,?,'limit','global','accepted','owner',0,'now','now','owner')",
-            [(f"rule-{i}", f"Rule {i}: keep exact words.") for i in range(500)],
-        )
-    assert "incomplete" in injected(local)
+    populate_500_rules(store)
     populated = measure()
     record_property("empty_p95_ms", empty * 1000)
     record_property("500_rules_p95_ms", populated * 1000)

@@ -223,6 +223,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Privacy near-miss correctness runs without a clock; its unchanged 20 ms average budget runs separately under the `timing` marker.
 
+  - The 500-rule initialization checks separate deterministic truncation behavior from the unchanged informational p95 budget; a fake-clock regression covers empty injection after deadline expiry.
+
 - **How it fails:**
 
   - A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
