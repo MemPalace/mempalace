@@ -283,6 +283,135 @@ def test_mine_entity_tunnel_failure_does_not_crash_mine(monkeypatch):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class TestMinerEntityTunnelsToggle:
+    """The ``entity_tunnels`` knob gates automatic derivation in the miner
+    only (regression for #2950).
+
+    Setup mirrors ``tests/test_palace_graph_tunnels.py``: tunnel storage is
+    redirected to a scratch file, the collection lookup is neutralised, and
+    the hallway store is stubbed with two wings sharing three entities —
+    the shape the real ``entity_strength_records()`` returns.
+    """
+
+    def _use_tmp_tunnel_file(self, monkeypatch, tmp_path):
+        """Redirect tunnel storage to a scratch file; neutralise the
+        collection lookup so endpoint validation takes the allow branch.
+        Mirrors the helper in ``tests/test_palace_graph_tunnels.py``."""
+        import mempalace.palace_graph as palace_graph
+
+        tunnel_file = tmp_path / "tunnels.json"
+        monkeypatch.setattr(palace_graph, "_get_tunnel_file", lambda *a, **kw: str(tunnel_file))
+        monkeypatch.setattr(
+            palace_graph,
+            "_legacy_tunnel_file",
+            lambda: str(tmp_path / "legacy-tunnels.json"),
+        )
+        monkeypatch.setattr(palace_graph, "_get_collection", lambda *a, **kw: None)
+        return tunnel_file
+
+    def _stub_shared_entities(self, monkeypatch):
+        """Two wings sharing three entities; returns a list recording each
+        call so tests can prove the hallway store was (not) read."""
+        from mempalace import hallways as hallways_mod
+
+        calls = []
+        records = [
+            {"wing": wing, "entity_a": name, "co_occurrence_count": 3}
+            for name in ("Ben", "Aya", "Igor")
+            for wing in ("wing_a", "wing_b")
+        ]
+
+        def fake_records(config=None):
+            calls.append(config)
+            return list(records)
+
+        monkeypatch.setattr(hallways_mod, "entity_strength_records", fake_records)
+        return calls
+
+    def _config(self, tmp_path, monkeypatch, value):
+        """A MempalaceConfig reading ``entity_tunnels`` from a scratch
+        config.json, with the env override cleared."""
+        import json
+
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_ENTITY_TUNNELS", raising=False)
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        (cfgdir / "config.json").write_text(json.dumps({"entity_tunnels": value}), encoding="utf-8")
+        return MempalaceConfig(config_dir=cfgdir)
+
+    def test_disabled_returns_zero_without_reading_hallways(self, tmp_path, monkeypatch):
+        """Disabled: no hallway scan runs, nothing is derived, nothing is
+        written — the gate sits before the scan, not after it."""
+        import mempalace.palace_graph as palace_graph
+        from mempalace.miner import _compute_entity_tunnels_for_wing
+
+        self._use_tmp_tunnel_file(monkeypatch, tmp_path)
+        calls = self._stub_shared_entities(monkeypatch)
+        cfg = self._config(tmp_path, monkeypatch, False)
+
+        assert _compute_entity_tunnels_for_wing("wing_a", config=cfg) == 0
+        assert calls == []
+        assert palace_graph.list_tunnels() == []
+
+    def test_enabled_creates_three_tunnels_for_three_shared_entities(self, tmp_path, monkeypatch):
+        """Enabled (default): two wings sharing three entities produce
+        exactly three ``kind="entity"`` tunnels — the #2950 repro."""
+        import mempalace.palace_graph as palace_graph
+        from mempalace.miner import _compute_entity_tunnels_for_wing
+
+        self._use_tmp_tunnel_file(monkeypatch, tmp_path)
+        self._stub_shared_entities(monkeypatch)
+        cfg = self._config(tmp_path, monkeypatch, True)
+
+        assert _compute_entity_tunnels_for_wing("wing_a", config=cfg) == 3
+        stored = palace_graph.list_tunnels()
+        entity = [t for t in stored if t.get("kind") == "entity"]
+        assert len(entity) == 3
+        assert {t["source"]["room"] for t in entity} == {
+            "entity:Ben",
+            "entity:Aya",
+            "entity:Igor",
+        }
+
+    def test_disabled_leaves_existing_tunnels_untouched(self, tmp_path, monkeypatch):
+        """Disabling stops NEW tunnels only: previously derived tunnels stay
+        readable, and a recompute while disabled adds nothing. No implicit
+        prune — removal stays an explicit ``tunnels prune --yes``."""
+        import mempalace.palace_graph as palace_graph
+        from mempalace.miner import _compute_entity_tunnels_for_wing
+
+        self._use_tmp_tunnel_file(monkeypatch, tmp_path)
+        self._stub_shared_entities(monkeypatch)
+
+        enabled = self._config(tmp_path, monkeypatch, True)
+        assert _compute_entity_tunnels_for_wing("wing_a", config=enabled) == 3
+        assert len(palace_graph.list_tunnels()) == 3
+
+        disabled = self._config(tmp_path, monkeypatch, False)
+        assert _compute_entity_tunnels_for_wing("wing_a", config=disabled) == 0
+        assert _compute_entity_tunnels_for_wing("wing_a", config=disabled) == 0
+        assert len(palace_graph.list_tunnels()) == 3
+
+    def test_explicit_entity_tunnels_for_wing_ignores_miner_toggle(self, tmp_path, monkeypatch):
+        """The gate is miner-only: explicit ``palace_graph.
+        entity_tunnels_for_wing`` (the ``tunnels propose --yes`` path) still
+        derives tunnels when the miner knob is off."""
+        import mempalace.palace_graph as palace_graph
+
+        self._use_tmp_tunnel_file(monkeypatch, tmp_path)
+        cfg = self._config(tmp_path, monkeypatch, False)
+        records = [
+            {"wing": wing, "entity_a": name, "co_occurrence_count": 3}
+            for name in ("Ben", "Aya", "Igor")
+            for wing in ("wing_a", "wing_b")
+        ]
+
+        created = palace_graph.entity_tunnels_for_wing("wing_a", records, config=cfg)
+        assert len(created) == 3
+
+
 def test_load_config_uses_defaults_when_yaml_missing():
     tmpdir = tempfile.mkdtemp()
     try:

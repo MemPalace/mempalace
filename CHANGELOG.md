@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Entity tunnels can now be switched off: set `entity_tunnels: false` in
+  `config.json` or `MEMPALACE_ENTITY_TUNNELS=0` to stop the miner deriving
+  new cross-wing `kind="entity"` tunnels. Existing tunnels are left
+  untouched, and explicit `mempalace tunnels propose --yes` keeps working.
+  (#2950)
+
 ### Fixed
 
 - Room names in `mempalace.yaml` are validated when the miner loads them, so a
