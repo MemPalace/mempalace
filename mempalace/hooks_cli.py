@@ -1021,30 +1021,44 @@ def run_detached_diary_checkpoint(payload_path: str) -> None:
     The mines start only after the diary write, so they never hold the palace
     lock that write needs.
     """
-    from .miner import _cleanup_mine_pid_file
+    from .miner import _arm_hook_mine_exit_watchdog, _cleanup_mine_pid_file
 
-    path = Path(payload_path)
+    exit_code = 0
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        _log(f"Diary checkpoint payload unreadable: {type(exc).__name__}")
-        payload = None
-    try:
-        if payload is not None:
-            _apply_diary_checkpoint(payload)
-    finally:
+        path = Path(payload_path)
         try:
-            path.unlink()
-        except OSError:
-            pass
-        _cleanup_mine_pid_file()
-    if payload is None:
-        return
-    with _hook_write_routing_context():
-        transcript = payload.get("ingest_transcript")
-        if isinstance(transcript, str) and transcript:
-            _ingest_transcript(transcript)
-        _maybe_auto_ingest()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _log(f"Diary checkpoint payload unreadable: {type(exc).__name__}")
+            payload = None
+        try:
+            if payload is not None:
+                _apply_diary_checkpoint(payload)
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            _cleanup_mine_pid_file()
+        if payload is None:
+            return
+        with _hook_write_routing_context():
+            transcript = payload.get("ingest_transcript")
+            if isinstance(transcript, str) and transcript:
+                _ingest_transcript(transcript)
+            _maybe_auto_ingest()
+    except SystemExit as exc:
+        exit_code = (
+            exc.code
+            if isinstance(exc.code, int) and not isinstance(exc.code, bool)
+            else (0 if exc.code is None else 1)
+        )
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        _arm_hook_mine_exit_watchdog(exit_code=exit_code)
 
 
 def _diary_write_locked(tool_diary_write, **kwargs) -> dict:

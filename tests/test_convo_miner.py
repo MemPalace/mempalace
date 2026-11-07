@@ -1494,3 +1494,159 @@ def test_a_collision_aborts_the_mine_instead_of_failing_one_file(tmp_path, monke
     monkeypatch.setattr(convo_miner, "_file_chunks_locked", collide)
     with pytest.raises(CollisionError):
         mine_convos(str(tmp_path), str(tmp_path / "palace"), wing="test")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for #2917: convo_miner PID-slot cleanup & shutdown watchdog
+# ---------------------------------------------------------------------------
+
+
+def test_mine_convos_cleans_up_pid_file_on_clean_exit(tmp_path, monkeypatch):
+    """Hook-spawned `mine --mode convos` must remove its MEMPALACE_MINE_PID_FILE slot."""
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    (convo_dir / "chat.txt").write_text(_THREE_TURNS, encoding="utf-8")
+
+    pid_file = tmp_path / "mine_slot.pid"
+    pid_file.write_text(f"{os.getpid()} 1700000000", encoding="utf-8")
+    monkeypatch.setenv("MEMPALACE_MINE_PID_FILE", str(pid_file))
+
+    mine_convos(str(convo_dir), str(tmp_path / "palace"), wing="test")
+
+    assert not pid_file.exists(), "mine_convos must remove its own PID slot on completion"
+
+
+def test_mine_convos_cleans_up_pid_file_on_dry_run_and_error(tmp_path, monkeypatch):
+    """Dry-run and raised errors in mine_convos also release our own PID slot."""
+    from mempalace import convo_miner
+    from mempalace.collision_scan import CollisionError
+
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    (convo_dir / "chat.txt").write_text(_THREE_TURNS, encoding="utf-8")
+
+    pid_file = tmp_path / "mine_slot.pid"
+    monkeypatch.setenv("MEMPALACE_MINE_PID_FILE", str(pid_file))
+
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    mine_convos(str(convo_dir), str(tmp_path / "palace"), wing="test", dry_run=True)
+    assert not pid_file.exists()
+
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setattr(
+        convo_miner,
+        "_file_chunks_locked",
+        lambda *_a, **_kw: (_ for _ in ()).throw(CollisionError("boom")),
+    )
+    with pytest.raises(CollisionError):
+        mine_convos(str(convo_dir), str(tmp_path / "palace"), wing="test")
+    assert not pid_file.exists()
+
+
+def test_mine_convos_preserves_other_process_pid_file(tmp_path, monkeypatch):
+    """A PID slot belonging to a different process must never be unlinked."""
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    (convo_dir / "chat.txt").write_text(_THREE_TURNS, encoding="utf-8")
+
+    other_pid = os.getpid() + 999_999
+    pid_file = tmp_path / "mine_slot.pid"
+    pid_file.write_text(f"{other_pid} 1700000000", encoding="utf-8")
+    monkeypatch.setenv("MEMPALACE_MINE_PID_FILE", str(pid_file))
+
+    mine_convos(str(convo_dir), str(tmp_path / "palace"), wing="test", dry_run=True)
+
+    assert pid_file.exists()
+    assert pid_file.read_text(encoding="utf-8").split()[0] == str(other_pid)
+
+
+def test_hook_mine_exit_watchdog_noop_without_pid_file_env(monkeypatch):
+    """Manual `mempalace mine` (no MEMPALACE_MINE_PID_FILE) never starts a watchdog."""
+    from mempalace.miner import _arm_hook_mine_exit_watchdog
+
+    monkeypatch.delenv("MEMPALACE_MINE_PID_FILE", raising=False)
+    assert _arm_hook_mine_exit_watchdog() is None
+
+
+def test_hook_mine_exit_watchdog_terminates_hung_non_daemon_thread(tmp_path):
+    """A hook-spawned mine that hangs in threading._shutdown() exits after grace period."""
+    import subprocess
+    import sys
+
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    (convo_dir / "chat.txt").write_text(_THREE_TURNS, encoding="utf-8")
+    palace_dir = tmp_path / "palace"
+    pid_file = tmp_path / "mine_slot.pid"
+
+    script = (
+        "import os, pathlib, sys, threading, time\n"
+        "from unittest.mock import patch\n"
+        "import mempalace.convo_miner as cm\n"
+        "from mempalace.cli import main\n"
+        "pathlib.Path(os.environ['MEMPALACE_MINE_PID_FILE']).write_text(f'{os.getpid()} 1')\n"
+        "orig = cm.mine_convos\n"
+        "def hung_mine_convos(*a, **kw):\n"
+        "    res = orig(*a, **kw)\n"
+        "    threading.Thread(target=time.sleep, args=(30,), daemon=False).start()\n"
+        "    return res\n"
+        f"sys.argv = ['mempalace', '--palace', {str(palace_dir)!r}, 'mine', {str(convo_dir)!r}, '--mode', 'convos', '--dry-run', '--direct']\n"
+        "with patch.object(cm, 'mine_convos', side_effect=hung_mine_convos):\n"
+        "    main()\n"
+    )
+    env = os.environ.copy()
+    env["MEMPALACE_MINE_PID_FILE"] = str(pid_file)
+    env["MEMPALACE_HOOK_MINE_EXIT_GRACE_SECONDS"] = "0.1"
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert proc.returncode == 0, f"stderr={proc.stderr!r}"
+    assert not pid_file.exists(), "PID slot must be removed before/on forced exit"
+    assert "Hook mine shutdown exceeded" in proc.stderr
+
+
+def test_hook_mine_exit_watchdog_preserves_nonzero_exit_code_on_atexit_hang(tmp_path):
+    """If cmd_mine fails AND an atexit handler hangs, watchdog exits with the failure code."""
+    import subprocess
+    import sys
+
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    palace_dir = tmp_path / "palace"
+    pid_file = tmp_path / "mine_slot.pid"
+
+    script = (
+        "import atexit, os, pathlib, sys, time\n"
+        "from unittest.mock import patch\n"
+        "import mempalace.convo_miner as cm\n"
+        "from mempalace.palace import MineFileErrors\n"
+        "from mempalace.cli import main\n"
+        "pathlib.Path(os.environ['MEMPALACE_MINE_PID_FILE']).write_text(f'{os.getpid()} 1')\n"
+        "def failing_mine_convos(*a, **kw):\n"
+        "    atexit.register(time.sleep, 30)\n"
+        "    raise MineFileErrors(['bad.jsonl'], 1)\n"
+        f"sys.argv = ['mempalace', '--palace', {str(palace_dir)!r}, 'mine', {str(convo_dir)!r}, '--mode', 'convos', '--dry-run', '--direct']\n"
+        "with patch.object(cm, 'mine_convos', side_effect=failing_mine_convos):\n"
+        "    main()\n"
+    )
+    env = os.environ.copy()
+    env["MEMPALACE_MINE_PID_FILE"] = str(pid_file)
+    env["MEMPALACE_HOOK_MINE_EXIT_GRACE_SECONDS"] = "0.1"
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert proc.returncode == 1, (
+        f"Expected exit code 1, got {proc.returncode}; stderr={proc.stderr!r}"
+    )
+    assert not pid_file.exists()
+    assert "Hook mine shutdown exceeded" in proc.stderr
