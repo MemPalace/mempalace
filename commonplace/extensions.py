@@ -74,6 +74,8 @@ class LocalTool:
     # False hides the tool exactly like a tool the token can't use.
     available: Optional[Callable[[Any, Any], bool]] = None  # (principal, gateway)
 
+    input_schema_for: Optional[Callable[[Any, Any], dict]] = None
+
     def usable_by(self, principal, gateway=None) -> bool:
         if self.owner_only and principal.role != "owner":
             return False
@@ -84,11 +86,13 @@ class LocalTool:
         except Exception:
             return False
 
-    def schema(self) -> dict:
+    def schema(self, principal=None, gateway=None) -> dict:
         return {
             "name": self.name,
             "description": self.description,
-            "inputSchema": self.input_schema,
+            "inputSchema": self.input_schema_for(principal, gateway)
+            if self.input_schema_for is not None and principal is not None
+            else self.input_schema,
         }
 
 

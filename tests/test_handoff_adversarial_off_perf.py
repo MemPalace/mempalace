@@ -559,6 +559,13 @@ def legacy(tmp_path_factory):
     # Overlaid board tools use the current registry contract; handoff remains
     # absent from the baseline's enabled modules below.
     shutil.copy2(ROOT / "commonplace" / "extensions.py", snapshot / "commonplace" / "extensions.py")
+    # Current board schemas need only the read-only orchestration setting probe.
+    # Do not install current project routes into the pinned HTTP baseline.
+    projects = snapshot / "commonplace" / "projects"
+    projects.mkdir(exist_ok=True)
+    (projects / "__init__.py").write_text("")
+    for name in ("orchestration.py", "limits.py"):
+        shutil.copy2(ROOT / "commonplace" / "projects" / name, projects / name)
     # Current board storage depends on the opt-in SQLite adapter. Supply only
     # that dependency; the archived handoff/search/storage sources stay pinned.
     shutil.copy2(
@@ -587,6 +594,30 @@ extensions.MODULES = tuple(
 for module in (cli, extensions, gateway, policy, sqlite_crypto):
     assert Path(module.__file__).resolve().is_relative_to(Path.cwd())
 assert "commonplace.handoff.extension" not in extensions.MODULES
+
+# The pinned gateway predates live availability and workspace-derived schemas.
+# Adapt only that registry seam; keep its HTTP dispatch, bodies and audit intact.
+# Board schemas come from the overlaid definitions, so this fixture compares
+# visibility and transport compatibility, not independent task_add/task_update
+# schema stability. The focused card-schema tests cover the opt-in fields.
+legacy_tools_list = gateway.Mediator._tools_list
+
+def visible_tools_list(self, principal, request):
+    response = legacy_tools_list(self, principal, request)
+    result = response.get("result", {})
+    if "tools" in result:
+        visible = []
+        for schema in result["tools"]:
+            tool = extensions.get(schema["name"])
+            if tool is not None:
+                if not tool.usable_by(principal, self.gateway):
+                    continue
+                schema = tool.schema(principal, self.gateway)
+            visible.append(schema)
+        result["tools"] = visible
+    return response
+
+gateway.Mediator._tools_list = visible_tools_list
 """
         + inspect.getsource(_Workers)
         + inspect.getsource(_server)

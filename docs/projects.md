@@ -152,3 +152,44 @@ The recommendation also includes `card.moved`; pass the three events as the arra
 `["space_message", "card.moved", "card.created"]`.
 Without a runner or a subscribed card webhook, new work waits for the seat's next
 session; this switch does not run the orchestrator continuously.
+
+## Opt-in card inbox and splitting
+
+The workspace orchestration switch defaults off. When enabled, the main board
+coordinator and signed-in workspace owners can call `orchestrator_inbox(board)`
+or `GET /api/projects/<board>/orchestrator/inbox`. It returns open top-level
+cards without a split marker, excluding coordinator-created roots and children;
+Doing and Review roots remain visible. Each root includes its stable keyed
+children. Existing connections gain the `space_message,card.created` setup hint
+on the project view as soon as the switch is enabled; reconnecting is unnecessary.
+
+Create missing children with `task_add(parent=N, labels=["split:N:build"])`.
+The parent must be a root on the same board. One transaction checks the key
+and inserts the child; concurrent requests cannot create duplicate keys.
+`split_key_exists` (409) includes the existing child's `number`. The coordinator
+chooses the keys and keeps them stable across retries; the hub never splits.
+Finish with `card_split_done(task=N, state="split"|"kept")`, or
+`POST /api/projects/<board>/orchestrator/split` with `{"task":N,"state":"kept"}`.
+The first marker wins and is recorded in card history.
+
+On a runner-configured board, enabled orchestration changes root todo triggers
+to role `main`, with an inbox snapshot and instructions in the launch message.
+Split children never trigger that start. The existing event deduplication,
+one-active-start rule and 24-hour non-person start restriction still apply.
+Every runner sweep reconciles unsplit roots older than 10 minutes without an
+active or started job. Attempts use `split-retry:<card>:<n>`, with gaps of
+10/30/90 minutes and at most three attempts. Two concurrent sweeps admit one
+attempt under the runner fence. Three refusals show `not_released: split stuck`
+in card waiting reasons and checkpoints; a person must resolve the cause and
+arrange completion. Marking the root ends reconciliation.
+
+Without a runner, delivery uses a subscribed `card.created` webhook and the
+inbox on the next session. Without either a runner or a webhook, a new card
+waits until that session; an always-running coordinator is separate work.
+Turning the switch off preserves configured todo triggers and the prior card
+shapes; the new blocker arguments and inbox tools are unavailable.
+
+An unavailable inbox snapshot does not discard a committed runner lease: the
+response keeps the pinned role instructions and asks the agent to read the inbox
+before acting. Checkpoint inbox context is best effort. Label edits cannot remove
+or replace a stable split-child key or make a root disappear into a split label.

@@ -610,3 +610,46 @@ complete list of deliberately open paths.
 Board and card REST bodies may carry a compatibility `rules_seq` field, but
 it is discarded before dispatch and never replaces the header. Response shapes
 are unchanged. The internal PR repository backfill does not add a card field.
+
+## Opt-in blockers and waiting reasons
+
+When workspace orchestration is enabled, `task_add` accepts `blocked_by` and
+`task_update` replaces it; REST uses the same field on card POST/PATCH.
+The list contains at most 16 same-board card numbers. Empty removes all edges.
+Self edges, cross-board references, cycles and traversals over 200 nodes are
+refused atomically. Card views include `blocked_by` and the inverse `blocks`;
+MCP `task_show` lists both directions, including satisfied dependencies.
+Only a blocker's Done status satisfies it; automatic claiming skips unresolved
+blockers, and runner starts refuse with `blocked_by`. Blocker changes increment
+the card version and append an edit history row. Existing card ownership,
+visibility and optimistic-version rules still apply.
+
+Enabled card views include `waiting` (null or one reason). Precedence is
+`blocked_by`, `waits_on_person`, `not_released`, then `project_limit` for a new
+agent. Reasons include `text`; blockers include same-board numbers and titles,
+and a project limit includes `used` and `cap`. Board lists include a `waiting`
+count by code. A blocked-card wait alone does not appear in `needs_me`.
+Explicit claims use the same waiting text for blocker and project-cap refusals;
+existing-agent admission exemptions still apply. Board tags show the blocker
+title or occupied-slot count instead of advertising a waiting card as available.
+With orchestration off these fields and the `blocked_by` schema properties are absent,
+and `blocked_by` is refused. `not_released` applies only to Todo/Backlog cards.
+
+`orchestrator_inbox(board)` and `card_split_done(task,state)` are coordinator or
+signed-in-owner tools available only with the switch on. Their REST equivalents
+are `GET /api/projects/<board>/orchestrator/inbox` and
+`POST /api/projects/<board>/orchestrator/split`. The POST body is exactly
+`{"task":N,"state":"split"}` or `{"task":N,"state":"kept"}`. The first marker
+wins; invalid input or a refused key inserts nothing. Database lock timeout
+returns bounded `409` with `{"error":"busy","code":"busy"}`.
+
+Split child keys remain attached to their original child when labels are edited.
+Removing or replacing a key is refused with `split_key_immutable`; adding split
+labels to roots or using a different parent is refused. The marker REST endpoint
+accepts only positive integer task numbers below the SQLite integer bound.
+Unreadable orchestration settings return `503 settings_unavailable`. Only actual
+SQLite lock timeouts return `409 busy`; other database errors retain their failure.
+
+`card_split_done` is a checked write: MCP callers supply the served `rules_seq`
+and REST callers supply the matching `Commonplace-Rules-Seq` header when rules
+freshness is enforced, just as for other card decisions.

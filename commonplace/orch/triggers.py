@@ -155,6 +155,9 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
     gateway, ws = js.gateway, js.workspace_id
     directory = gateway.workspace_dir(ws)
     results: list[dict] = []
+    from commonplace.projects import orchestration
+
+    on = orchestration.enabled(gateway.db, ws)
     with st.connection() as conn:  # autocommit reads; the lock is fenced_start's
         pair = orch_store.cursor_in(conn, board)
         if pair is None or pair[0] is None:
@@ -168,7 +171,7 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
             board_row = dict(board_row)
             events = boards.execute(_EVENTS, (cursor, board_row["id"], BATCH)).fetchall()
             cards = {row["task_id"]: dict(task_row(boards, row["task_id"])) for row in events}
-        if not events:
+        if not events and not on:
             return results
         version = orch_store.resolve_in(conn, board)
         machine = registry.get_machine(gateway.db, ws, version.config().runner.machine)
@@ -184,6 +187,7 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
                 principal=principal,
                 requested_by=ref or "unknown",
                 person=False,
+                split_start=on,
             )
             _barrier("sweep_before_start", conn)
             outcome = runner_bridge.fenced_start(
@@ -204,6 +208,64 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
                     "card": event["task_id"],
                     "job": outcome.job["id"] if outcome.job else None,
                     "miss": outcome.refusal.code if outcome.refusal else None,
+                }
+            )
+    if on:
+        results.extend(_reconcile(js, st, board, now or jobs._now()))
+    return results
+
+
+def _reconcile(js, st, board, now):
+    from commonplace.projects import orchestration, split
+
+    gateway, ws = js.gateway, js.workspace_id
+    with orchestration.board_read(gateway.workspace_dir(ws)) as boards:
+        b = boards.execute("SELECT * FROM boards WHERE slug=? AND archived=0", (board,)).fetchone()
+        if b is None:
+            return []
+        roots = split.eligible(boards, b, b["coordinator"])
+        cards = {r["id"]: dict(task_row(boards, r["id"])) for r in roots}
+        b = dict(b)
+    results = []
+    with st.connection() as conn:
+        pair = orch_store.cursor_in(conn, board)
+        if pair is None or pair[0] is None:
+            return results
+        version = orch_store.resolve_in(conn, board)
+        machine = registry.get_machine(gateway.db, ws, version.config().runner.machine)
+        for row in roots:
+            if not split.retry_due(conn, row, now):
+                continue
+            n = len(split.attempts(conn, row["id"])) + 1
+            event = {"stamp_user": row["stamp_user"], "stamp_connection": row["stamp_connection"]}
+            principal, ref, refusal = _actor(gateway, ws, event, machine)
+            plan = runner_bridge.prepare(
+                gateway,
+                ws,
+                board_row=b,
+                card_row=cards[row["id"]],
+                version=version,
+                principal=principal,
+                requested_by=ref or "unknown",
+                person=False,
+                split_start=True,
+            )
+            outcome = runner_bridge.fenced_start(
+                js,
+                plan,
+                path="trigger",
+                request_key=f"split-retry:{row['id']}:{n}",
+                trigger=runner_bridge.TriggerRef(0, pair[0], pair[1], ref, retry=n),
+                actor_refusal=refusal,
+                now=now,
+            )
+            results.append(
+                {
+                    "card": row["id"],
+                    "retry": n,
+                    "job": outcome.job["id"] if outcome.job else None,
+                    "miss": outcome.refusal.code if outcome.refusal else None,
+                    "dropped": outcome.dropped,
                 }
             )
     return results

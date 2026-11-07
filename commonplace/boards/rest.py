@@ -1,5 +1,7 @@
 """Contract REST routes; all policy and state changes run in BoardService."""
 
+import sqlite3
+
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.rules.enforce import RulesRefresh, rest_write
 
@@ -15,6 +17,7 @@ from ._http import (
 from .digest import ssml
 from .display import NEEDS, with_urls
 from .service import BoardService, ParentError, VersionClash
+from .store import CardRefused
 
 OPEN_LIMIT, OPEN_LIMIT_MAX = 200, 500
 
@@ -30,11 +33,24 @@ def install(gateway):
         principal = require_principal(gateway, h)
         if principal is None:
             return
-        service = BoardService(ToolContext(principal=principal, gateway=gateway))
         parts = path_parts(h, "/api/")
         method = h.command
         try:
+            service = BoardService(ToolContext(principal=principal, gateway=gateway))
             status, result = dispatch(service, h, parts, method)
+        except sqlite3.OperationalError as exc:
+            from commonplace.projects import orchestration
+
+            orchestration.require_lock_timeout(exc)
+            send_json(h, 409, {"error": "busy", "code": "busy"})
+            return
+        except CardRefused as exc:
+            send_json(
+                h,
+                exc.status,
+                {"error": str(exc).removeprefix("no: "), "code": exc.code, **exc.details},
+            )
+            return
         except RulesRefresh as exc:
             send_json(h, 428, exc.payload)
             return

@@ -48,16 +48,20 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
 from commonplace.boards.store import BoardStore
 from commonplace.extensions import ToolContext, ToolError
+from commonplace.http_util import log_failure
 from commonplace.runner import jobs, registry
 from commonplace.runner.predicate import requester_ok
 
 from . import store as orch_store
+
+logger = logging.getLogger(__name__)
 
 TTL_SECONDS = 1800
 STEP_KEY = re.compile(r"[A-Za-z0-9._:-]{1,80}\Z")
@@ -1265,7 +1269,18 @@ def _checkpoint(ctx, st, board_row, role, now, cards):
     for key in view:
         view[key] = view[key][-MAX_LIST:]
     view["finished"].reverse()
+    from commonplace.projects import orchestration, split
+
+    inbox_note = {}
+    try:
+        if orchestration.enabled(ctx.db, ctx.principal.workspace_id):
+            note = split.context(ctx.gateway, ctx.principal, board)
+            if note:
+                inbox_note = {"inbox": note}
+    except Exception as exc:
+        log_failure(logger, "checkpoint inbox unavailable", exc)
     return {
+        **inbox_note,
         "board": board,
         "role": role,
         "lease": None

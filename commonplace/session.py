@@ -116,6 +116,18 @@ def session_start(ctx, args) -> str:
     except Exception as exc:
         # Startup context is best effort and must never migrate or create boards.
         log_failure(logger, "session approvals unavailable", exc)
+    try:
+        from .projects import orchestration, split
+
+        if (
+            orchestration.enabled(ctx.db, ctx.principal.workspace_id)
+            and (Path(ctx.workspace_dir()) / "boards.sqlite3").is_file()
+        ):
+            note = split.context(ctx.gateway, ctx.principal, args.get("board"))
+            if note:
+                lines.append(note)
+    except Exception as exc:
+        log_failure(logger, "session inbox unavailable", exc)
     if _available(ctx, "facts_import"):
         lines.append(import_grant.GUIDANCE)
     return "\n\n".join(lines)

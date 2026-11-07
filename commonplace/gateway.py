@@ -384,7 +384,7 @@ class Mediator:
         for name in sorted(local_names):
             tool = extensions.get(name)
             if policy.tool_visible(name) and tool.usable_by(principal, self.gateway):
-                visible.append(tool.schema())
+                visible.append(tool.schema(principal, self.gateway))
         from commonplace.rules import checks, enforce
 
         mode = "off" if principal.person else checks.mode(self.gateway, principal)

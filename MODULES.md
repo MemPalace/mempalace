@@ -68,6 +68,8 @@ Format (read by `commonplace orch docs-check`):
   - Imported-history consent: Imported-history documentation distinguishes write-only import from the independent reader scope and explains exclusions and revocation.
   - Project setup documentation also explains the recommended card-move webhook and explicit updates for existing subscriptions.
 
+  - Documents enabled blockers, waiting payloads, stable split keys and bounded runner retry delivery.
+
   - Documentation describes shipped behaviour; design notes are marked as proposals.
 
   - Project documentation explains opt-in start authority, shared admission, seat consent and the card-webhook delivery residual.
@@ -246,12 +248,26 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Safety tests run identically on a pinned base and implementation; server import and low-level persistence remain covered.
+  - Card schema regressions cover missing gateways, missing control databases and unexpected settings read failures.
+
+  - Gate regressions let unexpected capacity exceptions fail directly and avoid vacuous retry-report checks; the legacy fixture documents its shared-schema coverage boundary.
+
+  - The pinned handoff baseline adapts live tool availability and workspace schemas while retaining strict HTTP and audit equality; visibility mutations must fail.
 
   - The revoked-token socket guard observes the completed server-side 401, no body reads and no route dispatch, including a forced close before upload finishes.
   - The seat webhook replay checks actual worker completion with orchestration off and on, retains card-created notifications when enabled, and verifies message filtering and unchanged subscriptions on reconnect.
   - Reassignment regressions keep doing-card handoffs unclaimed and avoid queued replacement starts until the receiver takes the card.
 
   - Manual-assignment regressions cover the statechart claim replay, configured worker starts, visible blocked-start reasons, project admission, busy agents and restricted-origin release.
+  - Off-mode capacity regressions preserve legacy refusal text and card state, including a coded admission refusal.
+
+  - Card contract tests cover paired RED assertions, off-path guards, atomic key races, bounded retries and route busy responses with unchanged state.
+
+  - All card requirement tests, including validation and error paths, have assertion-level RED evidence on the declared stack base; existing-database launch-role migration is checked directly.
+
+  - Claim text assertions avoid feature imports; duplicate-key label edits preserve labels, version and audit history on refusal.
+
+  - Pure-module guards check generic path/URL patterns and outbound imports without embedding deployment identifiers.
 
   - Lease regressions retain started jobs beyond an hour while their cards remain doing with the machine worker, and release capacity on completion, reassignment or a terminal job state without taking a boards write lock.
 
@@ -326,6 +342,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Imported-history consent: Imported reader results bypass wing restrictions only after exact-view proof; ordinary scope, tool, wing and mutation gates remain in force.
 
+  - Local extension schemas may derive workspace-gated properties per request without mutating shared schemas.
+
   - Every request resolves to one principal or none; scopes, wings and trust are checked before any tool runs; tokens are stored hashed; writes are audited.
 
   - Existing workspace directory lookups pass a backup freeze, so a writer holding a database transaction can finish; new directories remain gated.
@@ -349,6 +367,8 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Imported-history consent: OAuth reader consent is separate and unticked; defaults and person policies exclude the reader, while refresh descendants cannot regain a dropped scope.
+
+  - Enabled coordinator startup context includes unsplit inbox counts, without migrating boards.
 
   - Accounts exist only after verification; sessions are cookie-bound and revocable; mail is configured only through the environment.
 
@@ -374,6 +394,10 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Imported-history consent: CLI token creation rejects the imported-history reader scope before issuing a credential; browser consent is required.
+
+  - The agent skill stays below 120 lines and links to the full opt-in splitting guide for delivery details.
+
+  - The agent playbook requires inbox reads at session start, on wakes and every 10 minutes, stable keys, and completion markers.
 
   - CLI commands act through the same services as the network routes; installers never change trust policy; hooks fail open.
 
@@ -402,6 +426,15 @@ Format (read by `commonplace orch docs-check`):
   - After commit they request the configured worker start, or persist a visible reason that it could not start; concurrent card updates are preserved.
 
   - Explicit takes of an already held card return that claim without renewing it.
+  - Card schemas default to orchestration off when the control database is absent or settings reads fail.
+
+  - Disabled orchestration preserves legacy capacity refusals and never rewrites coded limit errors through the enabled waiting projection.
+
+  - Enabled blocker updates are versioned and audited; pure waiting reasons drive views and claims, and SQL skips unresolved edges.
+
+  - Card lists share a runner read and per-board usage; a capacity refusal retains its original error when no display reason is available.
+
+  - Board REST maps only database lock timeouts to busy; waiting summaries reuse one runner read and two board usage counts; split-key edits preserve child identity.
 
   - Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval.
 
@@ -443,6 +476,7 @@ Format (read by `commonplace orch docs-check`):
   - A machine may start a todo card reserved for its own worker or a doing card already held by that worker.
 
   - Other assignees, waiting-person gates and unreleased origins remain refused.
+  - Enabled starts reject unresolved same-board blockers through read-only board probes, without constructing a board store inside a runner transaction.
 
   - Started jobs retain machine in-flight capacity and per-machine project exclusion while their cards remain doing with the machine worker; a terminal job state or a changed card state or assignee releases capacity, using read-only boards access.
 
@@ -474,6 +508,11 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Owner-assigned runner work uses the existing configured person-start fence; agent-authored todo reservations still produce an assigned-card trigger miss for a different worker.
+  - Enabled root triggers pin main-role launches; reconciliation uses existing miss history and an in-lock eligibility recheck for at most three attempts.
+
+  - Empty disabled sweeps avoid config resolution, checkpoint inbox context is best effort, and failed inbox snapshots keep committed leases launchable using pinned instructions.
+
+  - Lease snapshot failures log sanitized diagnostics without exception messages.
 
   - Only owner-accepted versions run; every config-driven start is one fenced, capped transaction; a retry returns the stored job; external effects are never re-issued by the hub; after a restore nothing config-driven runs until the owner acknowledges.
 
@@ -510,6 +549,9 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Connect recommends a board-scoped subscription to `space_message` and `card.moved`, retaining `card.created` with orchestration enabled, without creating or modifying webhooks.
+  - The opt-in inbox excludes children and coordinator roots, exposes keyed children, and accepts first-wins split markers only from the coordinator or signed-in owner.
+
+  - Split marker task references are range-checked before SQLite binding and settings-read failures remain retryable.
 
   - Only a signed-in owner changes models or limits; `max_agents` counts distinct connection assignees with orchestration off; opt-in orchestration shares card/job admission accounting, default cap 3, owner-only settings and atomic seat trust; model resolution goes project, then workspace, then the runner default.
 
@@ -530,6 +572,8 @@ Format (read by `commonplace orch docs-check`):
   - Owner-reviewed rules and their freshness gate, guard building blocks, sensitive-text flags and redaction.
 
 - **Promises:**
+
+  - Split completion markers are checked writes on MCP and REST.
 
   - Rules take effect only after owner review; writes from a client with stale rules get 428; flags are deterministic.
 
@@ -718,6 +762,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Imported-history consent: The owner form offers independent unticked import and reader checkboxes and displays reader authority beside Revoke.
   - The Connect checklist renders the supplied webhook event recommendation, including card moves and optional card creation, with escaped values.
+
+  - Enabled waiting tags show dependency titles or occupied-slot counts and suppress the available tag.
 
   - The web app calls the same services as REST; it shows only what the signed-in person may read.
 

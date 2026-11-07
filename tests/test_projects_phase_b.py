@@ -124,7 +124,8 @@ def test_r5_one_job_blocks_claim(world):
     cap(w, 1)
     w.person_start(w.card())
     result = claim(w, w.card())
-    assert result[0] == 409 and "project_limit 1/1" in str(result)  # RED
+    assert result[0] == 409 and result[1]["code"] == "project_limit"  # RED
+    assert result[1]["error"].removeprefix("no: ") == "Waiting for a free slot: 1 of 1"
 
 
 def test_r6_busy_assignment(world):
@@ -144,7 +145,8 @@ def test_r7_workers_count_cards(world):
     for _ in range(2):
         doing(w, w.card(), "conn:" + worker)
     result = claim(w, w.card())
-    assert result[0] == 409 and "project_limit 2/2" in str(result)  # RED
+    assert result[0] == 409 and result[1]["code"] == "project_limit"  # RED
+    assert result[1]["error"].removeprefix("no: ") == "Waiting for a free slot: 2 of 2"
 
 
 def lifecycle(w, monkeypatch, *, second=True):

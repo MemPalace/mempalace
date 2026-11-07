@@ -28,16 +28,21 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import logging
+import sqlite3
+from dataclasses import dataclass, replace
 
 from commonplace.boards.service import BoardService
 from commonplace.boards.store import BoardStore, task_row
 from commonplace.extensions import ToolContext, ToolError
+from commonplace.http_util import log_failure
 from commonplace.projects import limits as project_limits, models
 from commonplace.runner import jobs, registry
 from commonplace.runner.predicate import Refused, grant_values, requester_ok, startable
 
 from . import durable, schema, store as orch_store
+
+logger = logging.getLogger(__name__)
 
 MAX_REQUEST_KEY = 128
 PATHS = ("orch", "person", "trigger")
@@ -124,6 +129,7 @@ class TriggerRef:
     cursor: int
     gen: int
     actor: str | None = None
+    retry: int = 0
 
 
 @dataclass
@@ -143,6 +149,8 @@ def ensure_schema(conn) -> None:
     durable.ensure_schema(conn)
     for statement in MISSES_SCHEMA:
         conn.execute(statement)
+    if "launch_role" not in {r[1] for r in conn.execute("PRAGMA table_info(runner_jobs)")}:
+        conn.execute("ALTER TABLE runner_jobs ADD COLUMN launch_role TEXT")
 
 
 def _has_configs(directory) -> bool:
@@ -206,7 +214,7 @@ def card_refusal(gateway, machine, card_row, board_row, principal, config) -> st
     ):
         return "machine_unavailable"
     try:
-        BoardService(ToolContext(principal=principal, gateway=gateway))._write(
+        BoardService(ToolContext(principal=principal, gateway=gateway), store=False)._write(
             board_row, row=card_row
         )
     except ToolError as exc:
@@ -238,6 +246,7 @@ def prepare(
     principal,
     requested_by: str,
     person: bool,
+    split_start: bool = False,
 ) -> Plan:
     """Read the control snapshot of one start (before ``fenced_start``)."""
     from commonplace.projects import orchestration as orch
@@ -245,6 +254,8 @@ def prepare(
     on = orch.enabled(gateway.db, workspace_id)
     workers = orch.workers(gateway.db, workspace_id) if on else frozenset()
     config = version.config()
+    if split_start and on and config.runner is not None:
+        config = replace(config, runner=replace(config.runner, role="main"))
     role = config.runner_role
     if config.runner is None or role is None:
         raise StartRefused("not_configured", "the board has no orchestrator runner config")
@@ -450,6 +461,11 @@ def _fenced(conn, plan, *, path, role, step_key, epoch, token, request_key, now,
         )
     except jobs.Conflict as exc:
         raise StartRefused(jobs.conflict_code(exc), str(exc)) from None
+    if path == "trigger" and plan.orchestration_on:
+        conn.execute(
+            "UPDATE runner_jobs SET launch_role=? WHERE id=?", (plan.config.runner.role, row["id"])
+        )
+        row = _job(conn, row["id"])
     step = None
     if path == "orch":
         step = durable.insert_step_in(
@@ -513,7 +529,7 @@ def fenced_start(
     now = clock()
     role = plan.config.runner.role if role is None else role
     key = request_key_for(
-        path,
+        "person" if trigger is not None and trigger.retry else path,
         role=role,
         step_key=step_key,
         event=trigger.event if trigger else None,
@@ -527,11 +543,32 @@ def fenced_start(
         if plan.orchestration_on
         else store.transaction() as conn
     ):
-        if trigger is not None:
+        if trigger is not None and not trigger.retry:
             # First statement in the lock: the pair the sweep recorded must still hold.
             if orch_store.cursor_in(conn, plan.board) != (trigger.cursor, trigger.gen):
                 return Outcome(dropped=True)
         ensure_schema(conn)
+        if trigger is not None and plan.orchestration_on:
+            from commonplace.projects import split
+
+            with orch.board_read(plan.workspace_dir) as boards:
+                row = task_row(boards, plan.card)
+                marked = boards.execute(
+                    "SELECT 1 FROM card_splits WHERE task_id=?", (plan.card,)
+                ).fetchone()
+                board = boards.execute(
+                    "SELECT * FROM boards WHERE id=?", (plan.board_id,)
+                ).fetchone()
+                if (
+                    not split.is_root(row)
+                    or marked is not None
+                    or row["created_by"] == board["coordinator"]
+                ):
+                    if not trigger.retry:
+                        _advance(conn, plan, trigger)
+                    return Outcome(dropped=True)
+                if trigger.retry and not split.retry_due(conn, row, now, expected=trigger.retry):
+                    return Outcome(dropped=True)
         conn.execute("SAVEPOINT fenced_start")
         try:
             if actor_refusal is not None:
@@ -553,21 +590,22 @@ def fenced_start(
             refusal, outcome = exc, Outcome(refusal=exc)
         conn.execute("RELEASE fenced_start")
         if trigger is not None:
-            if refusal is not None:
+            if refusal is not None or trigger.retry:
                 conn.execute(
                     "INSERT INTO orch_misses(board,event_id,card,code,actor,gen,created_at) "
                     "VALUES (?,?,?,?,?,?,?)",
                     (
                         plan.board,
-                        trigger.event,
+                        -trigger.retry if trigger.retry else trigger.event,
                         plan.card,
-                        refusal.code,
+                        refusal.code if refusal else "split_started",
                         trigger.actor,
                         trigger.gen,
                         now,
                     ),
                 )
-            _advance(conn, plan, trigger)
+            if not trigger.retry:
+                _advance(conn, plan, trigger)
     if refusal is not None and trigger is None:
         raise refusal
     return outcome
@@ -732,7 +770,33 @@ def launch_fields(conn, row) -> dict:
     try:
         version = orch_store._version(stored)
         config = orch_store._checked_config(version)
-        text = schema.role_instructions(config, config.runner.role)
+        role = (
+            row["launch_role"]
+            if "launch_role" in row.keys() and row["launch_role"]
+            else config.runner.role
+        )
+        text = schema.role_instructions(config, role)
+        if role == "main" and "launch_role" in row.keys() and row["launch_role"]:
+            text += f"\n\nRead orchestrator_inbox(board={row['board_slug']}) now. Use stable split:<parent>:<key> labels for missing children, then card_split_done. Poll the inbox on every wake and every 10 minutes while running."
+            from pathlib import Path
+
+            from commonplace.projects import orchestration, split
+
+            directory = Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent
+            try:
+                with orchestration.board_read(directory) as boards:
+                    board = boards.execute(
+                        "SELECT * FROM boards WHERE slug=?", (row["board_slug"],)
+                    ).fetchone()
+                    roots = split.eligible(boards, board, board["coordinator"]) if board else []
+                text += "\nInbox (quoted card data): " + json.dumps(
+                    [{"number": r["id"], "title": r["title"]} for r in roots], ensure_ascii=False
+                )
+            except sqlite3.OperationalError as exc:
+                log_failure(logger, "lease inbox snapshot unavailable", exc)
+                # The lease is already committed. Keep its pinned launch instructions;
+                # the agent rereads the inbox through the normal retryable tool path.
+                text += "\nInbox snapshot unavailable; read orchestrator_inbox before acting."
     except (orch_store.OrchError, schema.ConfigError, AttributeError):
         return {}
     message = SPAWN_MESSAGE.format(n=row["task_number"], job_id=row["id"]) + "\n\n" + text

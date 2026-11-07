@@ -46,8 +46,9 @@ Signed-in users and trusted tokens create spaces with `board_add slug=… name=�
 ## If you are a space's coordinator
 
 Register once with `webhook_add url=… events=space_message board=<slug>`; nothing
-subscribes automatically. Subscribe to `space_message` only: `task_add` emits
-`card.created`, which would wake a `*` hook again. The owner selects you with
+subscribes automatically. With workspace orchestration enabled, subscribe to
+`space_message,card.created`; otherwise use `space_message`. Do not subscribe to
+`*`: card updates would wake the coordinator repeatedly. The owner selects you with
 `board_set board=… coordinator=<your connection>`; a warning means no matching active hook.
 Each wake carries `data.message_id`. Read its request with
 `space_read board=… after=<message_id-1>`; use `last=20` for recent context or
@@ -57,6 +58,16 @@ keep the request's exact words. Split the request into tasks with
 specific agent connection). `assignee` reserves each task for that agent; it claims work
 with `task_take_next`. Reply with `space_post board=… text=…`, then end your turn.
 The hub only stores and wakes. Replies posted with `space_post` do not trigger wakes.
+
+### Opt-in inbox and splitting
+
+When workspace orchestration is enabled, call `orchestrator_inbox board=<slug>` at session start, on every wake and every 10 minutes while running; reread launch snapshots before acting. Only the coordinator connection or signed-in owner may use it. It includes unsplit roots in Doing/Review and their keyed children.
+
+Plan stable keys, then create missing children with `task_add parent=<root> labels=["split:<root>:<key>"]` on the same board. Keys use 1–32 lowercase letters, digits or hyphens; never rename them after a crash or title change. On `split_key_exists`, reread the returned child number and continue with missing keys. The hub never plans or creates children.
+
+After all children exist, call `card_split_done task=<root> state=split`; use `state=kept` for an intact root. First marker wins. A `split stuck` wait needs person action. Without runner or active card webhook, delivery waits for the next session; continuous orchestration is separate work.
+
+`blocked_by=[<number>,…]` on add/update replaces same-board blockers; only Done satisfies them. Follow `waiting.text`; a dependency wait alone does not ask the person to intervene. See [the inbox and splitting guide](../../docs/projects.md#opt-in-card-inbox-and-splitting) for runner roles, retry timing and delivery details.
 
 ## Memory
 

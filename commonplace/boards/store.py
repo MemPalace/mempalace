@@ -41,6 +41,77 @@ TASK_COLUMNS = {
 }
 
 
+BLOCKERS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS task_blockers (
+ task_id INTEGER NOT NULL REFERENCES tasks(id),
+ blocker_id INTEGER NOT NULL REFERENCES tasks(id),
+ created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+ PRIMARY KEY(task_id, blocker_id)
+);
+CREATE INDEX IF NOT EXISTS task_blockers_reverse ON task_blockers(blocker_id, task_id);
+CREATE TABLE IF NOT EXISTS card_splits (
+ task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+ state TEXT NOT NULL CHECK(state IN ('split','kept')),
+ by TEXT NOT NULL, at TEXT NOT NULL
+);
+"""
+
+
+class CardRefused(ToolError):
+    def __init__(self, code, message=None, *, status=409, **details):
+        self.code, self.status, self.details = code, status, details
+        super().__init__("no: " + (message or code))
+
+
+def active_blockers(conn, number):
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='task_blockers'").fetchone():
+        return []
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT t.id AS number,t.title FROM task_blockers b JOIN tasks t ON t.id=b.blocker_id "
+            "WHERE b.task_id=? AND t.status!='done' ORDER BY t.id",
+            (number,),
+        )
+    ]
+
+
+def set_blockers(conn, row, values, actor):
+    if (
+        not isinstance(values, list)
+        or len(values) > 16
+        or any(type(n) is not int or not 1 <= n < 2**63 for n in values)
+    ):
+        raise CardRefused("invalid_blockers", status=400)
+    for number in set(values):
+        if number == row["id"]:
+            raise CardRefused("self", status=400)
+        found = conn.execute("SELECT board_id FROM tasks WHERE id=?", (number,)).fetchone()
+        if found is None or found[0] != row["board_id"]:
+            raise CardRefused("other_board", status=400)
+        pending, seen = [number], set()
+        while pending:
+            current = pending.pop()
+            if current == row["id"]:
+                raise CardRefused("cycle", status=400)
+            if current in seen:
+                continue
+            seen.add(current)
+            if len(seen) > 200:
+                raise CardRefused("blocker_graph_too_large", status=400)
+            pending.extend(
+                r[0]
+                for r in conn.execute(
+                    "SELECT blocker_id FROM task_blockers WHERE task_id=?", (current,)
+                )
+            )
+    conn.execute("DELETE FROM task_blockers WHERE task_id=?", (row["id"],))
+    conn.executemany(
+        "INSERT INTO task_blockers VALUES (?,?,?,?)",
+        [(row["id"], n, actor, now()) for n in sorted(set(values))],
+    )
+
+
 def pr_repository(url):
     """Repository part of a PR URL, including GitLab and plural pulls URLs."""
     if not isinstance(url, str):
@@ -289,7 +360,7 @@ class BoardStore:
         self.create = create
         self.path = str(directory / "boards.sqlite3")
         with self.connection() as conn:
-            conn.executescript(Path(__file__).with_name("schema.sql").read_text())
+            conn.executescript(Path(__file__).with_name("schema.sql").read_text() + BLOCKERS_SCHEMA)
             conn.execute("BEGIN IMMEDIATE")
             try:
                 board_columns = {r[1] for r in conn.execute("PRAGMA table_info(boards)")}

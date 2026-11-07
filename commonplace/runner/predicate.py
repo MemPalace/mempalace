@@ -49,7 +49,14 @@ def startable(gateway, machine, row, board) -> None:
     worker = gateway.db.authenticate_connection(machine["worker_connection_id"])
     if worker is None or worker.workspace_id != machine["workspace_id"]:
         raise Refused("worker unavailable")
-    service = BoardService(ToolContext(worker, gateway))
+    service = BoardService(ToolContext(worker, gateway), store=False)
+    from commonplace.boards.store import active_blockers
+    from commonplace.projects import orchestration as orch
+
+    if orch.enabled(gateway.db, machine["workspace_id"]):
+        with orch.board_read(gateway.workspace_dir(machine["workspace_id"])) as conn:
+            if active_blockers(conn, row["id"]):
+                raise Refused("blocked_by")
     if _waiting_on_person(row):
         raise Refused("waiting_on_person")
     own_claim = row["status"] == "doing" and row["assignee"] == worker.actor

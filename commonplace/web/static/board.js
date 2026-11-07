@@ -16,11 +16,17 @@ function author(ref, board) {
 }
 export function cardTags(card, { me, board = {}, messages = [] } = {}) {
   const tags = [];
+  if (card.waiting) {
+    const w = card.waiting;
+    if (w.code === 'blocked_by') tags.push('Waiting on ' + w.blockers.map((b) => `#${b.number}: ${b.title}`).join(', '));
+    else if (w.code === 'project_limit') tags.push(`Waiting for a free slot: ${w.used} of ${w.cap}`);
+    else tags.push(w.text);
+  }
   if (isBlocked(card, me)) tags.push('Blocked');
   else if (card.need === 'you' || (card.status === 'review' && card.ask && card.ask_to === me && card.review_kind !== 'completion')) tags.push('Needs me');
   if (card.message_id) tags.push(chatTag(card, messages));
   if (card.need === 'working') tags.push(`Working on it: ${author(card.assignee, board)}`, `working ${elapsed(card.heartbeat_at || card.updated_at)}`);
-  else if (card.status === 'todo' && !card.assignee) tags.push('Available for an agent');
+  else if (card.status === 'todo' && !card.assignee && !card.waiting) tags.push('Available for an agent');
   if (card.status === 'review' && String(card.return_to).startsWith('conn:')) tags.push(`Built by ${author(card.return_to, board)}`);
   if (card.status === 'review' && card.review_kind === 'completion' && card.ask_to) tags.push(`Reviewer: ${author(card.ask_to, board)}`);
   return tags;

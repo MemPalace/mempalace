@@ -14,7 +14,7 @@ from .store import rules_sequence
 CHECKED_WRITES = frozenset(
     "task_add task_update task_comment task_take_next task_handoff ask space_post "
     "board_own_wing board_add memory_save memory_link fact_save handoff_start decide board_set rules_publish "
-    "task_approve facts_import card_start card_start_cancel card_start_resolve "
+    "task_approve card_split_done facts_import card_start card_start_cancel card_start_resolve "
     "orch_config_propose orch_config_accept orch_config_write orch_config_reject "
     "orch_exp_retire orch_restore_ack orch_resume orch_force_release orch_card_start "
     "orch_journal_intent orch_journal_record orch_gate_open orch_gate_record "
@@ -64,6 +64,9 @@ class RestRoute:
 # Inventory of dispatch shapes, rather than registered prefixes. The callstack
 # exception is a body restriction on task_update, not another route branch.
 REST_ROUTES = (
+    RestRoute(
+        "projects.routes", "POST", "/api/projects/<slug>/orchestrator/split", "card_split_done"
+    ),
     RestRoute("boards.rest", "PATCH", "/api/cards/<n>", "task_update"),
     RestRoute("boards.rest", "POST", "/api/cards/<n>/comments", "task_comment"),
     RestRoute("boards.rest", "POST", "/api/cards/<n>/handoff", "task_handoff"),

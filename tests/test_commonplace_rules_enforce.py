@@ -379,7 +379,13 @@ def test_served_state_is_connection_scoped_and_default_reads_do_not_serve(env):
 @pytest.mark.parametrize("name", sorted(enforce.CHECKED_WRITES))
 def test_every_checked_mcp_tool_rejects_before_dispatch(env, name, monkeypatch):
     setup(env)
-    if name in ("handoff_start", "card_start", "card_start_cancel", "card_start_resolve"):
+    if name in (
+        "handoff_start",
+        "card_start",
+        "card_start_cancel",
+        "card_start_resolve",
+        "card_split_done",
+    ):
         monkeypatch.setitem(
             extensions.REGISTRY, name, replace(extensions.get(name), available=None)
         )
@@ -507,6 +513,7 @@ def test_checked_and_exempt_inventory_covers_all_gateway_writes():
 def test_checked_rest_shapes_refuse_then_accept_fresh_header(env, http, route):
     card = setup(env)
     bodies = {
+        "card_split_done": {"task": card["number"], "state": "kept"},
         "task_update": {"version": card["version"], "title": "Changed"},
         "task_comment": {"text": "Comment"},
         "task_handoff": {
@@ -525,6 +532,11 @@ def test_checked_rest_shapes_refuse_then_accept_fresh_header(env, http, route):
         "fact_save": {"subject": "Avery", "predicate": "likes", "object": "tea"},
         "relaunch": {},
     }
+    if route.tool == "card_split_done":
+        from commonplace.projects import orchestration
+
+        orchestration.set_enabled(env.db, env.person, True)
+        BoardService(env.owner.ctx).board_set("work", env.principal.actor)
     if route.tool == "decide":
         card = BoardService(env.owner.ctx).ask(
             "Should this change proceed now?",
