@@ -49,6 +49,24 @@ run_command() {
     "${command[@]}"
 }
 
+backup_reference=
+
+release_backup_reference() {
+    [[ -n $backup_reference ]] || return 0
+    systemctl stop "$backup_reference" >/dev/null 2>&1 || return 1
+    backup_reference=
+}
+
+cleanup_backup_reference() {
+    local status=$?
+    trap - EXIT
+    if ! release_backup_reference; then
+        printf '[deploy] ERROR: backup: cannot release backup unit reference\n' >&2
+        status=1
+    fi
+    exit "$status"
+}
+
 main() {
     local owner mode
     local key value line config start before after result latest timestamp snap now rendered health execution
@@ -121,7 +139,7 @@ main() {
     [[ $APP_PORT =~ ^[0-9]{1,5}$ ]] || die config 'invalid APP_PORT'
     (( 10#$APP_PORT >= 1 && 10#$APP_PORT <= 65535 )) || die config 'invalid APP_PORT'
     APP_PORT=$((10#$APP_PORT))
-    for key in jq flock curl systemctl docker date timeout; do
+    for key in jq flock curl systemctl systemd-run sleep docker date timeout; do
         command -v "$key" >/dev/null || die preflight "missing $key"
     done
     [[ -f $COMPOSE_FILE && -f $COMPOSE_ENV_FILE ]] || die config 'compose and environment files must exist'
@@ -135,6 +153,18 @@ main() {
     unit_timeout=$(systemctl show -p TimeoutStartUSec --value "$DEPLOY_BACKUP_UNIT") || die config 'cannot read unit TimeoutStartSec'
     unit_timeout=$(timespan_seconds "$unit_timeout") || die config 'unit TimeoutStartSec must be finite'
     (( unit_timeout < 10#$DEPLOY_BACKUP_TIMEOUT )) || die config 'unit TimeoutStartSec must be below DEPLOY_BACKUP_TIMEOUT'
+
+    # systemd.unit's GC contract: an active unit's After= dependency keeps the
+    # referenced unit loaded, including its execution results after a fast exit.
+    # Ordering alone does not start the backup before we record its old ID.
+    backup_reference="commonplace-deploy-proof-$$-$RANDOM.service"
+    trap cleanup_backup_reference EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    systemd-run --quiet --collect --unit="$backup_reference" \
+        --property=Type=exec --property="After=$DEPLOY_BACKUP_UNIT" \
+        -- "$(command -v sleep)" infinity >/dev/null 2>&1 || die backup 'cannot hold backup unit reference'
     start=$(date -u +%s) || die preflight 'cannot read clock'
 
     before=$(systemctl show -p InvocationID --value "$DEPLOY_BACKUP_UNIT" 2>/dev/null) || die backup 'cannot read invocation'
@@ -162,6 +192,7 @@ main() {
     if systemctl is-active --quiet "$DEPLOY_BACKUP_UNIT"; then
         die backup 'unit is active; not deploying'
     fi
+    release_backup_reference || die backup 'cannot release backup unit reference'
     local -a compose=(docker compose -f "$COMPOSE_FILE" --env-file "$COMPOSE_ENV_FILE")
     rendered=$("${compose[@]}" config --format json 2>/dev/null) || die deploy 'compose config failed'
     jq --arg port "$APP_PORT" -e 'all(.services[] | .ports[]? | select(.published != null); .host_ip == "127.0.0.1" and (.published | tostring) == $port)' <<< "$rendered" >/dev/null 2>&1 || die deploy 'published ports must use loopback'

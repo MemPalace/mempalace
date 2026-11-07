@@ -46,8 +46,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `Dockerfile`, `Dockerfile.gpu`, `docker-compose.yml`, `docker-entrypoint.sh`, `.dockerignore`, `deploy/`, `backup-hook.sh`, `nightly-backup.sh`
 - **Owns:** Container images, compose files, example reverse-proxy and service units, and the nightly backup wrappers.
-- **Promises:** Images run the gateway as an unprivileged user on a mounted data directory; examples hold placeholders, never real hosts or secrets; the backup wrappers call the verified backup path and report failure.
-- **How it fails:** A broken image or unit only shows at deploy time; a backup wrapper that exits 0 on failure hides missing backups.
+- **Promises:** Images run the gateway as an unprivileged user on a mounted data directory; examples hold placeholders, never real hosts or secrets; deploy holds an active transient unit reference through fresh invocation, snapshot and backup verification, then releases it, including on trapped exits.
+- **How it fails:** Missing execution proof, stale snapshots, failed verification or reference creation/release refuse deployment; SIGKILL can leave a transient reference holder for operator cleanup. A broken image or unit only shows at deploy time.
 - **Tests:** `tests/test_commonplace_deploy.py`, `tests/test_commonplace_nightly_backup.py`, `tests/test_commonplace_w5_backup.py`.
 
 ## scripts-and-tools
@@ -86,7 +86,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `tests/`
 - **Owns:** Shared fixtures and harnesses and every test file not listed in another block.
-- **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls. Restricted-origin content-edit regressions verify audit attribution and unchanged release and claim state through both public routes.
+- **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls. Deploy fakes discard inactive, unreferenced execution proof and cover synchronous fast exit, consecutive deploys and reference cleanup on failure, timeout and signals. Restricted-origin content-edit regressions verify audit attribution and unchanged release and claim state through both public routes.
 - **How it fails:** A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
 - **Tests:** The suite itself under the coverage gate; `tests/test_commonplace_webhooks.py::test_dispatcher_thread_survives_an_unexpected_pass_error` checks that an unexpected delivery-pass error is logged without its private message and the dispatcher retries while staying alive. `tests/test_projects_phase_b.py` and `tests/test_projects_admission.py` keep paired pin/head assertions and independent runner-lock coverage.
 

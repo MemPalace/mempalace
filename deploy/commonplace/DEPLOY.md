@@ -174,7 +174,7 @@ uv run pytest -q -p no:cacheprovider tests/test_commonplace_deploy.py
 uv run ruff check .
 uv run ruff format --check .
 bash -n backup-hook.sh nightly-backup.sh deploy/commonplace/deploy.sh deploy/commonplace/backup-live-probe.sh
-shellcheck backup-hook.sh nightly-backup.sh deploy/commonplace/backup-live-probe.sh
+shellcheck backup-hook.sh nightly-backup.sh deploy/commonplace/deploy.sh deploy/commonplace/backup-live-probe.sh
 ```
 
 ## Deploy
@@ -194,7 +194,9 @@ sudo /srv/commonplace/deploy.sh
 
 Run the installed script as root after staging and pinning the release.
 There is no skip option. Install jq on the host (`apt install jq`); bash,
-GNU date, timeout, flock, curl, systemctl and docker compose are also required.
+GNU date, timeout, sleep, flock, curl, systemctl, systemd-run and docker compose
+are also required. systemd must support transient services with `Type=exec`
+(version 240 or newer).
 
 Set `COMMONPLACE_ROOT` to the operator directory (default `/srv/commonplace`).
 `COMMONPLACE_DEPLOY_ENV` defaults to `$COMMONPLACE_ROOT/deploy.env`.
@@ -228,7 +230,7 @@ Keep these aligned with the backup unit's configuration.
 The script performs these steps in order:
 
 1. Validate root, configuration, dependencies and files, then acquire a nonblocking deploy lock.
-2. Start the backup unit with `systemctl start --wait`, require a changed,
+2. Hold a reference to the backup unit, then start it with `systemctl start --wait`, require a changed,
    nonempty InvocationID and a successful Result. The unit must be loaded, Type=oneshot and RemainAfterExit=no. The start is
    bounded by DEPLOY_BACKUP_TIMEOUT (positive integer seconds, default 3600);
    the unit's own `TimeoutStartSec` must be finite and below it, or the deploy
@@ -236,16 +238,25 @@ The script performs these steps in order:
    `TimeoutStartSec=3h` and `DEPLOY_BACKUP_TIMEOUT=11400`.
    ExecMainStartTimestamp must independently be at or after deploy start.
    All clock comparisons use epoch seconds, matching systemd timestamp precision.
-   Missing InvocationID/Result state fails closed. A prerequisite is that the
-   inactive unit remains referenced, for example by an enabled timer, so systemd
-   does not unload it and discard InvocationID. Before using this script, inspect
-   `systemctl show -p Triggers <backup>.timer` to confirm the service reference,
-   and verify a completed backup leaves a nonempty InvocationID different from
-   its previous value (`systemctl show -p InvocationID <backup>.service`).
-   An empty post-run InvocationID reports that the unit was unloaded.
+   Missing InvocationID/Result state fails closed. The script creates a unique
+   transient `commonplace-deploy-proof-*.service` running `sleep infinity` with
+   `After=<backup>.service`. An active unit's dependency keeps the backup loaded
+   under [systemd's unit garbage collection rules](https://www.freedesktop.org/software/systemd/man/251/systemd.unit.html#Unit%20Garbage%20Collection).
+   `After=` only orders jobs; it does not start the backup. `Type=exec` makes
+   reference creation wait for successful execution of the holder, before reading
+   the previous InvocationID or starting the backup. This preserves execution
+   proof even when the timer is masked and the oneshot exits before start returns;
+   no polling or journal retention is needed. No enabled timer or persistent
+   reference is an operator precondition, and `RemainAfterExit=yes` is refused.
 3. Validate the latest snapshot: it must start at or after deploy start,
    be no more than 60 seconds ahead of the current clock, and be within MAX_AGE.
 4. Run the backup verification command and require success.
+   Require the backup to be inactive, then stop the reference holder before any
+   Compose call. An EXIT trap also stops it on failure, timeout, HUP, INT or TERM;
+   `--collect` lets systemd unload the stopped transient service. A failure to
+   create or release the holder fails the deploy. SIGKILL or a shell crash cannot
+   run a trap: inspect and stop any leftover `commonplace-deploy-proof-*.service`
+   before retrying.
 5. Validate Compose JSON so every published port binds to `127.0.0.1`,
    require the published port equals APP_PORT, run `up -d --build`, show `ps`,
    and print the health HTTP status. The health probe is informational and has

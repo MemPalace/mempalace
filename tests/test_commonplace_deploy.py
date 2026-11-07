@@ -535,21 +535,31 @@ def run_deploy(tmp_path, **fakes):
     import shutil
 
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for name in "jq date flock timeout bash".split():
+    bin_dir.mkdir(exist_ok=True)
+    for name in "jq date flock timeout bash rm kill sleep".split():
         executable = shutil.which(name)
         assert executable, f"required test dependency: {name}"
-        (bin_dir / name).symlink_to(executable)
+        if not (bin_dir / name).exists():
+            (bin_dir / name).symlink_to(executable)
     stat = bin_dir / "stat"
     stat.write_text(
         "#!/usr/bin/env bash\nprintf '%s\\n' " + shlex.quote(fakes.get("stat", "0 600")) + "\n"
     )
     stat.chmod(0o755)
     calls_file = tmp_path / "calls.jsonl"
+    previous_calls = len(calls_file.read_text().splitlines()) if calls_file.exists() else 0
     log = f'jq -cn --arg cmd "$0" --args \'[$cmd | split("/")[-1]] + $ARGS.positional\' -- "$@" >> {shlex.quote(str(calls_file))}\n'
     bodies = {
         "id": f"echo {fakes.get('uid', 0)}",
-        "systemctl": """case "$*" in
+        "systemctl": """# A masked timer holds no reference. Inactive unreferenced proof is lost.
+if [[ GC == yes && -f "$HOME/started" && ( ! -f "$HOME/reference" || ! -f "$HOME/proof" ) && "$1" == show ]]; then
+    case "$3" in InvocationID|Result|ExecMainStartTimestamp) exit 0 ;; esac
+fi
+case "$*" in
+"stop "commonplace-deploy-proof-*.service)
+    rm -f "$HOME/reference"
+    [[ GC != yes ]] || rm -f "$HOME/proof"
+    exit STOP_RC ;;
 "show -p LoadState --value test-backup.service") echo loaded ;;
 "show -p Type --value test-backup.service") echo oneshot ;;
 "show -p RemainAfterExit --value test-backup.service") echo REMAIN ;;
@@ -558,20 +568,38 @@ def run_deploy(tmp_path, **fakes):
 "is-active --quiet test-backup.service") exit ACTIVE ;;
 "show -p InvocationID --value test-backup.service")
     if [[ -f "$HOME/started" ]]; then echo AFTER; else echo BEFORE; fi ;;
-"start --wait test-backup.service") : > "$HOME/started"; exit START_RC ;;
+"start --wait test-backup.service")
+    n=0; [[ ! -f "$HOME/started" ]] || n=$(< "$HOME/started")
+    echo $((n + 1)) > "$HOME/started"
+    : > "$HOME/proof"
+    # Complete synchronously, before the client can sample a running unit.
+    START_BODY
+    exit START_RC ;;
 "show -p Result --value test-backup.service") echo RESULT ;;
 *) exit 97 ;;
 esac""".replace(
             "date -u +%Y-%m-%dT%H:%M:%S.%NZ",
             fakes.get("execution", "date -u +'%a %Y-%m-%d %H:%M:%S UTC'"),
         )
-        .replace("AFTER", fakes.get("after", "new"))
+        .replace("AFTER", fakes.get("after", '"invocation-$(< "$HOME/started")"'))
         .replace("BEFORE", "old")
+        .replace("START_BODY", fakes.get("start_body", ":"))
         .replace("START_RC", str(fakes.get("start_rc", 0)))
+        .replace("STOP_RC", str(fakes.get("stop_rc", 0)))
+        .replace("GC", "yes" if fakes.get("gc") else "no")
         .replace("RESULT", fakes.get("result", "success"))
         .replace("REMAIN", fakes.get("remain", "no"))
         .replace("UNIT_TIMEOUT", fakes.get("unit_timeout", "45min"))
         .replace("ACTIVE", str(fakes.get("active", 1))),
+        "systemd-run": """[[ "$*" == *"--property=After=test-backup.service"* ]]
+[[ "$*" == *"--property=Type=exec"* ]]
+[[ "$*" != *Wants=* && "$*" != *Requires=* && "$*" != *RemainAfterExit=* ]]
+[[ "$*" == *"--collect"* && "$*" == *"sleep infinity"* ]]
+printf '%s\\n' "$*" > "$HOME/reference"
+HOLD_SIGNAL
+exit HOLD_RC""".replace("HOLD_RC", str(fakes.get("hold_rc", 0))).replace(
+            "HOLD_SIGNAL", fakes.get("hold_signal", ":")
+        ),
         "docker": """if [[ "$*" == *"config --format json" ]]; then
  echo '{"services":{"commonplace":{"ports":[{"host_ip":"HOST_IP","published":"PUBLISHED"}]}}}'
 fi""".replace("HOST_IP", fakes.get("host_ip", "127.0.0.1")).replace(
@@ -621,18 +649,107 @@ fi""".replace("HOST_IP", fakes.get("host_ip", "127.0.0.1")).replace(
         timeout=30,
     )
     calls = (
-        [json.loads(line) for line in calls_file.read_text().splitlines()]
+        [json.loads(line) for line in calls_file.read_text().splitlines()[previous_calls:]]
         if calls_file.exists()
         else []
     )
     return result, calls
 
 
+def without_reference_calls(calls):
+    return [
+        call
+        for call in calls
+        if call[0] != "systemd-run" and not (call[:2] == ["systemctl", "stop"])
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
+@pytest.mark.parametrize(
+    "scenario",
+    ["masked", "failure", "missing", "old", "twice", "fast", "timeout"],
+)
+def test_deploy_sh_holds_invocation_proof(tmp_path, scenario):
+    # No enabled timer: the fake drops all execution properties on GC. A fast
+    # oneshot completes inside start, before any post-start show can observe it.
+    fakes = {"gc": True}
+    if scenario == "masked":
+        fakes["start_body"] = "sleep 0.05"
+    elif scenario == "failure":
+        fakes.update(start_rc=1, result="exit-code")
+    elif scenario == "missing":
+        fakes["after"] = ""
+    elif scenario == "old":
+        fakes["after"] = "old"
+    elif scenario == "timeout":
+        fakes.update(
+            start_body="sleep 3",
+            unit_timeout="500ms",
+            env={"DEPLOY_BACKUP_TIMEOUT": "2"},
+        )
+    for _ in range(2 if scenario == "twice" else 1):
+        result, calls = run_deploy(tmp_path, **fakes)
+        holds = [call for call in calls if call[0] == "systemd-run"]
+        assert len(holds) == 1, (result.stderr, calls)
+        hold = holds[0]
+        unit = next(arg.removeprefix("--unit=") for arg in hold if arg.startswith("--unit="))
+        stop = ["systemctl", "stop", unit]
+        assert stop in calls
+        assert not (tmp_path / "reference").exists()
+        assert not (tmp_path / "proof").exists()  # inactive unit is GC'd on release
+        start = ["systemctl", "start", "--wait", "test-backup.service"]
+        assert calls.index(hold) < calls.index(start) < calls.index(stop)
+        before = ["systemctl", "show", "-p", "InvocationID", "--value", "test-backup.service"]
+        assert calls.index(hold) < calls.index(before) < calls.index(start)
+        assert not any(
+            "timer" in arg or arg in {"unmask", "enable"} for call in calls for arg in call
+        )
+        if scenario in {"failure", "missing", "old", "timeout"}:
+            assert result.returncode == 1, result.stderr
+            assert result.stderr.startswith("[deploy] ERROR: backup:")
+            assert not any(call[0] in {"latest", "check", "docker"} for call in calls)
+        else:
+            assert result.returncode == 0, result.stderr
+            execution = [
+                "systemctl",
+                "show",
+                "-p",
+                "ExecMainStartTimestamp",
+                "--value",
+                "test-backup.service",
+            ]
+            assert calls.index(start) < calls.index(execution) < calls.index(["latest"])
+            assert calls.index(["latest"]) < calls.index(["check"]) < calls.index(stop)
+            assert calls.index(stop) < next(
+                i for i, call in enumerate(calls) if call[0] == "docker"
+            )
+    assert (tmp_path / "started").read_text().strip() == ("2" if scenario == "twice" else "1")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
+@pytest.mark.parametrize("signal", ["HUP", "INT", "TERM"])
+def test_deploy_sh_releases_reference_on_signal(tmp_path, signal):
+    result, calls = run_deploy(tmp_path, gc=True, hold_signal=f'kill -{signal} "$PPID"')
+    assert result.returncode == {"HUP": 129, "INT": 130, "TERM": 143}[signal]
+    assert not (tmp_path / "reference").exists()
+    assert any(call[:2] == ["systemctl", "stop"] for call in calls)
+    assert not any(call[0] == "docker" for call in calls)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="deploy.sh targets GNU/Linux hosts")
+def test_deploy_sh_reference_failure_is_closed(tmp_path):
+    result, calls = run_deploy(tmp_path, gc=True, hold_rc=1)
+    assert result.returncode == 1
+    assert "cannot hold backup unit reference" in result.stderr
+    assert not (tmp_path / "reference").exists()
+    assert not any(call[:2] == ["systemctl", "start"] or call[0] == "docker" for call in calls)
+
+
 def assert_deploy_failure(result, calls, step, prefix):
     assert result.returncode == 1, result.stderr
     assert result.stderr.startswith(f"[deploy] ERROR: {step}:")
     assert result.stderr.count("\n") == 1
-    assert [call[0] for call in calls] == prefix
+    assert [call[0] for call in without_reference_calls(calls)] == prefix
     assert not any(call[0] == "docker" for call in calls)
 
 
@@ -692,6 +809,7 @@ def test_deploy_sh_success_order(tmp_path):
     assert DEPLOY_SH.is_file()
     result, calls = run_deploy(tmp_path)
     assert result.returncode == 0, result.stderr
+    calls = without_reference_calls(calls)
     compose = [
         "docker",
         "compose",

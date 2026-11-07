@@ -195,6 +195,17 @@ Backups copy every SQLite file in the data directory (`commonplace/backup.py`).
 `restore()` publishes a verified copy into a new directory and leaves a restore
 marker there.
 
+Deploy (`deploy/commonplace/deploy.sh`) requires a new successful backup invocation,
+a fresh snapshot and backup verification before any Compose call. A transient
+sleep service with `After=<backup>.service` keeps the backup unit referenced from
+before invocation capture through validation, independently of an enabled timer.
+The ordering dependency does not trigger a backup; it prevents garbage collection
+from discarding even a fast oneshot's invocation and execution time. The holder
+uses `Type=exec`, is stopped before Compose, and is released by EXIT and signal
+traps on failure or timeout. Missing proof always refuses deployment. SIGKILL or
+a shell crash can leave a holder that the operator must stop before retrying;
+see the deployment runbook.
+
 ## Restore runbook
 
 1. Stop the service that uses the old data directory. Never run two services
