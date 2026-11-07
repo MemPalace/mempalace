@@ -12,6 +12,15 @@ def cmd_mine(args):
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
+    # Most specific layer of the configurable extension whitelist: these
+    # beat mempalace.yaml and config.json include/exclude_extensions. The
+    # miner normalizes and reports invalid suffixes.
+    include_extensions = []
+    for raw in getattr(args, "include_extension", None) or []:
+        include_extensions.extend(part.strip() for part in raw.split(",") if part.strip())
+    exclude_extensions = []
+    for raw in getattr(args, "exclude_extension", None) or []:
+        exclude_extensions.extend(part.strip() for part in raw.split(",") if part.strip())
 
     payload = {
         "source": os.path.abspath(os.path.expanduser(args.dir)),
@@ -28,6 +37,8 @@ def cmd_mine(args):
             "max_chunks_per_file",
             None,
         ),
+        "include_extensions": include_extensions,
+        "exclude_extensions": exclude_extensions,
         "redetect_origin": getattr(
             args,
             "redetect_origin",
@@ -172,6 +183,8 @@ def cmd_mine(args):
                 respect_gitignore=not args.no_gitignore,
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
+                include_extensions=include_extensions,
+                exclude_extensions=exclude_extensions,
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this

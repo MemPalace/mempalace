@@ -285,7 +285,7 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
     The pre-scan that produces the file-count estimate is reused as the
     mine input so we never walk the corpus twice.
     """
-    from ..miner import mine, scan_project
+    from ..miner import effective_readable_extensions, mine, scan_project
 
     project_dir = args.dir
     auto_mine = bool(getattr(args, "auto_mine", False))
@@ -293,9 +293,14 @@ def _maybe_run_mine_after_init(args, cfg) -> None:
     # Single corpus walk: this scan feeds BOTH the "what would be mined"
     # estimate the user sees in the prompt AND the file list mine() will
     # process. We pass the result into mine() via the `files` kwarg so it
-    # doesn't re-walk the tree.
+    # doesn't re-walk the tree. The scan honors the configured extension
+    # layers (config.json include/exclude_extensions, mempalace.yaml) so
+    # the estimate matches what the mine files.
     try:
-        scanned_files = scan_project(project_dir)
+        scanned_files = scan_project(
+            project_dir,
+            readable_extensions=effective_readable_extensions(project_dir),
+        )
         file_count = len(scanned_files)
         total_bytes = 0
         for fp in scanned_files:

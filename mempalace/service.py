@@ -261,6 +261,8 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 respect_gitignore=not bool(payload.get("no_gitignore")),
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
+                include_extensions=payload.get("include_extensions"),
+                exclude_extensions=payload.get("exclude_extensions"),
                 files=files,
             )
         else:
