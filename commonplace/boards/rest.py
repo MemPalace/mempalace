@@ -1,6 +1,8 @@
 """Contract REST routes; all policy and state changes run in BoardService."""
 
 import sqlite3
+from dataclasses import dataclass
+from urllib.parse import quote
 
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.rules.enforce import RulesRefresh, rest_write
@@ -16,7 +18,7 @@ from ._http import (
 )
 from .digest import ssml
 from .display import NEEDS, with_urls
-from .service import BoardService, ParentError, VersionClash
+from .service import BoardService, ParentError, SpaceError, VersionClash
 from .store import CardRefused
 
 OPEN_LIMIT, OPEN_LIMIT_MAX = 200, 500
@@ -28,6 +30,23 @@ def read_json(h):
     return body
 
 
+@dataclass
+class SpaceResponse:
+    status: int
+    payload: dict
+    headers: dict | None = None
+
+
+def space_projection(service, row):
+    return {
+        **{k: row[k] for k in ("slug", "name", "wing", "coordinator", "counts")},
+        "can_configure": service.principal.person and service.principal.role == "owner",
+        "open_url": "/app/#/board/" + quote(row["slug"], safe=""),
+        "version": 1,
+        "deleted": False,
+    }
+
+
 def install(gateway):
     def route(h):
         principal = require_principal(gateway, h)
@@ -35,6 +54,19 @@ def install(gateway):
             return
         parts = path_parts(h, "/api/")
         method = h.command
+        if parts and parts[0] == "spaces":
+            try:
+                service = BoardService(ToolContext(principal=principal, gateway=gateway))
+                response = dispatch(service, h, parts, method)
+            except RulesRefresh as exc:
+                send_json(h, 428, exc.payload)
+            except SpaceError as exc:
+                send_json(h, exc.status, {"error": exc.code})
+            except HTTPError as exc:
+                send_json(h, exc.status, {"error": str(exc)})
+            else:
+                send_json(h, response.status, response.payload, response.headers)
+            return
         try:
             service = BoardService(ToolContext(principal=principal, gateway=gateway))
             status, result = dispatch(service, h, parts, method)
@@ -87,7 +119,7 @@ def install(gateway):
             send_json(h, status, with_urls(service.ctx, result))
 
     for method in ("GET", "POST", "PATCH", "DELETE"):
-        for prefix in ("/api/boards/", "/api/cards/", "/api/needs-me/"):
+        for prefix in ("/api/boards/", "/api/cards/", "/api/needs-me/", "/api/spaces/"):
             gateway.add_prefix_route(method, prefix, route)
 
 
@@ -181,6 +213,45 @@ def _card_route(service, h, parts, method):
 
 
 def dispatch(service, h, parts, method):
+    if parts and parts[0] == "spaces":
+        if len(parts) not in (1, 2):
+            raise HTTPError(404, "not_found")
+        collection = len(parts) == 1
+        if (collection and method not in ("GET", "POST")) or (not collection and method != "GET"):
+            return SpaceResponse(
+                405,
+                {"error": "method_not_allowed"},
+                {"Allow": "GET, POST" if collection else "GET"},
+            )
+        if "Idempotency-Key" in h.headers:
+            raise HTTPError(400, "unsupported_idempotency")
+        if "include_deleted" in query(h):
+            raise HTTPError(400, "unsupported_include_deleted")
+        if method == "POST":
+            try:
+                body = _read_json(h)
+            except HTTPError as exc:
+                if exc.status == 400:
+                    raise HTTPError(400, "invalid_arguments") from exc
+                raise
+            if (
+                set(body) - {"slug", "name", "wing", "repo"}
+                or not isinstance(body.get("slug"), str)
+                or any(value is not None and not isinstance(value, str) for value in body.values())
+            ):
+                raise HTTPError(400, "invalid_arguments")
+            with rest_write(service.ctx, h, "board_add", body):
+                return SpaceResponse(201, space_projection(service, service.board_add(**body)))
+        if collection:
+            return SpaceResponse(
+                200,
+                {
+                    "spaces": [
+                        space_projection(service, row) for row in service.board_list(top_level=True)
+                    ]
+                },
+            )
+        return SpaceResponse(200, space_projection(service, service.space_metadata(parts[1])))
     if len(parts) in (2, 3) and parts[0] == "boards":
         routed = _space_route(service, h, parts, method)
         if routed:

@@ -109,7 +109,7 @@ PREFIX = {
     **{
         (method, prefix): "authenticated"
         for method in ("GET", "POST", "PATCH", "DELETE")
-        for prefix in ("/api/boards/", "/api/cards/", "/api/needs-me/")
+        for prefix in ("/api/boards/", "/api/cards/", "/api/needs-me/", "/api/spaces/")
     },
     **{(method, "/api/rules/"): "authenticated" for method in ("GET", "POST", "PATCH")},
     ("GET", "/api/memory/"): "authenticated",
@@ -761,6 +761,9 @@ def test_mcp_failure_preserves_rpc_envelope_without_exception_text(surface, capl
 
 
 REST_TOOLS = [
+    ("GET", "/api/spaces", "board_list"),
+    ("POST", "/api/spaces", "board_add"),
+    ("GET", "/api/spaces/work", "board_list"),
     ("GET", "/api/boards", "board_list"),
     ("POST", "/api/boards", "board_add"),
     ("GET", "/api/boards/work/cards", "task_list"),

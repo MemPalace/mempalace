@@ -833,3 +833,38 @@ appears in the owner queue again without changing its stored words or audit log.
 ### Compatibility fixture coverage boundary
 
 - The overlaid board definitions share schemas between baseline and current servers; the strict fixture protects visibility, HTTP and audit compatibility, while focused card tests cover opt-in schema fields.
+
+### Canonical Space REST foundation
+
+`GET /api/spaces` lists `{spaces:[Space]}`, `POST /api/spaces` creates a `Space`
+with status 201, and `GET /api/spaces/<slug>` reads metadata. A Space contains
+`slug`, `name`, `wing`, `coordinator`, top-level status `counts`, `can_configure`,
+`open_url`, `version:1` and `deleted:false`. `open_url` points to
+`/app/#/board/<encoded slug>`; only a signed-in workspace owner person has
+`can_configure:true`. Legacy board responses remain supported.
+
+The existing board row is the Space. Board, Memory and Chat are views of that
+Space, with Board as the default view. Identity is the authenticated workspace and
+exact slug; no new identity object or identity migration is needed.
+List retains claim expiry; metadata is a plain active-row read without expiry,
+transactions, orchestration, seats, settings or credential creation.
+`POST /api/spaces` creates through `board_add`, preserving board authorization,
+the transaction and the `space_created` event with `data.board`.
+Non-person callers must pass the existing board tool visibility gate. Checked
+create accepts freshness only through `Commonplace-Rules-Seq`; refresh failures
+retain status 428 and their original payload. Optional null name/wing/repo use
+slug/shared/no-repo defaults; distinct slugs may share a name.
+
+Canonical validation is 400 `invalid_arguments`; policy or seat refusal is 403
+`forbidden`; missing, hidden or archived metadata is 404 `space_not_found`.
+Readable slug/repo collisions are 409 `space_exists` / `repo_assigned`, including
+archived reservations. Hidden slug collisions are concealed as 404 and hidden repo
+owners produce 403 without identity details. These different outcomes do not
+eliminate existence oracles. Unknown subpaths are 404 `not_found`; collection
+PATCH/DELETE and item POST/PATCH/DELETE are 405 `method_not_allowed` with
+`Allow: GET, POST` or `Allow: GET`. Unregistered methods retain gateway errors.
+An Idempotency-Key or include_deleted query is rejected with 400
+`unsupported_idempotency` or `unsupported_include_deleted`.
+
+Rename, archive, versions/retries/tombstones, project adapters, MCP/UI vocabulary,
+new-user migration and desktop synchronization are deferred.

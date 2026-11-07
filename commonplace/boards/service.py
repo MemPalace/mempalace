@@ -78,6 +78,46 @@ class WingRefused(ToolError):
         super().__init__(json.dumps(self.payload))
 
 
+class SpaceError(ToolError):
+    """Typed creation/read refusal; the legacy message remains unchanged."""
+
+    def __init__(self, status, code, message):
+        self.status, self.code = status, code
+        super().__init__(message)
+
+
+class SpaceInvalid(SpaceError):
+    def __init__(self, message):
+        super().__init__(400, "invalid_arguments", message)
+
+
+class SpaceForbidden(SpaceError):
+    def __init__(self, message):
+        super().__init__(403, "forbidden", message)
+
+
+class SpaceMissing(SpaceError):
+    def __init__(self, message="no: board not found"):
+        super().__init__(404, "space_not_found", message)
+
+
+class SpaceExists(SpaceError):
+    def __init__(self, message="no: board already exists"):
+        super().__init__(409, "space_exists", message)
+
+
+class RepoAssigned(SpaceError):
+    def __init__(self, message="no: repo is already assigned"):
+        super().__init__(409, "repo_assigned", message)
+
+
+def _space_value(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except (ToolError, ValueError) as exc:
+        raise SpaceInvalid(str(exc)) from exc
+
+
 class VersionClash(ToolError):
     def __init__(self, current):
         super().__init__("no: card changed")
@@ -1218,35 +1258,41 @@ class BoardService:
     def _add_board(self, conn, *, slug, name=None, wing=None, repo=None, bootstrap=False):
         p = self.principal
         if self._is_seat:
-            raise ToolError("no: seat_cannot_create_boards")
+            raise SpaceForbidden("no: seat_cannot_create_boards")
         if not bootstrap and not p.person and p.policy.trust != "trusted":
-            raise ToolError("no: only an owner or trusted connection can create a board")
-        slug = validate_text(slug, "slug", required=True, limit=100)
+            raise SpaceForbidden("no: only an owner or trusted connection can create a board")
+        slug = _space_value(validate_text, slug, "slug", required=True, limit=100)
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", slug):
-            raise ToolError("no: slug must use lowercase letters, numbers, underscores or hyphens")
+            raise SpaceInvalid(
+                "no: slug must use lowercase letters, numbers, underscores or hyphens"
+            )
         existing = conn.execute("SELECT * FROM boards WHERE slug=?", (slug,)).fetchone()
         if existing is not None and not p.policy.can_read_wing(existing["wing"]):
-            raise ToolError("no: board not found")
-        wing = validate_text(
-            wing if wing is not None else "shared", "theme", required=True, limit=200
+            raise SpaceMissing()
+        wing = _space_value(
+            validate_text, wing if wing is not None else "shared", "theme", required=True, limit=200
         )
         if (
             not p.policy.has_scope("memory:write")
             or not p.policy.can_read_wing(wing)
             or (wing != "shared" and not p.policy.can_write_wing(wing))
         ):
-            raise ToolError("no: this connection cannot create this board")
+            raise SpaceForbidden("no: this connection cannot create this board")
         if existing is not None:
-            raise ToolError("no: board already exists")
-        name = validate_text(name if name is not None else slug, "name", required=True, limit=1000)
-        normalized_repo = normalize_repo(repo) if repo is not None else None
-        if (
-            normalized_repo
-            and conn.execute(
-                "SELECT 1 FROM board_repos WHERE repo=?", (normalized_repo,)
+            raise SpaceExists()
+        name = _space_value(
+            validate_text, name if name is not None else slug, "name", required=True, limit=1000
+        )
+        normalized_repo = _space_value(normalize_repo, repo) if repo is not None else None
+        if normalized_repo:
+            owner = conn.execute(
+                "SELECT b.wing FROM board_repos r JOIN boards b ON b.id=r.board_id WHERE r.repo=?",
+                (normalized_repo,),
             ).fetchone()
-        ):
-            raise ToolError("no: repo is already assigned")
+            if owner is not None:
+                if not p.policy.can_read_wing(owner["wing"]):
+                    raise SpaceForbidden("no: repo is already assigned")
+                raise RepoAssigned()
         cur = conn.execute(
             "INSERT INTO boards(slug,name,wing,stamp_user,stamp_connection,stamp_trust,created_at) "
             "VALUES (?,?,?,?,?,?,?)",
@@ -1515,6 +1561,33 @@ class BoardService:
                                 summary[reason["code"]] += 1
                         result[-1]["waiting"] = summary
             return result
+
+    def space_metadata(self, slug):
+        """Exact active workspace row and counts, without write/expiry machinery."""
+        with self.store.connection() as conn:
+            board = conn.execute(
+                "SELECT * FROM boards WHERE slug=? AND archived=0", (slug,)
+            ).fetchone()
+            if board is None or not self.principal.policy.can_read_wing(board["wing"]):
+                raise SpaceMissing()
+            counts = dict.fromkeys(STATUSES, 0)
+            counts.update(
+                {
+                    r["status"]: r["n"]
+                    for r in conn.execute(
+                        "SELECT status,count(*) n FROM tasks WHERE board_id=? "
+                        "AND parent_number IS NULL GROUP BY status",
+                        (board["id"],),
+                    )
+                }
+            )
+            return {
+                "slug": board["slug"],
+                "name": board["name"],
+                "wing": board["wing"],
+                "coordinator": board["coordinator"],
+                "counts": counts,
+            }
 
     def board_add(self, slug, name=None, wing=None, repo=None):
         with self.transaction() as conn:

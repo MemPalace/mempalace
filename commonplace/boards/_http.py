@@ -28,18 +28,22 @@ def read_json(h) -> dict:
     return value
 
 
-def send_text(h, status, text, content_type):
+def send_text(h, status, text, content_type, headers=None):
     body = text.encode("utf-8")
     h.send_response(status)
     h.send_header("Content-Type", content_type)
     h.send_header("Content-Length", str(len(body)))
     h.send_header("Cache-Control", "no-store")
+    for name, value in (headers or {}).items():
+        h.send_header(name, value)
     h.end_headers()
     h.wfile.write(body)
 
 
-def send_json(h, status, obj):
-    send_text(h, status, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+def send_json(h, status, obj, headers=None):
+    send_text(
+        h, status, json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8", headers
+    )
 
 
 def require_principal(gateway, h):

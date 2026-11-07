@@ -568,7 +568,11 @@ def test_checked_rest_shapes_refuse_then_accept_fresh_header(env, http, route):
     owner_board = BoardService(env.owner.ctx)
     original_card = owner_board.task_show(card["number"])
     before = events.latest_seq(env.db, env.workspace)
-    body = {**bodies[route.tool], "rules_seq": seq}
+    body = (
+        {**bodies[route.tool], "slug": "canonical-new"}
+        if route.path == "/api/spaces"
+        else {**bodies[route.tool], "rules_seq": seq}
+    )
     status, response, _ = http(route.method, path, body)
     assert status == 428 and response == {
         "error": enforce.MESSAGES["missing"],
