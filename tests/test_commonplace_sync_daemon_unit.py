@@ -69,8 +69,15 @@ class State:
             for (s, p, n), value in self.status.items()
         ]
 
-    def retry_rejected(self):
-        self.marked = {op: status for op, status in self.marked.items() if status != "revoked"}
+    def retry_rejected(self, *, exclude_legacy=False):
+        from commonplace.sync_state import eligible
+
+        allowed = {op.op_id for op in self.pending if not exclude_legacy or eligible(op)}
+        self.marked = {
+            op: status
+            for op, status in self.marked.items()
+            if status != "revoked" or op not in allowed
+        }
 
     def outbox_all(self):
         return [replace(op, state=self.marked.get(op.op_id, "pending")) for op in self.pending]
@@ -241,9 +248,10 @@ def setup(tmp_path, monkeypatch):
     state = State(tmp_path / "state.db")
     config = {
         "hub": "https://sync.example",
+        "consent": {"version": 1, "hub": "https://sync.example"},
+        "memories": [],
         "tokens": {TOKEN_ENV["claude-code"]: TOKEN, TOKEN_ENV["native-memory"]: TOKEN},
         "sources": [],
-        "memories": [],
     }
     now = [datetime(2026, 11, 4, tzinfo=timezone.utc).timestamp()]
     monkeypatch.setattr(plans, "_now", lambda: datetime.fromtimestamp(now[0], timezone.utc))
@@ -319,11 +327,12 @@ def test_fresh_state_database_adopts_grown_server_cursor_before_push(setup):
 
 
 def test_capture_precedes_memory_and_cycle_end_is_frozen(setup):
-    sources, _, _, _ = setup
+    sources, state, _, _ = setup
     sources.memory = True
     hub = Hub()
     assert once(setup, hub) == 0
-    assert [route for route, _ in hub.posts] == ["/api/capture", "/api/import"]
+    assert [route for route, _ in hub.posts] == ["/api/capture"]
+    assert any(op.kind == "import" for op in state.pending)
     assert all(target == sources.targets[0] for target in sources.targets)
 
 
@@ -435,9 +444,15 @@ def test_install_inert_then_private_configuration(tmp_path, monkeypatch, capsys)
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     before = list(home.rglob("*"))
-    assert cli.main(["sync", "install", "--source", "claude-code"]) == 0
+    assert (
+        cli.main(["sync", "install", "--source", "claude-code", "--hub", "https://sync.example"])
+        == 0
+    )
     assert list(home.rglob("*")) == before
-    assert "--enable" in capsys.readouterr().out
+    preview = capsys.readouterr().out
+    assert "--enable" in preview
+    assert str(home) not in preview
+    assert TOKEN not in preview
     env = tmp_path / "client.env"
     env.write_text(
         "COMMONPLACE_URL=https://sync.example\nCOMMONPLACE_CAPTURE_TOKEN_CLAUDE_CODE="
@@ -483,6 +498,8 @@ def test_bad_environment_mode_and_cursor_install_write_nothing(tmp_path, monkeyp
                 "claude-code",
                 "--enable",
                 "--no-service",
+                "--hub",
+                "https://sync.example",
                 "--env-file",
                 str(env),
             ]
@@ -571,27 +588,86 @@ def test_rollback_feed_and_client_op_fallback_keep_capture_working(setup):
 
 def test_private_config_mode_is_checked_before_opening_state(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
-    assert cli.main(["sync", "install", "--source", "claude-code", "--enable", "--no-service"]) == 0
+    assert (
+        cli.main(
+            [
+                "sync",
+                "install",
+                "--source",
+                "claude-code",
+                "--enable",
+                "--no-service",
+                "--hub",
+                "https://sync.example",
+            ]
+        )
+        == 0
+    )
     config = tmp_path / ".commonplace/sync/config.json"
     config.chmod(0o644)
     assert cli.main(["sync", "run", "--once"]) == 2
     assert not (config.parent / "state.db").exists()
 
 
-def test_missing_selected_token_is_a_configuration_error(setup):
+def test_missing_selected_token_is_a_configuration_error(setup, monkeypatch):
+    _, state, config, _ = setup
+    # A usable feed credential lets initialization reach the selected Claude stream.
+    config["tokens"] = {TOKEN_ENV["codex"]: TOKEN}
+    initialized = []
+    original = sync_daemon._Session.initialize
+
+    def initialize(session, *args, **kwargs):
+        initialized.append(session.feed_env)
+        return original(session, *args, **kwargs)
+
+    monkeypatch.setattr(sync_daemon._Session, "initialize", initialize)
+    hub = Hub()
+    error = None
+    try:
+        once(setup, hub)
+    except sync_daemon.ConfigError as exc:
+        error = str(exc)
+    assert error == "Missing capture token environment variable"
+    assert initialized == [TOKEN_ENV["codex"]]
+    assert all(
+        method == "GET" and route.startswith("/api/events?") for method, route, _ in hub.calls
+    )
+    assert hub.posts == []
+    assert not state.outbox_pending()
+
+
+def test_import_only_token_is_not_a_feed_credential(setup, monkeypatch):
     _, state, config, _ = setup
     config["tokens"] = {TOKEN_ENV["native-memory"]: TOKEN}
-    with pytest.raises(sync_daemon.ConfigError):
-        once(setup, Hub())
+    initialized = []
+    original = sync_daemon._Session.initialize
+
+    def initialize(session, *args, **kwargs):
+        initialized.append(session.feed_env)
+        return original(session, *args, **kwargs)
+
+    monkeypatch.setattr(sync_daemon._Session, "initialize", initialize)
+    hub = Hub()
+    error = None
+    try:
+        once(setup, hub)
+    except sync_daemon.ConfigError as exc:
+        error = str(exc)
+    assert error == "Set a sync token environment variable"
+    assert initialized == []
+    assert hub.calls == []
     assert not state.outbox_pending()
 
 
 def test_memory_only_install_does_not_select_unrequested_transcripts(tmp_path, monkeypatch):
+    from commonplace import sync_cli
+
     monkeypatch.setenv("HOME", str(tmp_path))
-    assert cli.main(["sync", "install", "--memory", "notes=notes", "--enable", "--no-service"]) == 0
-    config = json.loads((tmp_path / ".commonplace/sync/config.json").read_text())
-    assert config["sources"] == []
-    assert config["memories"][0]["label"] == "notes"
+    calls = []
+    monkeypatch.setattr(sync_cli, "_selections", lambda *a: (calls.append(1), ([], []))[1])
+    assert cli.main(["sync", "install", "--memory", "notes=notes", "--enable", "--no-service"]) == 2
+    assert not (tmp_path / ".commonplace/sync/config.json").exists()
+    assert calls == []
 
 
 class ManySources:
@@ -649,6 +725,8 @@ def backfill_setup(tmp_path, monkeypatch):
     state = State(tmp_path / "state.db")
     config = {
         "hub": "https://sync.example",
+        "consent": {"version": 1, "hub": "https://sync.example"},
+        "memories": [],
         "tokens": {TOKEN_ENV["claude-code"]: TOKEN},
     }
     now = [10000.0]
@@ -827,7 +905,12 @@ def test_capture_off_does_not_end_backfill(backfill_setup):
 def test_backfill_budget_survives_real_state_reopen(tmp_path):
     from commonplace import sync_state
 
-    config = {"hub": "https://sync.example", "tokens": {TOKEN_ENV["claude-code"]: TOKEN}}
+    config = {
+        "hub": "https://sync.example",
+        "consent": {"version": 1, "hub": "https://sync.example"},
+        "memories": [],
+        "tokens": {TOKEN_ENV["claude-code"]: TOKEN},
+    }
     path = tmp_path / "durable.db"
     now = [10000.0]
     with sync_state.open_state(path) as state:

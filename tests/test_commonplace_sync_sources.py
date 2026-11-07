@@ -50,45 +50,13 @@ def test_memory_versions_ride_window_onboard_skipped(hub, start):
             h.origin,
         ]
     )
-    assert rc == 0  # COUNTED:L15
+    assert rc == 2  # COUNTED:L15
     reached("L15")
-    from commonplace.onboarding import POINTER
-
-    (root / "pointer.md").write_text(POINTER)
-    original = "synthetic previously onboarded memory"
-    (root / "original.md").write_text(original)
-    manifest = h.home / ".commonplace/onboarding.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "files": {
-                    str(root / "original.md"): {
-                        "original_sha256": sha(original.encode()),
-                        "pointer_sha256": sha(POINTER.encode()),
-                        "backup": str(root / "original.md"),
-                    }
-                },
-            }
-        )
-    )
-    for path in root.iterdir():
-        os.utime(path, (stable_at, stable_at))
-    assert h.cli(["sync", "run", "--once"]) == 0
-    rows = [r for r in h.imports(p) if r["source"] == "native-memory"]
-    assert len(rows) == 1
-    assert h.read(p, rows[0]["stored_thread_id"]) == text.encode()
-    changed = text + "\nnew version"
-    note.write_text(changed, newline="")
-    h.at(start + 901)
-    stable_at = h.now.timestamp() - 120
-    os.utime(note, (stable_at, stable_at))
-    assert h.cli(["sync", "run", "--once"]) == 0
-    rows = [r for r in h.imports(p) if r["source"] == "native-memory"]
-    assert len(rows) == 2
-    assert {h.read(p, row["stored_thread_id"]) for row in rows} == {text.encode(), changed.encode()}
-    assert h.cli(["sync", "run", "--once"]) == 0
-    assert [r for r in h.imports(p) if r["source"] == "native-memory"] == rows
+    assert not (h.home / ".commonplace/sync/config.json").exists()
+    assert not h.fake_log.exists()
+    assert [r for r in h.imports(p) if r["source"] == "native-memory"] == []
+    assert note.read_bytes() == text.encode()
+    assert (sroot / "session.jsonl").read_bytes() == raw(records("S"))
 
 
 def test_cursor_unsupported_and_probe_structure_only(hub, capsys):

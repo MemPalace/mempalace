@@ -1,6 +1,6 @@
 # Live sync
 
-Live sync uploads selected Claude Code and Codex transcripts and memory files
+Live sync uploads selected Claude Code and Codex transcripts
 verbatim to your Commonplace gateway. Choose a remote gateway only if you want
 those files uploaded there. T3 sessions use their underlying native transcript
 roots. Cursor supports structure-only inspection with
@@ -10,9 +10,9 @@ roots. Cursor supports structure-only inspection with
 
 Enable capture as the workspace owner with
 `POST /api/settings/capture` and `{"enabled":true}`. Use a matching Claude Code
-or Codex connection with `memory:write`. Memory files need an import-enabled
-connection in your personal workspace. See [capture](transcript-capture.md) and
-[import permissions](one-time-import.md#import-only-connection).
+or Codex connection with `memory:write`. See [capture](transcript-capture.md).
+Normal consented server imports remain available separately through
+[one-time import](one-time-import.md).
 
 Create a private environment file (mode `0600`) containing only the credentials
 you need, as shell-compatible `NAME='value'` lines:
@@ -20,7 +20,6 @@ you need, as shell-compatible `NAME='value'` lines:
 ```text
 COMMONPLACE_CAPTURE_TOKEN_CLAUDE_CODE='your Claude Code connection token'
 COMMONPLACE_CAPTURE_TOKEN_CODEX='your Codex connection token'
-COMMONPLACE_IMPORT_TOKEN='your import-enabled connection token'
 ```
 
 Use an absolute environment-file path. Preview the installation first:
@@ -38,11 +37,11 @@ Installation never edits client hooks. Keep the Python environment installed
 at the same location so the service can restart.
 
 `--source claude-code:ROOT` and `--source codex:ROOT` narrow selection; defaults
-are `~/.claude/projects` and `~/.codex/sessions`. Add
-`--memory notes=ROOT` to sync Markdown files, or `--memory 'notes=ROOT:**/*.txt'`
-for another pattern. Memory selection skips recently modified files (60 seconds),
-files over 400,000 bytes, Commonplace's own data and onboarding pointer files.
+are `~/.claude/projects` and `~/.codex/sessions`.
 Native scans skip symlinks and wait for complete records.
+Legacy `--memory` synchronization is disabled; memory-once is not available yet.
+Memory roots are not inspected, even when retained in old configuration.
+
 
 For a foreground pass, load the environment file into your shell and run
 `commonplace sync run --once`. `commonplace sync run` runs continuously;
@@ -51,24 +50,50 @@ of command arguments and shared logs. Configuration and the durable local
 outbox live under `~/.commonplace/sync/`, with private permissions; the outbox
 stores references and hashes, not transcript text or credentials.
 
+## Destination consent and upgrading
+
+Choose a destination explicitly with `--hub` or `COMMONPLACE_URL` in your shell
+or private environment file. There is no hosted default. A supplied environment
+file must be private even when `--hub` is present. Preview needs neither an
+environment file nor `--no-service`; it reports counts and source types only.
+
+An enabled transcript-only installation saves `consent` in the existing local
+`config.json`: version 1 and the validated exact hub string. Tokens are excluded.
+Unmarked configurations, configured memory selections and changed destinations
+exit 2 before token loading or state access. Reinstall explicitly to consent to
+an endpoint change, including spelling changes; an identical run override works.
+This binds only the endpoint: a different workspace token at the same hub is still
+possible. Workspace/principal and token-rotation binding remain future work.
+
+All existing stores and SQLite schema remain unchanged. Disabled legacy outbox
+rows remain intact, without reads, retries or acknowledgements. Status excludes
+them from pending and parked counts, reports `Disabled legacy operations: N`,
+and labels native-memory sources `disabled; coverage unverified`, even if a stored
+status says ready. Status inspection does not mark backfill complete.
+
+Stop old processes before updating, then explicitly reinstall transcript-only or
+uninstall. Updating files alone does not protect a running old process. Existing
+systemd and launchd restart policies retry rejected old configs until reinstall
+or uninstall; service definitions are unchanged. This safety stop does not prove
+memory coverage or activate replacement import, runner, Mac or Grok routes.
+
 ## Timing and recovery
 
 Free opens one account-wide upload window every 900 seconds; captures on other
 streams can join it for 60 seconds, and each stream still waits 900 seconds
 between appends. After a one-time import, live uploads may wait up to 900
-seconds. A refused import still consumes that slot, and memory-only uploads
-use it too. Paid and unrestricted self-hosted instances send changes immediately,
+seconds. A refused import still consumes that slot. Paid and unrestricted self-hosted instances send changes immediately,
 within the server's write budget. Continuous sync checks files every two seconds;
 it does not stream individual tokens.
 
-Continuous `sync run` gets one backfill phase per hub and local state, including
-existing installs on upgrade. It uses the normal 120 attempts per hour first,
+Continuous `sync run` gets one backfill phase per hub and local state, after an explicit transcript-only reinstall for older configurations. It uses the normal 120 attempts per hour first,
 then adds at most one backfill attempt every 2 seconds (with an immediate
 legacy-format retry if required), up to 5,000 additional attempts in total.
 It ends once at least one selected session has a known cursor and every selected
 session is caught up or refused, or the cap is reached. Workspace capture being
 off does not end backfill. Conflict, paused, and revoked queued rows do not keep
-backfill alive; revoked rows are retried once after each daemon restart.
+backfill alive; eligible revoked transcript rows are retried once after each daemon restart.
+Retained legacy memory operations never keep backfill active or consume its allowance.
 Transient failures retain the normal retry backoff.
 After catch-up or the cap, only the normal hourly budget applies; unused hourly
 slots remain available immediately. Backfill never restarts. `run --once` uses
@@ -114,7 +139,7 @@ without a newline is accepted. Exact bytes remain available in every case.
 
 Uploads and Memory indexing have separate progress. After an accepted capture
 append or exact retry, background indexing catches up the whole stored session.
-Imports, including memory-file imports, are also indexed in the background.
+Normal server imports are also indexed in the background; legacy client memory sync is disabled.
 Searchable text keeps the original words; a hit's `source.thread` can point to
 the shared session rather than an individual import.
 

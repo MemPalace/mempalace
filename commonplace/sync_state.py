@@ -34,6 +34,11 @@ class Op:
     attempts: int = 0
 
 
+def eligible(op):
+    """Legacy memory operations stay stored but are never active client work."""
+    return op.kind != "import" and op.source != "native-memory"
+
+
 def body_digest(body):
     return hashlib.sha256(
         json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -133,15 +138,19 @@ class State:
             (kind, str(path), info.st_size, info.st_mtime_ns, json.dumps(value)),
         )
 
-    def retry_rejected(self):
+    def retry_rejected(self, *, exclude_legacy=False):
+        clause = " AND kind != 'import' AND source != 'native-memory'" if exclude_legacy else ""
         with self.transaction():
             self.conn.execute(
                 "UPDATE source_status SET status='pending' WHERE EXISTS "
                 "(SELECT 1 FROM outbox WHERE state IN ('revoked') "
-                "AND outbox.source=source_status.source AND outbox.path=source_status.path "
+                + clause
+                + " AND outbox.source=source_status.source AND outbox.path=source_status.path "
                 "AND outbox.native_id=source_status.native_id)"
             )
-            self.conn.execute("UPDATE outbox SET state='pending' WHERE state IN ('revoked')")
+            self.conn.execute(
+                "UPDATE outbox SET state='pending' WHERE state IN ('revoked')" + clause
+            )
 
     def close(self):
         self.conn.close()

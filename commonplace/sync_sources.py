@@ -11,18 +11,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .capture_client import CHUNK_BYTES, MAX_RECORD_BYTES, CaptureError, files
-from .onboarding import POINTER
 from .sync_protocol import (
     CURSOR_MESSAGE,
     MEMORY_FORMAT,
     MEMORY_IMPORT_SOURCE,
     PROBE_KEY_ALLOWLIST,
     TRANSCRIPT_SOURCES,
-    memory_thread_id,
     native_identity,
     native_source,
 )
-from .sync_state import Op, body_digest
+from .sync_state import Op, body_digest, eligible
 
 MEMORY_BYTES = 400_000
 
@@ -242,63 +240,8 @@ def _manifest_hashes(home, state=None):
 
 
 def _memory_ops(config, state, now, targets):
-    if not config.get("memories"):
-        return
-    home = Path(config.get("home", Path.home())).absolute()
-    private = home / ".commonplace"
-    try:
-        originals = _manifest_hashes(home, state)
-    except SourceError:
-        state.set_status(MEMORY_IMPORT_SOURCE, home, "", "unreadable")
-        return
-    for selected in config.get("memories", []):
-        root = Path(selected["root"]).expanduser().absolute()
-        if any(p.is_symlink() for p in (root, *root.parents)) or not root.is_dir():
-            state.set_status(MEMORY_IMPORT_SOURCE, root, "", "unreadable")
-            continue
-        for path in sorted(root.glob(selected.get("glob", "**/*.md"))):
-            try:
-                if path == private or private in path.parents:
-                    continue
-                if any(p.is_symlink() for p in (path, *path.parents)) or not path.is_file():
-                    continue
-                before = path.stat()
-                if before.st_size > MEMORY_BYTES:
-                    state.set_status(MEMORY_IMPORT_SOURCE, path, "", "too_large")
-                    continue
-                if now - before.st_mtime < 60:
-                    continue
-                if targets is not None and targets.get(str(path)) != before.st_size:
-                    continue
-                digest = state.cached_file("memory", path, before)
-                label, relpath = selected["label"], path.relative_to(root).as_posix()
-                if digest and (
-                    digest in originals
-                    or digest
-                    in (
-                        hashlib.sha256(POINTER.encode()).hexdigest(),
-                        hashlib.sha256(b"").hexdigest(),
-                    )
-                    or state.memory_seen(label, relpath, digest)
-                ):
-                    continue
-                with _open(path) as stream:
-                    raw = stream.read(MEMORY_BYTES + 1)
-                    after = os.fstat(stream.fileno())
-                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                    continue
-                digest = hashlib.sha256(raw).hexdigest()
-                if raw:
-                    raw.decode("utf-8")
-                state.cache_file("memory", path, before, digest)
-                if not raw or raw == POINTER.encode() or digest in originals:
-                    continue
-                native_id = memory_thread_id(label, relpath, digest)
-                op = _op("import", MEMORY_IMPORT_SOURCE, path, native_id, 0, raw)
-                if not state.memory_seen(label, relpath, digest):
-                    yield op
-            except (OSError, UnicodeError, SourceError):
-                state.set_status(MEMORY_IMPORT_SOURCE, path, "", "unreadable")
+    """Legacy memory discovery is disabled before any filesystem access."""
+    return iter(())
 
 
 def scan(config, state, *, now, targets=None) -> list[Op]:
@@ -333,7 +276,7 @@ def scan(config, state, *, now, targets=None) -> list[Op]:
         if (op.source, op.native_id) not in occupied:
             state.outbox_add(op)
             occupied.add((op.source, op.native_id))
-    return state.outbox_pending()
+    return [op for op in state.outbox_pending() if eligible(op)]
 
 
 def _discovered(config):
@@ -341,19 +284,8 @@ def _discovered(config):
 
 
 def snapshot_targets(config):
-    """Freeze byte ends at cycle start for captures and selected memory files."""
-    targets = {source.path: source.size for source in _discovered(config)}
-    for selected in config.get("memories", []):
-        root = Path(selected["root"]).expanduser().absolute()
-        if any(p.is_symlink() for p in (root, *root.parents)):
-            continue
-        for path in root.glob(selected.get("glob", "**/*.md")):
-            try:
-                if not any(p.is_symlink() for p in (path, *path.parents)) and path.is_file():
-                    targets[str(path)] = path.stat().st_size
-            except OSError:
-                continue
-    return targets
+    """Freeze consented transcript byte ends without inspecting memory roots."""
+    return {source.path: source.size for source in _discovered(config)}
 
 
 def probe(path) -> dict:

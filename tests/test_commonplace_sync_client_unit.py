@@ -222,12 +222,11 @@ def test_capture_first_and_memory_target_snapshot(client):
     config["memories"] = [{"label": "notes", "root": str(notes)}]
     targets = snapshot_targets(config)
     operations = scan(config, state, now=NOW, targets=targets)
-    assert [op.kind for op in operations] == ["capture", "import"]
-    state.outbox_ack(operations[1].op_id, {"accepted": 1, "errors": 0})
+    assert [op.kind for op in operations] == ["capture"]
     note.write_bytes(b"synthetic new longer version")
     os.utime(note, (NOW - 120, NOW - 120))
     assert scan(config, state, now=NOW, targets=targets) == [operations[0]]
-    assert len(scan(config, state, now=NOW)) == 2
+    assert scan(config, state, now=NOW) == operations
 
 
 def test_memory_ack_crash_keeps_unseen_version(client):
@@ -236,7 +235,18 @@ def test_memory_ack_crash_keeps_unseen_version(client):
     note.write_bytes(b"synthetic memory")
     os.utime(note, (NOW - 120, NOW - 120))
     config["memories"] = [{"label": "notes", "root": str(root)}]
-    (op,) = scan(config, state, now=NOW)
+    from commonplace.sync_protocol import memory_thread_id
+    from commonplace.sync_sources import _op
+
+    op = _op(
+        "import",
+        "native-memory",
+        note,
+        memory_thread_id("notes", "note.md", sha(note.read_bytes())),
+        0,
+        note.read_bytes(),
+    )
+    state.outbox_add(op)
     with pytest.raises(StateError):
         state.outbox_ack(op.op_id, {"accepted": 0, "errors": 1})
     original = state.conn
@@ -398,22 +408,15 @@ def test_memory_versions_skips_and_verbatim(client):
         if not path.is_symlink():
             os.utime(path, (NOW - 120, NOW - 120))
     os.utime(memory / "recent.md", (NOW - 59, NOW - 59))
-    (op,) = scan(config, state, now=NOW)
-    request = body(op)
-    assert request["source"] == "native-memory"
-    assert request["threads"][0]["transcript"].encode() == note.read_bytes()
-    assert not state.memory_seen("notes", "note.md", sha(note.read_bytes()))
-    state.outbox_ack(op.op_id, {"accepted": 1, "errors": 0})
-    assert state.memory_seen("notes", "note.md", sha(note.read_bytes()))
     assert scan(config, state, now=NOW) == []
+    assert state.statuses() == []
+    assert not state.memory_seen("notes", "note.md", sha(note.read_bytes()))
     note.write_bytes((content + "\nnew").encode())
-    os.utime(note, (NOW - 120, NOW - 120))
-    (next_op,) = scan(config, state, now=NOW)
-    assert next_op.native_id != op.native_id
-    assert body(next_op)["threads"][0]["transcript"] == content + "\nnew"
-    # A broad memory root cannot read the client's own files.
+    assert scan(config, state, now=NOW) == []
+    # Broad private-root non-enumeration is independently exercised by safety tests.
     config["memories"] = [{"label": "private", "root": config["home"], "glob": "**/*"}]
-    assert scan(config, state, now=NOW) == [next_op]
+    assert scan(config, state, now=NOW) == []
+    assert state.statuses() == []
 
 
 @pytest.mark.parametrize("underlying", ["claude-code", "codex"])

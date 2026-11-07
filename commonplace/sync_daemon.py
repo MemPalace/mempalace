@@ -21,11 +21,28 @@ from .sync_protocol import (
     TOKEN_ENV,
     WRITE_BUDGET,
 )
-from .sync_state import StateError
+from .sync_state import StateError, eligible
 
 
 class ConfigError(ValueError):
     """A configuration problem, distinct from a retryable source failure."""
+
+
+def validate_consent(config, hub=None):
+    """Require an explicit transcript-only reinstall for this exact endpoint."""
+    marker = config.get("consent")
+    if (
+        config.get("memories")
+        or not isinstance(marker, dict)
+        or type(marker.get("version")) is not int
+        or marker.get("version") != 1
+        or not isinstance(config.get("hub"), str)
+        or not config["hub"]
+        or marker.get("hub") != config["hub"]
+        or (hub is not None and hub != config["hub"])
+    ):
+        raise ConfigError("Explicit transcript-only reinstall required")
+    endpoint(config["hub"])
 
 
 class SentError(OSError):
@@ -86,11 +103,7 @@ class _Session:
         self.target = endpoint(config["hub"])
         self.tokens = config["tokens"]
         self.feed_env = next(
-            (
-                TOKEN_ENV[s]
-                for s in ("claude-code", "codex", "native-memory")
-                if self.tokens.get(TOKEN_ENV[s])
-            ),
+            (TOKEN_ENV[s] for s in ("claude-code", "codex") if self.tokens.get(TOKEN_ENV[s])),
             None,
         )
         if self.feed_env is None:
@@ -264,7 +277,7 @@ class _Session:
 
     def _rearm(self):
         for op in self.state.outbox_all():
-            if op.state not in ("failed", "unreadable"):
+            if not eligible(op) or op.state not in ("failed", "unreadable"):
                 continue
             key = self.key + ":op:" + op.op_id
             if self._deadline(key, 86400) <= self.now():
@@ -435,6 +448,8 @@ class _Session:
         return True
 
     def _attempt(self, op, env_name, lane):
+        if not eligible(op):
+            return "disabled"
         if not self._budget(env_name, consume=False):
             return "budget"
         if lane == "S" and not self._ceiling(env_name):
@@ -582,7 +597,9 @@ class _Session:
         initializing = True
         retried = set()
         while True:
-            ops = self.sources.scan(config, self.state, now=self.now())
+            ops = [
+                op for op in self.sources.scan(config, self.state, now=self.now()) if eligible(op)
+            ]
             if self.initialize_connection_error:
                 return failed
             self.backfill = not once and self._backfill(config["_discovered"], ops)
@@ -625,11 +642,12 @@ class _Session:
 
 def run(config, state, *, clock, sleep, transport, once=False, stop=None) -> int:
     """Run one bounded cycle or watch until stop(), using injected I/O and time."""
-    state.retry_rejected()
+    validate_consent(config)
+    state.retry_rejected(exclude_legacy=True)
     from . import sync_sources
 
     for op in state.outbox_all():
-        if op.state != "conflict":
+        if not eligible(op) or op.state != "conflict":
             continue
         try:
             sync_sources.body(op)

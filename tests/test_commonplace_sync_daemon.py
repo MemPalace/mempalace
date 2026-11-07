@@ -29,7 +29,7 @@ def test_cli_install_inert_then_enable_import_live(hub):
     (root / "session.jsonl").write_bytes(raw(F + G))
     E = h.env_file(token, grant)
     before = home_tree(h.home)
-    rc = h.cli(["sync", "install", "--source", f"claude-code:{root}"])
+    rc = h.cli(["sync", "install", "--source", f"claude-code:{root}", "--hub", h.origin])
     assert rc == 0  # COUNTED:L13
     reached("L13")
     assert home_tree(h.home) == before
@@ -119,8 +119,33 @@ def test_daemon_offline_three_writes_reconnect_exactly_once(hub, plan):
     assert not pending(h.home)
     path.write_bytes(raw(F + R))
     h.at(2703)
+    state_path = h.home / ".commonplace/sync/state.db"
+
+    def reinstall(destination):
+        before = state_path.read_bytes()
+        assert (
+            h.cli(
+                [
+                    "sync",
+                    "install",
+                    "--enable",
+                    "--no-service",
+                    "--source",
+                    f"claude-code:{root}",
+                    "--env-file",
+                    E,
+                    "--hub",
+                    destination,
+                ]
+            )
+            == 0
+        )
+        assert state_path.read_bytes() == before
+
     with h.drop_proxy() as proxy:
+        reinstall(proxy)
         assert h.cli(["sync", "run", "--once", "--hub", proxy]) == 1
+    reinstall(h.origin)
     assert counts(h.oracle(p, R[-1:]), R[-1:]) == [1]
     assert h.cli(["sync", "run", "--once", "--hub", h.origin]) == 0
     assert counts(h.oracle(p, R[-1:]), R[-1:]) == [1]

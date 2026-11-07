@@ -149,30 +149,23 @@ def _save(directory, config):
 
 
 def _install(args, home, directory):
+    if args.memory:
+        print("Legacy memory sync is disabled; memory-once is not available yet.")
+        return 2
     sources, memories = _selections(args, home)
     if sources is None:
         print(CURSOR_MESSAGE)
         return 1
     values = _environment(args.env_file)
-    hub = args.hub or values.get("COMMONPLACE_URL") or "https://app.cmmn.dev"
+    hub = args.hub if args.hub is not None else values.get("COMMONPLACE_URL")
+    if not hub:
+        raise ValueError("Explicit sync destination required")
     endpoint(hub)
     if not args.enable:
-        print("Sync is disabled. Selected sources:")
-        print(json.dumps({"sources": sources, "memories": memories}))
-        command = [sys.executable, "-m", "commonplace", "sync", "install", "--enable"]
-        for source in sources:
-            command += ["--source", source["source"] + ":" + source["root"]]
-        for memory in memories:
-            command += ["--memory", memory["label"] + "=" + memory["root"] + ":" + memory["glob"]]
-        command += ["--hub", hub, "--home", str(home)]
-        if args.env_file:
-            command += ["--env-file", str(args.env_file.absolute())]
-        if args.no_service:
-            command += ["--no-service"]
-        if args.no_activate:
-            command += ["--no-activate"]
-        command += ["--service", args.service]
-        print("Enable explicitly: " + shlex.join(command))
+        print(f"Sync is disabled. Selected transcript sources: {len(sources)}")
+        for source in sorted({selected["source"] for selected in sources}):
+            print(f"Source type: {source}")
+        print("Repeat your command with --enable")
         return 0
     if not args.no_service and args.env_file is None:
         raise ValueError("Service installation needs a private environment file")
@@ -180,6 +173,7 @@ def _install(args, home, directory):
         "version": 1,
         "home": str(home),
         "hub": hub,
+        "consent": {"version": 1, "hub": hub},
         "env_file": str(args.env_file.absolute()) if args.env_file else None,
         "sources": sources,
         "memories": memories,
@@ -214,6 +208,7 @@ def _run(args, home, directory):
     from . import plans, sync_daemon
 
     config = _load(directory, home)
+    sync_daemon.validate_consent(config, args.hub)
 
     from .sync_state import open_state
 
@@ -235,7 +230,7 @@ def _run(args, home, directory):
 
 def _status(directory, home):
     from .sync_daemon import _feed_key
-    from .sync_state import open_state
+    from .sync_state import eligible, open_state
 
     config = _load(directory, home)
     if not (directory / "state.db").exists():
@@ -251,8 +246,10 @@ def _status(directory, home):
         if used > 0:
             mode = "done" if state.next_due(bkey + "-done") else "active"
             print(f"Backfill: {mode}, {int(used)} of {BACKFILL_WRITES} attempts")
-        print(f"Pending operations: {len(state.outbox_pending())}")
-        operations = state.outbox_all()
+        print(f"Pending operations: {sum(eligible(op) for op in state.outbox_pending())}")
+        retained = state.outbox_all()
+        operations = [op for op in retained if eligible(op)]
+        print(f"Disabled legacy operations: {len(retained) - len(operations)}")
         parks = [
             f"{kind}={sum(op.state == kind for op in operations)}"
             for kind in ("failed", "unreadable", "rejected", "conflict", "revoked")
@@ -261,7 +258,12 @@ def _status(directory, home):
         if parks:
             print("Parked operations: " + " ".join(parks))
         for row in state.statuses():
-            print(f"Source status: {row['status']}")
+            status = (
+                "disabled; coverage unverified"
+                if row["source"] == "native-memory"
+                else row["status"]
+            )
+            print(f"Source status: {status}")
     return 0
 
 

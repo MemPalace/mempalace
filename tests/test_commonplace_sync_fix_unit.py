@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from commonplace import cli, sync_daemon, sync_service, sync_sources
+from commonplace import cli, sync_cli, sync_daemon, sync_service, sync_sources
 from commonplace.sync_protocol import TOKEN_ENV
 from commonplace.sync_state import open_state
 
@@ -68,11 +68,24 @@ def local(tmp_path):
     config = {
         "home": str(home),
         "hub": "https://sync.example",
+        "consent": {"version": 1, "hub": "https://sync.example"},
+        "memories": [],
         "sources": [{"source": "claude-code", "root": str(root)}],
         "tokens": {TOKEN_ENV["claude-code"]: "synthetic", TOKEN_ENV["native-memory"]: "synthetic"},
     }
     with open_state(home / ".commonplace/sync/state.db") as state:
         yield config, state, root
+
+
+def retained_import(state, path, label="notes"):
+    from commonplace.sync_protocol import memory_thread_id
+
+    raw = path.read_bytes()
+    op = sync_sources._op(
+        "import", "native-memory", path, memory_thread_id(label, path.name, sha(raw)), 0, raw
+    )
+    state.outbox_add(op)
+    return op
 
 
 def run(local, hub, *, continuous=False):
@@ -105,7 +118,7 @@ def test_exhausted_token_does_not_block_import_or_codex(local, once):
     note = notes / "memory.md"
     note.write_text("Synthetic verbatim memory.\n")
     os.utime(note, (NOW - 120, NOW - 120))
-    config["memories"] = [{"label": "notes", "root": str(notes)}]
+    legacy = retained_import(state, note)
     config["tokens"] = {env: "synthetic-" + source for source, env in TOKEN_ENV.items()}
     hub = Hub()
 
@@ -120,8 +133,9 @@ def test_exhausted_token_does_not_block_import_or_codex(local, once):
     for _ in range(sync_daemon.WRITE_BUDGET[0]):
         assert active._budget(TOKEN_ENV["claude-code"])
     assert active.cycle(once=once) == 0
-    assert [body["source"] for body in hub.posts] == ["codex", "native-memory"]  # RED
-    pending = state.outbox_pending()
+    assert [body["source"] for body in hub.posts] == ["codex"]  # RED
+    assert legacy in state.outbox_all()
+    pending = [op for op in state.outbox_pending() if op.kind != "import"]
     assert [op.native_id for op in pending] == ["a-blocked", "b-blocked"]
     assert all(op.attempts == 0 for op in pending)
     assert state.next_due(active.key) == 0
@@ -131,7 +145,8 @@ def test_exhausted_token_does_not_block_import_or_codex(local, once):
     active = sync_daemon._Session(config, state, lambda: NOW, transport)
     assert active.cycle(once=once) == 0
     assert hub.posts[-1]["thread_id"] == "a-blocked"
-    assert [op.native_id for op in state.outbox_pending()] == ["b-blocked"]
+    assert [op.native_id for op in state.outbox_pending() if op.kind != "import"] == ["b-blocked"]
+    assert legacy in state.outbox_all()
 
 
 def test_fix1_default_install_syncs_available_source(tmp_path, monkeypatch):
@@ -166,7 +181,17 @@ def test_fix1_default_install_syncs_available_source(tmp_path, monkeypatch):
     assert hub.stored == {"good": raw}
 
 
-def test_fix1_explicit_missing_root_fails_before_config(tmp_path):
+def test_fix1_explicit_missing_root_fails_before_config(tmp_path, monkeypatch):
+    from commonplace import sync_cli
+
+    calls = []
+    original = sync_cli._selections
+
+    def observed(*a):
+        calls.append(1)
+        return original(*a)
+
+    monkeypatch.setattr(sync_cli, "_selections", observed)
     home = tmp_path / "home"
     assert (
         cli.main(
@@ -175,6 +200,8 @@ def test_fix1_explicit_missing_root_fails_before_config(tmp_path):
                 "install",
                 "--source",
                 "codex:" + str(tmp_path / "absent"),
+                "--hub",
+                "https://sync.example",
                 "--enable",
                 "--no-service",
                 "--home",
@@ -183,6 +210,7 @@ def test_fix1_explicit_missing_root_fails_before_config(tmp_path):
         )
         == 2
     )
+    assert calls == [1]
     assert not (home / ".commonplace/sync/config.json").exists()
 
 
@@ -202,10 +230,10 @@ def test_fix2_bad_source_does_not_block_good_source(local, continuous, fault, mo
     (root / "z-good.jsonl").write_bytes(record("good"))
     bad = root / "a-bad.jsonl"
     if fault == "encoding":
-        bad = root / "bad.md"
-        bad.write_bytes(b"\xff")
+        bad = root / "a-bad.jsonl"
+        bad.write_bytes(record("bad") + b"\xff\n")
+        state.store_cursor("claude-code", bad, "bad", 0, sha(b""))
         os.utime(bad, (NOW - 120, NOW - 120))
-        config["memories"] = [{"label": "notes", "root": str(root)}]
     else:
         bad.write_bytes(
             record("bad") + (record("bad", "x" * 1_700_000) if fault == "oversize" else b"")
@@ -249,12 +277,12 @@ def test_fix3_rejected_op_yields_to_next_and_retries_after_restart_or_backoff(lo
 
 
 def test_fix4_idle_cycles_read_no_source_or_memory_content(local, monkeypatch):
-    config, _, root = local
+    config, state, root = local
     (root / "session.jsonl").write_bytes(record("good"))
     note = root / "note.md"
     note.write_bytes(b"verbatim memory")
     os.utime(note, (NOW - 120, NOW - 120))
-    config["memories"] = [{"label": "notes", "root": str(root)}]
+    legacy = retained_import(state, note)
     from commonplace.onboarding import POINTER
 
     (root / "pointer.md").write_bytes(POINTER.encode())
@@ -300,11 +328,13 @@ def test_fix4_idle_cycles_read_no_source_or_memory_content(local, monkeypatch):
         assert run(local, hub) == 0
     assert sum(read_bytes) == 0
     assert len(discoveries) == 10
-    # A new version invalidates the metadata cache and remains verbatim.
+    # Disabled versions never trigger reads or advance retained history.
     note.write_bytes(b"new verbatim memory")
     os.utime(note, (NOW - 120, NOW - 120))
     assert run(local, hub) == 0
-    assert hub.posts[-1]["threads"][0]["transcript"] == "new verbatim memory"
+    assert legacy in state.outbox_all()
+    assert sum(read_bytes) == 0
+    assert all(body["source"] != "native-memory" for body in hub.posts)
 
 
 def test_fix7_free_feed_waits_until_next_window(local):
@@ -330,7 +360,10 @@ def test_fix7_free_feed_waits_until_next_window(local):
 
 
 def test_fix8_service_failure_is_generic_exit_two(tmp_path, monkeypatch, capsys):
+    calls = []
+
     def failed(*args, **kwargs):
+        calls.append(1)
         raise subprocess.CalledProcessError(1, ["synthetic-manager"])
 
     monkeypatch.setattr(sync_service, "install", failed)
@@ -346,6 +379,8 @@ def test_fix8_service_failure_is_generic_exit_two(tmp_path, monkeypatch, capsys)
                 "claude-code",
                 "--enable",
                 "--no-activate",
+                "--hub",
+                "https://sync.example",
                 "--env-file",
                 str(env),
                 "--home",
@@ -355,21 +390,31 @@ def test_fix8_service_failure_is_generic_exit_two(tmp_path, monkeypatch, capsys)
     except subprocess.CalledProcessError:
         result = None
     assert result == 2
+    assert calls == [1]
     assert (
         capsys.readouterr().err
         == "Sync failed; check configuration, credentials and private file permissions.\n"
     )
 
 
-@pytest.mark.parametrize(
-    "selection", ["default-parent", "default-root", "memory-parent", "memory-root", "empty"]
-)
-def test_fix2_install_refuses_symlinked_or_empty_selections(tmp_path, selection):
+@pytest.mark.parametrize("selection", ["default-parent", "default-root", "empty"])
+def test_fix2_install_refuses_symlinked_or_empty_transcript_selections(
+    tmp_path, monkeypatch, selection
+):
     home = tmp_path / "home"
     home.mkdir()
     target = tmp_path / "target"
     target.mkdir()
-    args = ["sync", "install", "--enable", "--no-service", "--home", str(home)]
+    args = [
+        "sync",
+        "install",
+        "--enable",
+        "--no-service",
+        "--home",
+        str(home),
+        "--hub",
+        "https://sync.example",
+    ]
     if selection.startswith("default"):
         if selection == "default-parent":
             (target / "projects").mkdir()
@@ -377,16 +422,62 @@ def test_fix2_install_refuses_symlinked_or_empty_selections(tmp_path, selection)
         else:
             (home / ".claude").mkdir()
             (home / ".claude/projects").symlink_to(target, target_is_directory=True)
-    elif selection.startswith("memory"):
-        link = home / "notes"
-        link.symlink_to(target, target_is_directory=True)
-        root = link
-        if selection == "memory-parent":
-            (target / "nested").mkdir()
-            root = link / "nested"
-        args += ["--memory", "notes=" + str(root)]
+    errors = []
+    original = sync_cli._selections
+
+    def selections(*args):
+        try:
+            return original(*args)
+        except ValueError as error:
+            errors.append(str(error))
+            raise
+
+    monkeypatch.setattr(sync_cli, "_selections", selections)
     assert cli.main(args) == 2
+    assert errors == [
+        "Select at least one source"
+        if selection == "empty"
+        else "Symlinked transcript directory refused"
+    ]
     assert not (home / ".commonplace/sync/config.json").exists()
+
+
+@pytest.mark.parametrize("selection", ["memory-parent", "memory-root"])
+def test_fix2_memory_install_refused_before_selection(tmp_path, monkeypatch, capsys, selection):
+    home = tmp_path / "home"
+    home.mkdir()
+    target = tmp_path / "target"
+    target.mkdir()
+    link = home / "notes"
+    link.symlink_to(target, target_is_directory=True)
+    root = link
+    if selection == "memory-parent":
+        (target / "nested").mkdir()
+        root = link / "nested"
+    calls = []
+    monkeypatch.setattr(sync_cli, "_selections", lambda *args: (calls.append(1), ([], []))[1])
+    assert (
+        cli.main(
+            [
+                "sync",
+                "install",
+                "--enable",
+                "--no-service",
+                "--home",
+                str(home),
+                "--memory",
+                "notes=" + str(root),
+                "--hub",
+                "https://sync.example",
+            ]
+        )
+        == 2
+    )
+    assert capsys.readouterr().out == (
+        "Legacy memory sync is disabled; memory-once is not available yet.\n"
+    )
+    assert calls == []
+    assert not (home / ".commonplace").exists()
 
 
 def test_fix2_free_sleep_handles_expired_deadlines(local, monkeypatch):
@@ -473,12 +564,6 @@ def parking_sources(local):
         json.dumps({"type": "session_meta", "payload": {"id": "codex-session"}}) + "\n"
     )
     config["sources"].append({"source": "codex", "root": str(codex)})
-    notes = root.parent / "notes"
-    notes.mkdir()
-    note = notes / "memory.md"
-    note.write_text("Synthetic verbatim memory.\n")
-    os.utime(note, (NOW - 120, NOW - 120))
-    config["memories"] = [{"label": "notes", "root": str(notes)}]
     config["tokens"] = {env: "synthetic-" + source for source, env in TOKEN_ENV.items()}
 
 
@@ -506,7 +591,7 @@ def test_card223_f1_capture_cadence_is_stream_local(local, stage, once):
         state.defer(active.key, NOW + 900)
     assert active.cycle(once=once) == 0
     assert hub.stored.get("good") == record("good")  # RED
-    assert {body["source"] for body in hub.posts} == {"claude-code", "codex", "native-memory"}
+    assert {body["source"] for body in hub.posts} == {"claude-code", "codex"}
     if stage != "legacy":
         assert state.next_due(active.key) == 0  # RED
         assert active.retry_due == NOW + 7
@@ -551,7 +636,7 @@ def test_card223_guard_s3_import_account_cadence_limits_fanout(local):
         note = notes / f"m{i:02d}.md"
         note.write_text(f"Synthetic verbatim memory {i}.\n")
         os.utime(note, (NOW - 120, NOW - 120))
-    config["memories"] = [{"label": "notes", "root": str(notes)}]
+    legacy = [retained_import(state, note) for note in sorted(notes.glob("*.md"))]
     now, posts, admitted, hub = [NOW], [], [], Hub()
 
     def transport(target, token, method, route, body=None):
@@ -567,8 +652,8 @@ def test_card223_guard_s3_import_account_cadence_limits_fanout(local):
     for step in range(0, 3600 + 1, 60):
         now[0] = NOW + step
         assert active.cycle() == 0
-    assert admitted == [NOW + step for step in (0, 900, 1800, 2700, 3600)]
-    assert all(sum(start <= stamp < start + 900 for stamp in posts) <= 2 for start in admitted)
+    assert admitted == posts == []
+    assert state.outbox_all() == legacy
 
 
 def test_card223_guard_slow_down_stops_get_pass(local):
@@ -630,7 +715,8 @@ def test_card223_account_capture_wait_defers_whole_token(local):
 
     active = sync_daemon._Session(config, state, lambda: NOW, transport)
     assert active.cycle() == 0
-    assert any(body["source"] == "native-memory" for body in hub.posts)  # RED
+    assert any(body["source"] == "codex" for body in hub.posts)
+    assert all(body["source"] != "native-memory" for body in hub.posts)  # RED
     assert len(posts) == 1
     assert state.next_due(active._token_key(TOKEN_ENV["claude-code"])) == NOW + 900
 
@@ -920,7 +1006,8 @@ def test_card223_t02_failure_ends_only_this_token(local, monkeypatch, fault):
         False,
     )
     assert attempt_times(posts, "bad") == [0]
-    assert any(body["source"] == "native-memory" for body in hub.posts)
+    assert any(body["source"] == "codex" for body in hub.posts)
+    assert all(body["source"] != "native-memory" for body in hub.posts)
     bad = next(op for op in state.outbox_all() if op.native_id == "bad")
     key = op_key(active, bad)
     assert [state.next_due(key + suffix) for suffix in (":fails", ":strikes", ":last", "")] == [
@@ -1076,14 +1163,14 @@ def imports_seeded(local, count=3):
     config, state, root = local
     notes = root.parent / "notes"
     notes.mkdir()
+    ops = []
     for index in range(1, count + 1):
         note = notes / f"i{index}.md"
         note.write_text(f"Synthetic memory {index}.\n")
         os.utime(note, (NOW - 120, NOW - 120))
-    config["memories"] = [{"label": "notes", "root": str(notes)}]
+        ops.append(retained_import(state, note))
     config["tokens"][TOKEN_ENV["native-memory"]] = "synthetic-import"
-    sync_sources.scan(config, state, now=NOW)
-    return state.outbox_pending()
+    return ops
 
 
 @pytest.mark.parametrize(
@@ -1092,18 +1179,21 @@ def imports_seeded(local, count=3):
 def test_card223_import_row_classification(local, code):
     _, state, _ = local
     ops = imports_seeded(local)
-    now, posts, hub = [NOW], [], Hub()
-
-    def transport(target, token, method, route, body=None):
-        if method == "POST":
-            identity = body["threads"][0]["thread_id"]
-            posts.append((now[0] - NOW, identity))
-            if identity == ops[0].native_id:
-                return 200, {"accepted": 0, "errors": 1, "results": [{"code": code}]}
-        return hub(target, token, method, route, body)
-
-    active = active_session(local, now, transport)
-    active.cycle()
+    active = active_session(local, [NOW], Hub())
+    body = {
+        "source": "native-memory",
+        "threads": [
+            {"thread_id": ops[0].native_id, "format": "file", "transcript": "Synthetic memory 1.\n"}
+        ],
+    }
+    result = active._post_result(
+        ops[0],
+        TOKEN_ENV["native-memory"],
+        body,
+        200,
+        {"accepted": 0, "errors": 1, "results": [{"code": code}]},
+        None,
+    )
     bad = next(op for op in state.outbox_all() if op.op_id == ops[0].op_id)
     key = op_key(active, bad)
     expected = (
@@ -1113,18 +1203,17 @@ def test_card223_import_row_classification(local, code):
         if code == "storage_limit"
         else ("pending", 1, 0)
     )
-    assert (  # RED
+    assert (
         bad.state,
         state.next_due(key + ":fails"),
         state.next_due(token_key(active, "native-memory")),
     ) == expected
-    assert len(posts) == (3 if code == "conflict" else 1)
+    assert result == (
+        "terminal" if code == "conflict" else "token" if code == "storage_limit" else "failure"
+    )
     if code not in ("conflict", "storage_limit"):
         assert state.next_due(key) == NOW + 60
-        now[0] += 60
-        active.cycle()
-        assert [oid for stamp, oid in posts if stamp == 60] == [op.native_id for op in ops]
-        assert len(state.outbox_all()) == 1
+    assert all(op.attempts == 0 for op in state.outbox_all())
 
 
 @pytest.mark.parametrize("status", [507, 404, 421])
@@ -1160,6 +1249,7 @@ def test_card223_t12_token_wide_replies(local, status):
 def test_card223_t11_token_wait(local, kind):
     parking_sources(local)
     _, state, _ = local
+    legacy = imports_seeded(local, 1) if kind == "import" else []
     hub, posts = Hub(), []
 
     def transport(target, token, method, route, body=None):
@@ -1178,8 +1268,9 @@ def test_card223_t11_token_wait(local, kind):
     active = active_session(local, [NOW], transport)
     active.cycle()
     key = token_key(active, "native-memory" if kind == "import" else "claude-code")
-    assert state.next_due(key) == NOW + (900 if kind == "import" else 5)  # RED
-    assert "codex-session" in hub.stored and len(posts) == 1
+    assert state.next_due(key) == (0 if kind == "import" else NOW + 5)  # RED
+    assert "codex-session" in hub.stored and len(posts) == (0 if kind == "import" else 1)
+    assert all(op in state.outbox_all() for op in legacy)
     assert ("good" in hub.stored) == (kind == "import")
     assert not state.conn.execute("SELECT 1 FROM cadence WHERE key LIKE '%:op:%'").fetchall()
 
@@ -1249,7 +1340,8 @@ def test_card223_initialize_token_failure_skips_same_token_but_sends_others(loca
     active = active_session(local, now, transport)
     result = active.cycle()
     assert (len(gets), "codex-session" in hub.stored) == (1, True)  # RED
-    assert any(body["source"] == "native-memory" for body in hub.posts)
+    assert any(body["source"] == "codex" for body in hub.posts)
+    assert all(body["source"] != "native-memory" for body in hub.posts)
     assert result == (0 if status == 429 else 1)
     key = token_key(active) if status == 429 else active._stream_key("claude-code", "bad")
     assert state.next_due(key) == NOW + 37

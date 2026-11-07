@@ -57,9 +57,13 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `AGENTS.md`, `CHANGELOG.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `HUB-DESIGN.md`, `INSPIRATION-REPOS.md`, `LICENSE`, `MISSION.md`, `PRODUCT-DESIGN.md`, `README.md`, `REPORT.md`, `ROADMAP.md`, `SECURITY.md`, `openarena-claim.txt`, `design/`, `docs/`
 - **Owns:**
 
+  - Live-sync instructions describe transcript-only reinstall, explicit destination and retained disabled memory history.
+
   - Contributor and agent instructions, the mission and design notes, user and operator documentation, release history, the licence and the security policy.
 
 - **Promises:**
+
+  - Live-sync setup makes no active memory-upload or completed-coverage claim.
 
   - Imported-history consent: Imported-history documentation distinguishes write-only import from the independent reader scope and explains exclusions and revocation.
   - Project setup documentation also explains the recommended card-move webhook and explicit updates for existing subscriptions.
@@ -74,11 +78,15 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Updating installed files alone leaves an old running process unaffected.
+
   - Text drifts from code silently; nothing executes most of it.
 
   - Broken commands in docs surface only when someone follows them.
 
 - **Tests:**
+
+  - Live-sync behavior and privacy claims are exercised by `tests/test_card199_safety.py`.
 
   - `tests/test_commonplace_public_surface.py`, `tests/test_commonplace_legal_pages.py` and the documentation checks in `tests/test_commonplace_release_gate.py`.
 
@@ -227,6 +235,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:**
 
+  - Synthetic legacy safety-stop cases and explicitly classified transcript-only fixture updates.
+
   - `tests/test_commonplace_subagent_asks.py` covers released-card questions and coordinator routing, answers, escalation and recovery.
 
   - Shared fixtures and harnesses and every test file not listed in another block, including binding-epoch migration, direct fences, lock-entry instrumentation and bounded reset races.
@@ -234,6 +244,8 @@ Format (read by `commonplace orch docs-check`):
   - Subagent question routing, proposal/release prerequisites and recipient authority regressions.
 
 - **Promises:**
+
+  - Safety tests run identically on a pinned base and implementation; server import and low-level persistence remain covered.
 
   - The revoked-token socket guard observes the completed server-side 401, no body reads and no route dispatch, including a forced close before upload finishes.
   - The seat webhook replay checks actual worker completion with orchestration off and on, retains card-created notifications when enabled, and verifies message filtering and unchanged subscriptions on reconnect.
@@ -266,12 +278,18 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Configuration refusal can hide a later guard unless that boundary is also exercised directly.
+
   - A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
 
   - Email cookie-scope regressions use an HTTPS cookie jar over loopback, including an older host-only cookie; sign-in rendering checks cover the request confirmation.
 
 
 - **Tests:**
+
+  - `tests/test_card199_safety.py` and the sync test family retain transcript-byte/cursor and server-import compatibility checks.
+  - Transcript selection tests observe the actual symlink/empty rejection; memory selections separately prove refusal before selection.
+  - Token tests distinguish missing selected capture credentials during initialization from import-only feed credential rejection.
   - Thread-boundary integration tests exercise real separate workspace workers; focused scope tests cover stale snapshots, optional collections, malformed probes, decoding and response caches.
 
   - Release helper regressions simulate the old app disappearing before the signed-in board arrives and verify useful exception messages without credentials in JSON or Markdown reports.
@@ -606,17 +624,25 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/sync_cli.py`, `commonplace/sync_daemon.py`, `commonplace/sync_feed.py`, `commonplace/sync_protocol.py`, `commonplace/sync_service.py`, `commonplace/sync_sessions.py`, `commonplace/sync_sources.py`, `commonplace/sync_state.py`
 - **Owns:**
 
+  - Transcript-only entry consent, legacy read/rewrite guards and filtered active-operation scheduling.
+
   - Opt-in client synchronization of transcripts and memory, its local state and the content-free live feed.
 
 - **Promises:**
+
+  - Explicit exact-endpoint consent precedes token/state access. Disabled legacy rows and schema survive unchanged; memory roots are never inspected. Caught-up transcripts finish backfill without legacy allowance use.
 
   - Sync never opens a server database and never reads credentials; local state holds metadata only.
 
 - **How it fails:**
 
+  - Endpoint consent does not bind workspace/principal identity; a different token at the same hub remains possible. Old services retry rejected configs until explicit reinstall or uninstall.
+
   - A lost connection keeps the outbox and resumes from the cursor; a corrupt local cache is rebuilt from the server.
 
 - **Tests:**
+
+  - `tests/test_card199_safety.py` covers entry order, each discriminator, direct scanner/attempt/rearm guards, retained rows, backfill, status and private preview output.
 
   - The `tests/test_commonplace_sync_` files.
 
