@@ -181,7 +181,8 @@ temporary failure from silently ending background delivery.
 | M | Runner store writes use `BEGIN IMMEDIATE`; busy timeout 10 s | `commonplace/runner/jobs.py:68-95` |
 | M | One active start per card | `commonplace/runner/jobs.py:47-50` |
 | M | A non-person start within 24 h of the last start is refused | `commonplace/runner/jobs.py:236-243` |
-| M | Started hold 3600 s (`STARTED_HOLD_SECONDS`) | `commonplace/runner/jobs.py:17,280-283` |
+| M | Started jobs hold machine in-flight capacity and per-machine project exclusion while their card remains doing with that machine's worker as assignee; failed/cancelled jobs and cards no longer doing or reassigned release capacity, irrespective of elapsed time | `commonplace/runner/jobs.py:lease` |
+| M | Hourly start-rate limits, the 24 h started_recently refusal and the separate 3600 s orchestrator admission hold remain unchanged | `commonplace/runner/jobs.py:_hourly,create_in`, `commonplace/orch/runner_bridge.py:_cap_count` |
 | M | T3 launch timeout 2–60 s; a timed-out launch is `uncertain` and never re-queued | `commonplace/runner/agent.py:127,333-336` |
 | M | Runner hub timeout 15 s | `commonplace/runner/agent.py:247` |
 | M | Machine queue limit 8 queued jobs | `commonplace/runner/jobs.py:16` |
@@ -291,8 +292,14 @@ still wrong.
   (whitespace-only edits do not count); it never judges whether the new text
   is right.
 - **Cap overshoot.** The cap reads card state from `boards.sqlite3` as a
-  snapshot, so a concurrent claim outside the runner can overshoot it. The 1 h
-  started hold is conservative.
+  snapshot, so a concurrent claim outside the runner can overshoot it. Started
+  jobs hold machine in-flight capacity and per-machine project exclusion only
+  while their cards are doing with that machine's worker as assignee, even
+  after an hour. A terminal job state, a card leaving doing, or reassignment
+  releases that capacity. The lease resolves the worker identity before its
+  runner transaction and reads cards through the read-only boards helper inside
+  it, without constructing BoardService/BoardStore or acquiring a boards write
+  lock. Card state can change after that read; the next lease reads it again.
 - **D1 shared worker PAT.** All runner children use the machine's worker PAT,
   so per-child provenance and per-child limits are not available.
 - **D2 launch shape.** Whether T3 accepts `modelSelection` at runtime is

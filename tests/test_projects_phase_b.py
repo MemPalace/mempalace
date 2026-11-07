@@ -189,11 +189,12 @@ def test_r8a_done_frees_project_slot(world, monkeypatch):
 def test_r8b_machine_fence(world, monkeypatch):
     w = world
     a, b, m = lifecycle(w, monkeypatch, second=False)
-    raw_state(w, a, "done")
     early = jobs.lease(w.js, m)
     monkeypatch.setattr(jobs, "_now", lambda: "2030-01-01T01:00:01Z")
-    later = jobs.lease(w.js, m)
-    assert early is None and later["task_number"] == b and count(w) == 1
+    assert early is None and jobs.lease(w.js, m) is None
+    raw_state(w, a, "done")
+    released = jobs.lease(w.js, m)
+    assert released is not None and released["task_number"] == b and count(w) == 1
 
 
 def trust(h, body, auth=None):

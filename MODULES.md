@@ -84,6 +84,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## tests
 
+- Lease regressions retain started jobs beyond an hour while their cards remain doing with the machine worker, and release capacity on completion, reassignment or a terminal job state without taking a boards write lock.
 - **Paths:** `tests/`
 - **Owns:** Shared fixtures and harnesses and every test file not listed in another block.
 - **Promises:** Tests use temporary directories, loopback servers and synthetic names; they make no external network calls. Deploy fakes discard inactive, unreferenced execution proof and cover synchronous fast exit, consecutive deploys and reference cleanup on failure, timeout and signals. Restricted-origin content-edit regressions verify audit attribution and unchanged release and claim state through both public routes. Restricted-origin replay tests verify inactive creation, coordinator release and owner fallback. Inactive status annotations keep release gates unchanged; notification fixtures use unrestricted workers for unrelated feature scenarios. Functional rules-injection checks isolate scheduler time, and concurrent handoff fixtures admit the full request burst.
@@ -124,6 +125,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## runner
 
+- Started jobs retain machine in-flight capacity and per-machine project exclusion while their cards remain doing with the machine worker; a terminal job state or a changed card state or assignee releases capacity, using read-only boards access.
 - **Paths:** `commonplace/runner/`, `docs/runner.md`
 - **Owns:** Machine enrollment and grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
 - **Promises:** A start needs a person owner or a listed trusted PAT and a card the worker could claim; one active start per card; an uncertain launch is never re-queued; on a configured board `card_start` is person-owner only, starts are fenced and capped, and the lease payload carries the pinned message and model. Opt-in orchestration requires the active coordinator for unconfigured PAT requests, reserves project capacity when starts are queued, and admits leases using active slots under the shared runner lock.

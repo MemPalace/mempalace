@@ -1,9 +1,11 @@
 """HTTP acceptance controls for machine fencing and launch job state."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from mempalace.sqlite_crypto import connect
 from tests.runner_harness import (
     attest,
     card,
@@ -126,6 +128,18 @@ def _later(seconds):
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _mark_working(hub, owner, machine, task):
+    worker = hub.db.connection(machine["worker_connection_id"], owner["workspace"])["name"]
+    conn = connect(str(hub.gateway.workspace_dir(owner["workspace"])) + "/boards.sqlite3")
+    try:
+        conn.execute(
+            "UPDATE tasks SET status='doing',assignee=? WHERE id=?", ("conn:" + worker, task)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_p1_machine_dispatch_default_deny(signup_hub, owners):  # noqa: F811
     hub, owner = signup_hub, owners["A"]
     machine = enroll(hub, owner)
@@ -229,10 +243,127 @@ def test_l4_concurrent_leases(signup_hub, owners):  # noqa: F811
         assert sorted(f.result(timeout=15) for f in pending) == [200, 204]
 
 
+@pytest.fixture
+def started_capacity(tmp_path, monkeypatch):
+    from commonplace.projects import orchestration
+    from commonplace.runner import jobs
+
+    monkeypatch.setattr(orchestration, "enabled", lambda db, ws: False)
+    monkeypatch.setattr(jobs, "_sweep", lambda store: None)
+    gw = SimpleNamespace(
+        workspace_dir=lambda ws: str(tmp_path),
+        db=SimpleNamespace(connection=lambda ref, ws: {"name": "worker"}),
+    )
+    store = jobs.JobStore(gw, "ws")
+    boards = connect(str(tmp_path / "boards.sqlite3"), isolation_level=None)
+    boards.executescript(
+        "CREATE TABLE boards (id INTEGER PRIMARY KEY, slug TEXT);"
+        "CREATE TABLE tasks (id INTEGER PRIMARY KEY, board_id INTEGER, status TEXT, assignee TEXT);"
+        "INSERT INTO boards VALUES (1, 'work');"
+        "INSERT INTO tasks VALUES (1, 1, 'doing', 'conn:worker');"
+    )
+    machine = {
+        "id": "m1",
+        "worker_connection_id": "worker-id",
+        "binding_state": "owner_attested",
+        "max_in_flight": 1,
+        "max_starts_per_hour": 30,
+        "grant_version": 1,
+    }
+    for n in (1, 2):
+        jobs.create(
+            store,
+            task_number=n,
+            board_slug="work",
+            machine=machine,
+            project="p",
+            topic="t",
+            requested_by="user:u",
+            person=True,
+        )
+    first = jobs.lease(store, machine)
+    assert first is not None
+    with store.transaction() as conn:
+        conn.execute(
+            "UPDATE runner_jobs SET state='started', started_at=? WHERE id=?",
+            (jobs._after(jobs._now(), -3601), first["id"]),
+        )
+    try:
+        yield store, machine, first, boards
+    finally:
+        boards.close()
+
+
+@pytest.mark.parametrize("max_in_flight", [1, 2])
+@pytest.mark.parametrize("terminal_state", ["failed", "cancelled"])
+def test_started_job_keeps_counting_after_an_hour(started_capacity, max_in_flight, terminal_state):
+    from commonplace.runner import jobs
+
+    store, machine, first, _ = started_capacity
+    machine["max_in_flight"] = max_in_flight
+    assert jobs.lease(store, machine) is None
+    with store.transaction() as conn:
+        conn.execute("UPDATE runner_jobs SET state=? WHERE id=?", (terminal_state, first["id"]))
+    second = jobs.lease(store, machine)
+    assert second is not None
+    assert second["task_number"] == 2
+
+
+@pytest.mark.parametrize("age", [1, 3601])
+@pytest.mark.parametrize(
+    ("state", "assignee"),
+    [
+        ("done", "conn:worker"),
+        ("review", "conn:worker"),
+        ("todo", "conn:worker"),
+        ("backlog", "conn:worker"),
+        ("doing", "conn:other"),
+        ("doing", None),
+        ("doing", "user:owner"),
+    ],
+)
+def test_started_job_releases_capacity_when_card_stops_working(
+    started_capacity, age, state, assignee
+):
+    from commonplace.runner import jobs
+
+    store, machine, first, boards = started_capacity
+    with store.transaction() as conn:
+        conn.execute(
+            "UPDATE runner_jobs SET started_at=? WHERE id=?",
+            (jobs._after(jobs._now(), -age), first["id"]),
+        )
+    assert jobs.lease(store, machine) is None
+    boards.execute("UPDATE tasks SET status=?,assignee=? WHERE id=1", (state, assignee))
+    second = jobs.lease(store, machine)
+    assert second is not None
+    assert second["task_number"] == 2
+
+
+def test_started_capacity_uses_read_only_boards(started_capacity, monkeypatch):
+    from commonplace.boards.service import BoardService
+    from commonplace.boards.store import BoardStore
+    from commonplace.runner import jobs
+
+    store, machine, _, boards = started_capacity
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("lease must not construct boards")
+
+    monkeypatch.setattr(BoardService, "__init__", forbidden)
+    monkeypatch.setattr(BoardStore, "__init__", forbidden)
+    # A separate RESERVED boards write lock permits readers, not schema writes.
+    boards.execute("BEGIN IMMEDIATE")
+    try:
+        assert jobs.lease(store, machine) is None
+    finally:
+        boards.rollback()
+
+
 def test_l5_machine_capacity_hold_and_uncertain(signup_hub, owners, monkeypatch):  # noqa: F811
     hub, owner = signup_hub, owners["A"]
     machine = _setup(hub, owner, projects=["demo", "demo2"], max_in_flight=1)
-    _start(hub, owner, machine)
+    first_task, _ = _start(hub, owner, machine)
     second_task, _ = _start(hub, owner, machine, project="demo2")
     first = _lease(hub, machine)
     from commonplace.runner import jobs
@@ -243,12 +374,17 @@ def test_l5_machine_capacity_hold_and_uncertain(signup_hub, owners, monkeypatch)
     assert _status(hub, owner, second_task)["state"] == "queued"
     _starting(hub, machine, first)
     _result(hub, machine, first, thread_id="thread-one")
+    _mark_working(hub, owner, machine, first_task)
     assert _machine_call(hub, machine, "lease")[0] == 204
     before = _later(3599)
     after = _later(3601)
     monkeypatch.setattr(jobs, "_now", lambda: before)
     assert _machine_call(hub, machine, "lease")[0] == 204
     monkeypatch.setattr(jobs, "_now", lambda: after)
+    assert _machine_call(hub, machine, "lease")[0] == 204
+    store = jobs.open_store(hub.gateway, owner["workspace"])
+    with store.transaction() as conn:
+        conn.execute("UPDATE runner_jobs SET state='failed' WHERE id=?", (first["job_id"],))
     second = _lease(hub, machine)
     assert second["task_number"] == second_task
     _starting(hub, machine, second)
@@ -288,14 +424,20 @@ def test_l6_capacity_is_exclusive_per_project(signup_hub, owners, monkeypatch): 
     assert third["task_number"] == third_task
     _starting(hub, machine, third)
     _result(hub, machine, third, thread_id="thread-other-project")
+    _mark_working(hub, owner, machine, third_task)
     assert _machine_call(hub, machine, "lease")[0] == 204
     _starting(hub, machine, first)
     _result(hub, machine, first, thread_id="thread-demo")
+    _mark_working(hub, owner, machine, first_task)
     before = _later(3599)
     after = _later(3601)
     monkeypatch.setattr(jobs, "_now", lambda: before)
     assert _machine_call(hub, machine, "lease")[0] == 204
     monkeypatch.setattr(jobs, "_now", lambda: after)
+    assert _machine_call(hub, machine, "lease")[0] == 204
+    store = jobs.open_store(hub.gateway, owner["workspace"])
+    with store.transaction() as conn:
+        conn.execute("UPDATE runner_jobs SET state='failed' WHERE id=?", (first["job_id"],))
     assert _lease(hub, machine)["task_number"] == second_task
 
 

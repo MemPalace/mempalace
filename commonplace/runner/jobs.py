@@ -407,6 +407,9 @@ def lease(store, machine):
     _sweep(store)
     if machine["binding_state"] != "owner_attested":
         return None
+    # Resolve control data before taking the runner write lock.
+    worker = store.gateway.db.connection(machine["worker_connection_id"], store.workspace_id)
+    assignee = "conn:" + worker["name"]
     now = _now()
     with (
         orch.admission(store.gateway, store.workspace_id, store=store)
@@ -414,10 +417,27 @@ def lease(store, machine):
         else store.transaction() as conn
     ):
         in_flight = conn.execute(
-            "SELECT project FROM runner_jobs WHERE machine_id=? AND "
-            "(state IN ('leased','starting','uncertain') OR (state='started' AND started_at>?))",
-            (machine["id"], _after(now, -STARTED_HOLD_SECONDS)),
+            "SELECT project,state,board_slug,task_number FROM runner_jobs WHERE machine_id=? AND "
+            "state IN ('leased','starting','uncertain','started')",
+            (machine["id"],),
         ).fetchall()
+        if any(row["state"] == "started" for row in in_flight):
+            # Read committed cards without BoardStore's schema/write lock; board
+            # writes acquire runner admission first, so the reverse lock would deadlock.
+            with orch.board_read(store.gateway.workspace_dir(store.workspace_id)) as boards:
+                working = {
+                    (row["slug"], row["id"])
+                    for row in boards.execute(
+                        "SELECT b.slug,t.id FROM tasks t JOIN boards b ON b.id=t.board_id "
+                        "WHERE t.status='doing' AND t.assignee=?",
+                        (assignee,),
+                    )
+                }
+            in_flight = [
+                row
+                for row in in_flight
+                if row["state"] != "started" or (row["board_slug"], row["task_number"]) in working
+            ]
         if len(in_flight) >= machine["max_in_flight"]:
             return None
         projects = {r["project"] for r in in_flight}
