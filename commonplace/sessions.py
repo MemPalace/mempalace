@@ -242,6 +242,18 @@ def set_cookie(session: str, secure: bool) -> str:
     return "; ".join(attrs)
 
 
+def signin_headers(session: str, secure: bool) -> tuple:
+    """Migrate a previous host-only session before setting a shared cookie."""
+    headers = []
+    if _domain():
+        expired = f"{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+        if secure:
+            expired += "; Secure"
+        headers.append(("Set-Cookie", expired))
+    headers.append(("Set-Cookie", set_cookie(session, secure)))
+    return tuple(headers)
+
+
 def clear_cookie() -> str:
     return "; ".join([f"{COOKIE}=", "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0", *_domain()])
 

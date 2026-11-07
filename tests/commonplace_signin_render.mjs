@@ -87,9 +87,10 @@ function app({ search = "", pathname = "/app/", hash = "", cookie = "", loadProv
     const next = new URL(path, "https://app.example");
     Object.assign(location, { search: next.search, pathname: next.pathname, hash: next.hash });
   } };
-  const document = { cookie, querySelector: () => root, addEventListener: (name, handler) => listeners.set(name, handler) };
+  const document = { cookie, querySelector: () => root, addEventListener: (name, handler) => listeners.set(name, handler), createElement: () => ({ setAttribute(name, value) { this[name] = value; } }) };
   const context = createContext({
     document, location, history, URLSearchParams, signinView, signinMessage, e: escape, calls,
+    FormData: class extends Array { constructor(form) { super(...Object.entries(form.payload)); } },
     setPeople() {},
     window: { addEventListener() {} },
     digestSpeech: () => ({ stop() {} }),
@@ -113,8 +114,23 @@ function app({ search = "", pathname = "/app/", hash = "", cookie = "", loadProv
   });
   const source = me === undefined ? appSource : appSource.replace("async function route() {", 'async function route() { calls.push("route:" + location.hash); return; } async function __route() {');
   runInContext(source, context);
-  return { root, calls, cleared, replacements, location, context, voice, expire: () => listeners.get("session-expired")(), logout: () => rootListeners.get("click")({ target: { closest: () => ({ dataset: { action: "logout" } }) } }) };
+  return { root, calls, cleared, replacements, location, context, voice, submit: (form) => rootListeners.get("submit")({ preventDefault() {}, target: { closest: () => form } }), expire: () => listeners.get("session-expired")(), logout: () => rootListeners.get("click")({ target: { closest: () => ({ dataset: { action: "logout" } }) } }) };
 }
+
+test("email request inserts a visible account-neutral confirmation after the form", async () => {
+  const message = "If this email can sign in, a link is on its way.";
+  const page = app({ answers: { "/app/auth/email": { message } } });
+  await settle();
+  const inserted = [];
+  await page.submit({
+    dataset: { form: "email-login" }, payload: { email: "reader@example.test", next: "" },
+    querySelector: () => null, after: (element) => inserted.push(element),
+  });
+  assert.equal(page.calls.at(-1), "/app/auth/email");
+  assert.equal(inserted.length, 1);
+  assert.equal(inserted[0].role, "status");
+  assert.equal(inserted[0].textContent, message);
+});
 
 test("boot maps callback errors, clears auth parameters and caches providers across expiry", async () => {
   const next = "/oauth/authorize?client_id=test&scope=memory:read";

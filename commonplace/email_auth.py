@@ -310,9 +310,7 @@ class EmailAuth:
                 h,
                 destination,
                 status=303,
-                headers=(
-                    ("Set-Cookie", sessions.set_cookie(session, self.gateway.secure_cookies)),
-                ),
+                headers=sessions.signin_headers(session, self.gateway.secure_cookies),
             )
         except (OAuthError, SignInError):
             send(h, 400, b"Sign in link is invalid or expired", media="text/plain; charset=utf-8")
