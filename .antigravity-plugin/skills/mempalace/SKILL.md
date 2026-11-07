@@ -75,6 +75,14 @@ mempalace instructions status
 
 Use when the user asks "what's in my palace", "how big is my palace", or wants a summary of wings, rooms, and drawer counts.
 
+### Choosing or changing the embedding model
+
+For a better model, multilingual or cross-language search, media search or GPU
+(Ollama) embeddings, follow
+[docs/choosing-an-embedder.md](https://github.com/MemPalace/mempalace/blob/main/docs/choosing-an-embedder.md):
+measure a sample first, rebuild into a new palace, copy the delta, swap,
+verify search and one write, and state the rollback.
+
 ### `audit` — how well organized the palace is, plus a repair session
 
 ```bash

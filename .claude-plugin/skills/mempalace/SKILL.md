@@ -1,6 +1,6 @@
 ---
 name: mempalace
-description: Install, configure, and operate MemPalace, including a private local palace, a shared-brain hub, or a client joining an existing hub. Use for first-time setup, MCP wiring, mining, status, palace audit and repair, wings, rooms, drawers, shared-brain identity, or logstream readiness.
+description: Install, configure, and operate MemPalace, including a private local palace, a shared-brain hub, or a client joining an existing hub. Use for first-time setup, MCP wiring, mining, status, palace audit and repair, wings, rooms, drawers, shared-brain identity, logstream readiness, or choosing, changing and upgrading the embedding model (multilingual or cross-language search, GPU or Ollama embeddings, media search).
 ---
 
 # MemPalace Setup
@@ -141,6 +141,29 @@ update plan`. A remote server update is informational on the client: surface it
 naturally and ask the hub operator to prepare and authorize the plan on the
 palace-serving machine. Never use a client-generated plan to upgrade the
 server, and never execute any plan without explicit approval.
+
+## Choosing or changing the embedding model
+
+Use this when the user asks which embedding model to use, wants better
+search in a language other than English or across languages, wants media
+(image/audio/video) search, wants GPU acceleration (for example Ollama on an
+Apple Silicon Mac), or is upgrading MemPalace and asks whether the embedder
+should change. Follow
+[Choosing, changing and upgrading the embedding model](https://github.com/MemPalace/mempalace/blob/main/docs/choosing-an-embedder.md).
+In short:
+
+- Ask which languages the notes are in, whether media search is needed, and
+  what hardware the palace runs on; recommend from the guide's table.
+- Changing the model re-embeds every row. Time a sample first and give the
+  user the rebuild estimate before starting. Never relabel vectors with
+  `palace set-embedder`.
+- Build into a new palace from a `.backup` snapshot while the live one keeps
+  serving, stop every writer, copy the rows written meanwhile, carry over
+  `logstream.sqlite3` and `replica.json`, swap, set `config.json`, restart the
+  hub and MCP clients, then verify a search in each of the user's languages
+  and one write.
+- Say plainly when the switch adds a runtime dependency (an Ollama or other
+  `/v1/embeddings` server must be running) and give the rollback.
 
 ## Palace health: audit and repair session
 
