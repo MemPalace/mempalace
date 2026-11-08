@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from typing import Mapping
 
+from . import _net
 from ._env import env_bool, env_str
 from .stored_text import EXACT_WIRE_HEADER, dumps_internal
 
@@ -221,7 +222,7 @@ class HubClient:
         """Whether ``/healthz`` answers 200 within ``timeout``."""
         request = urllib.request.Request(f"{self.base_url}/healthz", headers=hub_request_headers())
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _net.urlopen(request, timeout=timeout) as response:
                 return response.status == 200
         except (urllib.error.URLError, OSError, ValueError):
             return False
@@ -258,14 +259,16 @@ class HubClient:
         from . import server_registry
 
         *earlier, last = server_registry.load_server_tokens(self.palace_path) or ("",)
+        # ``_net.urlopen`` follows no redirect: the token travels only to the
+        # hub recorded in serverinfo.json, never to wherever a reply points.
         for token in earlier:
             try:
-                return urllib.request.urlopen(self._request(url, body, token), timeout=timeout)
+                return _net.urlopen(self._request(url, body, token), timeout=timeout)
             except urllib.error.HTTPError as exc:
                 if exc.code != 401:
                     raise
                 exc.close()
-        return urllib.request.urlopen(self._request(url, body, last), timeout=timeout)
+        return _net.urlopen(self._request(url, body, last), timeout=timeout)
 
     @staticmethod
     def _request(url: str, body: bytes, token: str):

@@ -29,7 +29,13 @@ from urllib.parse import parse_qs, urlparse
 
 from . import paths
 from ._env import env_float, env_int
-from ._proc import kernel32 as _kernel32, pid_alive as _pid_alive
+from ._net import NoRedirectHandler as _NoRedirectHandler
+from ._proc import (
+    kernel32 as _kernel32,
+    pid_alive as _pid_alive,
+    safe_child_env as _safe_child_env,
+    safe_module_argv as _safe_module_argv,
+)
 from .config import MempalaceConfig
 from .fsio import atomic_write_text, read_published_bytes
 from .palace import (
@@ -1168,7 +1174,9 @@ class DaemonClient:
         # timeout — on a CI runner with no network it can hang for tens of
         # seconds, which looks exactly like the daemon never came up. A no-proxy
         # opener is the correct production choice here and also removes that hang.
-        self._opener = urlrequest.build_opener(urlrequest.ProxyHandler({}))
+        # It follows no redirect either: the daemon token travels only to
+        # the daemon's own loopback endpoint.
+        self._opener = urlrequest.build_opener(urlrequest.ProxyHandler({}), _NoRedirectHandler)
 
     @property
     def base_url(self) -> str:
@@ -1594,17 +1602,12 @@ def start_daemon(
     _refuse_live_registration(palace_path)
 
     _remove_registration(palace_path)
-    cmd = [
-        sys.executable,
-        "-m",
-        "mempalace.daemon",
-        "serve",
-        "--palace",
-        palace_path,
-    ]
+    # Started from the caller's cwd, which may be an untrusted checkout: run
+    # the installed module, never one planted in the working directory.
+    cmd = _safe_module_argv("mempalace.daemon", "serve", "--palace", palace_path)
     if backend:
         cmd.extend(["--backend", backend])
-    env = os.environ.copy()
+    env = _safe_child_env()
     if STATE_ROOT_ENV in os.environ:
         env[STATE_ROOT_ENV] = os.environ[STATE_ROOT_ENV]
     kwargs = _detached_kwargs(sd / "daemon.log")

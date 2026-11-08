@@ -1299,7 +1299,10 @@ def _http_serve_logstream_stream(handler) -> None:
                 else _call_logstream(lambda ls: ls.list_events(limit=_SSE_BATCH_LIMIT, **filters))
             )
             for event in events:
-                frame = f"id: {event['id']}\nevent: logstream\ndata: {dumps_internal(event)}\n\n"
+                # One SSE field per id: a line break in an id (a remote event
+                # applied before ids were checked) must not open another field.
+                event_id = str(event["id"]).replace("\r", " ").replace("\n", " ")
+                frame = f"id: {event_id}\nevent: logstream\ndata: {dumps_internal(event)}\n\n"
                 handler.wfile.write(frame.encode("utf-8"))
                 cursor = event["id"]
                 last_write = time.monotonic()

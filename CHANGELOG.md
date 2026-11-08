@@ -35,6 +35,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   stays on one line in wake-up and Hermes output, and a long one is shortened
   instead of crowding out the story.
 
+### Security
+
+- **The Antigravity hooks, the daemon and `mempalace serve` no longer import
+  from the working directory.** They started Python with `-m mempalace` (or
+  `-c`) in the user's workspace, where Python looks first, so a cloned
+  repository holding a `mempalace/` package or a `sqlite3.py` ran instead of
+  the installed one, as the user, on every hook fire. Every child interpreter
+  now runs with `PYTHONSAFEPATH=1` and through the launcher the Claude Code and
+  Codex hooks already used, which drops the working directory from `sys.path`
+  on Python 3.10 too. The small `-c` helpers around the launcher (the
+  kill-switch config reader, the wake-up JSON encoder, the state-file
+  timestamps) carry the same two lines, since Python 3.10 ignores
+  `PYTHONSAFEPATH` and the config reader runs before the launcher does. The
+  working directory itself is unchanged.
+- **A hostile `.gitignore` can no longer hang the miner.** The `**` matcher
+  branched on every `**` segment, so one line of a dozen of them in a cloned
+  repository kept `mempalace mine` and `mempalace init` busy for minutes
+  (`exclude_patterns` in `mempalace.yaml` reached the same code). Matching is
+  now a table over path and pattern positions, and adjacent `**` segments are
+  folded, so the cost is the product of the two lengths. Results are unchanged.
+- **`mempalace init` refuses to write through a symbolic link.**
+  `mempalace.yaml`, `entities.json` and `.gitignore` were guarded with
+  `exists()` and `is_file()`, which follow links, so a checkout that shipped
+  one of them as a link at a file in the user's home had that file replaced or
+  appended to, and a dangling link had its target created. The three writers
+  now decide by `lstat`, refuse anything that is not a regular file or absent,
+  and publish through a fresh temporary file that never follows a link. The
+  replacement keeps the mode of the file it replaces, so a `mempalace.yaml` or
+  `entities.json` the user had set to 0600 stays 0600 instead of coming back
+  at the umask default; this holds for every non-private `fsio` publish.
+- **A sync peer's events and artifacts pass the same checks as local ones.**
+  `apply_remote_event` only checked that required fields were present, so a
+  configured peer (or whoever held its token) could store a body of any size,
+  an id with line breaks that broke the `/logstream/stream` frames, a
+  non-numeric `origin_seq` that made every other replica's pull fail, or an
+  op stamped with a third replica's name and a huge sequence number, which
+  told this node it already had everything from that replica. Remote events
+  and artifacts now go through the routing, type, status, body-size,
+  artifact-size and sha256-shape checks `append_event` and `put_artifact`
+  apply, an event must carry the origin it was served for, its `hlc` stamp
+  must parse (a stamp that did not sorted above every real one, and the next
+  open of that replica's log failed seeding the clock from it; a log that
+  already holds such a row now opens, skips it with a warning and seeds from
+  the newest stamp that parses), and the sync round
+  refuses a page that does not advance the cursor it asked from (a peer could
+  otherwise hold the round, and every peer behind it, for ever), pulls a
+  bounded number of pages per origin per round, and reports any failure a peer
+  provokes instead of letting it stop the loop. Event ids are also written to
+  the SSE stream as a single field. A peer is still trusted for the origins it
+  relays; signing them is the RFC 004 MeshGuard step.
+- **Credentials no longer follow a redirect.** The peer transport, the hub
+  client, the LLM and embedding client, the Qdrant backend and the daemon
+  client used `urllib`'s default opener, whose redirect handler copies
+  `Authorization` and API-key headers onto the redirected request whatever
+  host it names, so an endpoint answering `302 Location: http://elsewhere/`
+  received the token or key meant for it. Those requests now go through one
+  opener that follows no redirect and raises the 3xx, naming the target it did
+  not follow.
+
 ---
 
 ## [3.12.0] — 2026-10-31

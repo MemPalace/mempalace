@@ -33,9 +33,12 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from ._env import env_bool
+
+# Follows no redirect: an API key would travel to wherever a reply pointed.
+from ._net import urlopen
 
 logger = logging.getLogger(__name__)
 

@@ -379,25 +379,41 @@ class GitignoreMatcher:
         return any(fnmatch.fnmatch(part, pattern) for part in parts)
 
     def _match_from_root(self, target_parts: list, pattern_parts: list) -> bool:
-        def matches(path_index: int, pattern_index: int) -> bool:
-            if pattern_index == len(pattern_parts):
-                return True
+        """Whether ``pattern_parts`` matches a prefix of ``target_parts``.
 
-            if path_index == len(target_parts):
-                return all(part == "**" for part in pattern_parts[pattern_index:])
+        ``**`` spans zero or more path segments. A pattern that is consumed
+        before the path is matches (an ignored directory covers everything
+        under it); a path that is consumed first matches only if what is
+        left of the pattern is all ``**``.
 
-            pattern_part = pattern_parts[pattern_index]
-            if pattern_part == "**":
-                return matches(path_index, pattern_index + 1) or matches(
-                    path_index + 1, pattern_index
-                )
-
-            if not fnmatch.fnmatch(target_parts[path_index], pattern_part):
-                return False
-
-            return matches(path_index + 1, pattern_index + 1)
-
-        return matches(0, 0)
+        Solved as a table over (path index, pattern index), so the cost is
+        the product of the two lengths. The obvious recursion branches on
+        every ``**`` and is exponential in the number of ``**`` segments: a
+        ``.gitignore`` line of a dozen of them, in a repository the user
+        only cloned, kept ``mempalace mine`` busy for minutes.
+        """
+        # Adjacent ``**`` segments mean the same as one.
+        pattern = [
+            part
+            for index, part in enumerate(pattern_parts)
+            if not (part == "**" and index and pattern_parts[index - 1] == "**")
+        ]
+        n, m = len(target_parts), len(pattern)
+        # match[i][j]: target_parts[i:] is matched by pattern[j:].
+        match = [[False] * (m + 1) for _ in range(n + 1)]
+        for i in range(n + 1):
+            match[i][m] = True
+        for j in range(m - 1, -1, -1):
+            match[n][j] = pattern[j] == "**" and match[n][j + 1]
+        for i in range(n - 1, -1, -1):
+            segment = target_parts[i]
+            for j in range(m - 1, -1, -1):
+                part = pattern[j]
+                if part == "**":
+                    match[i][j] = match[i][j + 1] or match[i + 1][j]
+                else:
+                    match[i][j] = fnmatch.fnmatch(segment, part) and match[i + 1][j + 1]
+        return match[0][0]
 
 
 def load_gitignore_matcher(dir_path: Path, cache: dict):

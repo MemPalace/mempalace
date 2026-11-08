@@ -47,6 +47,7 @@ from typing import Optional
 from . import paths
 from .config import sanitize_iso_temporal, strip_lone_surrogates
 from .fsio import atomic_publish, read_published_bytes
+from .hlc import parse as parse_hlc
 from .timeutil import filename_stamp, utc_now_z
 
 logger = logging.getLogger(__name__)
@@ -158,6 +159,31 @@ def _sanitize_body(value, max_bytes: int, field_name: str = "body") -> str:
     if size > max_bytes:
         raise ValueError(f"{field_name} is {size} bytes; maximum is {max_bytes} bytes")
     return value
+
+
+# origin_seq values are read back from JSON by every peer; 2**53-1 is the
+# largest integer each of them represents exactly.
+MAX_ORIGIN_SEQ = 2**53 - 1
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _sanitize_origin_seq(value) -> int:
+    """A remote op's per-origin sequence number: a positive JSON-safe integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_ORIGIN_SEQ:
+        raise ValueError(f"origin_seq={value!r} is not an integer between 1 and {MAX_ORIGIN_SEQ}")
+    return value
+
+
+def _sanitize_hlc(value) -> str:
+    """A remote op's HLC stamp, in the fixed-width form ``hlc.render`` produces.
+
+    The clock is seeded from the newest stamp in the log on every open, so a
+    stamp ``hlc.parse`` rejects must never reach the table: it would sort
+    above every well-formed one and fail the next ``Logstream()``.
+    """
+    text = _sanitize_routing(value, "hlc")
+    parse_hlc(text)
+    return text
 
 
 def _sanitize_metadata(value) -> str:
@@ -531,8 +557,38 @@ class Logstream:
         conn.commit()
         # Seed the HLC from the newest stamp in the log so monotonicity
         # survives restarts (RFC 004 op envelope).
-        row = conn.execute("SELECT max(hlc) AS last FROM events").fetchone()
-        self._clock = HybridLogicalClock(self.replica_id, last=row["last"] if row else None)
+        self._clock = HybridLogicalClock(self.replica_id, last=self._newest_valid_hlc(conn))
+
+    @staticmethod
+    def _newest_valid_hlc(conn):
+        """The newest well-formed hlc stamp in the log, or None.
+
+        Every stamp is checked on its way in (``tick()`` locally,
+        ``_sanitize_hlc`` for remote ops), but a log written before that
+        check may hold one ``parse`` rejects. Such a stamp sorts above every
+        well-formed one in SQLite's TEXT order, so ``max(hlc)`` would hand it
+        to the clock and the replica could never be opened again. Walking
+        down from the top and skipping what does not parse keeps the log
+        openable; the skipped rows stay where they are and are otherwise
+        inert. The first row parses in any healthy log, so this reads one.
+        """
+        skipped = 0
+        cursor = conn.execute("SELECT hlc FROM events WHERE hlc IS NOT NULL ORDER BY hlc DESC")
+        for row in cursor:
+            stamp = row[0]
+            try:
+                parse_hlc(stamp)
+            except ValueError:
+                skipped += 1
+                continue
+            break
+        else:
+            stamp = None
+        if skipped:
+            logger.warning(
+                "logstream: %d malformed hlc stamp(s) ignored while seeding the clock", skipped
+            )
+        return stamp
 
     def _migrate_schema(self, conn):
         """RFC 004 / RFC 003 migration: add provenance and topic columns to pre-existing logs.
@@ -1200,7 +1256,7 @@ class Logstream:
             events = [self._event_dict(row) for row in rows]
             return self._attach_artifact_ids(conn, events)
 
-    def apply_remote_event(self, event: dict) -> bool:
+    def apply_remote_event(self, event: dict, expected_origin: Optional[str] = None) -> bool:
         """Fold one remote op into the local log, idempotently.
 
         Verbatim rule: the event is stored exactly as authored (id,
@@ -1210,7 +1266,19 @@ class Logstream:
         id, same invariant as append_event. Returns True if inserted, False
         if we already had it. Raises ValueError on malformed input or a
         missing artifact.
+
+        A peer is trusted for what it relays, not for its shape: every field
+        passes the same checks ``append_event`` applies to a local author
+        (types, lengths, the body cap, no control characters in an id, an
+        ``origin_seq`` that is a positive integer), so a peer cannot plant
+        an unbounded body, a non-numeric sequence number that stops every
+        other replica's pull, or an id that breaks the SSE stream. With
+        ``expected_origin`` (the replica whose ops were asked for) an event
+        stamped by any other replica is refused, so a page served for one
+        origin cannot move another origin's cursor.
         """
+        if not isinstance(event, dict):
+            raise ValueError("remote event must be an object")
         for key in (
             "id",
             "type",
@@ -1224,18 +1292,45 @@ class Logstream:
         ):
             if not event.get(key):
                 raise ValueError(f"remote event is missing required field {key!r}")
-        if event["origin_replica"] == self.replica_id:
-            return False  # our own op echoed back — by definition already present
-        artifact_ids = list(dict.fromkeys(event.get("artifact_ids") or []))
-        metadata_json = _sanitize_metadata(event.get("metadata"))
+        event_id = _sanitize_routing(event["id"], "id")
+        event_type = _sanitize_event_type(event["type"])
+        stream = _sanitize_routing(event["stream"], "stream")
+        room = _sanitize_routing(event["room"], "room")
         topic = _sanitize_routing(event.get("topic"), "topic", required=False)
+        from_agent = _sanitize_routing(event["from_agent"], "from_agent")
+        to_agent = _sanitize_routing(event.get("to_agent"), "to_agent", required=False)
+        correlation_id = _sanitize_routing(
+            event.get("correlation_id"), "correlation_id", required=False
+        )
+        branch = _sanitize_routing(event.get("branch"), "branch", required=False)
+        base_commit = _sanitize_routing(event.get("base_commit"), "base_commit", required=False)
+        status = _sanitize_status(event.get("status"))
+        body = _sanitize_body(event.get("body"), self.max_body_bytes)
+        created_at = _sanitize_routing(event["created_at"], "created_at")
+        origin_replica = _sanitize_routing(event["origin_replica"], "origin_replica")
+        origin_seq = _sanitize_origin_seq(event["origin_seq"])
+        hlc = _sanitize_hlc(event["hlc"])
+        metadata_json = _sanitize_metadata(event.get("metadata"))
+        if expected_origin is not None and origin_replica != expected_origin:
+            raise ValueError(
+                f"remote event {event_id!r} is stamped origin_replica={origin_replica!r}, "
+                f"not the origin {expected_origin!r} it was served for"
+            )
+        if origin_replica == self.replica_id:
+            return False  # our own op echoed back — by definition already present
+        raw_artifact_ids = event.get("artifact_ids") or []
+        if not isinstance(raw_artifact_ids, list):
+            raise ValueError("artifact_ids must be a list of artifact id strings")
+        artifact_ids = list(
+            dict.fromkeys(_sanitize_routing(a, "artifact_id") for a in raw_artifact_ids)
+        )
 
         with self._lock:
             conn = self._conn()
             with conn:
                 dup = conn.execute(
                     "SELECT 1 FROM events WHERE id = ? OR (origin_replica = ? AND origin_seq = ?)",
-                    (event["id"], event["origin_replica"], event["origin_seq"]),
+                    (event_id, origin_replica, origin_seq),
                 ).fetchone()
                 if dup:
                     return False
@@ -1245,7 +1340,7 @@ class Logstream:
                     ).fetchone()
                     if not found:
                         raise ValueError(
-                            f"remote event {event['id']!r} references artifact "
+                            f"remote event {event_id!r} references artifact "
                             f"{artifact_id!r} not yet applied locally"
                         )
                 conn.execute(
@@ -1254,33 +1349,33 @@ class Logstream:
                     " metadata_json, origin_replica, origin_seq, hlc)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        event["id"],
-                        event["type"],
-                        event["stream"],
-                        event["room"],
+                        event_id,
+                        event_type,
+                        stream,
+                        room,
                         topic,
-                        event["from_agent"],
-                        event.get("to_agent"),
-                        event.get("correlation_id"),
-                        event.get("branch"),
-                        event.get("base_commit"),
-                        event.get("status"),
-                        event.get("body") or "",
-                        event["created_at"],
+                        from_agent,
+                        to_agent,
+                        correlation_id,
+                        branch,
+                        base_commit,
+                        status,
+                        body,
+                        created_at,
                         metadata_json,
-                        event["origin_replica"],
-                        event["origin_seq"],
-                        event["hlc"],
+                        origin_replica,
+                        origin_seq,
+                        hlc,
                     ),
                 )
                 for artifact_id in artifact_ids:
                     conn.execute(
                         "INSERT OR IGNORE INTO event_artifacts (event_id, artifact_id)"
                         " VALUES (?, ?)",
-                        (event["id"], artifact_id),
+                        (event_id, artifact_id),
                     )
         # Absorb the remote instant so our next local op sorts after it.
-        self._clock.observe(event["hlc"])
+        self._clock.observe(hlc)
         return True
 
     def has_artifact(self, artifact_id: str) -> bool:
@@ -1297,22 +1392,51 @@ class Logstream:
         Content is verbatim; the sha256 must match or the artifact is
         rejected — a corrupt transfer must never enter the store.
         """
+        if not isinstance(artifact, dict):
+            raise ValueError("remote artifact must be an object")
         for key in ("id", "kind", "sha256", "content", "created_by", "created_at"):
             if not artifact.get(key):
                 raise ValueError(f"remote artifact is missing required field {key!r}")
+        # The same shape checks put_artifact applies to a local author: a
+        # peer is trusted for what it relays, not for its sizes and types.
+        artifact_id = _sanitize_routing(artifact["id"], "id")
+        kind = artifact["kind"]
+        if not isinstance(kind, str) or kind not in ARTIFACT_KINDS:
+            allowed = ", ".join(sorted(ARTIFACT_KINDS))
+            raise ValueError(f"kind={kind!r} is not one of: {allowed}")
+        claimed = artifact["sha256"]
+        if not isinstance(claimed, str) or not _SHA256_HEX_RE.match(claimed):
+            raise ValueError("sha256 must be 64 lowercase hex characters")
         content = artifact["content"]
-        digest = sha256(content.encode("utf-8")).hexdigest()
-        if digest != artifact["sha256"]:
+        if not isinstance(content, str):
+            raise ValueError("content must be a non-empty string")
+        if "\x00" in content:
+            raise ValueError("content contains null bytes")
+        try:
+            raw = content.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("content is not valid UTF-8 text") from None
+        if len(raw) > self.max_artifact_bytes:
             raise ValueError(
-                f"remote artifact {artifact['id']!r} failed hash verification "
-                f"(claimed {artifact['sha256'][:16]}..., computed {digest[:16]}...)"
+                f"content is {len(raw)} bytes; maximum is {self.max_artifact_bytes} bytes"
+            )
+        created_by = _sanitize_routing(artifact["created_by"], "created_by")
+        created_at = _sanitize_routing(artifact["created_at"], "created_at")
+        origin_replica = _sanitize_routing(
+            artifact.get("origin_replica"), "origin_replica", required=False
+        )
+        digest = sha256(raw).hexdigest()
+        if digest != claimed:
+            raise ValueError(
+                f"remote artifact {artifact_id!r} failed hash verification "
+                f"(claimed {claimed[:16]}..., computed {digest[:16]}...)"
             )
         metadata_json = _sanitize_metadata(artifact.get("metadata"))
         with self._lock:
             conn = self._conn()
             with conn:
                 dup = conn.execute(
-                    "SELECT 1 FROM artifacts WHERE id = ?", (artifact["id"],)
+                    "SELECT 1 FROM artifacts WHERE id = ?", (artifact_id,)
                 ).fetchone()
                 if dup:
                     return False
@@ -1321,15 +1445,15 @@ class Logstream:
                     " created_by, created_at, metadata_json, origin_replica)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        artifact["id"],
-                        artifact["kind"],
-                        artifact["sha256"],
-                        len(content.encode("utf-8")),
+                        artifact_id,
+                        kind,
+                        claimed,
+                        len(raw),
                         content,
-                        artifact["created_by"],
-                        artifact["created_at"],
+                        created_by,
+                        created_at,
                         metadata_json,
-                        artifact.get("origin_replica"),
+                        origin_replica,
                     ),
                 )
         return True
