@@ -27,6 +27,9 @@ def digest(groups):
     )
     count = len(ordered)
     items = [{k: c[k] for k in ("number", "title", "need", "board")} for c in ordered[:5]]
+    for item, c in zip(items, ordered):
+        if c.get("approval_kind") in ("origin", "origin_configuration"):
+            item.update({k: c[k] for k in ("why", "approval_kind", "actions", "can_approve")})
     remaining = count - len(items)
     text = _text(count, items, remaining)
     return {"text": text, "count": count, "items": items, "remaining": remaining}

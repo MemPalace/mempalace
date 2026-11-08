@@ -100,6 +100,10 @@ def test_guard_need_items_order_kept():
     _render("need_items")
 
 
+def test_owner_origin_survives_shell_refresh():
+    _render("origin_shell")
+
+
 def test_needs_actions_behaviour():
     node = shutil.which("node")
     if not node:

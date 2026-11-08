@@ -218,9 +218,16 @@ def test_pending_child_proposal_requires_real_parent_approval(hub, fresh, surfac
 def test_signed_in_owner_can_approve_a_child_proposal(hub, fresh):
     proposed = fresh.subagent.service.task_add(title="Owner fallback", board="work")
     status, approved = api(
-        hub, fresh.cookie, "POST", f"/api/cards/{proposed['number']}/approve", {}
+        hub,
+        fresh.cookie,
+        "POST",
+        f"/api/cards/{proposed['number']}/approve",
+        {"reason": "Independent owner recovery"},
     )
     assert status == 200 and approved["approved_by"] == fresh.owner.principal.actor
+    assert approved["proposal_status"] == "pending" and approved["status"] == "backlog"
+    reviewed = fresh.owner.task_approve(proposed["number"], reason="Separate proposal review")
+    assert reviewed["proposal_status"] == "approved" and reviewed["status"] == "todo"
     assert fresh.subagent.service.task_update(approved["number"], status="done")["status"] == "done"
 
 

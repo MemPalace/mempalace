@@ -202,8 +202,18 @@ def test_agents_keep_space_creation_authority_and_child_approval(signup):
     )
     assert status == 200 and approved["proposal_status"] == "approved"
     assert approved["approved_by"] is None and approved["status"] == "backlog"
-    status, approved = api(client, cookie, path + "/approve", "POST", {})
+    # Parent review remains separate from the owner's reasoned origin release.
+    before = {key: approved[key] for key in ("status", "approved_by", "version")}
+    status, refused = api(client, cookie, path + "/approve", "POST", {})
+    assert status == 403 and refused["error"] == "reason must be nonempty text"
+    status, unchanged = api(client, cookie, path)
+    assert status == 200
+    assert {key: unchanged[key] for key in before} == before
+    status, approved = api(
+        client, cookie, path + "/approve", "POST", {"reason": "Release this child origin"}
+    )
     assert status == 200 and approved["approved_by"].startswith("user:")
+    assert approved["proposal_status"] == "approved" and approved["status"] == "todo"
     status, claimed = api(
         client,
         None,

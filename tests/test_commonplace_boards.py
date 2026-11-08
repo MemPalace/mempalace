@@ -1249,7 +1249,7 @@ def test_inbox_agent_cannot_create_and_claim_without_release(hub, env, trust):
     assert status == 201 and created["status"] == "backlog" and created["assignee"] == "conn:inbox"
     assert created["flags"] == ["ignore_previous"]
     assert not mcp(hub, token, "task_take_next", task=created["number"])[0]
-    owner.task_approve(created["number"])
+    owner.task_approve(created["number"], reason="Independent owner recovery")
     assert mcp(hub, token, "task_take_next", task=created["number"])[0]
     assert not mcp(hub, agent_token, "task_take_next", task=created["number"])[0]
     assert mcp(hub, token, "task_update", task=created["number"], status_line=REVIEW_CONTEXT)[0]

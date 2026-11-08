@@ -137,7 +137,12 @@ def test_r06_crash_recovery(chat_hub, kind):
     with h.db._lock:
         h.db._conn.execute("UPDATE answer_holds SET state='settling' WHERE id=?", (result["id"],))
     if kind == "approve":
-        s.task_approve(card["number"], approve=True, version=body["version"])
+        s.task_approve(
+            card["number"],
+            approve=True,
+            version=body["version"],
+            reason="Independent owner recovery",
+        )
     else:
         s.decide(card["number"], choice="First", version=body["version"])
     recovery = m.HoldWorker(h.gateway, start=False)

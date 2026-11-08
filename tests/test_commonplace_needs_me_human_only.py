@@ -81,7 +81,10 @@ def mine(hub, agent):
 def holding(fresh, agent):
     card = allowed(lambda: agent.work.task_add(board="work", title="Work to finish"))
     if card.get("proposal_status") == "pending":
-        allowed(lambda: fresh.owner.task_approve(card["number"]))
+        allowed(
+            lambda: fresh.owner.task_approve(card["number"], reason="Independent owner recovery")
+        )
+        allowed(lambda: fresh.owner.task_approve(card["number"], reason="Separate proposal review"))
     return allowed(lambda: agent.work.task_take_next(task=card["number"]))
 
 
@@ -346,21 +349,22 @@ def test_only_unreleasable_proposals_reach_the_owner(hub, fresh):
     assert not container["children_need_you"]
     absent(owner_items(hub, fresh), parent_card["number"])
     revoke(hub, fresh, parent)
-    item = listed(owner_items(hub, fresh), "backlog_from_agents", number)
+    item = listed(owner_items(hub, fresh), "approvals", number)
     assert (
         item.get("why")
-        == "child proposed this, and no agent can approve it any more. Approve or reject it."
+        == "Restricted-origin work has not been released. No live coordinator with all required release grants is available. You are the workspace owner: use task_approve with a reason to release its origin. Origin release does not approve the pending proposal or plan; separate review is still required."
     )
-    assert item.get("actions") == ["approve", "reject"]
+    assert item.get("actions") == ["approve"]
     assert shown(hub, fresh, number)["need"] == "you"
     code, _ = api(
         hub,
         fresh.cookie,
         "POST",
         f"/api/cards/{number}/approve",
-        {"version": item["version"], "approve": True},
+        {"version": item["version"], "approve": True, "reason": "Independent owner recovery"},
     )
     assert code == 200
+    fresh.owner.task_approve(number, reason="Separate proposal review")
     absent(owner_items(hub, fresh), number)
 
 
@@ -369,10 +373,10 @@ def test_release_authority_uses_live_write_read_predicates(hub, fresh):
     child = fresh.connect("child", parent=parent.id)
     proposal = child.work.task_add(board="work", title="Child proposal")
     number = proposal["number"]
-    item = listed(owner_items(hub, fresh), "backlog_from_agents", number)
+    item = listed(owner_items(hub, fresh), "approvals", number)
     assert (
         item.get("why")
-        == "child proposed this, and no agent can approve it any more. Approve or reject it."
+        == "Restricted-origin work has not been released. No live coordinator with all required release grants is available. You are the workspace owner: use task_approve with a reason to release its origin. Origin release does not approve the pending proposal or plan; separate review is still required."
     )
     assert shown(hub, fresh, number)["need"] == "you"
     keeper = fresh.connect("coordinator")
@@ -380,7 +384,7 @@ def test_release_authority_uses_live_write_read_predicates(hub, fresh):
     absent(owner_items(hub, fresh), number)
     assert shown(hub, fresh, number)["need"] == "plan"
     coordinator(hub, fresh, None)
-    listed(owner_items(hub, fresh), "backlog_from_agents", number)
+    listed(owner_items(hub, fresh), "approvals", number)
     root = fresh.connect("root")
     middle = fresh.connect("middle", parent=root.id, scopes=["memory:read"])
     grandchild = fresh.connect("grandchild", parent=middle.id)
@@ -716,9 +720,9 @@ def test_status_line_cannot_hide_person_release(hub, fresh):
     card = agent.work.task_add(board="work", title="Proposed work")
     revoke(hub, fresh, parent)
     assert card["proposal_status"] == "pending"
-    listed(owner_items(hub, fresh), "backlog_from_agents", card["number"])
+    listed(owner_items(hub, fresh), "approvals", card["number"])
     agent.work.task_update(card["number"], status_line="waiting on an upstream release")
-    listed(owner_items(hub, fresh), "backlog_from_agents", card["number"])
+    listed(owner_items(hub, fresh), "approvals", card["number"])
 
 
 def test_claim_with_same_call_pr_report(hub, fresh):

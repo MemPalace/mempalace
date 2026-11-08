@@ -62,7 +62,7 @@ def test_brand_new_workspace_default_client_owns_work(hub, capsys, client, membe
     assert worker.task_show(number)["status"] == ("backlog" if restricted else "todo")
     if restricted:
         assert not mcp(hub, token, "task_take_next", task=number)[0]
-        owner.task_approve(number)
+        owner.task_approve(number, reason="Independent owner recovery")
     assert agent.parent_agent is None
     assert mcp(hub, token, "task_update", task=number, status="doing")[0]
     assert mcp(hub, token, "task_update", task=number, status_line=CONTEXT)[0]
@@ -81,7 +81,7 @@ def test_brand_new_workspace_default_client_owns_work(hub, capsys, client, membe
     assert ok and ("backlog" if restricted else "doing") in reply
     next_card = worker.task_list(mine=True, status="backlog" if restricted else "doing")[0]
     if restricted:
-        owner.task_approve(next_card["number"])
+        owner.task_approve(next_card["number"], reason="Independent owner recovery")
         next_card = worker.task_take_next(task=next_card["number"])
     assert next_card["assignee"] == agent.actor and next_card["claim_until"]
 
@@ -123,7 +123,7 @@ def test_explicit_grok_overrides_and_legacy_own_backlog(hub, capsys):
     with pytest.raises(ToolError, match="restricted-origin"):
         worker.task_update(created["number"], status="todo")
     owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
-    owner.task_approve(created["number"])
+    owner.task_approve(created["number"], reason="Independent owner recovery")
     assert (
         worker.task_update(created["number"], status="doing")["assignee"] == worker.principal.actor
     )
@@ -185,8 +185,13 @@ def test_rejection_owner_fallback_and_nested_parent(hub):
             nested.task_update(proposal["number"], status=status)
     person = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
     proposal = nested.task_add(title="Owner fallback")
+    released = person.task_approve(proposal["number"], reason="Independent owner recovery")
+    assert released["proposal_status"] == "pending" and released["status"] == "backlog"
+    assert released["approved_by"] == person.principal.actor
     assert (
-        person.task_approve(proposal["number"], reason="synthetic reason")["proposal_status"]
+        person.task_approve(proposal["number"], reason="Separate proposal review")[
+            "proposal_status"
+        ]
         == "approved"
     )
     assert nested.task_update(proposal["number"], status="doing")["status"] == "doing"
@@ -364,7 +369,7 @@ def test_inbox_memory_links_renew_only_the_held_card(hub):
     worker = service(hub, hub.db.authenticate_token(token))
     created = worker.task_add(title="Linked work", claim=True)
     owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
-    owner.task_approve(created["number"])
+    owner.task_approve(created["number"], reason="Independent owner recovery")
     worker.task_take_next(task=created["number"])
     with worker.store.transaction() as conn:
         conn.execute(
@@ -426,7 +431,7 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     assert creator.task_show(number)["approved_by"] is None
     assert other.task_take_next() is None
     owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
-    owner.task_approve(number)
+    owner.task_approve(number, reason="Independent owner recovery")
     creator.task_take_next(task=number)
     creator.task_handoff(number, to="anyone", note="Ready for the shared queue")
     queued = other.task_take_next()
@@ -462,7 +467,7 @@ def test_restricted_origin_stays_private_to_its_creator_until_owner_release(hub)
     with pytest.raises(ToolError, match="owner release"):
         person.task_update(number, status="doing")
     owner = service(hub, sessions.person_principal(hub.db, hub.admin, hub.workspace))
-    owner.task_approve(number)
+    owner.task_approve(number, reason="Independent owner recovery")
     owner.task_handoff(number, to="anyone", note="Approved for the shared queue")
     assert child.task_show(number)["approved_by"] == owner.principal.actor
     assert other.task_take_next()["number"] == number

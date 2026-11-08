@@ -198,12 +198,19 @@ def callstack_json(value):
     return stored
 
 
+def validate_choice(value, name):
+    value = validate_text(value, name, required=True, limit=120)
+    if value == "release origin":
+        raise ToolError("no: 'release origin' is a reserved choice")
+    return value
+
+
 def choices(value):
     if value is None:
         return []
     if not isinstance(value, list) or len(value) > 6:
         raise ToolError("no: options must contain up to six choices")
-    return [validate_text(v, "option", required=True, limit=120) for v in value]
+    return [validate_choice(v, "option") for v in value]
 
 
 def review_request(question, options, context):
@@ -331,14 +338,24 @@ def _stuck(row, cutoff):
 
 
 def needs_me(
-    store, principal, *, release=None, names=None, supervisors=None, coordinated=(), ask_owner=None
+    store,
+    principal,
+    *,
+    release=None,
+    names=None,
+    supervisors=None,
+    coordinated=(),
+    release_boards=(),
+    origin_pending=None,
+    origin_blocks_approval=None,
+    ask_owner=None,
 ) -> dict:
     """Decision queue: asks, done_review, backlog_from_agents, ready_to_merge, stale, count."""
     owner_queue = True
     try:
         _owner(principal, trusted_read=True)
     except ToolError:
-        if not coordinated:
+        if not coordinated and not release_boards:
             raise
         owner_queue = False
     result = {
@@ -375,6 +392,8 @@ def needs_me(
                 and row["review_kind"] == "decision"
             )
             if not owner_queue and not own_ask:
+                continue
+            if origin_pending is not None and origin_pending(row):
                 continue
             kind = None
             addressed = (
@@ -430,16 +449,30 @@ def needs_me(
                     why = f"{asker} asks {recipient}: {ask_line}"
                     actions = ["answer"]
             elif kind == "plans":
+                blocked = (
+                    principal.person
+                    and origin_blocks_approval is not None
+                    and origin_blocks_approval(row)
+                )
                 why = (
-                    "Awaiting plan review. Approve or reject it."
+                    "Awaiting plan review. You may reject it; origin release is required before approval."
+                    if blocked
+                    else "Awaiting plan review. Approve or reject it."
                     if principal.person
                     else "The owner must review this plan."
                 )
-                actions = ["approve", "reject"]
+                actions = ["reject"] if blocked else ["approve", "reject"]
             elif kind == "backlog_from_agents":
                 creator = actor(row["created_by"])
+                blocked = (
+                    principal.person
+                    and origin_blocks_approval is not None
+                    and origin_blocks_approval(row)
+                )
                 decision = (
-                    "Approve or reject it."
+                    "You may reject it; origin release is required before approval."
+                    if blocked
+                    else "Approve or reject it."
                     if principal.person
                     else "The owner must approve or reject it."
                 )
@@ -448,7 +481,7 @@ def needs_me(
                     if (row["proposed_to"] or "").startswith("user:")
                     else f"{creator} proposed this, and no agent can approve it any more. {decision}"
                 )
-                actions = ["approve", "reject"]
+                actions = ["reject"] if blocked else ["approve", "reject"]
             else:
                 holder = actor(row["assignee"])
                 at = row["claim_until"] or row["heartbeat_at"] or row["updated_at"]
@@ -670,11 +703,30 @@ class BoardService:
                     live[q.actor] = role
         return tuple(live.items())
 
+    def release_boards(self):
+        """Release discovery is separate from authority to answer addressed asks."""
+        p = self.principal
+        if p.person:
+            return ()
+        with self.store.connection() as conn:
+            return tuple(
+                b["id"]
+                for b in conn.execute(
+                    "SELECT * FROM boards WHERE archived=0 AND coordinator=?", (p.actor,)
+                )
+                if (q := self._live_connection(p.connection_id)) is not None
+                and self._release_grants(q, b["wing"])
+            )
+
     def _needs_person_release(self, row):
         if "escalated_to" in row.keys() and row["escalated_to"]:
             return True
+        if (row["proposed_to"] or "").startswith("user:") and (
+            _plan_waiting(row) or row["proposal_status"] == "pending"
+        ):
+            return True
         if self._awaits_origin_release(row):
-            return self._live_coordinator(row) is None
+            return self._origin_authority(row)[0] != "coordinator"
         if not (
             _plan_waiting(row)
             or (row["status"] == "backlog" and row["proposal_status"] == "pending")
@@ -691,15 +743,22 @@ class BoardService:
                 return self.approvals_for_me(conn, limit=limit, budget=budget)
         p = self.principal
         result = dict(items=[], truncated=False, more=False)
+        if (
+            not p.policy.has_scope("memory:read")
+            or not p.policy.has_scope("memory:write")
+            or not p.policy.tool_visible("task_approve")
+            or not p.policy.tool_visible("needs_me")
+        ):
+            return result
+        ordinary_reader = not p.person
         try:
             _owner(p, trusted_read=True)
         except ToolError:
-            return result
+            ordinary_reader = False
         if (
-            p.person
-            or not p.policy.has_scope("memory:read")
-            or not p.policy.has_scope("memory:write")
-            or not p.policy.tool_visible("task_approve")
+            not ordinary_reader
+            and not (p.person and p.role == "owner")
+            and not self.release_boards()
         ):
             return result
         descendants = []
@@ -725,32 +784,53 @@ class BoardService:
         escalated = "AND t.escalated_to IS NULL " if "escalated_to" in columns else ""
         sql = (
             f"SELECT t.*, b.slug AS board,b.wing AS board_wing,{coordinator} AS board_coordinator "
-            "FROM tasks t JOIN boards b ON b.id=t.board_id WHERE t.id>? AND t.status!='done' "
+            "FROM tasks t JOIN boards b ON b.id=t.board_id WHERE b.archived=0 AND t.id>? AND t.status!='done' "
             + escalated
-            + "AND (t.proposal_status='pending' OR ((t.restricted_origin=1 OR t.agent_parent IS NOT NULL) AND t.status IN ('backlog','todo')) OR (t.status IN ('todo','doing') AND t.labels LIKE '%\"plan\"%')) "
-            f"AND (t.proposed_to=? OR t.created_by IN ({placeholders}) OR {coordinator}=?) ORDER BY t.id LIMIT 50"
+            + "AND ((t.proposal_status='pending' OR (t.status IN ('todo','doing') AND t.labels LIKE '%\"plan\"%')) "
+            f"AND (t.proposed_to=? OR t.created_by IN ({placeholders}) OR {coordinator}=?) "
+            "OR ((COALESCE(t.restricted_origin,1)!=0 OR t.agent_parent IS NOT NULL) "
+            f"AND t.status IN ('backlog','todo','doing') AND (? OR {coordinator}=?))) ORDER BY t.id LIMIT 50"
         )
         cap = 60 if budget == "session" else 200
         checked, last = 0, 0
         started = monotonic()
         with self._projection():
             while True:
-                rows = conn.execute(sql, (last, p.actor, *actors, p.actor)).fetchall()
+                rows = conn.execute(
+                    sql, (last, p.actor, *actors, p.actor, p.person and p.role == "owner", p.actor)
+                ).fetchall()
                 if not rows:
                     break
                 for row in rows:
                     last = row["id"]
-                    if not self._approval_visible(p, row):
+                    if not p.policy.can_read_wing(row["board_wing"]):
+                        continue
+                    ordinary_visible = ordinary_reader and self._approval_visible(p, row)
+                    origin_visible = (p.person and p.role == "owner") or row[
+                        "board_coordinator"
+                    ] == p.actor
+                    if not ordinary_visible and not origin_visible:
                         continue
                     if checked >= cap:
                         result["truncated"] = True
                         break
                     checked += 1
-                    role = self._approval_role(p, row)
-                    if role and (
-                        row["proposal_status"] == "pending"
-                        or _plan_waiting(row)
-                        or (self._awaits_origin_release(row) and self._can_release_origin(p, row))
+                    role = self._approval_role(p, row) if ordinary_visible else None
+                    origin = self._origin_item(conn, row, review_role=role)
+                    if origin is not None:
+                        result["items"].append(origin)
+                    elif (
+                        ordinary_visible
+                        and role
+                        and not p.person
+                        and (
+                            row["proposal_status"] == "pending"
+                            or _plan_waiting(row)
+                            or (
+                                self._awaits_origin_release(row)
+                                and self._can_release_origin(p, row)
+                            )
+                        )
                     ):
                         item = self._card(conn, row, approval_role=role)
                         item.update(
@@ -760,9 +840,9 @@ class BoardService:
                             actions=[],
                         )
                         result["items"].append(item)
-                        if len(result["items"]) > limit:
-                            result["more"] = True
-                            break
+                    if len(result["items"]) > limit:
+                        result["more"] = True
+                        break
                 if result["truncated"] or result["more"] or len(rows) < 50:
                     break
         result["items"] = result["items"][:limit]
@@ -1110,6 +1190,10 @@ class BoardService:
             return (
                 not q.person
                 and row["created_by"] != q.actor
+                and (
+                    not self._restricted_origin(row)
+                    or self._origin_lineage(q, row) == "independent"
+                )
                 and row["board_coordinator"] == q.actor
                 and _can_coordinate(q, row["board_wing"])
             )
@@ -1124,13 +1208,56 @@ class BoardService:
         except (ControlError, ValueError, TypeError):
             return False
 
-    def _live_coordinator(self, row):
+    def _origin_lineage(self, q, row):
+        """Directional identity check, without requiring ancestors to remain live.
+
+        A failed stamp or traversal is never evidence of independence. Raw actor
+        comparisons precede stamp resolution, including for legacy rows.
+        """
+        creator_actor = row["created_by"]
+        conflict = "creator" if q.actor == creator_actor else None
+        seen = set()
+        try:
+            current = q.connection_id
+            while current:
+                if current in seen:
+                    return "unsafe"
+                seen.add(current)
+                ancestor = self.ctx.db.connection(current, self.principal.workspace_id)
+                if "conn:" + ancestor["name"] == creator_actor:
+                    conflict = conflict or "descendant"
+                current = ancestor["parent_id"]
+            creator = self._creator_connection(row)
+            if creator_actor.startswith("conn:") and creator is None:
+                return "unsafe"
+            if creator is not None and creator["id"] in seen:
+                conflict = conflict or "descendant"
+            return conflict or "independent"
+        except (ControlError, ValueError, TypeError):
+            return "unsafe"
+
+    @staticmethod
+    def _release_grants(q, wing):
+        return (
+            _can_coordinate(q, wing)
+            and q.policy.tool_visible("task_approve")
+            and q.policy.tool_visible("needs_me")
+        )
+
+    def _origin_authority(self, row):
+        """Nonrecursive shared owner/coordinator classification for this card."""
         actor = row["board_coordinator"] or ""
-        if actor.startswith("conn:"):
-            q = self._live_connection(actor[5:])
-            if q is not None and _can_coordinate(q, row["board_wing"]):
-                return q
-        return None
+        q = self._live_connection(actor[5:]) if actor.startswith("conn:") else None
+        if q is None:
+            return "owner", None
+        lineage = self._origin_lineage(q, row)
+        if row["created_by"].startswith("conn:") and self._creator_connection(row) is None:
+            return "stamp", q
+        if lineage != "independent":
+            return lineage, q
+        if self._release_grants(q, row["board_wing"]):
+            return "coordinator", q
+        return "owner", q
 
     @staticmethod
     def _restricted_origin(row):
@@ -1139,16 +1266,81 @@ class BoardService:
     def _awaits_origin_release(self, row):
         return (
             self._restricted_origin(row)
-            and row["status"] in ("backlog", "todo")
+            and row["status"] in ("backlog", "todo", "doing")
             and row["proposal_status"] != "rejected"
+            and not _waiting_on_person(row)
+            and not ("escalated_to" in row.keys() and row["escalated_to"])
             and not self._origin_released(row)
         )
 
     def _can_release_origin(self, q, row):
-        coordinator = self._live_coordinator(row)
-        if coordinator is not None:
-            return q.actor == coordinator.actor and self._coordinates(q, row)
-        return q.person and q.role == "owner"
+        state, coordinator = self._origin_authority(row)
+        if state == "coordinator":
+            return not q.person and q.actor == coordinator.actor
+        return state == "owner" and q.person and q.role == "owner"
+
+    def _origin_only(self, q, row, *, role=_UNSET):
+        """Whether release must preserve a separate proposal or plan review."""
+        return (
+            q.person
+            or not self._approval_visible(q, row)
+            or not (self._approval_role(q, row) if role is _UNSET else role)
+            or not (_plan_waiting(row) or row["proposal_status"] == "pending")
+        )
+
+    def _origin_pending(self, row):
+        """Origin work stays in approvals even beyond its bounded display page."""
+        if not self._awaits_origin_release(row):
+            return False
+        p = self.principal
+        if p.person and p.role == "owner":
+            return self._origin_authority(row)[0] != "coordinator"
+        return self._can_release_origin(p, row) and self._origin_only(p, row)
+
+    def _origin_item(self, conn, row, *, review_role=_UNSET):
+        p = self.principal
+        if not self._awaits_origin_release(row):
+            return None
+        if not p.policy.tool_visible("needs_me") or not p.policy.tool_visible("task_approve"):
+            return None
+        state, coordinator = self._origin_authority(row)
+        person = p.person and p.role == "owner"
+        if person:
+            if state == "coordinator":
+                return None
+            why = {
+                "owner": "Restricted-origin work has not been released. No live coordinator with all required release grants is available. You are the workspace owner: use task_approve with a reason to release its origin.",
+                "creator": "Restricted-origin work has not been released. The live board coordinator is this card's creator. Appoint an independent coordinator in board settings; owner release is blocked.",
+                "descendant": "Restricted-origin work has not been released. The live board coordinator acts under this card's creator. Appoint an independent coordinator in board settings; owner release is blocked.",
+                "unsafe": "Restricted-origin work has not been released. The live board coordinator's independence from this card's creator cannot be verified. Appoint an independent coordinator in board settings; owner release is blocked.",
+                "stamp": "Restricted-origin work has not been released. This card’s creator stamp cannot be verified. Clear the coordinator in board settings, then use the existing owner release path; owner release is blocked while this live record remains.",
+            }[state]
+        elif (
+            state == "coordinator"
+            and coordinator.actor == p.actor
+            and self._origin_only(p, row, role=review_role)
+        ):
+            holder = (
+                people(self.ctx, row["assignee"].removeprefix("conn:"))
+                if row["assignee"]
+                else "unassigned"
+            )
+            why = f"Restricted-origin work held by {holder} has not been released. You are this board's coordinator: use task_approve with a reason to release its origin."
+        else:
+            return None
+        configuration = person and state != "owner"
+        if _plan_waiting(row) or row["proposal_status"] == "pending":
+            why += " Origin release does not approve the pending proposal or plan; separate review is still required."
+        item = self._card(conn, row)
+        item.update(
+            approval_kind="origin_configuration" if configuration else "origin",
+            approval_role="workspace owner" if person else "board coordinator",
+            can_approve=not configuration,
+            actions=["configure_coordinator"] if configuration else ["approve"],
+            need="you" if configuration else "release",
+            why=why,
+        )
+        return item
 
     def _origin_released(self, row):
         actor = row["approved_by"]
@@ -1165,10 +1357,17 @@ class BoardService:
                 return False
             connection = self.ctx.db.connection(actor[5:], self.principal.workspace_id)
             approver = self.ctx.db.authenticate_connection(connection["id"])
+            if approver is None or approver.actor != actor:
+                return False
+            if self._restricted_origin(row):
+                lineage = self._origin_lineage(approver, row)
+                if lineage in ("descendant", "unsafe"):
+                    return False
+            if row["assignee"] == actor:
+                return self._restricted_origin(row) and self._can_release_origin(approver, row)
             return bool(
                 approver is not None
                 and approver.actor == actor
-                and row["assignee"] != actor
                 and approver.policy.has_scope("memory:write")
                 and approver.policy.can_read_wing(row["board_wing"])
                 and (
@@ -1411,7 +1610,7 @@ class BoardService:
             "%Y-%m-%dT%H:%M:%SZ"
         )
 
-    def _set(self, conn, row, updates, *, release_origin=True):
+    def _set(self, conn, row, updates, *, release_origin=True, renew_claim=True):
         from commonplace.projects import reports
 
         reports.guard(
@@ -1450,7 +1649,8 @@ class BoardService:
                 else None
             )
         if (
-            row["status"] == "doing"
+            renew_claim
+            and row["status"] == "doing"
             and row["assignee"] == self.principal.actor
             and "claim_until" not in updates
             and not self.principal.person
@@ -1750,33 +1950,30 @@ class BoardService:
         if not self.principal.person or self.principal.role != "owner":
             return []
         waiting = {}
-        live = {}
-        with self.store.connection() as conn:
+        with self.store.connection() as conn, self._projection():
             rows = conn.execute(
                 "SELECT t.*,b.slug AS board,b.wing AS board_wing,"
-                "b.coordinator AS board_coordinator FROM tasks t "
-                "JOIN boards b ON b.id=t.board_id "
-                "WHERE b.archived=0 AND t.status IN ('backlog','todo') AND t.restricted_origin=1 "
-                "AND coalesce(t.proposal_status,'')!='rejected' ORDER BY b.slug,t.id"
+                "b.coordinator AS board_coordinator FROM tasks t JOIN boards b ON b.id=t.board_id "
+                "WHERE b.archived=0 AND t.status IN ('backlog','todo','doing') "
+                "AND (COALESCE(t.restricted_origin,1)!=0 OR t.agent_parent IS NOT NULL) "
+                "ORDER BY b.slug,t.id"
             ).fetchall()
             for row in rows:
                 if not self.principal.policy.can_read_wing(row["board_wing"]):
                     continue
-                board = row["board"]
-                if board not in live:
-                    live[board] = any(
-                        p.actor == row["board_coordinator"]
-                        for p in self._coordinator_candidates(row["board_wing"])
-                    )
-                if not live[board] and not self._origin_released(row):
-                    waiting[board] = waiting.get(board, 0) + 1
+                item = self._origin_item(conn, row)
+                if item is not None:
+                    counts = waiting.setdefault(row["board"], [0, 0])
+                    counts[item["approval_kind"] == "origin_configuration"] += 1
         return [
             {
                 "board": board,
-                "count": count,
-                "message": f"{count} cards wait for a coordinator: set one in board settings",
+                "count": r + c,
+                "message": f"{r + c} restricted-origin "
+                + ("card needs" if r + c == 1 else "cards need")
+                + f" owner recovery ({r} release, {c} configuration); review these cards in Needs me.",
             }
-            for board, count in waiting.items()
+            for board, (r, c) in waiting.items()
         ]
 
     def board_set(self, board, coordinator):
@@ -2429,12 +2626,67 @@ class BoardService:
                 result = self._card(conn, row)
         return self._start_assignment(result)
 
+    def _release_origin(self, conn, row, approve, reason, escalate):
+        p = self.principal
+        if not self._can_release_origin(p, row):
+            raise ToolError(
+                "no: restricted-origin work requires an independent coordinator or signed-in owner recovery"
+            )
+        if not isinstance(escalate, bool) or escalate:
+            raise ToolError("no: origin release cannot escalate")
+        if approve is not _UNSET and (not isinstance(approve, bool) or not approve):
+            raise ToolError("no: origin release requires affirmative approval")
+        reason = validate_text(reason, "reason", required=True, limit=500)
+        candidate = dict(row)
+        candidate["approved_by"] = p.actor
+        if not self._origin_released(candidate):
+            raise ToolError("no: origin release authority could not be verified")
+        changes = {"approved_by": p.actor}
+        pending = (
+            _plan_waiting(row)
+            or row["proposal_status"] == "pending"
+            or "plan" in json.loads(row["labels"] or "[]")
+        )
+        if row["status"] == "backlog" and not pending:
+            self._transition(candidate, "todo", origin_release=True)
+            changes["status"] = "todo"
+        self._set(conn, row, changes, release_origin=False, renew_claim=False)
+        self._log(
+            conn,
+            row["id"],
+            "decide",
+            reason=reason,
+            choice="release origin",
+            flags=flags_for(reason),
+        )
+        self._emit(conn, row["id"], "card.updated")
+        result = self._card(conn, task_row(conn, row["id"]), p)
+        result["notice"] = "Origin released." + (
+            " Origin release does not approve the pending proposal or plan; separate review is still required."
+            if pending
+            else ""
+        )
+        return result
+
     def task_approve(self, task, approve=_UNSET, version=None, reason=None, escalate=False):
         with self.transaction() as conn:
             row, board = self._get(conn, task)
             self._write(board, submission=True)
             self._version(conn, row, version)
             p = self.principal
+            unreleased = self._restricted_origin(row) and not self._origin_released(row)
+            if (
+                unreleased
+                and not p.person
+                and self._origin_lineage(p, row) in ("descendant", "unsafe")
+            ):
+                raise ToolError("no: restricted-origin creator lineage cannot release this card")
+            if (
+                self._awaits_origin_release(row)
+                and self._origin_only(p, row)
+                and self._can_release_origin(p, row)
+            ):
+                return self._release_origin(conn, row, approve, reason, escalate)
             role = self._approval_role(p, row)
             owner = role == "owner"
             if not p.person and row["escalated_to"]:
@@ -2448,9 +2700,15 @@ class BoardService:
             release = self._restricted_origin(row) and not self._origin_released(row)
             can_release = self._can_release_origin(p, row)
             if release and owner and not can_release and approve is not False and not escalate:
-                raise ToolError(
-                    "no: the live board coordinator must release restricted-origin work"
+                state = self._origin_authority(row)[0]
+                refusal = {
+                    "coordinator": "no: the live board coordinator must release restricted-origin work",
+                    "stamp": "no: origin release is blocked; clear the board coordinator first",
+                }.get(
+                    state,
+                    "no: origin release is blocked; appoint an independent board coordinator first",
                 )
+                raise ToolError(refusal)
             if not (
                 plan
                 or (can_release and self._awaits_origin_release(row))
@@ -2682,7 +2940,8 @@ class BoardService:
             self._emit(conn, row["id"], "card.claimed", **{"from": row["status"], "to": "doing"})
             result = self._card(conn, task_row(conn, row["id"]), self.principal)
             decision = conn.execute(
-                "SELECT * FROM task_events WHERE task_id=? AND kind='decide' ORDER BY id DESC LIMIT 1",
+                "SELECT * FROM task_events WHERE task_id=? AND kind='decide' "
+                "AND (choice IS NULL OR choice!='release origin') ORDER BY id DESC LIMIT 1",
                 (row["id"],),
             ).fetchone()
             if row["return_to"] == self.principal.actor and decision:
@@ -2730,7 +2989,7 @@ class BoardService:
             and self.principal.actor in (row["assignee"], row["return_to"])
         )
 
-    def _transition(self, row, status):
+    def _transition(self, row, status, *, origin_release=False):
         if status not in STATUSES:
             raise ToolError("no: invalid status")
         old = row["status"]
@@ -2796,6 +3055,13 @@ class BoardService:
         else:
             if old != "review" and _waiting_on_person(row):
                 raise ToolError("no: this move requires a person or a handoff")
+            if (
+                origin_release
+                and old == "backlog"
+                and status == "todo"
+                and self._can_release_origin(self.principal, row)
+            ):
+                return
             if old == "backlog" and status in ("todo", "doing") and self._backlog_available(row):
                 return
             if (old, status) in {
@@ -3426,7 +3692,7 @@ class BoardService:
             if then not in ("return", "todo", "done", "backlog"):
                 raise ToolError("no: invalid decision destination")
             if choice is not None:
-                choice = validate_text(choice, "choice", required=True, limit=120)
+                choice = validate_choice(choice, "choice")
                 offered = json.loads(row["ask_options"] or "[]")
                 if offered and choice not in offered:
                     raise ToolError("no: choose one of the offered options")
@@ -3477,6 +3743,12 @@ class BoardService:
             return self._card(conn, task_row(conn, row["id"]), self.principal)
 
     def needs_me(self, format="list"):
+        if not self.principal.policy.has_scope(
+            "memory:read"
+        ) or not self.principal.policy.tool_visible("needs_me"):
+            raise ToolError(
+                "no: only a workspace owner or an authorized connection can read needs_me"
+            )
         if format not in ("list", "digest"):
             raise ToolError("no: format must be list or digest")
         with self._projection():
@@ -3487,13 +3759,23 @@ class BoardService:
                 names=lambda text: people(self.ctx, text),
                 supervisors=self._supervisors,
                 coordinated=self.coordinated_ask_boards(),
+                release_boards=self.release_boards(),
+                origin_pending=self._origin_pending,
+                origin_blocks_approval=lambda row: (
+                    self._awaits_origin_release(row)
+                    and not self._can_release_origin(self.principal, row)
+                ),
                 ask_owner=self._ask_owner,
             )
-            approvals = (
-                self.approvals_for_me()
-                if not self.principal.person
-                else dict(items=[], truncated=False, more=False)
-            )
+            approvals = self.approvals_for_me()
+            origin_numbers = {
+                c["number"]
+                for c in approvals["items"]
+                if c.get("approval_kind", "").startswith("origin")
+            }
+            for key in groups:
+                if isinstance(groups[key], list):
+                    groups[key] = [c for c in groups[key] if c["number"] not in origin_numbers]
             groups["approvals"] = approvals["items"]
             groups["count"] = len(
                 {

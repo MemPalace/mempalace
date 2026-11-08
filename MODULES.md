@@ -153,6 +153,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Contributor test instructions state that the default run excludes the `timing` lane and that timing results are informational, never a merge gate.
 
+  - Board API and design prose describe deliberate origin release, fail-closed provenance and signed-in owner recovery separately from proposal/plan review.
+
 - **How it fails:**
 
   - Updating installed files alone leaves an old running process unaffected.
@@ -386,7 +388,6 @@ Format (read by `commonplace orch docs-check`):
   - Driven-clock heartbeat tests cover standby takeover after release and expiry; a subprocess SIGTERM test covers immediate restart after stubbed-HTTP serve teardown. Shutdown regressions cover server and worker entry points, one lease release and duplicate closes after SQLite closes.
   - Driven-clock heartbeat tests cover standby takeover after release and expiry; a subprocess SIGTERM test covers immediate restart after stubbed-HTTP serve teardown. Shutdown regressions cover server and worker entry points, one lease release and duplicate closes after SQLite closes. Unreadable-grant and confirmation regressions require local disconnect and unconfirmed revocation.
   - The same contract selection runs on pinned base and implementation head; transport regressions execute separately.
-  - Space profile/tool snapshots are captured from the development base, retaining its split and inbox visibility and card-schema additions.
   - `tests/test_projects_phase_b.py::test_head_connect_hint_and_trust_failures` asserts the Connect list contract: base message and move events, plus creation and report events when enabled.
 
   - `tests/test_project_reports.py::test_gateway_install_does_not_resolve_or_create_workspaces` covers missing, forbidden and real supervisor lookups; `test_dispatch_recovers_existing_source_without_creating_workspaces` proves lazy migration, delivery, workspace isolation and one diagnostic per failed workspace pass without private workspace names, identifiers or content in formatted logs. `test_dispatch_reinitializes_changed_source` checks schema recovery through the catalog after an in-process table drop; normal-pass initialization counts have a separate regression. `test_dispatch_isolates_publish_programming_error` proves that a non-closure publication error is logged once while the same pass publishes the next workspace's report for delivery.
@@ -402,6 +403,12 @@ Format (read by `commonplace orch docs-check`):
 
   - Public presence witnesses reach real worker acquisition branches and real search fan-out before comparing hidden and absent worlds. Private protocol tests cover descriptor revalidation, bounded batches and metadata-only reads.
 
+  - Space profile/tool snapshots retain split and inbox visibility and card-schema additions, with current origin-release descriptions. Legacy NULL-origin and untrusted-policy controls isolate each predicate independently.
+  - Origin overflow stays out of ordinary proposal buckets when the bounded approvals projection truncates; list and digest retain their truncation signals.
+  - Origin-holder regressions cover assertion-level RED evidence on a pinned base for same-holder and child-held release, lease preservation, exact agent/owner queues, MCP discovery, REST, notices, digest and direct web actions. The web action harness keeps required reasons and configuration navigation separate from delayed proposal review.
+  - Owner rejection of person-targeted restricted proposals with a healthy coordinator preserves origin state; owner fallback still refuses rejection. Existing release, connection, default-client and delayed-approval contracts supply explicit recovery reasons and separate required proposal review.
+  - Person proposal/plan queues assert reject-only actions before an independent coordinator releases origin and full actions afterwards; coordinator and fallback-owner approval controls remain positive. Routed-decision claims preserve choice and reply across a later origin release, including reply-only decisions. Owners can directly reject pending proposals during creator, descendant, unsafe-lineage and invalid-stamp configuration states without releasing origin. Coordinator-settings coverage counts the owner recovery card once, excluding its notice. Button-click regressions exercise reject-only proposals and plans through both the direct rejection request and the shell callback, with no approval control. Reserved-choice regressions refuse the exact origin sentinel in free-text decisions and new/existing ask options without changing task/event state, then verify delivery of a replacement decision; case and whitespace variants remain ordinary choices.
+  - Origin security controls preserve creator, descendant, token, person-decision, terminal, hidden-tool and standard-member boundaries. Named mutations exercise unsafe lineage, unverifiable stamps, grant fallback, stored-holder revalidation and review/ask queue separation; controls are distinct from base RED evidence.
 
   - The revoked-token socket guard observes the completed server-side 401, no body reads and no route dispatch, including a forced close before upload finishes.
   - The seat webhook replay checks actual worker completion with orchestration off and on, retains card-created notifications when enabled, and verifies message filtering and unchanged subscriptions on reconnect.
@@ -676,18 +683,22 @@ Format (read by `commonplace orch docs-check`):
   - Owner todo assignments validate the target’s typed grant before claiming; repeat takes preserve an existing holder’s claim after grant removal.
 
   - Owner status changes preserve typed-card assignees and validate their grants; card task types are owner-person edits; stable-ID grants in the workspace store guard new typed acquisition while existing holders retain their claims.
-  - Owner coordinator settings list eligible active PAT connections; needs-me reports restricted cards waiting on a missing coordinator once per board.
-  - Owner coordinator settings list eligible active PAT connections; needs-me reports restricted cards waiting on a missing coordinator once per board, with the waiting bucket omitted for non-owners.
+  - Owner coordinator settings list eligible active PAT connections; signed-in owners see restricted-origin recovery once per visible board across backlog, todo and doing.
+  - Owner notices count release and configuration separately; notices stay out of digest while actionable origin cards retain reasons and actions in it. Non-person callers receive no owner notice.
   - Metadata uses an exact active slug on a plain store connection; list retains expiry and create retains rules enforcement.
   - Non-done to done transitions capture metadata in the source transaction. Unavailable report settings reject before status or lesson writes; new boards without a coordinator remain history only. Raw events retain their existing matching and authorization.
 
   - Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval.
 
-  - Trusted agents and authorized board coordinators may edit only the title/body of unassigned restricted-origin todo cards without releasing the origin or changing claim authority.
+  - Trusted agents retain their title/body edit alternative on unassigned restricted-origin todo cards. Coordinator-derived edits require verified independence: creators, descendants and unsafe lineage cannot use that exception. Content edits never release origin or grant claims.
 
   - With workspace orchestration enabled, claims hold runner admission through board commit and person assignments or handoffs cannot reserve a busy agent.
 
-  - Subagent and restricted-agent submissions remain inactive until coordinator release, with owner fallback only when no coordinator is live.
+  - Subagent and restricted-agent submissions remain inactive until deliberate origin release. An appointed independent coordinator needs current memory read/write, board-wing read/write and visible space_read, space_post, task_approve and needs_me; decide is not required. Ancestors remain eligible, while creators and their descendants cannot obtain new release authority. Missing, foreign or cyclic ancestry and unverifiable connection-creator stamps fail closed on every agent release path, including stored markers.
+  - The appointed independent coordinator may release origin while holding the card, preserving status, holder, every lease timestamp, provenance and pending review. Its marker is revalidated against current appointment, liveness, lineage and grants. This grants no self-review, rejection or escalation rights; origin release requires an affirmative decision and a nonempty reason of at most 500 characters.
+  - Signed-in workspace owners recover origin only when the configured record is absent/non-live, or verified independent but missing a required release grant. A live creator, descendant or unsafe lineage requires coordinator configuration and blocks owner release, even with missing grants. An unverifiable creator stamp plus any live configured record also blocks release: clear the coordinator first. Clearing affects the entire board and routes its other unreleased cards to owner recovery as well. Owner-role connection tokens gain no person fallback.
+  - Owner recovery preserves pending proposals and plan reviews: release origin first, then review separately. Origin/configuration items appear once in approvals with release/you needs and approve/configure_coordinator actions; healthy coordinator work creates no owner origin item. Explicit person-targeted backlog proposals and plans retain their independent review route, including owner rejection outside fallback without origin release. Origin audit events keep kind=decide with choice="release origin"; that exact validated choice is reserved and refused in user decisions and ask options.
+  - Person review items advertise reject only while origin awaits release that the viewer cannot perform, with a matching explanation; proposal Decline and plan Reject controls render independently of approval permission; other review actions remain intact. Owners retain pending-proposal rejection in configuration states via the card/API approve route with approve=false; the configuration item itself offers only board settings. Claim delivery excludes origin-release decide events by choice so an earlier return-routed decision, including a reply-only decision, is delivered unchanged.
 
   - Holders may annotate an inactive status line without activation.
 
@@ -953,6 +964,7 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Chat status counts cards in needs-me while ignoring per-board coordinator notices.
+  - Opt-in phone needs-you evaluation includes actionable Approvals, so owner origin recovery still notifies after coordinator revocation.
 
   - Chat answers come from the configured provider or the poster's own runner, never a silent fallback; audio stays in request memory; push is opt-in.
 
@@ -963,6 +975,7 @@ Format (read by `commonplace orch docs-check`):
 - **Tests:**
 
   - The `tests/test_chat_` files, `tests/test_commonplace_voice.py`, the `tests/test_commonplace_phone_push_` files.
+  - Coordinator-revocation recovery verifies the origin approval item and retains notification, priority and duplicate-suppression assertions.
 
 
 ## memory-and-search
@@ -1125,6 +1138,9 @@ Format (read by `commonplace orch docs-check`):
   - **Connection teardown boundary:** Stopping clears rendered GitHub details while preserving the established teardown contract for other Needs details.
 
   - **Connection recovery:** Callbacks reopen the selected Needs item; GitHub-only status failures preserve card actions, and connections in another workspace show an explicit disconnect control.
+
+  - Needs me renders origin/configuration as approvals, requires a release reason and posts directly; coordinator configuration navigates to existing settings without mutating a card. Proposal Decline and plan Reject controls follow reject permission independently of approve permission and use the existing rejection handler.
+  - Shell needItems includes approvals when counting each project and retaining selected details on refresh; release ranks between person decisions and plan review.
 
 - **How it fails:**
 

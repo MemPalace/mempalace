@@ -134,7 +134,19 @@ def test_precedence_follows_needs_order():
     assert derive({**doing, "pr_url": None}) == "working"
     assert derive({**doing, "pr_url": None, "heartbeat_at": STALE}) == "idle"
     assert derive({**doing, "status": "done"}) == "done"
-    assert NEEDS == ("you", "plan", "merge", "checks", "expired", "working", "idle", "done")
+    # Origin queue projections rank release between person decisions and review;
+    # ordinary task rows above still derive their existing needs.
+    assert NEEDS == (
+        "you",
+        "release",
+        "plan",
+        "merge",
+        "checks",
+        "expired",
+        "working",
+        "idle",
+        "done",
+    )
 
 
 def test_failing_checks_and_pr_without_passing_checks_stay_quiet():

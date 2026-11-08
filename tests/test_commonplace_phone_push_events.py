@@ -741,7 +741,8 @@ def test_t21_eventless_needs_you_revoke_reconcile_and_sweep(hub, signup, monkeyp
     dispatcher.reconcile()
     dispatcher.sweep()
     dispatcher.drain()
-    assert number in {c["number"] for c in needs(hub, owner)["backlog_from_agents"]}
+    recovery = next(c for c in needs(hub, owner)["approvals"] if c["number"] == number)
+    assert recovery["approval_kind"] == "origin" and recovery["actions"] == ["approve"]
     assert bodies(hub) == [f"#{number} needs you"]
     assert hub.ntfy.requests[0].headers["Priority"] == "high"
     dispatcher.sweep()

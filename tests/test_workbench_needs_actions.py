@@ -14,7 +14,15 @@ TESTS = Path(__file__).parent
 
 
 @pytest.mark.parametrize(
-    "case", ["plan_direct", "shell_actions", "answer_error_stale", "answer_error_same_card"]
+    "case",
+    [
+        "plan_direct",
+        "proposal_reject_only",
+        "plan_reject_only",
+        "shell_actions",
+        "answer_error_stale",
+        "answer_error_same_card",
+    ],
 )
 def test_needs_detail_actions(case):
     result = subprocess.run(

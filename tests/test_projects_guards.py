@@ -18,9 +18,28 @@ def test_unheld_seat_keeps_person_routing(projects_hub):
     assert h.create_board(h.owner, "alpha")[0] == 201
     status, proposal = h.propose("alpha")
     assert status == 201 and proposal["proposal_status"] == "pending"
-    code, numbers = h.backlog(h.owner)
-    assert code == 200 and proposal["number"] in numbers
+    code, queue, _ = h.get(h.owner, "/api/needs-me")
+    assert code == 200
+    assert [c["number"] for c in queue["approvals"]] == [proposal["number"]]
+    origin = queue["approvals"][0]
+    assert origin["approval_kind"] == "origin"
+    assert origin["approval_role"] == "workspace owner"
+    assert origin["need"] == "release"
+    assert origin["can_approve"] is True and origin["actions"] == ["approve"]
+    assert queue["backlog_from_agents"] == []
     assert h.coordinator("alpha") is None
+    # Origin recovery preserves the pending proposal for a separate owner review.
+    code, released, _ = h.request(
+        h.owner,
+        "POST",
+        f"/api/cards/{proposal['number']}/approve",
+        {"reason": "Release the unheld project's origin", "version": proposal["version"]},
+    )
+    assert code == 200 and released["approved_by"].startswith("user:")
+    assert released["proposal_status"] == "pending" and released["status"] == "backlog"
+    code, queue, _ = h.get(h.owner, "/api/needs-me")
+    assert code == 200 and queue["approvals"] == []
+    assert [c["number"] for c in queue["backlog_from_agents"]] == [proposal["number"]]
 
 
 def test_public_surface_unchanged(projects_hub):

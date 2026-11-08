@@ -27,7 +27,7 @@ def test_root_cannot_review_grandchild_plan_after_parent_revocation(hub, fresh):
     leaf = fresh.connect("leaf", parent=parent.id, trust="untrusted", write_wing="inbox")
     card = leaf.work.task_add(board="work", title="Synthetic descendant work")
     parent.work.task_approve(card["number"], reason="Synthetic proposal approval")
-    fresh.owner.task_approve(card["number"])
+    fresh.owner.task_approve(card["number"], reason="Independent owner recovery")
     leaf.work.task_take_next(task=card["number"])
     leaf.work.task_update(card["number"], labels=["plan"])
     hub.db.revoke(parent.id, actor=fresh.user, workspace_ref=fresh.workspace)
@@ -112,7 +112,7 @@ def test_member_approval_reads_use_needs_me_gate(hub, fresh, monkeypatch, trust)
     pending = child.work.task_add(board="work", title="Synthetic gated proposal")
     held = parent.work.task_add(board="work", title="Synthetic held work", claim=True)
     if trust == "untrusted":
-        fresh.owner.task_approve(held["number"])
+        fresh.owner.task_approve(held["number"], reason="Independent owner recovery")
         parent.work.task_take_next(task=held["number"])
     assert parent.principal.role == "member"
     calls = count_roles(monkeypatch)
@@ -124,9 +124,7 @@ def test_member_approval_reads_use_needs_me_gate(hub, fresh, monkeypatch, trust)
     with pytest.raises(ToolError, match="workspace owner"):
         parent.work.needs_me()
     assert not calls
-    assert {c["number"] for c in fresh.owner.needs_me()["backlog_from_agents"]} == {
-        pending["number"]
-    }
+    assert {c["number"] for c in fresh.owner.needs_me()["approvals"]} == {pending["number"]}
 
 
 def test_related_unapprovable_rows_hit_cap_and_preserve_owner_completeness(hub, fresh, monkeypatch):

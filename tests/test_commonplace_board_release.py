@@ -80,9 +80,19 @@ def test_owner_releases_without_live_coordinator(hub, fresh, coordinator_state, 
         else fresh.connect("restricted", trust="untrusted", write_wing="inbox")
     )
     card = creator.work.task_add(board="work", title="Follow-up")
-    status, released = api(hub, fresh.cookie, "POST", f"/api/cards/{card['number']}/approve", {})
+    status, released = api(
+        hub,
+        fresh.cookie,
+        "POST",
+        f"/api/cards/{card['number']}/approve",
+        {"reason": "Independent owner recovery"},
+    )
     assert status == 200, released
     assert released["approved_by"] == fresh.owner.principal.actor
+    if origin == "subagent":
+        assert released["proposal_status"] == "pending" and released["status"] == "backlog"
+        reviewed = fresh.owner.task_approve(card["number"], reason="Separate proposal review")
+        assert reviewed["proposal_status"] == "approved" and reviewed["status"] == "todo"
     assert creator.work.task_take_next(task=card["number"])["status"] == "doing"
 
 

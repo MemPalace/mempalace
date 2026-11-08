@@ -282,7 +282,10 @@ def test_r16b(hub, fresh):
     approve_compat(hub, t, row["number"])
     shown = fresh.owner.task_show(row["number"])
     assert shown["approved_by"] is None and shown["status"] == "backlog"
-    assert fresh.owner.task_approve(row["number"])["approved_by"] == fresh.owner.principal.actor
+    assert (
+        fresh.owner.task_approve(row["number"], reason="Independent owner recovery")["approved_by"]
+        == fresh.owner.principal.actor
+    )
 
 
 def test_r17(hub, fresh):
@@ -300,7 +303,7 @@ def test_r17(hub, fresh):
         conn.execute(
             "UPDATE tasks SET approved_by=? WHERE id=?", (k.principal.actor, pending["number"])
         )
-    restored = fresh.owner.task_approve(pending["number"])
+    restored = fresh.owner.task_approve(pending["number"], reason="Independent owner recovery")
     assert restored["approved_by"] == k.principal.actor
 
 
@@ -328,6 +331,8 @@ def test_r19(hub, fresh):
     ok, text = approve_compat(hub, k, row["number"])
     assert fresh.owner.task_show(row["number"])["need"] == "idle"
     assert not fresh.owner.task_show(row["number"])["can_approve"]
+    assert ok, text
+    ok, text = approve_compat(hub, k, row["number"])
     assert not ok and "direct parent" in text
     w = fresh.connect("worker")
     with pytest.raises(ToolError):
@@ -410,7 +415,7 @@ def test_r24(hub, fresh):
     )
     assert ok  # RED
     assert fresh.owner.task_show(row["number"]).get("escalated_to")
-    fresh.owner.task_approve(row["number"])
+    fresh.owner.task_approve(row["number"], reason="Independent owner recovery")
     assert fresh.owner.task_show(row["number"]).get("escalated_to") is None
 
 
@@ -486,7 +491,12 @@ def test_r27(hub, fresh):
 def test_guard(hub, fresh, monkeypatch, case):
     p, c, row = proposal(fresh)
     if case in ("g01", "g10"):
-        assert fresh.owner.task_approve(row["number"])["approved_by"] == fresh.owner.principal.actor
+        assert (
+            fresh.owner.task_approve(row["number"], reason="Independent owner recovery")[
+                "approved_by"
+            ]
+            == fresh.owner.principal.actor
+        )
     elif case == "g03":
         creator = fresh.connect("restricted-creator", trust="untrusted", write_wing="inbox")
         row = creator.work.task_add(board="work", title="Synthetic root claim", claim=True)
@@ -508,12 +518,13 @@ def test_guard(hub, fresh, monkeypatch, case):
         ok, text = approve_compat(hub, a, row["number"])
         assert not ok and "direct parent" in text
     elif case == "g04":
-        assert row["number"] in numbers(fresh.owner.needs_me(), "backlog_from_agents")
+        assert row["number"] in numbers(fresh.owner.needs_me(), "approvals")
         assert fresh.owner.task_show(row["number"])["need"] == "you"
     elif case == "g05":
         from tests._commonplace_helpers import REVIEW_CONTEXT, REVIEW_OPTIONS, REVIEW_QUESTION
 
-        fresh.owner.task_approve(row["number"])
+        fresh.owner.task_approve(row["number"], reason="Independent owner recovery")
+        fresh.owner.task_approve(row["number"], reason="Separate proposal review")
         c.work.task_take_next(task=row["number"])
         c.work.ask(REVIEW_QUESTION, REVIEW_OPTIONS, task=row["number"], context=REVIEW_CONTEXT)
         assert ANSWER in home(fresh, row)

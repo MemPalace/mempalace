@@ -70,7 +70,7 @@ def coordinator(hub, fresh, *, parent=None):
         "coordinator",
         parent=parent,
         trust="standard",
-        tools=["space_read", "space_post", "task_add", "task_approve"],
+        tools=["space_read", "space_post", "task_add", "task_approve", "needs_me"],
     )
     status, reply = api(
         hub, fresh.cookie, "PATCH", "/api/boards/work", {"coordinator": k.principal.actor}
@@ -83,7 +83,9 @@ def released_card(fresh, creator, **kwargs):
     """Downstream coordination checks start from explicitly released work."""
     card = creator.work.task_add(**kwargs)
     if card["restricted"]:
-        fresh.owner.task_approve(card["number"])
+        released = fresh.owner.task_approve(card["number"], reason="Independent owner recovery")
+        if released["proposal_status"] == "pending":
+            fresh.owner.task_approve(card["number"], reason="Separate proposal review")
         if kwargs.get("claim"):
             creator.work.task_take_next(task=card["number"])
         card = creator.work.task_show(card["number"])
@@ -136,7 +138,7 @@ def test_top_level_assigns_to_another_top_level(hub, fresh, shape):
     assert card["assignee"] == b.principal.actor
     if shape in RESTRICTED:
         assert not mcp(hub, b.token, "task_take_next", task=card["number"])[0]
-        fresh.owner.task_approve(card["number"])
+        fresh.owner.task_approve(card["number"], reason="Independent owner recovery")
     take(hub, b)
     assert b.work.task_show(card["number"])["status"] == "doing"
     if shape in RESTRICTED:
@@ -218,11 +220,11 @@ def test_owning_root_approves_and_rejects_descendant_proposals(hub, fresh, shape
     status, card = change(hub, fresh, root.token, number, "POST", "/approve")
     assert status == 200, card
     assert card["approved_by"] is None and card["status"] == "backlog"
-    fresh.owner.task_approve(number)
+    fresh.owner.task_approve(number, reason="Independent owner recovery")
     nested = proposed(grandchild)
     status, card = change(hub, fresh, root.token, nested, "POST", "/approve")
     assert status == 200 and card["approved_by"] is None, card
-    fresh.owner.task_approve(nested)
+    fresh.owner.task_approve(nested, reason="Independent owner recovery")
     take(hub, child, number)
     handoff(child, number, receiver.principal.actor)
     take(hub, receiver, number)
@@ -415,7 +417,7 @@ def test_root_release_keeps_existing_nonholder_annotations(hub, fresh):
     number = proposed(child)
     status, reply = change(hub, fresh, root.token, number, "POST", "/approve")
     assert status == 200, reply
-    fresh.owner.task_approve(number)
+    fresh.owner.task_approve(number, reason="Independent owner recovery")
     take(hub, child, number)
     handoff(child, number)
     status, reply = change(hub, fresh, other.token, number, status_line="Released work annotation")

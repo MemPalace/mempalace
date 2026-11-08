@@ -154,7 +154,13 @@ def test_default_inbox_reservation_requires_owner_release_for_other_agents(hub, 
     ok, reply = mcp(hub, fresh.second.token, "task_update", task=number, status="doing")
     assert not ok, reply
     assert show(hub, creator, number) == created
-    status, approved = api(hub, fresh.cookie, "POST", f"/api/cards/{number}/approve", {})
+    status, approved = api(
+        hub,
+        fresh.cookie,
+        "POST",
+        f"/api/cards/{number}/approve",
+        {"reason": "Independent owner recovery"},
+    )
     assert status == 200 and approved["approved_by"] == f"user:{fresh.user}"
     assert mcp(hub, creator.token, "task_take_next", task=number)[0]
     assert mcp(
@@ -178,7 +184,13 @@ def test_default_inbox_reservation_requires_owner_release_for_other_agents(hub, 
     refused_claims(hub, child, show(hub, child, number))
     released = show(hub, child, number)
     refused_claims(hub, fresh.second, released)
-    status, approved = api(hub, fresh.cookie, "POST", f"/api/cards/{number}/approve", {})
+    status, approved = api(
+        hub,
+        fresh.cookie,
+        "POST",
+        f"/api/cards/{number}/approve",
+        {"reason": "Independent owner recovery"},
+    )
     assert status == 200 and approved["approved_by"] == f"user:{fresh.user}"
     status, approved = api(
         hub,

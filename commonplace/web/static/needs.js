@@ -7,6 +7,8 @@ const exact = (text) => e(text).replaceAll("\r", "&#13;");
 const filters = { all: "All", approvals: "Approvals", decisions: "Decisions", reviews: "Reviews" };
 const labels = { approval: "Approval", decision: "Decision", review: "Review" };
 const buckets = ["backlog_from_agents", "approvals", "asks", "done_review", "ready_to_merge", "plans", "stale"];
+const originKind = (card) => ["origin", "origin_configuration"].includes(card.approval_kind);
+const badge = (card, kind) => card.approval_kind === "origin" ? "Origin release" : card.approval_kind === "origin_configuration" ? "Coordinator configuration" : labels[kind];
 const active = (hold) => hold && ["waiting", "settling", "released"].includes(hold.state);
 const clock = (at) => new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 const stamp = (at) => at ? `<time datetime="${e(at)}">${e(clock(at))}</time>` : "";
@@ -20,7 +22,7 @@ export function needsItems(needs = {}, filter = "all") {
     if (!items.has(card.number)) items.set(card.number, { card, buckets: new Set() });
     items.get(card.number).buckets.add(bucket);
   }
-  return [...items.values()].map((item) => ({ ...item, kind: item.card.proposal_status === "pending" ? "approval" :
+  return [...items.values()].map((item) => ({ ...item, kind: originKind(item.card) || item.card.proposal_status === "pending" ? "approval" :
     item.buckets.has("done_review") || item.buckets.has("ready_to_merge") || item.buckets.has("plans") || item.card.review_kind === "completion" ? "review" : "decision" }))
     .filter((item) => filter === "all" || `${item.kind}s` === filter);
 }
@@ -28,7 +30,7 @@ export function needsItems(needs = {}, filter = "all") {
 // A loaded card gets the actions the server queued for this version; nothing else draws a button.
 export function needsCard(needs, card) {
   const queued = needsItems(needs).find((item) => item.card.number === card.number)?.card;
-  return { ...card, actions: queued?.version === card.version ? queued.actions || [] :
+  return { ...card, ...(queued?.version === card.version && originKind(queued) ? { approval_kind: queued.approval_kind, why: queued.why, can_approve: queued.can_approve } : {}), actions: queued?.version === card.version ? queued.actions || [] :
     card.can_approve && card.proposal_status === "pending" ? ["approve", "reject"] : [] };
 }
 
@@ -133,7 +135,7 @@ export function renderNeeds({ needs = {}, boards = [], holds = [], cards = [], f
   const row = (card, kind, hold = null) => {
     const board = boardFor(boards, card), state = holdState(hold, now);
     const opening = detailsContext(card).author || card.return_to || card.created_by;
-    const status = hold ? ["waiting", "sending"].includes(state.state) ? "Waiting" : state.state === "released" ? "Released" : state.state === "stopped" ? "Stopped" : "Failed" : labels[kind];
+    const status = hold ? ["waiting", "sending"].includes(state.state) ? "Waiting" : state.state === "released" ? "Released" : state.state === "stopped" ? "Stopped" : "Failed" : badge(card, kind);
     return `<article class="row-item${card.number === selected ? " is-selected" : ""}${hold ? active(hold) && state.state !== "released" ? " is-pending" : " is-done" : ""}" data-row="${e(card.number)}"><span class="typ ${hold ? "pending" : kind}">${status}</span><div><h3><a href="#/card/${e(card.number)}" data-needs-select="${e(card.number)}"${card.number === selected ? ' aria-current="true"' : ""}>${kind === "review" ? `<span class="cid">${e(cardId(board, card.number))}</span> ` : ""}${e(card.title)}</a></h3><div class="sub">${e(board.name || board.slug)}${hold ? ` · ${holdCopy(hold, now)}` : opening ? ` · ${e(detailsAuthor(opening, board))}` : ""}</div></div>${hold ? stopButton(hold, now) : ago(card.updated_at, now)}</article>`;
   };
   const groups = new Map();
@@ -177,8 +179,10 @@ function githubControls(card, github, busy) {
   return `<button class="btn" data-needs-github="connect"${disabled}>Connect GitHub</button>${state === "expired" ? `<p>Expired locally. ${access}</p>` : ""}${github.acknowledge_required ? `<label><input type="checkbox" data-needs-github-ack> I reviewed GitHub app access; revocation was unconfirmed.</label>${access}` : ""}`;
 }
 export function renderNeedDetail(card, { board = { slug: card.board }, hold = null, now = Date.now(), confirm = false, note = "", error = "", busy = false, chatOpen = false, phone = false, kind, github = null } = {}) {
-  const proposal = card.proposal_status === "pending";
-  kind ||= proposal ? "approval" : card.review_kind === "completion" || card.need === "merge" ? "review" : "decision";
+  const origin = originKind(card), release = card.approval_kind === "origin";
+  if (origin) hold = null;
+  const proposal = !origin && card.proposal_status === "pending";
+  kind ||= origin || proposal ? "approval" : card.review_kind === "completion" || card.need === "merge" ? "review" : "decision";
   const context = detailsContext(card), canAnswer = !active(hold) && !hold?.tooLate;
   const allowed = (action) => (card.actions || []).includes(action);
   const quote = !context.text ? "" : `<section class="context-words"><h3>Context (exact words)</h3><p class="quote" data-context-text>${exact(context.text)}</p>${context.author ? `<p>— ${e(detailsAuthor(context.author, board))}</p>` : ""}</section>`;
@@ -186,17 +190,18 @@ export function renderNeedDetail(card, { board = { slug: card.board }, hold = nu
   const ask = `<button class="btn" data-needs-ask aria-keyshortcuts="R" aria-controls="chat" aria-expanded="${chatOpen}">${hold?.tooLate || hold?.state === "released" ? "Ask the orchestrator" : "Ask a question"} <kbd>R</kbd></button>`;
   const disabled = busy ? " disabled" : "";
   const confirmTag = phone ? "dialog" : "div";
-  const noteBox = canAnswer && (proposal || allowed("answer")) ? `<label class="lbl">Note to the orchestrator <span class="help">Optional. Sent with your answer.</span><textarea data-needs-note rows="1" placeholder="e.g. Send at 09:00 tomorrow"${proposal ? ' maxlength="500"' : ""}>${exact(note)}</textarea></label>` : "";
+  const noteBox = canAnswer && (release || proposal || allowed("answer")) ? `<label class="lbl">${release ? "Origin release reason" : "Note to the orchestrator"} <span class="help">${release ? "Required, up to 500 characters." : "Optional. Sent with your answer."}</span><textarea data-needs-note rows="1" placeholder="e.g. Send at 09:00 tomorrow"${release ? ' required maxlength="500"' : proposal ? ' maxlength="500"' : ""}>${exact(note)}</textarea></label>` : "";
   const decisions = !proposal && kind === "decision" && allowed("answer") ? (card.ask_options || []).map((choice, index) => `<button class="btn primary" data-needs-choice="${index}"${disabled}>${e(choice)}</button>`).join("") : "";
   // The shell's existing handlers carry these: Accept, and recovery for a card whose claim ran out.
   const shellButton = (action, label, tone = "") => allowed(action) ? `<button class="btn${tone}" data-action="need-${action}" data-card="${e(card.number)}" data-version="${e(card.version)}"${disabled}>${label}</button>` : "";
   // A plan is approved directly; only a proposal's approval waits as a hold.
-  const plan = !proposal && allowed("approve") ? `<button class="btn primary" data-needs-approve="plan"${disabled}>Approve</button>${allowed("reject") ? `<button class="btn danger" data-action="need-reject" data-card="${e(card.number)}" data-version="${e(card.version)}"${disabled}>Reject</button>` : ""}` : "";
+  const plan = !origin && !proposal ? `${allowed("approve") ? `<button class="btn primary" data-needs-approve="plan"${disabled}>Approve</button>` : ""}${shellButton("reject", "Reject", " danger")}` : "";
   const recovery = ["requeue", "reassign", "park"].map((action) => shellButton(action, { requeue: "Requeue", reassign: "Reassign", park: "Park" }[action])).join("");
-  const direct = proposal ? "" : plan + shellButton("accept", "Accept", " primary") + recovery;
+  const originAction = release && allowed("approve") ? `<button class="btn primary" data-needs-approve="origin"${disabled}>Release origin</button>` : origin && allowed("configure_coordinator") ? `<button class="btn" data-action="coordinator" data-board="${e(card.board)}"${disabled}>Configure coordinator</button>` : "";
+  const direct = proposal ? shellButton("reject", "Decline", " danger") : originAction + plan + shellButton("accept", "Accept", " primary") + recovery;
   const open = recovery ? `<a class="btn" href="#/card/${e(card.number)}">Answer</a>` : `<a class="btn" href="${kind === "decision" ? `#/decide/${e(card.number)}` : `#/card/${e(card.number)}`}">${kind === "review" ? "Open review" : "Open card"}</a>`;
   const actions = canAnswer ? proposal && allowed("approve") ? `${confirm ? `<${confirmTag} class="confirm" role="${phone ? "alertdialog" : "group"}"${phone ? ' aria-modal="true"' : ""} aria-labelledby="needs-confirm-title" aria-describedby="needs-confirm-description"><h3 id="needs-confirm-title">${e(card.title)}</h3><p id="needs-confirm-description">Your approval reaches the orchestrator 60 seconds after you confirm. Until then you can stop it from Needs me.</p><div class="acts"><button class="btn" data-needs-cancel${disabled}>Cancel</button><button class="btn primary" data-needs-confirm${disabled}>Yes, approve</button></div></${confirmTag}>` : `<button class="btn primary" data-needs-approve${disabled}>Approve and send…</button><div class="decide-acts">${allowed("reject") ? `<button class="btn danger" data-action="need-reject" data-card="${e(card.number)}" data-version="${e(card.version)}"${disabled}>Decline</button>` : ""}${ask}</div>`}` : `${direct ? `<div class="acts">${direct}</div>` : ""}<div class="decide-acts">${decisions}${open}${ask}</div>` : ask;
-  return `<section class="needs-detail" data-card="${e(card.number)}" data-version="${e(card.version)}" aria-label="Needs me details"><header class="ctx-head"><b>Details</b><button class="btn ghost sm" data-needs-close>Hide</button></header><div class="ctx-body"><button class="btn phone-back" data-needs-close>Back to Needs me</button><header class="detail-h"><div class="row"><span class="typ ${kind}">${labels[kind]}</span><span>${e(board.name || board.slug)}${asked(card) ? ` · asked ${asked(card)}` : ""}</span></div><h2 tabindex="-1" data-needs-title>${e(card.title)}</h2></header>${hold ? `<section class="hold-note ${e(hold.state)}" role="status">${holdCopy(hold, now)}${stopButton(hold, now)}</section>` : ""}${quote}${card.ask && !proposal ? `<p class="quote">${exact(card.ask)}</p>` : ""}${linked}${proposal && canAnswer ? '<div class="facts" role="note">Commonplace holds your approval for <b>60 seconds</b> before the orchestrator receives it, so it can’t send earlier. Until then, Stop cancels it and nothing is sent. After that it can’t be undone here.</div>' : ""}${noteBox}${error ? `<p class="error" role="alert">${e(error)}</p>` : ""}</div><footer class="ctx-foot">${githubControls(card, github, busy)}${actions}</footer></section>`;
+  return `<section class="needs-detail" data-card="${e(card.number)}" data-version="${e(card.version)}" aria-label="Needs me details"><header class="ctx-head"><b>Details</b><button class="btn ghost sm" data-needs-close>Hide</button></header><div class="ctx-body"><button class="btn phone-back" data-needs-close>Back to Needs me</button><header class="detail-h"><div class="row"><span class="typ ${kind}">${badge(card, kind)}</span><span>${e(board.name || board.slug)}${asked(card) ? ` · asked ${asked(card)}` : ""}</span></div><h2 tabindex="-1" data-needs-title>${e(card.title)}</h2></header>${hold ? `<section class="hold-note ${e(hold.state)}" role="status">${holdCopy(hold, now)}${stopButton(hold, now)}</section>` : ""}${quote}${card.ask && !proposal ? `<p class="quote">${exact(card.ask)}</p>` : ""}${linked}${proposal && canAnswer ? '<div class="facts" role="note">Commonplace holds your approval for <b>60 seconds</b> before the orchestrator receives it, so it can’t send earlier. Until then, Stop cancels it and nothing is sent. After that it can’t be undone here.</div>' : ""}${noteBox}${error ? `<p class="error" role="alert">${e(error)}</p>` : ""}</div><footer class="ctx-foot">${githubControls(card, github, busy)}${actions}</footer></section>`;
 }
 
 // The shell owns routing, sheet modality and chat. All requests use the shared JSON api.
@@ -351,6 +356,20 @@ export function createNeeds({ mount, detailMount, api = request, onAction, onAsk
     data = { ...data, needs };
     if (token === revision) { confirming = false; current = null; selected = null; revision++; }
   }
+  async function releaseOrigin() {
+    if (stopped || busy || !current || current.approval_kind !== "origin" || !(current.actions || []).includes("approve")) return;
+    rememberNote();
+    const reason = notes.get(current.number) || "";
+    if (!reason.trim() || reason.length > 500) { error = "Enter an origin release reason (1–500 characters)."; drawDetail(); return; }
+    const card = current, token = revision;
+    busy = true; error = ""; drawDetail();
+    try {
+      await api(`/api/cards/${card.number}/approve`, { method: "POST", body: { approve: true, version: card.version, reason } });
+      if (stopped) return;
+      dropFromQueue(card, token); notes.delete(card.number); onChange();
+    } catch (failure) { failedFor(card.number, "Could not release origin. Open the card again before trying again.", failure); }
+    finally { busy = false; draw(); }
+  }
   // A plan's Approve uses the card's approve route at once; no hold, unlike a proposal.
   async function approvePlan() {
     if (stopped || busy || !current || current.proposal_status === "pending" || !(current.actions || []).includes("approve")) return;
@@ -444,6 +463,7 @@ export function createNeeds({ mount, detailMount, api = request, onAction, onAsk
     if (button.hasAttribute("data-needs-github")) await githubAction(button.dataset.needsGithub);
     else if (button.hasAttribute("data-needs-select")) { paused = false; await select(button.dataset.needsSelect); }
     else if (button.hasAttribute("data-needs-filter")) await setFilter(button.dataset.needsFilter);
+    else if (button.dataset?.needsApprove === "origin") await releaseOrigin();
     else if (button.dataset?.needsApprove === "plan") await approvePlan();
     else if (button.hasAttribute("data-needs-approve")) approve();
     else if (button.hasAttribute("data-needs-confirm")) await confirm();

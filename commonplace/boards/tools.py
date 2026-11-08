@@ -219,6 +219,7 @@ def _run(ctx, name, args):
             if name == "task_handoff" and result.get("status_line")
             else ""
         )
+        + ("\n" + result["notice"] if result.get("notice") else "")
         + ("\n" + approval_note if approval_note else "")
     )
 
@@ -254,8 +255,8 @@ def add(
                 "space_post": "Append your verbatim reply to a space chat.",
                 "task_list": "List visible cards. mine=true also lists stuck claims of agents you supervise.",
                 "task_show": "Read a card and its history and linked memories.",
-                "task_add": "Create a todo card. claim=true or assignee=self starts work immediately. Child-created cards are pending until parent approval.",
-                "task_approve": "Approve or reject a proposal or advisory plan review with a reason, or escalate to the owner. Never approve a card you hold.",
+                "task_add": "Create a card. Unrestricted top-level work can start with claim=true or assignee=self. Restricted-origin and child submissions stay inactive until deliberate origin release; pending proposals also need review.",
+                "task_approve": "Approve or reject a proposal or advisory plan review with a reason, or escalate to the owner. An appointed independent coordinator may release the origin of a held card with a required reason, preserving its lease and separate review. Holders cannot review their own work.",
                 "task_heartbeat": "Renew your doing card's claim and read approvals waiting on you. Call every 20 minutes, including while waiting on checks.",
                 "task_comment": "Append a comment and renew your claim.",
                 "task_take_next": "Claim ready work reserved for you or available in your board scope. You may also claim your own backlog by number. Pending child proposals require parent approval; other reservations and person decisions stay protected.",
@@ -267,7 +268,7 @@ def add(
                 "task_handoff": "Hand off work with a note, or ask a person and end the turn.",
                 "ask": "Ask and end the turn. Subagent questions go to the live board coordinator when available; otherwise the owner.",
                 "decide": "Answer a review as its owner or addressed live coordinator. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
-                "needs_me": "Read the visible decision queue. Live coordinators also receive subagent questions addressed to them.",
+                "needs_me": "Read the visible decision queue and origin releases. Eligible coordinators receive origin work without decide authority; signed-in owners receive release or configuration recovery only when needed. Ask authority remains separate.",
             }[name],
             input_schema=input_schema,
             input_schema_for=(
@@ -284,6 +285,10 @@ def add(
             available=available,
         )
     )
+
+
+def receives_releases(principal, gateway):
+    return bool(BoardService(ToolContext(principal=principal, gateway=gateway)).release_boards())
 
 
 def receives_asks(principal, gateway):
@@ -484,6 +489,9 @@ def register_tools():
         "needs_me",
         {"format": {"type": "string", "enum": ["list", "digest"]}},
         available=lambda p, gateway: (
-            p.role == "owner" or _trusted_agent(p) or receives_asks(p, gateway)
+            p.role == "owner"
+            or _trusted_agent(p)
+            or receives_asks(p, gateway)
+            or receives_releases(p, gateway)
         ),
     )

@@ -11,7 +11,7 @@ _USER = re.compile(r"\buser:(usr_[0-9a-f]+)\b")
 
 # What a card needs from the person reading it, strongest first. ``done`` is
 # terminal and wins over everything; the rest apply in this order.
-NEEDS = ("you", "plan", "merge", "checks", "expired", "working", "idle", "done")
+NEEDS = ("you", "release", "plan", "merge", "checks", "expired", "working", "idle", "done")
 STALE_MINUTES = 30
 
 

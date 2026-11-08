@@ -30,6 +30,66 @@ if (which === "need_items") {
   const legacy = { ...ask }; delete legacy.why;
   assert.deepEqual(home.needItems({ asks: [legacy] }).map((item) => item.reason), ["asks: Which one?"]);
   assert.deepEqual(home.needItems({}), []);
+} else if (which === "origin_shell") {
+  const { createNeeds } = await import(file("needs.js"));
+  const rail = await import(file("rail.js"));
+  const origin = card(7, { board: "atlas", title: "Release this origin", status: "backlog", proposal_status: "pending", need: "release", approval_kind: "origin", approval_role: "workspace owner", can_approve: true, actions: ["approve"], why: "Origin release needs your reason.", body: "Original words" });
+  const plan = card(1, { need: "plan", status: "todo", labels: ["plan"] });
+  const question = { ...ask, board: "harbor" };
+  const needs = { approvals: [origin], asks: [question], plans: [plan], count: 3 };
+  const node = (extra = {}) => ({ innerHTML: "", hidden: true, dataset: {}, contains: () => false, querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, removeEventListener() {}, setAttribute() {}, focus() {}, ...extra });
+  const mount = node();
+  const content = node({ querySelector: (selector) => selector === "[data-needs-mount]" && content.innerHTML.includes("data-needs-mount") ? mount : null });
+  const panel = node();
+  const nodes = Object.fromEntries(["#board-nav", "#phone-bar", "#phone-tabs", ".shell", "#title", "#head-actions"].map((selector) => [selector, node()]));
+  Object.assign(nodes, { "#content": content, "#card-panel": panel });
+  const state = { me: { actor: "user:maya", workspace: "work" }, needs, boards: [{ slug: "atlas", name: "Atlas" }, { slug: "harbor", name: "Harbor" }], selected: origin.number, route: "#/needs", base: "#/needs" };
+  const shows = [];
+  const context = {
+    state, ...rail, needItems: home.needItems,
+    document: { activeElement: null, title: "" }, root: { querySelector: (selector) => nodes[selector] || null },
+    localStorage: { getItem: () => null }, speech: { supported: false }, speechView() {},
+    api: async (path) => {
+      if (path === "/api/holds") return { holds: [] };
+      const number = Number(/^\/api\/cards\/(\d+)$/.exec(path)?.[1]);
+      const found = [origin, plan, question].find((item) => item.number === number);
+      assert.ok(found, `Unexpected API request: ${path}`);
+      return { ...found, events: [] };
+    },
+    createNeeds: (options) => {
+      const ui = createNeeds({ ...options, setInterval: () => 1, clearInterval() {} });
+      const show = ui.show;
+      ui.show = (data) => { shows.push(data.selected); return show(data); };
+      return ui;
+    },
+    singleKeysEnabled: () => true, matchMedia: () => ({ matches: false }), mountWorkbenchChat() {}, closeCardPanel() {}, refresh() {},
+  };
+  runInNewContext([
+    slice("function currentBoard()", "function closeCardPanel()"),
+    slice("function navigation()", "function showError"),
+    slice("function title(", "function decision("),
+    slice("function needsCards()", "const hhmm"),
+  ].join("\n"), context);
+  const flush = async () => { for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve)); };
+  try {
+    context.navigation();
+    const project = nodes["#board-nav"].outerHTML.match(/<a class="proj" href="#\/board\/atlas"[^>]*>[\s\S]*?<\/a>/);
+    assert.ok(project, "Atlas rail entry missing");
+    assert.match(project[0], />2<span class="sr"> need you<\/span>/, "Owner origin release must count in its project's rail badge");
+    assert.deepEqual(home.needItems(needs).map(({ card }) => card.number), [22, 7, 1], "Release must rank after you and before plan, regardless of card number");
+    context.needsView(); await flush();
+    assert.equal(shows.at(-1), origin.number, "Origin approval must remain selected when opening Needs me");
+    assert.ok(panel.innerHTML.includes(origin.title), "Selected origin detail must be shown");
+    origin.version++;
+    context.needsView(); await flush();
+    assert.equal(shows.length, 2, "Changed payload must exercise the refresh selection gate");
+    assert.equal(shows.at(-1), origin.number, "Origin approval selection must survive refresh");
+    assert.equal(state.selected, origin.number);
+    assert.ok(panel.innerHTML.includes(origin.title), "Refresh must keep the origin detail open");
+    state.needs = { asks: [question], plans: [plan], count: 2 };
+    context.needsView(); await flush();
+    assert.equal(shows.at(-1), undefined, "A departed origin must not be passed through the shell selection gate");
+  } finally { state.needsUI?.stop(); }
 } else if (which === "home_removed") {
   // RED: Home's tiles and open-task table are removed with their stylesheet link.
   assert.equal(home.homeView, undefined, "homeView must be removed");

@@ -353,7 +353,7 @@
           "name": "memory_search"
         },
         {
-          "description": "Read the visible decision queue. Live coordinators also receive subagent questions addressed to them.",
+          "description": "Read the visible decision queue and origin releases. Eligible coordinators receive origin work without decide authority; signed-in owners receive release or configuration recovery only when needed. Ask authority remains separate.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -1300,7 +1300,7 @@
           "name": "space_read"
         },
         {
-          "description": "Create a todo card. claim=true or assignee=self starts work immediately. Child-created cards are pending until parent approval.",
+          "description": "Create a card. Unrestricted top-level work can start with claim=true or assignee=self. Restricted-origin and child submissions stay inactive until deliberate origin release; pending proposals also need review.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -1360,7 +1360,7 @@
           "name": "task_add"
         },
         {
-          "description": "Approve or reject a proposal or advisory plan review with a reason, or escalate to the owner. Never approve a card you hold.",
+          "description": "Approve or reject a proposal or advisory plan review with a reason, or escalate to the owner. An appointed independent coordinator may release the origin of a held card with a required reason, preserving its lease and separate review. Holders cannot review their own work.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -2079,7 +2079,7 @@
           "name": "memory_search"
         },
         {
-          "description": "Read the visible decision queue. Live coordinators also receive subagent questions addressed to them.",
+          "description": "Read the visible decision queue and origin releases. Eligible coordinators receive origin work without decide authority; signed-in owners receive release or configuration recovery only when needed. Ask authority remains separate.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -2251,7 +2251,7 @@
           "name": "session_start"
         },
         {
-          "description": "Create a todo card. claim=true or assignee=self starts work immediately. Child-created cards are pending until parent approval.",
+          "description": "Create a card. Unrestricted top-level work can start with claim=true or assignee=self. Restricted-origin and child submissions stay inactive until deliberate origin release; pending proposals also need review.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -2311,7 +2311,7 @@
           "name": "task_add"
         },
         {
-          "description": "Approve or reject a proposal or advisory plan review with a reason, or escalate to the owner. Never approve a card you hold.",
+          "description": "Approve or reject a proposal or advisory plan review with a reason, or escalate to the owner. An appointed independent coordinator may release the origin of a held card with a required reason, preserving its lease and separate review. Holders cannot review their own work.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -2996,7 +2996,7 @@
           "name": "memory_search"
         },
         {
-          "description": "Read the visible decision queue. Live coordinators also receive subagent questions addressed to them.",
+          "description": "Read the visible decision queue and origin releases. Eligible coordinators receive origin work without decide authority; signed-in owners receive release or configuration recovery only when needed. Ask authority remains separate.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -3943,7 +3943,7 @@
           "name": "space_read"
         },
         {
-          "description": "Create a todo card. claim=true or assignee=self starts work immediately. Child-created cards are pending until parent approval.",
+          "description": "Create a card. Unrestricted top-level work can start with claim=true or assignee=self. Restricted-origin and child submissions stay inactive until deliberate origin release; pending proposals also need review.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -4003,7 +4003,7 @@
           "name": "task_add"
         },
         {
-          "description": "Approve or reject a proposal or advisory plan review with a reason, or escalate to the owner. Never approve a card you hold.",
+          "description": "Approve or reject a proposal or advisory plan review with a reason, or escalate to the owner. An appointed independent coordinator may release the origin of a held card with a required reason, preserving its lease and separate review. Holders cannot review their own work.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {

@@ -88,7 +88,7 @@ def test_waiting_notice_requires_missing_live_coordinator(hub, fresh, inactive):
         {
             "board": "work",
             "count": 2,
-            "message": "2 cards wait for a coordinator: set one in board settings",
+            "message": "2 restricted-origin cards need owner recovery (2 release, 0 configuration); review these cards in Needs me.",
         }
     ]
     live = fresh.connect("live")
@@ -100,7 +100,9 @@ def test_released_cards_do_not_wait_for_coordinator(fresh):
     parent = fresh.connect("parent")
     creator = fresh.connect("restricted", parent=parent.id, trust="untrusted", write_wing="inbox")
     proposal = creator.work.task_add(board="work", title="Released work")
-    fresh.owner.task_approve(proposal["number"], reason="Owner released work")
+    released = fresh.owner.task_approve(proposal["number"], reason="Owner released work")
+    assert released["proposal_status"] == "pending"
+    assert proposal["number"] in {c["number"] for c in parent.work.needs_me()["approvals"]}
     assert fresh.owner.needs_me().get("coordinator_waiting") == []
 
 
@@ -179,6 +181,11 @@ def test_non_waiting_or_invisible_cards_do_not_raise_notice(hub, fresh, kind):
     with fresh.owner.store.transaction() as conn:
         if kind in ("done", "doing"):
             conn.execute("UPDATE tasks SET status=? WHERE id=?", (kind, card["number"]))
+            if kind == "doing":
+                conn.execute(
+                    "UPDATE tasks SET approved_by=?,proposal_status='approved' WHERE id=?",
+                    (f"user:{fresh.user}", card["number"]),
+                )
         elif kind == "review":
             conn.execute(
                 "UPDATE tasks SET status='review',ask='Synthetic question' WHERE id=?",
@@ -210,7 +217,8 @@ def test_waiting_is_grouped_by_board_and_only_shown_to_people(hub, fresh):
         creator.work.task_add(board=board, title="Waiting work")
     notices = fresh.owner.needs_me().get("coordinator_waiting", [])
     assert [(n["board"], n["count"]) for n in notices] == [("second", 2), ("work", 1)]
-    assert snapshot(hub.gateway, fresh.owner.principal, "work")["needs_you"] == 0
+    # The owner origin-recovery item counts once; its board notice adds no card.
+    assert snapshot(hub.gateway, fresh.owner.principal, "work")["needs_you"] == 1
     agent = fresh.connect("trusted")
     assert agent.work.needs_me().get("coordinator_waiting") == []
     assert "text" in fresh.owner.needs_me(format="digest")

@@ -172,9 +172,19 @@ def test_unseen_seat_keeps_owner_release(projects_hub):
     assert view["connected"] is True and view["seen"] is False
     proposed_status, proposal = h.propose("alpha")
     assert proposed_status == 201
-    assert proposal["number"] in h.backlog(h.owner)[1]
+    code, queue, _ = h.get(h.owner, "/api/needs-me")
+    assert code == 200
+    assert [c["number"] for c in queue["approvals"]] == [proposal["number"]]
+    origin = queue["approvals"][0]
+    assert origin["approval_kind"] == "origin"
+    assert origin["approval_role"] == "workspace owner"
+    assert origin["need"] == "release"
+    assert origin["can_approve"] is True and origin["actions"] == ["approve"]
+    assert queue["backlog_from_agents"] == []
     assert h.mcp(body["token"], "space_read", board="alpha")[1]["ok"]
-    assert proposal["number"] not in h.backlog(h.owner)[1]
+    code, queue, _ = h.get(h.owner, "/api/needs-me")
+    assert code == 200 and queue["approvals"] == []
+    assert queue["backlog_from_agents"] == []
     assert h.project(h.owner, "alpha")[1]["main"]["seen"] is True
 
 

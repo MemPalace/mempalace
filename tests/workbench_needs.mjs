@@ -48,7 +48,48 @@ function setup({ api: customApi, onAction, onAsk } = {}) {
   return { ui, mount, detailMount, requests, timers, events, doc, setHolds: (value) => { holds = value; }, setTime: (value) => { clock = value; } };
 }
 const opts = { boards: [board], now };
+async function rejectOnly(kind) {
+  const card = kind === 'proposal' ? { ...proposal, actions: ['reject'] } : {
+    number: 24, board: 'atlas', title: 'Plan the launch', status: 'review', version: 5,
+    labels: ['plan'], actions: ['reject'],
+  };
+  const queue = kind === 'proposal' ? { backlog_from_agents: [card] } : { plans: [card] };
+  const { actions, ...loaded } = card;
+  for (const shell of [false, true]) {
+    const calls = [];
+    const s = setup({ api: (path) => path === `/api/cards/${card.number}` ? loaded : undefined,
+      onAction: shell ? (...args) => calls.push(args) : undefined });
+    await s.ui.show({ needs: queue, boards: [board], selected: card.number });
+    const html = s.detailMount.innerHTML;
+    const control = html.match(/<button\b[^>]*data-action="need-reject"[^>]*>(Decline|Reject)<\/button>/);
+    assert.ok(control, `${kind} reject-only control missing`);
+    assert.equal(control[1], kind === 'proposal' ? 'Decline' : 'Reject');
+    assert.ok(!html.includes('data-needs-approve'), `${kind} must not offer approval`);
+    s.detailMount.controls.get('[data-needs-note]').value = 'Please stop.';
+    const button = { disabled: false, dataset: { action: 'need-reject' }, hasAttribute: () => false };
+    let prevented = false, stopped = false;
+    await s.detailMount.handlers.get('click')({
+      target: { closest: (selector) => selector.split(',').includes('[data-action=need-reject]') ? button : null },
+      preventDefault() { prevented = true; }, stopPropagation() { stopped = true; },
+    });
+    assert.ok(prevented && stopped, 'rejection must be handled once');
+    if (shell) {
+      assert.equal(calls.length, 1); assert.equal(calls[0][0], 'need-reject');
+      assert.equal(calls[0][1].number, card.number); assert.deepEqual(calls[0][2], { reason: 'Please stop.' });
+      assert.equal(s.requests.filter((r) => r.method === 'POST').length, 0);
+    } else {
+      assert.deepEqual(s.requests.filter((r) => r.method === 'POST'), [{
+        path: `/api/cards/${card.number}/approve`, method: 'POST',
+        body: { approve: false, version: card.version, reason: 'Please stop.' },
+      }]);
+    }
+    assert.ok(!s.mount.innerHTML.includes(card.title), 'rejected item must leave the queue');
+    s.ui.stop();
+  }
+}
 const cases = {
+  proposal_reject_only: () => rejectOnly('proposal'),
+  plan_reject_only: () => rejectOnly('plan'),
   async approve() {
     const s = setup(); await s.ui.show({ needs, boards: [board], selected: 21 });
     s.detailMount.controls.get('[data-needs-note]').value = '  Send tomorrow\n';
