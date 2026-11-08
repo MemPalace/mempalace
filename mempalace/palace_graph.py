@@ -226,6 +226,9 @@ def _iter_all_metadata(col):
     collection from the start. The loop is kept only for collection objects
     that predate the contract method.
     """
+    from .worker_observation import mark
+
+    mark(fallback_kind="full_metadata")
     if isinstance(col, BaseCollection):
         yield from col.get_all_metadata()
         return

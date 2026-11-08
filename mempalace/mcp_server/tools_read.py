@@ -81,7 +81,9 @@ def _sqlite_taxonomy():
         and _taxonomy_cache[0] == cache_key
         and (fingerprint_matches or ttl_fresh)
     ):
+        _observation.mark(taxonomy_cache_hit=True, metadata_fallback=False, fallback_kind="none")
         return _taxonomy_cache[1]
+    _observation.mark(taxonomy_cache_hit=False)
     counts = None
     try:
         if _is_chroma_backend():
@@ -118,6 +120,7 @@ def _sqlite_taxonomy():
         for room, n in room_counts.items():
             rkey = _norm(room)
             dest[rkey] = dest.get(rkey, 0) + n
+    _observation.mark(metadata_fallback=False, fallback_kind="none")
     result = total, normalized
     _taxonomy_cache = (cache_key, result, fingerprint)
     # Stamp once the query is done: stamped at the start, a query slower than
@@ -413,6 +416,7 @@ def tool_status():
                 except (TypeError, ValueError):
                     pass
                 result["total_drawers"] = count - _drop_bookkeeping_facets(col, wings, rooms)
+                _observation.mark(metadata_fallback=False, fallback_kind="none")
 
             except Exception as e:
                 logger.warning(
@@ -420,10 +424,12 @@ def tool_status():
                 )
                 rooms.clear()
                 wings.clear()
+                _observation.mark(metadata_fallback=True)
                 result["total_drawers"] = _tally_wings_rooms(
                     _get_cached_metadata(col), wings, rooms
                 )
         else:
+            _observation.mark(metadata_fallback=True)
             result["total_drawers"] = _tally_wings_rooms(_get_cached_metadata(col), wings, rooms)
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
@@ -499,6 +505,7 @@ def _scoped_taxonomy(scope, *, wings=False):
                     col.facet_counts("room", where={"wing": wing}, limit=500)
             except Exception:
                 fallback = True
+        _observation.mark(metadata_fallback=fallback, fallback_kind="bounded_pages")
         rows, cursor = metadata_page(
             _config,
             _selected_backend_name(),
@@ -559,12 +566,14 @@ def tool_list_wings(thread_scope: dict = None):
             except (TypeError, ValueError):
                 pass
             _drop_bookkeeping_facets(col, wings=wings)
+            _observation.mark(metadata_fallback=False, fallback_kind="none")
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
             wings.clear()
+            _observation.mark(metadata_fallback=True)
             _tally_wings_rooms(_get_cached_metadata(col), wings=wings)
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
@@ -614,12 +623,14 @@ def tool_list_rooms(wing: str = None):
             except (TypeError, ValueError):
                 pass
             _drop_bookkeeping_facets(col, rooms=rooms, only=wings)
+            _observation.mark(metadata_fallback=False, fallback_kind="none")
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
             rooms.clear()
+            _observation.mark(metadata_fallback=True)
             _tally_wings_rooms(_fetch_all_metadata(col, where=where), rooms=rooms)
     except Exception as e:
         logger.exception("tool_list_rooms metadata fetch failed")
@@ -665,11 +676,13 @@ def tool_get_taxonomy(thread_scope: dict = None):
                     temp_taxonomy[wing] = room_counts
                 taxonomy.update(temp_taxonomy)
             _drop_bookkeeping_facets(col, taxonomy=taxonomy)
+            _observation.mark(metadata_fallback=False, fallback_kind="none")
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
+            _observation.mark(metadata_fallback=True)
             _tally_wings_rooms(_get_cached_metadata(col), taxonomy=taxonomy)
     except Exception as e:
         logger.exception("tool_get_taxonomy metadata fetch failed")

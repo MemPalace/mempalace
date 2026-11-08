@@ -124,6 +124,9 @@ class _FakeServer:
     def _request_is_mutating(self, request):
         return self._mutating
 
+    def _observed_local_request(self, request, mode):
+        return self.handle_request(request)
+
     def handle_request(self, request):
         self.calls.append(request)
         return {

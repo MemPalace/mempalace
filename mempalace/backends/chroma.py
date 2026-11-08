@@ -829,6 +829,10 @@ class _SafePersistentDataUnpickler:
     def load(cls, path: str):
         import pickle
 
+        from ..worker_observation import covered
+
+        covered("restricted_pickle_load_count")
+
         class _Restricted(pickle.Unpickler):
             def find_class(self, module: str, name: str):
                 if (module, name) in cls._ALLOWED:
@@ -836,7 +840,11 @@ class _SafePersistentDataUnpickler:
                 raise pickle.UnpicklingError(f"disallowed class: {module}.{name}")
 
         with open(path, "rb") as f:
-            return _Restricted(f).load()
+            result = _Restricted(f).load()
+            from ..worker_observation import success
+
+            success("restricted_pickle_load_count")
+            return result
 
 
 def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
@@ -3223,6 +3231,11 @@ class ChromaBackend(BaseBackend):
                     if explanation:
                         raise EmbeddingFunctionMismatchError(explanation) from e
                     raise
+            from ..worker_observation import client_count, selected, success
+
+            client_count(len(self._clients))
+            success("collection_open_count")
+            selected(backend="chroma")
             if caller_vectors:
                 _require_caller_vector_collection(collection)
             elif not read_only:

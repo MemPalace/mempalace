@@ -180,7 +180,8 @@ def _get_client():
         # if the index is severely undersized, segment load can segfault
         # the whole MCP server. The probe is pure sqlite +
         # metadata read; never touches the HNSW binary files.
-        _refresh_vector_disabled_flag()
+        with _worker_phase("capacity_probe"):
+            _refresh_vector_disabled_flag()
         if client_is_current and (inode_changed or mtime_changed):
             ChromaBackend._quarantined_paths.discard(_config.palace_path)
             # A peer process changed chroma.sqlite3 on disk. chromadb
@@ -273,6 +274,7 @@ def _get_collection(create=False):
                     and _collection_cache_palace == _config.palace_path
                 ):
                     _collection_open_error = None
+                    _observation.selected(backend=backend_name)
                     return _collection_cache
                 _collection_cache = None
                 _collection_cache_backend = None
@@ -287,6 +289,7 @@ def _get_collection(create=False):
                         backend=backend_name,
                         read_only=collection_read_only,
                     )
+                    _observation.selected(backend=backend_name)
                     _collection_cache_backend = backend_name
                     _collection_cache_palace = _config.palace_path
                     _collection_open_error = None
@@ -350,6 +353,7 @@ def _get_collection(create=False):
                 }
         return None
 
+    _observation.covered("collection_open_count")
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not create and not os.path.isfile(db_path):
         _force_chroma_cache_reset()
@@ -419,6 +423,8 @@ def _get_collection(create=False):
                         },
                         **ef_kwargs,
                     )
+                _observation.success("collection_open_count")
+                _observation.selected(backend="chroma")
                 _pin_hnsw_threads(raw)
                 _collection_cache = _checked_chroma_collection(raw, create=True)
                 _restamp_palace_db()
@@ -432,6 +438,8 @@ def _get_collection(create=False):
                     "embedding_function": ChromaBackend._resolve_embedding_function(read_only=True)
                 }
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
+                _observation.success("collection_open_count")
+                _observation.selected(backend="chroma")
                 _pin_hnsw_threads(raw)
                 _collection_cache = _checked_chroma_collection(raw, create=False)
                 _restamp_palace_db()
@@ -665,6 +673,7 @@ def _fetch_all_metadata(col, where=None):
     correct strategy without this caller needing to know which backend it's
     talking to.
     """
+    _observation.mark(fallback_kind="full_metadata")
     get_all = getattr(col, "get_all_metadata", None)
     if callable(get_all):
         return get_all(where=where)
@@ -753,7 +762,9 @@ def _get_cached_metadata(col, where=None):
         and _metadata_cache is not None
         and (time.time() - _metadata_cache_time) < _METADATA_CACHE_TTL
     ):
+        _observation.mark(raw_metadata_cache_hit=True)
         return _metadata_cache
+    _observation.mark(raw_metadata_cache_hit=False)
     result = _fetch_all_metadata(col, where=where)
     if where is None:
         _metadata_cache = result

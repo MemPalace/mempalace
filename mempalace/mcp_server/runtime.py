@@ -3,6 +3,91 @@ if __name__ != "mempalace.mcp_server":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.mcp_server")
 
 
+# Serving-only activation: daemon call_tool and library imports never opt in.
+from contextlib import contextmanager
+
+from .. import worker_observation as _observation
+
+_worker_observer = None
+_worker_observer_failed = False
+_worker_observation_lost = 0
+_worker_observer_lock = threading.Lock()
+
+
+def _worker_observer_factory(directory, **kwargs):
+    return _observation.Observer(directory, **kwargs)
+
+
+def _activate_worker_observation():
+    global _worker_observer, _worker_observer_failed, _worker_observation_lost
+    if os.environ.get("MEMPALACE_WORKER_MEMORY_OBSERVE") == "0":
+        return None
+    with _worker_observer_lock:
+        if _worker_observer_failed:
+            return None
+        if _worker_observer is None:
+            try:
+                _worker_observer = _worker_observer_factory(_config.config_dir)
+            except Exception:
+                _worker_observer_failed = True
+                _worker_observation_lost = min(_observation.MAX_U, _worker_observation_lost + 1)
+                return None
+    return _worker_observer
+
+
+@contextmanager
+def _worker_local_scope(tool, mode="stdio", phase=None):
+    tool = (
+        tool
+        if type(tool) is str and tool in _observation.TOOL_NAMES
+        else (None if phase else "unknown")
+    )
+    observer = _activate_worker_observation()
+    if observer is None:
+        yield None
+        return
+    scope = observer.scope(tool, mode, phase)
+    if (
+        getattr(_observation._LOCAL, "defer", False)
+        and getattr(_observation._LOCAL, "pending", None) is None
+        and getattr(_observation._LOCAL, "token", None) is None
+    ):
+        token = scope.__enter__()
+        _observation._LOCAL.pending = scope
+        try:
+            yield token
+        except BaseException:
+            if token is not None:
+                token.outcome = "raised"
+            raise
+    else:
+        with scope as token:
+            yield token
+
+
+_worker_transport = _observation.transport
+
+
+def _observed_local_request(request, mode="stdio"):
+    method, params = _normalize_envelope(request) if isinstance(request, dict) else ("", {})
+    if method != "tools/call" and method not in {
+        "internal/write_mirror_units",
+        "internal/read_associations",
+    }:
+        return handle_request(request)
+    with _worker_local_scope(params.get("name") if method == "tools/call" else method, mode):
+        return handle_request(request)
+
+
+@contextmanager
+def _worker_phase(phase):
+    if _worker_observer is None:
+        yield
+        return
+    with _worker_local_scope(None, "background", phase=phase):
+        yield
+
+
 def _startup_preflight() -> None:
     """Startup SQLite integrity + HNSW capacity probes, off the protocol thread.
 
@@ -11,8 +96,9 @@ def _startup_preflight() -> None:
     re-check on demand, so an exception here only loses the early warning.
     """
     try:
-        _ensure_sqlite_integrity_status()
-        _refresh_vector_disabled_flag()
+        with _worker_phase("startup_preflight"):
+            _ensure_sqlite_integrity_status()
+            _refresh_vector_disabled_flag()
     except Exception:
         logger.exception("startup preflight failed")
 
@@ -87,7 +173,7 @@ def _dispatch_stdio_request(request: dict):
 
     hub = _hub_proxy_target()
     if hub is None:
-        return handle_request(request)
+        return _observed_local_request(request)
     try:
         from ..mcp_proxy import _annotate_forwarded_update_status
 
@@ -98,7 +184,7 @@ def _dispatch_stdio_request(request: dict):
             logger.warning(
                 "Hub at %s unreachable (%s); handling request locally", hub.base_url, exc
             )
-            return handle_request(request)
+            return _observed_local_request(request)
         return proxy_error_response(request, hub.base_url, exc)
 
 
@@ -163,7 +249,8 @@ def _run_stdio_loop() -> None:
     # Opt-in: pre-load the embedder so the first chromadb-write tool call
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
     # timeout. Default off — preserves current startup latency.
-    _maybe_eager_warmup_embedder()
+    with _worker_phase("eager_warmup"):
+        _maybe_eager_warmup_embedder()
 
     # Idle auto-exit: release ChromaDB file handles from stale servers
     # that outlived their Claude Code session.
@@ -193,24 +280,31 @@ def _run_stdio_loop() -> None:
         if not line:
             continue
 
-        try:
-            payload = _stdio_reply(line, _dispatch_stdio_request)
-        except KeyboardInterrupt:
-            break
-        if payload is None:
-            continue
-        try:
-            sys.stdout.write(payload + "\n")
-            sys.stdout.flush()
-        except KeyboardInterrupt:
-            break
-        except (BrokenPipeError, OSError) as exc:
-            # The client's read end is gone; every future response write
-            # would fail the same way, so treat it like stdin EOF and
-            # shut down instead of swallowing it in the generic handler.
-            logger.info("stdout write failed (%s) -- client disconnected, shutting down", exc)
-            _drop_broken_stdout()
-            break
+        with _worker_transport():
+            try:
+                try:
+                    payload = _stdio_reply(line, _dispatch_stdio_request)
+                except KeyboardInterrupt:
+                    break
+                if payload is None:
+                    continue
+                try:
+                    sys.stdout.write(payload + "\n")
+                    sys.stdout.flush()
+                except KeyboardInterrupt:
+                    break
+                except (BrokenPipeError, OSError) as exc:
+                    # The client's read end is gone; every future response write
+                    # would fail the same way, so treat it like stdin EOF and
+                    # shut down instead of swallowing it in the generic handler.
+                    logger.info(
+                        "stdout write failed (%s) -- client disconnected, shutting down", exc
+                    )
+                    _observation.control_outcome("aborted")
+                    _drop_broken_stdout()
+                    break
+            finally:
+                line = payload = None
 
 
 _MCP_WRITER_WAIT_SECONDS_ENV = "MEMPALACE_MCP_WRITER_WAIT_SECONDS"
@@ -302,7 +396,8 @@ def _run_http_loop() -> None:
         # filesystem-only probe before binding, but never make the listener wait on
         # optional embedder/HNSW warmup. Operators and tests should see /healthz as
         # soon as the process is alive.
-        _refresh_vector_disabled_flag()
+        with _worker_phase("startup_preflight"):
+            _refresh_vector_disabled_flag()
         _start_idle_exit_watchdog()
         _start_write_stall_watchdog()
 
@@ -310,7 +405,8 @@ def _run_http_loop() -> None:
 
             def _warmup_with_lock():
                 with _HTTP_REQUEST_LOCK:
-                    _maybe_eager_warmup_embedder()
+                    with _worker_phase("eager_warmup"):
+                        _maybe_eager_warmup_embedder()
 
             threading.Thread(
                 target=_warmup_with_lock,

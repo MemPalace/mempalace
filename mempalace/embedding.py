@@ -326,7 +326,12 @@ def _build_ef_class():
             # still works.
             cap = getattr(self, "_intra_op_num_threads", 0)
             if not cap or cap <= 0:
-                return super().model
+                session = super().model
+                from .worker_observation import selected, success
+
+                success("model_session_create_count")
+                selected(model="minilm")
+                return session
             try:
                 ort = self.ort
                 providers = self._preferred_providers or ort.get_available_providers()
@@ -335,17 +340,27 @@ def _build_ef_class():
                 so.log_severity_level = 3
                 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 so.intra_op_num_threads = cap
-                return ort.InferenceSession(
+                session = ort.InferenceSession(
                     os.path.join(self.DOWNLOAD_PATH, self.EXTRACTED_FOLDER_NAME, "model.onnx"),
                     providers=providers,
                     sess_options=so,
                 )
+                from .worker_observation import selected, success
+
+                success("model_session_create_count")
+                selected(model="minilm")
+                return session
             except Exception:
                 logger.warning(
                     "thread-capped ORT session build failed; using ORT defaults",
                     exc_info=True,
                 )
-                return super().model
+                session = super().model
+                from .worker_observation import selected, success
+
+                success("model_session_create_count")
+                selected(model="minilm")
+                return session
 
     return _MempalaceONNX
 
@@ -452,18 +467,28 @@ def _new_embeddinggemma_session(ort, model_path, patch, intra_op_num_threads, pr
                 "session.model_external_initializers_file_folder_path", patch.external_data_dir
             )
         try:
-            return ort.InferenceSession(patch.model_bytes, sess_options=so, providers=providers)
+            session = ort.InferenceSession(patch.model_bytes, sess_options=so, providers=providers)
+            from .worker_observation import selected, success
+
+            success("model_session_create_count")
+            selected(model="embeddinggemma")
+            return session
         except Exception:
             logger.warning(
                 "onnxruntime rejected the rewritten EmbeddingGemma graph; loading it "
                 "unchanged, which dequantizes the full token table on every run",
                 exc_info=True,
             )
-    return ort.InferenceSession(
+    session = ort.InferenceSession(
         model_path,
         sess_options=_intra_op_session_options(intra_op_num_threads),
         providers=providers,
     )
+    from .worker_observation import selected, success
+
+    success("model_session_create_count")
+    selected(model="embeddinggemma")
+    return session
 
 
 def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
@@ -1347,6 +1372,9 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
             if cached is None:
                 cached = EmbeddingGemma2EmbeddingFunction(**settings)
                 _EF_CACHE[cache_key] = cached
+        from .worker_observation import selected
+
+        selected(model=model)
         return cached
 
     # OpenAI-compatible embedding API: bypasses local ONNX entirely. Checked
@@ -1376,6 +1404,9 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         cache_key = ("openai-compat", url, api_model, key_fp)
         cached = _EF_CACHE.get(cache_key)
         if cached is not None:
+            from .worker_observation import selected
+
+            selected(model=model)
             return cached
         # Return the concrete function. Chroma accepts only ``__call__(self, input)``,
         # and callers distinguish backends by type. A proxy breaks both.
@@ -1384,16 +1415,25 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         logger.info(
             "Embedding function initialized (openai-compat url=%s model=%s)", url, api_model
         )
+        from .worker_observation import selected
+
+        selected(model=model)
         return ef
 
     providers, effective = _resolve_providers(device, model)
     cache_key = (model, tuple(providers))
     cached = _EF_CACHE.get(cache_key)  # lock-free fast path; dict.get is GIL-atomic
     if cached is not None:
+        from .worker_observation import selected
+
+        selected(model=model)
         return cached
     with _EF_CACHE_LOCK:
         cached = _EF_CACHE.get(cache_key)
         if cached is not None:
+            from .worker_observation import selected
+
+            selected(model=model)
             return cached
 
         threads = _resolve_intra_op_threads()
@@ -1415,6 +1455,9 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
         effective,
         providers,
     )
+    from .worker_observation import selected
+
+    selected(model=model)
     return ef
 
 

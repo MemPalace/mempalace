@@ -300,7 +300,7 @@ def _handle(request: dict, palace_path, local: _LocalServer, backend=None):
         except Exception as exc:
             logger.error("Local server could not start: %s", exc)
             return _local_server_error(request, exc)
-        return module.handle_request(request)
+        return module._observed_local_request(request, "proxy_local")
     hub = HubClient.discover(palace_path)
     if hub is not None:
         base_url = hub.base_url
@@ -325,13 +325,13 @@ def _handle(request: dict, palace_path, local: _LocalServer, backend=None):
             if isinstance(exc, urllib.error.HTTPError) or module._request_is_mutating(request):
                 return _proxy_error(request, base_url, exc)
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
-            return _annotate_degraded(module.handle_request(request))
+            return _annotate_degraded(module._observed_local_request(request, "proxy_local"))
     try:
         module = local.load()
     except Exception as exc:
         logger.error("Local server could not start: %s", exc)
         return _local_server_error(request, exc)
-    return _annotate_degraded(module.handle_request(request))
+    return _annotate_degraded(module._observed_local_request(request, "proxy_local"))
 
 
 def _run_proxy_loop(palace_path, backend=None) -> None:
@@ -358,44 +358,53 @@ def _run_proxy_loop(palace_path, backend=None) -> None:
         if not line:
             continue
 
-        payload = None
-        try:
-            request = json.loads(line)
-        except KeyboardInterrupt:
-            break
-        except Exception as exc:
-            # Whatever json.loads rejects, nesting too deep to parse included,
-            # leaves the id unknowable: the answer carries a null one, as the
-            # hub's HTTP transport answers it.
-            logger.error("Server error: %s", exc)
-            payload = dumps_client(_json_rpc_error(None, -32700, "Parse error"))
-        else:
-            try:
-                response = _handle(request, palace_path, local, backend)
-                if response is not None:
-                    payload = dumps_client(response)
-            except KeyboardInterrupt:
-                break
-            except Exception:
-                # The client gets the full server's generic -32603, so the
-                # traceback is the only record of what failed.
-                logger.exception("Server error")
-                req_id = request.get("id") if isinstance(request, dict) else None
-                if req_id is None:
-                    # A notification is owed no response, failure included.
-                    continue
-                payload = dumps_client(_json_rpc_error(req_id, -32603, "Internal error"))
+        from .worker_observation import control_outcome, transport
 
-        if payload is None:
-            continue
-        try:
-            sys.stdout.write(payload + "\n")
-            sys.stdout.flush()
-        except KeyboardInterrupt:
-            break
-        except (BrokenPipeError, OSError) as exc:
-            logger.info("stdout write failed (%s) -- client disconnected, shutting down", exc)
-            break
+        with transport():
+            try:
+                payload = None
+                try:
+                    request = json.loads(line)
+                except KeyboardInterrupt:
+                    break
+                except Exception as exc:
+                    # Whatever json.loads rejects, nesting too deep to parse included,
+                    # leaves the id unknowable: the answer carries a null one, as the
+                    # hub's HTTP transport answers it.
+                    logger.error("Server error: %s", exc)
+                    payload = dumps_client(_json_rpc_error(None, -32700, "Parse error"))
+                else:
+                    try:
+                        response = _handle(request, palace_path, local, backend)
+                        if response is not None:
+                            payload = dumps_client(response)
+                    except KeyboardInterrupt:
+                        break
+                    except Exception:
+                        # The client gets the full server's generic -32603, so the
+                        # traceback is the only record of what failed.
+                        logger.exception("Server error")
+                        req_id = request.get("id") if isinstance(request, dict) else None
+                        if req_id is None:
+                            # A notification is owed no response, failure included.
+                            continue
+                        payload = dumps_client(_json_rpc_error(req_id, -32603, "Internal error"))
+
+                if payload is None:
+                    continue
+                try:
+                    sys.stdout.write(payload + "\n")
+                    sys.stdout.flush()
+                except KeyboardInterrupt:
+                    break
+                except (BrokenPipeError, OSError) as exc:
+                    control_outcome("aborted")
+                    logger.info(
+                        "stdout write failed (%s) -- client disconnected, shutting down", exc
+                    )
+                    break
+            finally:
+                line = payload = request = response = req_id = None
 
 
 def main() -> None:

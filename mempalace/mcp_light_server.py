@@ -125,7 +125,8 @@ def _call_handler_safe(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
         mapped = mcp_server.validate_tool_arguments(name, _alias_args_for_handler(handler, params))
     except mcp_server.ToolArgumentError as e:
         return {"success": False, "error": f"Invalid params for tool {name}: {e}"}
-    return handler(**mapped)
+    with mcp_server._worker_local_scope(name, "light_local"):
+        return handler(**mapped)
 
 
 def _resolve_fuzzy_wing(wing: Optional[str]) -> Optional[str]:
@@ -812,8 +813,9 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         try:
             handler = LIGHT_TOOLS[tool_name]["handler"]
-            with mcp_server._write_stall_watch(underlying_name):
-                result = handler(arguments)
+            with mcp_server._worker_local_scope(underlying_name, "light_local"):
+                with mcp_server._write_stall_watch(underlying_name):
+                    result = handler(arguments)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -1045,14 +1047,21 @@ def main():
         line = line.strip()
         if not line:
             continue
-        payload = mcp_server._stdio_reply(line, dispatch_light_stdio_request)
-        if payload is None:
-            continue
-        try:
-            sys.stdout.write(payload + "\n")
-            sys.stdout.flush()
-        except (BrokenPipeError, OSError):
-            break
+        from .worker_observation import control_outcome, transport
+
+        with transport():
+            try:
+                payload = mcp_server._stdio_reply(line, dispatch_light_stdio_request)
+                if payload is None:
+                    continue
+                try:
+                    sys.stdout.write(payload + "\n")
+                    sys.stdout.flush()
+                except (BrokenPipeError, OSError):
+                    control_outcome("aborted")
+                    break
+            finally:
+                line = payload = None
 
 
 if __name__ == "__main__":

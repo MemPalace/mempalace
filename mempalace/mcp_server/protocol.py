@@ -991,6 +991,7 @@ def call_tool(req_id, params: dict, internal: bool = False):
                 tool_name, TOOLS[tool_name]["handler"](**tool_args)
             )
     except TypeError as e:
+        _observation.control_outcome("raised")
         # Qualname match prevents leaking internal helper/param names raised
         # inside the handler body — see test_handler_internal_signature_shape_stays_generic.
         msg = str(e)
@@ -1014,6 +1015,7 @@ def call_tool(req_id, params: dict, internal: bool = False):
                 ), None
         return _internal_tool_error(req_id, tool_name, e, include_message=internal), None
     except Exception as exc:
+        _observation.control_outcome("raised")
         expose = internal or isinstance(exc, ValueError)
         return _internal_tool_error(req_id, tool_name, exc, include_message=expose), None
 
