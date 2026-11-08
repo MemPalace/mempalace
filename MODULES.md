@@ -846,6 +846,7 @@ Format (read by `commonplace orch docs-check`):
   - Import boundary fixtures use the real Recall authorization dependency while retaining frozen continuity doubles and control-count assertions without holder reads.
   - Imported-history consent: Synthetic reader journeys check unticked consent, unchanged old credentials, bounded shared holders, not-found refusals and source-range proof.
 
+  - `tests/test_commonplace_webhooks.py::test_dispatcher_recovers_from_programming_error` covers recovery and subsequent delivery at each pass stage; `test_dispatcher_closed_control_database_exits_silently` guards silent shutdown.
   - The suite itself under the coverage gate; `tests/test_commonplace_webhooks.py::test_dispatcher_thread_survives_an_unexpected_pass_error` checks that an unexpected delivery-pass error is logged without its private message and the dispatcher retries while staying alive.
 
   - `tests/test_projects_phase_b.py` and `tests/test_projects_admission.py` keep paired pin/head assertions and independent runner-lock coverage.
@@ -1097,7 +1098,7 @@ Format (read by `commonplace orch docs-check`):
 
   - A swallowed emission loses a notification but not the change (the trigger sweep reads `task_events`); webhook delivery retries and records failures.
 
-  - Each unexpected dispatcher-pass exception is contained and logged without its private message, then waits on the stop event for 5 s, doubling after consecutive errors up to 300 s, before continuing.
+  - Non-closure ProgrammingError follows the same recovery path as every other unexpected dispatcher-pass exception: it is contained and logged without its private message, then waits on the stop event for 5 s, doubling after consecutive errors up to 300 s, before continuing.
 
   - A successful pass resets the backoff; stopping interrupts the wait, and a closed database still ends the dispatcher.
 

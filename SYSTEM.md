@@ -624,7 +624,7 @@ playbooks and the original wider orchestration acceptance remain separate work.
 
 - A successful pass resets the backoff; stopping interrupts the wait.
 
-- A closed-database `sqlite3.ProgrammingError` still ends the dispatcher, and exit always removes its event listener.
+- A `sqlite3.ProgrammingError` ends the dispatcher silently only when its ControlDB is closed; otherwise it follows the logged, bounded-backoff recovery path. Exit always removes the event listener.
 
 - This keeps a temporary failure from silently ending background delivery.
 

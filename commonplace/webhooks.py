@@ -836,10 +836,10 @@ class Dispatcher:
                         self._deliver(row)
                         backoff = self.error_backoff
                         continue
-                except sqlite3.ProgrammingError:
-                    # A test or embedding application may close its ControlDB first.
-                    return
                 except Exception as exc:
+                    # A test or embedding application may close its ControlDB first.
+                    if isinstance(exc, sqlite3.ProgrammingError) and self.db._closed:
+                        return
                     # Contain the pass (e.g. a control DB lock held past the busy
                     # timeout); deliveries stay queued and resume after a bounded backoff.
                     log_failure(logger, "webhook dispatcher pass failed", exc)

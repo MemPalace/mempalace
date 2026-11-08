@@ -820,3 +820,73 @@ def test_scoped_owner_can_test_its_own_webhook(live, receiver):
     assert payload["message"].startswith("test wake ") and payload["data"] == {
         "webhook_id": hook["id"]
     }
+
+
+@pytest.mark.parametrize("stage", ["scan_reports", "reconcile", "_due", "_deliver"])
+def test_dispatcher_recovers_from_programming_error(security, monkeypatch, caplog, stage):
+    dispatcher = security.dispatcher
+    event = security_event(security)
+    sent = []
+    waits = []
+    alive = []
+    failed = []
+    original = getattr(dispatcher, stage)
+    deliver = dispatcher._deliver
+
+    def fail_once(*args):
+        if not failed:
+            failed.append(True)
+            raise sqlite3.ProgrammingError("PRIVATE-CANARY invalid binding")
+        return original(*args)
+
+    def retry(delay):
+        waits.append(delay)
+        alive.append(dispatcher.thread.is_alive())
+        return len(waits) > 1  # Bound a broken retry path without waiting on a clock.
+
+    def finish(row):
+        deliver(row)
+        dispatcher._stop.set()
+
+    monkeypatch.setattr(webhooks, "_post", lambda *args: sent.append(args) or 204)
+    monkeypatch.setattr(dispatcher, "_deliver", finish)
+    if stage == "_deliver":
+        original = finish
+    monkeypatch.setattr(dispatcher, stage, fail_once)
+    monkeypatch.setattr(dispatcher._stop, "wait", retry)
+    monkeypatch.setattr(dispatcher._wake, "wait", lambda _: dispatcher._stop.set())
+    dispatcher.thread.start()
+    dispatcher.thread.join()
+
+    assert waits == [dispatcher.error_backoff]
+    assert alive == [True]
+    assert len(sent) == 1
+    assert json.loads(sent[0][1])["seq"] == event["seq"]
+    records = [r for r in caplog.records if r.name == webhooks.logger.name]
+    assert len(records) == 1
+    assert "webhook dispatcher pass failed (ProgrammingError)" in records[0].getMessage()
+    assert "PRIVATE-CANARY" not in caplog.text
+    assert "invalid binding" not in caplog.text
+
+
+def test_dispatcher_closed_control_database_exits_silently(security, monkeypatch, caplog):
+    dispatcher = security.dispatcher
+    waits = []
+    removed = []
+    remove = events.remove_listener
+
+    def finished(listener):
+        removed.append(listener)
+        remove(listener)
+
+    monkeypatch.setattr(events, "remove_listener", finished)
+    monkeypatch.setattr(dispatcher._stop, "wait", lambda delay: waits.append(delay) or True)
+    events.add_listener(dispatcher.on_event)
+    security.db.close()
+    dispatcher.thread.start()
+    dispatcher.thread.join()
+
+    assert not dispatcher.thread.is_alive()
+    assert removed == [dispatcher.on_event]
+    assert waits == []
+    assert not caplog.records
