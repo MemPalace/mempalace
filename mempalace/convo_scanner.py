@@ -27,7 +27,6 @@ from typing import Optional
 
 from mempalace.project_scanner import ProjectInfo
 
-
 MAX_HEADER_LINES = 20  # lines to read per session looking for `cwd`
 
 

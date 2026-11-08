@@ -165,6 +165,7 @@ def _serve_nothing(monkeypatch, served):
 
 def test_main_applies_its_own_flags_before_serving(monkeypatch, tmp_path):
     from _mcp_server_helpers import _keep_server_command_line_state
+
     from mempalace import mcp_server
 
     _keep_server_command_line_state(monkeypatch)
@@ -209,6 +210,7 @@ def test_main_backend_flag_sets_the_stale_library_watch_list(
     for a server that does not store in it refuses that server's writes after an
     upgrade of chromadb alone."""
     from _mcp_server_helpers import _keep_server_command_line_state
+
     from mempalace import mcp_server
     from mempalace.config import MempalaceConfig
 
@@ -233,6 +235,7 @@ def test_main_backend_flag_sets_the_stale_library_watch_list(
 
 def test_main_refuses_an_unknown_backend_flag_before_serving(monkeypatch):
     from _mcp_server_helpers import _keep_server_command_line_state
+
     from mempalace import mcp_server
     from mempalace.backends.registry import BackendUnavailableError
 
@@ -282,6 +285,7 @@ def test_flags_without_a_backend_leave_the_stale_library_baseline_alone(monkeypa
     Re-reading the baseline then would take whatever is installed by that time
     as the code being served, which is how the gate would miss an upgrade."""
     from _mcp_server_helpers import _keep_server_command_line_state
+
     from mempalace import mcp_server
 
     _keep_server_command_line_state(monkeypatch)

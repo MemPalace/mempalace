@@ -964,8 +964,8 @@ class TestLogstreamWatch:
     def test_unreadable_state_file_replays_instead_of_skipping(self, palace_path, tmp_path, capsys):
         """A failed cursor read must not be treated as a first run.
 
-        read_watch_cursor returns None for both "no state file yet" and
-        "state file exists but is corrupt". Jumping to the tip on the second
+        A cursor of None means either "no state file yet" or "state file
+        exists but is corrupt". Jumping to the tip on the second
         silently skips everything since the last good checkpoint, and the
         next checkpoint makes that loss permanent — the opposite of the
         documented "a corrupt state file costs a replay".

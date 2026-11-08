@@ -42,6 +42,9 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 
+from . import _net
+from ._env import env_float, env_str
+
 PEERS_FILENAME = "peers.json"
 
 _HTTP_TIMEOUT_S = 30
@@ -60,10 +63,7 @@ def _http_timeout_s() -> float:
     production: a 31k-drawer bootstrap timing out at offset 27500). Set
     MEMPALACE_SYNC_HTTP_TIMEOUT to raise it for bootstrap pulls.
     """
-    try:
-        return float(os.environ.get("MEMPALACE_SYNC_HTTP_TIMEOUT", "") or _HTTP_TIMEOUT_S)
-    except ValueError:
-        return float(_HTTP_TIMEOUT_S)
+    return env_float("MEMPALACE_SYNC_HTTP_TIMEOUT", float(_HTTP_TIMEOUT_S))
 
 
 def load_peers(palace_path: str) -> list[dict]:
@@ -97,7 +97,8 @@ def http_request(base_url: str, token: str, path: str, params: dict = None) -> d
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(request, timeout=_http_timeout_s()) as response:
+        # Never follows a redirect: the bearer token would travel with it.
+        with _net.urlopen(request, timeout=_http_timeout_s()) as response:
             return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         raise TransportError(f"{url}: {exc}") from None
@@ -158,7 +159,7 @@ def get_transport(palace_path: str) -> Transport:
     a user who asked for mesh-identity auth must never unknowingly
     run on the token model.
     """
-    selected = (os.environ.get("MEMPALACE_TRANSPORT") or "https").strip().lower()
+    selected = env_str("MEMPALACE_TRANSPORT", "https").lower()
     if selected == "https":
         return HttpsBearerTransport(palace_path)
     if selected == "meshguard":

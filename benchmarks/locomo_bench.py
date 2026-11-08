@@ -10,7 +10,9 @@ For each conversation:
 1. Ingest all sessions into a fresh MemPal palace
 2. For each QA pair, query the palace
 3. Score retrieval recall (did we find the evidence dialog?)
-4. Score F1 (optional, if --llm is provided)
+
+On LoCoMo, --llm-rerank only reorders the selected results. Retrieval recall
+checks which evidence IDs are present, so changing their order cannot change it.
 
 Usage:
     python benchmarks/locomo_bench.py /path/to/locomo/data/locomo10.json
@@ -464,6 +466,7 @@ def llm_rerank_locomo(
     """
     Ask LLM to pick the single most relevant document for this question.
     Returns reordered retrieved_ids with the best candidate first.
+    The retrieved ID set is unchanged, so this cannot change retrieval recall.
 
     Supports backend="anthropic" (default) or "ollama" (OpenAI-compat endpoint).
     """
@@ -930,7 +933,7 @@ def run_benchmark(
 
 
 def compute_retrieval_recall(retrieved_ids, evidence_ids):
-    """What fraction of evidence dialog IDs were retrieved?"""
+    """Fraction of evidence IDs retrieved, independent of result order."""
     if not evidence_ids:
         return 1.0
     found = sum(1 for eid in evidence_ids if eid in retrieved_ids)
@@ -980,7 +983,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--limit", type=int, default=0, help="Limit to N conversations")
     parser.add_argument("--out", default=None, help="Output JSON file path")
-    parser.add_argument("--llm-rerank", action="store_true", help="Use LLM to rerank top results")
+    parser.add_argument(
+        "--llm-rerank",
+        action="store_true",
+        help="Use an LLM to reorder the already-selected results (ordering only; "
+        "does not change Avg Recall, which ignores result order)",
+    )
     parser.add_argument(
         "--llm-model",
         default="claude-sonnet-4-6",

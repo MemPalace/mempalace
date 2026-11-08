@@ -27,7 +27,6 @@ from mempalace.corpus_origin import (
     detect_origin_llm,
 )
 
-
 # ── Tier 1: heuristic (no LLM) ────────────────────────────────────────────
 
 

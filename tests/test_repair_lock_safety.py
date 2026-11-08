@@ -101,3 +101,34 @@ def test_rebuild_refuses_when_lock_held_leaves_palace_untouched(tmp_path, monkey
     finally:
         open(release, "w").close()
         holder.join(timeout=5)
+
+
+def test_max_seq_id_repair_refuses_while_another_process_holds_the_palace(tmp_path, monkeypatch):
+    """Another process holding the palace lease makes the max-seq repair stop clean."""
+    import sqlite3
+    from contextlib import closing
+
+    from test_repair import _max_seq_rows, _seed_poisoned_max_seq_id
+
+    from mempalace.repair import repair_max_seq_id
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+    before = _max_seq_rows(palace)
+
+    ready = str(tmp_path / "ready")
+    release = str(tmp_path / "release")
+    holder = _get_mp_context().Process(target=_hold_lock, args=(palace, ready, release))
+    holder.start()
+    try:
+        assert _wait_for(ready), "holder failed to acquire the palace lock"
+        result = repair_max_seq_id(palace, assume_yes=True)
+    finally:
+        open(release, "w").close()
+        holder.join(timeout=5)
+
+    assert result["reason"] == "writer-active"
+    assert _max_seq_rows(palace) == before
+    with closing(sqlite3.connect(os.path.join(palace, "chroma.sqlite3"))) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone() == ("ok",)

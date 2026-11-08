@@ -12,6 +12,12 @@ on:
       - '.codex-plugin/plugin.json'
       - '.dsh-plugin/package.json'
       - 'integrations/openclaw/SKILL.md'
+      - 'README.md'
+      - 'uv.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/check_versions.py'
+      - 'tests/test_version_guard.py'
       - '.github/workflows/version-guard.yml'
 
 jobs:
@@ -20,69 +26,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Extract versions from all sources
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify versions from all sources
         id: versions
         run: |
-          set -euo pipefail
-          py_version=$(grep -E '^__version__' mempalace/version.py | cut -d'"' -f2)
-          pyproject_version=$(grep -E '^version' pyproject.toml | head -1 | cut -d'"' -f2)
-          marketplace_version=$(jq -r '.plugins[0].version' .claude-plugin/marketplace.json)
-          plugin_version=$(jq -r '.version' .claude-plugin/plugin.json)
-          codex_version=$(jq -r '.version' .codex-plugin/plugin.json)
-          dsh_version=$(jq -r '.version' .dsh-plugin/package.json)
-          openclaw_version=$(grep -E '^version:' integrations/openclaw/SKILL.md | cut -d' ' -f2)
-
-          {
-            echo "py_version=$py_version"
-            echo "pyproject_version=$pyproject_version"
-            echo "marketplace_version=$marketplace_version"
-            echo "plugin_version=$plugin_version"
-            echo "codex_version=$codex_version"
-            echo "dsh_version=$dsh_version"
-            echo "openclaw_version=$openclaw_version"
-          } >> "$GITHUB_OUTPUT"
-
-          {
-            echo "## Detected versions"
-            echo ""
-            echo "| Source | Version |"
-            echo "| --- | --- |"
-            echo "| mempalace/version.py | \`$py_version\` |"
-            echo "| pyproject.toml | \`$pyproject_version\` |"
-            echo "| .claude-plugin/marketplace.json | \`$marketplace_version\` |"
-            echo "| .claude-plugin/plugin.json | \`$plugin_version\` |"
-            echo "| .codex-plugin/plugin.json | \`$codex_version\` |"
-            echo "| .dsh-plugin/package.json | \`$dsh_version\` |"
-            echo "| integrations/openclaw/SKILL.md | \`$openclaw_version\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Verify all sources agree
-        env:
-          PY: ${{ steps.versions.outputs.py_version }}
-          PYPROJECT: ${{ steps.versions.outputs.pyproject_version }}
-          MARKETPLACE: ${{ steps.versions.outputs.marketplace_version }}
-          PLUGIN: ${{ steps.versions.outputs.plugin_version }}
-          CODEX: ${{ steps.versions.outputs.codex_version }}
-          DSH: ${{ steps.versions.outputs.dsh_version }}
-          OPENCLAW: ${{ steps.versions.outputs.openclaw_version }}
-        run: |
-          set -euo pipefail
-          fail=0
-          check() {
-            local name="$1" value="$2" expected="$3"
-            if [[ "$value" != "$expected" ]]; then
-              echo "::error file=$name::version mismatch — expected $expected, got $value"
-              fail=1
-            fi
-          }
-          # All seven must agree with each other (use version.py as the reference, per CLAUDE.md)
-          check "pyproject.toml" "$PYPROJECT" "$PY"
-          check ".claude-plugin/marketplace.json" "$MARKETPLACE" "$PY"
-          check ".claude-plugin/plugin.json" "$PLUGIN" "$PY"
-          check ".codex-plugin/plugin.json" "$CODEX" "$PY"
-          check ".dsh-plugin/package.json" "$DSH" "$PY"
-          check "integrations/openclaw/SKILL.md" "$OPENCLAW" "$PY"
-          exit $fail
+          python scripts/check_versions.py \
+            --github-output "$GITHUB_OUTPUT" \
+            --github-summary "$GITHUB_STEP_SUMMARY"
 
       - name: Verify tag matches manifest (tag pushes only)
         if: startsWith(github.ref, 'refs/tags/v')

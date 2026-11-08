@@ -301,12 +301,13 @@ def _logstream_watch(ls, args, as_json):
         return min(args.poll_timeout_ms, remaining_ms)
 
     try:
-        for matched, cursor in ls.watch_events(
+        for matched, latest in ls.watch_events(
             cursor=cursor,
             poll_timeout_ms=_poll_timeout_ms,
             limit=args.limit,
             **spec,
         ):
+            cursor = latest
             if matched:
                 matched_any = True
                 if idle_s:

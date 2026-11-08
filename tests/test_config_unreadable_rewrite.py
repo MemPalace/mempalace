@@ -265,10 +265,10 @@ def test_the_rename_is_made_durable(tmp_path, monkeypatch):
     """The rename's own durability needs the parent directory synced, which is
     what ``EntityRegistry.save`` does and explains. Nothing observable comes
     out of an fsync, so this asserts the call rather than its effect."""
-    import mempalace.config as config_module
+    from mempalace import fsio
 
     synced = []
-    monkeypatch.setattr(config_module, "_fsync_directory", lambda d: synced.append(str(d)))
+    monkeypatch.setattr(fsio, "fsync_directory", lambda d: synced.append(str(d)))
 
     MempalaceConfig(config_dir=str(tmp_path)).set_backend("qdrant")
 
@@ -396,9 +396,8 @@ def test_an_orphan_at_the_temporary_name_does_not_cost_the_rename(tmp_path, caps
 
 @needs_unprivileged_posix
 def test_a_reusable_orphan_does_not_widen_the_config(tmp_path):
-    """The pid-named file can be one this process left behind itself, with
-    whatever mode it had. ``O_CREAT`` on an existing name does not touch the
-    mode, so without the explicit ``chmod`` the config inherits it."""
+    """A file at the old pid-named temp name, whatever its mode, is never
+    reused: the publish creates its own file, so the config comes out 0600."""
     _config_file(tmp_path).write_text(json.dumps(REAL))
     orphan = tmp_path / f"config.json.tmp-{os.getpid()}"
     orphan.write_text("left behind")
@@ -413,7 +412,7 @@ def test_the_temporary_file_is_synced(tmp_path, monkeypatch):
     """The rename publishes whatever the temporary file holds. Syncing the
     directory makes the rename survive a crash; syncing the file is what makes
     the bytes it publishes survive one."""
-    from mempalace import config as config_mod
+    from mempalace import fsio
 
     _config_file(tmp_path).write_text(json.dumps(REAL))
     real_fsync = os.fsync
@@ -424,7 +423,7 @@ def test_the_temporary_file_is_synced(tmp_path, monkeypatch):
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", record)
-    monkeypatch.setattr(config_mod, "_fsync_directory", lambda d: None)
+    monkeypatch.setattr(fsio, "fsync_directory", lambda d: None)
 
     MempalaceConfig(config_dir=str(tmp_path)).set_backend("qdrant")
 
@@ -452,34 +451,9 @@ def test_a_hard_link_at_the_temporary_name_is_not_written_through(tmp_path, caps
 
 
 @needs_unprivileged_posix
-def test_a_temporary_file_the_fallback_cannot_remove_is_named(tmp_path, capsys):
-    """Removing it needs the directory, which is what refused the rename. It
-    holds what the call was asked to save, so leaving the user to find it is
-    worse than saying where it is."""
-    _config_file(tmp_path).write_text(json.dumps(REAL))
-    orphan = tmp_path / f"config.json.tmp-{os.getpid()}"
-    orphan.write_text("half a config from a run that was killed")
-    os.chmod(orphan, 0o600)
-    os.chmod(tmp_path, 0o555)
-    try:
-        MempalaceConfig(config_dir=str(tmp_path)).set_backend("qdrant")
-        err = capsys.readouterr().err
-    finally:
-        os.chmod(tmp_path, 0o700)
-
-    assert orphan.exists(), "the fallback could not have removed it here"
-    assert orphan.name in err
-    assert "could not be removed" in err
-    assert json.loads(_config_file(tmp_path).read_text())["backend"] == "qdrant"
-
-
-@needs_unprivileged_posix
 def test_a_read_only_directory_with_a_usable_orphan_still_saves(tmp_path, capsys):
-    """Opening a temporary file that already exists needs the file, not the
-    directory, so a run that reuses an orphan at the pid name never asks the
-    directory anything and reaches the rename, where a read-only directory
-    refuses. ``develop`` wrote the config in place there and saved the setting;
-    raising instead would lose it."""
+    """A read-only directory takes no new temporary file, orphan or not, so
+    the setting is written in place rather than lost."""
     _config_file(tmp_path).write_text(json.dumps(REAL))
     orphan = tmp_path / f"config.json.tmp-{os.getpid()}"
     orphan.write_text("half a config from a run that was killed")
@@ -510,13 +484,13 @@ def test_a_failed_write_in_place_keeps_the_finished_copy(tmp_path, monkeypatch, 
             raise OSError(errno.EPERM, "Operation not permitted")
         return real_replace(src, dst, *args, **kwargs)
 
-    def dies(path, payload):
+    def dies(path, write_body, **kwargs):
         raise OSError(errno.EIO, "Input/output error")
 
     monkeypatch.setattr(os, "replace", refused)
-    from mempalace import config as config_mod
+    from mempalace import fsio
 
-    monkeypatch.setattr(config_mod, "_write_json_in_place", dies)
+    monkeypatch.setattr(fsio, "write_in_place", dies)
 
     # The setter reports rather than raising, which is what `cli.py` relies on.
     cfg.set_backend("qdrant")
@@ -659,7 +633,7 @@ def test_the_symlink_probe_raises_when_it_cannot_tell(tmp_path):
     put a regular file where the link was. Nothing reaches it that way through
     a setter, since a config this process cannot ``lstat`` fails its read first
     and the setter declines before writing, so this calls the probe itself."""
-    from mempalace.config import _write_target
+    from mempalace.fsio import write_target
 
     locked = tmp_path / "locked"
     locked.mkdir()
@@ -667,7 +641,7 @@ def test_the_symlink_probe_raises_when_it_cannot_tell(tmp_path):
     os.chmod(locked, 0o000)
     try:
         with pytest.raises(OSError) as caught:
-            _write_target(target)
+            write_target(target)
     finally:
         os.chmod(locked, 0o700)
 
@@ -684,8 +658,7 @@ def test_the_umask_does_not_leave_the_temporary_file_unwritable(tmp_path, monkey
     real_fsync = os.fsync
 
     def record(fd):
-        candidate = tmp_path / f"config.json.tmp-{os.getpid()}"
-        if candidate.exists():
+        for candidate in tmp_path.glob(".config.json.*.tmp"):
             seen["mode"] = stat.S_IMODE(os.stat(candidate).st_mode)
         return real_fsync(fd)
 
