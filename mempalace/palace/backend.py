@@ -101,6 +101,8 @@ def _backend_artifact_label(backend_name: Optional[str]) -> str:
         return "pgvector_backend.json"
     if backend_name in {"sqlite_exact", "rust_exact"}:
         return "sqlite_exact.sqlite3"
+    if backend_name == "sqlite_vec":
+        return "sqlite_vec.sqlite3"
     return "backend database"
 
 
