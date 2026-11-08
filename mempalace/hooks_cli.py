@@ -1097,26 +1097,53 @@ def _diary_write_locked(tool_diary_write, **kwargs) -> dict:
     return result if isinstance(result, dict) else {}
 
 
-def _apply_diary_checkpoint(payload: dict) -> bool:
-    """File the checkpoint and write its ack. Only the child imports mcp_server."""
+def _diary_write_in_process(arguments: dict) -> dict:
+    """File a diary entry in this process, waiting out a briefly held lock."""
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .mcp_server import tool_diary_write
 
-    entry = payload.get("entry")
-    if not isinstance(entry, str) or not entry:
-        return False
     for delay in _DIARY_LOCK_RETRY_DELAYS + (None,):
-        result = _diary_write_locked(
-            tool_diary_write,
-            agent_name=str(payload.get("agent_name") or "claude"),
-            entry=entry,
-            topic=str(payload.get("topic") or "checkpoint"),
-            wing=str(payload.get("wing") or ""),
-        )
+        result = _diary_write_locked(tool_diary_write, **arguments)
         if result.get("success") or result.get("error_class") != LOCK_REFUSAL_ERROR_CLASS:
             break
         if delay is not None:
             time.sleep(delay)
+    return result
+
+
+def _apply_diary_checkpoint(payload: dict) -> bool:
+    """File the checkpoint and write its ack.
+
+    A running ``mempalace serve`` hub holds the palace writer lease for its
+    whole lifetime, so an in-process write would be refused for as long as it
+    runs. The entry therefore goes to the hub when a writable one is serving
+    this palace, the same way the hook's transcript mine is forwarded, and is
+    written here only when none answers. Only that fallback imports mcp_server.
+    """
+    from .hub_client import forward_tool_call
+
+    entry = payload.get("entry")
+    if not isinstance(entry, str) or not entry:
+        return False
+    arguments = {
+        "agent_name": str(payload.get("agent_name") or "claude"),
+        "entry": entry,
+        "topic": str(payload.get("topic") or "checkpoint"),
+        "wing": str(payload.get("wing") or ""),
+    }
+    handled, result = forward_tool_call(
+        MempalaceConfig().palace_path, "mempalace_diary_write", arguments
+    )
+    if handled and result is None:
+        # The hub took the request but gave no readable answer. The entry may
+        # already be filed, so it is not written again here; the save marker
+        # stays put and the next Stop files a fresh checkpoint.
+        _log("Diary checkpoint sent to the palace hub, which did not report back")
+        return False
+    if handled:
+        _log("Diary checkpoint forwarded to the palace hub")
+    else:
+        result = _diary_write_in_process(arguments)
     if not result.get("success"):
         # The save marker stays put, so the next Stop files a fresh checkpoint.
         _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")

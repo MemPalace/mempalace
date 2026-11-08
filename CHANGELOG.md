@@ -17,6 +17,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Stop and PreCompact diary checkpoints are filed through a running
+  `mempalace serve` hub. The hub holds the palace writer lease for its whole
+  lifetime, so the checkpoint's own write was refused for as long as a hub
+  ran, the save marker never advanced, and every later Stop re-mined the whole
+  transcript. The checkpoint now goes to the hub's `mempalace_diary_write`, the
+  same way the hook's transcript mine is forwarded, and is written in-process
+  only when no writable hub answers. A hub that took the request but gave no
+  readable answer may already have filed it, so the entry is not written a
+  second time.
 - A torn `index_metadata.pickle` read no longer quarantines a live HNSW
   segment. When a metadata load fails with an error outside the
   known-transient set, the guard now re-checks the file up to six times
