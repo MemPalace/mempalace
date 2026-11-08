@@ -41,6 +41,9 @@ Format (read by `commonplace orch docs-check`):
   - Documents citation omission and backend proof limits separately from fact eligibility.
 
   - Records current typed citation proof and raw path authorization before display conversion.
+  - Tunnel concurrency and computed imported-drawer qualifications are documented separately from stored-association proof.
+
+  - Explicit tunnel read proof documents current drawer associations and proof before preview hydration or traversal recording.
 
   - Documents field-specific citation length errors, atomic whole-write refusal, surface-specific citation exceptions and informational performance measurements.
 
@@ -289,6 +292,10 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Tunnel keysets use stable ids; final lookup ignores traversal statistics and unrelated metadata while rechecking current endpoint associations.
+
+  - Explicit tunnel probes page metadata without content, bind both endpoints and optional current drawer descriptors, and revalidate before follow hydration or recording.
+
   - Scoped wing and taxonomy counts use bounded metadata-only identity pages, normalize absent/null/question-mark loci to unknown, exclude bookkeeping, and revalidate concrete descriptors in fresh snapshots. Local unscoped readers retain their conventions.
   - Exact non-Chroma physical citation ids remain supported without document hydration.
 
@@ -345,6 +352,9 @@ Format (read by `commonplace orch docs-check`):
   - Citation failure cases compare complete surviving facts with readable controls.
 
   - Typed citation fixtures use native stored threads and real public reads, with metadata and Recall spies.
+  - Tunnel concurrency witnesses, effective hydration spies and four authorization mutants cover the explicit-read contract alongside retained mirror and import suites.
+
+  - Explicit tunnel regression witnesses and private protocol tests cover moved drawers, room-only compatibility, bounded pages and authorization races.
 
   - Default provenance regressions assert zero candidate work above either cap and accurate write errors with unchanged verbatim storage. Cap-sized and 1 MiB scan measurements run separately under `timing`, reporting resource budgets without gating on them.
 
@@ -523,6 +533,7 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Private association requests carry the authenticated workspace and are unavailable as public operations.
+  - Authenticated explicit tunnel reads use request-local endpoint and drawer proof for owners and connections without altering mutation authorization.
 
   - KG provenance writes report the offending field and citation character limit before storage; hidden-reference refusals keep their existing replies and refused writes leave existing facts untouched.
 
@@ -869,6 +880,9 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Outgoing typed citations require current wing and thread authority plus snapshot revalidation; raw source_file tokens are authorized before basename display.
+  - Tunnel projection validates names before acquisition, pages by identity and preserves live readable associations across non-association updates.
+
+  - Tunnel visibility combines wing policy with the workspace reader, renews authority after probing, and discards incomplete proof.
 
   - A dedicated strict Recall callback propagates owner-progress lookup faults; extraction retains the ordinary deny-on-fault callback.
 

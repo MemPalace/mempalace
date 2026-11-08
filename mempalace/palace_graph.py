@@ -928,7 +928,9 @@ def record_tunnel_traversal(tunnel_ids, config=None) -> int:
     return touched
 
 
-def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = True):
+def follow_tunnels(
+    wing: str, room: str, col=None, config=None, record: bool = True, *, tunnels=None
+):
     """Follow explicit tunnels from a room — returns connected drawers.
 
     Given a location (wing/room), finds all tunnels leading from or to it,
@@ -943,7 +945,7 @@ def follow_tunnels(wing: str, room: str, col=None, config=None, record: bool = T
     # mempalace.yaml slug (underscore) and an explicit ``--wing`` slug
     # (verbatim) both resolve through the same comparison.
     norm_wing = _normalize_wing(wing) or wing
-    tunnels = _load_tunnels(config)
+    tunnels = _load_tunnels(config) if tunnels is None else tunnels
     connections = []
 
     for t in tunnels:

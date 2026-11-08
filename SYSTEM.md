@@ -1178,3 +1178,38 @@ contracts.
   it does not turn the whole map into an error or remove readable fact text.
 - Hidden and absent targets have the same public map. Citation proof still uses
   current thread authority; stored facts and citations are never rewritten.
+### Explicit tunnel read proof
+
+Authenticated list_tunnels and follow_tunnels require both stored endpoint pairs
+and every optional drawer's current metadata association to pass wing policy and
+the existing reader in the authenticated workspace, including for owners. A
+readable endpoint hint cannot authorize a moved drawer. Missing, malformed or
+unresolved optional drawers drop the entire tunnel; room-only readable tunnels
+remain eligible. Local unscoped calls keep their behavior.
+
+Private probes page at most 250 tunnels and resolve at most 500 drawer metadata
+rows per batch without loading document columns or calling get_drawers. Concrete
+allow descriptors are request-local. The final read rechecks stored endpoints
+and metadata descriptors, excluding changed or newly arrived associations before
+follow previews or traversal recording. Reader authority is refreshed after
+probing. Incomplete acquisition, malformed protocol responses and deadline errors
+produce an empty public list without private markers. Read-only follow retains
+record=False behavior; create/delete authorization and delete snapshot checks
+are unchanged. Passive graph traversal and graph statistics remain separate work.
+
+
+### Explicit tunnel concurrency and import qualification
+
+- Tunnel probes use identity keysets from one file read per worker call. Deleting
+  an earlier id cannot shift later pages. Final identity lookup compares only the
+  id and endpoint wing/room/drawer associations and returns the current row, so
+  traversal potentiation and unrelated drawer metadata updates remain visible.
+- Missing or changed associations still fail closed before preview hydration or
+  traversal recording. Probe and allow batches remain bounded and request-local.
+  Invalid name arguments retain the ordinary validation error envelope.
+- Computed `imported:` drawers have no stored metadata association and are excluded
+  from explicit tunnels even when the existing import reader proves their consent
+  and source range. Ordinary imported-history read APIs retain their range rules.
+- The read-only server seam used by the regression witness passes `record=False`;
+  the public follow schema does not expose that argument. Tunnel label reference
+  handling predates this change and remains follow-up work for graph traversal.

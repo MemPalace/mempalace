@@ -879,3 +879,40 @@ def test_r08_listing_refusal(journey):
         assert status == 404
         assert json.loads(raw) == {"error": "not found"}
     assert j.request("/api/imports")[0] == 401
+
+
+def test_virtual_tunnel_drawer_requires_stored_association(live, functional_worker_transport):
+    """A proved imported view is virtual; explicit tunnels require stored metadata."""
+    from mempalace import mcp_server as mcp, palace_graph as graph
+
+    j = live
+    reader = mint(j)["token"]
+    writer = j.pat()["token"]
+    own = upload_native(j, writer, session_line("zqvirtualtunnel"))
+    p = principal(j, reader)
+    recall = j.client.gateway.handoff.recall
+    assert recall.import_reader(p)
+    virtuals = recall.import_candidates(p, "zqvirtualtunnel", limit=5)
+    assert virtuals and virtuals[0]["drawer_id"].startswith("imported:")
+    virtual = virtuals[0]
+    assert recall.import_drawer(p, virtual["drawer_id"])["content"] == virtual["content"]
+    owner = sessions.person_principal(j.client.db, j.owner.user, j.owner.workspace)
+    assert owner.person and owner.role == "owner" and recall.can_read(owner, own.id)
+    row = {
+        "id": "virtual-tunnel",
+        "source": {"wing": "shared", "room": "ordinary"},
+        "target": {
+            "wing": virtual["wing"],
+            "room": virtual["room"],
+            "drawer_id": virtual["drawer_id"],
+        },
+    }
+    graph._save_tunnels([row], mcp._config)
+    assert graph._load_tunnels(mcp._config) == [row]
+    assert j.client.gateway.call_memory_tool(owner, "mempalace_list_tunnels", {}) == []
+    assert (
+        j.client.gateway.call_memory_tool(
+            owner, "mempalace_follow_tunnels", {"wing": "shared", "room": "ordinary"}
+        )
+        == []
+    )

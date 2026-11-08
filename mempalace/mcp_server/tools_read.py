@@ -1066,13 +1066,23 @@ def tool_create_tunnel(
         return {"error": str(e)}
 
 
-def tool_list_tunnels(wing: str = None):
+def tool_list_tunnels(wing: str = None, thread_scope: dict = None):
     """List all explicit cross-wing tunnels, optionally filtered by wing."""
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    return list_tunnels(wing)
+    rows = list_tunnels(wing)
+    if thread_scope is not None:
+        from ..tunnel_scope import scoped_tunnels
+
+        try:
+            return scoped_tunnels(
+                thread_scope, rows, _config, _selected_backend_name(), _get_collection
+            )
+        except Exception:
+            return []
+    return rows
 
 
 def tool_delete_tunnel(tunnel_id: str, thread_scope: dict = None):
@@ -1131,7 +1141,7 @@ def tool_delete_hallway(hallway_id: str, thread_scope: dict = None):
     return {"deleted": delete_hallway(hallway_id, allow=None if scope is None else scope["pairs"])}
 
 
-def tool_follow_tunnels(wing: str, room: str, record: bool = True):
+def tool_follow_tunnels(wing: str, room: str, record: bool = True, thread_scope: dict = None):
     """Follow explicit tunnels from a room to see connected drawers in other wings.
 
     An agent calling this tool is crossing the tunnel, so the traversal is
@@ -1149,4 +1159,15 @@ def tool_follow_tunnels(wing: str, room: str, record: bool = True):
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    return follow_tunnels(wing, room, col=col, record=bool(record) and not _READ_ONLY)
+    rows = None
+    if thread_scope is not None:
+        rows = tool_list_tunnels(thread_scope=thread_scope)
+        if not isinstance(rows, list) or not rows:
+            return []
+    return follow_tunnels(
+        wing,
+        room,
+        col=col,
+        record=bool(record) and not _READ_ONLY,
+        **({"tunnels": rows} if thread_scope is not None else {}),
+    )

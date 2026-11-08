@@ -415,6 +415,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "wing": {
                     "type": "string",
                     "description": "Filter tunnels by wing (shows tunnels where wing is source or target)",
@@ -476,6 +477,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "wing": {"type": "string", "description": "Wing to start from"},
                 "room": {"type": "string", "description": "Room to follow tunnels from"},
             },
