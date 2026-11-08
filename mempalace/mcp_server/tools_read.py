@@ -465,7 +465,75 @@ Read AAAK naturally — expand codes mentally, treat *markers* as emotional cont
 When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 
 
-def tool_list_wings():
+def _scoped_taxonomy(scope, *, wings=False):
+    """Private complete-page acquisition or concrete-descriptor revalidation."""
+    from ..read_scope import descriptor, metadata_page, valid_descriptors
+
+    key = "wings" if wings else "taxonomy"
+    empty = {key: {}}
+    try:
+        if not isinstance(scope, dict):
+            return empty
+        probe = scope.get("probe") is True
+        expected_keys = {"probe", "after", "timeout"} if probe else {"allow", "timeout"}
+        if set(scope) != expected_keys or (wings and probe):
+            return empty
+        if not probe and not valid_descriptors(scope["allow"]):
+            return empty
+        if not probe and not scope["allow"]:
+            return empty
+        # Keep indexed pair acquisition and the legacy fallback seams. These
+        # raw maps are advisory only; identities determine every scoped sum.
+        first_page = probe and scope["after"] is None
+        fast = _sqlite_taxonomy() if first_page else None
+        fallback = False
+        if first_page and fast is None:
+            col = _get_collection()
+            if col is None:
+                return empty
+            try:
+                if not _supports_metadata_facets(col):
+                    raise ValueError("facets unavailable")
+                wing_counts = col.facet_counts("wing", limit=500)
+                for wing in wing_counts:
+                    col.facet_counts("room", where={"wing": wing}, limit=500)
+            except Exception:
+                fallback = True
+        rows, cursor = metadata_page(
+            _config,
+            _selected_backend_name(),
+            _get_collection,
+            after=scope.get("after"),
+            ids=None if probe else [r["id"] for r in scope["allow"]],
+            timeout=scope["timeout"],
+        )
+        if fallback:
+            # Never publish a partial tally, even when a backend fails midway.
+            _tally_wings_rooms([dict(meta) for _, meta in rows], taxonomy={})
+        descriptors = [
+            d for drawer_id, meta in rows if (d := descriptor(drawer_id, meta)) is not None
+        ]
+        if not valid_descriptors(descriptors):
+            return empty
+        if not probe:
+            allowed = {r["id"]: r for r in scope["allow"]}
+            descriptors = [d for d in descriptors if allowed.get(d["id"]) == d]
+        taxonomy = {}
+        for row in descriptors:
+            rooms = taxonomy.setdefault(row["wing"], {})
+            rooms[row["room"]] = rooms.get(row["room"], 0) + 1
+        if probe:
+            return {"taxonomy": taxonomy, "probe": {"rows": descriptors, "next": cursor}}
+        if wings:
+            return {"wings": {w: sum(rooms.values()) for w, rooms in taxonomy.items()}}
+        return {"taxonomy": taxonomy}
+    except Exception:
+        return empty
+
+
+def tool_list_wings(thread_scope: dict = None):
+    if thread_scope is not None:
+        return _scoped_taxonomy(thread_scope, wings=True)
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
@@ -560,7 +628,9 @@ def tool_list_rooms(wing: str = None):
     return result
 
 
-def tool_get_taxonomy():
+def tool_get_taxonomy(thread_scope: dict = None):
+    if thread_scope is not None:
+        return _scoped_taxonomy(thread_scope)
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast

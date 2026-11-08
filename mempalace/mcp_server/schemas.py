@@ -13,7 +13,12 @@ TOOLS = {
     },
     "mempalace_list_wings": {
         "description": "List all wings with drawer counts",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"}
+            },
+        },
         "handler": tool_list_wings,
     },
     "mempalace_list_rooms": {
@@ -28,7 +33,12 @@ TOOLS = {
     },
     "mempalace_get_taxonomy": {
         "description": "Full taxonomy: wing → room → drawer count",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"}
+            },
+        },
         "handler": tool_get_taxonomy,
     },
     "mempalace_get_aaak_spec": {

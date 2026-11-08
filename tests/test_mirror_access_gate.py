@@ -585,13 +585,17 @@ def test_hidden_related_fact_keeps_committed_result(world):
     assert "hidden old words" not in str(cleaned)
 
 
-def test_fact_search_is_gated_before_cli_rendering(world):
+def test_fact_search_is_gated_before_cli_rendering(world, monkeypatch):
     from commonplace.gateway import Mediator, _tool_response, _tool_result
 
     world.private.readable.return_value = False
     principal = replace(
         world.principal,
         policy=replace(world.principal.policy, scopes=(*world.principal.policy.scopes, "kg:read")),
+    )
+    monkeypatch.setattr(
+        "commonplace.handoff.overview.project",
+        lambda *args: {"wings": {"shared": 1, "private_threads": 1}},
     )
     workers = Mock(
         post=Mock(return_value=_tool_response(1, {"results": [], "cli_output": "No drawers"}))
@@ -609,7 +613,6 @@ def test_fact_search_is_gated_before_cli_rendering(world):
     }
     workers.call_tool.side_effect = [
         facts,
-        {"wings": {"shared": 1, "private_threads": 1}},
         {"results": [], "cli_output": "No drawers"},
     ]
     mediator = Mediator(Mock(), workers)
@@ -808,13 +811,16 @@ def test_committed_fact_result_and_audit_survive_hidden_echo(world):
 
 
 @pytest.mark.parametrize("wing", [None, "private_threads"])
-def test_owner_cli_search_also_excludes_mirrors(world, wing):
+def test_owner_cli_search_also_excludes_mirrors(world, wing, monkeypatch):
     from commonplace.gateway import Mediator
 
     world.principal = replace(world.principal, role="owner")
+    monkeypatch.setattr(
+        "commonplace.handoff.overview.project",
+        lambda *args: {"wings": {"shared": 1, "private_threads": 1}},
+    )
     workers = Mock()
     workers.call_tool.side_effect = [
-        {"wings": {"private_threads": 1, "shared": 1}},
         {"results": [], "cli_output": "public"},
     ]
     mediator = Mediator(Mock(), workers)

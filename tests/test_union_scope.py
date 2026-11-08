@@ -12,6 +12,7 @@ from mempalace.backends.qdrant import QdrantBackend
 from mempalace.backends.sqlite_exact import SQLiteExactBackend
 from mempalace.palace import get_collection
 from mempalace.searcher import _resolve_candidate_strategy, search_memories
+from tests._overview_helpers import overview_result
 
 
 @pytest.mark.parametrize("backend", [ChromaBackend, SQLiteExactBackend, CompactBackend])
@@ -371,15 +372,23 @@ def test_scope_local_terms_ids_closets_and_full_responses_are_private(
             {"wing": "public", "source_file": "1.md"},
         ],
     )
-    principal = SimpleNamespace(policy=SimpleNamespace(can_read_wing=lambda wing: wing == "public"))
+    principal = SimpleNamespace(
+        workspace_id="fixture-workspace",
+        policy=SimpleNamespace(can_read_wing=lambda wing: wing == "public"),
+    )
     other = SimpleNamespace(
-        policy=SimpleNamespace(can_read_wing=lambda wing: wing in {"public", "shared"})
+        workspace_id="fixture-workspace",
+        policy=SimpleNamespace(can_read_wing=lambda wing: wing in {"public", "shared"}),
     )
     calls = []
 
     def call_tool(who, name, args):
-        if name == "mempalace_list_wings":
-            return {"wings": {w: {} for w in ("public", "shared", "private")}}
+        assert who.workspace_id == "fixture-workspace"
+        overview = overview_result(
+            name, args, dict.fromkeys(("public", "shared", "private"), "notes")
+        )
+        if overview is not None:
+            return overview
         calls.append(args)
         return search_memories(
             args["query"], palace, wings=args["wings"], n_results=args["limit"], include_facts=False
@@ -590,12 +599,17 @@ def test_cli_compatible_wing_union_never_prints_private_drawer(monkeypatch, conf
     mediator = object.__new__(Mediator)
 
     def call_tool(principal, name, args):
-        if name == "mempalace_list_wings":
-            return {"wings": {"public": {}, "private": {}}}
+        assert principal.workspace_id == "fixture-workspace"
+        overview = overview_result(name, args, {"public": "notes", "private": "notes"})
+        if overview is not None:
+            return overview
         return mcp_server.tool_search(**args)
 
     mediator.workers = SimpleNamespace(call_tool=call_tool)
-    principal = SimpleNamespace(policy=SimpleNamespace(can_read_wing=lambda wing: wing == "public"))
+    principal = SimpleNamespace(
+        workspace_id="fixture-workspace",
+        policy=SimpleNamespace(can_read_wing=lambda wing: wing == "public"),
+    )
     result = mediator._fan_out_search(
         principal,
         "mempalace_search",

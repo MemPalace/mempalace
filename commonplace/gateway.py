@@ -253,6 +253,8 @@ def _observe_console(mediator, principal, request, response, started):
 class Mediator:
     """Applies a principal's policy to one JSON-RPC request."""
 
+    gateway = None  # Direct worker helpers may be constructed without __init__.
+
     def __init__(self, db: ControlDB, workers: WorkerClient):
         self.db = db
         self.workers = workers
@@ -601,7 +603,9 @@ class Mediator:
         return None  # Policy.refusal already required every wing.
 
     def _before_wing_list(self, principal, name, args, notes):
-        return None
+        from .handoff.overview import project
+
+        return {"respond": project(self.gateway, principal, self.workers, name)}
 
     def _reader_recall(self, principal):
         """Startup reuses only an already opened store and preserves live eligibility."""
@@ -1221,10 +1225,21 @@ class Mediator:
         return wings
 
     def _fan_out_search(self, principal, name, args) -> dict:
+        """Keep acquisition, authorization and the worker search on one deadline."""
+        from .rules import checks
+
+        try:
+            with checks.deadline(WORKER_TIMEOUT_S):
+                return self._scoped_fan_out_search(principal, name, args)
+        except TimeoutError:
+            return {"query": args.get("query", ""), "results": [], "wings_searched": []}
+
+    def _scoped_fan_out_search(self, principal, name, args) -> dict:
         """One worker search and one ranking over the readable wing union."""
         from .handoff.models import MIRROR_WING
+        from .handoff.overview import project
 
-        listing = self.workers.call_tool(principal, "mempalace_list_wings", {}) or {}
+        listing = project(self.gateway, principal, self.workers, "mempalace_list_wings")
         requested = args.get("wings")
         wings = sorted(
             w

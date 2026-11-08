@@ -52,6 +52,15 @@ Format (read by `commonplace orch docs-check`):
   - Records authenticated owner progress, process-lifetime units, fixed unavailable responses and the accepted global-quota causality.
 
   - Architecture describes exact-slug, workspace-local reads without implying lifecycle support.
+
+  - Cold-start readability, imported-room count compatibility and remaining search totals are documented separately from content range checks.
+
+  - Standalone mediator compatibility distinguishes policy-only local helpers from workspace-bound callers without thread authority.
+
+  - Workspace-less overview and fan-out callers fail closed; the previous legacy-listing exception is removed.
+
+  - Visible overview and search fan-out boundaries are documented separately from the remaining hallway, tunnel, graph, provenance and progress residuals.
+
   - Thread mutation rules and accepted provenance/read residuals are recorded below as separate additions.
 
   - Imported-history consent: Imported-history reader authority is recorded as an explicit consent boundary, with shared-holder and withdrawal residuals.
@@ -78,6 +87,9 @@ Format (read by `commonplace orch docs-check`):
 
   - Later object migration requires an explicit compatibility decision.
 
+  - Overview failure documentation promises keyed empty responses and no latency guarantee.
+
+
   - A stale block passes the mechanical check while describing old behaviour; reviewers judge whether the text is true.
 
   - A path added without a block fails `docs-check`.
@@ -89,6 +101,9 @@ Format (read by `commonplace orch docs-check`):
   - Authenticated progress regressions and documentation obligations.
 
   - Space REST contract tests and documentation obligations.
+
+  - Presence, private read-scope and docs-obligation checks cover the scoped overview contract.
+
 
   - `tests/test_docs_obligations.py` runs `docs-check` against the merge base; `tests/test_orch_checks.py` covers unowned paths, missing obligations, empty blocks and waivers.
 
@@ -261,6 +276,9 @@ Format (read by `commonplace orch docs-check`):
   - The memory engine: verbatim drawers, mining, search, knowledge graph, storage backends and the MCP server; plus the reviewed seed card list.
 
 - **Promises:**
+
+  - Scoped wing and taxonomy counts use bounded metadata-only identity pages, normalize absent/null/question-mark loci to unknown, exclude bookkeeping, and revalidate concrete descriptors in fresh snapshots. Local unscoped readers retain their conventions.
+
   - Scoped KG writes recheck provenance snapshots in-lock; source/id deletes use authorized rooms and explicit ids, and missing optional closets count as zero.
 
   - Direct B2 providers reject malformed metadata with encryption errors; marked-workspace refusals retain an explicit locked diagnostic.
@@ -271,12 +289,18 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Incomplete acquisition or invalid descriptors discard all projected output. New or changed metadata cannot inherit an earlier allow descriptor.
+
+
   - Backend lock or index damage degrades recall; repair tools rebuild indexes without touching drawers.
 
   - When a session's cached database disappears during a rebuild, the session resets the palace's shared Chroma System as well as its client so dropped owners cannot leave a pool pointing at the renamed database.
 
 
 - **Tests:**
+
+  - Presence and private read-scope tests exercise SQLite, compact, Chroma, facet and generic metadata paths, unknown values, batching and races.
+
 
   - The `tests/test_` files for mining, search, palace, knowledge graph, backends and the MCP server.
 
@@ -336,6 +360,15 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_project_reports.py` uses the same public completion witnesses on the base and changed code; deterministic scans cover episode keys, publication recovery, routing isolation, retry inspection and transaction faults.
   - Source initialization regressions hold the real report write transaction before the creator's WAL setup, require a successful BoardStore open, and verify next-pass recovery. Nonempty files missing either base table must also defer all report writes until initialization finishes.
+
+  - Cold and warm public overview/search responses retain readable native rooms; explicitly consenting import readers retain readable grant-room counts and fan-out membership.
+
+  - Standalone overview/search regressions retain ordinary rows while unresolved thread presence matches the absent-thread world, with missing, null or incomplete gateway context.
+
+  - Workspace-less direct tool calls return empty overview shapes; fan-out tests hide unreadable thread-only wings even at the visible-wing limit. Union privacy and joint-ranking fixtures use workspace-bound principals and metadata probe/revalidation replies.
+
+  - Public presence witnesses reach real worker acquisition branches and real search fan-out before comparing hidden and absent worlds. Private protocol tests cover descriptor revalidation, bounded batches and metadata-only reads.
+
 
   - The revoked-token socket guard observes the completed server-side 401, no body reads and no route dispatch, including a forced close before upload finishes.
   - The seat webhook replay checks actual worker completion with orchestration off and on, retains card-created notifications when enabled, and verifies message filtering and unchanged subscriptions on reconnect.
@@ -402,6 +435,9 @@ Format (read by `commonplace orch docs-check`):
   - Configuration refusal can hide a later guard unless that boundary is also exercised directly.
   - Feature assertions fail before DTO inspection on the unregistered base route.
 
+  - Fixture reachability and setup failures are distinct from expected output AssertionErrors; malformed acquisition must never become an authorization grant.
+
+
   - A plan fixture that names a missing test file fails G7; a shared fixture change can break unrelated suites; slow or flaky tests waste every run.
 
   - Email cookie-scope regressions use an HTTPS cookie jar over loopback, including an older host-only cookie; sign-in rendering checks cover the request confirmation.
@@ -418,6 +454,9 @@ Format (read by `commonplace orch docs-check`):
   - Token tests distinguish missing selected capture credentials during initialization from import-only feed credential rejection.
   - GitHub lifecycle rendering runs in Node with deferred replies and synthetic roots, including logout during an outstanding status read.
   - `tests/test_spaces_contract.py`, `tests/spaces_surfaces.json` and the checked REST/public surface regressions.
+
+  - Focused presence and read-scope selections run alongside existing gateway, mirror, imported-history and mutation-scope regressions.
+
   - Thread-boundary integration tests exercise real separate workspace workers; focused scope tests cover stale snapshots, optional collections, malformed probes, decoding and response caches.
 
   - Release helper regressions simulate the old app disappearing before the signed-in board arrives and verify useful exception messages without credentials in JSON or Markdown reports.
@@ -456,6 +495,13 @@ Format (read by `commonplace orch docs-check`):
 
   - Supported Space routes pass the existing non-person tool visibility gate.
   - Gateway installation registers project reports without resolving workspace directories; the webhook worker recovers existing sources on its first scan and drives independent monotonic deadlines without adding authority or holding database locks during report HTTP.
+
+  - Authenticated wing lists and search fan-out share the complete authorized pair projection. Hidden-only wings affect neither wings_searched nor the fan-out denial count; internal consumers inherit the same listing.
+
+  - Direct mediator helpers default to no gateway; workspace-bound callers still project metadata.
+
+  - Policy-only callers without workspace context receive empty overview and fan-out results through the shared projection boundary.
+
   - Gateway mutation scopes and provenance lookups follow the principal workspace; hidden targets use absent replies, and client-supplied scopes cannot widen access.
 
   - Imported-history consent: Imported reader results bypass wing restrictions only after exact-view proof; ordinary scope, tool, wing and mutation gates remain in force.
@@ -472,11 +518,17 @@ Format (read by `commonplace orch docs-check`):
 
   - Rejected methods have no tool alias; authentication and body transport refusals remain shared.
 
+  - Malformed, partial or timed-out overview acquisition yields the same empty successful shape as no visible data, before any sees-all shortcut. Client scopes are discarded and absent from discovery.
+
+
   - A worker that does not start returns an error, never another workspace's data; the control database is the single point of failure for sign-in.
 
 - **Tests:**
 
   - `tests/test_spaces_contract.py` and the installed public surface inventory.
+
+  - Public presence witnesses cover wing counts, every fan-out entry and denial, malformed payloads, deadlines and forged scopes.
+
 
   - `tests/test_commonplace_gateway.py`, `tests/test_commonplace_control_db.py`, `tests/test_commonplace_policy.py`, `tests/test_hub_` files.
 
@@ -790,6 +842,14 @@ Format (read by `commonplace orch docs-check`):
   - Complete protected-reference shadows join ordinary authorization tokens; namespace/source case normalizes only in the authorization copy, and full capture/import identity/hash suffixes remain literal.
 
   - Fixed-length fork shadows prove the digest with arbitrary trailing characters, replacing only its own ordinary trailing context while every overlapping protected spelling still requires proof; omitted separators distinguish ids from prose actors.
+  - Overview pair authorization reuses the existing response reader in the authenticated workspace, including owners, with response-only memoization and no persisted authorization. Whole-holder counts require ordinary thread authority; import range consent grants no whole-room authority.
+  - Overview projection opens the authenticated workspace store before deadline-bound authorization and uses the existing room predicate without adding whole-thread authority requirements.
+
+  - Missing gateway or handoff context does not discard ordinary readable pairs; workspace-bound projections deny unresolved thread pairs through the existing reader.
+
+  - A principal without workspace context gets an empty overview before worker acquisition, shared by direct lists, taxonomy and fan-out.
+
+  - Overview pair authorization reuses the existing response reader in the authenticated workspace, including owners, with response-only memoization and no persisted authorization. Readable imported rooms retain existing presence/count visibility; imported content keeps its separate range proof.
 
   - Provenance uses one bounded decoder and response-local access caches; extraction by a non-reader leaves the source cursor untouched.
 
@@ -810,6 +870,8 @@ Format (read by `commonplace orch docs-check`):
   - Store or private-reader exceptions invalidate the entire owner progress proof without an unscoped fallback.
 
   - Incomplete progress proof fails unavailable without global counters; process restart drops unit attribution, and shared storage may block readable work.
+  - Missing, unresolved, malformed, revoked or failed thread authorization hides the pair. Any incomplete private acquisition discards all sums.
+
 
   - A failed launch of the successor leaves the source agent running; an interrupted archive adoption resumes from its last committed step.
 
@@ -818,6 +880,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_card253_s12.py::test_card253_s12_authority_fault_fixed_unavailable` exercises real Recall faults in both store formats.
 
   - `tests/test_card253_s12.py` and the search-index backlog and sweep suites cover attribution, revocation, snapshots, quota causality and deadlines.
+  - Presence and private read-scope tests cover native private threads, owner/shared readable threads, workspace binding, cache isolation and later revocation.
+
 
   - The `tests/test_handoff_` files, `tests/test_commonplace_continuity_unit.py`.
 
