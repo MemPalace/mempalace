@@ -20,7 +20,8 @@ def test_u6_a_owner_only_counts(person, role, status):
     routes = {}
     counts = dict(state="running", threads_indexed=2, threads_pending=3, units_written=7)
 
-    def index_status(workspace):
+    def index_status(workspace, *, principal):
+        assert principal.person and principal.role == "owner"
         calls.append(workspace)
         return dict(counts, text="hidden", thread_ids=["hidden"])
 

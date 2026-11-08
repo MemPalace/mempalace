@@ -107,6 +107,7 @@ class HandoffService:
         call_tool=None,
         save_fact=None,
         can_read=None,
+        progress_can_read=None,
         prompt_dir: str = "",
     ):
         self.control_db = control_db
@@ -117,6 +118,7 @@ class HandoffService:
         self.call_tool = call_tool
         self.save_fact = save_fact
         self.can_read = can_read
+        self.progress_can_read = progress_can_read
         self.prompt_dir = prompt_dir
         self.db.set_document_store(store_for)
         self._mirror_lock = threading.Lock()
@@ -406,8 +408,10 @@ class HandoffService:
         except Exception:
             pass
 
-    def index_status(self, workspace_id):
-        """Return counts for the owner/operator progress surface."""
+    def index_status(self, workspace_id, *, principal=None):
+        """Project authenticated progress; local operators explicitly stay unscoped."""
+        if principal is not None:
+            return search_index.projected_status(self, workspace_id, principal)
         counts = self.store_for(workspace_id).index_counts(workspace_id)
         with self._mirror_lock:
             state = self._index_states.get(workspace_id, search_index.State())

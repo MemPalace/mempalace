@@ -38,6 +38,10 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Records the strict owner-progress authority probe separately from ordinary Recall denial semantics.
+
+  - Records authenticated owner progress, process-lifetime units, fixed unavailable responses and the accepted global-quota causality.
+
   - Architecture describes exact-slug, workspace-local reads without implying lifecycle support.
   - Thread mutation rules and accepted provenance/read residuals are recorded below as separate additions.
 
@@ -59,6 +63,10 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - An authority fault makes the complete progress response unavailable, even when other threads are readable.
+
+  - A progress count is not a new thread read grant; other thread-boundary residuals remain documented.
+
   - Later object migration requires an explicit compatibility decision.
 
   - A stale block passes the mechanical check while describing old behaviour; reviewers judge whether the text is true.
@@ -66,6 +74,10 @@ Format (read by `commonplace orch docs-check`):
   - A path added without a block fails `docs-check`.
 
 - **Tests:**
+
+  - Owner-route store/private-reader fault regressions and the documentation obligation.
+
+  - Authenticated progress regressions and documentation obligations.
 
   - Space REST contract tests and documentation obligations.
 
@@ -275,6 +287,10 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Console activity schema and query checks freeze the store clock so dated fixtures stay inside the retention window.
+  - Owner progress fault regressions traverse the real wired Recall authority in paired hidden/absent worlds.
+
+  - Progress witnesses compare authenticated hidden-present and hidden-absent worlds through the real scheduler and successful-write path in both store formats.
+
   - Safety tests run identically on a pinned base and implementation; server import and low-level persistence remain covered.
   - Card schema regressions cover missing gateways, missing control databases and unexpected settings read failures.
 
@@ -349,6 +365,10 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Swallowing an authority fault must fail the fixed-503 assertion rather than silently reduce counters.
+
+  - Guard-only tests do not substitute for base failures; metadata, authority, state and unit mutations must change public assertions.
+
   - Configuration refusal can hide a later guard unless that boundary is also exercised directly.
   - Feature assertions fail before DTO inspection on the unregistered base route.
 
@@ -358,6 +378,10 @@ Format (read by `commonplace orch docs-check`):
 
 
 - **Tests:**
+
+  - `tests/test_card253_s12.py` covers strict store/private-reader failures, ordinary deny-on-fault compatibility and second-pass enumeration failure.
+
+  - `tests/test_card253_s12.py` covers owner progress isolation, current read authority, quota causality, incomplete proof and bounded metadata polling.
 
   - `tests/test_card199_safety.py` and the sync test family retain transcript-byte/cursor and server-import compatibility checks.
   - Transcript selection tests observe the actual symlink/empty rejection; memory selections separately prove refusal before selection.
@@ -463,6 +487,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Local search-index status and run pass an explicit unscoped principal and retain their printed count keys and capture enrolment behavior.
+
   - Serve always closes its control database on exit, including SIGTERM unwind, releasing owned resources through pre-close callbacks.
 
   - Imported-history consent: CLI token creation rejects the imported-history reader scope before issuing a credential; browser consent is required.
@@ -475,9 +501,13 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Local data-directory access remains operator authority; authenticated progress never inherits it.
+
   - The CLI runs with data-dir access, so anyone with the service's OS user can use it (residual in `SYSTEM.md`).
 
 - **Tests:**
+
+  - `tests/test_search_index_progress.py` covers local status, run and explicit capture enrolment.
 
   - `tests/test_commonplace_cli.py`, `tests/test_commonplace_client.py`, `tests/test_commonplace_client_hooks.py`, `tests/test_commonplace_client_install.py`, `tests/test_commonplace_onboarding.py`.
 
@@ -699,6 +729,11 @@ Format (read by `commonplace orch docs-check`):
   - Agent context handoff to a fresh agent and append-only native session continuity.
 
 - **Promises:**
+
+  - A dedicated strict Recall callback propagates owner-progress lookup faults; extraction retains the ordinary deny-on-fault callback.
+
+  - Search-index polls authorize current metadata once per thread, revalidate descriptors in one snapshot and project per-thread successful units, activity and quota refusals.
+
   - Provenance uses one bounded decoder and response-local access caches; extraction by a non-reader leaves the source cursor untouched.
 
   - Imported-history consent: Imported readers receive bounded immutable views, source-range proof and view-specific metadata; capture tails never inherit import authority.
@@ -715,9 +750,17 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Store or private-reader exceptions invalidate the entire owner progress proof without an unscoped fallback.
+
+  - Incomplete progress proof fails unavailable without global counters; process restart drops unit attribution, and shared storage may block readable work.
+
   - A failed launch of the successor leaves the source agent running; an interrupted archive adoption resumes from its last committed step.
 
 - **Tests:**
+
+  - `tests/test_card253_s12.py::test_card253_s12_authority_fault_fixed_unavailable` exercises real Recall faults in both store formats.
+
+  - `tests/test_card253_s12.py` and the search-index backlog and sweep suites cover attribution, revocation, snapshots, quota causality and deadlines.
 
   - The `tests/test_handoff_` files, `tests/test_commonplace_continuity_unit.py`.
 
@@ -753,13 +796,19 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Owner HTTP progress always forwards the authenticated principal, returns only readable progress and disables response caching.
+
   - Reads and writes respect the caller's wings and scopes; store cutovers are backup-gated and restartable; capture is explicit and append-only.
 
 - **How it fails:**
 
+  - Incomplete progress proof returns the fixed 503 error without partial totals or private failure details.
+
   - An interrupted cutover keeps the previous store live; an index rebuild degrades search speed, not stored text.
 
 - **Tests:**
+
+  - `tests/test_card253_s12.py` covers authenticated HTTP isolation and failures; `tests/test_search_index_progress.py` covers the route contract.
 
   - `tests/test_commonplace_memory.py`, `tests/test_commonplace_capture.py`, `tests/test_workspace_store_switch.py`.
 

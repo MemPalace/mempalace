@@ -123,6 +123,9 @@ def install(gateway, data_dir=None, **_ignored) -> HandoffContext:
         call_tool=ctx.call_tool,
         save_fact=ctx.save_fact,
         can_read=ctx.recall.can_read,
+        progress_can_read=lambda principal, stored_id: ctx.recall.can_read(
+            principal, stored_id, strict=True
+        ),
         prompt_dir=str(Path(data_dir) / "handoff-prompts"),
     )
     gateway.handoff = ctx

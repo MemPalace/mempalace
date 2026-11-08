@@ -159,7 +159,8 @@ class Recall:
             and principal.policy.has_scope("memory:import:read")
         )
 
-    def can_read(self, principal, stored_id: str) -> bool:
+    def can_read(self, principal, stored_id: str, *, strict: bool = False) -> bool:
+        """Keep ordinary denial semantics; owner progress needs lookup faults to propagate."""
         if not isinstance(stored_id, str) or _THREAD_ID.fullmatch(stored_id) is None:
             return False
         if not principal.policy.has_scope("threads:read") and not self.import_reader(principal):
@@ -176,6 +177,8 @@ class Recall:
                 and (self._private is None or self._private.readable(principal, stored))
             )
         except Exception:
+            if strict:
+                raise
             return False
 
     def thread(self, principal, stored_thread_id: str) -> StoredThread:

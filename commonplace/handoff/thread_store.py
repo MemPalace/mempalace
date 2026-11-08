@@ -250,6 +250,46 @@ class ThreadStore:
             ).fetchall()
         return [_stored_thread(row) for row in rows]
 
+    @contextmanager
+    def index_snapshot(self):
+        """Bound a read-only progress snapshot to the caller's single deadline.
+
+        The caller holds the store lock, so connection settings cannot affect
+        another operation. Both store formats share this metadata connection.
+        """
+        from time import monotonic
+
+        from commonplace.rules import checks
+
+        wait = self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            self._conn.execute(f"PRAGMA busy_timeout={int(checks.remaining(1.0) * 1000)}")
+            end = checks._deadline.get()
+            self._conn.set_progress_handler(lambda: end is not None and monotonic() >= end, 1000)
+            self._conn.execute("BEGIN")
+            try:
+                yield
+            finally:
+                self._conn.rollback()
+        finally:
+            self._conn.set_progress_handler(None, 0)
+            self._conn.execute(f"PRAGMA busy_timeout={wait}")
+
+    def index_descriptors(self, workspace_id: str, *, after_id: str = "", limit: int = 500):
+        """Page current thread metadata with the existing checkpoint predicates."""
+        if not 1 <= limit <= 500:
+            raise ValueError("Progress pages require a limit from 1 to 500")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.*, p.completed_seq >= t.message_count-1 AS indexed, "
+                + _INDEX_PENDING_SQL
+                + " AS pending FROM threads t "
+                "LEFT JOIN mirror_progress p ON p.thread_id=t.id "
+                "WHERE t.workspace_id=? AND t.id>? ORDER BY t.id LIMIT ?",
+                (workspace_id, after_id, limit),
+            ).fetchall()
+        return [(_stored_thread(row), bool(row["indexed"]), bool(row["pending"])) for row in rows]
+
     def index_counts(self, workspace_id: str) -> dict[str, int]:
         """Count completed mirrors and pending threads without loading words.
 
