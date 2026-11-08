@@ -2404,22 +2404,37 @@ _ACTIVE_EXIT_WATCHDOG = None
 
 
 class _HookMineExitWatchdog:
-    """Handle for a daemon watchdog thread waiting on interpreter shutdown."""
+    """Handle for an independent process waiting on interpreter shutdown."""
 
-    def __init__(self, thread, cancelled) -> None:
-        self.thread = thread
-        self._cancelled = cancelled
+    def __init__(self, process) -> None:
+        self.process = process
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        try:
+            # Unbuffered, one-byte pipe write: no stdout/stderr locks or flush.
+            os.write(self.process.stdin.fileno(), b"S")
+        except (OSError, ValueError):
+            pass
 
     def cancel(self) -> None:
-        self._cancelled.set()
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=5)
+        self.process.stdin.close()
 
 
 def _hook_mine_exit_grace_seconds() -> float:
+    import math
+
     raw = os.environ.get(_HOOK_MINE_EXIT_GRACE_ENV, "").strip()
     if raw:
         try:
             value = float(raw)
-            if value > 0:
+            if math.isfinite(value) and value > 0:
                 return value
         except ValueError:
             pass
@@ -2427,18 +2442,14 @@ def _hook_mine_exit_grace_seconds() -> float:
 
 
 def _arm_hook_mine_exit_watchdog(exit_code: int = 0) -> Optional[_HookMineExitWatchdog]:
-    """Bound interpreter shutdown for hook-spawned mine subprocesses.
+    """Bound hook-mine shutdown with supervision outside this interpreter.
 
-    Hook-spawned mines inherit ``MEMPALACE_MINE_PID_FILE`` in their
-    environment. Once the mine body returns or raises, non-daemon worker
-    threads or ``atexit`` callbacks inside native runtime dependencies can
-    stall ``Py_FinalizeEx`` indefinitely while holding the per-target PID
-    slot. Clearing the PID slot immediately and arming a shutdown-triggered
-    daemon watchdog leaves normal runs and in-process callers untouched while
-    guaranteeing wedged shutdowns log thread stacks and exit with ``exit_code``.
+    The helper starts its grace period at interpreter shutdown, before Python
+    joins worker threads. It survives native finalization and never writes or
+    flushes diagnostic streams. Windows preserves ``exit_code`` on forced
+    termination; POSIX reports SIGKILL (a nonzero failure status).
 
-    Manual ``mempalace mine`` invocations do not set ``MEMPALACE_MINE_PID_FILE``
-    and return ``None`` without starting a thread.
+    Manual mines without ``MEMPALACE_MINE_PID_FILE`` remain unaffected.
     """
     global _ACTIVE_EXIT_WATCHDOG
 
@@ -2451,52 +2462,19 @@ def _arm_hook_mine_exit_watchdog(exit_code: int = 0) -> Optional[_HookMineExitWa
         _ACTIVE_EXIT_WATCHDOG.cancel()
 
     import atexit
-    import faulthandler
     import threading
 
-    grace = _hook_mine_exit_grace_seconds()
+    from ._mine_exit_watchdog import start_watchdog
+
     code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else 1
-    shutdown_started = threading.Event()
-    cancelled = threading.Event()
-
-    def _mark_shutting_down() -> None:
-        shutdown_started.set()
-
+    handle = _HookMineExitWatchdog(start_watchdog(_hook_mine_exit_grace_seconds(), code))
     register_threading_atexit = getattr(threading, "_register_atexit", None)
     if callable(register_threading_atexit):
         try:
-            register_threading_atexit(_mark_shutting_down)
+            register_threading_atexit(handle.start)
         except RuntimeError:
-            shutdown_started.set()
-    atexit.register(_mark_shutting_down)
-
-    def _watchdog_worker() -> None:
-        shutdown_started.wait()
-        if cancelled.wait(timeout=grace):
-            return
-        _cleanup_mine_pid_file()
-        try:
-            sys.stderr.write(
-                f"\n[mempalace] Hook mine shutdown exceeded {grace:g}s grace period; "
-                f"dumping thread stacks and forcing exit ({code}).\n"
-            )
-            faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
-        except Exception:
-            pass
-        for stream in (sys.stdout, sys.stderr):
-            try:
-                stream.flush()
-            except Exception:
-                pass
-        os._exit(code)
-
-    worker = threading.Thread(
-        target=_watchdog_worker,
-        name="mempalace-hook-mine-exit-watchdog",
-        daemon=True,
-    )
-    worker.start()
-    handle = _HookMineExitWatchdog(worker, cancelled)
+            handle.start()
+    atexit.register(handle.start)
     _ACTIVE_EXIT_WATCHDOG = handle
     return handle
 
