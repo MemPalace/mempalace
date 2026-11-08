@@ -6,6 +6,14 @@ on:
   # Every PR, so a PR stacked on another feature branch is tested too.
   pull_request:
 
+# A push to a PR branch cancels the run its previous push started: the
+# earlier commit is no longer what would be merged, and the full matrix is
+# about 27 runner-minutes. Pushes to develop and main keep every run, so
+# each merge has its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-linux:
     runs-on: ubuntu-latest
@@ -21,7 +29,11 @@ jobs:
       - run: pip install -e ".[dev]"
       # Gate is [tool.coverage.report] fail_under in pyproject.toml.
       # Do not pass --cov-fail-under.
-      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --durations=10
+      # -n auto runs one worker per CPU; --dist loadfile keeps a module's tests
+      # on one worker, which is what the module-scoped fixtures and the
+      # autouse state resets in tests/conftest.py assume. pytest-cov combines
+      # the workers' coverage before the gate is applied.
+      - run: python -m pytest tests/ -v --ignore=tests/benchmarks -n auto --dist loadfile --cov=mempalace --cov-report=term-missing --durations=25
 
   test-windows:
     runs-on: windows-latest
@@ -42,8 +54,8 @@ jobs:
       # Same pyproject gate as Linux. tests/coverage_gate.py switches Windows
       # to [tool.mempalace.coverage] fail_under_windows.
       - run: >-
-          python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace
-          --cov-report=term-missing --durations=10 --reruns 2
+          python -m pytest tests/ -v --ignore=tests/benchmarks -n auto --dist loadfile
+          --cov=mempalace --cov-report=term-missing --durations=25 --reruns 2
           --reruns-delay 5 --only-rerun
           "Failed to apply logs to the hnsw segment writer|Error creating hnsw segment reader: Nothing found on disk"
 
@@ -56,7 +68,7 @@ jobs:
           python-version: "3.13"
           cache: 'pip'
       - run: pip install -e ".[dev]"
-      - run: python -m pytest tests/ -v --ignore=tests/benchmarks --cov=mempalace --cov-report=term-missing --durations=10
+      - run: python -m pytest tests/ -v --ignore=tests/benchmarks -n auto --dist loadfile --cov=mempalace --cov-report=term-missing --durations=25
 
   test-milvus:
     name: Measure Milvus extra
