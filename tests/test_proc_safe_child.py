@@ -131,10 +131,8 @@ def test_hold_script_ignores_a_planted_sqlite3_module(tmp_path):
         # marker on stderr instead.
         first = proc.stdout.readline().strip()
     finally:
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
+        # communicate() closes the child's stdin itself (EOF tells the holder
+        # to exit); closing it here first makes communicate() raise on POSIX.
         try:
             _out, err = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
