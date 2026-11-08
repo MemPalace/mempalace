@@ -567,6 +567,7 @@ def test_head_connect_hint_and_trust_failures(projects_hub):
         "space_message",
         "card.moved",
         "card.created",
+        "project.report",
     ]
     assert trust(h, {"confirm": True, "machines": ["mach_0000000000000000"]})[0] == 404
     from commonplace.sessions import person_principal

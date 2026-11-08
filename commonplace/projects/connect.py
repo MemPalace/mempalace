@@ -154,6 +154,10 @@ def connect(
         wing=wing,
         target_ids=(project["id"], cid),
     )
+    from commonplace.projects import reports
+
+    with db._lock, db._tx():
+        reports.bind_in(db, ws, board, cid)
     connection = connection_view(db.connection(cid, ws))
     connection["name"] = redact.redact(connection["name"])[0]
     result = {
@@ -167,7 +171,7 @@ def connect(
     from commonplace.projects import orchestration
 
     if orchestration.enabled(db, ws):
-        result["setup"]["webhook_add"]["events"].append("card.created")
+        result["setup"]["webhook_add"]["events"].extend(["card.created", "project.report"])
     if "warning" in configured:
         result["warning"] = configured["warning"]
     return (201 if minted else 200), result
@@ -176,8 +180,10 @@ def connect(
 def _demote_in(db, principal, cid):
     import json
 
+    from commonplace.projects import reports
     from commonplace.runner import registry
 
+    reports.invalidate_in(db, principal.workspace_id, cid)
     # Demotion must also clean revoked seats and machines, without validating peers.
     row = db.connection(cid, principal.workspace_id)
     policy = json.loads(row["policy"])

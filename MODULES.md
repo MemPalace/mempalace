@@ -330,6 +330,12 @@ Format (read by `commonplace orch docs-check`):
   - Driven-clock heartbeat tests cover standby takeover after release and expiry; a subprocess SIGTERM test covers immediate restart after stubbed-HTTP serve teardown. Shutdown regressions cover server and worker entry points, one lease release and duplicate closes after SQLite closes. Unreadable-grant and confirmation regressions require local disconnect and unconfirmed revocation.
   - The same contract selection runs on pinned base and implementation head; transport regressions execute separately.
   - Space profile/tool snapshots are captured from the development base, retaining its split and inbox visibility and card-schema additions.
+  - `tests/test_projects_phase_b.py::test_head_connect_hint_and_trust_failures` asserts the Connect list contract: base message and move events, plus creation and report events when enabled.
+
+  - `tests/test_project_reports.py::test_gateway_install_does_not_resolve_or_create_workspaces` covers missing, forbidden and real supervisor lookups; `test_dispatch_recovers_existing_source_without_creating_workspaces` proves lazy migration, delivery, workspace isolation and one diagnostic per failed workspace pass without private workspace names, identifiers or content in formatted logs. `test_dispatch_reinitializes_changed_source` checks schema recovery through the catalog after an in-process table drop; normal-pass initialization counts have a separate regression. `test_dispatch_isolates_publish_programming_error` proves that a non-closure publication error is logged once while the same pass publishes the next workspace's report for delivery.
+
+  - `tests/test_project_reports.py` uses the same public completion witnesses on the base and changed code; deterministic scans cover episode keys, publication recovery, routing isolation, retry inspection and transaction faults.
+  - Source initialization regressions hold the real report write transaction before the creator's WAL setup, require a successful BoardStore open, and verify next-pass recovery. Nonempty files missing either base table must also defer all report writes until initialization finishes.
 
   - The revoked-token socket guard observes the completed server-side 401, no body reads and no route dispatch, including a forced close before upload finishes.
   - The seat webhook replay checks actual worker completion with orchestration off and on, retains card-created notifications when enabled, and verifies message filtering and unchanged subscriptions on reconnect.
@@ -449,6 +455,7 @@ Format (read by `commonplace orch docs-check`):
   - KG provenance writes report the offending field and citation character limit before storage; hidden-reference refusals keep their existing replies and refused writes leave existing facts untouched.
 
   - Supported Space routes pass the existing non-person tool visibility gate.
+  - Gateway installation registers project reports without resolving workspace directories; the webhook worker recovers existing sources on its first scan and drives independent monotonic deadlines without adding authority or holding database locks during report HTTP.
   - Gateway mutation scopes and provenance lookups follow the principal workspace; hidden targets use absent replies, and client-supplied scopes cannot widen access.
 
   - Imported-history consent: Imported reader results bypass wing restrictions only after exact-view proof; ordinary scope, tool, wing and mutation gates remain in force.
@@ -572,6 +579,7 @@ Format (read by `commonplace orch docs-check`):
   - Owner coordinator settings list eligible active PAT connections; needs-me reports restricted cards waiting on a missing coordinator once per board.
   - Owner coordinator settings list eligible active PAT connections; needs-me reports restricted cards waiting on a missing coordinator once per board, with the waiting bucket omitted for non-owners.
   - Metadata uses an exact active slug on a plain store connection; list retains expiry and create retains rules enforcement.
+  - Non-done to done transitions capture metadata in the source transaction. Unavailable report settings reject before status or lesson writes; new boards without a coordinator remain history only. Raw events retain their existing matching and authorization.
 
   - Every card change is one transaction with its `task_events` row; event emission happens after commit and a failed emission never undoes the change; on a configured board only `task_approve` removes `plan` and plan-check gates plan approval.
 
@@ -588,6 +596,7 @@ Format (read by `commonplace orch docs-check`):
 - **How it fails:**
 
   - Hidden metadata is absent; hidden repo collisions are forbidden; unsupported shapes execute no domain method.
+  - Report routing defers one event durably before advancing the global cursor; authorization retries indefinitely with fixed inspection code and persisted count/since, independent of HTTP attempts. Control persistence failures retain unacknowledged work.
 
   - A swallowed emission loses a notification but not the change (the trigger sweep reads `task_events`); webhook delivery retries and records failures.
 
@@ -598,6 +607,7 @@ Format (read by `commonplace orch docs-check`):
 - **Tests:**
 
   - `tests/test_spaces_contract.py` covers DTOs, isolation, authority, collisions and side effects.
+  - `tests/test_project_reports.py::test_enqueue_deferral_raw_progress_and_backoff`, `test_send_retry_accounting_and_identity` and `test_auth_retry_inspection_beyond_latest_100` pin durable retries and inspection.
 
   - `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`, `tests/test_commonplace_webhooks.py`.
 
@@ -696,6 +706,10 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/projects/`, `commonplace/plans.py`
 - **Owns:**
 
+  - Source outboxes and observed stuck episodes, internal seat bindings, publication receipts and reserved report dispatch.
+  - Report installation touches only control state; dispatcher passes resolve existing board databases without creating workspace directories, migrate sources lazily by path, inode and SQLite schema version, and isolate workspace failures, including publication ProgrammingError, with diagnostics that omit exception text and local values. Ordinary data writes retain the initialization cache; a new inode or a changed schema version triggers initialization again.
+  - Recovery skips zero-byte sources before connecting and uses a read-only base-schema probe for nonempty sources. Missing `boards` or `tasks` defers all report writes and migrations until a later pass, leaving creator initialization unblocked.
+
   - Project orchestrator seats, project model choices, project limits, project wings and optional hosted plans.
 
 - **Promises:**
@@ -703,9 +717,12 @@ Format (read by `commonplace orch docs-check`):
   - Orchestration settings reads wait at most one second for the shared control lock, then return the existing retryable `settings_unavailable` refusal without reading an unlocked connection.
 
   - Connect recommends a board-scoped subscription to `space_message` and `card.moved`, retaining `card.created` with orchestration enabled, without creating or modifying webhooks.
+  - Connect recommends a board-scoped subscription to `space_message` and `card.moved`, retaining `card.created` and adding `project.report` with orchestration enabled, without creating or modifying webhooks.
+
   - The opt-in inbox excludes children and coordinator roots, exposes keyed children, and accepts first-wins split markers only from the coordinator or signed-in owner.
 
   - Split marker task references are range-checked before SQLite binding and settings-read failures remain retryable.
+  - Default-off project reports capture the current coordinator and activation/binding generations, baseline existing staleness, scan at most 100 cards and publish at most 100 rows per workspace pass, and retain receipt-backed event identity across crashes.
 
   - Only a signed-in owner changes models or limits; `max_agents` counts distinct connection assignees with orchestration off; opt-in orchestration shares card/job admission accounting, default cap 3, owner-only settings and atomic seat trust; model resolution goes project, then workspace, then the runner default.
 
@@ -713,9 +730,13 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Snapshot failures leave observation state untouched. Missing seats yield history only; changed bindings cancel old reports. Unknown authorization errors retain fixed-code retries without exposing exception text.
+
   - An unresolved model refuses a config-driven start before insert; a limit change does not stop work already started.
 
 - **Tests:**
+
+  - `tests/test_project_reports.py::test_done_writers`, `test_seed_done_new_board_history_only`, `test_idle_stuck_and_episode_resets`, `test_scan_budget_isolation_cleanup_recovery` and `test_publication_crashes_and_lock_order`.
 
   - The `tests/test_projects_` files, `tests/test_commonplace_plans.py`.
 

@@ -35,6 +35,9 @@ class SettingsUnavailable(AdmissionRefused):
 def ensure_schema(db):
     with db._lock:
         db._conn.execute(SCHEMA)
+    from commonplace.projects import reports
+
+    reports.ensure_control(db)
 
 
 def enabled(db, ws):
@@ -75,6 +78,9 @@ def set_enabled(db, principal, value):
                 control_db._iso(control_db._now()),
             ),
         )
+        from commonplace.projects import reports
+
+        reports.activation_in(db, principal.workspace_id, value)
         db.audit(
             action="workspace.orchestration",
             decision="allow",

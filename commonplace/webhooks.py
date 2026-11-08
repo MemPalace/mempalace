@@ -134,6 +134,17 @@ def ensure_schema(db):
                 "UPDATE webhooks SET start_seq = coalesce((SELECT max(seq) FROM events "
                 "WHERE workspace_id = webhooks.workspace_id AND at < webhooks.created_at), 0)"
             )
+        delivery_columns = {r[1] for r in db._conn.execute("PRAGMA table_info(webhook_deliveries)")}
+        for name, datatype in {
+            "report_auth_retry_count": "INTEGER NOT NULL DEFAULT 0",
+            "report_auth_retry_since": "TEXT DEFAULT NULL",
+            "report_envelope": "TEXT",
+        }.items():
+            if name not in delivery_columns:
+                db._conn.execute(f"ALTER TABLE webhook_deliveries ADD COLUMN {name} {datatype}")
+        from commonplace.projects import reports
+
+        reports.ensure_control(db)
         db._conn.execute(
             "INSERT OR IGNORE INTO meta(key,value) VALUES ('webhook_dispatch_seq','0')"
         )
@@ -327,7 +338,8 @@ def remove(db, principal, webhook_id):
         with db._tx():
             db._conn.execute("UPDATE webhooks SET active = 0 WHERE id = ?", (webhook_id,))
             db._conn.execute(
-                "UPDATE webhook_deliveries SET status = 'cancelled' "
+                "UPDATE webhook_deliveries SET status = 'cancelled',error='', "
+                "report_auth_retry_count=0,report_auth_retry_since=NULL "
                 "WHERE webhook_id = ? AND status IN ('pending','retry')",
                 (webhook_id,),
             )
@@ -340,9 +352,11 @@ def deliveries(db, principal, webhook_id):
         _get(db, principal, webhook_id)
         rows = db._conn.execute(
             "SELECT id, webhook_id, event_seq, attempt, status, http_status, error, next_at, "
-            "delivered_at FROM webhook_deliveries WHERE webhook_id = ? "
-            "ORDER BY rowid DESC LIMIT 100",
-            (webhook_id,),
+            "delivered_at, report_auth_retry_count AS count, report_auth_retry_since AS retry_since "
+            "FROM webhook_deliveries WHERE webhook_id = ? AND (report_auth_retry_count > 0 OR "
+            "rowid IN (SELECT rowid FROM webhook_deliveries WHERE webhook_id = ? "
+            "ORDER BY rowid DESC LIMIT 100)) ORDER BY rowid DESC",
+            (webhook_id, webhook_id),
         ).fetchall()
         result = []
         for row in rows:
@@ -362,6 +376,8 @@ def deliveries(db, principal, webhook_id):
 def _matches(row, event):
     if row["workspace_id"] != event["workspace_id"]:
         return False
+    if event["kind"] == "project.report":
+        return False  # Reserved routing must precede every wildcard path.
     kinds = json.loads(row["kinds"])
     kind = event["kind"]
     # Replies refresh the app but must never turn a wildcard wake into a reply loop.
@@ -382,10 +398,13 @@ def _matches(row, event):
 
 
 def _payload(db, event):
+    from commonplace.projects.report_dispatch import PUBLIC_FIELDS
+
+    fields = PUBLIC_FIELDS if event["kind"] == "project.report" else _DATA_FIELDS
     data = {
         k: v
         for k, v in event["data"].items()
-        if k in _DATA_FIELDS and (isinstance(v, (str, int, float, bool)) or v is None)
+        if k in fields and (isinstance(v, (str, int, float, bool)) or v is None)
     }
     number = data.get("number")
     if number is None and re.fullmatch(r"#\d+", event["subject"]):
@@ -407,7 +426,11 @@ def _payload(db, event):
         )
         url = base.rstrip("/") + path
     else:
-        url = urls.share_link(db, event["workspace_id"], path)
+        url = (
+            urls.app_link(path)
+            if event["kind"] == "project.report"
+            else urls.share_link(db, event["workspace_id"], path)
+        )
     decision = event["kind"] == "card.review_needed" or (
         event["kind"] == "card.handoff" and str(data.get("ask_to") or "").startswith("user:")
     )
@@ -459,8 +482,15 @@ def _enqueue(db, row, event):
     with db._lock:
         db._conn.execute(
             "INSERT OR IGNORE INTO webhook_deliveries "
-            "(id, webhook_id, event_seq, next_at, payload) VALUES (?,?,?,?,?)",
-            (delivery_id, row["id"], event["seq"], time.time(), _payload(db, event)),
+            "(id, webhook_id, event_seq, next_at, payload, report_envelope) VALUES (?,?,?,?,?,?)",
+            (
+                delivery_id,
+                row["id"],
+                event["seq"],
+                time.time(),
+                _payload(db, event),
+                json.dumps(event) if event["kind"] == "project.report" else None,
+            ),
         )
     return delivery_id
 
@@ -614,6 +644,7 @@ class Dispatcher:
         self.max_attempts = max_attempts
         self.error_backoff = ERROR_BACKOFF
         self.max_error_backoff = MAX_ERROR_BACKOFF
+        self._next_report_scan = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()
         self.thread = threading.Thread(target=self._run, name="commonplace-webhooks", daemon=True)
@@ -648,6 +679,8 @@ class Dispatcher:
         self._wake.set()
 
     def reconcile(self):
+        from commonplace.projects import report_dispatch
+
         with self.db._lock:
             cursor = int(
                 self.db._conn.execute(
@@ -659,9 +692,18 @@ class Dispatcher:
                     "SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT 200", (cursor,)
                 ).fetchall()
                 if not batch:
-                    return
+                    break
                 for stored in batch:
                     event = events._row(stored)
+                    if event["kind"] == "project.report":
+                        with self.db._tx():
+                            report_dispatch.defer_in(self.db, event)
+                            self.db._conn.execute(
+                                "UPDATE meta SET value=? WHERE key='webhook_dispatch_seq'",
+                                (str(event["seq"]),),
+                            )
+                        cursor = event["seq"]
+                        continue
                     rows = self.db._conn.execute(
                         "SELECT * FROM webhooks WHERE workspace_id=? AND active=1 AND start_seq < ?",
                         (event["workspace_id"], event["seq"]),
@@ -681,6 +723,8 @@ class Dispatcher:
                         "UPDATE meta SET value=? WHERE key='webhook_dispatch_seq'", (str(cursor),)
                     )
 
+        report_dispatch.process(self.db)
+
     def _due(self):
         with self.db._lock:
             return self.db._conn.execute(
@@ -692,6 +736,13 @@ class Dispatcher:
             ).fetchone()
 
     def _deliver(self, row):
+        if json.loads(bytes(row["payload"])).get("kind") == "project.report":
+            from commonplace.projects import report_dispatch
+
+            row = report_dispatch.prepare(self, row)
+            if row is not None:
+                self._send(row)
+            return
         with self.db._lock:
             current = self.db._conn.execute(
                 "SELECT d.*, w.url, w.secret, w.workspace_id, w.connection_id, w.owner_actor, "
@@ -716,6 +767,9 @@ class Dispatcher:
             if current["attempt"] != row["attempt"]:
                 return
             row = current
+        self._send(row)
+
+    def _send(self, row):
         body = bytes(row["payload"])
         kind = json.loads(body)["kind"]
         status, error = None, ""
@@ -762,12 +816,20 @@ class Dispatcher:
                 data={"webhook_id": row["webhook_id"], "delivery_id": row["id"]},
             )
 
+    def scan_reports(self):
+        pump = getattr(self.gateway, "project_reports", None)
+        now = time.monotonic()
+        if pump is not None and now >= self._next_report_scan:
+            self._next_report_scan = now + 30
+            pump.pass_once()
+
     def _run(self):
         backoff = self.error_backoff
         try:
             while not self._stop.is_set():
                 try:
                     self._wake.clear()
+                    self.scan_reports()
                     self.reconcile()
                     row = self._due()
                     if row is not None:

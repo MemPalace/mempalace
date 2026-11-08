@@ -430,6 +430,9 @@ class BoardStore:
                     repo = pr_repository(row["pr_url"])
                     if repo:
                         conn.execute("UPDATE tasks SET pr_repo=? WHERE id=?", (repo, row["id"]))
+                from commonplace.projects import reports
+
+                reports.ensure_source(conn)
                 conn.commit()
             except BaseException:
                 conn.rollback()

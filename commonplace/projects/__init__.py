@@ -1,7 +1,7 @@
 """Automatic project orchestrator seats and model preferences."""
 
 from commonplace.chat import settings
-from commonplace.projects import orchestration, routes, seats
+from commonplace.projects import orchestration, reports, routes, seats
 
 
 def install(gateway):
@@ -12,4 +12,5 @@ def install(gateway):
     settings.ensure_schema(gateway.db)
     routes.install(gateway)
     seats.install_listener(gateway)
+    reports.install(gateway)
     gateway.projects_installed = True
