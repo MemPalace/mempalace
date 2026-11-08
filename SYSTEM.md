@@ -158,6 +158,10 @@ configs. No deployment, replacement importer or memory-coverage completion is cl
 
 - Rules initialization tests check remaining SQLite wait budgets with a fake clock; wall-clock budgets stay in separate timing-marked tests.
 
+### Console activity query checks
+
+- Console activity schema and query checks freeze the store clock, keeping both dated rows within the seven-day retention window while asserting ordering, latest timestamps and redaction.
+
 ### Subagent questions
 
 A subagent must first propose a card and obtain approval and release before asking.

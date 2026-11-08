@@ -376,6 +376,7 @@ def test_activity_reads_and_open_do_not_create_files(gateway, tmp_path):
 
 
 def test_activity_schema_crypto_connection_redaction_and_queries(gateway, monkeypatch):
+    monkeypatch.setattr(store, "datetime", FixedDatetime)
     calls = []
     real_connect = store.connect
 

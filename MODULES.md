@@ -274,6 +274,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Console activity schema and query checks freeze the store clock so dated fixtures stay inside the retention window.
   - Safety tests run identically on a pinned base and implementation; server import and low-level persistence remain covered.
   - Card schema regressions cover missing gateways, missing control databases and unexpected settings read failures.
 
