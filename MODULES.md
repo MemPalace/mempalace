@@ -38,6 +38,15 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Documents field-specific citation length errors, atomic whole-write refusal, surface-specific citation exceptions and informational performance measurements.
+
+  - Documents both 16,384-character authorization caps, O(n + C²) bounds, over-limit readable citation refusal and verbatim fact/storage preservation.
+
+  - Documents bounded authorization-only reference spellings, exact producer domains and citation compatibility.
+
+  - Fork proof uses the fixed digest before trailing context and independently proves overlapping embedded references; omitted namespace separators require an actor id marker, and capture/import punctuation remains literal.
+
+
   - Records the strict owner-progress authority probe separately from ordinary Recall denial semantics.
 
   - Records authenticated owner progress, process-lifetime units, fixed unavailable responses and the accepted global-quota causality.
@@ -112,6 +121,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Board design also documents coordinator release of restricted-origin cards.
 
+  - Contributor test instructions state that the default run excludes the `timing` lane and that timing results are informational, never a merge gate.
+
 - **How it fails:**
 
   - Updating installed files alone leaves an old running process unaffected.
@@ -137,6 +148,8 @@ Format (read by `commonplace orch docs-check`):
   - Python and Rust packaging, pinned dependencies, the coverage gate, lint and format settings, pre-commit hooks, repository metadata and the development container.
 
 - **Promises:**
+
+  - Plain pytest excludes the `timing` marker from behavior checks; explicit timing selection remains available for serial informational measurements.
 
   - `uv sync --extra dev` reproduces the locked environment; `ruff check` and `ruff format --check` define style; the coverage threshold in `pyproject.toml` is the gate.
 
@@ -286,6 +299,15 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Default provenance regressions assert zero candidate work above either cap and accurate write errors with unchanged verbatim storage. Cap-sized and 1 MiB scan measurements run separately under `timing`, reporting resource budgets without gating on them.
+
+  - Public read/write cases cover full-field refusal, long readable controls and non-boundary fork prefixes.
+
+  - Public KG spelling regressions retain ordinary citations and all canonical producer formats on read/write, with separate grammar, owner and exact-hash isolation checks.
+
+  - Trailing fork regressions cover hidden read scrubbing/write refusal, readable spelling preservation, every printable ASCII suffix and ordinary URL/path/prose collision guards; concatenated references have public read/write refusal and develop byte-preservation guards.
+
+
   - Console activity schema and query checks freeze the store clock so dated fixtures stay inside the retention window.
   - Owner progress fault regressions traverse the real wired Recall authority in paired hidden/absent worlds.
 
@@ -421,6 +443,8 @@ Format (read by `commonplace orch docs-check`):
   - Extension installation registers email shutdown before GitHub shutdown; HTTP server teardown closes both in that order before SQLite closes.
 
 - **Promises:**
+
+  - KG provenance writes report the offending field and citation character limit before storage; hidden-reference refusals keep their existing replies and refused writes leave existing facts untouched.
 
   - Supported Space routes pass the existing non-person tool visibility gate.
   - Gateway mutation scopes and provenance lookups follow the principal workspace; hidden targets use absent replies, and client-supplied scopes cannot widen access.
@@ -733,6 +757,14 @@ Format (read by `commonplace orch docs-check`):
   - A dedicated strict Recall callback propagates owner-progress lookup faults; extraction retains the ordinary deny-on-fault callback.
 
   - Search-index polls authorize current metadata once per thread, revalidate descriptors in one snapshot and project per-thread successful units, activity and quota refusals.
+  - Complete protected-reference shadows join ordinary authorization tokens; namespace/source case normalizes only in the authorization copy, and full identity/hash suffixes remain literal.
+  - Citation parsing optionally raises a specific decoded/NFKC length error for writes while retaining fail-closed read projection; token collection deduplicates thread ids on insertion in first-occurrence order.
+
+  - Decoded and normalized reference scans are each capped at 16,384 characters and fail closed without partial proof; non-boundary run starts retain ordinary authorization, and only earlier runs admit overlapping shadows.
+
+  - Complete protected-reference shadows join ordinary authorization tokens; namespace/source case normalizes only in the authorization copy, and full capture/import identity/hash suffixes remain literal.
+
+  - Fixed-length fork shadows prove the digest with arbitrary trailing characters, replacing only its own ordinary trailing context while every overlapping protected spelling still requires proof; omitted separators distinguish ids from prose actors.
 
   - Provenance uses one bounded decoder and response-local access caches; extraction by a non-reader leaves the source cursor untouched.
 

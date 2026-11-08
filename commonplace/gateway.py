@@ -917,7 +917,7 @@ class Mediator:
 
     def _check_provenance(self, principal, name, args):
         from .handoff.mirror_access import reader, unreadable_room
-        from .handoff.provenance_refs import PROVENANCE_FIELDS, REFUSE
+        from .handoff.provenance_refs import PROVENANCE_FIELDS, REFUSE, ReferenceLimitError, refs
 
         access = reader(self.gateway, principal)
         for field in sorted(PROVENANCE_FIELDS):
@@ -930,7 +930,10 @@ class Mediator:
                 if field == "source_drawer_id"
                 else "Source not found",
             }
-            parsed = access.parse(raw)
+            try:
+                parsed = refs(raw, raise_on_limit=True)
+            except ReferenceLimitError as exc:
+                raise Hidden({"success": False, "error": f"{field}: {exc}"}) from None
             if parsed is REFUSE or not all(access.reference(t) for t in parsed.tokens):
                 raise Hidden(error)
             if field == "source_drawer_id":

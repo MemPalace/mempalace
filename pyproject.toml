@@ -269,7 +269,7 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-m 'not benchmark and not slow and not stress'"
+addopts = "-m 'not benchmark and not slow and not stress and not timing'"
 markers = [
     "benchmark: scale/performance benchmark tests",
     "timing: wall-clock budgets that run serially after the parallel suite",
