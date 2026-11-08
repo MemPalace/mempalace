@@ -2117,6 +2117,7 @@ class ChromaCollection(BaseCollection):
     directly without going through ``ChromaBackend``.
     """
 
+    overview_projection_bounded = True
     upsert_merges_metadata = True
 
     def __init__(self, collection, palace_path: Optional[str] = None, backend=None):
@@ -2491,6 +2492,14 @@ class ChromaCollection(BaseCollection):
         return sqlite_iter_metadata(
             self._palace_path, self._collection.name, keys, require_key, equals
         )
+
+    def iter_overview_metadata(self, where=None):
+        """Bounded overview projection; no vector or unrelated metadata payloads."""
+        from .chroma_sqlite import sqlite_overview_metadata
+
+        if self._palace_path is None:
+            return None
+        return sqlite_overview_metadata(self._palace_path, self._collection.name, where)
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
         """Every drawer's metadata in one pass over chroma.sqlite3.

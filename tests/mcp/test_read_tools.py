@@ -354,6 +354,15 @@ with mine_palace_lock(sys.argv[1]):
         from mempalace import mcp_server
 
         class _FakeQdrantCollection:
+            _backend = type("Backend", (), {"capabilities": {"supports_metadata_facets"}})()
+
+            def facet_counts(self, field, where=None, limit=1000):
+                if where:
+                    return {}
+                if field == "wing":
+                    return {"project": 2}
+                return {"backend": 1, "api": 1} if field == "room" else {}
+
             def count(self):
                 return 2
 
@@ -395,15 +404,21 @@ with mine_palace_lock(sys.argv[1]):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_status
 
-        # Inject a metadata cache where one entry is None
+        # A bounded projection preserves metadata-less drawer identities.
         with _patch("mempalace.mcp_server._get_collection") as mock_get_col:
-            fake_col = type("C", (), {"count": lambda self: 2})()
+            fake_col = type(
+                "C",
+                (),
+                {
+                    "count": lambda self: 2,
+                    "overview_projection_bounded": True,
+                    "iter_overview_metadata": lambda self, where=None: iter(
+                        [[{"wing": "proj", "room": "r"}, None]]
+                    ),
+                },
+            )()
             mock_get_col.return_value = fake_col
-            with _patch(
-                "mempalace.mcp_server._get_cached_metadata",
-                return_value=[{"wing": "proj", "room": "r"}, None],
-            ):
-                result = tool_status()
+            result = tool_status()
 
         # The None-metadata drawer falls under 'unknown/unknown' — no crash,
         # no partial flag.
@@ -827,10 +842,15 @@ class TestMetadataFacets:
 
         col = MagicMock()
         col.count.return_value = 5
-        col.facet_counts.side_effect = [
-            {"wing_a": 2, "wing_b": 3},
-            {"room_x": 4, "room_y": 1},
-        ]
+
+        def facets(field, where=None, limit=1000):
+            if where:
+                return {}
+            if field == "wing":
+                return {"wing_a": 2, "wing_b": 3}
+            return {"room_x": 4, "room_y": 1} if field == "room" else {}
+
+        col.facet_counts.side_effect = facets
         monkeypatch.setattr(mcp, "_get_collection", lambda create=False: col)
         result = mcp.tool_status()
 
@@ -843,7 +863,25 @@ class TestMetadataFacets:
             "room_x": 4,
             "room_y": 1,
         }
-        assert col.facet_counts.call_count == 2
+        from unittest.mock import call
+
+        assert col.facet_counts.call_args_list == [
+            call("wing", where=None, limit=16385),
+            call("room", where=None, limit=16385),
+            call("is_sentinel", where=None, limit=16385),
+            call("wing", where={"ingest_mode": "registry"}, limit=16385),
+            call("room", where={"ingest_mode": "registry"}, limit=16385),
+            call(
+                "room",
+                where={"$and": [{"wing": "wing_a"}, {"ingest_mode": "registry"}]},
+                limit=16385,
+            ),
+            call(
+                "room",
+                where={"$and": [{"wing": "wing_b"}, {"ingest_mode": "registry"}]},
+                limit=16385,
+            ),
+        ]
 
     def test_tool_list_wings_uses_metadata_facets(self, monkeypatch):
         import mempalace.mcp_server as mcp
@@ -852,10 +890,10 @@ class TestMetadataFacets:
         monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
 
         col = MagicMock()
-        col.facet_counts.return_value = {
-            "wing_a": 5,
-            "wing_b": 2,
-        }
+        col.count.return_value = 7
+        col.facet_counts.side_effect = lambda field, where=None, limit=1000: (
+            {"wing_a": 5, "wing_b": 2} if field == "wing" and not where else {}
+        )
         monkeypatch.setattr(mcp, "_get_collection", lambda: col)
         result = mcp.tool_list_wings()
 
@@ -865,7 +903,24 @@ class TestMetadataFacets:
                 "wing_b": 2,
             }
         }
-        col.facet_counts.assert_called_once_with("wing")
+        from unittest.mock import call
+
+        assert col.facet_counts.call_args_list == [
+            call("wing", where=None, limit=16385),
+            call("is_sentinel", where=None, limit=16385),
+            call("wing", where={"ingest_mode": "registry"}, limit=16385),
+            call("room", where={"ingest_mode": "registry"}, limit=16385),
+            call(
+                "room",
+                where={"$and": [{"wing": "wing_a"}, {"ingest_mode": "registry"}]},
+                limit=16385,
+            ),
+            call(
+                "room",
+                where={"$and": [{"wing": "wing_b"}, {"ingest_mode": "registry"}]},
+                limit=16385,
+            ),
+        ]
 
     def test_tool_list_rooms_uses_metadata_facets(self, monkeypatch):
 
@@ -876,10 +931,14 @@ class TestMetadataFacets:
 
         col = MagicMock()
 
-        col.facet_counts.return_value = {
-            "room1": 7,
-            "room2": 3,
-        }
+        def facets(field, where=None, limit=1000):
+            if field == "wing" and (where is None or "wing" in where):
+                return {"engineering": 10}
+            if field == "room" and where and "wing" in where:
+                return {"room1": 7, "room2": 3}
+            return {}
+
+        col.facet_counts.side_effect = facets
 
         monkeypatch.setattr(mcp, "_get_collection", lambda: col)
 
@@ -894,8 +953,17 @@ class TestMetadataFacets:
 
         wing = {"wing": {"$in": ["engineering", "wing_engineering"]}}
         assert col.facet_counts.call_args_list == [
-            call("room", where=wing),
-            call("wing", where=wing),
+            call("wing", where=None, limit=16385),
+            call("room", where=wing, limit=16385),
+            call("wing", where=wing, limit=16385),
+            call("is_sentinel", where=None, limit=16385),
+            call("wing", where={"ingest_mode": "registry"}, limit=16385),
+            call("room", where={"ingest_mode": "registry"}, limit=16385),
+            call(
+                "room",
+                where={"$and": [{"wing": "engineering"}, {"ingest_mode": "registry"}]},
+                limit=16385,
+            ),
         ]
 
     def test_tool_get_taxonomy_uses_metadata_facets(self, monkeypatch):
@@ -908,8 +976,8 @@ class TestMetadataFacets:
 
         col = MagicMock()
 
-        def facet_counts_mock(field, where=None):
-            if field == "wing":
+        def facet_counts_mock(field, where=None, limit=1000):
+            if field == "wing" and where is None:
                 return {"wing_a": 2, "wing_b": 1}
             if field == "room" and where == {"wing": "wing_a"}:
                 return {"room1": 2}
@@ -922,14 +990,28 @@ class TestMetadataFacets:
         monkeypatch.setattr(mcp, "_get_collection", lambda: col)
 
         result = mcp.tool_get_taxonomy()
-        assert col.facet_counts.call_args_list[0] == call("wing")
-        # Per-wing room facets run concurrently (ThreadPoolExecutor), so order is
-        # non-deterministic. Compare order-independently without a set() — a
-        # ``call`` carrying a dict kwarg is unhashable, so membership (==) is used.
-        room_calls = col.facet_counts.call_args_list[1:]
-        assert len(room_calls) == 2
-        assert call("room", where={"wing": "wing_a"}) in room_calls
-        assert call("room", where={"wing": "wing_b"}) in room_calls
+        calls = col.facet_counts.call_args_list
+        primary = [call("room", where={"wing": w}, limit=16385) for w in ("wing_a", "wing_b")]
+        # Preserve the base's order-independent concurrent room expectation,
+        # while checking the complete sequence including bookkeeping work.
+        assert calls[1:3] == primary or calls[1:3] == primary[::-1]
+        assert calls == [
+            call("wing", where=None, limit=16385),
+            *calls[1:3],
+            call("is_sentinel", where=None, limit=16385),
+            call("wing", where={"ingest_mode": "registry"}, limit=16385),
+            call("room", where={"ingest_mode": "registry"}, limit=16385),
+            call(
+                "room",
+                where={"$and": [{"wing": "wing_a"}, {"ingest_mode": "registry"}]},
+                limit=16385,
+            ),
+            call(
+                "room",
+                where={"$and": [{"wing": "wing_b"}, {"ingest_mode": "registry"}]},
+                limit=16385,
+            ),
+        ]
 
         assert result["taxonomy"] == {
             "wing_a": {

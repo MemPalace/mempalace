@@ -16,7 +16,6 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections import defaultdict
 from typing import Iterable, Iterator, Optional
 
 from ..lexical import tokenize
@@ -891,6 +890,8 @@ def _sqlite_wing_room_counts(
       than dropping it to ``"?"``.
     """
 
+    from ..overview import CELL_BYTES, OverviewError, Tally
+
     def read(conn):
         # Distinguish "collection never bootstrapped" (-> None, so the
         # caller can show the 'initialized but empty' message) from
@@ -900,25 +901,29 @@ def _sqlite_wing_room_counts(
         # Registry rows and sentinels track sources; they are not drawers.
         rows = conn.execute(
             f"""
-            SELECT COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
-                            CAST(wm.float_value AS TEXT), '?') AS wing,
-                   COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
-                            CAST(rm.float_value AS TEXT), '?') AS room,
-                   COUNT(*) AS n
+            SELECT CASE WHEN length(CAST(wm.string_value AS BLOB)) > {CELL_BYTES}
+                        THEN NULL ELSE COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
+                            CAST(wm.float_value AS TEXT), '?') END AS wing,
+                   CASE WHEN length(CAST(rm.string_value AS BLOB)) > {CELL_BYTES}
+                        THEN NULL ELSE COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
+                            CAST(rm.float_value AS TEXT), '?') END AS room,
+                   COUNT(*) AS n,
+                   length(CAST(wm.string_value AS BLOB)), length(CAST(rm.string_value AS BLOB))
             {_DRAWERS_SQL}
             LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
             LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
             WHERE c.name = ? AND {not_bookkeeping_sql(conn)}
-            GROUP BY wing, room
+            GROUP BY wm.string_value, wm.int_value, wm.float_value,
+                     rm.string_value, rm.int_value, rm.float_value
             """,
             (collection_name,),
-        ).fetchall()
-        total = 0
-        wing_rooms: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        for wing, room, n in rows:
-            wing_rooms[decode_value(wing)][decode_value(room)] += int(n)
-            total += int(n)
-        return total, wing_rooms
+        )
+        tally = Tally()
+        for wing, room, n, wl, rl in rows:
+            if (wl or 0) > CELL_BYTES or (rl or 0) > CELL_BYTES:
+                raise OverviewError("overview_too_large")
+            tally.add(decode_value(wing), decode_value(room), int(n))
+        return tally.result()
 
     return _read_db(palace_path, read, busy=True)
 
@@ -1532,3 +1537,72 @@ def sqlite_drawer_rows(
             return direct, _scalar_rows(rows)
     except (sqlite3.Error, ValueError):
         return None
+
+
+def sqlite_overview_metadata(palace_path, collection_name, where=None):
+    """Presence-preserving projected batches from one recovery-checked snapshot.
+
+    Selected-key filtering belongs in LEFT JOIN ON. SQL length guards suppress
+    oversized values before Python acquires them; unrelated payloads are absent.
+    """
+    from ..overview import CELL_BYTES, KEYS, OverviewError, Tally, projected_batches
+
+    db_path = _db_file(palace_path)
+    if db_path is None:
+        return None
+    aliases = None
+    if where:
+        if (
+            set(where) != {"wing"}
+            or not isinstance(where["wing"], dict)
+            or set(where["wing"]) != {"$in"}
+        ):
+            raise OverviewError("overview_unavailable")
+        aliases = list(dict.fromkeys(where["wing"]["$in"]))
+        budget = Tally()
+        for name in aliases:
+            if not isinstance(name, str) or len(name.encode("utf-8")) > CELL_BYTES:
+                raise OverviewError("overview_too_large")
+            budget.add(name, "")
+
+    def rows():
+        conn = open_palace_reader(db_path)
+        try:
+            conn.execute("BEGIN")
+            if _sqlite_ready_metadata_segment(conn, collection_name) is None:
+                raise MetadataRecoveryPending("metadata recovery pending")
+            scope = f"SELECT e.id {_DRAWERS_SQL} WHERE c.name = ?"
+            params = [collection_name]
+            if aliases is not None:
+                scope += f" AND e.id IN (SELECT id FROM embedding_metadata WHERE key = 'wing' AND string_value IN ({_marks(aliases)}))"
+                params.extend(encode_filter(a) for a in aliases)
+            keys = [*KEYS, FLAG]
+            present = set(_metadata_value_columns(conn))
+            columns = ", ".join(
+                f"m.{col}" if col in present else "NULL"
+                for col in ("int_value", "float_value", "bool_value")
+            )
+            cursor = conn.execute(
+                f"""SELECT ids.id, m.key,
+                CASE WHEN length(CAST(m.string_value AS BLOB)) <= {CELL_BYTES} THEN m.string_value ELSE NULL END,
+                {columns}, length(CAST(m.string_value AS BLOB))
+                FROM ({scope}) ids LEFT JOIN embedding_metadata m
+                ON m.id = ids.id AND m.key IN ({_marks(keys)}) ORDER BY ids.id""",
+                [*params, *keys],
+            )
+            current_id, meta = None, {}
+            for row_id, key, sval, ival, fval, bval, length in cursor:
+                if row_id != current_id:
+                    if current_id is not None:
+                        yield decode_record(None, meta)[1]
+                    current_id, meta = row_id, {}
+                if length is not None and length > CELL_BYTES:
+                    raise OverviewError("overview_too_large")
+                if key is not None:
+                    meta[key] = _cell_value(sval, ival, fval, bval)
+            if current_id is not None:
+                yield decode_record(None, meta)[1]
+        finally:
+            conn.close()
+
+    return projected_batches(rows())

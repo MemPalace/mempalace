@@ -173,7 +173,7 @@ def _where_uses_only_cached_keys(where: Optional[dict]) -> bool:
 def _equality_where_sql(
     where: Optional[dict], *, locus_columns: bool = True
 ) -> Optional[tuple[str, list]]:
-    """Push equality, ``$eq`` / ``$in`` and ``$and`` of them into SQL, else ``None``.
+    """Push equality, ``$eq`` / ``$ne`` / ``$in`` and ``$and`` into SQL, else ``None``.
 
     ``None`` means the filter needs the Python ``matches_where`` path
     (``$or``, comparisons, ``$contains``, ``None`` operands, non-identifier keys).
@@ -211,6 +211,11 @@ def _equality_where_sql(
         if op == "$eq" and _pushable_scalar(operand):
             clauses.append(f"{expr} = ?")
             params.append(encode_filter(expected)["$eq"])
+        elif op == "$ne" and _pushable_scalar(operand):
+            # matches_where treats a missing key as None, which is unequal
+            # to a non-null scalar. SQL's NULL comparison needs this arm.
+            clauses.append(f"({expr} IS NULL OR {expr} != ?)")
+            params.append(encode_filter(expected)["$ne"])
         elif (
             op == "$in"
             and isinstance(operand, (list, tuple))
@@ -296,29 +301,29 @@ def sqlite_wing_room_counts(
                 " AND COALESCE(json_extract(metadata_json, '$.is_sentinel'), 0)"
                 " NOT IN (1, 'true', 'True', '1')"
             )
-            total_row = conn.execute(
-                f"SELECT COUNT(*) FROM documents WHERE collection_id = ? AND {not_bookkeeping}",
-                (collection_id,),
-            ).fetchone()
-            total = int(total_row[0]) if total_row and total_row[0] is not None else 0
-            wing_rooms: dict[str, dict[str, int]] = {}
+            from ..overview import CELL_BYTES, OverviewError, Tally
+
+            tally = Tally()
             locus = _documents_has_locus_columns(conn)
             wing_expr = "wing" if locus else "json_extract(metadata_json, '$.wing')"
             room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
-            for wing, room, n in conn.execute(
-                f"""
-                SELECT {wing_expr}, {room_expr}, COUNT(*)
-                FROM documents
-                WHERE collection_id = ? AND {not_bookkeeping}
-                GROUP BY 1, 2
-                """,
+            for wing, room, n, wl, rl in conn.execute(
+                f"""SELECT
+                  CASE WHEN length(CAST({wing_expr} AS BLOB)) <= {CELL_BYTES} THEN {wing_expr} END,
+                  CASE WHEN length(CAST({room_expr} AS BLOB)) <= {CELL_BYTES} THEN {room_expr} END,
+                  COUNT(*), length(CAST({wing_expr} AS BLOB)), length(CAST({room_expr} AS BLOB))
+                  FROM documents WHERE collection_id = ? AND {not_bookkeeping}
+                  GROUP BY {wing_expr}, {room_expr}""",
                 (collection_id,),
             ):
-                wkey = "?" if wing is None else str(decode_value(wing))
-                rkey = "?" if room is None else str(decode_value(room))
-                dest = wing_rooms.setdefault(wkey, {})
-                dest[rkey] = dest.get(rkey, 0) + int(n)
-            return total, wing_rooms
+                if (wl or 0) > CELL_BYTES or (rl or 0) > CELL_BYTES:
+                    raise OverviewError("overview_too_large")
+                tally.add(
+                    "?" if wing is None else str(decode_value(wing)),
+                    "?" if room is None else str(decode_value(room)),
+                    int(n),
+                )
+            return tally.result()
         finally:
             conn.close()
     except sqlite3.Error:

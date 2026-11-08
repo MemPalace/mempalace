@@ -406,6 +406,26 @@ class _QdrantRESTClient:
         self.request("DELETE", f"/collections/{urlparse.quote(collection, safe='')}")
 
 
+def _membership_condition(key: str, values: list) -> dict:
+    """Keep MatchAny keyword/integer lists homogeneous; booleans match singly."""
+    strings = [v for v in values if type(v) is str]
+    integers = [v for v in values if type(v) is int]
+    conditions = []
+    for group in (strings, integers):
+        if group:
+            conditions.append({"key": key, "match": {"any": group}})
+    for value in values:
+        if type(value) is bool:
+            conditions.append({"key": key, "match": {"value": value}})
+        elif type(value) is float:
+            conditions.append({"key": key, "range": {"gte": value, "lte": value}})
+        elif type(value) not in (str, int):
+            raise UnsupportedCapabilityError("unsupported membership operand")
+    if not conditions:
+        return {"key": key, "match": {"any": []}}
+    return conditions[0] if len(conditions) == 1 else {"should": conditions}
+
+
 def _condition(field: str, expression: Any) -> tuple[Optional[dict], list[dict]]:
     key = f"{_PAYLOAD_METADATA}.{field}"
     if isinstance(expression, dict):
@@ -417,9 +437,9 @@ def _condition(field: str, expression: Any) -> tuple[Optional[dict], list[dict]]
             elif op == "$ne":
                 must_not.append({"key": key, "match": {"value": operand}})
             elif op == "$in":
-                conditions.append({"key": key, "match": {"any": operand or []}})
+                conditions.append(_membership_condition(key, operand or []))
             elif op == "$nin":
-                must_not.append({"key": key, "match": {"any": operand or []}})
+                must_not.append(_membership_condition(key, operand or []))
             elif op in ("$gt", "$gte", "$lt", "$lte"):
                 range_key = {"$gt": "gt", "$gte": "gte", "$lt": "lt", "$lte": "lte"}[op]
                 conditions.append({"key": key, "range": {range_key: operand}})

@@ -140,7 +140,7 @@ from ..knowledge_graph import (  # noqa: E402
     visibility,
 )
 from ..logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
-from ..metadata_types import BOOKKEEPING_WHERE, is_bookkeeping  # noqa: E402
+from ..metadata_types import is_bookkeeping  # noqa: E402
 from ..palace_graph import (  # noqa: E402
     GraphUnavailable,
     _load_tunnels as _load_graph_tunnels,
