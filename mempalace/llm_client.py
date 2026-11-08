@@ -523,6 +523,7 @@ class OpenAICompatProvider(LLMProvider):
             timeout=timeout,
             api_key_source=source,
         )
+        self._send_temperature = True
 
     def _resolve_url(self) -> str:
         if not self.endpoint:
@@ -595,6 +596,10 @@ class OpenAICompatProvider(LLMProvider):
         exactly that at 8192 reasoning tokens. ``reasoning_effort`` is the
         OpenAI field for this and the servers above honor it; a server that
         rejects unknown fields with HTTP 400 gets one retry without it.
+
+        OpenAI's reasoning models accept only the default ``temperature``. An
+        HTTP 400 that names the field drops it and later calls on this provider
+        skip it, so they do not repeat a request that would fail.
         """
         body: dict = {
             "model": self.model,
@@ -602,8 +607,9 @@ class OpenAICompatProvider(LLMProvider):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0.1,
         }
+        if self._send_temperature:
+            body["temperature"] = 0.1
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         if think is False:
@@ -613,13 +619,20 @@ class OpenAICompatProvider(LLMProvider):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         url = self._resolve_url()
-        try:
-            data = post_json(url, body, headers=headers, timeout=self.timeout)
-        except LLMError as e:
-            if "reasoning_effort" not in body or "HTTP 400" not in str(e):
-                raise
-            body.pop("reasoning_effort")
-            data = post_json(url, body, headers=headers, timeout=self.timeout)
+        while True:
+            try:
+                data = post_json(url, body, headers=headers, timeout=self.timeout)
+                break
+            except LLMError as e:
+                if "HTTP 400" not in str(e):
+                    raise
+                if "temperature" in body and "temperature" in str(e):
+                    body.pop("temperature")
+                    self._send_temperature = False
+                elif "reasoning_effort" in body:
+                    body.pop("reasoning_effort")
+                else:
+                    raise
         try:
             choice = data["choices"][0]
             text = choice["message"]["content"]
