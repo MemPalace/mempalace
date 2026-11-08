@@ -873,6 +873,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "wing": {"type": "string", "description": "Filter by wing (optional)"},
                 "room": {"type": "string", "description": "Filter by room (optional)"},
                 "since": {

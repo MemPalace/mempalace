@@ -550,12 +550,35 @@ def test_worker_jsonrpc_error_preserves_envelope(world, tool, args):
     workers.call_tool.return_value = {"facts": []}
     mediator = Mediator(Mock(), workers)
     mediator.gateway = world.gateway
-    assert (
-        mediator._tools_call(
-            world.principal, {"id": 1, "params": {"name": tool, "arguments": args}}
+    if tool == "mempalace_list_drawers":
+        # Match production's cold workspace-store initialization seam.
+        world.gateway.handoff.store_for = world.opener
+        from commonplace.gateway import _tool_response
+
+        workers.post.return_value = _tool_response(
+            "commonplace-page-validation",
+            {"drawers": [], "total": 0, "count": 0, "offset": 0, "limit": 20},
         )
-        is response
+    actual = mediator._tools_call(
+        world.principal, {"id": 1, "params": {"name": tool, "arguments": args}}
     )
+    if tool == "mempalace_list_drawers":
+        # Incomplete membership proof has a fixed empty public page. The
+        # malformed metadata probe must never fall back to an unscoped read.
+        from commonplace.gateway import _tool_result
+
+        assert _tool_result(actual) == {
+            "drawers": [],
+            "total": 0,
+            "count": 0,
+            "offset": 0,
+            "limit": 20,
+        }
+        workers.post.assert_called_once()
+        assert workers.post.call_args.args[1]["params"]["arguments"]["thread_scope"]["allow"] == []
+        assert workers.call_tool.call_args.args[1] == "mempalace_get_taxonomy"
+    else:
+        assert actual is response
 
 
 def test_hidden_related_fact_keeps_committed_result(world):

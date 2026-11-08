@@ -433,6 +433,8 @@ class Mediator:
         args = params.get("arguments")
         from mempalace.stored_text import user_tool_arguments
 
+        from .handoff.drawer_pages import PageArgumentError
+
         args = user_tool_arguments(dict(args), tool_name=name) if isinstance(args, dict) else {}
         supplied_rules_seq = args.pop("rules_seq", None)
         policy = principal.policy
@@ -481,6 +483,8 @@ class Mediator:
         try:
             _check_argument_types(args)
             plan = getattr(self, f"_before_{rule}")(principal, name, args, notes)
+        except PageArgumentError as exc:
+            return {"jsonrpc": "2.0", "id": req_id, "error": exc.error}
         except Hidden as exc:
             self._audit(
                 principal, name, "deny", "hidden drawer", target_ids=_target_ids(args, None)
@@ -545,18 +549,7 @@ class Mediator:
             except Exception as exc:
                 # Optional import search fails closed; preserve ordinary results.
                 logger.error("Imported-history search failed (%s)", type(exc).__name__)
-        from .handoff.mirror_access import gate
-
-        committed_result = None
-        if isinstance(response, dict) and "result" in response:
-            result = committed_result = _tool_result(response)
-            cleaned = gate(self.gateway, principal, rule, result)
-            if cleaned is not result:
-                response = (
-                    _replace_result(response, cleaned)
-                    if isinstance(response.get("result"), dict)
-                    else _tool_response(req_id, cleaned)
-                )
+        response, committed_result = self._gate_response(principal, name, rule, req_id, response)
 
         if classify_tool(name) != "read":
             result = committed_result
@@ -570,6 +563,27 @@ class Mediator:
                 target_ids=_target_ids(args, result),
             )
         return response
+
+    def _gate_response(self, principal, name, rule, req_id, response):
+        """Apply the final read boundary while retaining the committed result for audit."""
+        from .handoff.mirror_access import gate
+
+        committed_result = None
+        if isinstance(response, dict) and "result" in response:
+            result = committed_result = _tool_result(response)
+            cleaned = gate(self.gateway, principal, rule, result)
+            if name == "mempalace_list_drawers":
+                from .handoff.drawer_pages import finish_page
+
+                cleaned = finish_page(result, cleaned)
+            if cleaned is not result:
+                response = (
+                    _replace_result(response, cleaned)
+                    if isinstance(response.get("result"), dict)
+                    else _tool_response(req_id, cleaned)
+                )
+
+        return response, committed_result
 
     def _audit(self, principal, tool, decision, reason="", wing=None, target_ids=()):
         from commonplace.rules.enforce import audit
@@ -639,24 +653,20 @@ class Mediator:
             and policy.has_scope("memory:import:read")
             and name in ("mempalace_list_drawers", "mempalace_list_rooms")
         ):
-            recall = self._reader_recall(principal)
-            drawers = (
-                []
-                if recall is None
-                else recall.import_listing(
-                    principal,
-                    limit=max(1, min(int(args.get("limit", 20)), 100)),
-                    offset=max(0, min(int(args.get("offset", 0)), 100)),
-                    room=args.get("room"),
-                )
-            )
-            if args.get("since") or args.get("before"):
-                drawers = []  # An unproved date cannot match an explicit window.
-            if name == "mempalace_list_rooms":
-                return {
-                    "respond": {"wing": "private_chats", "rooms": {d["room"]: 1 for d in drawers}}
-                }
-            return {"respond": {"drawers": drawers, "count": len(drawers)}}
+            return self._before_import_listing(principal, name, args)
+        if name == "mempalace_list_drawers":
+            if not policy.sees_all_wings:
+                wing = args.get("wing") or _only_literal_wing(policy)
+                if not wing:
+                    raise Denied(f"pass a wing: this connection reads {_wings_text(policy)}")
+                if not policy.can_read_wing(wing):
+                    raise Denied(f"this connection can't read wing {wing!r}")
+                args["wing"] = wing
+            from .handoff.drawer_pages import finish_page, project
+
+            result = project(self.gateway, principal, self.workers, args)
+            response = self._after(principal, name, "read_wing", args, _tool_response(None, result))
+            return {"respond": finish_page(result, _tool_result(response))}
         if policy.sees_all_wings:
             return None
         wing = args.get("wing")
@@ -668,6 +678,72 @@ class Mediator:
         if not policy.can_read_wing(wing):
             raise Denied(f"this connection can't read wing {wing!r}")
         return None
+
+    def _before_import_listing(self, principal, name, args):
+        from .handoff.drawer_pages import PageArgumentError, _prepare_page
+        from .rules import checks
+
+        empty = (
+            {"wing": "private_chats", "rooms": {}}
+            if name == "mempalace_list_rooms"
+            else {"drawers": [], "count": 0}
+        )
+        timeout = WORKER_TIMEOUT_S
+        try:
+            with checks.deadline(timeout):
+                prepared = _prepare_page(
+                    principal,
+                    self.workers,
+                    {**args, "wing": "private_chats"},
+                    checks.remaining(timeout),
+                )
+                if (
+                    isinstance(prepared, dict)
+                    and set(prepared) == {"error"}
+                    and isinstance(prepared["error"], str)
+                ):
+                    return {"respond": prepared}
+                if (
+                    not isinstance(prepared, dict)
+                    or set(prepared) != {"drawers", "total", "count", "offset", "limit"}
+                    or prepared.get("drawers") != []
+                    or prepared.get("total") != 0
+                    or prepared.get("count") != 0
+                    or type(prepared.get("limit")) is not int
+                    or not 1 <= prepared["limit"] <= 100
+                    or type(prepared.get("offset")) is not int
+                    or prepared["offset"] < 0
+                ):
+                    return {"respond": empty}
+                context = getattr(self.gateway, "handoff", None)
+                if context is not None:
+                    context.store_for(principal.workspace_id)
+                recall = self._reader_recall(principal)
+                drawers = (
+                    []
+                    if recall is None
+                    else recall.import_listing(
+                        principal,
+                        limit=prepared["limit"],
+                        offset=prepared["offset"],
+                        room=args.get("room"),
+                    )
+                )
+                if args.get("since") or args.get("before"):
+                    drawers = []  # Valid windows still require a proved import date.
+                checks.remaining(0)
+                if name == "mempalace_list_rooms":
+                    return {
+                        "respond": {
+                            "wing": "private_chats",
+                            "rooms": {d["room"]: 1 for d in drawers},
+                        }
+                    }
+                return {"respond": {"drawers": drawers, "count": len(drawers)}}
+        except PageArgumentError:
+            raise
+        except Exception:
+            return {"respond": empty}
 
     def _before_search(self, principal, name, args, notes):
         requested = args.get("wings")

@@ -1196,6 +1196,7 @@ def sqlite_list_id_metadata(
     collection_name: str,
     where: Optional[dict] = None,
     *,
+    ids: Optional[list[str]] = None,
     _connection=None,
 ) -> Optional[tuple[list[str], list[dict]]]:
     """All matching drawer ids + metadata from sqlite, without opening HNSW.
@@ -1243,7 +1244,16 @@ def sqlite_list_id_metadata(
                     f"AND {alias}.key = ? AND {alias}.string_value IN ({_marks(values)})"
                 )
                 params.extend([key, *(encode_filter(v) for v in values)])
+            identity_filter = ""
+            if ids is not None:
+                if not ids:
+                    return [], []
+                if len(ids) > 500:
+                    raise ValueError("metadata identity batch exceeds 500")
+                identity_filter = f"AND e.embedding_id IN ({_marks(ids)})"
             params.append(collection_name)
+            if ids is not None:
+                params.extend(ids)
             rows = conn.execute(
                 f"""
                 SELECT e.embedding_id, m.key, {", ".join("m." + c for c in value_columns)}
@@ -1251,7 +1261,7 @@ def sqlite_list_id_metadata(
                 {" ".join(joins)}
                 LEFT JOIN embedding_metadata m
                     ON m.id = e.id AND substr(m.key, 1, 7) != 'chroma:'
-                WHERE c.name = ?
+                WHERE c.name = ? {identity_filter}
                 ORDER BY e.id
                 """,
                 params,

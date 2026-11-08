@@ -1731,6 +1731,53 @@ def tool_get_drawers(drawer_ids: list):
     }
 
 
+def _drawer_page_remaining(allowed, end):
+    from time import monotonic
+
+    if allowed is not None and monotonic() >= end:
+        raise TimeoutError("drawer page deadline expired")
+
+
+def _hydrate_scoped_drawer_page(page, allowed, end, *, col=None, connection=None):
+    if allowed is None:
+        if connection is not None:
+            return _fill_drawer_previews_from_sqlite(page, connection=connection)
+        _fill_drawer_previews(col, page)
+        return True
+    from ..backends.chroma_sqlite import sqlite_documents_for_ids
+    from ..read_scope import descriptor
+
+    physical = _page_physical_ids(page)
+    documents = {}
+    for start in range(0, len(physical), 500):
+        _drawer_page_remaining(allowed, end)
+        batch = physical[start : start + 500]
+        if connection is not None:
+            fetched = sqlite_documents_for_ids(
+                _config.palace_path, _config.collection_name, batch, _connection=connection
+            )
+            if fetched is None:
+                raise ValueError("drawer documents unavailable")
+            documents.update(fetched)
+        else:
+            fetched = col.get(ids=batch, include=["metadatas", "documents"])
+            keys, metas, docs = fetched["ids"], fetched["metadatas"], fetched["documents"]
+            if (
+                len(keys) != len(metas)
+                or len(keys) != len(docs)
+                or len(keys) != len(batch)
+                or set(keys) != set(batch)
+            ):
+                raise ValueError("drawer hydration incomplete")
+            for key, meta, doc in zip(keys, metas, docs):
+                if allowed.get(key) != descriptor(key, meta):
+                    raise ValueError("drawer association changed")
+                documents[key] = doc or ""
+    _drawer_page_remaining(allowed, end)
+    _apply_drawer_previews(page, documents)
+    return True
+
+
 def tool_list_drawers(
     wing: str = None,
     room: str = None,
@@ -1738,6 +1785,7 @@ def tool_list_drawers(
     before: str = None,
     limit: int = 20,
     offset: int = 0,
+    thread_scope: dict = None,
 ):
     """List logical drawers with pagination.
 
@@ -1762,12 +1810,49 @@ def tool_list_drawers(
     except ValueError as e:
         return {"error": str(e)}
 
+    empty = {"drawers": [], "total": 0, "count": 0, "offset": offset, "limit": limit}
+    allowed, end = None, None
+    if thread_scope is not None:
+        from ..read_scope import valid_descriptors
+
+        if (
+            not isinstance(thread_scope, dict)
+            or set(thread_scope) != {"allow", "timeout"}
+            or not isinstance(thread_scope["allow"], list)
+            or not all(valid_descriptors(batch) for batch in thread_scope["allow"])
+        ):
+            return empty
+        from time import monotonic
+
+        budget = thread_scope["timeout"]
+        if not isinstance(budget, (int, float)) or not 0 < budget <= 660:
+            return empty
+        end = monotonic() + budget
+        allowed = {row["id"]: row for batch in thread_scope["allow"] for row in batch}
+        if not allowed:
+            return empty
+
     try:
+
+        def remaining():
+            if allowed is not None and monotonic() >= end:
+                raise TimeoutError("drawer page deadline expired")
+
         known = _palace_known_wings() if wing else frozenset()
         where = build_where_filter(wing, room, known=known) or None
 
         def make_page(ids, metadatas):
-            kept = [(i, m) for i, m in zip(ids, metadatas) if not is_bookkeeping(m, i)]
+            from ..read_scope import descriptor
+
+            remaining()
+            if len(ids) != len(metadatas):
+                raise ValueError("incomplete drawer metadata")
+            kept = [
+                (i, m)
+                for i, m in zip(ids, metadatas)
+                if not is_bookkeeping(m, i)
+                and (allowed is None or i in allowed and allowed[i] == descriptor(i, m))
+            ]
             drawers = _collapse_drawer_rows([i for i, _ in kept], [], [m for _, m in kept])
             if since_dt is not None or before_dt is not None:
                 drawers = [
@@ -1793,24 +1878,64 @@ def tool_list_drawers(
             # share a recovered SQLite snapshot. Close it before any SDK fallback.
             with sqlite_metadata_snapshot(_config.palace_path, _config.collection_name) as conn:
                 if conn is not None:
-                    listed = sqlite_list_id_metadata(
-                        _config.palace_path, _config.collection_name, where=where, _connection=conn
-                    )
+                    if allowed is None:
+                        listed = sqlite_list_id_metadata(
+                            _config.palace_path,
+                            _config.collection_name,
+                            where=where,
+                            _connection=conn,
+                        )
+                    else:
+                        conn.set_progress_handler(lambda: int(monotonic() >= end), 1000)
+                        listed = ([], [])
+                        keys = list(allowed)
+                        for start in range(0, len(keys), 500):
+                            remaining()
+                            batch = sqlite_list_id_metadata(
+                                _config.palace_path,
+                                _config.collection_name,
+                                where=where,
+                                ids=keys[start : start + 500],
+                                _connection=conn,
+                            )
+                            if batch is None:
+                                raise ValueError("drawer metadata unavailable")
+                            listed[0].extend(batch[0])
+                            listed[1].extend(batch[1])
                     if listed is not None:
                         result = make_page(*listed)
-                        if _fill_drawer_previews_from_sqlite(result["drawers"], connection=conn):
+                        if _hydrate_scoped_drawer_page(
+                            result["drawers"], allowed, end, connection=conn
+                        ):
                             return result
 
         col = _get_collection()
         if not col:
-            return _collection_error_or_no_palace()
-        ids, _documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
+            return empty if allowed is not None else _collection_error_or_no_palace()
+        if allowed is None:
+            ids, _documents, metadatas = _fetch_drawer_rows(
+                col, where=where, page_size=500, include=["metadatas"]
+            )
+        else:
+            ids, metadatas = [], []
+            keys = list(allowed)
+            for start in range(0, len(keys), 500):
+                remaining()
+                fetched = col.get(
+                    ids=keys[start : start + 500],
+                    include=["metadatas"],
+                    **({"where": where} if where else {}),
+                )
+                if len(fetched["ids"]) != len(fetched["metadatas"]):
+                    raise ValueError("incomplete drawer metadata")
+                ids.extend(fetched["ids"])
+                metadatas.extend(fetched["metadatas"])
         result = make_page(ids, metadatas)
-        _fill_drawer_previews(col, result["drawers"])
+        _hydrate_scoped_drawer_page(result["drawers"], allowed, end, col=col)
         return result
     except Exception as e:
         logger.exception("tool_list_drawers failed")
-        return {"error": str(e)}
+        return empty if thread_scope is not None else {"error": str(e)}
 
 
 # Stamps that say how the source file was read. Text a caller writes into a
