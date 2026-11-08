@@ -19,6 +19,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   those found through the candidate-name fallback, and no existing key changes.
   `kg_timeline` and `query_relationship` facts gain the `id`. (#2184)
 
+### Security
+
+- Wake-up text and Hermes prefetch results now mark stored memory as reference
+  data inside a fence that stored words cannot close, so a mined file or
+  transcript cannot pose as instructions in the system prompt. The stored words
+  themselves are unchanged. The memory protocol says the same to agents.
+
 ### Fixed
 
 - The `wing` in `mempalace.yaml` is validated when a project is mined, so a
