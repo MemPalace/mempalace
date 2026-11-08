@@ -17,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A torn `index_metadata.pickle` read no longer quarantines a live HNSW
+  segment. When a metadata load fails with an error outside the
+  known-transient set, the guard now re-checks the file up to six times
+  50 ms apart and only quarantines it when the bytes stay identical and
+  the load keeps failing; a file that is still being rewritten is left
+  alone for the next open to re-check once it has settled.
 - The `wing` in `mempalace.yaml` is validated when a project is mined, so a
   cloned repository's config cannot hang the miner with a yaml alias structure
   or file drawers under unsafe text, a number or a list. A rejected name becomes
