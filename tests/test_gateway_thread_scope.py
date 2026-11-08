@@ -305,13 +305,13 @@ def test_u3_m_scrub_provenance_before_early_return_and_every_dict(env):
     }
     result = access_mod.gate(env.gateway, env.principal, "kg_read", response)
     first, mixed = result["facts"]
-    assert first == {"fact": "neutral", "source_seq_start": 4, "sources": [{"source_seq_end": 5}]}
+    assert first == {"fact": "neutral", "sources": [{}]}
     assert (
         "source_closet" not in mixed
         and "source_seq_start" not in mixed
         and mixed["sources"] == [{"source_thread": own.id}]
     )
-    assert result["other"] == {"source_seq_end": 8}
+    assert result["other"] == {}
 
 
 @pytest.mark.parametrize("role", ["owner", "member"])

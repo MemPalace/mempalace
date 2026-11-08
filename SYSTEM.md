@@ -1617,3 +1617,14 @@ This fixes a measured fallback defect. Production worker memory attribution
 remains open. Other full metadata consumers, including delete-by-source and the
 palace-graph fallback, and model/vector allocations remain separate candidates.
 Storage format and verbatim drawer retrieval are unchanged.
+### Outgoing provenance aliases and coherent ranges
+
+Outgoing memory responses clean `source.thread` and `source_kept.thread` bundles through the existing workspace provenance authority, including readable private-chat source identities. Missing, malformed, hidden or unproved token parents omit the nested bundle; non-null flat `source_seq_start` and `source_seq_end` are omitted only when the provenance pass leaves `source_thread` absent or None. Token-free flat parents and ranges retain their existing wing-policy semantics (the accepted external-id residual); token-free nested bundles retain their existing wing-policy semantics. Readable bundles and verbatim drawer text are retained, including idempotent retries and independent batch siblings. Memory conversion consumes this cleaned metadata. Projection never changes stored bytes or adds a write refusal for old provenance. Typed citations and token-free plain `source_file` proof retain their existing semantics. Non-dict nested `source`/`source_kept` values retain their existing behavior: no current producer emits these shapes, and their potential token exposure remains a residual.
+
+Alias-only nested bundles use `source_thread` when `thread` is absent and require the same provenance authority, including token-free compatibility. Only provenance-shaped nested bundles containing `thread`, `seq_start`, `seq_end` or their `source_` aliases are scrubbed. Tunnel wing/room endpoints without a drawer id remain unchanged; source and target endpoints carrying `drawer_id` require a current readable drawer association or the entire endpoint is omitted. A pre-existing residual remains in KG projection: a readable private-source primary can be omitted when a readable native `thr_` secondary is present; this slice does not change that behavior.
+
+Accepted endpoint residual: on non-Chroma backends, a readable chunked drawer's logical handle omits its endpoint because association proof supports exact physical ids only, even when get reconstructs the drawer. This inherits the limit in “Current typed provenance association proof” above (logical handles lack ordered snapshot enumeration); no broader proof is added here.
+
+Dependent non-null sequence values are omitted when their parent provenance is missing, hidden or unproved; earlier gateway expectations that retained orphan ranges are updated to this rule.
+
+Tunnel reads also inherit the earlier whole-record tunnel projection: malformed, unresolved or non-Chroma logical drawer descriptors can remove the entire tunnel before this final endpoint scrub.

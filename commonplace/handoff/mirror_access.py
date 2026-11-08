@@ -252,6 +252,38 @@ def scrub_provenance(node, access):
             if out is node:
                 out = dict(node)
             out.pop(key, None)
+    # Flat ranges follow the existing provenance pass, preserving token-free
+    # legacy parents. Nested aliases require a complete protected reference.
+    if out.get("source_thread") is None:
+        keys = {k for k in ("source_seq_start", "source_seq_end") if out.get(k) is not None}
+        if keys:
+            out = {key: value for key, value in out.items() if key not in keys}
+    for key in ("source", "source_kept"):
+        bundle = out.get(key)
+        if (
+            isinstance(bundle, dict)
+            and bundle.keys()
+            & {
+                "thread",
+                "seq_start",
+                "seq_end",
+                "source_thread",
+                "source_seq_start",
+                "source_seq_end",
+            }
+            and not _proved_thread(bundle.get("thread", bundle.get("source_thread")), access)
+        ):
+            out = {name: value for name, value in out.items() if name != key}
+    for key in ("source", "target"):
+        endpoint = out.get(key)
+        if isinstance(endpoint, dict) and "drawer_id" in endpoint:
+            identifier = endpoint["drawer_id"]
+            if (
+                not isinstance(identifier, str)
+                or not identifier
+                or not access.association("drawer", identifier)
+            ):
+                out = {name: value for name, value in out.items() if name != key}
     return out
 
 
@@ -296,6 +328,19 @@ def _hallway_text_visible(value, access):
         return True
     except TimeoutError:
         return False
+
+
+def _proved_thread(value, access):
+    parsed = access.parse(value)
+    return (
+        parsed is not provenance_refs.REFUSE
+        and bool(parsed.text)
+        and (
+            not parsed.tokens
+            or parsed.text in parsed.tokens
+            and all(access.reference(token) for token in parsed.tokens)
+        )
+    )
 
 
 def gate(gateway, principal, rule, result, *, access=None):

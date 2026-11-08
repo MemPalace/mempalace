@@ -50,6 +50,7 @@ Format (read by `commonplace orch docs-check`):
   - Graph documentation describes SQLite affinity, native Compact values and read-only legacy schema ordering.
 
   - Documents backend graph order, numeric locus text parity and explicit tunnel compatibility residuals.
+  - Outgoing provenance aliases and ranges document token-free compatibility, orphan-range removal and accepted endpoint proof limits.
 
   - Consented private-chat drawer listings validate page arguments with the worker before listing imports, forwarding the normalized limit and offset unchanged.
 
@@ -563,6 +564,7 @@ Format (read by `commonplace orch docs-check`):
   - Graph parity fixtures include generated and absent locus schemas, Compact native values and large integers.
 
   - Graph compatibility witnesses distinguish required RED regressions from Chroma and old-base parity guards.
+  - Outgoing alias tests cover token-free retry compatibility, short/flat alias proof, hidden storage equality, plain/chunked endpoints and orphan ranges. The focused set includes gateway thread scope and unchanged fact-save compatibility; drawer-search guards claim text preservation only.
 
   - Consented private-chat drawer listings validate page arguments with the worker before listing imports, forwarding the normalized limit and offset unchanged.
 
@@ -1267,6 +1269,7 @@ Format (read by `commonplace orch docs-check`):
   - Graph mediation validates and rechecks the descriptor-bound SQLite sort values before traversal and ranking.
 
   - Graph traversal and ranking preserve backend sibling order before caps; grouped stats preserve their distinct tie convention.
+  - Outgoing source/source_kept bundles share provenance authority for short and source_ aliases, retaining token-free parents under wing policy. Non-null orphan ranges are removed; null keys remain. Source/target drawer endpoints require association proof. Non-Chroma chunked logical endpoints are an accepted residual under the exact-physical-id limit in SYSTEM.md, “Current typed provenance association proof”. Non-dict nested provenance and mixed private-primary/native-secondary KG projection remain residuals.
 
   - Literal-wing drawer readers retain proved visible totals after import-aware metadata scrubbing; page arguments share worker schema defaults and error forms.
 
