@@ -27,7 +27,7 @@ def _response_safe_meta(meta):
     safe_meta = public_metadata(_safe_meta(meta))
     if not safe_meta.get("last_modified") and safe_meta.get("filed_at"):
         safe_meta["last_modified"] = safe_meta["filed_at"]
-    if safe_meta.get("source_file"):
+    if safe_meta.get("source_file") and _provenance.current() is None:
         safe_meta["source_file"] = Path(safe_meta["source_file"]).name
     # ``source_dir_ino`` is bookkeeping for ``sync``, which reads the metadata
     # directly. It says nothing a caller can use and it describes the host's
@@ -38,6 +38,83 @@ def _response_safe_meta(meta):
     # passes a record it goes on to write through here today.
     safe_meta.pop("source_dir_ino", None)
     return safe_meta
+
+
+def read_associations(kind: str, identifier: str, expect=None):
+    """Read complete current metadata only; never create optional collections.
+
+    Physical ids take precedence over logical handles, as in drawer reads.
+    Chroma proves every chunk, including legacy parents, in a read snapshot.
+    Other backends support exact physical ids only, failing closed for logical
+    handles. A second request compares the concrete descriptors.
+    """
+    if kind not in {"drawer", "closet"} or not isinstance(identifier, str) or not identifier:
+        return {"associations": None}
+    if _is_chroma_backend():
+        from ..backends.chroma_sqlite import sqlite_drawer_rows
+
+        found = sqlite_drawer_rows(
+            _config.palace_path,
+            "mempalace_closets" if kind == "closet" else _config.collection_name,
+            drawer_id=identifier,
+            metadata_only=True,
+            logical=kind == "drawer",
+        )
+        if found is None:
+            return {"associations": None}
+        rows = [_association_descriptor(rid, meta) for rid, _, meta in found[1]]
+    else:
+        from ..palace import get_closets_collection, get_collection
+
+        if kind == "closet":
+            col = get_closets_collection(_config.palace_path, create=False, read_only=True)
+        else:
+            col = get_collection(
+                _config.palace_path,
+                collection_name=_config.collection_name,
+                create=False,
+                backend=_selected_backend_name(),
+                read_only=True,
+            )
+        found = col.get(ids=[identifier], include=["metadatas"])
+        rows = _association_descriptors(found)
+        if not rows and kind == "drawer":
+            # The generic collection contract has no ordering or snapshot token.
+            # Even an empty terminal page cannot prove that offset paging did
+            # not skip a chunk during concurrent changes. Keep exact physical
+            # ids supported, but omit logical citations without complete proof.
+            return {"associations": None}
+
+    rows.sort(key=lambda row: row["id"])
+    if not rows or len({r["id"] for r in rows}) != len(rows):
+        return {"associations": None}
+    if expect is not None and rows != expect:
+        return {"associations": None}
+    return {"associations": rows}
+
+
+def _association_descriptor(rid, meta):
+    return {
+        "id": rid,
+        **{
+            key: (meta or {}).get(key)
+            for key in (
+                "wing",
+                "room",
+                "source_file",
+                "parent_drawer_id",
+                "parent_entry_id",
+                "chunk_index",
+            )
+        },
+    }
+
+
+def _association_descriptors(found):
+    ids, metas = found.get("ids") or [], found.get("metadatas") or []
+    if len(ids) != len(metas):
+        raise ValueError("Incomplete association metadata")
+    return [_association_descriptor(rid, meta) for rid, meta in zip(ids, metas)]
 
 
 def _content_preview(content):

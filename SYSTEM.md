@@ -851,9 +851,9 @@ playbooks and the original wider orchestration acceptance remain separate work.
 - Read counts in `kg_query.count`, `kg_timeline.count` and
   `kg_timeline.total` can include hidden items. Non-mirror hallway room names
   and labels and `list_tunnels` drawer endpoints retain existing read gaps.
-- Opaque legacy drawer/closet/file provenance without recognized tokens is
-  not resolved on read. An opaque citation can later move into a hidden room;
-  foreign identifiers already stored before this change are not purged.
+- Token-free plain-file provenance still has no local association proof on read.
+  Typed drawer/closet citations now resolve current local metadata as described
+  below; foreign identifiers already stored before this change are not purged.
 - Non-canonical spellings outside the token grammar remain possible, including
   inserted characters that are neither Cc nor Cf (combining marks or Unicode
   spaces), fullwidth letters, and missing underscores. Subject, predicate and
@@ -1145,3 +1145,36 @@ exhaustion and hang-guard results are recorded as information, not test failures
 This changes reference recognition only: typed associations, provenance aliases,
 plain-file association proof and search-index progress retain their existing
 contracts.
+
+
+### Current typed provenance association proof
+
+- Every outgoing source_drawer_id and source_closet resolves the complete decoded
+  local id in the authenticated workspace. Physical ids and both logical parent
+  keys resolve to current metadata on Chroma; every chunk requires a nonempty wing/room,
+  wing authority and the existing thread reader. Owners use the same checks.
+- Private metadata reads return no documents, page by at most 500 records, open
+  collections read-only with create=False, and revalidate concrete descriptors.
+  Chroma uses a final read snapshot. Other backends support exact physical ids;
+  logical handles fail closed because the collection API offers no ordered
+  snapshot enumeration guarantee. Missing targets, failed lookups, missing room proof,
+  changed metadata or revoked authority omit the citation. Probes never invoke
+  KG mutation handlers, write the KG or create an optional closet collection.
+- Original source sets still decide any-readable-source fact eligibility before
+  citation omission. Readable text and stored citations remain verbatim. Complete
+  raw source_file tokens are checked before drawer metadata displays a basename;
+  readable citation spellings and token-free plain-file behavior stay compatible.
+- D9.1=A is locked: complete local plain-file proof is separate follow-up work.
+  D9.2=A remains locked, including accepted global-quota deferral of actually
+  blocked readable work. Neither decision grants new read authority. Imported
+  history retains consent/range checks; unproved roomless derived rows stay stored.
+  Provenance aliases and external-id wing-only limitations remain unchanged.
+
+
+### Memory map citation omission
+
+- Owner maps keep visible person relationships when a fact cites a missing,
+  deleted or unreadable drawer. An unproved citation produces no memory link;
+  it does not turn the whole map into an error or remove readable fact text.
+- Hidden and absent targets have the same public map. Citation proof still uses
+  current thread authority; stored facts and citations are never rewritten.

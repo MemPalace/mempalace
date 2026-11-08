@@ -1,6 +1,7 @@
 """Apply thread read boundaries to every outgoing mirror drawer."""
 
 import re
+from pathlib import Path
 
 from commonplace.policy import canonical_wing
 from commonplace.rules import checks
@@ -112,6 +113,48 @@ class _ResponseAccess:
                 pass
         return self.private[key]
 
+    def association(self, kind, identifier):
+        """Authorize current metadata in this workspace, then revalidate it."""
+        try:
+            checks.remaining(0)
+            workers = self.gateway.mediator.workers
+            args = {"kind": kind, "identifier": identifier}
+            result = workers.call_tool(self.principal, "read_associations", args)
+            rows = result.get("associations") if isinstance(result, dict) else None
+            if not isinstance(rows, list) or not rows:
+                return False
+            if not self.association_rows_allowed(rows):
+                return False
+            checked = workers.call_tool(
+                self.principal, "read_associations", {**args, "expect": rows}
+            )
+            return (
+                isinstance(checked, dict)
+                and checked.get("associations") == rows
+                and self.association_rows_allowed(rows)
+            )
+
+        except Exception:
+            return False
+
+    def association_rows_allowed(self, rows):
+        # Refresh authority even when the same room occurred earlier in this reply.
+        self.rooms.clear()
+        for row in rows:
+            if not isinstance(row, dict):
+                return False
+            wing, room = row.get("wing"), row.get("room")
+            if (
+                not isinstance(wing, str)
+                or not wing.strip()
+                or not isinstance(room, str)
+                or not room.strip()
+                or not self.principal.policy.can_read_wing(wing)
+                or unreadable_room(self, wing, room)
+            ):
+                return False
+        return True
+
 
 def reader(gateway, principal):
     """Access and provenance caches live for one request/response only."""
@@ -188,10 +231,22 @@ def scrub_provenance(node, access):
     out = node
     for key in provenance_refs.PROVENANCE_FIELDS | provenance_refs.DERIVED_FIELDS:
         value = node.get(key)
+        if value is None:
+            continue
         if not isinstance(value, str):
+            if out is node:
+                out = dict(node)
+            out.pop(key, None)
             continue
         parsed = access.parse(value)
-        if parsed is provenance_refs.REFUSE or not all(access.reference(t) for t in parsed.tokens):
+        allowed = parsed is not provenance_refs.REFUSE and all(
+            access.reference(t) for t in parsed.tokens
+        )
+        if allowed and key in {"source_drawer_id", "source_closet"}:
+            allowed = access.association(
+                "drawer" if key == "source_drawer_id" else "closet", parsed.text
+            )
+        if not allowed:
             if out is node:
                 out = dict(node)
             out.pop(key, None)
@@ -262,6 +317,12 @@ def gate(gateway, principal, rule, result):
                 cleaned = scrub(value)
                 if cleaned is _DROP:
                     return _DROP
+                if (
+                    key == "metadata"
+                    and isinstance(cleaned, dict)
+                    and isinstance(cleaned.get("source_file"), str)
+                ):
+                    cleaned = {**cleaned, "source_file": Path(cleaned["source_file"]).name}
                 out[key] = cleaned
             out = _clean_related(node, out)
             if len(out) == len(node) and all(out[k] is v for k, v in node.items()):

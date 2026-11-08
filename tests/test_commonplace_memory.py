@@ -15,7 +15,8 @@ from commonplace.extensions import ToolContext, ToolError
 from mempalace import provenance
 from mempalace.knowledge_graph import KnowledgeGraph
 from mempalace.paths import KNOWLEDGE_GRAPH_FILENAME
-from tests._commonplace_helpers import hub_fixture  # noqa: F401
+from tests._commonplace_helpers import functional_worker_transport, hub_fixture  # noqa: F401
+from tests.test_typed_association_reads import case  # noqa: F401
 
 
 def _call(hub, token, name, **args):
@@ -687,3 +688,63 @@ def test_private_memory_link_shows_no_trace_to_a_scoped_reader(hub):
     assert memory_id not in listed
     full = _call(hub, owner, "task_show", task=number)["content"][0]["text"]
     assert memory_id in full
+
+
+@pytest.mark.parametrize("state", ["missing", "deleted", "hidden"])
+def test_map_unproved_citation_keeps_visible_fact(case, state):  # noqa: F811
+    c = case
+    identifier = "unproved-memory"
+    if state != "missing":
+        c.col.add(
+            ids=[identifier],
+            documents=["Hidden drawer words"],
+            metadatas=[{"wing": "shared", "room": c.hidden.id}],
+        )
+        if state == "deleted":
+            c.col.delete(ids=[identifier])
+    c.kg.add_entity("Alice", "person")
+    c.kg.add_entity("Bob", "person")
+    c.kg.add_triple(
+        "Alice",
+        "knows",
+        "Bob",
+        wing="shared",
+        sensitivity="public",
+        source_thread=c.primary.id,
+        source_drawer_id=identifier,
+    )
+    assert (
+        c.kg._conn().execute("SELECT source_drawer_id FROM fact_sources").fetchone()[0]
+        == identifier
+    )
+    path = Path(c.h.gateway.workspace_dir(c.h.workspace)) / "palace" / KNOWLEDGE_GRAPH_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with KnowledgeGraph(str(path)) as graph:
+        graph.add_entity("Alice", "person")
+        graph.add_entity("Bob", "person")
+        graph.add_triple(
+            "Alice",
+            "knows",
+            "Bob",
+            wing="shared",
+            sensitivity="public",
+            source_thread=c.primary.id,
+            source_drawer_id=identifier,
+        )
+    headers = {"Cookie": f"{sessions.COOKIE}={c.cookie}"}
+    status, raw = c.h.raw(None, b"", method="GET", path="/api/memory/map", headers=headers)
+    assert status == 200, "unproved citation must not break the memory map"
+    body = json.loads(raw)
+    assert identifier not in raw and "Hidden drawer words" not in raw
+    assert body["links"] == [
+        {"source": "person:Alice", "target": "person:Bob", "kind": "fact", "label": "knows"}
+    ]
+    from tests.test_typed_association_reads import invoke
+
+    visible = invoke(c, "kg_query", "owner", entity="Alice")["facts"][0]
+    assert visible["object"] == "Bob" and visible["predicate"] == "knows"
+    assert all("source_drawer_id" not in row for row in visible["sources"])
+    if state == "hidden":
+        c.col.delete(ids=[identifier])
+        status, absent = c.h.raw(None, b"", method="GET", path="/api/memory/map", headers=headers)
+        assert status == 200 and json.loads(absent) == body

@@ -470,8 +470,8 @@ def _people(ctx, nodes, links, memory_ids):
             seen.add(
                 (f"person:{people[source]['name']}", f"person:{people[target]['name']}", label)
             )
-        memory_id = fact["source_drawer_id"]
-        if memory_id in memory_ids:
+        memory_id = fact.get("source_drawer_id")
+        if memory_id is not None and memory_id in memory_ids:
             for person_id in (source, target):
                 if person_id in people:
                     seen.add((f"person:{people[person_id]['name']}", memory_id, label))

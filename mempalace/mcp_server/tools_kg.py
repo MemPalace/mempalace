@@ -191,21 +191,15 @@ def _kg_mutation_scope(
     )
     result = {"success": True, "probe": page}
     if "closet" in thread_scope:
-        # Internal citation probe, no collection creation and no content returned.
-        from ..backends.base import CollectionNotInitializedError
-        from ..palace import get_closets_collection
-
         try:
-            col = get_closets_collection(_config.palace_path, create=False)
-        except CollectionNotInitializedError:
-            col = None
-        found = (
-            col.get(ids=[thread_scope["closet"]], include=["metadatas"]) if col is not None else {}
-        )
-        metas = found.get("metadatas") or []
-        meta = metas[0] if metas else {}
-        pair = [meta.get("wing"), meta.get("room")]
-        result["cited"] = {"closet": pair if all(isinstance(x, str) for x in pair) else None}
+            found = read_associations("closet", thread_scope["closet"])["associations"]
+            pair = [found[0].get("wing"), found[0].get("room")] if found else None
+            if pair is not None and not all(isinstance(x, str) and x.strip() for x in pair):
+                pair = None
+        except Exception:
+            pair = None
+        result["cited"] = {"closet": pair}
+
     return None, result
 
 

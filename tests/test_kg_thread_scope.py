@@ -179,22 +179,24 @@ def test_history_merge_uses_the_same_allow(kg):
 
 
 @pytest.mark.parametrize("missing", [True, False])
-def test_closet_citation_probe_missing_collection_only(kg, config, monkeypatch, missing):
-    from mempalace import mcp_server as mcp, palace
+def test_closet_citation_probe_unavailable_is_read_only(kg, config, monkeypatch, missing):
+    from mempalace import mcp_server as mcp
     from mempalace.backends.base import CollectionNotInitializedError
 
     _patch_mcp_server(monkeypatch, config, kg)
     error = CollectionNotInitializedError(config.palace_path) if missing else OSError("unavailable")
 
+    calls = []
+
     def unavailable(*a, **kw):
+        calls.append((a, kw))
         raise error
 
-    monkeypatch.setattr(palace, "get_closets_collection", unavailable)
+    monkeypatch.setattr(mcp, "read_associations", unavailable)
     args = dict(
         subject="A", predicate="b", object="C", thread_scope={"probe": True, "closet": "absent"}
     )
-    if missing:
-        assert mcp.tool_kg_add(**args)["cited"] == {"closet": None}
-    else:
-        with pytest.raises(OSError, match="unavailable"):
-            mcp.tool_kg_add(**args)
+    before = kg._conn().total_changes
+    assert mcp.tool_kg_add(**args)["cited"] == {"closet": None}
+    assert calls == [(("closet", "absent"), {})]
+    assert kg._conn().total_changes == before

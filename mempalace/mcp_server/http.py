@@ -629,6 +629,14 @@ def _http_dispatch(request):
     # `or ""` fallback only rescues falsy values, so a truthy non-string method
     # reached .startswith() below and raised out of the handler thread.
     method, params = _normalize_envelope(request) if isinstance(request, dict) else ("", {})
+    if method == "internal/read_associations" and _provenance.current() is not None:
+        req_id = request.get("id")
+        with _HTTP_REQUEST_LOCK.read_lock():
+            try:
+                result = read_associations(**params)
+            except Exception:
+                result = {"associations": None}
+            return _tool_call_response(req_id, result)
     if method == "internal/write_mirror_units" and _provenance.current() is not None:
         from ..palace import mine_yield_hook
 

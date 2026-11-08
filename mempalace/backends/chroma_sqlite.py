@@ -256,7 +256,9 @@ def _metadata_value_columns(conn) -> list[str]:
     return [c for c in ("string_value", "int_value", "float_value", "bool_value") if c in present]
 
 
-def _decoded_rows(conn, row_ids, where: Optional[dict] = None, *, with_row_ids=False):
+def _decoded_rows(
+    conn, row_ids, where: Optional[dict] = None, *, with_row_ids=False, metadata_only=False
+):
     """``(drawer_id, document, metadata)`` for ``row_ids``, in that order, decoded.
 
     The shape Chroma's ``get`` returns: a missing document is ``None``, as is
@@ -280,7 +282,8 @@ def _decoded_rows(conn, row_ids, where: Optional[dict] = None, *, with_row_ids=F
             records[row_id] = [drawer_id, None, None]
         for row_id, key, *cells in conn.execute(
             f"SELECT id, key, {', '.join(columns)} FROM embedding_metadata"
-            f" WHERE id IN ({_marks(chunk)})",
+            f" WHERE id IN ({_marks(chunk)})"
+            + (" AND substr(key, 1, 7) != 'chroma:'" if metadata_only else ""),
             chunk,
         ):
             record = records.get(row_id)
@@ -1466,6 +1469,8 @@ def sqlite_drawer_rows(
     collection_name: str,
     *,
     drawer_id: str,
+    metadata_only: bool = False,
+    logical: bool = True,
 ) -> Optional[tuple[bool, list[tuple[str, Optional[str], dict]]]]:
     """Read a direct drawer, or every scalar-parent-linked physical chunk.
 
@@ -1474,6 +1479,8 @@ def sqlite_drawer_rows(
     Missing, unsupported, or unmaterialized records return ``None`` so Chroma
     can recover them or preserve metadata types this scalar reader cannot
     decode. In particular any selected array metadata requires that fallback.
+    ``metadata_only`` excludes document columns in SQL; ``logical=False`` keeps
+    closet ids exact. Citation proof treats unavailable snapshots as unproved.
     """
     try:
         with _ready_snapshot(palace_path, collection_name) as snapshot:
@@ -1488,7 +1495,7 @@ def sqlite_drawer_rows(
                 (segment_id, drawer_id),
             ).fetchall()
             direct = bool(selected)
-            if not direct:
+            if not direct and logical:
                 # The composite key/string index drives the parent search;
                 # each row's internal id then seeks its embedding by PK.
                 selected = conn.execute(
@@ -1511,7 +1518,7 @@ def sqlite_drawer_rows(
                         chunk,
                     ).fetchone():
                         return None
-            rows = _decoded_rows(conn, row_ids)
+            rows = _decoded_rows(conn, row_ids, metadata_only=metadata_only)
             return direct, _scalar_rows(rows)
     except (sqlite3.Error, ValueError):
         return None

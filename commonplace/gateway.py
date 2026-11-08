@@ -225,8 +225,8 @@ class WorkerClient:
         arguments = dict(arguments)
         params = {"name": name, "arguments": arguments}
         method = "tools/call"
-        if name == "write_mirror_units":
-            method, params = "internal/write_mirror_units", arguments
+        if name in {"write_mirror_units", "read_associations"}:
+            method, params = "internal/" + name, arguments
         response = self.post(
             principal,
             {
