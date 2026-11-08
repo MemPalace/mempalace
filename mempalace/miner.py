@@ -2090,36 +2090,39 @@ def mine(
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
     """
-    if dry_run:
-        return _mine_impl(
-            project_dir,
-            palace_path,
-            wing_override=wing_override,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            files=files,
-            max_chunks_per_file=max_chunks_per_file,
-        )
+    try:
+        if dry_run:
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+                max_chunks_per_file=max_chunks_per_file,
+            )
 
-    # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
-    # message and exit non-zero. In-process callers (tests, library users) that
-    # expect to coexist with another writer should handle the exception.
-    with mine_palace_lock(palace_path):
-        return _mine_impl(
-            project_dir,
-            palace_path,
-            wing_override=wing_override,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            files=files,
-            max_chunks_per_file=max_chunks_per_file,
-        )
+        # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
+        # message and exit non-zero. In-process callers (tests, library users) that
+        # expect to coexist with another writer should handle the exception.
+        with mine_palace_lock(palace_path):
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+                max_chunks_per_file=max_chunks_per_file,
+            )
+    finally:
+        _cleanup_mine_pid_file()
 
 
 def _project_wing(raw, project_path: Path) -> str:
@@ -2469,6 +2472,87 @@ def _cleanup_mine_pid_file() -> None:
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
         pass
+
+
+_HOOK_MINE_EXIT_GRACE_SECONDS = 60.0
+_HOOK_MINE_EXIT_GRACE_ENV = "MEMPALACE_HOOK_MINE_EXIT_GRACE_SECONDS"
+_ACTIVE_EXIT_WATCHDOG = None
+
+
+class _HookMineExitWatchdog:
+    """Handle for an independent process waiting on interpreter shutdown."""
+
+    def __init__(self, process) -> None:
+        self.process = process
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        try:
+            # Unbuffered, one-byte pipe write: no stdout/stderr locks or flush.
+            os.write(self.process.stdin.fileno(), b"S")
+        except (OSError, ValueError):
+            pass
+
+    def cancel(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=5)
+        self.process.stdin.close()
+
+
+def _hook_mine_exit_grace_seconds() -> float:
+    import math
+
+    raw = os.environ.get(_HOOK_MINE_EXIT_GRACE_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if math.isfinite(value) and value > 0:
+                return value
+        except ValueError:
+            pass
+    return float(_HOOK_MINE_EXIT_GRACE_SECONDS)
+
+
+def _arm_hook_mine_exit_watchdog(exit_code: int = 0) -> Optional[_HookMineExitWatchdog]:
+    """Bound hook-mine shutdown with supervision outside this interpreter.
+
+    The helper starts its grace period at interpreter shutdown, before Python
+    joins worker threads. It survives native finalization and never writes or
+    flushes diagnostic streams. Windows preserves ``exit_code`` on forced
+    termination; POSIX reports SIGKILL (a nonzero failure status).
+
+    Manual mines without ``MEMPALACE_MINE_PID_FILE`` remain unaffected.
+    """
+    global _ACTIVE_EXIT_WATCHDOG
+
+    if not os.environ.get("MEMPALACE_MINE_PID_FILE"):
+        return None
+
+    _cleanup_mine_pid_file()
+
+    if _ACTIVE_EXIT_WATCHDOG is not None:
+        _ACTIVE_EXIT_WATCHDOG.cancel()
+
+    import atexit
+    import threading
+
+    from ._mine_exit_watchdog import start_watchdog
+
+    code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else 1
+    handle = _HookMineExitWatchdog(start_watchdog(_hook_mine_exit_grace_seconds(), code))
+    register_threading_atexit = getattr(threading, "_register_atexit", None)
+    if callable(register_threading_atexit):
+        try:
+            register_threading_atexit(handle.start)
+        except RuntimeError:
+            handle.start()
+    atexit.register(handle.start)
+    _ACTIVE_EXIT_WATCHDOG = handle
+    return handle
 
 
 def _compute_topic_tunnels_for_wing(wing: str, config=None) -> int:
