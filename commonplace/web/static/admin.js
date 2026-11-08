@@ -28,11 +28,13 @@ export async function boundedRequest(api, path, { timers = globalThis, signal } 
 }
 
 export function createAdmin({ mount, api, e, current, timers = globalThis }) {
-  let host = null, workspace = null, epoch = 0, live = false;
+  let host = null, workspace = null, epoch = 0, live = false, instanceBlocked = false;
   const sections = new Map(), requests = new Map(), generations = new Map();
   const owner = () => current()?.can_admin === true;
   const eligible = () => live && owner() && current()?.workspace === workspace;
-  const label = key => ({users:'Users',connections:'Connections',needs:'Needs-me',stuck:'Stuck',runtime:'Runtime',limits:'Agent limits'})[key] || SECTIONS[key];
+  const operational = key => ['deploy','health','backups','backup-online','backup-offline'].includes(key);
+  const instanceOwner = () => current()?.can_admin_instance === true && !instanceBlocked;
+  const label = key => ({health:'Health','backup-online':'Online backup','backup-offline':'Offline backup',users:'Users',connections:'Connections',needs:'Needs-me',stuck:'Stuck',runtime:'Runtime',limits:'Agent limits'})[key] || SECTIONS[key];
   const value = v => e(v == null || v === '' ? '—' : v);
   const rows = (headers, items) => `<table><thead><tr>${headers.map(h => `<th scope="col">${e(h)}</th>`).join('')}</tr></thead><tbody>${items.map(cells => `<tr>${cells.map((v, i) => `<td data-label="${e(headers[i])}">${value(v)}</td>`).join('')}</tr>`).join('')}</tbody></table>`;
 
@@ -78,6 +80,13 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
   }
 
   function content(key, data) {
+    if (key === 'deploy') return rows(['Package', 'Version'], [['Commonplace', data.commonplace_version], ['MemPalace', data.mempalace_version]]) + `<p>${data.commit_source === 'build' && /^(?:[a-fA-F0-9]{40}|[a-fA-F0-9]{64})$/.test(data.commit) ? 'Running commit ' + e(data.commit) : 'Running commit unknown'}</p>`;
+    if (key === 'health') return '<p>Gateway reachable</p><p class="quiet">The gateway answered. This does not verify memory, runners, databases or backups.</p>';
+    if (key === 'backups') return '<p>Last completed recorded attempt. Snapshot status does not verify remote upload or retention. Interrupted runs may leave the previous receipt.</p>' + '<h3>Online</h3>' + panel('backup-online') + '<h3>Offline</h3>' + panel('backup-offline');
+    if (key.startsWith('backup-')) {
+      if (data.state === 'unknown') return `<p>${data.reason === 'not_configured' ? 'Backup status not configured' : 'No recorded attempt'}</p>`;
+      return rows(['Mode', 'Result', 'Started', 'Finished'], [[data.mode, data.result, data.started_at, data.finished_at]]);
+    }
     if (key === 'runtime') return runtimeContent(data);
     if (key === 'limits') return limitsContent(data);
     if (key === 'needs') return queueContent(data);
@@ -106,7 +115,8 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
   function render() {
     if (!host || !live) return;
     host.innerHTML = `<div class="admin settings"><p class="admin-workspace">${e(current().workspace_name || '')}</p><a href="#/settings">Manage agents and workspace settings</a>${Object.entries(SECTIONS).map(([key, title]) => {
-      if (!sections.has(key)) return `<section class="settings-section" data-admin-section="${key}"><h2>${e(title)}</h2><p>Available in a later slice</p></section>`;
+      if (!sections.has(key)) return '';
+      if (key === 'deploy') return `<section class="settings-section" data-admin-section="deploy"><h2>${e(title)}</h2>${panel('deploy')}${panel('health')}</section>`;
       return `<section class="settings-section" data-admin-section="${key}" aria-busy="${requests.has(key)}"><h2>${e(title)}</h2>${key === 'stuck' ? '<h3>Needs-me</h3>' + panel('needs') + '<h3>Stuck facts</h3>' : ''}${panel(key)}</section>`;
     }).join('')}</div>`;
   }
@@ -124,7 +134,7 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
 
   function refreshSection(key, { more = false, list = null, cursor: requestedCursor } = {}) {
     if (!eligible()) { if (live) stop(); return; }
-    if (!sections.has(key) || requests.has(key)) return;
+    if (!sections.has(key) || requests.has(key) || (operational(key) && !instanceOwner())) return;
     const generation = (generations.get(key) || 0) + 1, pageEpoch = epoch;
     generations.set(key, generation);
     const controller = new AbortController(), item = sections.get(key);
@@ -138,10 +148,10 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
       if (live && !eligible()) stop();
       return eligible() && epoch === pageEpoch && generations.get(key) === generation;
     };
-    const path = key === 'needs' ? '/api/needs-me' : `/api/admin/workspaces/${encodeURIComponent(workspace)}/${key}${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`;
+    const path = key === 'health' ? '/healthz' : operational(key) ? `/api/admin/instance/${key.startsWith('backup-') ? 'backups' : key}` : key === 'needs' ? '/api/needs-me' : `/api/admin/workspaces/${encodeURIComponent(workspace)}/${key}${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`;
     return boundedRequest(api, path, { timers, signal: controller.signal }).then(data => {
       if (!valid()) return;
-      if (key !== 'needs' && data.workspace_id !== workspace) throw new Error('Invalid workspace response');
+      if (key !== 'needs' && !operational(key) && data.workspace_id !== workspace) throw new Error('Invalid workspace response');
       if (more) {
         const unique = (old, next, id) => [...new Map([...old, ...next].map(row => [row[id], row])).values()];
         if (key === 'runtime') {
@@ -159,14 +169,41 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
           data = {...data, [field]:unique(item.data[field], data[field], key === 'stuck' ? 'number' : 'id')};
         }
       }
+      if (key === 'health' && data?.ok !== true) throw new Error('Invalid health response');
+      if (key === 'backups' || key.startsWith('backup-')) {
+        const modes = key === 'backups' ? ['online','offline'] : [key.slice(7)];
+        for (const mode of modes) {
+          const state = sections.get('backup-' + mode), receipt = data[mode];
+          if (!['ready','unknown','error'].includes(receipt?.state)) throw new Error('Invalid receipt response');
+          if (key === 'backups') {
+            const child = 'backup-' + mode;
+            generations.set(child, (generations.get(child) || 0) + 1);
+            requests.get(child)?.abort(); requests.delete(child);
+          }
+          state.data = receipt.state === 'error' ? null : receipt;
+          state.error = receipt.state === 'error' ? 'Backup status unavailable. Retry.' : '';
+          state.restricted = false;
+        }
+        if (key.startsWith('backup-')) return;
+      }
       item.data = data; item.retry = null;
     }).catch(error => {
       if (!valid()) return;
       item.retry = { more, cursor, list };
       if (error.status === 401) { stop(); return; }
       if (error.status === 403) {
-        item.data = null; item.restricted = true;
-        item.error = 'a signed-in workspace owner is required';
+        if (operational(key)) {
+          instanceBlocked = true;
+          for (const [name, state] of sections) if (operational(name)) {
+            state.data = null; state.restricted = true; state.error = 'Instance administrator access required';
+            requests.get(name)?.abort(); requests.delete(name);
+            generations.set(name, (generations.get(name) || 0) + 1);
+          }
+          render();
+        } else {
+          item.data = null; item.restricted = true;
+          item.error = 'a signed-in workspace owner is required';
+        }
       } else if (error.name !== 'AbortError') {
         item.error = `${label(key)} ${error.name === 'TimeoutError' ? 'timed out' : 'unavailable'}. Retry.`;
       }
@@ -191,13 +228,14 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
     stop(); host = mount();
     if (!host) return;
     if (!owner()) { host.innerHTML = '<p role="status">a signed-in workspace owner is required</p>'; return; }
-    workspace = current().workspace; live = true;
+    workspace = current().workspace; live = true; instanceBlocked = false;
     for (const key of ['users', 'connections', 'runtime', 'limits', 'stuck', 'needs']) sections.set(key, { data: null, error: '', restricted: false });
+    for (const key of ['deploy','health','backups','backup-online','backup-offline']) sections.set(key, { data:null, error:instanceOwner() ? '' : 'Instance administrator access required', restricted:!instanceOwner() });
     host.addEventListener('click', click);
     globalThis.document?.addEventListener('session-expired', stop);
     globalThis.document?.addEventListener('signout', stop);
     render();
-    for (const key of sections.keys()) void refreshSection(key);
+    for (const key of sections.keys()) if (!key.startsWith('backup-')) void refreshSection(key);
   }
   return { show, refreshSection, stop };
 }

@@ -14,14 +14,20 @@ entry was written.
 
 - **Workspace Admin foundation:** `/app/#/admin` is discoverable only when
   `/api/me.can_admin` is true (signed-in person and current-workspace owner).
-  The additive `can_admin_instance` stays false. New GET-only users/connections/runtime/limits/stuck
+  The additive `can_admin_instance` uses the operational predicate below. New GET-only users/connections/runtime/limits/stuck
   inventories bind the decoded path ID to the authenticated workspace before any
   projection source read. Members and owner connections receive the exact
   person-owner refusal; foreign workspace IDs are concealed with 404. Personal
   data remains workspace-local; no global directory or mutation action is added.
-  Future operational metadata follows the locked person + workspace owner +
-  server-fetched `users.is_admin=1` predicate, with the existing signed-out 401
-  challenge. That future predicate and its routes are not shipped here.
+  Operational deploy and backup GETs require a signed-in person + current-workspace
+  owner + exact server-fetched `users.is_admin=1`, read per request through the
+  bounded RO connection, including `/api/me`. Authenticated ordinary failures use
+  exactly “Instance administrator access required”; missing users deny and read
+  faults on instance data routes fail closed with 503 before source reads.
+  A capability-read fault in `/api/me` preserves the 200 bootstrap response with
+  `can_admin_instance:false`; data routes always recheck authority. Signed-out keeps
+  the existing gateway 401 challenge. No authority extends to other workspaces’ personal data.
+  The installed route inventory mirrors both authenticated Admin GET prefixes.
 
 - **Admin read and lifecycle bounds:** New projections use an existing SQLite
   `mode=ro` connection, connection-local `query_only`, at most 250 ms busy/connect
@@ -833,15 +839,14 @@ playbooks and the original wider orchestration acceptance remain separate work.
 
 ## Residuals
 
-- **Partial Admin rollout:** Users/workspaces, connections, runtime, effective
-  limits and attention panels are implemented. Deployment/health and backups say
-  “Available in a later slice” and send no requests; instance capability stays false.
+- **Admin observations:** All seven sections are implemented; operational sections
+  request data only with instance eligibility. Health validates the existing public
+  `healthz` response independently from installed versions and packaged build SHA.
   Token activity indicates recorded contact, not a live process. Machine and worker
   contact remain separate; owner attestation is always unverified. There is no
   workspace concurrency cap. Off uses distinct doing agents (including unlimited);
   on reuses accepted-only slot accounting, preserving actual use above the cap and
-  stored worker assignments on disabled machines. Operational reads and backup
-  receipts remain deferred. The reused needs-me route has a read-first limitation: `/api/needs-me` can initialize legacy stores and bind
+  stored worker assignments on disabled machines. The reused needs-me route has a read-first limitation: `/api/needs-me` can initialize legacy stores and bind
   rule-store metadata; the no-write promise here covers only the new Admin GETs.
   SQLite may create WAL/SHM sidecars during reads, so no-write tests compare logical
   tables, schema and non-sidecar files rather than byte equality of WAL files.
@@ -869,6 +874,30 @@ playbooks and the original wider orchestration acceptance remain separate work.
   from the deduplicated union of expired leases, active blockers, waiting-person
   facts and raw stale-agent facts, including children. Admin actions are GET reads
   or navigation to existing details/settings; no new admission or mutation API.
+
+
+- **Backup receipt limits:** Opt-in CLI receipts record the last completed online or
+  offline instance snapshot attempt, outside every data/staging/snapshot tree.
+  Final-mode reporting suppresses a rejected offline probe when online fallback is
+  taken. Check, cleanup and restore do not report. A same-directory 0600 temporary
+  file is fsynced, atomically replaced, then its parent fsynced; reporting faults
+  emit only a fixed diagnostic and never alter backup outcomes or retries. SIGKILL
+  before reporting leaves the previous attempt; no historical backfill, running
+  indicator or remote-upload/retention verification is claimed. The gateway only
+  reads canonical UTC timestamps with mandatory date/time seconds and optional
+  one-to-six fractional digits. Parent receipt refreshes advance child generations
+  and cancel older per-mode retries before applying results. The reader
+  reads fixed names through no-follow/nonblocking descriptors, fstat regular-file
+  checks, strict schema/enums/timestamps and a 16 KiB cap; corrupt modes fail independently.
+  The hosting operator provisions one UID/GID 10001:10001, 0700 directory and 0600
+  files. The optional overlay mounts it at `/run/commonplace-backup-status-ro` RO
+  for the gateway's configuration and `/run/commonplace-backup-status-rw` RW for a
+  snapshot-only CLI environment override. Compose must not create the host path.
+  Both aliases are visible in the shared container namespace: the configured gateway
+  path is RO and its code only reads, but this is not OS isolation from the RW alias.
+  This accepted residual requires no alternate container or host reconfiguration by
+  the application. Build identity is a validated 40/64 hex SHA installed as package
+  data; absent/invalid markers remain unknown, never runtime git/environment identity.
 
 
 - Accepted, known gaps.

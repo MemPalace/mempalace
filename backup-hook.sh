@@ -16,6 +16,7 @@ exec 3>&2
 stage="setup"
 log_file=""
 compose=()
+snapshot_env=()
 data_staging=""
 stamp=""
 hb=""
@@ -160,6 +161,13 @@ fi
 hb_every=$(( stale_s / 3 ))
 (( hb_every <= 10 )) || hb_every=10
 (( hb_every >= 1 )) || hb_every=1
+if [[ -n "${COMMONPLACE_BACKUP_STATUS_WRITE_DIR:-}" ]]; then
+    if [[ "$COMMONPLACE_BACKUP_STATUS_WRITE_DIR" != /run/commonplace-backup-status-rw ]]; then
+        stage="configuration: invalid backup status writer alias"
+        exit 2
+    fi
+    snapshot_env=(-e "COMMONPLACE_BACKUP_STATUS_DIR=$COMMONPLACE_BACKUP_STATUS_WRITE_DIR")
+fi
 # This hook never reads the env file itself; Compose does.
 compose=(docker compose --env-file "$env_file" -f "$compose_file")
 
@@ -297,7 +305,7 @@ run_backup() {
     snapshot_started=1
     printf 'snapshot %s started\n' "$stamp"
     SECONDS=0
-    timeout -k 10 "$t" "${compose[@]}" exec -T commonplace commonplace backup --online --deadline "$deadline" "/data/.backup-staging/$stamp" </dev/null 3>&- 9>&- &
+    timeout -k 10 "$t" "${compose[@]}" exec -T "${snapshot_env[@]}" commonplace commonplace backup --online --deadline "$deadline" "/data/.backup-staging/$stamp" </dev/null 3>&- 9>&- &
     snap_pid=$!
     rc=0
     wait "$snap_pid" || rc=$?

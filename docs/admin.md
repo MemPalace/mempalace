@@ -11,13 +11,11 @@ form. **Manage agents and workspace settings** opens the existing Settings page.
 `GET /api/me` retains its identity fields and adds boolean capabilities:
 
 - `can_admin`: true only for a signed-in person with role `owner` in the active workspace.
-- `can_admin_instance`: false during this partial rollout.
+- `can_admin_instance`: true only for that person-owner with server-fetched `users.is_admin=1`.
 
 Capabilities govern navigation; every inventory request independently checks current
 authority. Ownership of the user behind an agent token grants no browser authority.
-The instance-administration decision remains signed-in person + active-workspace
-owner + server-fetched `users.is_admin=1`, for operational metadata only. Instance
-routes and that capability are not implemented in this rollout.
+Instance authority is rechecked server-side for operational metadata only, as described below.
 
 | Caller | Inventory response |
 | --- | --- |
@@ -33,7 +31,7 @@ requests. Signed-out visits retain sign-in. Static JavaScript is a public SPA as
 
 ## HTTP inventories
 
-Only these new GET routes ship:
+Workspace inventory GET routes:
 
 - `/api/admin/workspaces/<workspace-id>/users`
 - `/api/admin/workspaces/<workspace-id>/connections`
@@ -46,7 +44,7 @@ Only the optional `cursor` query parameter is accepted; unknown or repeated keys
 malformed cursors, and cursors from another section or workspace return 400
 `{"error":"Invalid admin query"}`. The routes register no mutation methods.
 
-Every successful response is `Cache-Control: no-store` and includes `workspace_id`,
+Every successful workspace response is `Cache-Control: no-store` and includes `workspace_id`,
 `recorded_at` (UTC). Each list has full-list `count`, `has_more`, and `next_cursor`
 (null when complete). Pages contain at most 100 items. Users/connections and machines
 sort by creation time then stable ID; members use membership creation time. Projects
@@ -173,7 +171,7 @@ mean not wakeable. Safe whole-section errors are `Limits unavailable; try again`
 and `Stuck unavailable; try again`; runtime suberrors use `Orchestration`,
 `Orchestrators`, or `Machines` followed by `unavailable; try again`.
 
-## Loading and partial rollout
+## Loading and source bounds
 
 The page mounts before shared boards, needs-me or rules refreshes. Each section
 loads independently, with a 5,000 ms deadline covering transport and JSON decoding.
@@ -201,6 +199,68 @@ wrappers, coordinator wrappers or webhook authorization/delivery wrappers. Alrea
 read runtime subresults survive later source errors; an exhausted budget gives
 unattempted siblings explicit errors. SQLite may take bounded ordinary read locks.
 
-Deployment/health and backups remain labeled **Available in a later slice**. They make no requests and
-provide no operational data in this rollout. No deploy, backup, restore, runner
-control or new enforcement endpoint is present.
+Deployment/health and backup receipts are read-only operational sections. No deploy,
+backup-run, restore, runner control or new enforcement endpoint is present.
+
+## Instance deployment, health and backup receipts
+
+The operational sections require a signed-in person who owns the active workspace
+and whose exact server user row has `is_admin = 1`. The server reads that flag on
+every request, including `/api/me`, through the bounded read-only control connection.
+A missing user denies. On instance data routes a flag-read failure returns safe
+503 and reads no operational source. For `/api/me`, the same failure keeps the
+200 identity response with `can_admin_instance:false`, so navigation stays available.
+Flag changes apply on the next request regardless of cached capabilities.
+This grants operational metadata only; foreign-workspace personal data remains 404.
+
+| Caller | Instance response |
+| --- | --- |
+| Signed-in current-workspace owner with server admin flag | 200 |
+| Non-admin owner, member, ordinary owner PAT or OAuth connection | 403 `{"error":"Instance administrator access required"}` |
+| Signed out | Existing 401 `{"error":"unauthorized"}` and challenge |
+| Machine / worker connection | Existing gateway 404 / 403 restrictions |
+
+Ineligible operational panels show exactly **Instance administrator access required**
+and make no deployment, health or backup requests. A later instance 403 clears all
+operational data and stops pending operational loads. No admin mutation API exists.
+
+`GET /api/admin/instance/deploy` accepts no query parameters and returns:
+
+```json
+{"commonplace_version":"0.1.0","mempalace_version":"3.12.0","commit":null,"commit_source":"unknown"}
+```
+
+Both versions come from the installed packages. A valid packaged build marker gives
+`commit_source:"build"` and a full 40- or 64-character hexadecimal commit. Missing or
+invalid marker means **Running commit unknown**. Runtime git and environment flags
+cannot override image identity. Separately the eligible page requests existing
+`GET /healthz` and requires `ok === true`: **Gateway reachable** proves only that the
+gateway answered. The existing public health endpoint remains `{"ok":true}`.
+Version and health have independent 5,000 ms deadlines, errors and retries.
+
+`GET /api/admin/instance/backups` accepts no query parameters and returns independent
+`online` and `offline` subresults. All successful operational GETs are no-store.
+A ready mode carries this exact receipt schema:
+
+```json
+{"state":"ready","schema":1,"run_id":"12345678-1234-4234-8234-123456789abc","mode":"online","result":"success","started_at":"2026-11-07T12:00:00Z","finished_at":"2026-11-07T12:01:00Z","stage":"complete","scope":"instance_snapshot"}
+```
+
+Failure uses `result:"failure"`, `stage:"backup_failed"`. Missing configuration is
+`{"state":"unknown","reason":"not_configured"}`; an absent receipt in a provisioned
+directory is `{"state":"unknown","reason":"no_record"}`. Invalid/unreadable configured
+status is `{"state":"error","error":"Backup status unavailable"}` for that mode;
+its sibling remains visible. Each failed mode has a separate Retry, which repeats
+the GET and replaces only that mode's subresult. Whole-section failures return safe
+503 `Deploy unavailable; try again` or `Backups unavailable; try again`.
+
+The page labels receipts **Last completed recorded attempt**, never current/running.
+They do not verify remote upload or retention, backfill history, or guarantee a record
+when a process is killed before reporting. Readers use fixed basenames, no-follow,
+nonblocking opens, regular-file checks, a 16 KiB cap and strict schema validation.
+No request supplies a path. See [backup reporting](backups.md#optional-status-receipts)
+and the [deployment guide](../deploy/commonplace/DEPLOY.md#optional-backup-status).
+
+Receipt timestamps require `YYYY-MM-DDTHH:MM:SSZ`, optionally with one to six
+fractional-second digits before `Z`; shortened or space-separated forms are rejected.
+A parent receipts refresh supersedes older per-mode retries.

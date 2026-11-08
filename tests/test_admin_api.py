@@ -66,7 +66,7 @@ def test_me_admin_capability(hub):
     assert status == 200
     result = json.loads(body)
     assert result.get("can_admin") is True
-    assert result.get("can_admin_instance") is False
+    assert result.get("can_admin_instance") is True
     assert result["user"] == hub.admin and result["workspace"] == hub.workspace
     member(hub)
     _, _, body = request(hub, "/api/me", headers=cookie(hub, "member@example.com"))

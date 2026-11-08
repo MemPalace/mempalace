@@ -914,10 +914,23 @@ def cmd_backup(args) -> int:
     if args.online_cleanup:
         print(json.dumps(backup_supervisor.cleanup(data, args.dest_dir), sort_keys=True))
         return 0
+    from .backup_status import Reporter
+
+    reporter = Reporter()
     if args.online:
-        print(backup_supervisor.run_online(data, args.dest_dir, deadline=args.deadline))
+        try:
+            result = backup_supervisor.run_online(data, args.dest_dir, deadline=args.deadline)
+        except BaseException:
+            reporter.finish("online", False)
+            raise
+        reporter.finish("online", True)
+        print(result)
         return 0
-    print(backup_supervisor.backup_auto(data, args.dest_dir, deadline=args.deadline))
+    print(
+        backup_supervisor.backup_auto(
+            data, args.dest_dir, deadline=args.deadline, report=reporter.finish
+        )
+    )
     return 0
 
 

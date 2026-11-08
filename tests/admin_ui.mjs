@@ -136,7 +136,7 @@ async function main() {
     assert.match(section(f.mount.innerHTML,'connections'),/aria-label="Retry Connections"/);
     assert.match(section(f.mount.innerHTML,'users'),/person@example.com/);
     assert.equal(f.timers.size,0);
-    for(const key of ['deploy','backups']) assert.match(section(f.mount.innerHTML,key),/Available in a later slice/);
+    for(const key of ['deploy','backups']) assert.match(section(f.mount.innerHTML,key),/Instance administrator access required/);
     assert.ok(f.requests.every(r=>/\/(users|connections|runtime|limits|stuck|needs-me)$/.test(r.path)));
     f.ui.stop();
   } else if(which==='lifecycle') {

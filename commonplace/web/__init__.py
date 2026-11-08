@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from commonplace import events, plans, sessions, sync_feed, urls
-from commonplace.http_util import query, require_principal, send_json
+from commonplace.http_util import log_failure, query, require_principal, send_json
+
+LOG = logging.getLogger(__name__)
 
 STATIC = Path(__file__).parent / "static"
 CSP = (
@@ -93,12 +96,21 @@ def install(gateway):
     def me(h):
         principal = require_principal(gateway, h)
         if principal is not None:
+            from . import admin
+
+            try:
+                can_instance = admin.instance_authorized(
+                    gateway, principal, admin.ReadContext(gateway.admin_clock)
+                )
+            except Exception as exc:
+                log_failure(LOG, "Admin capability unavailable", exc)
+                can_instance = False
             send_json(
                 h,
                 200,
                 {
                     "can_admin": principal.person and principal.role == "owner",
-                    "can_admin_instance": False,
+                    "can_admin_instance": can_instance,
                     "user": principal.user_id,
                     "email": principal.user_email,
                     "workspace": principal.workspace_id,

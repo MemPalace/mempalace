@@ -5,6 +5,8 @@ services:
     build:
       context: ${COMMONPLACE_SOURCE_DIR:?Set COMMONPLACE_SOURCE_DIR to the source checkout}
       dockerfile: deploy/commonplace/Dockerfile
+      args:
+        COMMONPLACE_BUILD_COMMIT: ${COMMONPLACE_BUILD_COMMIT:-}
     init: true
     restart: unless-stopped
     ports:

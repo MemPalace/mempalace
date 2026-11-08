@@ -10,6 +10,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlsplit
@@ -737,6 +738,45 @@ def runtime_cursor_key(raw, workspace_id, section):
     return kind, key
 
 
+INSTANCE_DENIAL = "Instance administrator access required"
+
+
+def instance_authorized(gateway, principal, context):
+    """Deny cheaply before the exact server user flag read, without app locks."""
+    if principal is None or not principal.person or principal.role != "owner":
+        return False
+    with read_control(gateway.db, context) as conn:
+        row = select(
+            conn, context, "SELECT is_admin FROM users WHERE id=?", (principal.user_id,)
+        ).fetchone()
+    return row is not None and row["is_admin"] == 1
+
+
+def deploy(context):
+    from commonplace import __version__ as commonplace_version
+    from mempalace.version import __version__ as mempalace_version
+
+    context.remaining()
+    try:
+        commit = (
+            resources.files("commonplace.web")
+            .joinpath("_build_commit.txt")
+            .read_text(encoding="ascii")
+            .strip()
+        )
+    except (OSError, UnicodeError):
+        commit = ""
+    if not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", commit):
+        commit = None
+    context.remaining()
+    return {
+        "commonplace_version": commonplace_version,
+        "mempalace_version": mempalace_version,
+        "commit": commit,
+        "commit_source": "build" if commit else "unknown",
+    }
+
+
 def install(gateway):
     if not hasattr(gateway, "admin_clock"):
         gateway.admin_clock = SimpleNamespace(
@@ -793,4 +833,33 @@ def install(gateway):
             log_failure(LOG, "Admin inventory unavailable", exc)
             send_json(h, 503, {"error": f"{section.title()} unavailable; try again"})
 
+    def instance(h):
+        principal = require_principal(gateway, h)
+        if principal is None:
+            return
+        parts = path_parts(h, "/api/admin/instance/")
+        if len(parts) != 1 or parts[0] not in ("deploy", "backups"):
+            send_json(h, 404, {"error": "not found"})
+            return
+        section = parts[0]
+        try:
+            context = ReadContext(gateway.admin_clock)
+            if not instance_authorized(gateway, principal, context):
+                send_json(h, 403, {"error": INSTANCE_DENIAL})
+                return
+            if urlsplit(h.path).query:
+                send_json(h, 400, {"error": "Invalid admin query"})
+                return
+            if section == "deploy":
+                result = deploy(context)
+            else:
+                from commonplace.backup_status import read_receipts
+
+                result = read_receipts(context)
+            send_json(h, 200, result)
+        except Exception as exc:
+            log_failure(LOG, "Admin instance source unavailable", exc)
+            send_json(h, 503, {"error": f"{section.title()} unavailable; try again"})
+
+    gateway.add_prefix_route("GET", "/api/admin/instance/", instance)
     gateway.add_prefix_route("GET", "/api/admin/workspaces/", inventory)

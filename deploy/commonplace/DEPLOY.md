@@ -266,3 +266,55 @@ The deploy script makes no docker/compose call until steps 2–4 pass. The backu
 
 On failure, fix the backup or configuration and rerun the script. Do not work
 around the gate. The script does not fetch source or delete operator files.
+
+## Running build identity
+
+When staging a clean reviewed source tree, set `COMMONPLACE_BUILD_COMMIT` to its
+full reviewed commit (40 or 64 hexadecimal characters) before building with the
+tracked host compose example. The actual image recipe validates the build argument
+and writes `commonplace/web/_build_commit.txt` before package installation. This
+resource travels with the installed wheel. An empty build argument is permitted
+and reports **Running commit unknown**; an invalid nonempty argument fails the
+build. No runtime environment or checkout HEAD overrides image identity. Admin
+shows both installed package versions separately from the commit.
+
+## Optional backup status
+
+Only the hosting administrator provisions live configuration. The optional tracked
+`deploy/compose.backup-status.yml.example` overlays the host compose example. Set
+`COMMONPLACE_BACKUP_STATUS_HOST_DIR` to an existing directory outside `/data` and
+all backup snapshot/staging trees. Provision it with UID/GID **10001:10001**, mode
+**0700**; receipts are **0600**. Compose uses `bind.create_host_path:false` on both
+binds and must never create the source as root. If using another UID, provide
+explicit read access rather than making files public.
+
+The same host directory has two distinct container targets:
+
+| Target | Mount | Consumer |
+| --- | --- | --- |
+| `/run/commonplace-backup-status-ro` | read-only | Gateway, `COMMONPLACE_BACKUP_STATUS_DIR` |
+| `/run/commonplace-backup-status-rw` | read-write | Snapshot CLI override only |
+
+Keep the gateway environment on the RO path. Set
+`COMMONPLACE_BACKUP_STATUS_WRITE_DIR=/run/commonplace-backup-status-rw` on the
+**host hook invocation**, never in the gateway environment. Only the real snapshot
+exec inserts `-e COMMONPLACE_BACKUP_STATUS_DIR=/run/commonplace-backup-status-rw`
+before the service name. Preflight/check and cleanup do not report and receive no
+writer override. The hook still uses only the existing ps/exec topology and no new
+container. For a manual offline CLI in that container use the same explicit
+per-command `compose exec -T -e ...` override; a host CLI uses the provisioned host
+directory as its status path. Without opt-in, reporting is disabled and Admin shows
+unknown. Never mount a container engine socket for status reads.
+
+Both aliases are visible in the shared container mount namespace. The configured
+gateway path is enforced RO and gateway code only reads it; this is **not OS
+isolation** preventing that process from reaching the RW alias. No per-process
+mount table or UID separation is claimed. This residual is accepted for this topology.
+
+Receipts record the last completed online/offline instance snapshot attempt, not
+running state or verified remote upload/retention. No historical backfill is possible;
+SIGKILL before reporting leaves the previous receipt. Receipt errors never change
+backup success/failure or fencing. Admin authorization is signed-in current-workspace
+owner plus a per-request server admin flag; ordinary owners see exactly
+“Instance administrator access required” and send no operational requests.
+See [Admin API](../../docs/admin.md) and [backup receipts](../../docs/backups.md#optional-status-receipts).

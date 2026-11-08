@@ -58,7 +58,7 @@ def test_admin_owner_cold_reload_retry_and_responsive_navigation(hub, chromium, 
         page.reload(wait_until="domcontentloaded")
         expect(page.get_by_text("workspace-agent", exact=True)).to_be_visible()
         assert page.locator(".admin section").count() == 7
-        assert page.get_by_text("Available in a later slice", exact=True).count() == 2
+        expect(page.get_by_text("Running commit unknown", exact=True)).to_be_visible()
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         if width < 700:
             page.get_by_role("button", name="Project: Projects. Switch project", exact=True).click()
@@ -116,6 +116,7 @@ def test_admin_runtime_panels_retry_independently(hub, runtime, chromium, width)
     from tests.test_admin_runtime_api import OLD, machine, task, webhook
 
     clock(hub)
+    hub.db._conn.execute("UPDATE users SET is_admin=0 WHERE id=?", (hub.admin,))
     cid, _ = agent(hub, "lead", expires_at="2026-11-07T13:00:00Z")
     webhook(hub, cid)
     machine(hub, binding_state="owner_attested")
@@ -169,7 +170,7 @@ def test_admin_runtime_panels_retry_independently(hub, runtime, chromium, width)
         expect(page.get_by_text("1 card waiting", exact=True)).to_be_visible()
         assert page.locator('[data-admin-panel="needs"] a[href="#/card/1"]').count() == 2
         assert "hidden queue body" not in page.locator(".admin").inner_text()
-        assert page.get_by_text("Available in a later slice", exact=True).count() == 2
+        assert page.get_by_text("Instance administrator access required", exact=True).count() >= 2
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
         assert all(method == "GET" for method, url in reads if "/api/" in url)
         assert not any("/api/admin/instance/" in url for _, url in reads)
@@ -181,5 +182,76 @@ def test_admin_runtime_panels_retry_independently(hub, runtime, chromium, width)
             page.locator('section[data-admin-section="runtime"]').screenshot(
                 path=str(target / f"runtime-section-{width}.png")
             )
+    finally:
+        context.close()
+
+
+@pytest.mark.parametrize("width", [1440, 390])
+def test_admin_operational_subpanels_retry_independently(hub, chromium, width):
+    from playwright.sync_api import expect
+
+    link = sessions.create_login_link(hub.db, "owner@example.com", hub.workspace)
+    session = sessions.redeem_login_link(hub.db, link)
+    origin = f"http://127.0.0.1:{hub.port}"
+    context = chromium.new_context(viewport={"width": width, "height": 1000})
+    context.add_cookies([{"name": sessions.COOKIE, "value": session, "url": origin}])
+    try:
+        page = context.new_page()
+        errors, reads = [], []
+        page.on("pageerror", lambda error: errors.append(type(error).__name__))
+        page.on("request", lambda req: reads.append((req.method, req.url)))
+        for path in ("boards", "needs-me", "rules/count", "events?*"):
+            page.route(f"**/api/{path}", lambda route: None)
+        health_calls = backup_calls = 0
+
+        def health(route):
+            nonlocal health_calls
+            health_calls += 1
+            route.fulfill(
+                status=503, json={"error": "synthetic"}
+            ) if health_calls == 1 else route.fulfill(json={"ok": True})
+
+        def backups(route):
+            nonlocal backup_calls
+            backup_calls += 1
+            route.fulfill(
+                json={
+                    "online": {"state": "unknown", "reason": "no_record"},
+                    "offline": {"state": "error", "error": "Backup status unavailable"}
+                    if backup_calls == 1
+                    else {"state": "unknown", "reason": "no_record"},
+                }
+            )
+
+        page.route("**/healthz", health)
+        page.route("**/api/admin/instance/backups", backups)
+        page.goto(origin + "/app/#/admin", wait_until="domcontentloaded")
+        expect(page.get_by_text("Running commit unknown", exact=True)).to_be_visible()
+        expect(page.get_by_text("Health unavailable. Retry.", exact=True)).to_be_visible()
+        expect(page.get_by_role("button", name="Retry Offline backup", exact=True)).to_be_visible()
+        expect(
+            page.locator('[data-admin-panel="backup-online"]').get_by_text(
+                "No recorded attempt", exact=True
+            )
+        ).to_be_visible()
+        page.get_by_role("button", name="Retry Offline backup", exact=True).click()
+        expect(
+            page.locator('[data-admin-panel="backup-offline"]').get_by_text(
+                "No recorded attempt", exact=True
+            )
+        ).to_be_visible()
+        assert backup_calls == 2 and health_calls == 1
+        page.get_by_role("button", name="Retry Health", exact=True).click()
+        expect(page.get_by_text("Gateway reachable", exact=True)).to_be_visible()
+        assert health_calls == 2
+        assert len([url for _, url in reads if url.endswith("/instance/deploy")]) == 1
+        assert page.locator(".admin section").count() == 7
+        assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+        assert all(method == "GET" for method, url in reads if "/api/" in url)
+        assert not errors
+        if os.environ.get("CP_ADMIN_SHOTS"):
+            target = Path(os.environ["CP_ADMIN_SHOTS"])
+            target.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(target / f"admin-operations-{width}.png"), full_page=True)
     finally:
         context.close()

@@ -1,0 +1,19 @@
+# Optional overlay for compose.host.yml.example. Provision the source first.
+# Both aliases are visible in the serving container; this is not process isolation.
+services:
+  commonplace:
+    environment:
+      COMMONPLACE_BACKUP_STATUS_DIR: /run/commonplace-backup-status-ro
+    volumes:
+      - type: bind
+        source: ${COMMONPLACE_BACKUP_STATUS_HOST_DIR:?Set COMMONPLACE_BACKUP_STATUS_HOST_DIR to an existing status directory}
+        target: /run/commonplace-backup-status-ro
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${COMMONPLACE_BACKUP_STATUS_HOST_DIR:?Set COMMONPLACE_BACKUP_STATUS_HOST_DIR to an existing status directory}
+        target: /run/commonplace-backup-status-rw
+        read_only: false
+        bind:
+          create_host_path: false

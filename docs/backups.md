@@ -281,3 +281,36 @@ For production recovery only after the drill: stop all writers, retain the old
 data directory, switch the persistent mount to the verified restored sibling,
 set ownership for the service user and start the matching image. Verify health,
 sign-in, isolation, search, boards and a subsequent nightly backup.
+
+## Optional status receipts
+
+Set `COMMONPLACE_BACKUP_STATUS_DIR` only for opt-in last-completed attempt reporting.
+The hosting operator must precreate the directory outside the data, staging and
+snapshot trees; the CLI does not create it. For the container default, use owner
+UID/GID 10001:10001 and mode 0700; receipt files are 0600. Another runtime UID needs
+explicit read access rather than public files. No historical attempts are backfilled.
+
+`online.json` and `offline.json` independently hold schema 1, UUID `run_id`, final
+`mode`, `result` (success/failure), UTC `started_at`/`finished_at`, fixed `stage`
+(complete/backup_failed), and `scope:instance_snapshot`. The CLI writes a private
+same-directory temporary file, fsyncs it, atomically replaces the receipt and fsyncs
+the directory. No paths, credentials, exception/log text, repository URLs or file
+inventories are stored. Automatic offline-to-online fallback records only the final
+online attempt; terminal offline outcomes record offline. Check, cleanup and restore
+do not report. Reporting failure emits only `backup status unavailable` and preserves
+the snapshot's original return value/exception without retrying it.
+
+Receipts mean **Last completed recorded attempt**. SIGKILL or interruption before
+reporting leaves the previous record. Snapshot success does not establish remote
+upload or retention success. Missing config/records remain unknown; a corrupt or
+unreadable mode has its own safe error without hiding the other mode.
+
+See [Admin API](admin.md#instance-deployment-health-and-backup-receipts) and the
+[optional deployment overlay](../deploy/commonplace/DEPLOY.md#optional-backup-status).
+The gateway is configured to the RO alias; the backup hook's host invocation sets
+`COMMONPLACE_BACKUP_STATUS_WRITE_DIR=/run/commonplace-backup-status-rw`. Only its
+snapshot exec adds the writer override. For an offline CLI in the same container,
+explicitly pass `compose exec -T -e COMMONPLACE_BACKUP_STATUS_DIR=/run/commonplace-backup-status-rw commonplace commonplace backup <destination>`.
+A host CLI sets its writer path to the provisioned host directory. Both aliases are
+visible in the shared mount namespace; RO configuration is not process isolation
+from the RW alias. Backup consistency, fencing and heartbeat behavior are unchanged.

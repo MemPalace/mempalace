@@ -282,25 +282,36 @@ def run_online(data_dir, dest, *, deadline=None) -> Path:
     return _Supervisor(data, target, None, deadline, knobs).run()
 
 
-def backup_auto(data_dir, dest, *, deadline=None) -> Path:
-    """``backup DEST``: offline when the data lock is free, else online."""
+def backup_auto(data_dir, dest, *, deadline=None, report=None) -> Path:
+    """Offline when free, otherwise online; report only the final selected attempt."""
     from . import backup as _backup
 
+    mode = "offline"
     try:
-        _backup.backup(data_dir, dest)
-    except BackupError as exc:
-        if not lock_busy(exc) or not _linux():
-            raise
-        data = _real_data_dir(data_dir)
-        if _answering(data) is None:
-            raise
-        if not is_staging_dest(data, dest):
-            raise BackupError(
-                f"{exc}; a gateway is serving, and an online backup needs DEST "
-                f"<data>/{STAGING_NAME}/<stamp>"
-            ) from exc
-        return run_online(data, dest, deadline=deadline)
-    return Path(dest).expanduser().resolve() / "manifest.json"
+        try:
+            _backup.backup(data_dir, dest)
+        except BackupError as exc:
+            if not lock_busy(exc) or not _linux():
+                raise
+            data = _real_data_dir(data_dir)
+            if _answering(data) is None:
+                raise
+            if not is_staging_dest(data, dest):
+                raise BackupError(
+                    f"{exc}; a gateway is serving, and an online backup needs DEST "
+                    f"<data>/{STAGING_NAME}/<stamp>"
+                ) from exc
+            mode = "online"
+            result = run_online(data, dest, deadline=deadline)
+        else:
+            result = Path(dest).expanduser().resolve() / "manifest.json"
+    except BaseException:
+        if report is not None:
+            report(mode, False)
+        raise
+    if report is not None:
+        report(mode, True)
+    return result
 
 
 def _default_snapshot(data_dir, dest, *, client, deadline, knobs):

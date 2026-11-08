@@ -17,6 +17,8 @@ WORKDIR /opt/commonplace
 COPY pyproject.toml README.md ./
 COPY mempalace/ ./mempalace/
 COPY commonplace/ ./commonplace/
+ARG COMMONPLACE_BUILD_COMMIT=""
+RUN python -c "import os, pathlib, re; sha = os.environ['COMMONPLACE_BUILD_COMMIT']; assert not sha or re.fullmatch(r'(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})', sha), 'Invalid build commit'; pathlib.Path('commonplace/web/_build_commit.txt').write_text(sha + chr(10), encoding='ascii')"
 RUN pip install ".[commonplace]"
 
 USER 10001:10001

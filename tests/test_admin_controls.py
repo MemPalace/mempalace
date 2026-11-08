@@ -92,6 +92,6 @@ def test_gateway_machine_worker_and_mutation_controls(hub):
     for section in ("runtime", "limits", "stuck"):
         assert get(hub, section, headers)[0] == 200
     for path in ("/api/admin/instance/deploy", "/api/admin/instance/backups"):
-        assert request(hub, path, headers=headers)[0] == 404
+        assert request(hub, path, headers=headers)[0] == 200
     status, _, raw = request(hub, "/healthz")
     assert status == 200 and json.loads(raw) == {"ok": True}

@@ -141,7 +141,7 @@ def test_hook_is_executable_and_uses_only_host_managed_restic():
     assert 'docker compose --env-file "$env_file" -f "$compose_file"' in text
     # The snapshot runs inside the running serve container, bounded, without stdin.
     assert (
-        'timeout -k 10 "$t" "${compose[@]}" exec -T commonplace commonplace backup --online'
+        'timeout -k 10 "$t" "${compose[@]}" exec -T "${snapshot_env[@]}" commonplace commonplace backup --online'
         ' --deadline "$deadline" "/data/.backup-staging/$stamp" </dev/null'
     ) in text
     assert 'install -d -o 10001 -g 10001 -m 0700 "$data_host/.backup-staging"' in text
