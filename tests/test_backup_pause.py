@@ -917,6 +917,54 @@ def test_memory_in_a_pause_gets_retry_hint_and_cached_tools(hub):
     assert "result" in hub.rpc(token, "ping")
 
 
+@pytest.mark.parametrize(
+    "name,importer",
+    [
+        ("mempalace_status", False),
+        ("mempalace_list_rooms", False),
+        ("mempalace_list_wings", False),
+        ("mempalace_get_taxonomy", False),
+        ("mempalace_list_rooms", True),
+        ("mempalace_list_drawers", True),
+    ],
+)
+@pytest.mark.parametrize("transport", ["rpc", "local"])
+def test_projected_counts_in_backup_pause_keep_retry_error(hub, name, importer, transport):
+    from commonplace.extensions import ToolError
+
+    token = (
+        hub.token(
+            "importer",
+            profile="full",
+            scopes=["memory:read", "memory:import:read", "private:read"],
+            read_wings=["*"],
+            trust="trusted",
+        )
+        if importer
+        else hub.owner_token()
+    )
+    arguments = {"wing": "private_chats"} if importer else {}
+    principal = hub.gateway.authenticate(f"Bearer {token}")
+    hub.supervisor.pause_wait_s = 0.05
+    hub.supervisor.pause(drain_s=5)
+    try:
+        if transport == "rpc":
+            reply = hub.rpc(token, "tools/call", {"name": name, "arguments": arguments})
+            assert "error" in reply, "paused projection returned a count result"
+            assert reply["error"]["code"] == -32603
+            assert reply["error"]["data"] == {"retry_after_s": 30}
+        else:
+            try:
+                hub.gateway.call_memory_tool(principal, name, arguments)
+            except ToolError as exc:
+                assert "paused for a backup" in str(exc)
+                assert "30" in str(exc)
+            else:
+                raise AssertionError("paused projection did not raise ToolError")
+    finally:
+        hub.supervisor.resume()
+
+
 def test_tools_list_in_a_pause_without_cache_is_an_error(hub):
     token = hub.owner_token()
     hub.supervisor.pause_wait_s = 0.1

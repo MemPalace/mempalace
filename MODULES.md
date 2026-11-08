@@ -64,6 +64,8 @@ Format (read by `commonplace orch docs-check`):
 
   - KG read guarantees include both query modes, protocol compatibility, deadline cleanup, measured cost and the response-local authority window.
 
+  - Only list_rooms/status respond payloads bypass the final generic gate after existing authorization proof; provenance-named count labels remain visible.
+
   - Documents citation omission and backend proof limits separately from fact eligibility.
 
   - Records current typed citation proof and raw path authorization before display conversion.
@@ -80,6 +82,7 @@ Format (read by `commonplace orch docs-check`):
   - Hallway documentation distinguishes plural-room final validation from drawer scrubbing.
 
   - Hallway read documentation distinguishes display-label token proof from citation parsing, visible counts from global storage and empty-on-incomplete behavior.
+  - Authenticated room/status sums use authorized pairs. Status suppresses global capacity and raw probe reasons, reports a fixed disabled-index reason, and omits transport diagnostics and palace/database paths. Status, list_rooms (including consented private_chats imports), list_wings and taxonomy propagate backup-pause retry errors; consented private_chats drawer listings do too. Pause tests cover RPC and internal calls on those routes.
 
   - Documents field-specific citation length errors, atomic whole-write refusal, surface-specific citation exceptions and informational performance measurements.
 
@@ -148,6 +151,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Keeps unavailable citation links absent without changing visible facts; documents scoped-search snapshot refusal, validation compatibility and the deliberate omission of failure-only fact markers, with Unreleased notes and sees-all string-wing validation ordering and per-fact visibility.
 
+  - Incomplete pair proof still returns zero counts. Tunnel/drawer/other replies retain the gate and malformed scalar provenance remains omitted.
+
   - Unproved citations disappear without removing readable fact text; plain-file proof remains a separate decision.
 
   - Incomplete drawer membership proof returns an empty pagination envelope; changed metadata cannot authorize a sibling chunk.
@@ -157,6 +162,7 @@ Format (read by `commonplace orch docs-check`):
   - Every returned hallway string uses the same capped raw-token proof; malformed numeric fields and unreviewed keys cannot reach public rows.
 
   - Hallway read failures expose an empty page, never global counts.
+  - Incomplete room/status acquisition returns zero visible sums with a count-free disabled-index reason; integrity failure flags remain, without raw failure details or shared principal caches.
 
   - An authority fault makes the complete progress response unavailable, even when other threads are readable.
 
@@ -191,6 +197,8 @@ Format (read by `commonplace orch docs-check`):
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
 
 
+  - `tests/test_card253_s02.py` covers nine provenance-key count collisions, hidden-pair exclusion and real tunnel/drawer gate reachability; the same typed-association and fact-provenance suites remain guards.
+
   - Memory-map and capped-backend regressions verify the documented failure policy.
 
   - Typed association regressions and documentation obligations.
@@ -204,6 +212,7 @@ Format (read by `commonplace orch docs-check`):
   - Readable mirror pages, exact page boundaries and private-label guards pin the documented behavior.
 
   - The documentation obligation covers hallway worker descriptors, public mediation and thread-reader ownership.
+  - `tests/test_card253_s02.py` covers room/status branches, real capacity refresh with hidden/control equality, transport diagnostic suppression, invalid wing types, no-palace/local guards and projection faults.
 
   - Owner-route store/private-reader fault regressions and the documentation obligation.
 
@@ -456,6 +465,8 @@ Format (read by `commonplace orch docs-check`):
 
   - KG search reuses the local tokenizer, selective terms and 50-seed candidate rules on a detached authorized index; deadline checks stop copy, indexing and scoring work. Scoped search requires its detached snapshot.
 
+  - Authenticated room/status sums use authorized pairs. Status suppresses global capacity and raw probe reasons, reports a fixed disabled-index reason, and omits transport diagnostics and palace/database paths. Status, list_rooms (including consented private_chats imports), list_wings and taxonomy propagate backup-pause retry errors; consented private_chats drawer listings do too. Pause tests cover RPC and internal calls on those routes.
+
   - Scoped wing and taxonomy counts use bounded metadata-only identity pages, normalize absent/null/question-mark loci to unknown, exclude bookkeeping, and revalidate concrete descriptors in fresh snapshots. Local unscoped readers retain their conventions.
   - Exact non-Chroma physical citation ids remain supported without document hydration.
 
@@ -485,6 +496,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
+  - Incomplete room/status acquisition returns zero visible sums with a count-free disabled-index reason; integrity failure flags remain, without raw failure details or shared principal caches.
 
   - Incomplete acquisition or invalid descriptors discard all projected output. New or changed metadata cannot inherit an earlier allow descriptor.
   - Non-Chroma logical citations fail closed because the collection API cannot guarantee ordered snapshot enumeration.
@@ -520,6 +532,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
 
+  - `tests/test_card253_s02.py` covers room/status branches, real capacity refresh with hidden/control equality, transport diagnostic suppression, invalid wing types, no-palace/local guards and projection faults.
 
   - Presence and private read-scope tests exercise SQLite, compact, Chroma, facet and generic metadata paths, unknown values, batching and races.
   - Capped-backend tests place a hidden chunk beyond the first short metadata page.
@@ -577,6 +590,8 @@ Format (read by `commonplace orch docs-check`):
   - Graph inputs are authorized before traversal, ranking and statistics; explicit totals reuse endpoint and label proof.
 
 
+  - Only list_rooms/status respond payloads bypass the final generic gate after existing authorization proof; provenance-named count labels remain visible.
+
   - Citation failure cases compare complete surviving facts with readable controls.
 
   - Typed citation fixtures use native stored threads and real public reads, with metadata and Recall spies.
@@ -593,6 +608,7 @@ Format (read by `commonplace orch docs-check`):
   - Readable mirror hallway regressions fail on the prior head with count/row disagreement in both stores.
 
   - Hallway regression witnesses exercise public tools with real stored thread authority.
+  - Authenticated room/status sums use authorized pairs. Status suppresses global capacity and raw probe reasons, reports a fixed disabled-index reason, and omits transport diagnostics and palace/database paths. Status, list_rooms (including consented private_chats imports), list_wings and taxonomy propagate backup-pause retry errors; consented private_chats drawer listings do too. Pause tests cover RPC and internal calls on those routes.
 
   - Default provenance regressions assert zero candidate work above either cap and accurate write errors with unchanged verbatim storage. Cap-sized and 1 MiB scan measurements run separately under `timing`, reporting resource budgets without gating on them.
 
@@ -727,6 +743,8 @@ Format (read by `commonplace orch docs-check`):
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
 
+  - Incomplete pair proof still returns zero counts. Tunnel/drawer/other replies retain the gate and malformed scalar provenance remains omitted.
+
   - Deadline tests assert no worker calls; closet probes assert invocation and a readable positive result.
 
   - Only named public AssertionErrors count as base regressions; readable citations and plain-file display remain controls.
@@ -738,6 +756,7 @@ Format (read by `commonplace orch docs-check`):
   - A final gate that silently drops a readable mirror row fails the count equality and zero-drop assertions.
 
   - Hallway fault cases discard incomplete results and preserve the pagination envelope.
+  - Incomplete room/status acquisition returns zero visible sums with a count-free disabled-index reason; integrity failure flags remain, without raw failure details or shared principal caches.
 
   - Swallowing an authority fault must fail the fixed-503 assertion rather than silently reduce counters.
 
@@ -778,6 +797,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_card253_s07.py` covers local/scoped parity, stop-word names, candidate caps, refusal scope, cooperative deadline cleanup and lock release alongside KG visibility and source-snapshot guards; hidden-present parity guards and missing-snapshot/unknown-key regressions cover defensive reads; literal/shorthand readers and malformed-argument protocol/handler regressions and owner/wildcard blank and canonical-empty wing cases cover compatibility, legacy hidden facts and error-shape equality.
 
+  - `tests/test_card253_s02.py` covers nine provenance-key count collisions, hidden-pair exclusion and real tunnel/drawer gate reachability; the same typed-association and fact-provenance suites remain guards.
+
   - Regression selections cover owner maps and capped non-Chroma logical citation proof.
 
   - Typed association read and protocol suites cover public results and private snapshot failures.
@@ -794,6 +815,7 @@ Format (read by `commonplace orch docs-check`):
   - Hallway regressions additionally pin malformed-numeric row exclusion, private-label bytes and exact metadata page boundaries.
 
   - `tests/test_card253_s03.py` covers labels, rooms, totals, ties, complete enumeration and forged scopes.
+  - `tests/test_card253_s02.py` covers room/status branches, real capacity refresh with hidden/control equality, transport diagnostic suppression, invalid wing types, no-palace/local guards and projection faults.
 
   - `tests/test_card253_s12.py` covers strict store/private-reader failures, ordinary deny-on-fault compatibility and second-pass enumeration failure.
 
@@ -863,12 +885,15 @@ Format (read by `commonplace orch docs-check`):
 
   - Only KG query enforces strict search booleans; other tools retain normal unknown-key handling. KG reads preserve protocol errors for unknown keys and malformed pages; non-owner shorthand filters resolve to stored names after raw policy checks. Sees-all string wing names retain worker validation and literal filtering; per-fact policy and final allow-lists still enforce visibility. Fact enrichment and KG search share projection, worker expiry and fixed empty failures.
 
+  - Only list_rooms/status respond payloads bypass the final generic gate after existing authorization proof; provenance-named count labels remain visible.
+
   - Private association requests carry the authenticated workspace and are unavailable as public operations.
   - Authenticated explicit tunnel reads use request-local endpoint and drawer proof for owners and connections without altering mutation authorization.
 
   - Logical drawer pages authorize physical identities before grouping, dates, totals and slicing; only visible page text is hydrated.
 
   - Hallway reads project authorized metadata before strength sorting and pagination.
+  - Authenticated room/status sums use authorized pairs. Status suppresses global capacity and raw probe reasons, reports a fixed disabled-index reason, and omits transport diagnostics and palace/database paths. Status, list_rooms (including consented private_chats imports), list_wings and taxonomy propagate backup-pause retry errors; consented private_chats drawer listings do too. Pause tests cover RPC and internal calls on those routes.
 
   - KG provenance writes report the offending field and citation character limit before storage; hidden-reference refusals keep their existing replies and refused writes leave existing facts untouched.
 
@@ -904,11 +929,14 @@ Format (read by `commonplace orch docs-check`):
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
 
+  - Incomplete pair proof still returns zero counts. Tunnel/drawer/other replies retain the gate and malformed scalar provenance remains omitted.
+
   - Worker failures remove only the affected citation, with no other-workspace fallback.
 
   - Incomplete drawer membership proof returns an empty pagination envelope; changed metadata cannot authorize a sibling chunk.
 
   - Incomplete hallway acquisition returns the normal empty pagination envelope.
+  - Incomplete room/status acquisition returns zero visible sums with a count-free disabled-index reason; integrity failure flags remain, without raw failure details or shared principal caches.
 
   - Rejected methods have no tool alias; authentication and body transport refusals remain shared.
 
@@ -928,11 +956,14 @@ Format (read by `commonplace orch docs-check`):
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
 
 
+  - `tests/test_card253_s02.py` covers nine provenance-key count collisions, hidden-pair exclusion and real tunnel/drawer gate reachability; the same typed-association and fact-provenance suites remain guards.
+
   - Public typed citation tests cover trusted members, owner sessions and workspace isolation.
 
   - Logical page SQLite/SDK equality, chunk visibility, owner authority, changed associations and incomplete acquisition are covered in the focused drawer-page tests.
 
   - `tests/test_card253_s03.py` verifies visible totals, hidden client scope arguments and both persisted formats.
+  - `tests/test_card253_s02.py` covers room/status branches, real capacity refresh with hidden/control equality, transport diagnostic suppression, invalid wing types, no-palace/local guards and projection faults.
 
   - `tests/test_spaces_contract.py` and the installed public surface inventory.
 
@@ -1279,6 +1310,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Bounded KG authorization carries one expiry to workers; changed descriptors are excluded, and the palace lock is released after copying the authorized search snapshot. Authority caches last one response. Declared KG arguments retain schema/required-parameter errors and data-independent handler refusals; acquisition failures remain empty.
 
+  - Only list_rooms/status respond payloads bypass the final generic gate after existing authorization proof; provenance-named count labels remain visible.
+
   - Outgoing typed citations require current wing and thread authority plus snapshot revalidation; raw source_file tokens are authorized before basename display.
   - Tunnel projection validates names before acquisition, pages by identity and preserves live readable associations across non-association updates.
 
@@ -1293,6 +1326,7 @@ Format (read by `commonplace orch docs-check`):
   - The hallway final gate preserves readable mirror-wing rows and their visible counts after plural-room validation.
 
   - Every returned hallway string and room entry needs current authority for each independently recognized thread/private reference.
+  - Authenticated room/status sums use authorized pairs. Status suppresses global capacity and raw probe reasons, reports a fixed disabled-index reason, and omits transport diagnostics and palace/database paths. Status, list_rooms (including consented private_chats imports), list_wings and taxonomy propagate backup-pause retry errors; consented private_chats drawer listings do too. Pause tests cover RPC and internal calls on those routes.
 
   - A dedicated strict Recall callback propagates owner-progress lookup faults; extraction retains the ordinary deny-on-fault callback.
 
@@ -1341,6 +1375,8 @@ Format (read by `commonplace orch docs-check`):
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
 
+  - Incomplete pair proof still returns zero counts. Tunnel/drawer/other replies retain the gate and malformed scalar provenance remains omitted.
+
   - Association faults or revoked authority omit citations after original-source fact eligibility; words remain verbatim.
 
   - Incomplete drawer membership proof returns an empty pagination envelope; changed metadata cannot authorize a sibling chunk.
@@ -1352,6 +1388,7 @@ Format (read by `commonplace orch docs-check`):
   - Invalid hallway rows are excluded before counts/pages; only a failed final-gate recheck empties the entire page and its counts.
 
   - Malformed rooms and roomless mirror hallways fail closed; display labels stay verbatim.
+  - Incomplete room/status acquisition returns zero visible sums with a count-free disabled-index reason; integrity failure flags remain, without raw failure details or shared principal caches.
 
   - Store or private-reader exceptions invalidate the entire owner progress proof without an unscoped fallback.
 
@@ -1374,6 +1411,8 @@ Format (read by `commonplace orch docs-check`):
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
 
 
+  - `tests/test_card253_s02.py` covers nine provenance-key count collisions, hidden-pair exclusion and real tunnel/drawer gate reachability; the same typed-association and fact-provenance suites remain guards.
+
   - Typed citation tests cover moved targets, legacy chunk handles, raw directories and revoked authority.
 
   - Logical page SQLite/SDK equality, chunk visibility, owner authority, changed associations and incomplete acquisition are covered in the focused drawer-page tests.
@@ -1385,6 +1424,7 @@ Format (read by `commonplace orch docs-check`):
   - Hallway eligibility tests require zero final-gate drops and count/total agreement for readable mirror rows.
 
   - Hallway guards cover owner access, revocation and final-gate stability.
+  - `tests/test_card253_s02.py` covers room/status branches, real capacity refresh with hidden/control equality, transport diagnostic suppression, invalid wing types, no-palace/local guards and projection faults.
 
   - `tests/test_card253_s12.py::test_card253_s12_authority_fault_fixed_unavailable` exercises real Recall faults in both store formats.
 

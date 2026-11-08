@@ -55,13 +55,28 @@ def _valid_cursor(cursor, after, rows):
     return False
 
 
-def project(gateway, principal, workers, name, *, timeout=660.0):
+def _pair_payload(value, worker_tool):
+    # Only internal status pair pages carry these transport decorations. Drop
+    # exactly that vocabulary before applying the unchanged strict validator.
+    if worker_tool == "mempalace_status" and isinstance(value, dict):
+        return {
+            k: v
+            for k, v in value.items()
+            if k not in {"sqlite_integrity", "library_versions", "updates"}
+        }
+    return value
+
+
+def project(gateway, principal, workers, name, *, timeout=660.0, worker_tool=None):
     """Return only current readable sums, or the same shape as empty visibility.
 
     No public gateway recursion and no process-wide authorization cache. Raw
     worker calls always carry the authenticated principal's workspace. A fault
-    anywhere discards all pages, including sums already revalidated.
+    anywhere discards all pages, including sums already revalidated. Backup
+    pauses propagate WorkerPaused so callers retain their retry contract.
     """
+    from commonplace.gateway import WorkerPaused
+
     wings = name == "mempalace_list_wings"
     key = "wings" if wings else "taxonomy"
     empty = {key: {}}
@@ -80,7 +95,7 @@ def project(gateway, principal, workers, name, *, timeout=660.0):
             while True:
                 page = workers.call_tool(
                     principal,
-                    "mempalace_get_taxonomy",
+                    worker_tool or "mempalace_get_taxonomy",
                     {
                         "thread_scope": {
                             "probe": True,
@@ -89,6 +104,7 @@ def project(gateway, principal, workers, name, *, timeout=660.0):
                         },
                     },
                 )
+                page = _pair_payload(page, worker_tool)
                 if (
                     not isinstance(page, dict)
                     or set(page) != {"taxonomy", "probe"}
@@ -127,11 +143,12 @@ def project(gateway, principal, workers, name, *, timeout=660.0):
                 batch = allowed[start : start + PAGE_SIZE]
                 result = workers.call_tool(
                     principal,
-                    name,
+                    worker_tool or name,
                     {
                         "thread_scope": {"allow": batch, "timeout": checks.remaining(timeout)},
                     },
                 )
+                result = _pair_payload(result, worker_tool)
                 if (
                     not isinstance(result, dict)
                     or set(result) != {key}
@@ -154,5 +171,89 @@ def project(gateway, principal, workers, name, *, timeout=660.0):
                             dest[room] = dest.get(room, 0) + n
             checks.remaining(0)
             return {key: output}
+    except WorkerPaused:
+        # Preserve the gateway retry contract instead of reporting zero counts.
+        raise
+    except Exception:
+        return empty
+
+
+def summary(gateway, principal, workers, name, wing=None, *, timeout=660.0):
+    """Room/status consumers of the same complete authorized pair snapshot."""
+    from commonplace.gateway import WorkerPaused
+    from mempalace.config import sanitize_name, wing_aliases
+
+    if wing is not None:
+        try:
+            wing = (
+                None if isinstance(wing, str) and not wing.strip() else sanitize_name(wing, "wing")
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
+    status = name == "mempalace_status"
+    empty = (
+        {"total_drawers": 0, "wings": {}, "rooms": {}}
+        if status
+        else {"wing": wing or "all", "rooms": {}}
+    )
+    if not getattr(principal, "workspace_id", None):
+        return empty
+    try:
+        with checks.deadline(timeout):
+            taxonomy = project(
+                gateway,
+                principal,
+                workers,
+                "mempalace_get_taxonomy",
+                timeout=checks.remaining(timeout),
+                worker_tool="mempalace_status" if status else None,
+            )["taxonomy"]
+            selected = set(wing_aliases(wing, taxonomy)) if wing else set(taxonomy)
+            rooms, wings = {}, {}
+            for w, counts in taxonomy.items():
+                if not status and w not in selected:
+                    continue
+                wings[w] = sum(counts.values())
+                for room, n in counts.items():
+                    rooms[room] = rooms.get(room, 0) + n
+            if not status:
+                checks.remaining(0)
+                return {"wing": wing or "all", "rooms": rooms}
+            diagnostics = workers.call_tool(
+                principal,
+                name,
+                {"thread_scope": {"allow": [], "timeout": checks.remaining(timeout)}},
+            )
+            diagnostics = _pair_payload(diagnostics, name)
+            # Only a fixed diagnostic vocabulary crosses this boundary. Counts
+            # come exclusively from the current authorized identity snapshot.
+            keys = {
+                "protocol",
+                "aaak_dialect",
+                "backend",
+                "embedding_device",
+                "vector_disabled",
+                "vector_disabled_reason",
+                "sqlite_integrity_failed",
+                "error",
+                "partial",
+            }
+            if not isinstance(diagnostics, dict) or set(diagnostics) - keys:
+                return empty
+            if diagnostics.get("vector_disabled") is True:
+                diagnostics = {
+                    **diagnostics,
+                    "vector_disabled_reason": "Vector index unavailable; repair required.",
+                }
+            checks.remaining(0)
+            return {
+                **diagnostics,
+                "total_drawers": sum(wings.values()),
+                "wings": wings,
+                "rooms": rooms,
+            }
+    except WorkerPaused:
+        # Preserve the gateway retry contract instead of reporting zero counts.
+        raise
     except Exception:
         return empty

@@ -8,7 +8,12 @@ if __name__ != "mempalace.mcp_server":
 TOOLS = {
     "mempalace_status": {
         "description": "Palace overview — total drawers, wing and room counts",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"}
+            },
+        },
         "handler": tool_status,
     },
     "mempalace_list_wings": {

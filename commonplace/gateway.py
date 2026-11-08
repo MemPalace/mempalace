@@ -572,7 +572,17 @@ class Mediator:
             except Exception as exc:
                 # Optional import search fails closed; preserve ordinary results.
                 logger.error("Imported-history search failed (%s)", type(exc).__name__)
-        response, committed_result = self._gate_response(principal, name, rule, req_id, response)
+        # Authorized count-map labels must not be interpreted as provenance fields.
+        if (
+            name in ("mempalace_list_rooms", "mempalace_status")
+            and isinstance(plan, dict)
+            and "respond" in plan
+        ):
+            committed_result = _tool_result(response)
+        else:
+            response, committed_result = self._gate_response(
+                principal, name, rule, req_id, response
+            )
 
         if classify_tool(name) != "read":
             result = committed_result
@@ -664,6 +674,11 @@ class Mediator:
             from .handoff.kg_projection import project
 
             return {"respond": project(self.gateway, principal, self.workers, name, args)}
+
+        if name == "mempalace_status":
+            from .handoff.overview import summary
+
+            return {"respond": summary(self.gateway, principal, self.workers, name)}
         if name == "mempalace_delete_by_source":
             return self._scope_delete_by_source(principal, name, args)
         if name == "mempalace_delete_tunnel":
@@ -724,16 +739,21 @@ class Mediator:
             result = project(self.gateway, principal, self.workers, args)
             response = self._after(principal, name, "read_wing", args, _tool_response(None, result))
             return {"respond": finish_page(result, _tool_result(response))}
-        if policy.sees_all_wings:
-            return None
-        wing = args.get("wing")
-        if not wing:
-            wing = _only_literal_wing(policy)
+        if not policy.sees_all_wings:
+            wing = args.get("wing")
             if not wing:
-                raise Denied(f"pass a wing: this connection reads {_wings_text(policy)}")
-            args["wing"] = wing
-        if not policy.can_read_wing(wing):
-            raise Denied(f"this connection can't read wing {wing!r}")
+                wing = _only_literal_wing(policy)
+                if not wing:
+                    raise Denied(f"pass a wing: this connection reads {_wings_text(policy)}")
+                args["wing"] = wing
+            if not policy.can_read_wing(wing):
+                raise Denied(f"this connection can't read wing {wing!r}")
+        if name == "mempalace_list_rooms":
+            from .handoff.overview import summary
+
+            return {
+                "respond": summary(self.gateway, principal, self.workers, name, args.get("wing"))
+            }
         return None
 
     def _before_import_listing(self, principal, name, args):
@@ -798,6 +818,8 @@ class Mediator:
                     }
                 return {"respond": {"drawers": drawers, "count": len(drawers)}}
         except PageArgumentError:
+            raise
+        except WorkerPaused:
             raise
         except Exception:
             return {"respond": empty}

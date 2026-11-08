@@ -258,23 +258,51 @@ def test_private_endpoint_hides_connection_without_preview(world):
     )
 
 
-def test_gateway_returns_original_worker_response(world):
-    from commonplace.gateway import Mediator, _tool_response
+def test_gateway_returns_original_worker_response(world, monkeypatch):
+    from commonplace.gateway import Mediator, _tool_response, _tool_result
+    from mempalace.read_scope import descriptor
 
     response = _tool_response(1, {"wing": "shared", "content": "words"})
-    workers = Mock(post=Mock(return_value=response))
+    row = descriptor("drawer_one", {"wing": "shared", "room": "public"})
+    taxonomy = {"shared": {"public": 1}}
+    decoration = {"sqlite_integrity": {"internal": True}, "library_versions": {}, "updates": {}}
+
+    def call_tool(principal, name, args):
+        assert principal is world.principal and name == "mempalace_status"
+        scope = args["thread_scope"]
+        if scope.get("probe"):
+            return {"taxonomy": taxonomy, "probe": {"rows": [row], "next": None}, **decoration}
+        if scope["allow"]:
+            assert scope["allow"] == [row]
+            return {"taxonomy": taxonomy, **decoration}
+        return {"protocol": "synthetic protocol"}
+
+    workers = Mock(post=Mock(return_value=response), call_tool=Mock(side_effect=call_tool))
     mediator = Mediator(Mock(), workers)
     mediator.gateway = world.gateway
+    monkeypatch.setattr(
+        world.gateway.handoff, "store_for", Mock(return_value=world.store), raising=False
+    )
     assert (
         mediator._tools_call(
             world.principal,
-            {
-                "id": 1,
-                "params": {"name": "mempalace_status", "arguments": {}},
-            },
+            {"id": 1, "params": {"name": "mempalace_get_aaak_spec", "arguments": {}}},
         )
         is response
     )
+    projected = mediator._tools_call(
+        world.principal,
+        {"id": 1, "params": {"name": "mempalace_status", "arguments": {}}},
+    )
+    assert projected is not response
+    assert _tool_result(projected) == {
+        "protocol": "synthetic protocol",
+        "total_drawers": 1,
+        "wings": {"shared": 1},
+        "rooms": {"public": 1},
+    }
+    workers.post.assert_called_once()
+    assert workers.call_tool.call_count == 3
 
 
 @pytest.mark.parametrize(

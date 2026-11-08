@@ -542,7 +542,41 @@ def _tally_wings_rooms(all_meta, wings=None, rooms=None, taxonomy=None) -> int:
     return total
 
 
-def tool_status():
+def tool_status(thread_scope: dict = None):
+    if thread_scope is not None:
+        if not isinstance(thread_scope, dict):
+            raise ValueError("thread_scope must be an object")
+        if thread_scope.get("probe") is True or thread_scope.get("allow"):
+            # Status remains callable when the integrity gate blocks ordinary
+            # tools. Its private metadata-only pair path needs the same access.
+            return _scoped_taxonomy(thread_scope)
+        # Authenticated counts are produced by the shared pair projection.
+        # This endpoint provides diagnostics only and never opens vector data.
+        if (
+            not isinstance(thread_scope, dict)
+            or set(thread_scope) != {"allow", "timeout"}
+            or thread_scope["allow"] != []
+        ):
+            return {}
+        result = {
+            "protocol": PALACE_PROTOCOL,
+            "aaak_dialect": AAAK_SPEC,
+            "backend": _selected_backend_name(),
+        }
+        _ensure_sqlite_integrity_status()
+        if _sqlite_integrity_errors:
+            result.update(
+                sqlite_integrity=_sqlite_integrity_payload(),
+                sqlite_integrity_failed=True,
+                error="SQLite integrity check failed",
+                partial=True,
+            )
+        _refresh_vector_disabled_flag()
+        if _vector_disabled or _sqlite_integrity_errors:
+            result["vector_disabled"] = True
+        else:
+            result["embedding_device"] = _describe_device_safe()
+        return result
     _ensure_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = _tool_status_via_sqlite()
@@ -746,7 +780,9 @@ def _scoped_taxonomy(scope, *, wings=False):
             return {"wings": {w: sum(rooms.values()) for w, rooms in taxonomy.items()}}
         return {"taxonomy": taxonomy}
     except Exception:
-        return empty
+        # Distinguish a failed final batch from a genuinely empty snapshot.
+        # The gateway discards all previously accumulated batches on failure.
+        return empty if scope.get("probe") is True else {**empty, "incomplete": True}
 
 
 def tool_list_wings(thread_scope: dict = None):
