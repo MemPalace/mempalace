@@ -1099,7 +1099,9 @@ def tool_delete_tunnel(tunnel_id: str, thread_scope: dict = None):
     return delete_tunnel(tunnel_id, expect=scope)
 
 
-def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
+def tool_list_hallways(
+    wing: str = None, limit: int = 100, offset: int = 0, thread_scope: dict = None
+):
     """List within-wing hallway records, strongest first, one page at a time.
 
     A palace of any size holds hundreds of thousands of hallways; returning
@@ -1111,6 +1113,13 @@ def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
+    if thread_scope is not None:
+        from ..hallway_scope import read
+        from ..provenance import current
+
+        if current() is None:
+            return {"error": "Internal hallway scope requires verified gateway identity"}
+        return read(thread_scope, wing)
     page, total = list_hallways_page(wing, limit=limit, offset=offset)
     return {
         "hallways": page,

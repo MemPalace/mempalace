@@ -1,5 +1,6 @@
 """Apply thread read boundaries to every outgoing mirror drawer."""
 
+import math
 import re
 from pathlib import Path
 
@@ -7,6 +8,7 @@ from commonplace.policy import canonical_wing
 from commonplace.rules import checks
 
 from . import provenance_refs
+from .hallway_fields import NUMERIC_KEYS, public_row
 from .models import MIRROR_WING
 from .recall import Recall
 
@@ -253,6 +255,49 @@ def scrub_provenance(node, access):
     return out
 
 
+def hallway_visible(node, access, policy):
+    """A label is display text: scan protected tokens without citation refusal."""
+    wing, rooms = node.get("wing"), node.get("rooms", [])
+    if not isinstance(wing, str) or not wing.strip() or not policy.can_read_wing(wing):
+        return False
+    if not isinstance(rooms, list) or any(not isinstance(r, str) or not r.strip() for r in rooms):
+        return False
+    if not rooms and canonical_wing(wing) == MIRROR_WING:
+        return False
+    if any(unreadable_room(access, wing, room) for room in rooms):
+        return False
+    for key, value in public_row(node).items():
+        if key in NUMERIC_KEYS:
+            if (
+                type(value) not in (int, float)
+                or isinstance(value, float)
+                and not math.isfinite(value)
+            ):
+                return False
+        elif key == "rooms":
+            if not all(_hallway_text_visible(room, access) for room in value):
+                return False
+        elif not _hallway_text_visible(value, access):
+            return False
+    return True
+
+
+def _hallway_text_visible(value, access):
+    """All hallway strings share the raw token scan and its character bound."""
+    if not isinstance(value, str) or len(value) > provenance_refs.MAX_REFERENCE_CHARS:
+        return False
+    try:
+        checks.remaining(0)
+        tokens = provenance_refs.label_tokens(value)
+        for token in tokens:
+            checks.remaining(0)
+            if not access.reference(token):
+                return False
+        return True
+    except TimeoutError:
+        return False
+
+
 def gate(gateway, principal, rule, result):
     """Scrub mirror words, caching access decisions only within this response."""
     access = reader(gateway, principal)
@@ -358,11 +403,22 @@ def gate(gateway, principal, rule, result):
         out = {**result, "results": items, "count": len(items), "errors": errors}
         out.pop("total", None)
         return _filter_fact_links(out)
+    if isinstance(result, dict) and isinstance(result.get("hallways"), list):
+        return _gate_hallways(result, access, principal.policy)
     result = filter_room_keys(rule, result, can_read)
     cleaned = scrub(result)
     if cleaned is _DROP:
         return _dropped_result(rule, result)
     return _filter_fact_links(cleaned)
+
+
+def _gate_hallways(result, access, policy):
+    rows = result["hallways"]
+    if not all(isinstance(row, dict) and hallway_visible(row, access, policy) for row in rows):
+        # A late revocation discards the page and its counts together.
+        return {**result, "hallways": [], "count": 0, "total": 0}
+    # Hallways prove plural rooms above; generic drawer scrub expects room.
+    return _filter_fact_links({**result, "hallways": [public_row(row) for row in rows]})
 
 
 def _proved_record(node):

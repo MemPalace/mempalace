@@ -607,6 +607,10 @@ class Mediator:
             from .handoff.tunnels import project
 
             return {"respond": project(self.gateway, principal, self.workers, name, args)}
+        if name == "mempalace_list_hallways":
+            from .handoff.hallway_reads import project
+
+            return {"respond": project(self.gateway, principal, self.workers, args)}
         if name == "mempalace_delete_by_source":
             return self._scope_delete_by_source(principal, name, args)
         if name == "mempalace_delete_tunnel":
