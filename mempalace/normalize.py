@@ -394,11 +394,17 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
     the canonical conversation turns. Newer Codex CLI rollouts (0.166+) can
     carry the conversation only as response_item messages; those are used
     when no event_msg turn is present, with synthetic context skipped.
+
+    A sub-agent rollout (``session_meta.source.subagent``) gets no such
+    fallback: its role=user messages are written by the parent agent or by
+    Codex's reviewer, which is handed whole transcripts of other sessions,
+    so none of them are the user's words.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
     response_messages = []
     has_session_meta = False
+    is_subagent = False
     for line in lines:
         try:
             entry = json.loads(line)
@@ -410,6 +416,10 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
         entry_type = entry.get("type", "")
         if entry_type == "session_meta":
             has_session_meta = True
+            meta = entry.get("payload")
+            source = meta.get("source") if isinstance(meta, dict) else None
+            if isinstance(source, dict) and "subagent" in source:
+                is_subagent = True
             continue
 
         payload = entry.get("payload", {})
@@ -446,7 +456,7 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
         elif payload_type == "agent_message":
             messages.append(("assistant", text))
 
-    if not messages:
+    if not messages and not is_subagent:
         messages = response_messages
     if len(messages) >= 2 and has_session_meta:
         return _messages_to_transcript(messages)

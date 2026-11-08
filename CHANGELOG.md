@@ -22,7 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   logged "0 exchanges" and saved nothing for them. A user message keeps only
   the blocks Codex marks `user.text`, so injected environment, AGENTS.md and
   app context is not filed as something the user said; rollouts without that
-  metadata skip messages that open with a known context tag.
+  metadata skip messages that open with a known context tag. Sub-agent
+  rollouts are not read this way: their user messages are written by another
+  agent, and Codex's reviewer is handed whole transcripts of other sessions.
 - Stop and PreCompact diary checkpoints are filed through a running
   `mempalace serve` hub. The hub holds the palace writer lease for its whole
   lifetime, so the checkpoint's own write was refused for as long as a hub

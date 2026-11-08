@@ -508,6 +508,20 @@ def test_codex_kinds_keep_user_text_that_opens_like_a_context_tag():
     assert codex_response_message(payload) == ("user", "<user_instructions> is the tag I meant")
 
 
+def test_codex_subagent_rollout_gets_no_response_item_fallback():
+    """A sub-agent's role=user messages come from another agent, not the user."""
+    meta = {"type": "session_meta", "payload": {"source": {"subagent": {"other": "guardian"}}}}
+    lines = [
+        json.dumps(meta),
+        json.dumps({"type": "response_item", "payload": _codex_kinded_user(("user.text", "Q"))}),
+        _codex_item("assistant", "A", "output_text"),
+    ]
+    assert _try_codex_jsonl("\n".join(lines)) is None
+    meta["payload"]["source"] = "vscode"
+    lines[0] = json.dumps(meta)
+    assert "> Q" in _try_codex_jsonl("\n".join(lines))
+
+
 def test_codex_kinds_that_do_not_line_up_fall_back_to_prefixes():
     from mempalace.normalize import codex_response_message
 
