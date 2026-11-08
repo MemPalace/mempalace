@@ -157,7 +157,10 @@ _http_embedding_release_tls = threading.local()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
-_HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
+# MCP 2026-07-28 clients (e.g. Codex with mcp_2026_07_28) probe server/discover
+# before falling back to initialize. It never touches the palace, so it must not
+# queue behind the exclusive lock (under write load that exceeded client timeouts).
+_HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list", "server/discover"})
 
 # SSE stream limits (GET /logstream/stream). Each connected client holds one
 # handler thread, so the cap is a thread-exhaustion guard, not a rate limit.
