@@ -474,6 +474,69 @@ def test_openai_compat_retries_without_reasoning_effort_on_400():
     assert len(bodies) == 2 and "reasoning_effort" not in bodies[1]
 
 
+def test_openai_compat_drops_temperature_a_400_names_and_remembers_it():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "temperature" in body:
+            raise HTTPError(
+                req.full_url,
+                400,
+                "'temperature' does not support 0.1 with this model",
+                hdrs=None,
+                fp=None,
+            )
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="gpt-5-mini", endpoint="http://localhost")
+        assert p.classify("s", "u").text == '{"ok": true}'
+        assert len(bodies) == 2 and "temperature" not in bodies[1]
+        # The next call skips the request that is known to fail.
+        assert p.classify("s", "u").text == '{"ok": true}'
+    assert len(bodies) == 3 and "temperature" not in bodies[2]
+
+
+def test_openai_compat_think_false_survives_rejecting_both_fields():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "reasoning_effort" in body:
+            raise HTTPError(req.full_url, 400, "unknown field", hdrs=None, fp=None)
+        if "temperature" in body:
+            raise HTTPError(req.full_url, 400, "'temperature' unsupported", hdrs=None, fp=None)
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="gpt-5-mini", endpoint="http://localhost")
+        assert p.classify("s", "u", think=False).text == '{"ok": true}'
+    assert len(bodies) == 3
+
+
+def test_openai_compat_keeps_temperature_when_a_400_does_not_name_it():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        bodies.append(json.loads(req.data))
+        raise HTTPError(req.full_url, 400, "context length exceeded", hdrs=None, fp=None)
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="x", endpoint="http://localhost")
+        with pytest.raises(LLMError, match="context length"):
+            p.classify("s", "u")
+    assert len(bodies) == 1 and bodies[0]["temperature"] == 0.1
+
+
 def test_openai_compat_empty_content_after_length_cutoff_names_the_cause():
     mock = MagicMock()
     payload = {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
@@ -654,6 +717,7 @@ def test_ollama_provider_defaultendpoint_is_local():
     )
 
 
+@pytest.mark.resolves_dns
 def test_single_label_hostname_is_local_only_when_it_resolves_privately(monkeypatch):
     import socket
 
@@ -857,6 +921,7 @@ def test_private_ip_literals_stay_local_and_neighbours_do_not():
         assert not endpoint_is_local(url), url
 
 
+@pytest.mark.resolves_dns
 def test_dot_local_names_are_resolved_not_trusted(monkeypatch):
     """Office networks reuse .local for unicast DNS; the suffix proves nothing."""
     import socket
@@ -968,6 +1033,7 @@ def test_trailing_dot_localhost_is_local_and_backslash_netloc_is_not():
     assert not endpoint_is_local("http://evil.com\\@localhost:11434/v1")
 
 
+@pytest.mark.resolves_dns
 def test_docker_host_is_resolved_not_trusted(monkeypatch):
     import socket
 
@@ -985,6 +1051,7 @@ def test_docker_host_is_resolved_not_trusted(monkeypatch):
     assert not endpoint_is_local("http://host.docker.internal:11434")
 
 
+@pytest.mark.resolves_dns
 def test_resolution_uses_the_hostname_with_its_trailing_dot(monkeypatch):
     import socket
 

@@ -72,6 +72,7 @@ from typing import Any, Dict, List, Optional
 
 from mempalace import paths
 from mempalace.config import (
+    MAX_NAME_LENGTH,
     MempalaceConfig,
     sanitize_iso_temporal,
     sanitize_kg_value,
@@ -79,7 +80,12 @@ from mempalace.config import (
 )
 from mempalace.convo_miner import file_conversation_exchange
 from mempalace.knowledge_graph import KnowledgeGraph, open_graph
-from mempalace.layers import Layer0, fetch_recent_window, recent_read_failure
+from mempalace.layers import (
+    Layer0,
+    fence_stored_memory,
+    fetch_recent_window,
+    recent_read_failure,
+)
 from mempalace.palace import MineAlreadyRunning, get_collection
 from mempalace.query_sanitizer import sanitize_query, sanitizer_report
 from mempalace.search_util import build_where_filter
@@ -149,10 +155,14 @@ def _l1_story_from_collection(
     for imp, meta, doc in top:
         by_room[meta.get("room", "general")].append((imp, meta, doc))
 
-    lines = ["## L1 -- ESSENTIAL STORY"]
+    heading = "## L1 -- ESSENTIAL STORY"
+    lines = []
     total = 0
     for room, entries in sorted(by_room.items()):
-        room_line = f"\n[{room}]"
+        room_line = f"\n[{' '.join(str(room).split())[:MAX_NAME_LENGTH]}]"
+        if total + len(room_line) > max_chars:
+            lines.append("  ... (more in L3 search)")
+            break
         lines.append(room_line)
         total += len(room_line)
         for _imp, meta, doc in entries:
@@ -165,10 +175,10 @@ def _l1_story_from_collection(
                 entry += f"  ({source})"
             if total + len(entry) > max_chars:
                 lines.append("  ... (more in L3 search)")
-                return "\n".join(lines)
+                return fence_stored_memory(heading, "\n".join(lines))
             lines.append(entry)
             total += len(entry)
-    return "\n".join(lines)
+    return fence_stored_memory(heading, "\n".join(lines))
 
 
 # The palace path this provider last bridged into ``MEMPALACE_PALACE_PATH``
@@ -819,7 +829,7 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
             hits = result.get("results", []) if isinstance(result, dict) else []
             if not hits:
                 return ""
-            lines = ["## MemPalace — relevant context"]
+            lines = []
             for r in hits:
                 wing = r.get("wing", "")
                 room = r.get("room", "")
@@ -827,7 +837,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
                 text = (r.get("text") or "").strip()
                 if text:
                     lines.append(f"{tag}{text}")
-            return "\n\n".join(lines)
+            if not lines:
+                return ""
+            return fence_stored_memory("## MemPalace — relevant context", "\n\n".join(lines))
         except Exception as exc:
             logger.debug("MemPalace prefetch error: %s", exc)
             return ""

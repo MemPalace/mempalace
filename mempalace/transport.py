@@ -42,6 +42,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 
+from . import _net
 from ._env import env_float, env_str
 
 PEERS_FILENAME = "peers.json"
@@ -96,7 +97,8 @@ def http_request(base_url: str, token: str, path: str, params: dict = None) -> d
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(request, timeout=_http_timeout_s()) as response:
+        # Never follows a redirect: the bearer token would travel with it.
+        with _net.urlopen(request, timeout=_http_timeout_s()) as response:
             return json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
         raise TransportError(f"{url}: {exc}") from None

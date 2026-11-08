@@ -8,6 +8,107 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+
+- Wake-up text and Hermes prefetch results now mark stored memory as reference
+  data inside a fence that stored words cannot close, so a mined file or
+  transcript cannot pose as instructions in the system prompt. The stored words
+  themselves are unchanged. The memory protocol says the same to agents.
+
+### Fixed
+
+- Stop and PreCompact diary checkpoints are filed through a running
+  `mempalace serve` hub. The hub holds the palace writer lease for its whole
+  lifetime, so the checkpoint's own write was refused for as long as a hub
+  ran, the save marker never advanced, and every later Stop re-mined the whole
+  transcript. The checkpoint now goes to the hub's `mempalace_diary_write`, the
+  same way the hook's transcript mine is forwarded, and is written in-process
+  only when no writable hub answers. A hub that took the request but gave no
+  readable answer may already have filed it, so the entry is not written a
+  second time.
+- A torn `index_metadata.pickle` read no longer quarantines a live HNSW
+  segment. When a metadata load fails with an error outside the
+  known-transient set, the guard now re-checks the file up to six times
+  50 ms apart and only quarantines it when the bytes stay identical and
+  the load keeps failing; a file that is still being rewritten is left
+  alone for the next open to re-check once it has settled.
+- The `wing` in `mempalace.yaml` is validated when a project is mined, so a
+  cloned repository's config cannot hang the miner with a yaml alias structure
+  or file drawers under unsafe text, a number or a list. A rejected name becomes
+  its wing slug, with a warning, and a config with no usable wing, including one
+  with no `wing` key, uses the directory's wing instead of failing. Valid names
+  and `--wing` are unchanged. Drawers already filed under the old spelling stay
+  there, and a wing filter finds both by slug. A wing with no slug, such as
+  `+++`, stays reachable by that name or an unfiltered search.
+- Room names in `mempalace.yaml` are validated when the miner loads them, so a
+  cloned repository's config cannot put newlines or other unsafe text into
+  drawer metadata and wake-up output. A rejected name such as `c++` becomes its
+  slug, with a warning. A room with no usable name is skipped, and its files go
+  to the other rooms or `general`. Every file is still mined, and stored drawers
+  are not changed.
+- The L1 size cap now holds for room lines. A room name already in a palace
+  stays on one line in wake-up and Hermes output, and a long one is shortened
+  instead of crowding out the story.
+
+### Security
+
+- **The Antigravity hooks, the daemon and `mempalace serve` no longer import
+  from the working directory.** They started Python with `-m mempalace` (or
+  `-c`) in the user's workspace, where Python looks first, so a cloned
+  repository holding a `mempalace/` package or a `sqlite3.py` ran instead of
+  the installed one, as the user, on every hook fire. Every child interpreter
+  now runs with `PYTHONSAFEPATH=1` and through the launcher the Claude Code and
+  Codex hooks already used, which drops the working directory from `sys.path`
+  on Python 3.10 too. The small `-c` helpers around the launcher (the
+  kill-switch config reader, the wake-up JSON encoder, the state-file
+  timestamps) carry the same two lines, since Python 3.10 ignores
+  `PYTHONSAFEPATH` and the config reader runs before the launcher does. The
+  working directory itself is unchanged.
+- **A hostile `.gitignore` can no longer hang the miner.** The `**` matcher
+  branched on every `**` segment, so one line of a dozen of them in a cloned
+  repository kept `mempalace mine` and `mempalace init` busy for minutes
+  (`exclude_patterns` in `mempalace.yaml` reached the same code). Matching is
+  now a table over path and pattern positions, and adjacent `**` segments are
+  folded, so the cost is the product of the two lengths. Results are unchanged.
+- **`mempalace init` refuses to write through a symbolic link.**
+  `mempalace.yaml`, `entities.json` and `.gitignore` were guarded with
+  `exists()` and `is_file()`, which follow links, so a checkout that shipped
+  one of them as a link at a file in the user's home had that file replaced or
+  appended to, and a dangling link had its target created. The three writers
+  now decide by `lstat`, refuse anything that is not a regular file or absent,
+  and publish through a fresh temporary file that never follows a link. The
+  replacement keeps the mode of the file it replaces, so a `mempalace.yaml` or
+  `entities.json` the user had set to 0600 stays 0600 instead of coming back
+  at the umask default; this holds for every non-private `fsio` publish.
+- **A sync peer's events and artifacts pass the same checks as local ones.**
+  `apply_remote_event` only checked that required fields were present, so a
+  configured peer (or whoever held its token) could store a body of any size,
+  an id with line breaks that broke the `/logstream/stream` frames, a
+  non-numeric `origin_seq` that made every other replica's pull fail, or an
+  op stamped with a third replica's name and a huge sequence number, which
+  told this node it already had everything from that replica. Remote events
+  and artifacts now go through the routing, type, status, body-size,
+  artifact-size and sha256-shape checks `append_event` and `put_artifact`
+  apply, an event must carry the origin it was served for, its `hlc` stamp
+  must parse (a stamp that did not sorted above every real one, and the next
+  open of that replica's log failed seeding the clock from it; a log that
+  already holds such a row now opens, skips it with a warning and seeds from
+  the newest stamp that parses), and the sync round
+  refuses a page that does not advance the cursor it asked from (a peer could
+  otherwise hold the round, and every peer behind it, for ever), pulls a
+  bounded number of pages per origin per round, and reports any failure a peer
+  provokes instead of letting it stop the loop. Event ids are also written to
+  the SSE stream as a single field. A peer is still trusted for the origins it
+  relays; signing them is the RFC 004 MeshGuard step.
+- **Credentials no longer follow a redirect.** The peer transport, the hub
+  client, the LLM and embedding client, the Qdrant backend and the daemon
+  client used `urllib`'s default opener, whose redirect handler copies
+  `Authorization` and API-key headers onto the redirected request whatever
+  host it names, so an endpoint answering `302 Location: http://elsewhere/`
+  received the token or key meant for it. Those requests now go through one
+  opener that follows no redirect and raises the 3xx, naming the target it did
+  not follow.
+
 ---
 
 ## [3.12.0] — 2026-10-31

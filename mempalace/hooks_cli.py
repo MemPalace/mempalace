@@ -821,6 +821,8 @@ def _mine_sync():
     for mine_dir, mode in targets:
         try:
             if routing.use_daemon:
+                from .daemon import DaemonWaitTimeout
+
                 try:
                     job = _submit_daemon_job(
                         "mine",
@@ -837,6 +839,9 @@ def _mine_sync():
                         _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
                     elif job.get("state") != "succeeded" or not result.get("success", True):
                         _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
+                except DaemonWaitTimeout as exc:
+                    # Accepted, and the daemon still runs it: not a failure.
+                    _log(f"Daemon sync mine still {exc.state}: job {exc.job_id}")
                 except Exception as exc:
                     # Daemon accepted context — don't fall back (would double-mine).
                     _log(f"Daemon sync mine submission failed: {exc}")
@@ -1032,30 +1037,44 @@ def run_detached_diary_checkpoint(payload_path: str) -> None:
     The mines start only after the diary write, so they never hold the palace
     lock that write needs.
     """
-    from .miner import _cleanup_mine_pid_file
+    from .miner import _arm_hook_mine_exit_watchdog, _cleanup_mine_pid_file
 
-    path = Path(payload_path)
+    exit_code = 0
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        _log(f"Diary checkpoint payload unreadable: {type(exc).__name__}")
-        payload = None
-    try:
-        if payload is not None:
-            _apply_diary_checkpoint(payload)
-    finally:
+        path = Path(payload_path)
         try:
-            path.unlink()
-        except OSError:
-            pass
-        _cleanup_mine_pid_file()
-    if payload is None:
-        return
-    with _hook_write_routing_context():
-        transcript = payload.get("ingest_transcript")
-        if isinstance(transcript, str) and transcript:
-            _ingest_transcript(transcript)
-        _maybe_auto_ingest()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _log(f"Diary checkpoint payload unreadable: {type(exc).__name__}")
+            payload = None
+        try:
+            if payload is not None:
+                _apply_diary_checkpoint(payload)
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            _cleanup_mine_pid_file()
+        if payload is None:
+            return
+        with _hook_write_routing_context():
+            transcript = payload.get("ingest_transcript")
+            if isinstance(transcript, str) and transcript:
+                _ingest_transcript(transcript)
+            _maybe_auto_ingest()
+    except SystemExit as exc:
+        exit_code = (
+            exc.code
+            if isinstance(exc.code, int) and not isinstance(exc.code, bool)
+            else (0 if exc.code is None else 1)
+        )
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        _arm_hook_mine_exit_watchdog(exit_code=exit_code)
 
 
 def _diary_write_locked(tool_diary_write, **kwargs) -> dict:
@@ -1089,26 +1108,53 @@ def _diary_write_locked(tool_diary_write, **kwargs) -> dict:
     return result if isinstance(result, dict) else {}
 
 
-def _apply_diary_checkpoint(payload: dict) -> bool:
-    """File the checkpoint and write its ack. Only the child imports mcp_server."""
+def _diary_write_in_process(arguments: dict) -> dict:
+    """File a diary entry in this process, waiting out a briefly held lock."""
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .mcp_server import tool_diary_write
 
-    entry = payload.get("entry")
-    if not isinstance(entry, str) or not entry:
-        return False
     for delay in _DIARY_LOCK_RETRY_DELAYS + (None,):
-        result = _diary_write_locked(
-            tool_diary_write,
-            agent_name=str(payload.get("agent_name") or "claude"),
-            entry=entry,
-            topic=str(payload.get("topic") or "checkpoint"),
-            wing=str(payload.get("wing") or ""),
-        )
+        result = _diary_write_locked(tool_diary_write, **arguments)
         if result.get("success") or result.get("error_class") != LOCK_REFUSAL_ERROR_CLASS:
             break
         if delay is not None:
             time.sleep(delay)
+    return result
+
+
+def _apply_diary_checkpoint(payload: dict) -> bool:
+    """File the checkpoint and write its ack.
+
+    A running ``mempalace serve`` hub holds the palace writer lease for its
+    whole lifetime, so an in-process write would be refused for as long as it
+    runs. The entry therefore goes to the hub when a writable one is serving
+    this palace, the same way the hook's transcript mine is forwarded, and is
+    written here only when none answers. Only that fallback imports mcp_server.
+    """
+    from .hub_client import forward_tool_call
+
+    entry = payload.get("entry")
+    if not isinstance(entry, str) or not entry:
+        return False
+    arguments = {
+        "agent_name": str(payload.get("agent_name") or "claude"),
+        "entry": entry,
+        "topic": str(payload.get("topic") or "checkpoint"),
+        "wing": str(payload.get("wing") or ""),
+    }
+    handled, result = forward_tool_call(
+        MempalaceConfig().palace_path, "mempalace_diary_write", arguments
+    )
+    if handled and result is None:
+        # The hub took the request but gave no readable answer. The entry may
+        # already be filed, so it is not written again here; the save marker
+        # stays put and the next Stop files a fresh checkpoint.
+        _log("Diary checkpoint sent to the palace hub, which did not report back")
+        return False
+    if handled:
+        _log("Diary checkpoint forwarded to the palace hub")
+    else:
+        result = _diary_write_in_process(arguments)
     if not result.get("success"):
         # The save marker stays put, so the next Stop files a fresh checkpoint.
         _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
@@ -1198,6 +1244,8 @@ def _save_diary_direct(
 
     try:
         if routing.use_daemon:
+            from .daemon import DaemonWaitTimeout
+
             try:
                 job = _submit_daemon_job(
                     "diary_write",
@@ -1211,6 +1259,13 @@ def _save_diary_direct(
                     wait=True,
                     timeout=30,
                 )
+            except DaemonWaitTimeout as exc:
+                # The daemon runs one job at a time, so a checkpoint submitted
+                # while a mine from an earlier Stop hook still runs waits behind
+                # it. It is filed once that mine ends: not a failure, and not a
+                # reason to write it here as well.
+                _log(f"Daemon diary checkpoint still {exc.state}: job {exc.job_id}")
+                return {"drawers_filed": 0, "messages_folded": 0}
             except Exception as exc:
                 # Daemon accepted context — don't fall back (would double-write).
                 _log(f"Daemon diary checkpoint failed: {exc}")
