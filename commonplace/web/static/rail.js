@@ -26,7 +26,7 @@ export function projectSubline(board) {
 // Pure markup: the shell delegates data-action clicks and owns navigation/state.
 // needsByBoard contains attention counts, never the whole Review column count.
 // Rail styles live in workbench.css, so re-rendering the rail never adds a stylesheet.
-export function renderRail({ workspace = 'Commonplace', user = '', boards = [], board = null, view = 'board', needs = 0, needsByBoard = {}, rulesWaiting = 0 } = {}) {
+export function renderRail({ workspace = 'Commonplace', user = '', boards = [], board = null, view = 'board', needs = 0, needsByBoard = {}, rulesWaiting = 0, can_admin = false } = {}) {
   return `<nav class="rail" aria-label="Workspace">
     <button class="ws" data-action="switch-workspace" aria-label="Workspace: ${e(workspace)}. Switch workspace"><span class="mark" aria-hidden="true">${e(Array.from(workspace)[0] || 'C')}</span>${e(workspace)}${icon('chevron')}</button>
     <button class="cmdk" id="cmdk" data-action="palette" aria-keyshortcuts="Control+K Meta+K">${icon('search')}<span>Search or do…</span><kbd>⌘/Ctrl K</kbd></button>
@@ -35,7 +35,7 @@ export function renderRail({ workspace = 'Commonplace', user = '', boards = [], 
     <div class="rail-h"><span id="ph">Projects</span><button class="iconbtn" id="new-project" data-action="new-board" aria-label="New project">+</button></div>
     <div role="list" aria-labelledby="ph">${boards.map((b) => `<div role="listitem"><a class="proj" href="${boardHref(b)}"${current(['board', 'chat', 'settings', 'space'].includes(view) && b.slug === board?.slug)}><span class="sw" aria-hidden="true"></span><span class="pn"><b>${e(b.name || b.slug)}</b><small>${projectSubline(b)}</small></span>${badge(needsByBoard[b.slug], 'need you')}</a></div>`).join('')}</div>
     <div class="rail-foot"><button class="nav" id="shortcuts-link" data-action="shortcuts">${icon('keys')}Shortcuts <kbd>?</kbd></button>
-    <details class="user-menu"><summary class="me"><span class="mark" aria-hidden="true">${e(Array.from(user)[0] || '?')}</span>${e(user || 'Account')}${badge(rulesWaiting, 'rules waiting')}</summary><div class="user-links"><a href="#/rules">Rules${badge(rulesWaiting, 'waiting')}</a><a href="#/console">Console</a><a href="#/settings">Workspace settings</a><button data-action="logout">Sign out</button></div></details></div>
+    <details class="user-menu"><summary class="me"><span class="mark" aria-hidden="true">${e(Array.from(user)[0] || '?')}</span>${e(user || 'Account')}${badge(rulesWaiting, 'rules waiting')}</summary><div class="user-links"><a href="#/rules">Rules${badge(rulesWaiting, 'waiting')}</a><a href="#/console">Console</a><a href="#/settings">Workspace settings</a>${can_admin === true ? '<a href="#/admin">Admin</a>' : ''}<button data-action="logout">Sign out</button></div></details></div>
   </nav>`;
 }
 

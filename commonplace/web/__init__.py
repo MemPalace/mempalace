@@ -97,6 +97,8 @@ def install(gateway):
                 h,
                 200,
                 {
+                    "can_admin": principal.person and principal.role == "owner",
+                    "can_admin_instance": False,
                     "user": principal.user_id,
                     "email": principal.user_email,
                     "workspace": principal.workspace_id,
@@ -204,8 +206,9 @@ def install(gateway):
             },
         )
 
-    from . import agents, task_types
+    from . import admin, agents, task_types
 
+    admin.install(gateway)
     agents.install(gateway)
     task_types.install(gateway)
 

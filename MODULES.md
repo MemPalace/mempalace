@@ -29,6 +29,11 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `SYSTEM.md`, `MODULES.md`
 - **Owns:**
 
+  - Admin card navigation restores a regular base, inventory counts match joined rows, and Retry retains the failed page mode and cursor.
+
+  - The Admin person-owner/workspace boundary, partial-rollout residuals and independent source/client deadlines.
+
+
   - The canonical Space REST foundation reuses board rows as Spaces, with Board, Memory and Chat views and Board as the default.
 
   - The system-wide decisions, numbers, stores, residuals and waiver list (`SYSTEM.md`) and this ownership map.
@@ -65,6 +70,8 @@ Format (read by `commonplace orch docs-check`):
   - Records the strict owner-progress authority probe separately from ordinary Recall denial semantics.
 
   - Records authenticated owner progress, process-lifetime units, fixed unavailable responses and the accepted global-quota causality.
+  - Records read-only SQLite behavior and the injected UTC/monotonic seam without claiming atomic observations or runtime liveness.
+
 
   - Architecture describes exact-slug, workspace-local reads without implying lifecycle support.
 
@@ -109,6 +116,8 @@ Format (read by `commonplace orch docs-check`):
   - An authority fault makes the complete progress response unavailable, even when other threads are readable.
 
   - A progress count is not a new thread read grant; other thread-boundary residuals remain documented.
+  - Legacy needs-me can initialize stores; new Admin no-write claims exclude only SQLite sidecars from file comparisons and no logical tables.
+
 
   - Later object migration requires an explicit compatibility decision.
 
@@ -134,6 +143,8 @@ Format (read by `commonplace orch docs-check`):
   - Owner-route store/private-reader fault regressions and the documentation obligation.
 
   - Authenticated progress regressions and documentation obligations.
+  - Admin boundary, fixed-clock, lifecycle and documentation obligation checks.
+
 
   - Space REST contract tests and documentation obligations.
 
@@ -148,12 +159,20 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `AGENTS.md`, `CHANGELOG.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `HUB-DESIGN.md`, `INSPIRATION-REPOS.md`, `LICENSE`, `MISSION.md`, `PRODUCT-DESIGN.md`, `README.md`, `REPORT.md`, `ROADMAP.md`, `SECURITY.md`, `openarena-claim.txt`, `design/`, `docs/`
 - **Owns:**
 
+  - `docs/admin.md` is the authoritative current Admin API and partial-rollout contract, linked from the existing board API and agent connection guide.
+
+
   - Live-sync instructions describe transcript-only reinstall, explicit destination and retained disabled memory history.
   - Public Space endpoint and error documentation alongside legacy board routes.
 
   - Contributor and agent instructions, the mission and design notes, user and operator documentation, release history, the licence and the security policy.
 
 - **Promises:**
+
+  - Admin docs pin current-member connection listing, matching inventory counts, exact-route card navigation and cursor-preserving Retry.
+
+  - Admin docs describe active-workspace-only personal data, false instance capability, typed metadata and explicit unknown/error/empty distinctions without implying future sections are shipped.
+
 
   - Live-sync setup makes no active memory-upload or completed-coverage claim.
   - The three canonical endpoints retain the existing authority and verbatim chat contracts.
@@ -177,6 +196,9 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Later operational sections remain unavailable until their authority and status producers ship; public docs contain no operator configuration or credential material.
+
+
   - Updating installed files alone leaves an old running process unaffected.
   - Rename, archive, retries, deleted queries and desktop synchronization are deferred.
 
@@ -185,6 +207,9 @@ Format (read by `commonplace orch docs-check`):
   - Broken commands in docs surface only when someone follows them.
 
 - **Tests:**
+
+  - Admin API/UI contracts and `tests/test_docs_obligations.py` keep the documented boundary aligned with the shipped foundation.
+
 
   - Live-sync behavior and privacy claims are exercised by `tests/test_card199_safety.py`.
   - Space contract and retained board/project/chat regression tests.
@@ -363,6 +388,11 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:**
 
+  - Sign-out regression covers null and mounted Admin controllers; slice fixtures supply the module binding. The installed route inventory includes the authenticated Admin workspace prefix. Sign-in and voice boot fixtures load the real bounded request helper.
+
+  - Synthetic Admin HTTP inventories and served-asset Node contracts, with assertion-only pinned-base RED evidence and identical selected head GREEN nodes.
+
+
   - Synthetic legacy safety-stop cases and explicitly classified transcript-only fixture updates.
   - `tests/test_backup_online_processes.py` reproduces separate backup/gateway ancestry and preserves foreign-writer and paused-worker refusals using a synthetic `/proc`.
   - The canonical Space REST matrix and base-captured profile/tool schemas.
@@ -406,6 +436,10 @@ Format (read by `commonplace orch docs-check`):
 
   - Progress witnesses compare authenticated hidden-present and hidden-absent worlds through the real scheduler and successful-write path in both store formats.
   - `tests/test_settings_load.py` drives fixed timers through production Settings reads, Retry and saved-state reloads, including fetch/body stalls, HTTP/network/JSON failures and contended orchestration reads.
+  - Baseline-pass Admin controls remain distinct from RED regressions, and routing, disposal, escaping and redaction mutations must fail by assertion.
+
+  - Admin tests use injected UTC and explicitly advanced JS timers, no sleep/elapsed-time assertions; harness errors are distinct from assertion failures, and credential fixtures never enter diagnostics.
+
 
   - Safety tests run identically on a pinned base and implementation; server import and low-level persistence remain covered.
   - Card schema regressions cover missing gateways, missing control databases and unexpected settings read failures.
@@ -514,6 +548,8 @@ Format (read by `commonplace orch docs-check`):
   - Swallowing an authority fault must fail the fixed-503 assertion rather than silently reduce counters.
 
   - Guard-only tests do not substitute for base failures; metadata, authority, state and unit mutations must change public assertions.
+  - An Admin asset missing on the base fails an HTTP status assertion before module loading; independent mutations must fail security/deadline assertions, not hang.
+
 
   - Configuration refusal can hide a later guard unless that boundary is also exercised directly.
   - Feature assertions fail before DTO inspection on the unregistered base route.
@@ -541,6 +577,10 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_card253_s12.py` covers strict store/private-reader failures, ordinary deny-on-fault compatibility and second-pass enumeration failure.
 
   - `tests/test_card253_s12.py` covers owner progress isolation, current read authority, quota causality, incomplete proof and bounded metadata polling.
+  - Baseline-pass gateway and route-disposal controls accompany count/list, card-navigation and cursor-retry regressions; individual mutations prove sensitivity without counting setup failures.
+
+  - `test_admin_api.py` and `test_admin_ui.py` provide fourteen foundation rows; `admin_ui.mjs` exercises served navigation, production route/refresh wiring, request generations, expiry and body-decoding deadlines. `test_admin_controls.py` covers cursor binding, pagination, source budgets and gateway controls; `workbench_e2e/test_admin.py` covers real-browser owner/member navigation at three widths.
+
 
   - `tests/test_card199_safety.py` and the sync test family retain transcript-byte/cursor and server-import compatibility checks.
   - Transcript selection tests observe the actual symlink/empty rejection; memory selections separately prove refusal before selection.
@@ -1188,13 +1228,22 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/web/`, `commonplace/console/`
 - **Owns:**
 
+  - The GET-only Admin dispatcher, scoped users/connections projections, account/palette navigation and independently settling page controller.
+
+
   - The cookie-authenticated web app and the live console, including the owner orchestration switch, project seat-consent controls and default agent-limit display.
 
 - **Promises:**
 
+  - Sign-out and expiry stop an existing Admin controller; it is null until mounted.
+
   - Background prerequisite failures keep rendered Settings sections and form drafts mounted, surfacing the named error separately; initial and foreground failures still render Retry.
 
   - Settings and its prerequisite reads use ten-second per-request deadlines through JSON decoding; each failed section is named with Retry while successful sections retain saved values.
+  - Only the exact Admin route bypasses shared refresh; leaving it disposes requests, card hashes load their requested card, joined counts match rows and Retry repeats the failed page.
+
+  - Admin requires a signed-in current-workspace owner before read-only SELECTs; explicit credential-free allowlists, display redaction, 100-row cursors, injected clocks and 2 second source/5,000 ms client deadlines preserve private state boundaries.
+
 
   - Imported-history consent: The owner form offers independent unticked import and reader checkboxes and displays reader authority beside Revoke.
   - The Connect checklist renders the supplied webhook event recommendation, including card moves and optional card creation, with escaped values.
@@ -1221,9 +1270,15 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - Safe source errors remain local to one section; session expiry/disposal clears data and pending generations. Other five sections are labeled as later work with no requests; token contact is not liveness.
+
+
   - Rendering errors surface in the browser; the server state is unaffected.
 
 - **Tests:**
+
+  - `tests/test_admin_api.py` covers person/role/workspace refusals, fixed lifecycle time, pagination, redaction and no writes/locks; `tests/test_admin_ui.py` and `tests/admin_ui.mjs` cover cold routing, independent deadlines, retries and disposal.
+
 
   - The `tests/test_workbench_` files, the `tests/test_console_` files and the `tests/test_commonplace_console_` files.
 

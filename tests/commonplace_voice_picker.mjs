@@ -186,6 +186,8 @@ assert.doesNotMatch(source, /SpeechRecognition|createObjectURL|\.submit\(|reques
 // Boot must display the app without waiting for voice status. The real API's
 // session-expired event must still replace that shell with sign-in on a late 401.
 const apiSource = await readFile(new URL("../commonplace/web/static/api.js", import.meta.url), "utf8");
+const adminSource = await readFile(new URL("../commonplace/web/static/admin.js", import.meta.url), "utf8");
+const { boundedRequest } = await import(`data:text/javascript;base64,${Buffer.from(adminSource).toString("base64")}`);
 const bootSource = app.slice(app.indexOf("async function boot()"), app.lastIndexOf("\nboot();"));
 const expiredSource = app.split("\n").find((line) => line.startsWith('document.addEventListener("session-expired"'));
 function bootFixture() {
@@ -193,7 +195,7 @@ function bootFixture() {
   let resolveStatus;
   const pendingStatus = new Promise((resolve) => { resolveStatus = resolve; });
   const context = {
-    document, state, Event, timer: null, clearTimeout() {},
+    document, state, Event, boundedRequest, adminUI: null, timer: null, clearTimeout() {},
     fetch: async (path) => path === "/api/voice" ? pendingStatus : { ok: true, status: 200, json: async () => ({ people: {} }) },
     shell() { calls.push("shell"); },
     async route() { calls.push("route"); },

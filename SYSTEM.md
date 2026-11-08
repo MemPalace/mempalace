@@ -12,6 +12,36 @@ entry was written.
 
 ## Decisions
 
+- **Workspace Admin foundation:** `/app/#/admin` is discoverable only when
+  `/api/me.can_admin` is true (signed-in person and current-workspace owner).
+  The additive `can_admin_instance` stays false. New GET-only users/connections
+  inventories bind the decoded path ID to the authenticated workspace before any
+  projection source read. Members and owner connections receive the exact
+  person-owner refusal; foreign workspace IDs are concealed with 404. Personal
+  data remains workspace-local; no global directory or mutation action is added.
+  Future operational metadata follows the locked person + workspace owner +
+  server-fetched `users.is_admin=1` predicate, with the existing signed-out 401
+  challenge. That future predicate and its routes are not shipped here.
+
+- **Admin read and lifecycle bounds:** New projections use an existing SQLite
+  `mode=ro` connection, connection-local `query_only`, at most 250 ms busy/connect
+  wait and a 2 second monotonic request budget with progress interruption. They
+  acquire no application locks, initialize no stores and invoke no memory worker.
+  They capture UTC once through `gateway.admin_clock.utc_now`; the paired
+  `monotonic` seam controls deadlines. Credential expiry authentication retains
+  its existing clock. Explicit field allowlists omit credentials, raw policy and
+  login links; display redaction does not modify stored content. Lists page by
+  creation time and ID in batches of 100 with full filtered counts. Each UI load,
+  including initial identity/body decoding, settles within its 5,000 ms client
+  deadline independently of other sections and the shared refresh fan-in. Abort,
+  page epochs and request generations clear private state on disposal or expiry.
+  Only the exact Admin route bypasses shared refresh; card navigation restores a
+  regular base view and loads the requested card without new inventory requests.
+  Inventory counts share the row membership/user joins; Retry preserves the failed
+  cursor and append or replacement mode. Sign-out and expiry stop an existing Admin
+  controller; it is null until mounted.
+
+
 ### Inert area configuration preview
 
 Area declarations can be parsed, rendered, diffed and proposed, with up to eight
@@ -799,6 +829,18 @@ playbooks and the original wider orchestration acceptance remain separate work.
   are unchanged.
 
 ## Residuals
+
+- **Partial Admin rollout:** Only users/workspaces and agents/connections are
+  implemented; the remaining five sections say “Available in a later slice” and
+  send no requests. Token activity indicates recorded contact, not a live process.
+  No workspace concurrency cap, runtime accounting or backup success is invented.
+  Operational reads and backup receipts remain deferred. Future needs-me reuse
+  has a read-first limitation: `/api/needs-me` can initialize legacy stores and bind
+  rule-store metadata; the no-write promise here covers only the new Admin GETs.
+  SQLite may create WAL/SHM sidecars during reads, so no-write tests compare logical
+  tables, schema and non-sidecar files rather than byte equality of WAL files.
+  Section requests are independent observations and can race ongoing activity.
+
 
 - Accepted, known gaps.
 

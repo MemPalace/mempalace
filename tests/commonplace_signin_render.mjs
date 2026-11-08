@@ -13,6 +13,7 @@ const read = (name) => readFile(new URL(`../commonplace/web/static/${name}`, imp
 const apiUrl = url(await read("api.js"));
 const { escape } = await import(apiUrl);
 const { signinView, signinMessage } = await import(url((await read("signin.js")).replace('"./api.js"', `"${apiUrl}"`)));
+const { boundedRequest } = await import(url(await read("admin.js")));
 const appSource = (await read("app.js")).replace(/^import .*;\n/gm, "");
 const providers = [
   ["google", "Google"], ["github", "GitHub"], ["apple", "Apple"], ["x", "X"], ["discord", "Discord"],
@@ -89,7 +90,7 @@ function app({ search = "", pathname = "/app/", hash = "", cookie = "", loadProv
   } };
   const document = { cookie, querySelector: () => root, addEventListener: (name, handler) => listeners.set(name, handler), createElement: () => ({ setAttribute(name, value) { this[name] = value; } }) };
   const context = createContext({
-    document, location, history, URLSearchParams, signinView, signinMessage, e: escape, calls,
+    document, location, history, URLSearchParams, signinView, signinMessage, e: escape, calls, boundedRequest,
     FormData: class extends Array { constructor(form) { super(...Object.entries(form.payload)); } },
     setPeople() {},
     window: { addEventListener() {} },

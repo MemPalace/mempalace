@@ -5,7 +5,7 @@ const keyPreference = 'cmmn.keys.single';
 const encode = encodeURIComponent;
 
 // Command descriptors are dispatched by the shell; this module makes no API calls.
-export function paletteItems({ board = null, boards = [], cards = [], selected = null, query = '' } = {}) {
+export function paletteItems({ board = null, boards = [], cards = [], selected = null, query = '', can_admin = false } = {}) {
   const commands = [];
   const add = (id, label, group, details = {}) => commands.push({ id, label, group, ...details });
   const currentCards = board ? cards.filter(card => !card.board || card.board === board.slug) : [];
@@ -35,6 +35,7 @@ export function paletteItems({ board = null, boards = [], cards = [], selected =
   add('rules', 'Rules', 'Workspace', { href: '#/rules' });
   add('console', 'Console', 'Workspace', { href: '#/console' });
   add('workspace-settings', 'Workspace settings', 'Workspace', { href: '#/settings', keywords: 'voice webhooks phone notifications plan' });
+  if (can_admin === true) add('admin', 'Admin', 'Workspace', { href: '#/admin' });
   add('decide', 'Decision queue', 'Workspace', { href: '#/decide' });
   add('shortcuts', 'Keyboard shortcuts', 'Workspace', { action: 'shortcuts', key: '?' });
   add('sign-out', 'Sign out', 'Workspace', { action: 'logout' });

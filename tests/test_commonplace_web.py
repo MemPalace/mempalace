@@ -41,6 +41,8 @@ def test_login_cookie_identity_replay_and_logout(hub):
     status, _headers, body = request(hub, "/api/me", headers=cookie)
     assert status == 200
     assert json.loads(body) == {
+        "can_admin": True,
+        "can_admin_instance": False,
         "user": hub.admin,
         "email": "owner@example.com",
         "workspace": hub.workspace,

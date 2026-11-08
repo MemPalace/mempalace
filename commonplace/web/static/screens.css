@@ -75,3 +75,22 @@
   .col + .col { border-left: 0; border-top: 1px solid var(--line); }
   .col > header { height: 44px; }
 }
+
+/* Admin reuses the shell's settings surfaces; tables become labeled rows on phones. */
+.admin { max-width: 100%; padding: 16px 20px; overflow-wrap: anywhere; }
+.admin .settings-section { padding: 16px; border-bottom: 1px solid var(--line); min-width: 0; }
+.admin h2 { font-size: 16px; margin: 0 0 12px; }
+.admin p { margin: 8px 0; }
+.admin table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+.admin th, .admin td { padding: 8px 6px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+.admin th { color: var(--muted); font-weight: 500; }
+.admin small { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
+.admin button { margin: 8px 8px 0 0; }
+.admin .quiet { color: var(--muted); font-size: 12px; }
+@media (max-width: 900px) {
+  .admin table, .admin tbody, .admin tr, .admin td { display: block; }
+  .admin thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .admin tr { padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .admin td { display: grid; grid-template-columns: 90px minmax(0, 1fr); gap: 12px; padding: 4px 0; border: 0; }
+  .admin td::before { content: attr(data-label); color: var(--muted); }
+}

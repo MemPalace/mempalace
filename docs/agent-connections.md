@@ -151,3 +151,9 @@ are checked on subsequent reads. Refresh scope narrowing affects descendants,
 not earlier access tokens or the connection's stored policy. Revoke the
 connection to stop all authority immediately. CLI token creation, parent
 relationships, wing edits and upgrades never confer reader consent.
+
+## Read-only overview
+
+Signed-in workspace owners can use [Admin](admin.md) to inspect connection
+lifecycle, permissions and recorded activity without revealing credentials.
+Manage or revoke connections in the existing Settings page.

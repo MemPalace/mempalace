@@ -692,3 +692,6 @@ An Idempotency-Key or include_deleted query is rejected with 400
 
 Rename, archive, versions/retries/tombstones, project adapters, MCP/UI vocabulary,
 new-user migration and desktop synchronization are deferred.
+
+Workspace owners can inspect members and connections through the separate
+[Admin GET API](../admin.md); board actions retain their existing authority.

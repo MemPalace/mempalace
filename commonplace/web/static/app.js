@@ -10,6 +10,7 @@ import { rulesView, rulesHandlers } from "./rules.js";
 import { signinView, signinMessage } from "./signin.js";
 import { childProgress } from "./children.js";
 import { agentsView, createAgent, agentAction, changeAgentClient, clearAgentSecret } from "./agents.js";
+import { createAdmin, boundedRequest } from "./admin.js";
 import { createConsole } from "./console.js";
 import { createChat } from "./chat.js";
 import { createDock } from "./chatdock.js";
@@ -64,6 +65,7 @@ const state = {
   phonePushPending: false, underChat: null, fromChat: null, detailsSheet: false, rebase: null,
   queue: null, pollFails: 0, queueFocus: "", queueShownAt: 0, queueField: false, queueDirty: false,
 };
+let adminUI = null;
 let consoleUI = null, chatUI = null, detailsUI = null, boardDispose = null;
 const statuses = ["backlog", "todo", "doing", "review", "done"];
 const enc = encodeURIComponent;
@@ -280,7 +282,7 @@ function paletteUI() {
 function shortcutsView() { paletteUI().shortcuts(); }
 function shellMenu() {
   const board = currentBoard(), cards = boardCards().filter((card) => !card.board || card.board === board?.slug);
-  paletteUI().open({ board, boards: state.boards, cards, selected: state.card || cards.find((card) => card.number === state.selected) || null });
+  paletteUI().open({ can_admin: state.me?.can_admin === true, board, boards: state.boards, cards, selected: state.card || cards.find((card) => card.number === state.selected) || null });
 }
 async function paletteCommand(item) {
   const action = item.action;
@@ -378,7 +380,7 @@ function navigation() {
     : /^#\/board\/[^/?]+\/chat$|^#\/chat\//.test(state.base) ? "chat" : /^#\/board\/[^/?]+$/.test(state.base) ? "board" : "page";
   const needsByBoard = {};
   for (const card of needsCards()) needsByBoard[card.board] = (needsByBoard[card.board] || 0) + 1;
-  boardNav.outerHTML = renderRail({ workspace: state.me.workspace_name || "Commonplace", user: state.me.people?.[state.me.actor] || state.me.email, boards: state.boards, board, view, needs: state.needs.count || 0, needsByBoard, rulesWaiting: state.rulesWaiting }).replace('<nav class="rail"', '<nav class="rail" id="board-nav"');
+  boardNav.outerHTML = renderRail({ can_admin: state.me.can_admin === true, workspace: state.me.workspace_name || "Commonplace", user: state.me.people?.[state.me.actor] || state.me.email, boards: state.boards, board, view, needs: state.needs.count || 0, needsByBoard, rulesWaiting: state.rulesWaiting }).replace('<nav class="rail"', '<nav class="rail" id="board-nav"');
   root.querySelector("#phone-bar").innerHTML = renderPhoneBar({ board });
   root.querySelector("#phone-tabs").innerHTML = renderPhoneTabs({ board, view, needs: state.needs.count || 0 });
   root.querySelector(".shell")?.setAttribute("data-screen", state.base === "#/decide" ? "decide" : "");
@@ -963,6 +965,7 @@ function mountWorkbenchChat() {
 // The signed-in user's seen ids live on the device: clear them on sign-out and session expiry
 // even when no board service exists (Settings, Memory, …). Other users' ids stay.
 function clearWorkbenchChat() {
+  adminUI?.stop();
   const user = state.me?.user || state.me?.actor?.replace(/^user:/, "");
   if (user) clearSeen(user);
   chatUI?.clearUnsent();
@@ -971,6 +974,12 @@ function clearWorkbenchChat() {
   chatUI?.stop(); chatUI = null;
   if (typeof Event === "function") document.dispatchEvent?.(new Event("signout"));
 }
+function adminScreen() {
+  adminUI ??= createAdmin({ mount: () => root.querySelector("#content"), api, e, current: () => state.me });
+  adminUI.show();
+  title("Workspace administration");
+  navigation();
+}
 function consoleScreen() {
   consoleUI ??= createConsole({ mount: () => root.querySelector("#content"), api, e });
   consoleUI.show();
@@ -978,6 +987,7 @@ function consoleScreen() {
 }
 async function refresh({ background = false, events = [] } = {}) {
   if (!state.me) return;
+  if (state.route === "#/admin") return;
   const epoch = state.screen, request = ++state.refreshRequest;
   if (!background) state.renderPending = epoch;
   const current = () => epoch === state.screen && request === state.refreshRequest;
@@ -1284,10 +1294,13 @@ async function route() {
   if (direct) { state.base = resolveRoute("#/", { boards: state.boards, last }); state.rebase = Number(hash.slice(7)); }
   const start = decideStart(hash);
   if (!/^#\/card\/[1-9]\d*$/.test(hash)) {
-    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board\/[^/?]+(?:\/chat)?|space\/[^/?]+)|start|needs|boards|rules|memory(?:\?.*)?|chat(?:\/[^/?]+)?|console|settings)$/.test(hash) ? hash : "#/");
+    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board\/[^/?]+(?:\/chat)?|space\/[^/?]+)|start|needs|boards|rules|memory(?:\?.*)?|chat(?:\/[^/?]+)?|console|settings|admin)$/.test(hash) ? hash : "#/");
     state.card = null;
+  } else if (state.base === "#/admin") {
+    state.base = resolveRoute("#/", { boards: state.boards, last });
   }
   if (state.base !== previousBase) state.workbenchChat?.dispose();
+  if (previousBase === "#/admin") adminUI?.stop();
   if (previousBase === "#/console" && state.base !== "#/console") consoleUI?.stop();
   if (previousBase === "#/decide" && state.base !== "#/decide") {
     queueFlush(true); queueStop(); state.queue = null; state.queueFocus = "";
@@ -1315,6 +1328,7 @@ async function route() {
   markOpenCard();
   if (!root.querySelector("#content").children.length || state.base !== previousBase) root.querySelector("#content").innerHTML = message("Loading…");
   showError("");
+  if (hash === "#/admin") { adminScreen(); return; }
   await refresh();
 }
 // The current view's list first, so a write never sends a version left over from another view.
@@ -1743,9 +1757,9 @@ async function poll() {
   }
 }
 document.addEventListener("visibilitychange", () => { if (document.hidden) queueFlush(true); schedule(document.hidden ? 30000 : 0); });
-document.addEventListener("session-expired", () => { state.needsUI?.stop(); state.needsUI = null; clearWorkbenchChat(); state.me = null; state.drafts.clear(); clearTimeout(timer); state.queue = null; state.error = ""; signin(); });
+document.addEventListener("session-expired", () => { adminUI?.stop(); state.needsUI?.stop(); state.needsUI = null; clearWorkbenchChat(); state.me = null; state.drafts.clear(); clearTimeout(timer); state.queue = null; state.error = ""; signin(); });
 window.addEventListener("hashchange", route);
-window.addEventListener("pagehide", () => { clearAgentSecret(root); queueFlush(true); speech.stop(); voice.stop(); });
+window.addEventListener("pagehide", () => { adminUI?.stop(); clearAgentSecret(root); queueFlush(true); speech.stop(); voice.stop(); });
 window.addEventListener("online", () => { state.pollFails = 0; queueNoteOffline(); if (state.me) schedule(0); });
 window.addEventListener("offline", queueNoteOffline);
 setInterval(() => {
@@ -1759,7 +1773,7 @@ setInterval(() => {
   });
 }, 15000);
 async function boot() {
-  try { state.me = await api("/api/me"); setPeople(state.me.people); }
+  try { state.me = await boundedRequest(api, "/api/me"); setPeople(state.me.people); }
   catch (error) { state.error = error.status === 401 ? "" : error.message; await signin(signinCode); return; }
   if (!state.me) return;
   shell(); void voice.load();

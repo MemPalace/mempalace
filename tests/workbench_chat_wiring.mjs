@@ -34,7 +34,7 @@ const api = async (path, options) => {
   if (path.endsWith('/status')) return {orchestrator: {visible: false, last_seen: 'private'}};
   return {me: {user: 'maya'}, board: selectedBoard.slug, messages: rows, replies, cursor: messageCursor, reply_cursor: replyCursor};
 };
-const context = {state, root, e, enc: encodeURIComponent, api, ...chatstate,
+const context = {state, root, e, enc: encodeURIComponent, api, adminUI: null, ...chatstate,
   seenStore: (user, slug) => chatstate.seenStore(user, slug, storageAPI), clearSeen: (user) => chatstate.clearSeen(user, storageAPI),
   currentBoard: () => selectedBoard, singleKeysEnabled: () => true, chatUI: null,
   createChat: (options) => {chatOptions = options; creates++; return pane;},
@@ -190,6 +190,10 @@ if (which === 'board_header') {
     assert.equal(typeof context.clearWorkbenchChat, 'function'); run('clearWorkbenchChat()');
     assert.equal(cleared, 1); assert.equal(storage.has('cmmn.chat.seen.maya.atlas'), false);
     assert.equal(storage.has('cmmn.chat.seen.leon.atlas'), true); assert.equal(state.workbenchChat, null);
+    let adminStops = 0;
+    context.adminUI = {stop() { adminStops++; }};
+    run('clearWorkbenchChat()');
+    assert.equal(adminStops, 1, 'sign-out stops an existing Admin controller');
     assert.match(app, /action === "logout"[\s\S]*?clearWorkbenchChat\(\)/);
     assert.match(source("async function signin(", "function currentBoard()"), /clearWorkbenchChat\(\)/);
   } else if (which === 'dispose') {

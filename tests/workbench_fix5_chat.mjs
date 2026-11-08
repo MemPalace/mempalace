@@ -325,7 +325,7 @@ function seenDevice(t) {
 async function shellContext() {
   const { clearSeen } = await modules();
   const docListeners = new Map();
-  return { state: { me: { user: "maya", actor: "user:maya" }, drafts: new Map(), queue: null, error: "" }, chatUI: null, clearSeen, Event,
+  return { state: { me: { user: "maya", actor: "user:maya" }, drafts: new Map(), queue: null, error: "" }, chatUI: null, adminUI: null, clearSeen, Event,
     document: { dispatchEvent() {}, addEventListener: (n, fn) => docListeners.set(n, fn) }, signin() {}, clearTimeout() {}, timer: null, docListeners };
 }
 const keptOnly = (device) => {
