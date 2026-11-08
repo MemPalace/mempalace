@@ -38,18 +38,21 @@ def ensure_schema(db):
 
 
 def enabled(db, ws):
+    if not db._lock.acquire(timeout=1):
+        raise SettingsUnavailable()
     try:
-        with db._lock:
-            if not db._conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE name='orchestration_settings'"
-            ).fetchone():
-                return False
-            row = db._conn.execute(
-                "SELECT enabled FROM orchestration_settings WHERE workspace_id=?", (ws,)
-            ).fetchone()
-            return bool(row and row[0])
+        if not db._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='orchestration_settings'"
+        ).fetchone():
+            return False
+        row = db._conn.execute(
+            "SELECT enabled FROM orchestration_settings WHERE workspace_id=?", (ws,)
+        ).fetchone()
+        return bool(row and row[0])
     except sqlite3.Error:
         raise SettingsUnavailable() from None
+    finally:
+        db._lock.release()
 
 
 def set_enabled(db, principal, value):

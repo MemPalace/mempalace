@@ -7,6 +7,29 @@ export class ApiError extends Error {
 }
 
 export async function api(path, options = {}) {
+  const { timeoutMs = 0, ...requestOptions } = options;
+  if (timeoutMs > 0) {
+    const controller = new AbortController();
+    const abort = () => controller.abort(requestOptions.signal.reason);
+    if (requestOptions.signal?.aborted) abort();
+    else requestOptions.signal?.addEventListener("abort", abort, { once: true });
+    let timer;
+    try {
+      // Race the complete read, including JSON decoding; abort alone may not settle it.
+      return await Promise.race([
+        api(path, { ...requestOptions, signal: controller.signal }),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`Request timed out: ${path}`));
+            controller.abort();
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      requestOptions.signal?.removeEventListener("abort", abort);
+    }
+  }
   const response = await fetch(path, {
     credentials: "same-origin",
     cache: "no-store",
