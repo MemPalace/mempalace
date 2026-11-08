@@ -889,7 +889,7 @@ playbooks and the original wider orchestration acceptance remain separate work.
   as before this projection; content reads retain their separate range gate.
   Search `total_before_filter` can include hidden candidates inside a visible
   wing before the response gate filters them.
-- Tunnel reads, other overview and graph/KG page counts, legacy
+- Other overview and KG page counts, legacy
   provenance and owner search-index progress remain separate residuals.
 
 ### Visible logical drawer pagination
@@ -972,8 +972,7 @@ playbooks and the original wider orchestration acceptance remain separate work.
 ### Thread-boundary residuals
 
 - Read counts in `kg_query.count`, `kg_timeline.count` and
-  `kg_timeline.total` can include hidden items. `list_tunnels` drawer endpoints
-  retain existing read gaps.
+  `kg_timeline.total` can include hidden items.
 - Token-free plain-file provenance still has no local association proof on read.
   Typed drawer/closet citations now resolve current local metadata as described
   below; foreign identifiers already stored before this change are not purged.
@@ -1318,14 +1317,14 @@ follow previews or traversal recording. Reader authority is refreshed after
 probing. Incomplete acquisition, malformed protocol responses and deadline errors
 produce an empty public list without private markers. Read-only follow retains
 record=False behavior; create/delete authorization and delete snapshot checks
-are unchanged. Passive graph traversal and graph statistics remain separate work.
+are unchanged. Passive graph reads use the input projection described below.
 
 
 ### Explicit tunnel concurrency and import qualification
 
 - Tunnel probes use identity keysets from one file read per worker call. Deleting
   an earlier id cannot shift later pages. Final identity lookup compares only the
-  id and endpoint wing/room/drawer associations and returns the current row, so
+  id, label and endpoint wing/room/drawer associations and returns the current row, so
   traversal potentiation and unrelated drawer metadata updates remain visible.
 - Missing or changed associations still fail closed before preview hydration or
   traversal recording. Probe and allow batches remain bounded and request-local.
@@ -1334,5 +1333,76 @@ are unchanged. Passive graph traversal and graph statistics remain separate work
   from explicit tunnels even when the existing import reader proves their consent
   and source range. Ordinary imported-history read APIs retain their range rules.
 - The read-only server seam used by the regression witness passes `record=False`;
-  the public follow schema does not expose that argument. Tunnel label reference
-  handling predates this change and remains follow-up work for graph traversal.
+  the public follow schema does not expose that argument. Tunnel labels now use
+  independent protected-token scans before listing, following or counting them.
+
+
+### Graph projection before traversal and ranking
+
+- Authenticated graph reads first enumerate metadata in batches of at most 500,
+  authorize each placement with wing policy and the live workspace reader, then
+  revalidate concrete descriptors in fresh metadata snapshots. Empty allow means
+  no placements; local unscoped graph calls keep their existing behavior.
+- Nodes, plural wings/halls/dates, counts, edges, fuzzy suggestions, traversal and
+  top-N ranking use only surviving rows. Grouped reads retain backend-specific
+  ordering; collection paths retain enumeration order for tied readable candidates.
+  Traversal and tunnel discovery retain the 50-result caps and stats the ten-node
+  top list. Projected results never enter the raw graph or overview caches.
+- Explicit tunnel totals reuse the authorized endpoint and drawer association set.
+  Labels independently prove every recognized thread/private token before list,
+  follow, preview hydration or counting. Kept labels (including emoji with a zero
+  width joiner and ordinary percent text) and other stored fields remain unchanged.
+  Label changes invalidate final tunnel descriptors; unrelated dynamics fields do
+  not. Missing/unresolved optional drawers and duplicate tunnel ids fail closed as
+  documented for explicit reads; computed imported drawers still require stored
+  associations. Imported-history consent/range rules are not widened.
+- Incomplete acquisition, malformed protocol replies, missing workspace context or
+  deadline failure discard the entire graph response: zero stats, an empty tunnel
+  list, or the ordinary not-found traversal envelope with empty suggestions. Odd
+  client argument errors retain their JSON-RPC validation shape. No private diagnostics,
+  redaction markers or partial global counts are returned. Literal-wing readers
+  retain the existing all-wing-tool refusal; actual owners use the same live reader.
+- Storage is never rewritten or purged. O4/O8 remain in force; external ids hidden
+  only by wing policy retain their accepted limitation. The separate LOCKED
+  D9.1 = A and D9.2 = A decisions, including actual-readable-work quota deferral,
+  are unchanged by graph projection.
+
+
+### Readable legacy graph parity
+
+- Graph descriptors bind literal projected wing and room names, including legacy
+  `?` values. Readable registry and sentinel rows remain graph inputs, matching
+  the local graph paths; overview bookkeeping rules do not change.
+- Graph argument names are checked against the worker's tool schema before any
+  metadata probe. Unknown and missing arguments retain JSON-RPC `-32602` errors.
+  Traversal retains the worker's null/default and integer-coercion conventions;
+  booleans and non-coercible values retain its JSON-RPC error shape. Schema lookup
+  and projection share one deadline. Worker/schema/projection faults still return
+  the empty operation envelope, never a client-validation error.
+- Ordering follows the reader that actually served the metadata page. Grouped
+  Chroma uses room/wing/hall order. Exact and Compact readers use wing/room/hall
+  with generated locus columns, or room/wing/hall on older read-only databases
+  without them. Collection fallback keeps enumeration order. Sibling ties,
+  suggestions and the 50-result cap follow that order; grouped statistics retain
+  their separate room-name tie break.
+- Exact and Compact projections read the local graph's SQL expressions and schema
+  from one metadata-only snapshot. SQLite applies TEXT affinity on exact loci,
+  including booleans and integers beyond int64; Compact and locus-less readers
+  preserve native numeric values and their falsy-zero behavior before converting
+  to text. Descriptors bind both projected values and stored SQLite sort values.
+  Chroma preserves its grouped numeric text casts, ignores boolean locus columns,
+  and reads dates from the string column. Collection fallback retains its existing
+  metadata interpretation; overview bookkeeping rules remain separate.
+- Null and missing tunnel labels are empty only for protected-token scanning.
+  Returned/stored nulls, missing keys and unrelated fields remain unchanged; other
+  non-string labels still fail closed. No palace data is rewritten.
+
+
+### Graph compatibility residuals
+
+- Accepted parity exception: non-string tunnel labels other than null remain
+  ineligible on authenticated list/follow/count paths, although legacy local reads
+  can list those records. Null and absent labels remain readable and stored intact.
+- The existing explicit-follow path predates graph projection: unknown arguments
+  can still become an empty list instead of a JSON-RPC invalid-params error.
+  This remains a separate follow-up; graph-tool validation does not change it.

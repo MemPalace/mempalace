@@ -121,6 +121,7 @@ def scoped_tunnels(scope, rows, config, backend, get_collection):
 def endpoint_proof(row):
     return (
         row["id"],
+        row.get("label", ""),
         *(
             tuple(row[key].get(k) for k in ("wing", "room", "drawer_id"))
             for key in ("source", "target")

@@ -7,14 +7,22 @@ from mempalace.tunnel_scope import TUNNEL_PAGE, drawer_ids, valid_tunnel
 from .mirror_access import reader, unreadable_room
 
 
-def project(gateway, principal, workers, name, args, *, timeout=660.0):
-    if not getattr(principal, "workspace_id", None):
+def project(gateway, principal, workers, name, args, *, timeout=660.0, raise_on_failure=False):
+    def failed():
+        if raise_on_failure:
+            raise ValueError("tunnel projection unavailable")
         return []
+
+    if not getattr(principal, "workspace_id", None):
+        return failed()
     from mempalace.config import sanitize_name
 
     try:
         for key in ("wing", "room") if name == "mempalace_follow_tunnels" else ("wing",):
-            if name != "mempalace_follow_tunnels" and not (args.get(key) or "").strip():
+            value = args.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{key} must be a non-empty string")
+            if name != "mempalace_follow_tunnels" and not (value or "").strip():
                 args[key] = None
             elif name == "mempalace_follow_tunnels" or args.get(key) is not None:
                 args[key] = sanitize_name(args.get(key), key)
@@ -27,6 +35,14 @@ def project(gateway, principal, workers, name, args, *, timeout=660.0):
 
             def visible(item, access):
                 row = item["tunnel"]
+                from .provenance_refs import _THREAD, _private_matches
+
+                label = "" if row.get("label") is None else row["label"]
+                if not isinstance(label, str) or any(
+                    not access.reference(match[0])
+                    for match in [*_THREAD.finditer(label), *_private_matches(label)]
+                ):
+                    return False
                 pairs = [row[k] for k in ("source", "target")] + item["drawers"]
                 if principal.policy.has_scope("memory:import:read") and any(
                     not access.preview_allowed(
@@ -61,7 +77,7 @@ def project(gateway, principal, workers, name, args, *, timeout=660.0):
                     },
                 )
                 if not isinstance(result, dict) or set(result) != {"probe"}:
-                    return []
+                    return failed()
                 page = result["probe"]
                 if (
                     not isinstance(page, dict)
@@ -69,7 +85,7 @@ def project(gateway, principal, workers, name, args, *, timeout=660.0):
                     or not isinstance(page["rows"], list)
                     or len(page["rows"]) > TUNNEL_PAGE
                 ):
-                    return []
+                    return failed()
                 for item in page["rows"]:
                     if (
                         not isinstance(item, dict)
@@ -78,11 +94,11 @@ def project(gateway, principal, workers, name, args, *, timeout=660.0):
                         or not valid_descriptors(item["drawers"])
                         or set(drawer_ids([item["tunnel"]])) != {d["id"] for d in item["drawers"]}
                     ):
-                        return []
+                        return failed()
                     checks.remaining(0)
                     key = item["tunnel"]["id"]
                     if key in seen:
-                        return []
+                        return failed()
                     seen.add(key)
                     if visible(item, access):
                         allowed.append(item)
@@ -96,7 +112,7 @@ def project(gateway, principal, workers, name, args, *, timeout=660.0):
                     and cursor <= after
                     or any(item["tunnel"]["id"] > cursor for item in page["rows"])
                 ):
-                    return []
+                    return failed()
                 after = cursor
             # Do not reuse authority decisions across the probe/final boundary.
             access = reader(gateway, principal)
@@ -116,8 +132,17 @@ def project(gateway, principal, workers, name, args, *, timeout=660.0):
                 )
                 checks.remaining(0)
                 if not isinstance(result, list):
-                    return []
+                    return failed()
+                # Final rows carry the current label; authorize it again after
+                # endpoint revalidation, before any public label is returned.
+                current_access = reader(gateway, principal)
+                if name == "mempalace_list_tunnels":
+                    result = [
+                        row
+                        for row in result
+                        if visible({"tunnel": row, "drawers": []}, current_access)
+                    ]
                 output.extend(result)
             return output
     except Exception:
-        return []
+        return failed()

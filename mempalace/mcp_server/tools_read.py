@@ -971,8 +971,10 @@ def tool_get_aaak_spec():
     return {"aaak_spec": AAAK_SPEC}
 
 
-def tool_traverse_graph(start_room: str, max_hops: int = 2):
+def tool_traverse_graph(start_room: str, max_hops: int = 2, thread_scope: dict = None):
     """Walk the palace graph from a room. Find connected ideas across wings."""
+    if thread_scope is not None:
+        return _scoped_graph_rows(thread_scope)
     max_hops = max(1, min(max_hops, 10))
     # sqlite metadata path does not open HNSW. When it cannot serve, open the
     # collection here so a missing/broken palace still reports why instead
@@ -988,8 +990,10 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
         return {"error": str(e)}
 
 
-def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
+def tool_find_tunnels(wing_a: str = None, wing_b: str = None, thread_scope: dict = None):
     """Find rooms that bridge two wings — the hallways connecting domains."""
+    if thread_scope is not None:
+        return _scoped_graph_rows(thread_scope)
     try:
         wing_a = _sanitize_optional_name(wing_a, "wing_a")
         wing_b = _sanitize_optional_name(wing_b, "wing_b")
@@ -1006,8 +1010,16 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         return {"error": str(e)}
 
 
-def tool_graph_stats():
+def _scoped_graph_rows(scope):
+    from ..graph_scope import scoped_rows
+
+    return scoped_rows(scope, _config, _selected_backend_name(), _get_collection)
+
+
+def tool_graph_stats(thread_scope: dict = None):
     """Palace graph overview: nodes, tunnels, edges, connectivity."""
+    if thread_scope is not None:
+        return _scoped_graph_rows(thread_scope)
     # Fast path: grouped sqlite read instead of paging all metadata and
     # cold-loading HNSW via build_graph(), which times out on large palaces.
     # Falls through to the client path for non-chroma backends.

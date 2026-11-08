@@ -343,14 +343,14 @@ def build_graph(col=None, config=None):
     return nodes, edges
 
 
-def traverse(start_room: str, col=None, config=None, max_hops: int = 2):
+def traverse(start_room: str, col=None, config=None, max_hops: int = 2, *, graph_data=None):
     """
     Walk the graph from a starting room. Find connected rooms
     through shared wings.
 
     Returns list of paths: [{room, wing, hall, hop_distance}]
     """
-    nodes, edges = build_graph(col, config)
+    nodes, edges = build_graph(col, config) if graph_data is None else graph_data
 
     if start_room not in nodes:
         return {
@@ -405,12 +405,12 @@ def traverse(start_room: str, col=None, config=None, max_hops: int = 2):
     return results[:50]  # cap results
 
 
-def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None):
+def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None, *, graph_data=None):
     """
     Find rooms that connect two wings (or all tunnel rooms if no wings specified).
     These are the "hallways" — same named idea appearing in multiple domains.
     """
-    nodes, edges = build_graph(col, config)
+    nodes, edges = build_graph(col, config) if graph_data is None else graph_data
 
     norm_a = _normalize_wing(wing_a)
     norm_b = _normalize_wing(wing_b)
@@ -449,7 +449,7 @@ def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None):
     return tunnels[:50]
 
 
-def graph_stats(col=None, config=None):
+def graph_stats(col=None, config=None, *, graph_data=None, explicit_tunnels=None):
     """Summary statistics about the palace graph.
 
     ``total_rooms`` keeps its historical meaning: unique room-name nodes in
@@ -458,11 +458,13 @@ def graph_stats(col=None, config=None):
     Explicit tunnel records are reported separately so the overview does not
     silently omit agent-created graph connections.
     """
-    nodes, edges = build_graph(col, config)
+    nodes, edges = build_graph(col, config) if graph_data is None else graph_data
 
     passive_tunnel_rooms = sum(1 for n in nodes.values() if len(n["wings"]) >= 2)
     total_room_instances = sum(len(n["wings"]) for n in nodes.values())
-    explicit_tunnel_count = len(_load_tunnels(config))
+    explicit_tunnel_count = len(
+        _load_tunnels(config) if explicit_tunnels is None else explicit_tunnels
+    )
     wing_counts = Counter()
     for data in nodes.values():
         for wing in data["wings"]:

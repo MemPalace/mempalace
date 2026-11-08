@@ -353,6 +353,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "start_room": {
                     "type": "string",
                     "description": "Room to start from (e.g. 'chromadb-setup', 'riley-school')",
@@ -371,6 +372,7 @@ TOOLS = {
         "input_schema": {
             "type": "object",
             "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
                 "wing_a": {"type": "string", "description": "First wing (optional)"},
                 "wing_b": {"type": "string", "description": "Second wing (optional)"},
             },
@@ -379,7 +381,12 @@ TOOLS = {
     },
     "mempalace_graph_stats": {
         "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
-        "input_schema": {"type": "object", "properties": {}},
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "thread_scope": {"type": "object", "description": "Set by the Commonplace server"},
+            },
+        },
         "handler": tool_graph_stats,
     },
     "mempalace_mesh_peers": {

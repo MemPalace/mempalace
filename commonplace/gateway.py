@@ -494,8 +494,12 @@ class Mediator:
             self._audit(principal, name, "deny", str(exc), wing=_wing_of(args))
             return _tool_response(req_id, {"error": str(exc), "denied": True}, is_error=True)
 
-        if isinstance(plan, dict) and "respond" in plan:
-            response = _tool_response(req_id, plan["respond"])
+        if isinstance(plan, dict) and ("respond" in plan or "rpc_error" in plan):
+            response = (
+                _rpc_error(req_id, -32602, plan["rpc_error"])
+                if "rpc_error" in plan
+                else _tool_response(req_id, plan["respond"])
+            )
         else:
             forwarded = dict(request)
             forwarded["params"] = {"name": name, "arguments": args}
@@ -603,6 +607,31 @@ class Mediator:
         return None
 
     def _before_all_wings(self, principal, name, args, notes):
+        if name in ("mempalace_traverse", "mempalace_find_tunnels", "mempalace_graph_stats"):
+            from .handoff.graph import GraphArgumentError, empty_result, project, validate_arguments
+            from .rules import checks
+
+            with checks.deadline(660.0):
+                try:
+                    listing = self._tools_list(
+                        principal, {"jsonrpc": "2.0", "id": "graph-schema", "method": "tools/list"}
+                    )
+                    schema = next(
+                        (
+                            tool.get("inputSchema")
+                            for tool in listing.get("result", {}).get("tools", [])
+                            if tool.get("name") == name
+                        ),
+                        None,
+                    )
+                    if schema is None:
+                        return {"respond": empty_result(name, args)}
+                    args = validate_arguments(name, args, schema)
+                except GraphArgumentError as exc:
+                    return {"rpc_error": str(exc)}
+                except Exception:
+                    return {"respond": empty_result(name, args)}
+                return {"respond": project(self.gateway, principal, self.workers, name, args)}
         if name in ("mempalace_list_tunnels", "mempalace_follow_tunnels"):
             from .handoff.tunnels import project
 
