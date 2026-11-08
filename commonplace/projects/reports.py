@@ -59,6 +59,10 @@ def ensure_source(conn):
         conn.execute("ALTER TABLE tasks ADD COLUMN report_reset_rev INTEGER NOT NULL DEFAULT 0")
     for statement in SOURCE_SCHEMA:
         conn.execute(statement)
+    # BoardStore adds legacy task columns before calling us again. SQLite
+    # accepts missing trigger references but then breaks later task updates.
+    if not set(WATCHED).issubset(columns):
+        return
     conn.execute(
         "CREATE TRIGGER IF NOT EXISTS project_report_reset AFTER UPDATE OF "
         + ",".join(WATCHED)

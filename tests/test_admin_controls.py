@@ -90,7 +90,7 @@ def test_gateway_machine_worker_and_mutation_controls(hub):
         )
         assert status == 404
     for section in ("runtime", "limits", "stuck"):
-        assert get(hub, section, headers)[0] == 404
+        assert get(hub, section, headers)[0] == 200
     for path in ("/api/admin/instance/deploy", "/api/admin/instance/backups"):
         assert request(hub, path, headers=headers)[0] == 404
     status, _, raw = request(hub, "/healthz")

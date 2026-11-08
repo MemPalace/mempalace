@@ -57,7 +57,7 @@ async function main() {
       void context.route(); await flush();
       assert.equal(state.base,'#/admin','Admin must survive the hash allowlist');
       assert.equal(shared,0,'Admin must bypass shared boards/needs/rules fan-in');
-      if(can_admin) {assert.match(f.mount.innerHTML,/Users and workspaces/);assert.equal(f.requests.length,2);}
+      if(can_admin) {assert.match(f.mount.innerHTML,/Users and workspaces/);assert.equal(f.requests.length,6);}
       else {assert.match(f.mount.innerHTML,/a signed-in workspace owner is required/);assert.equal(f.requests.length,0);}
       const calls=f.requests.length;
       const background=context.refresh({background:true,events:[{kind:'changed'}]});await flush();
@@ -80,7 +80,7 @@ async function main() {
       api(path,options={}){calls.push({path,options}); if(path==='/api/boards') return Promise.resolve({boards:[]}); if(path==='/api/cards/5') return Promise.resolve({number:5,title:'Requested card',board:'demo'}); return Promise.resolve({});}};
     runInNewContext(appSlice('async function cardPanel(', 'function newCardForm(')+appSlice('function adminScreen(', 'function consoleScreen(')+appSlice('async function refresh(', 'function decideStart(')+appSlice('async function route()', '// The current view'),context);
     await context.route(); await flush();
-    assert.equal(f.requests.length,2);
+    assert.equal(f.requests.length,6);
     const pending=[...f.requests], before=f.requests.length;
     if(which==='card-route') {
       // Palette navigation and browser Back both dispatch the same card hash.
@@ -124,7 +124,7 @@ async function main() {
     assert.match(f.mount.innerHTML,/Replacement/);assert.doesNotMatch(f.mount.innerHTML,/First|Second/);f.ui.stop();
   } else if(which==='independent') {
     const f=fixture(createAdmin); f.ui.show();
-    assert.equal(f.requests.length,2);
+    assert.equal(f.requests.length,6);
     assert.ok(f.requests.every(r=>!r.options.method||r.options.method==='GET'));
     const users=f.requests.find(r=>r.path.endsWith('/users'));
     users.resolve(userData('<img src=x onerror=bad()>')); await flush();
@@ -136,8 +136,8 @@ async function main() {
     assert.match(section(f.mount.innerHTML,'connections'),/aria-label="Retry Connections"/);
     assert.match(section(f.mount.innerHTML,'users'),/person@example.com/);
     assert.equal(f.timers.size,0);
-    for(const key of ['runtime','limits','stuck','deploy','backups']) assert.match(section(f.mount.innerHTML,key),/Available in a later slice/);
-    assert.ok(f.requests.every(r=>/\/(users|connections)$/.test(r.path)));
+    for(const key of ['deploy','backups']) assert.match(section(f.mount.innerHTML,key),/Available in a later slice/);
+    assert.ok(f.requests.every(r=>/\/(users|connections|runtime|limits|stuck|needs-me)$/.test(r.path)));
     f.ui.stop();
   } else if(which==='lifecycle') {
     const f=fixture(createAdmin); f.ui.show();
@@ -145,9 +145,9 @@ async function main() {
     assert.match(section(f.mount.innerHTML,'connections'),/Connections unavailable\. Retry\./);
     assert.doesNotMatch(f.mount.innerHTML,/source canary/);
     f.click('connections'); await flush();
-    assert.equal(f.requests.length,3); assert.ok(f.requests[2].path.endsWith('/connections'));
-    f.click('connections'); assert.equal(f.requests.length,3,'Only one active request per key');
-    f.requests[2].resolve(connectionData);await flush();
+    assert.equal(f.requests.length,7); assert.ok(f.requests[6].path.endsWith('/connections'));
+    f.click('connections'); assert.equal(f.requests.length,7,'Only one active request per key');
+    f.requests[6].resolve(connectionData);await flush();
     f.ui.refreshSection('users'); await flush();
     assert.match(section(f.mount.innerHTML,'users'),/First/);assert.match(section(f.mount.innerHTML,'users'),/Refreshing/);
     const old=f.requests.at(-1); f.expire();await flush();
@@ -156,9 +156,9 @@ async function main() {
     assert.match(f.mount.innerHTML,/Newest/);assert.doesNotMatch(f.mount.innerHTML,/STALE/);
     f.ui.refreshSection('users');const pending=f.requests.at(-1);f.ui.stop();pending.resolve(userData('LATE'));await flush();
     assert.equal(f.mount.innerHTML,'');assert.equal(f.timers.size,0);assert.equal(pending.options.signal.aborted,true);
-    f.ui.show(); f.setMe({...me,workspace:'w-two'}); f.requests.at(-2).resolve(userData('FOREIGN')); await flush();
+    f.ui.show(); f.setMe({...me,workspace:'w-two'}); f.requests.at(-6).resolve(userData('FOREIGN')); await flush();
     assert.doesNotMatch(f.mount.innerHTML,/FOREIGN|Newest/);assert.equal(f.timers.size,0);
-    f.setMe(me);f.ui.show();f.requests.at(-2).reject(Object.assign(new Error('expired'),{status:401}));await flush();
+    f.setMe(me);f.ui.show();f.requests.at(-6).reject(Object.assign(new Error('expired'),{status:401}));await flush();
     assert.equal(f.mount.innerHTML,'');assert.equal(f.timers.size,0);
     f.ui.show();document.dispatchEvent(new Event('signout'));await flush();assert.equal(f.mount.innerHTML,'');assert.equal(f.timers.size,0);
     // Use the real api: response headers arrive, but response.json never resolves.
@@ -178,7 +178,7 @@ async function main() {
     await Promise.resolve();
     race.ui.stop();race.ui.show();await flush();
     assert.match(section(race.mount.innerHTML,'users'),/Loading/,'A completed old-page continuation must not consume the new request state');
-    assert.equal(race.timers.size,2);race.ui.stop();
+    assert.equal(race.timers.size,6);race.ui.stop();
   } else assert.fail('Unknown case');
 }
 try { await main(); } catch(error) {

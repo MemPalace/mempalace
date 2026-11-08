@@ -1,5 +1,7 @@
 # Projects and orchestrators
 
+Owner [Admin overview](admin.md) reads existing project configuration without creating seats. It shows effective caps and actual usage under the current orchestration counting mode.
+
 Every project (board) gets one main orchestrator seat automatically, normally
 named `orchestrator:<project>`. Older projects get their seat when first viewed.
 An existing coordinator stays the main orchestrator until an owner replaces it.

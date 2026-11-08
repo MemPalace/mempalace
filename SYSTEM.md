@@ -14,7 +14,7 @@ entry was written.
 
 - **Workspace Admin foundation:** `/app/#/admin` is discoverable only when
   `/api/me.can_admin` is true (signed-in person and current-workspace owner).
-  The additive `can_admin_instance` stays false. New GET-only users/connections
+  The additive `can_admin_instance` stays false. New GET-only users/connections/runtime/limits/stuck
   inventories bind the decoded path ID to the authenticated workspace before any
   projection source read. Members and owner connections receive the exact
   person-owner refusal; foreign workspace IDs are concealed with 404. Personal
@@ -30,8 +30,8 @@ entry was written.
   They capture UTC once through `gateway.admin_clock.utc_now`; the paired
   `monotonic` seam controls deadlines. Credential expiry authentication retains
   its existing clock. Explicit field allowlists omit credentials, raw policy and
-  login links; display redaction does not modify stored content. Lists page by
-  creation time and ID in batches of 100 with full filtered counts. Each UI load,
+  login links; display redaction does not modify stored content. Lists page in batches of 100 with full filtered counts, using creation time/ID,
+  project slug/ID or card number as appropriate. Each UI load,
   including initial identity/body decoding, settles within its 5,000 ms client
   deadline independently of other sections and the shared refresh fan-in. Abort,
   page epochs and request generations clear private state on disposal or expiry.
@@ -334,6 +334,9 @@ not a guarantee to undo arbitrary external memory side effects after a lesson.
 Existing raw event emission can still fail after the board commit.
 
 Report installation registers recovery without resolving workspace directories.
+Recovery installs the report reset trigger only when all watched task columns
+exist; BoardStore installs it after migrating legacy task columns. This prevents
+missing-column trigger failures in task writes before that migration.
 The first dispatcher scan recovers and migrates existing board databases without creating
 workspace directories, followed by monotonic 30-second scan deadlines independent
 of requests and webhook traffic. Source initialization is cached by database path,
@@ -830,16 +833,42 @@ playbooks and the original wider orchestration acceptance remain separate work.
 
 ## Residuals
 
-- **Partial Admin rollout:** Only users/workspaces and agents/connections are
-  implemented; the remaining five sections say “Available in a later slice” and
-  send no requests. Token activity indicates recorded contact, not a live process.
-  No workspace concurrency cap, runtime accounting or backup success is invented.
-  Operational reads and backup receipts remain deferred. Future needs-me reuse
-  has a read-first limitation: `/api/needs-me` can initialize legacy stores and bind
+- **Partial Admin rollout:** Users/workspaces, connections, runtime, effective
+  limits and attention panels are implemented. Deployment/health and backups say
+  “Available in a later slice” and send no requests; instance capability stays false.
+  Token activity indicates recorded contact, not a live process. Machine and worker
+  contact remain separate; owner attestation is always unverified. There is no
+  workspace concurrency cap. Off uses distinct doing agents (including unlimited);
+  on reuses accepted-only slot accounting, preserving actual use above the cap and
+  stored worker assignments on disabled machines. Operational reads and backup
+  receipts remain deferred. The reused needs-me route has a read-first limitation: `/api/needs-me` can initialize legacy stores and bind
   rule-store metadata; the no-write promise here covers only the new Admin GETs.
   SQLite may create WAL/SHM sidecars during reads, so no-write tests compare logical
   tables, schema and non-sidecar files rather than byte equality of WAL files.
   Section requests are independent observations and can race ongoing activity.
+  Runtime/limits/stuck query unarchived boards through the generation-aware supervisor
+  resolver, opening existing encrypted board/runner stores with mode=ro, query_only,
+  a shared 2 second request budget, at most 250 ms connect/busy waits and a progress
+  handler. Missing coordinator and heartbeat columns read as unconfigured/unknown without migration.
+  Cursor slugs accept the creation limit of 100 characters. Only enabled, unrevoked
+  machines contribute active grants; historical assignments still count toward usage.
+  Runtime tables label connection state and token-use activity explicitly; next-page
+  source errors preserve earlier rows and retry the same cursor. Typed runtime
+  identifiers and enums reject malformed stored values.
+  Missing optional files/tables remain absent; corrupt sources fail safely. Only Admin opts into missing runner input; normal admission retains its strict input contract.
+  No application/writer locks, store constructors, seat creation, project GET,
+  lock-taking settings/registry methods or webhook/coordinator wrappers run on these
+  paths. Parameterized workspace-scoped joins verify current membership, disabled
+  users, lifecycle, runner kind and subscription policy/wing eligibility. Wakeability
+  is eligibility only, never delivery. The injected Admin UTC is captured once for
+  lifecycle, stale/lease predicates and recent-start accounting; monotonic time alone
+  bounds reads. Independent runtime subresults preserve completed sources and mark
+  unattempted sources as errors on budget exhaustion. Client loads including JSON
+  decoding retain the 5,000 ms deadline and generation/epoch disposal guards.
+  Needs-me keeps its exact server count and queue semantics in a separate panel
+  from the deduplicated union of expired leases, active blockers, waiting-person
+  facts and raw stale-agent facts, including children. Admin actions are GET reads
+  or navigation to existing details/settings; no new admission or mutation API.
 
 
 - Accepted, known gaps.

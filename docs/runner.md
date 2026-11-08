@@ -1,5 +1,7 @@
 # Optional machine runner
 
+The owner [Admin overview](admin.md) shows recorded machine and worker contact separately, unverified attestation, and machine grants. It sends no runner probe or control request.
+
 The runner lets a signed-in workspace owner or a granted coordinator request an agent start for a card the machine's worker could claim. It is inert by default: no machine means no change; an `unbound` machine refuses every start, including the owner's, and leases return 204. No config or service activation ships enabled. D1–D3 below remain open.
 
 ## Trust and authority
