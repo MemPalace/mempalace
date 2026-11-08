@@ -29,7 +29,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   the installed one, as the user, on every hook fire. Every child interpreter
   now runs with `PYTHONSAFEPATH=1` and through the launcher the Claude Code and
   Codex hooks already used, which drops the working directory from `sys.path`
-  on Python 3.10 too. The working directory itself is unchanged.
+  on Python 3.10 too. The small `-c` helpers around the launcher (the
+  kill-switch config reader, the wake-up JSON encoder, the state-file
+  timestamps) carry the same two lines, since Python 3.10 ignores
+  `PYTHONSAFEPATH` and the config reader runs before the launcher does. The
+  working directory itself is unchanged.
 - **A hostile `.gitignore` can no longer hang the miner.** The `**` matcher
   branched on every `**` segment, so one line of a dozen of them in a cloned
   repository kept `mempalace mine` and `mempalace init` busy for minutes
@@ -42,7 +46,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   one of them as a link at a file in the user's home had that file replaced or
   appended to, and a dangling link had its target created. The three writers
   now decide by `lstat`, refuse anything that is not a regular file or absent,
-  and publish through a fresh temporary file that never follows a link.
+  and publish through a fresh temporary file that never follows a link. The
+  replacement keeps the mode of the file it replaces, so a `mempalace.yaml` or
+  `entities.json` the user had set to 0600 stays 0600 instead of coming back
+  at the umask default; this holds for every non-private `fsio` publish.
 - **A sync peer's events and artifacts pass the same checks as local ones.**
   `apply_remote_event` only checked that required fields were present, so a
   configured peer (or whoever held its token) could store a body of any size,
@@ -52,7 +59,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   told this node it already had everything from that replica. Remote events
   and artifacts now go through the routing, type, status, body-size,
   artifact-size and sha256-shape checks `append_event` and `put_artifact`
-  apply, an event must carry the origin it was served for, and the sync round
+  apply, an event must carry the origin it was served for, its `hlc` stamp
+  must parse (a stamp that did not sorted above every real one, and the next
+  open of that replica's log failed seeding the clock from it; a log that
+  already holds such a row now opens, skips it with a warning and seeds from
+  the newest stamp that parses), and the sync round
   refuses a page that does not advance the cursor it asked from (a peer could
   otherwise hold the round, and every peer behind it, for ever), pulls a
   bounded number of pages per origin per round, and reports any failure a peer

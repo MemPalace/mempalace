@@ -7,11 +7,14 @@ from, and ``sync_all`` reports any peer failure instead of letting it stop
 the round.
 """
 
+import logging
 import os
+import sqlite3
 
 import pytest
 
 from mempalace import logsync
+from mempalace.hlc import parse as parse_hlc
 from mempalace.logstream import Logstream
 
 pytestmark = pytest.mark.usefixtures("tokenless_http_hub")
@@ -73,6 +76,9 @@ class TestRemoteEventValidation:
             ("origin_seq", 10**18, "origin_seq="),
             ("origin_seq", -1, "origin_seq="),
             ("hlc", "a\x00b", "control characters"),
+            ("hlc", "not-a-clock", "not a valid HLC"),
+            ("hlc", "1783038849123-000000", "not a valid HLC"),
+            ("hlc", 1783038849123, "must be a non-empty string"),
             ("artifact_ids", "art_1", "artifact_ids must be a list"),
             ("artifact_ids", ["ok", 3], "artifact_id must be a non-empty string"),
             ("metadata", "nope", "metadata must be an object"),
@@ -95,6 +101,44 @@ class TestRemoteEventValidation:
             ls_a.apply_remote_event(event, expected_origin="rep_cccccccccccc")
         # The forged cursor never lands in the version vector.
         assert ls_b.replica_id not in ls_a.version_vector()
+
+    def test_a_refused_hlc_stamp_leaves_the_log_reopenable(self, tmp_dir, ls_b):
+        """The clock is seeded from max(hlc) on open: a bad stamp must never be stored."""
+        path = os.path.join(tmp_dir, "reopen.sqlite3")
+        ls = Logstream(db_path=path)
+        with pytest.raises(ValueError, match="not a valid HLC"):
+            ls.apply_remote_event(
+                _remote_event(ls_b, hlc="not-a-clock"), expected_origin=ls_b.replica_id
+            )
+        ls.close()
+        reopened = Logstream(db_path=path)
+        try:
+            assert reopened.version_vector().get(ls_b.replica_id) is None
+        finally:
+            reopened.close()
+
+    def test_a_malformed_stamp_already_in_the_log_does_not_block_opening(self, tmp_dir, caplog):
+        """A log written before the check stays openable; the bad row is skipped, not trusted."""
+        path = os.path.join(tmp_dir, "legacy.sqlite3")
+        ls = Logstream(db_path=path)
+        _append(ls, body="good")
+        _append(ls, body="bad")
+        ls.close()
+        conn = sqlite3.connect(path)
+        with conn:
+            conn.execute("UPDATE events SET hlc = ? WHERE body = ?", ("not-a-clock", "bad"))
+        conn.close()
+
+        with caplog.at_level(logging.WARNING, logger="mempalace.logstream"):
+            reopened = Logstream(db_path=path)
+        try:
+            assert "1 malformed hlc stamp" in caplog.text
+            _append(reopened, body="after")
+            stamps = [e["hlc"] for e in reopened.list_ops(reopened.replica_id, 0)]
+            parse_hlc(stamps[-1])
+            assert stamps[-1] > stamps[0], stamps
+        finally:
+            reopened.close()
 
     def test_a_non_object_is_refused(self, ls_a):
         with pytest.raises(ValueError, match="must be an object"):

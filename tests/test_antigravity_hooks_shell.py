@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -48,6 +50,7 @@ def _run_hook(
     home: Path,
     extra_env: dict[str, str] | None = None,
     timeout: float = 10.0,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a hook script with isolated env and synthetic stdin."""
     if isinstance(stdin_json, dict):
@@ -73,6 +76,7 @@ def _run_hook(
         text=True,
         env=env,
         timeout=timeout,
+        cwd=None if cwd is None else str(cwd),
     )
 
 
@@ -512,6 +516,80 @@ def test_common_sh_keeps_the_workspace_off_sys_path() -> None:
     wake = WAKE_HOOK.read_text(encoding="utf-8")
     assert "if sys.path and sys.path[0] == '': del sys.path[0]" in wake
     assert "[sys.executable, '-c', safe_main, 'wake-up'" in wake
+
+
+_PYTHON_C_SITE = re.compile(r"""PYTHON_BIN" -c (["'])(?!\$)""")
+
+
+def test_every_python_helper_in_the_hooks_drops_the_cwd_before_importing() -> None:
+    """Each ``-c`` body starts by removing the cwd entry, ahead of its first real import.
+
+    Python 3.10 ignores PYTHONSAFEPATH, so the launcher's guard is not enough
+    on its own: the kill-switch config reader runs before the launcher, and a
+    workspace ``json.py`` would run there. Every helper carries the guard.
+    """
+    sites = 0
+    for script in (SAVE_HOOK, WAKE_HOOK, COMMON_SH):
+        code = script.read_text(encoding="utf-8")
+        for match in _PYTHON_C_SITE.finditer(code):
+            sites += 1
+            head = "\n".join(
+                line
+                for line in code[match.end() : match.end() + 400].splitlines()
+                if not line.lstrip().startswith("#")
+            )
+            where = f"{script.name}: {head.splitlines()[0][:60]!r}"
+            assert head.lstrip().startswith("import sys"), where
+            guard = head.find("sys.path[0]")
+            next_import = head.find("import ", head.find("import sys") + len("import sys"))
+            assert guard != -1, where
+            assert next_import == -1 or guard < next_import, where
+    assert sites >= 6, sites
+
+
+def test_save_hook_ignores_a_workspace_json_module_without_pythonsafepath(tmp_path: Path) -> None:
+    """A ``json.py`` in the workspace never runs, even where PYTHONSAFEPATH is ignored.
+
+    Python 3.10 drops the variable on the floor; an interpreter wrapper that
+    unsets it reproduces that on any version. The stop payload bails out on
+    ``fullyIdle`` false, after the kill-switch config read that used to run
+    ``import json`` with the workspace first on sys.path.
+    """
+    state, home = tmp_path / "state", tmp_path / "home"
+    _ensure_palace(home)
+    (home / ".mempalace" / "config.json").write_text(
+        json.dumps({"hooks": {"auto_save": True}}), encoding="utf-8"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = tmp_path / "executed.txt"
+    (workspace / "json.py").write_text(
+        "open(" + repr(str(marker)) + ", 'w').write('executed')\nraise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    py310 = tmp_path / "python310"
+    py310.write_text(
+        "#!/bin/sh\nunset PYTHONSAFEPATH\nexec " + shlex.quote(sys.executable) + ' "$@"\n',
+        encoding="utf-8",
+    )
+    py310.chmod(0o755)
+
+    control_env = {**os.environ, "PYTHONSAFEPATH": "1"}
+    subprocess.run([str(py310), "-c", "import json"], cwd=workspace, env=control_env, timeout=10)
+    assert marker.exists(), "control: the wrapper must expose the workspace module"
+    marker.unlink()
+
+    result = _run_hook(
+        SAVE_HOOK,
+        _stop_payload(fullyIdle=False),
+        state_dir=state,
+        home=home,
+        extra_env={"MEMPAL_PYTHON": str(py310)},
+        cwd=workspace,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "{}"
+    assert not marker.exists(), "a workspace json.py ran inside a hook helper"
 
 
 def test_save_hook_backgrounds_probe_mine_and_cleanup_in_one_subshell(tmp_path: Path) -> None:

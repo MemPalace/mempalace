@@ -138,7 +138,11 @@ MEMPAL_PYTHON_BIN="$(mempal_resolve_python)"
 # installed package, as the user, on every hook fire. PYTHONSAFEPATH
 # stops that on Python 3.11+ for every interpreter the hooks start; the
 # launcher below also drops the empty sys.path entry `-c` adds, which
-# covers 3.10. The working directory itself stays put. Same guard as
+# covers 3.10, where PYTHONSAFEPATH is ignored. Every other `-c`
+# helper in these hooks starts with the same two lines before its
+# first import, for the same reason: the kill-switch config reader
+# runs before the launcher, and a workspace `json.py` must not run
+# there either. The working directory itself stays put. Same guard as
 # hooks/mempal_hook_run.sh for the Claude Code and Codex hooks.
 export PYTHONSAFEPATH=1
 MEMPAL_SAFE_MAIN='import sys
@@ -238,7 +242,9 @@ mempal_kill_switch_tripped() {
     if [ -f "$cfg" ]; then
         local auto
         auto=$("$MEMPAL_PYTHON_BIN" -c "
-import json, sys
+import sys
+if sys.path and sys.path[0] == '': del sys.path[0]
+import json
 try:
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
@@ -539,7 +545,7 @@ mempal_gc_stale_state() {
     local marker="$MEMPAL_STATE_DIR/antigravity_last_sweep"
     if [ -f "$marker" ]; then
         local mtime now
-        if mtime=$("$MEMPAL_PYTHON_BIN" -c 'import os, sys; print(int(os.path.getmtime(sys.argv[1])))' "$marker" 2>/dev/null) \
+        if mtime=$("$MEMPAL_PYTHON_BIN" -c 'import sys; sys.path and sys.path[0] == "" and sys.path.pop(0); import os; print(int(os.path.getmtime(sys.argv[1])))' "$marker" 2>/dev/null) \
            && now=$(date '+%s' 2>/dev/null) \
            && [ -n "$mtime" ] \
            && [ "$((now - mtime))" -lt 86400 ]; then
@@ -590,7 +596,9 @@ mempal_emit_wake_inject() {
     # Encode the message as JSON via Python so embedded quotes / newlines
     # / control chars don't corrupt the output.
     "$MEMPAL_PYTHON_BIN" -c "
-import json, sys
+import sys
+if sys.path and sys.path[0] == '': del sys.path[0]
+import json
 msg = sys.argv[1]
 print(json.dumps({'injectSteps': [{'ephemeralMessage': msg}]}))
 " "$message" 2>/dev/null || printf '{}\n'

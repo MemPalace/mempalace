@@ -47,6 +47,7 @@ from typing import Optional
 from . import paths
 from .config import sanitize_iso_temporal, strip_lone_surrogates
 from .fsio import atomic_publish, read_published_bytes
+from .hlc import parse as parse_hlc
 from .timeutil import filename_stamp, utc_now_z
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,18 @@ def _sanitize_origin_seq(value) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_ORIGIN_SEQ:
         raise ValueError(f"origin_seq={value!r} is not an integer between 1 and {MAX_ORIGIN_SEQ}")
     return value
+
+
+def _sanitize_hlc(value) -> str:
+    """A remote op's HLC stamp, in the fixed-width form ``hlc.render`` produces.
+
+    The clock is seeded from the newest stamp in the log on every open, so a
+    stamp ``hlc.parse`` rejects must never reach the table: it would sort
+    above every well-formed one and fail the next ``Logstream()``.
+    """
+    text = _sanitize_routing(value, "hlc")
+    parse_hlc(text)
+    return text
 
 
 def _sanitize_metadata(value) -> str:
@@ -544,8 +557,38 @@ class Logstream:
         conn.commit()
         # Seed the HLC from the newest stamp in the log so monotonicity
         # survives restarts (RFC 004 op envelope).
-        row = conn.execute("SELECT max(hlc) AS last FROM events").fetchone()
-        self._clock = HybridLogicalClock(self.replica_id, last=row["last"] if row else None)
+        self._clock = HybridLogicalClock(self.replica_id, last=self._newest_valid_hlc(conn))
+
+    @staticmethod
+    def _newest_valid_hlc(conn):
+        """The newest well-formed hlc stamp in the log, or None.
+
+        Every stamp is checked on its way in (``tick()`` locally,
+        ``_sanitize_hlc`` for remote ops), but a log written before that
+        check may hold one ``parse`` rejects. Such a stamp sorts above every
+        well-formed one in SQLite's TEXT order, so ``max(hlc)`` would hand it
+        to the clock and the replica could never be opened again. Walking
+        down from the top and skipping what does not parse keeps the log
+        openable; the skipped rows stay where they are and are otherwise
+        inert. The first row parses in any healthy log, so this reads one.
+        """
+        skipped = 0
+        cursor = conn.execute("SELECT hlc FROM events WHERE hlc IS NOT NULL ORDER BY hlc DESC")
+        for row in cursor:
+            stamp = row[0]
+            try:
+                parse_hlc(stamp)
+            except ValueError:
+                skipped += 1
+                continue
+            break
+        else:
+            stamp = None
+        if skipped:
+            logger.warning(
+                "logstream: %d malformed hlc stamp(s) ignored while seeding the clock", skipped
+            )
+        return stamp
 
     def _migrate_schema(self, conn):
         """RFC 004 / RFC 003 migration: add provenance and topic columns to pre-existing logs.
@@ -1266,7 +1309,7 @@ class Logstream:
         created_at = _sanitize_routing(event["created_at"], "created_at")
         origin_replica = _sanitize_routing(event["origin_replica"], "origin_replica")
         origin_seq = _sanitize_origin_seq(event["origin_seq"])
-        hlc = _sanitize_routing(event["hlc"], "hlc")
+        hlc = _sanitize_hlc(event["hlc"])
         metadata_json = _sanitize_metadata(event.get("metadata"))
         if expected_origin is not None and origin_replica != expected_origin:
             raise ValueError(

@@ -9,6 +9,7 @@ and refuse anything that is not a regular file or absent.
 
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -128,3 +129,22 @@ class TestGitignore:
         assert _ensure_mempalace_files_gitignored(str(project)) is True
         text = (project / ".gitignore").read_text(encoding="utf-8")
         assert "node_modules/" in text and "entities.json" in text
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_init_writers_keep_a_locked_down_file_locked_down(tmp_path):
+    """Refusing links must not cost the user the 0600 they put on these files."""
+    config, entities = tmp_path / "mempalace.yaml", tmp_path / "entities.json"
+    config.write_text("wing: review\nrooms: []\n", encoding="utf-8")
+    entities.write_text("{}", encoding="utf-8")
+    for path in (config, entities):
+        path.chmod(0o600)
+    old = os.umask(0o022)
+    try:
+        save_config(str(tmp_path), "review", ROOMS)
+        _save_project_entities(entities, {"people": ["synthetic"]})
+    finally:
+        os.umask(old)
+    for path in (config, entities):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, path.name
+    assert json.loads(entities.read_text(encoding="utf-8")) == {"people": ["synthetic"]}

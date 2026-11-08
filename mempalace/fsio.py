@@ -152,18 +152,35 @@ def write_in_place(
         _chmod_quiet(path, 0o600)
 
 
+def _existing_mode(path: Path) -> Optional[int]:
+    """The permission bits of the regular file at ``path``, or None.
+
+    ``lstat`` so a link at ``path`` reports nothing: a publish that does not
+    follow links replaces it, and one that does has already resolved it.
+    """
+    try:
+        st = os.lstat(str(path))
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return stat.S_IMODE(st.st_mode)
+
+
 def _fill_temp(
-    fd: int, tmp: str, write_body: Callable[[Any], None], binary: bool, private: bool
+    fd: int, tmp: str, write_body: Callable[[Any], None], binary: bool, mode: Optional[int]
 ) -> None:
     """Serialize into ``fd`` and fsync before anything is published.
 
-    The mode is set before the write. Under a umask that clears the owner's
-    write bit, ``O_CREAT`` leaves the file at 0400, and one left behind by a
-    killed run is then a name its owner cannot open.
+    ``mode``, when given, is set before the write: ``os.open`` applied the
+    umask to the creation mode, and this is where a file keeps the bits its
+    predecessor had. Under a umask that clears the owner's write bit,
+    ``O_CREAT`` leaves the file at 0400, and one left behind by a killed run
+    is then a name its owner cannot open.
     """
     try:
-        if private:
-            _chmod_quiet(tmp, 0o600)
+        if mode is not None:
+            _chmod_quiet(tmp, mode)
         with _open_body(fd, "w", binary) as handle:
             write_body(handle)
             handle.flush()
@@ -277,8 +294,9 @@ def atomic_publish(
 
     ``write_body`` gets a UTF-8 text handle, or a bytes handle when
     ``binary`` is set (no newline translation). The file is 0600 unless
-    ``private`` is false, which leaves the mode to the umask as a plain
-    ``open()`` does. With ``follow_symlinks`` false a link at ``path`` is
+    ``private`` is false, which keeps the mode of the regular file being
+    replaced, as ``open(path, "w")`` would, and leaves a new file's mode to
+    the umask. With ``follow_symlinks`` false a link at ``path`` is
     replaced rather than written through, and there is no in-place fallback,
     since writing in place would follow it. Otherwise the write falls back to
     ``write_in_place`` only when the directory refuses a new name (``EACCES``,
@@ -286,9 +304,11 @@ def atomic_publish(
     Every other failure propagates and does not truncate ``path``.
     """
     path = write_target(path) if follow_symlinks else Path(path)
-    mode = 0o600 if private else 0o666
+    # A replacement is a new inode: without this, a 0600 file the user had
+    # locked down would come back at the umask default after every save.
+    keep = 0o600 if private else _existing_mode(path)
     try:
-        fd, tmp = _open_publish_temp(path, mode)
+        fd, tmp = _open_publish_temp(path, 0o666 if keep is None else keep)
     except OSError as exc:
         if not follow_symlinks or exc.errno not in _IN_PLACE_ERRNOS:
             raise
@@ -296,7 +316,7 @@ def atomic_publish(
         _warn_in_place(path, why="a temporary file")
         return
 
-    _fill_temp(fd, tmp, write_body, binary, private)
+    _fill_temp(fd, tmp, write_body, binary, keep)
     try:
         _replace(tmp, path)
     except BaseException as exc:

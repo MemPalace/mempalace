@@ -162,7 +162,7 @@ fi
 PENDING_FILE="$MEMPAL_STATE_DIR/antigravity_pending_${CONVERSATION_ID}"
 if [ -f "$PENDING_FILE" ]; then
     # mtime in epoch seconds (portable; BSD/macOS `date -r` takes epoch, not a path).
-    if mtime=$("$MEMPAL_PYTHON_BIN" -c 'import os, sys; print(int(os.path.getmtime(sys.argv[1])))' "$PENDING_FILE" 2>/dev/null) \
+    if mtime=$("$MEMPAL_PYTHON_BIN" -c 'import sys; sys.path and sys.path[0] == "" and sys.path.pop(0); import os; print(int(os.path.getmtime(sys.argv[1])))' "$PENDING_FILE" 2>/dev/null) \
        && now=$(date '+%s') \
        && [ -n "$mtime" ] \
        && [ "$((now - mtime))" -lt 3600 ]; then
