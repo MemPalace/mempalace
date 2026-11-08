@@ -9,13 +9,12 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-from hypothesis import given
-from hypothesis import strategies as st
+from hypothesis import given, strategies as st
 
 from mempalace.entity_detector import (
+    _MAX_CANDIDATE_TOKEN_LEN,
     PROSE_EXTENSIONS,
     STOPWORDS,
-    _MAX_CANDIDATE_TOKEN_LEN,
     _collapse_long_ascii_runs,
     _print_entity_list,
     classify_entity,
@@ -25,7 +24,6 @@ from mempalace.entity_detector import (
     scan_for_detection,
     score_entity,
 )
-
 
 # ── extract_candidates ──────────────────────────────────────────────────
 
@@ -42,6 +40,28 @@ def test_extract_candidates_ignores_stopwords():
     text = "The The The The The The"
     result = extract_candidates(text)
     assert "The" not in result
+
+
+def test_extract_candidates_ignores_technical_terms():
+    """Generic code/architecture terms are not entities (#476)."""
+    terms = [
+        "Handler",
+        "Node",
+        "Manager",
+        "Plugin",
+        "Module",
+        "Interface",
+        "Builder",
+        "Factory",
+        "Config",
+    ]
+    text = " ".join(f"The {t} runs. Later the {t} stops. Then {t} restarts." for t in terms)
+    text += " Riley said hi. Riley laughed. Riley smiled."
+    result = extract_candidates(text)
+    for term in terms:
+        assert term not in result, f"{term!r} should be a stopword; got: {list(result)!r}"
+        assert term.lower() in STOPWORDS
+    assert "Riley" in result
 
 
 def test_extract_candidates_requires_min_frequency():
@@ -142,6 +162,7 @@ def test_coca_wordlist_file_loads_with_expected_shape():
     """The data file ships with a stable schema."""
     import json
     from pathlib import Path
+
     import mempalace
 
     pkg_dir = Path(mempalace.__file__).parent
@@ -164,6 +185,7 @@ def test_coca_wordlist_contains_all_known_aya_false_positives():
     false positive from Aya's real palace, lowercased."""
     import json
     from pathlib import Path
+
     import mempalace
 
     pkg_dir = Path(mempalace.__file__).parent
@@ -261,6 +283,7 @@ def test_known_systems_file_loads_with_expected_shape():
     """The data file ships with a stable schema."""
     import json
     from pathlib import Path
+
     import mempalace
 
     pkg_dir = Path(mempalace.__file__).parent
@@ -287,6 +310,7 @@ def test_known_systems_file_contains_expected_high_value_entries():
     users mention in real palaces."""
     import json
     from pathlib import Path
+
     import mempalace
 
     pkg_dir = Path(mempalace.__file__).parent
@@ -682,6 +706,16 @@ def test_scan_for_detection_fallback_to_all_readable(tmp_path):
     assert ".py" in extensions or ".js" in extensions
 
 
+def test_scan_for_detection_never_samples_mempalace_project_files(tmp_path):
+    """The rooms and entities a previous ``mempalace init`` wrote are not
+    source prose; sampling them made a second init detect different names."""
+    (tmp_path / "notes.md").write_text("Alice met Bob.")
+    for name in ("mempalace.yaml", "mempalace.yml", "mempal.yaml", "entities.json"):
+        (tmp_path / name).write_text("people: [Carol]")
+    names = {f.name for f in scan_for_detection(str(tmp_path))}
+    assert names == {"notes.md"}
+
+
 def test_scan_for_detection_max_files(tmp_path):
     """Caps to max_files."""
     for i in range(20):
@@ -705,8 +739,7 @@ def _temp_locale(locale_code: str, entity_section: dict):
     on the next run (the fixture lacks the required terms/cli/aaak sections).
     Recover with `rm mempalace/i18n/zz-test-*.json`.
     """
-    from mempalace import i18n
-    from mempalace import entity_detector
+    from mempalace import entity_detector, i18n
 
     locale_path = Path(i18n.__file__).parent / f"{locale_code}.json"
     if locale_path.exists():
@@ -1143,7 +1176,7 @@ def test_entity_extraction_no_redos_on_adversarial_ascii_run():
     except subprocess.TimeoutExpired:
         raise AssertionError(
             "entity extraction hung on an adversarial ASCII run — ReDoS regression (#2063)"
-        )
+        ) from None
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
 
@@ -1161,3 +1194,108 @@ def test_al_and_ps1_are_sampled_when_prose_is_scarce(tmp_path):
     found = sorted(p.name for p in entity_detector.scan_for_detection(str(tmp_path)))
 
     assert found == ["Build.AL", "Customer.Codeunit.al", "build.ps1"]
+
+
+# ── issue #2811: entity_languages-aware filters ─────────────────────────
+
+
+def test_extract_candidates_uses_pt_br_stopwords():
+    """Portuguese function words must not become entities under pt-br."""
+    text = "Os Os Os Ele Ele Ele Se Se Se Markdown Markdown Markdown"
+    result = extract_candidates(text, languages=("pt-br",))
+    assert "Os" not in result
+    assert "Ele" not in result
+    assert "Se" not in result
+    assert "Markdown" in result
+
+
+def test_extract_candidates_coca_only_for_english():
+    """The COCA English content-word filter is skipped without 'en'.
+
+    'Data' is a COCA word but also a legitimate pt-br token that may head
+    a name; under pt-br-only configuration it must not be filtered.
+    """
+    text = "Data Data Data Markdown Markdown Markdown"
+    result = extract_candidates(text, languages=("pt-br",))
+    assert "Data" in result
+    assert "Markdown" in result
+
+
+def test_entity_metadata_respects_entity_languages(tmp_path, monkeypatch):
+    """miner._extract_entities_for_metadata filters pt-br function words."""
+    import mempalace.palace as palace
+    from mempalace.miner import _extract_entities_for_metadata
+
+    monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "pt-br")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(palace, "_CANDIDATE_RX_CACHE", None)
+
+    content = (
+        "Ele revisou Markdown. Ele atualizou Markdown. "
+        "Aquilo documenta Markdown. Os registros citam Markdown."
+    )
+    meta = _extract_entities_for_metadata(content)
+    entities = set(meta.split(";")) if meta else set()
+    assert "Markdown" in entities
+    assert "Ele" not in entities
+    assert "Aquilo" not in entities
+
+
+def test_entity_metadata_user_stopwords_file(tmp_path, monkeypatch):
+    """A global entity_stopwords.json in the config dir merges into the filters."""
+    import mempalace.palace as palace
+    from mempalace.miner import _extract_entities_for_metadata
+
+    tmp_path.joinpath("entity_stopwords.json").write_text(
+        json.dumps({"words": ["Fonte", "Tabela"]}), encoding="utf-8"
+    )
+    monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "pt-br")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(palace, "_CANDIDATE_RX_CACHE", None)
+
+    content = (
+        "Fonte descreve Markdown. Tabela registra Markdown. "
+        "Fonte e Tabela citam Markdown outra vez."
+    )
+    meta = _extract_entities_for_metadata(content)
+    entities = set(meta.split(";")) if meta else set()
+    assert "Markdown" in entities
+    assert "Fonte" not in entities
+    assert "Tabela" not in entities
+
+
+def test_closet_lines_respect_entity_languages(tmp_path, monkeypatch):
+    """build_closet_lines filters with the configured language's stopwords."""
+    import mempalace.palace as palace
+
+    monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "pt-br")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(palace, "_CANDIDATE_RX_CACHE", None)
+
+    content = "Ele revisou Markdown. Ele atualizou Markdown. Aquilo documenta Markdown novamente."
+    lines = palace.build_closet_lines("src.md", ["d1"], content, "w", "r")
+    entities_seg = lines[0].split("|")[1]
+    entities = set(entities_seg.split(";")) if entities_seg else set()
+    assert "Markdown" in entities
+    assert "Ele" not in entities
+    assert "Aquilo" not in entities
+
+
+def test_entity_metadata_english_filters_unchanged(tmp_path, monkeypatch):
+    """Default en config still applies the English stoplist and COCA filter."""
+    import mempalace.palace as palace
+    from mempalace.miner import _extract_entities_for_metadata
+
+    monkeypatch.setenv("MEMPALACE_ENTITY_LANGUAGES", "en")
+    monkeypatch.setenv("MEMPALACE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(palace, "_CANDIDATE_RX_CACHE", None)
+
+    content = (
+        "The Code changes updated Markdown. After the Code review, Markdown improved. "
+        "The Code base cites Markdown once more."
+    )
+    meta = _extract_entities_for_metadata(content)
+    entities = set(meta.split(";")) if meta else set()
+    assert "Markdown" in entities
+    assert "The" not in entities
+    assert "Code" not in entities

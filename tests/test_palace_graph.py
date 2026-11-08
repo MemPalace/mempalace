@@ -4,9 +4,10 @@ All ChromaDB access is mocked — no real database needed.
 """
 
 import json
-import pytest
 import os
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 def _make_fake_collection(metadatas, ids=None):

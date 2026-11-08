@@ -13,14 +13,14 @@ Three embedding-model options are available, selected via
 * ``embeddinggemma`` — ``onnx-community/embeddinggemma-300m-ONNX`` (q8), 384-dim
   via Matryoshka truncation, multilingual (100+ languages). Cross-lingual cos
   ~0.88 on parallel translations vs MiniLM's ~0.35. Recommended for any
-  non-English use; onboarding offers it as the default. The ~300 MB ONNX
+  non-English use (``mempalace init --embedding-model embeddinggemma``). The ~300 MB ONNX
   model is lazy-downloaded from HuggingFace on first use. Switching models
   on an existing palace requires ``mempalace repair rebuild-index``
   (different vector space). Its ``session.run()`` sub-batch size (32 docs by
-  default, #1770) is overridable via ``MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE``
+  default) is overridable via ``MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE``
   or ``embeddinggemma_batch_size`` in ``config.json`` for palaces whose
   drawers are long enough that the default sub-batch exceeds available
-  memory (#2330).
+  memory.
 * ``openai-compat`` — embeddings served by any OpenAI-compatible
   ``/v1/embeddings`` endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI
   shim, or a self-hosted server) instead of a local ONNX model. Useful for
@@ -35,10 +35,10 @@ Three embedding-model options are available, selected via
 Supported devices (env ``MEMPALACE_EMBEDDING_DEVICE`` or ``embedding_device``
 in ``~/.mempalace/config.json``):
 
-* ``auto`` — prefer CUDA ▸ CoreML ▸ DirectML, fall back to CPU
+* ``auto`` — prefer an available, model-compatible accelerator, then CPU
 * ``cpu`` — force CPU (the historical default)
 * ``cuda`` — NVIDIA GPU via ``onnxruntime-gpu`` (``pip install mempalace[gpu]``)
-* ``coreml`` — Apple Neural Engine (macOS)
+* ``coreml`` — Apple Core ML (macOS; see the model restrictions below)
 * ``dml`` — DirectML (Windows / AMD / Intel GPUs)
 
 ``embeddinggemma2`` runs on PyTorch rather than ONNX Runtime and reads the same
@@ -48,6 +48,8 @@ ONNX-only ``coreml`` and ``dml`` read as ``auto`` there, and ``mps`` reads as
 
 Requesting an unavailable accelerator emits a warning and falls back to CPU
 rather than hard-failing — mining must still work on a laptop without CUDA.
+MiniLM's ChromaDB session builder removes CoreML because it is less optimized
+than CPU, so both ``auto`` and an explicit ``coreml`` resolve to CPU for it.
 The same applies to an accelerator that runs but computes the model wrongly:
 ``embeddinggemma`` on CoreML returns NaN or all-zero vectors without raising,
 so ``auto`` never selects CoreML for it and an explicitly requested one is
@@ -64,9 +66,24 @@ import re
 import threading
 from typing import Optional
 
+from ._once import first_time
 from .version import __version__
 
 logger = logging.getLogger(__name__)
+
+
+def as_text_batch(input) -> list:  # noqa: A002 — mirrors the ChromaDB EF argument
+    """Return an embedding function's ``input`` as a list of documents.
+
+    A bare ``str`` is one document. Iterating it would embed each character
+    as its own document and hand back one vector per character.
+    """
+    if input is None:
+        return []
+    if isinstance(input, str):
+        return [input]
+    return input if isinstance(input, list) else list(input)
+
 
 # Optional per-thread hook around embedding inference. The HTTP transport
 # installs a context manager that releases its request lock only for the
@@ -115,6 +132,13 @@ _AUTO_ORDER = [
     ("DmlExecutionProvider", "dml"),
 ]
 
+# ChromaDB's MiniLM session builder removes CoreML on every load. Exclude it
+# before caching or reporting the provider so a cold status check stays cheap
+# and agrees with both the upstream and thread-capped session builders.
+_UNSUPPORTED_MODEL_PROVIDERS = {
+    "minilm": {"CoreMLExecutionProvider"},
+}
+
 # Providers that must never be picked *automatically* for a given model,
 # keyed by model name.
 #
@@ -158,7 +182,6 @@ _EF_CACHE: dict = {}
 # resolving the same key each keep their own EF instance, and each instance
 # later lazy-loads its own copy of the model.
 _EF_CACHE_LOCK = threading.Lock()
-_WARNED: set = set()
 
 
 def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, str]:
@@ -167,12 +190,14 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
     Falls back to CPU (with a one-shot warning) when the requested
     accelerator is not compiled into the installed ``onnxruntime``.
 
-    ``model`` gates ``_AUTO_PROVIDER_DENYLIST``: a provider known to produce
-    wrong results for that model is skipped under ``auto``. Explicit device
-    requests are left alone — a user who names an accelerator gets it.
+    Providers removed by a model's session builder are excluded for every
+    device setting. Providers known to produce wrong results are skipped
+    under ``auto``; explicit requests for those are checked at model load.
     """
     device = (device or "auto").strip().lower()
-    denied = _AUTO_PROVIDER_DENYLIST.get((model or "").strip().lower(), frozenset())
+    model = (model or "minilm").strip().lower()
+    unsupported = _UNSUPPORTED_MODEL_PROVIDERS.get(model, frozenset())
+    denied = unsupported | _AUTO_PROVIDER_DENYLIST.get(model, frozenset())
 
     try:
         import onnxruntime as ort
@@ -184,9 +209,7 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
     if device in _TORCH_ONLY_DEVICES:
         # One embedding_device serves both runtimes; a value meant for
         # EmbeddingGemma 2's PyTorch path picks the best ONNX provider instead.
-        warn_key = ("onnx-torch-only-device", device)
-        if warn_key not in _WARNED:
-            _WARNED.add(warn_key)
+        if first_time("embedding", "onnx-torch-only-device", device):
             logger.warning(
                 "embedding_device=%r is a PyTorch device used by embeddinggemma2 only; "
                 "the ONNX model %r uses 'auto' instead.",
@@ -203,17 +226,25 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
 
     requested = _PROVIDER_MAP.get(device)
     if requested is None:
-        if device not in _WARNED:
+        if first_time("embedding", "device", device):
             logger.warning("Unknown embedding_device %r -- falling back to cpu", device)
-            _WARNED.add(device)
         return (["CPUExecutionProvider"], "cpu")
 
     preferred = requested[0]
     if preferred == "CPUExecutionProvider":
         return (requested, "cpu")
 
+    if preferred in unsupported:
+        if first_time("embedding", "unsupported-device", model, device):
+            logger.warning(
+                "CoreML is disabled by ChromaDB's MiniLM session builder — "
+                "falling back to CPU for embedding_device=%r.",
+                device,
+            )
+        return (["CPUExecutionProvider"], "cpu")
+
     if preferred not in available:
-        if device not in _WARNED:
+        if first_time("embedding", "device", device):
             extra = _DEVICE_EXTRA.get(device, "the matching mempalace extra for your device")
             logger.warning(
                 "embedding_device=%r requested but %s is not installed — "
@@ -222,14 +253,13 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
                 preferred,
                 extra,
             )
-            _WARNED.add(device)
         return (["CPUExecutionProvider"], "cpu")
 
     return (requested, device)
 
 
 def _intra_op_session_options(intra_op_num_threads: int):
-    """Build ORT ``SessionOptions`` capping the intra-op thread pool (#1068).
+    """Build ORT ``SessionOptions`` capping the intra-op thread pool.
 
     Returns ``None`` when ``intra_op_num_threads <= 0`` so the caller leaves
     ORT at its default (≈ physical core count). ChromaDB's embedder ignores
@@ -247,7 +277,7 @@ def _intra_op_session_options(intra_op_num_threads: int):
 
 
 def _resolve_intra_op_threads() -> int:
-    """Read the configured ORT intra-op thread cap (``0`` = uncapped, #1068)."""
+    """Read the configured ORT intra-op thread cap (``0`` = uncapped)."""
     try:
         from .config import MempalaceConfig
 
@@ -258,7 +288,7 @@ def _resolve_intra_op_threads() -> int:
 
 
 def _resolve_embeddinggemma_batch_size() -> int:
-    """Read the configured EmbeddingGemma sub-batch size (#2330)."""
+    """Read the configured EmbeddingGemma sub-batch size."""
     try:
         from .config import MempalaceConfig
 
@@ -296,6 +326,9 @@ def _build_ef_class():
         def name() -> str:
             return "default"
 
+        def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol; embed_query routes here
+            return super().__call__(as_text_batch(input))
+
         def _forward(self, documents, batch_size=32):
             # Every upstream embed path (__call__, embed_query) runs the
             # session here, so this is the one place to serialize it.
@@ -304,16 +337,17 @@ def _build_ef_class():
 
         @cached_property
         def model(self):
-            # Upstream builds the InferenceSession with no intra-op thread cap,
-            # so ORT defaults its pool to the physical core count and a
-            # background mine pins every core (#1068). Rebuild the session the
-            # same way upstream does (same SessionOptions, same CoreML pruning,
-            # same model path) but with our cap applied. If upstream's
-            # internals shift, fall back to its uncapped build so embedding
-            # still works.
+            # Upstream builds the InferenceSession with ORT's defaults, which
+            # cost a long-lived process twice. There is no intra-op thread cap,
+            # so the pool defaults to the physical core count and a background
+            # mine pins every core. And the CPU memory arena is on: it
+            # grows to the largest batch a mine embeds and never shrinks, so a
+            # server keeps that high-water mark after every mine.
+            # Rebuild the session the same way upstream does (same
+            # SessionOptions, same CoreML pruning, same model path) with the
+            # arena off and our cap applied. If upstream's internals shift,
+            # fall back to its build so embedding still works.
             cap = getattr(self, "_intra_op_num_threads", 0)
-            if not cap or cap <= 0:
-                return super().model
             try:
                 ort = self.ort
                 providers = self._preferred_providers or ort.get_available_providers()
@@ -321,7 +355,9 @@ def _build_ef_class():
                 so = ort.SessionOptions()
                 so.log_severity_level = 3
                 so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                so.intra_op_num_threads = cap
+                so.enable_cpu_mem_arena = False
+                if cap and cap > 0:
+                    so.intra_op_num_threads = cap
                 return ort.InferenceSession(
                     os.path.join(self.DOWNLOAD_PATH, self.EXTRACTED_FOLDER_NAME, "model.onnx"),
                     providers=providers,
@@ -329,7 +365,7 @@ def _build_ef_class():
                 )
             except Exception:
                 logger.warning(
-                    "thread-capped ORT session build failed; using ORT defaults",
+                    "custom ORT session build failed; using ORT defaults",
                     exc_info=True,
                 )
                 return super().model
@@ -349,12 +385,12 @@ _EMBEDDINGGEMMA_MAX_LEN = 2048
 # so one unchunked run over a repair-scale batch (5000 docs, repair.py/
 # cli.py) allocates attention buffers that grow with batch size and
 # superlinearly with padded length (score tensors are batch x heads x
-# len^2 per layer), and the kernel OOM-kills the process (#1770). 32
+# len^2 per layer), and the kernel OOM-kills the process. 32
 # matches the internal batch size of chromadb's ONNXMiniLM_L6_V2, whose
 # chunked _forward survives the same call sites. embeddinggemma's
 # sentence_embedding output is attention-masked, so sub-batch padding
 # does not change any row's vector. __call__ decides which documents share
-# a sub-batch by size rather than by arrival order (#2104), because the run
+# a sub-batch by size rather than by arrival order, because the run
 # is priced on that padded length and not on the document count.
 _EMBEDDINGGEMMA_BATCH_SIZE = 32
 # Short document embedded once per model load to prove the execution provider
@@ -369,7 +405,7 @@ def _embeddinggemma_gather_patch(model_path: str):
     on every ``run()`` and only then gathers the rows it needs, so each run,
     even for a two-word query, builds a 768 MiB float32 copy that the CPU
     arena keeps; a long-running server grew with every concurrent search
-    until it was OOM-killed (#2681). See :mod:`mempalace.onnx_graph`.
+    until it was OOM-killed. See :mod:`mempalace.onnx_graph`.
     ``None`` (load the file unchanged) when the graph has no such lookup or
     cannot be read.
     """
@@ -469,13 +505,9 @@ def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
         )
 
     invalid_ids = sorted({int(token_id) for token_id in input_ids[out_of_range]})
-    warning_key = (
-        "embeddinggemma-out-of-range-token-ids",
-        model_vocab_size,
-        tuple(invalid_ids),
-    )
-
-    if warning_key not in _WARNED:
+    if first_time(
+        "embedding", "embeddinggemma-out-of-range-token-ids", model_vocab_size, tuple(invalid_ids)
+    ):
         logger.warning(
             "EmbeddingGemma tokenizer produced token IDs outside the ONNX "
             "text vocabulary (size=%d): %s; remapping to <unk> (%d)",
@@ -483,7 +515,6 @@ def _sanitize_embeddinggemma_input_ids(tokenizer, input_ids, np):
             invalid_ids,
             unknown_token_id,
         )
-        _WARNED.add(warning_key)
 
     sanitized = input_ids.copy()
     sanitized[out_of_range] = unknown_token_id
@@ -673,7 +704,7 @@ class EmbeddinggemmaONNX:
         long document drags a whole sub-batch up to its own length. Without
         grouping the bill is set by arrival order: a verbatim transcript
         whose long tool results sit between one-line replies pays the long
-        length for nearly every row (#2104).
+        length for nearly every row.
 
         An input that fits a single sub-batch is left in arrival order: every
         row pads to the same width either way, so the keys would buy nothing
@@ -692,14 +723,9 @@ class EmbeddinggemmaONNX:
         than characters per token do. The sort is stable, so equal-size
         documents keep arrival order and the split stays reproducible.
         """
-        if isinstance(input, str):
-            # A bare string would be iterated character by character below,
-            # silently producing one garbage vector per character.
-            input = [input]
-        if input is None or len(input) == 0:
-            # None or zero docs: nothing to embed; skip the lazy model
-            # download. len() over truthiness so an array-like documents
-            # sequence is not rejected by ambiguous-truth-value semantics.
+        input = as_text_batch(input)
+        if not input:
+            # Zero docs: nothing to embed; skip the lazy model download.
             return []
         self._lazy_load()
         np = self._np
@@ -714,7 +740,7 @@ class EmbeddinggemmaONNX:
         embeddings: list[list[float] | None] = [None] * len(input)
         # Tokenize and run per sub-batch, not over the whole input: the ONNX
         # runtime only ever holds batch_size rows of attention buffers at a
-        # time (#1770).
+        # time.
         for start in range(0, len(order), self._batch_size):
             idxs = order[start : start + self._batch_size]
             with _run_guard(self._providers, self._run_lock):
@@ -761,13 +787,32 @@ _EF_API_BATCH = 64
 _EF_API_TIMEOUT = 120
 
 
+def _warn_if_external_embedding(url: str) -> None:
+    """Warn once when an embedding URL would send document text off-machine."""
+    from mempalace.llm_client import endpoint_is_local, redact_secrets
+
+    if not url or endpoint_is_local(url) or not first_time("embedding", "external-endpoint"):
+        return
+    logger.warning(
+        "Embedding endpoint %s is outside the local network. "
+        "Document text sent there leaves this machine.",
+        redact_secrets(url),
+    )
+
+
 class EmbeddingAPIError(RuntimeError):
     """Raised when the embedding API is unreachable or returns an invalid body.
 
     Module-specific subclass mirroring ``llm_client.LLMError`` so callers can
     distinguish embedding-endpoint failures; subclasses ``RuntimeError`` so
-    existing ``except RuntimeError`` paths still catch it.
+    existing ``except RuntimeError`` paths still catch it. Like ``LLMError``,
+    its message is masked: the endpoint URL or its reply may carry a key.
     """
+
+    def __init__(self, message: str):
+        from mempalace.llm_client import redact_secrets
+
+        super().__init__(redact_secrets(message))
 
 
 class OpenAICompatEmbeddingFunction:
@@ -791,20 +836,14 @@ class OpenAICompatEmbeddingFunction:
         self._url = self._resolve_url(base_url)
         self._model = model
         self._api_key = api_key
+        _warn_if_external_embedding(base_url)
 
     @staticmethod
     def _resolve_url(base_url: str) -> str:
-        """Accept a base host, a ``/v1`` base, or a full endpoint URL.
+        """Accept a base host, a ``/v1`` base, or a full endpoint URL."""
+        from mempalace.llm_client import resolve_openai_url
 
-        Mirrors ``llm_client.OpenAICompatProvider._resolve_url`` so both sides
-        treat an ``http://host:port`` endpoint the same way.
-        """
-        url = base_url.rstrip("/")
-        if url.endswith("/embeddings"):
-            return url
-        if url.endswith("/v1"):
-            return f"{url}/embeddings"
-        return f"{url}/v1/embeddings"
+        return resolve_openai_url(base_url, "embeddings")
 
     def name(self) -> str:
         # Encode the model so switching it changes the persisted EF identity
@@ -818,35 +857,24 @@ class OpenAICompatEmbeddingFunction:
         return self(input)
 
     def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
-        import http.client
-        import json
-        from urllib.error import HTTPError, URLError
-        from urllib.request import Request, urlopen
+        from mempalace.llm_client import LLMError, post_json
 
-        headers = {
-            "Content-Type": "application/json",
-            # Some hosted (Cloudflare-fronted) endpoints 403 the default
-            # ``Python-urllib`` User-Agent — send our own (see issue #1570).
-            "User-Agent": f"mempalace/{__version__}",
-        }
+        # Some hosted (Cloudflare-fronted) endpoints 403 the default
+        # ``Python-urllib`` User-Agent — send our own.
+        headers = {"User-Agent": f"mempalace/{__version__}"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
 
         out: list = []
-        texts = list(input)
+        texts = as_text_batch(input)
         for start in range(0, len(texts), _EF_API_BATCH):
             batch = texts[start : start + _EF_API_BATCH]
             # encoding_format=float is explicit so a server that defaults to
             # base64 doesn't hand back strings we'd mis-parse as vectors.
             payload = {"model": self._model, "input": batch, "encoding_format": "float"}
-            req = Request(self._url, data=json.dumps(payload).encode("utf-8"), headers=headers)
             try:
-                with urlopen(req, timeout=_EF_API_TIMEOUT) as resp:
-                    data = json.loads(resp.read())
-            # ValueError covers an invalid/missing URL scheme and json.JSONDecodeError;
-            # http.client.HTTPException covers low-level protocol faults (BadStatusLine,
-            # IncompleteRead) common with local/overloaded servers.
-            except (HTTPError, URLError, OSError, http.client.HTTPException, ValueError) as e:
+                data = post_json(self._url, payload, headers, timeout=_EF_API_TIMEOUT)
+            except LLMError as e:
                 raise EmbeddingAPIError(
                     f"Embedding API request to {self._url} failed: {e}. Check that the "
                     f"server is reachable and MEMPALACE_EMBEDDING_API_URL / embedding_api_url "
@@ -868,14 +896,18 @@ class OpenAICompatEmbeddingFunction:
         """
         import numpy as np
 
+        from mempalace.llm_client import ECHO_LIMIT
+
         if not isinstance(data, dict):
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned a non-object response: {data}"
+                f"Embedding API at {self._url} returned a non-object response: "
+                f"{str(data)[:ECHO_LIMIT]}"
             )
         rows = data.get("data")
         if not isinstance(rows, list):
             raise EmbeddingAPIError(
-                f"Embedding API at {self._url} returned no 'data' array: {data.get('error', data)}"
+                f"Embedding API at {self._url} returned no 'data' array: "
+                f"{str(data.get('error', data))[:ECHO_LIMIT]}"
             )
         if len(rows) != n:
             raise EmbeddingAPIError(
@@ -1080,8 +1112,6 @@ _EMBEDDING_API_HINT = (
     "and that embedding_api_model (and embedding_api_key, if it needs one) are right, "
     "then retry."
 )
-_REFUSALS_LOGGED: set = set()
-_REFUSALS_LOCK = threading.Lock()
 
 
 def _model_error_class(exc: BaseException) -> Optional[type]:
@@ -1115,11 +1145,7 @@ def log_model_refusal(log, kind: str, exc: BaseException, palace_path=None) -> N
     everything else on stderr.
     """
     message = str(exc)
-    key = (str(palace_path or ""), kind, message)
-    with _REFUSALS_LOCK:
-        first = key not in _REFUSALS_LOGGED
-        _REFUSALS_LOGGED.add(key)
-    if first:
+    if first_time("embedding", "refusal", str(palace_path or ""), kind, message):
         log.error("%s: %s", kind, message)
     else:
         log.error(
@@ -1181,7 +1207,7 @@ def _near_miss_suggestions(name: str) -> tuple:
 def _normalize_stored_model_name(name) -> str:
     """The core model whose vectors a recorded ``model_name`` stands for.
 
-    Older builds (and develop before #2694) embedded any unrecognized
+    Older builds embedded any unrecognized
     ``embedding_model`` with MiniLM but recorded the raw name
     (``"all-minilm-l6-v2"``, ``"none"`` from a JSON null, ``"minilm-l6"``,
     even a typo such as ``"embedinggemma2"``). So a recorded name that is
@@ -1242,9 +1268,7 @@ def _resolve_embedding_model(model) -> str:
         shown = "'' (empty)"
     else:
         shown = repr(name)
-    warning_key = ("unknown-embedding-model", shown)
-    if warning_key not in _WARNED:
-        _WARNED.add(warning_key)
+    if first_time("embedding", "unknown-embedding-model", shown):
         logger.warning(
             "Unknown embedding_model %s; falling back to 'minilm'. Valid values: %s. "
             "Drawers filed meanwhile are embedded with MiniLM, so moving this palace "
@@ -1274,9 +1298,7 @@ def _embeddinggemma2_device(device: Optional[str]) -> str:
     else:
         mapped = "cpu"
         reason = "is not a known device"
-    warn_key = ("embeddinggemma2-device", value)
-    if warn_key not in _WARNED:
-        _WARNED.add(warn_key)
+    if first_time("embedding", "embeddinggemma2-device", value):
         logger.warning(
             "embedding_device=%r %s, so embeddinggemma2 uses %r (supported: %s).",
             value,
@@ -1398,39 +1420,43 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
 def describe_device(device: Optional[str] = None, model: Optional[str] = None) -> str:
     """Return a short human-readable label for the resolved embedding backend.
 
-    Used by the miner CLI header / MCP status so users can see at a glance
-    whether GPU acceleration engaged — or, for the ``openai-compat`` backend,
-    that embeddings are served by a remote endpoint rather than local hardware
-    (in which case the ``embedding_device`` accelerator label is irrelevant).
+    Before inference, report model-compatible provider selection without
+    loading a model. Once a session exists, report its enabled providers so
+    a runtime CPU fallback is visible. An enabled accelerator may still run
+    unsupported graph nodes on CPU. HTTP embeddings report the endpoint.
     """
-    if current_model_name(model).startswith("embeddinggemma2:"):
+    from .config import MempalaceConfig
+
+    cfg = None
+    if model is None:
+        cfg = MempalaceConfig()
+        model = cfg.embedding_model
+    model = _resolve_embedding_model(model)
+    if model == "openai-compat":
+        url = (cfg or MempalaceConfig()).embedding_api_url
+        return f"openai-compat ({url})" if url else "openai-compat"
+    if device is None:
+        device = (cfg or MempalaceConfig()).embedding_device
+    if model == "embeddinggemma2":
         ef = get_embedding_function(device=device, model="embeddinggemma2")
         # An explicit device torch cannot use warns now, before the caller
         # prints the label, and the label says so.
         ef.warn_if_device_unavailable()
         return f"embeddinggemma2 ({ef.device_label()}, float32)"
-    if device is None:
-        from .config import MempalaceConfig
-
-        cfg = MempalaceConfig()
-        if cfg.embedding_model == "openai-compat":
-            url = cfg.embedding_api_url
-            return f"openai-compat ({url})" if url else "openai-compat"
-        device = cfg.embedding_device
-        if model is None:
-            # The resolved device depends on the model (_AUTO_PROVIDER_DENYLIST),
-            # so the label would otherwise name a provider we won't use.
-            model = cfg.embedding_model
-    if model is not None:
-        # Label the provider list the factory will actually build with, which
-        # for an unrecognized model is minilm's.
-        model = _resolve_embedding_model(model)
-    _, effective = _resolve_providers(device, model)
+    providers, effective = _resolve_providers(device, model)
+    ef = _EF_CACHE.get((model, tuple(providers)))
+    # MiniLM's model is a cached_property: reading it normally would load
+    # weights during status. Inspect only an already-published session.
+    session_key = "_session" if model == "embeddinggemma" else "model"
+    session = getattr(ef, "__dict__", {}).get(session_key)
+    if session is not None:
+        active = session.get_providers()
+        return next((name for provider, name in _AUTO_ORDER if provider in active), "cpu")
     return effective
 
 
-# Probed vector widths, keyed by resolved model name. Populated once per
-# process the first time an identity is resolved for a model.
+# Probed vector widths, keyed by resolved model name. Populated the first
+# time a probe succeeds for a model; failures are never stored.
 _DIM_CACHE: dict = {}
 
 
@@ -1458,9 +1484,11 @@ def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -
     """Return the embedder's output dimension by embedding a short probe.
 
     Model-agnostic — works for any model without a hardcoded table — and
-    cached per resolved model name so the probe is paid at most once per
-    process. Returns ``0`` if the probe fails (treated as "dimension unknown"
-    by the identity check, so a probe failure never blocks normal operation).
+    cached per resolved model name so a successful probe is paid at most once
+    per process. Returns ``0`` if the probe fails (treated as "dimension
+    unknown" by the identity check, so a probe failure never blocks normal
+    operation). A failure is not cached: an embedder that was down when the
+    process started is probed again on the next call.
     """
     name = current_model_name(model)
     if name.startswith("embeddinggemma2:"):
@@ -1472,10 +1500,17 @@ def probe_dimension(device: Optional[str] = None, model: Optional[str] = None) -
         ef = get_embedding_function(device=device, model=model)
         vectors = ef(input=["probe"])
         dim = len(vectors[0]) if vectors and vectors[0] is not None else 0
-    except Exception:
-        logger.debug("Embedding dimension probe failed for model=%s", name, exc_info=True)
-        dim = 0
-    _DIM_CACHE[name] = dim
+    except Exception as exc:
+        log = logger.warning if first_time("embedding", "dim-probe", name) else logger.debug
+        log(
+            "Embedding dimension probe failed for model=%s (%s); will retry",
+            name,
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return 0
+    if dim > 0:
+        _DIM_CACHE[name] = dim
     return dim
 
 

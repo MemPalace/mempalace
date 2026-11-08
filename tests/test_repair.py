@@ -9,7 +9,6 @@ from contextlib import closing
 from unittest.mock import MagicMock, call, patch
 
 import pytest
-
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
 from mempalace import repair
@@ -1676,7 +1675,7 @@ def test_max_seq_id_detects_poison_rows(tmp_path):
         seg["closets_vec"],
         seg["closets_meta"],
     }
-    for sid, val in found:
+    for _sid, val in found:
         assert val > repair.MAX_SEQ_ID_SANITY_THRESHOLD
     assert "seg-clean" not in ids
 
@@ -1828,6 +1827,167 @@ def test_max_seq_id_backup_created(tmp_path):
     # Backup preserves the poisoned values from before the repair.
     assert rows[seg["drawers_vec"]] == seg["poisoned_values"][seg["drawers_vec"]]
     assert rows[seg["drawers_meta"]] == seg["poisoned_values"][seg["drawers_meta"]]
+
+
+def _max_seq_rows(palace):
+    with closing(sqlite3.connect(os.path.join(palace, "chroma.sqlite3"))) as conn:
+        return dict(conn.execute("SELECT segment_id, seq_id FROM max_seq_id").fetchall())
+
+
+def test_max_seq_id_refuses_while_another_writer_holds_the_palace(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    import mempalace.palace as palace_pkg
+
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+    before = _max_seq_rows(palace)
+
+    @contextmanager
+    def held(_path):
+        raise palace_pkg.MineAlreadyRunning("held by PID 4242 (mine notes)")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(palace_pkg, "mine_palace_lock", held)
+    result = repair.repair_max_seq_id(palace, assume_yes=True)
+
+    assert result["aborted"] is True
+    assert result["reason"] == "writer-active"
+    assert result["segment_repaired"] == []
+    assert _max_seq_rows(palace) == before
+    assert not [n for n in os.listdir(palace) if "max-seq-id-backup" in n]
+
+
+def test_max_seq_id_rewrites_only_under_the_palace_lock(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    import mempalace.palace as palace_pkg
+
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+    held = []
+    real_lock = palace_pkg.mine_palace_lock
+
+    @contextmanager
+    def recording_lock(path):
+        with real_lock(path):
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+
+    seen_held = []
+    real_close = repair._close_chroma_handles
+    monkeypatch.setattr(palace_pkg, "mine_palace_lock", recording_lock)
+    monkeypatch.setattr(
+        repair,
+        "_close_chroma_handles",
+        lambda *a, **k: (seen_held.append(bool(held)), real_close(*a, **k)),
+    )
+
+    result = repair.repair_max_seq_id(palace, assume_yes=True)
+
+    assert result["segment_repaired"]
+    assert seen_held == [True]
+
+
+def test_max_seq_id_backup_keeps_an_uncheckpointed_wal(tmp_path):
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+    db_path = os.path.join(palace, "chroma.sqlite3")
+    writer = sqlite3.connect(db_path)
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("CREATE TABLE late_write(v TEXT)")
+        writer.execute("INSERT INTO late_write VALUES ('still in the WAL')")
+        writer.commit()
+
+        result = repair.repair_max_seq_id(palace, assume_yes=True)
+    finally:
+        writer.close()
+
+    with closing(sqlite3.connect(result["backup"])) as conn:
+        assert conn.execute("SELECT v FROM late_write").fetchall() == [("still in the WAL",)]
+
+
+def _plan_changes_under_lock(monkeypatch, second_plan):
+    """Return the real plan for the report, then ``second_plan(real)`` under the lease."""
+    real_plan = repair._plan_max_seq_id_repair
+    calls = []
+
+    def plan(db_path, **kwargs):
+        poisoned, steps = real_plan(db_path, **kwargs)
+        calls.append(steps)
+        if len(calls) == 1:
+            return poisoned, steps
+        return poisoned, second_plan(steps)
+
+    monkeypatch.setattr(repair, "_plan_max_seq_id_repair", plan)
+
+
+def test_max_seq_id_clears_the_report_when_nothing_is_left_under_the_lock(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+    before = _max_seq_rows(palace)
+    _plan_changes_under_lock(monkeypatch, lambda steps: [])
+
+    result = repair.repair_max_seq_id(palace, assume_yes=True)
+
+    assert result["segment_repaired"] == []
+    assert result["before"] == {} and result["after"] == {}
+    assert result["plan_changed"] is True
+    assert result["backup"] is None
+    assert _max_seq_rows(palace) == before
+
+
+def test_max_seq_id_reports_a_plan_that_changed_under_the_lock(tmp_path, monkeypatch):
+    palace = str(tmp_path / "palace")
+    seg = _seed_poisoned_max_seq_id(palace)
+    _plan_changes_under_lock(
+        monkeypatch, lambda steps: [(sid, old, new + 5) for sid, old, new in steps]
+    )
+    lines = []
+
+    result = repair.repair_max_seq_id(palace, assume_yes=True, progress=lines.append)
+
+    expected = seg["drawers_meta_max"] + 5
+    assert result["plan_changed"] is True
+    assert result["after"][seg["drawers_meta"]] == expected
+    assert _max_seq_rows(palace)[seg["drawers_meta"]] == expected
+    changed_at = lines.index("  The plan changed once the palace was locked; applying:")
+    assert any(f"->  {expected}" in line for line in lines[changed_at:])
+
+
+def test_max_seq_id_reports_through_the_progress_callback(tmp_path, capsys):
+    palace = str(tmp_path / "palace")
+    _seed_poisoned_max_seq_id(palace)
+    lines = []
+
+    repair.repair_max_seq_id(palace, assume_yes=True, progress=lines.append)
+
+    assert capsys.readouterr().out == ""
+    assert any("max_seq_id Un-poison" in line for line in lines)
+    assert any("Repair complete" in line for line in lines)
+
+
+def test_paginate_ids_fallback_skips_ids_from_earlier_offset_pages():
+    first_page = [f"id-{i}" for i in range(1000)]
+
+    class Col:
+        def get(self, where=None, include=None, limit=None, offset=None):
+            if offset == 0:
+                return {"ids": first_page}
+            if offset is not None:
+                raise RuntimeError("offset broken")
+            # The no-offset fallback re-reads the head of the collection.
+            return {"ids": first_page[1:] + ["id-late"]}
+
+        def count(self):
+            return 1001
+
+    assert repair._paginate_ids(Col()) == first_page + ["id-late"]
 
 
 def test_max_seq_id_backup_pruned_to_max_backups(tmp_path, monkeypatch):
@@ -2121,8 +2281,8 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     Absence is not proven for it, which routes it to the probe.
 
     What happens there depends on the interpreter, measured on 3.9, 3.11, 3.12,
-    3.13 and 3.14: up to 3.12 ``pathname2url`` raises ``UnicodeEncodeError``
-    while building the URI, before SQLite is reached, and from 3.13 it
+    3.13 and 3.14: up to 3.11 ``pathname2url`` raises ``UnicodeEncodeError``
+    while building the URI, before SQLite is reached, and from 3.12 it
     percent-encodes the byte and the database opens normally. The first is a
     ``ValueError`` subclass, and the absence gate's docstring promises callers
     never see one; ``palace._validate_palace_fts5_after_mine`` and
@@ -2162,7 +2322,7 @@ def test_sqlite_integrity_errors_reports_a_path_python_cannot_encode(tmp_path):
     assert all("quick_check failed" in error for error in errors)
     assert not any("named pipe" in error for error in errors)
     assert repair.sqlite_integrity_status(palace).checked is True
-    if sys.version_info < (3, 13):
+    if sys.version_info < (3, 12):
         assert errors, "pathname2url raises here, and the probe has to report that"
 
 
@@ -2793,6 +2953,98 @@ def test_rebuild_from_sqlite_in_place_archives_when_opted_in(tmp_path):
     assert rebuilt.count() == 15
 
 
+def _seed_palace_with_logstream_event(palace):
+    from mempalace.logstream import Logstream
+
+    rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(3)]
+    _seed_palace(palace, "mempalace_drawers", rows)
+    with Logstream(db_path=str(palace / "logstream.sqlite3")) as ls:
+        return ls.append_event(
+            type="task.request",
+            stream="project/garden",
+            room="delegation",
+            from_agent="alice",
+            body="Water the tomatoes before nine.",
+        )
+
+
+def test_rebuild_from_sqlite_in_place_keeps_logstream_events(tmp_path):
+    """An in-place rebuild re-embeds drawers; it must not leave the
+    coordination log behind in the archive (#2746)."""
+    from mempalace.logstream import Logstream
+
+    palace = tmp_path / "palace"
+    event = _seed_palace_with_logstream_event(palace)
+
+    counts = repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+    assert counts["mempalace_drawers"] == 3
+
+    with Logstream(db_path=str(palace / "logstream.sqlite3")) as ls:
+        events = ls.list_events()
+    assert [e["id"] for e in events] == [event["id"]]
+    assert events[0]["body"] == "Water the tomatoes before nine."
+
+
+def test_rebuild_from_sqlite_in_place_keeps_replica_id(tmp_path):
+    """The replica id names this machine's copy of the palace and must not
+    be re-minted by a rebuild (#2746)."""
+    from mempalace.replica import get_replica_id
+
+    palace = tmp_path / "palace"
+    _seed_palace_with_logstream_event(palace)
+    replica_before = get_replica_id(str(palace))
+
+    repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    assert get_replica_id(str(palace)) == replica_before
+
+
+def test_preserve_logstream_and_replica_folds_open_wal_and_copies_replica(tmp_path):
+    """An open writer's WAL is folded into one consistent logstream.sqlite3
+    via the SQLite backup API without copying torn -wal/-shm sidecars."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    dest.mkdir()
+
+    ls = sqlite3.connect(str(src / "logstream.sqlite3"))
+    ls.execute("PRAGMA journal_mode=WAL")
+    ls.execute("PRAGMA wal_autocheckpoint=0")
+    ls.execute("CREATE TABLE t (v TEXT)")
+    ls.execute("INSERT INTO t VALUES ('only in the wal')")
+    ls.commit()
+    (src / "replica.json").write_text('{"replica_id": "rep-1"}', encoding="utf-8")
+    try:
+        copied = repair._preserve_logstream_and_replica(str(src), str(dest))
+    finally:
+        ls.close()
+
+    assert copied == ["logstream.sqlite3", "replica.json"]
+    assert not (dest / "logstream.sqlite3-wal").exists()
+    assert not (dest / "logstream.sqlite3-shm").exists()
+    with closing(sqlite3.connect(str(dest / "logstream.sqlite3"))) as conn:
+        assert conn.execute("SELECT v FROM t").fetchone() == ("only in the wal",)
+    assert (dest / "replica.json").read_text(encoding="utf-8") == '{"replica_id": "rep-1"}'
+
+
+def test_preserve_logstream_and_replica_unreadable_fallback_and_symlink_skip(tmp_path):
+    """Unreadable logstream bytes fall back to raw copy; symlinks are skipped."""
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text("secret", encoding="utf-8")
+
+    (src / "logstream.sqlite3").write_text("ls-raw-bytes", encoding="utf-8")
+    (src / "replica.json").symlink_to(outside)
+
+    copied = repair._preserve_logstream_and_replica(str(src), str(dest))
+
+    assert copied == ["logstream.sqlite3"]
+    assert (dest / "logstream.sqlite3").read_text(encoding="utf-8") == "ls-raw-bytes"
+    assert not (dest / "replica.json").exists()
+
+
 def test_rebuild_from_sqlite_in_place_refuses_without_archive_flag(tmp_path):
     """Source == dest without archive flag must abort untouched. The
     most catastrophic possible regression of this code path is silently
@@ -2927,7 +3179,7 @@ def test_preview_legacy_repair_leaves_the_palace_byte_identical(tmp_path, capsys
     assert [p for p in tmp_path.iterdir() if p.name.endswith(".backup")] == []
     out = capsys.readouterr().out
     assert "holds 6 rows" in out
-    assert "#1208 truncation guard" in out
+    assert "(the truncation guard)" in out
 
 
 def test_cmd_repair_dry_run_leaves_a_real_palace_byte_identical(tmp_path, capsys):
@@ -3058,7 +3310,7 @@ def test_preview_legacy_repair_reports_the_truncation_guard_as_disabled(tmp_path
 
     out = capsys.readouterr().out
     assert counts == {"mempalace_drawers": 3}
-    assert "#1208 truncation guard is DISABLED" in out
+    assert "the truncation guard is DISABLED" in out
     assert "the difference would be destroyed" in out
     assert "abort without changes" not in out
 
@@ -3787,14 +4039,14 @@ def test_declined_heal_message_renders_as_one_log_record(tmp_path, caplog):
     ``_validate_palace_fts5_after_mine`` passes ``logger.warning`` as
     ``progress`` so the MCP process does not print into its JSON-RPC stream. A
     message that opens with a newline renders there as a bare
-    ``WARNING:mempalace_mcp:`` header above an empty line, which reads as a
+    ``WARNING:mempalace.mcp_server:`` header above an empty line, which reads as a
     truncated record rather than an explanation.
     """
     palace = _make_fts5_palace(tmp_path, corrupt=False)
     page_errors = ["Page 4 of B-tree 12345: database disk image is malformed"]
 
-    logger = logging.getLogger("mempalace_mcp")
-    with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
+    logger = logging.getLogger("mempalace.mcp_server")
+    with caplog.at_level(logging.WARNING, logger="mempalace"):
         repair.maybe_autoheal_fts5_index(palace, page_errors, progress=logger.warning)
 
     assert caplog.records, "the decline must be logged, not swallowed"
@@ -4209,20 +4461,34 @@ def test_rebuild_from_sqlite_preserves_knowledge_graph_sidecar(tmp_path):
     src.mkdir()
     dest.mkdir()
 
+    kg = sqlite3.connect(str(src / "knowledge_graph.sqlite3"))
+    kg.execute("PRAGMA journal_mode=WAL")
+    kg.execute("PRAGMA wal_autocheckpoint=0")
+    kg.execute("CREATE TABLE t (v TEXT)")
+    kg.execute("INSERT INTO t VALUES ('only in the wal')")
+    kg.commit()
+    try:
+        copied = repair._preserve_knowledge_graph_sqlite(str(src), str(dest))
+    finally:
+        kg.close()
+
+    # One consistent file: the open writer's WAL is folded in, not copied.
+    assert copied == ["knowledge_graph.sqlite3"]
+    assert not (dest / "knowledge_graph.sqlite3-wal").exists()
+    with closing(sqlite3.connect(str(dest / "knowledge_graph.sqlite3"))) as conn:
+        assert conn.execute("SELECT v FROM t").fetchone() == ("only in the wal",)
+
+
+def test_preserve_knowledge_graph_copies_an_unreadable_file_as_bytes(tmp_path):
+    src = tmp_path / "source"
+    dest = tmp_path / "dest"
+    src.mkdir()
     (src / "knowledge_graph.sqlite3").write_text("kg-db", encoding="utf-8")
-    (src / "knowledge_graph.sqlite3-wal").write_text("kg-wal", encoding="utf-8")
-    (src / "knowledge_graph.sqlite3-shm").write_text("kg-shm", encoding="utf-8")
 
-    copied = repair._preserve_knowledge_graph_sqlite(str(src), str(dest))
-
-    assert copied == [
-        "knowledge_graph.sqlite3",
-        "knowledge_graph.sqlite3-wal",
-        "knowledge_graph.sqlite3-shm",
+    assert repair._preserve_knowledge_graph_sqlite(str(src), str(dest)) == [
+        "knowledge_graph.sqlite3"
     ]
     assert (dest / "knowledge_graph.sqlite3").read_text(encoding="utf-8") == "kg-db"
-    assert (dest / "knowledge_graph.sqlite3-wal").read_text(encoding="utf-8") == "kg-wal"
-    assert (dest / "knowledge_graph.sqlite3-shm").read_text(encoding="utf-8") == "kg-shm"
 
 
 def _fts5_check_errors(palace_path) -> list:
@@ -4406,6 +4672,10 @@ def test_vacuum_and_rebuild_fts5_strict_check_reads_the_file_cold(tmp_path):
             "INSERT INTO embedding_fulltext_search(rowid, string_value) VALUES(?, ?)", rows
         )
         conn.commit()
+        try:
+            conn.execute("SELECT 1 FROM dbstat LIMIT 1")
+        except sqlite3.OperationalError:
+            pytest.skip("this SQLite build has no dbstat virtual table to locate the leaf")
 
     real_open_writer = repair.open_palace_writer
     damage = []

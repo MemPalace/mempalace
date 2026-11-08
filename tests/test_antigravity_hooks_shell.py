@@ -876,11 +876,11 @@ def test_wing_inference_picks_first_workspace_path(tmp_path: Path) -> None:
     assert result.returncode == 0
     log_body = (state / "antigravity_hook.log").read_text(errors="replace")
     # Hyphens become underscores; lowercase.
-    assert "wing=wing_myproj_with_dashes" in log_body, log_body
+    assert "wing=myproj_with_dashes" in log_body, log_body
 
 
 def test_wing_inference_defaults_to_sessions_when_workspace_empty(tmp_path: Path) -> None:
-    """An empty workspacePaths array yields wing_sessions."""
+    """An empty workspacePaths array yields the sessions wing."""
     state = tmp_path / "state"
     home = tmp_path / "home"
     _ensure_palace(home)
@@ -898,7 +898,7 @@ def test_wing_inference_defaults_to_sessions_when_workspace_empty(tmp_path: Path
     )
     assert result.returncode == 0
     log_body = (state / "antigravity_hook.log").read_text(errors="replace")
-    assert "wing=wing_sessions" in log_body
+    assert "wing=sessions" in log_body
 
 
 # ── Performance budget (soft) ─────────────────────────────────────────

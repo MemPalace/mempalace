@@ -15,13 +15,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
 
-from .config import _default_config_dir
+from .paths import config_dir
+from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
 
-_WAL_FILE = _default_config_dir() / "wal" / "write_log.jsonl"
+_WAL_FILE = config_dir() / "wal" / "write_log.jsonl"
 _WAL_INITIALIZED_DIR = None
 
 # Keys whose values should be redacted in WAL entries to avoid logging sensitive content
@@ -34,16 +34,15 @@ def _ensure_wal() -> None:
     """Create (and re-harden) the WAL directory lazily, on the first write.
 
     This must NOT run at import time: a user who removed ``~/.mempalace`` has
-    engaged the documented kill-switch (``hooks_cli._palace_root_exists()``,
-    #1305), and recreating the directory just by importing this module would
-    silently re-arm the autosave/mining hooks they disabled (#1676). Creating
-    it on the first real write keeps the kill-switch contract intact.
+    engaged the documented kill-switch (``hooks_cli._palace_root_exists()``),
+    and recreating the directory just by importing this module would silently
+    re-arm the autosave/mining hooks they disabled. Creating it on the first
+    real write keeps the kill-switch contract intact.
 
     It is deliberately not gated on ``_palace_root_exists()``: by the time a
     write reaches here the palace is already being recreated by the ChromaDB/KG
     layer regardless, so gating would only drop audit records, not prevent
-    recreation. Runtime kill-switch enforcement for MCP writes is the broader
-    question tracked in #504.
+    recreation.
 
     Hardening is attempted once per directory and the path cached in
     ``_WAL_INITIALIZED_DIR`` regardless of outcome (keyed on the path, so a
@@ -85,9 +84,7 @@ def _wal_log(operation: str, params: dict, result: dict = None):
     the pre-mutation intent (``result: null``) and the post-mutation outcome
     (``result: {...success...}``). Consumers that select by
     ``result is None`` naturally pick up the intent entry; consumers that
-    select by ``result == {"success": True, ...}`` pick up the outcome. This
-    keeps the existing 8 call sites unchanged and adds the observation the
-    issue #538 reporter was missing.
+    select by ``result == {"success": True, ...}`` pick up the outcome.
     """
     # Redact sensitive content from params before logging
     safe_params = {}
@@ -97,7 +94,7 @@ def _wal_log(operation: str, params: dict, result: dict = None):
         else:
             safe_params[k] = v
     entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": utc_now_iso(),
         "operation": operation,
         "params": safe_params,
         "result": result,
@@ -120,8 +117,7 @@ def _wal_result(operation: str, result: dict):
     success or on the failure paths they catch. The resulting WAL line for a
     single logical write is then two entries: the pre-mutation intent from
     :func:`_wal_log` (``result: null``) followed by this outcome (``result``
-    populated). This is the "result is structurally always null" gap closed by
-    issue #538 — the WAL now answers "did this land?" with the tool's actual
+    populated). The WAL answers "did this land?" with the tool's actual
     return value, so a replay script can distinguish completed writes (skip
     them) from pending ones (redo them) using the intent entry as the key.
 
@@ -131,7 +127,7 @@ def _wal_result(operation: str, result: dict):
     error contract.
     """
     entry = {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": utc_now_iso(),
         "operation": operation,
         "result": result,
     }

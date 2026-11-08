@@ -23,17 +23,21 @@ normalizes that away from the caller.
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-logger = logging.getLogger("mempalace_llm")
+from ._env import env_bool
+
+logger = logging.getLogger(__name__)
 
 
 # ── External-service heuristic (issue #24 — privacy warning support) ─────
@@ -79,7 +83,7 @@ def _resolves_private(host: str) -> bool:
     return True
 
 
-def _endpoint_is_local(url: Optional[str]) -> bool:
+def endpoint_is_local(url: Optional[str]) -> bool:
     """Return True if ``url``'s hostname is on the user's machine or
     private network.
 
@@ -88,8 +92,8 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
       - IP literals that are loopback, RFC 1918 (10/8, 172.16/12,
         192.168/16), link-local, IPv6 unique-local (fc00::/7), or CGNAT
         100.64.0.0/10 (Tailscale and similar overlays)
-      - a single-label or ``.local`` hostname whose every resolved address
-        is one of the above
+      - a single-label, ``.local`` or ``host.docker.internal`` hostname
+        whose every resolved address is one of the above
 
     None / empty / unparseable URLs are treated as local (defensive default —
     no endpoint means no external request can happen yet).
@@ -99,12 +103,21 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
     if not url:
         return True
     try:
-        host = (urlparse(url).hostname or "").lower()
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
     except (ValueError, AttributeError):
+        return False
+    # ``http://evil.com\@localhost`` parses to host ``localhost`` here, while
+    # urllib connects to the text before the backslash.
+    if "\\" in parsed.netloc:
         return False
     if not host:
         return True
-    if host in _LOCALHOST_HOSTS:
+    # The trailing dot is dropped only to judge the name's shape. Anything
+    # resolved below resolves ``host`` exactly as urllib will connect to it,
+    # since ``gpu-box.`` and ``gpu-box`` differ under a resolver search domain.
+    name = host.rstrip(".")
+    if name in _LOCALHOST_HOSTS:
         return True
     # An IP literal is judged by its address, never by how the text starts:
     # ``10.example.com`` or ``fd.example.com`` are public names that merely
@@ -120,14 +133,35 @@ def _endpoint_is_local(url: Optional[str]) -> bool:
     # the name shape proves nothing: resolve it and require every address to
     # be private, loopback, link-local or CGNAT. Unresolvable or public means
     # external, and the user can still opt in with the explicit consent flag.
-    if "." not in host or host.endswith(".local"):
+    # ``host.docker.internal`` is Docker's name for the machine running the
+    # container; outside Docker it is an ordinary DNS name, so it resolves too.
+    if "." not in name or name.endswith(".local") or name == "host.docker.internal":
         return _resolves_private(host)
     # Any other domain name is external: DNS can point it anywhere.
     return False
 
 
+def resolve_openai_url(endpoint: str, leaf: str) -> str:
+    """Join an OpenAI-compatible base URL with ``leaf`` (``chat/completions`` or ``embeddings``)."""
+    url = endpoint.rstrip("/")
+    suffix = "/" + leaf.strip("/")
+    if url.endswith(suffix):
+        return url
+    if not url.endswith("/v1"):
+        url = f"{url}/v1"
+    return f"{url}/{leaf.strip('/')}"
+
+
 class LLMError(RuntimeError):
-    """Raised for any provider failure — transport, parse, auth, missing model."""
+    """Raised for any provider failure — transport, parse, auth, missing model.
+
+    ``status`` is the HTTP status when the endpoint answered with an error.
+    The message is masked: an endpoint URL or reply may carry a key.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(redact_secrets(message))
+        self.status = status
 
 
 @dataclass
@@ -162,10 +196,9 @@ class LLMProvider:
         # uses this to gate the consent prompt — stray env-resolved keys
         # require explicit user confirmation.
         self.api_key_source = api_key_source
-        # Set by a caller whose consent gate has passed for an external
-        # endpoint (`rooms propose` / `kg normalize` with
-        # --accept-external-llm). Until then an env-resolved key is withheld
-        # from an external endpoint's model listing; see served_models().
+        # Set by require_external_consent. Until then classify() refuses an
+        # external endpoint and an env-resolved key is withheld from its
+        # model listing; see served_models().
         self.external_use_accepted = False
 
     def classify(
@@ -201,30 +234,183 @@ class LLMProvider:
         if needed; the default works for the three in-tree providers
         (Ollama / OpenAI-compat / Anthropic).
         """
-        return not _endpoint_is_local(self.endpoint)
+        return not endpoint_is_local(self.endpoint)
+
+    def _refuse_unaccepted_external(self) -> None:
+        """Raise before any content leaves for an endpoint nobody accepted."""
+        if self.is_external_service and not self.external_use_accepted:
+            raise LLMError(
+                f"Refusing to send content to the non-local endpoint {self.endpoint}. "
+                "Pass --accept-external-llm or set MEMPALACE_ACCEPT_EXTERNAL_LLM=1."
+            )
 
 
-def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
-    """POST JSON and return the parsed response. Raises LLMError on any failure."""
-    req = Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json", **headers},
-    )
+def external_use_accepted_by_env() -> bool:
+    return env_bool("MEMPALACE_ACCEPT_EXTERNAL_LLM", False)
+
+
+def require_external_consent(
+    provider: LLMProvider,
+    *,
+    accept: bool = False,
+    interactive: bool = False,
+    prompt: Optional[str] = None,
+) -> bool:
+    """Allow an external endpoint only with an explicit yes.
+
+    Local endpoints are allowed. ``accept`` (``--accept-external-llm``) or
+    ``MEMPALACE_ACCEPT_EXTERNAL_LLM`` records consent without a prompt.
+    ``interactive`` asks on stdin. A yes sets ``external_use_accepted``.
+    """
+    if not provider.is_external_service:
+        return True
+    if accept or external_use_accepted_by_env():
+        provider.external_use_accepted = True
+        return True
+    if interactive:
+        text = prompt or "  This endpoint is external. Continue? [y/N] "
+        try:
+            answer = input(text).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer == "y":
+            provider.external_use_accepted = True
+            return True
+    return False
+
+
+def json_request_body(body: dict) -> bytes:
+    """UTF-8 JSON for an LLM API request.
+
+    A stray source byte is held in drawer text as a lone surrogate, which
+    strict APIs reject; it is sent as U+FFFD, the stored text keeps it.
+    """
+    from .config import strip_lone_surrogates
+
+    return strip_lone_surrogates(json.dumps(body, ensure_ascii=False)).encode("utf-8")
+
+
+def post_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
+    """POST JSON to an LLM or embedding endpoint and return the parsed reply.
+
+    Every model request leaves through here. Raises LLMError on any failure;
+    ``status`` carries the HTTP status when the server answered with one.
+    """
     try:
+        req = Request(
+            url,
+            data=json_request_body(body),
+            headers={"Content-Type": "application/json", **headers},
+        )
         with urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())
     except HTTPError as e:
         detail = ""
-        try:
-            detail = e.read().decode("utf-8", errors="replace")[:500]
-        except Exception:
-            pass
-        raise LLMError(f"HTTP {e.code} from {url}: {detail or e.reason}") from e
-    except (URLError, OSError) as e:
+        if e.code not in (401, 403):  # auth errors often echo the key back
+            try:
+                detail = e.read().decode("utf-8", errors="replace")[:ECHO_LIMIT]
+            except Exception:
+                pass
+        raise LLMError(f"HTTP {e.code} from {url}: {detail or e.reason}", status=e.code) from e
+    except (URLError, OSError, http.client.HTTPException) as e:
         raise LLMError(f"Cannot reach {url}: {e}") from e
     except json.JSONDecodeError as e:
         raise LLMError(f"Malformed response from {url}: {e}") from e
+    except ValueError as e:  # an invalid or missing URL scheme
+        raise LLMError(f"Cannot reach {url}: {e}") from e
+
+
+_SECRETS = (
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{6,}"), "sk-***"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+"), "Bearer ***"),
+    # user:password@ in a URL's authority
+    (re.compile(r"(//)[^/@\s]*@"), r"\1***@"),
+    (
+        re.compile(
+            r"(?i)([?&](?:(?:api[_-]?)?key|(?:access[_-]?)?token|secret|password|auth)=)[^&\s]+"
+        ),
+        r"\1***",
+    ),
+    (re.compile(r"(?i)(api[_-]?key[\"'\s]*[:=]\s*[\"']?)[A-Za-z0-9._\-]{8,}"), r"\1***"),
+)
+
+# How much of an endpoint's own reply an error message repeats.
+ECHO_LIMIT = 500
+
+
+def redact_secrets(text: str) -> str:
+    """Mask API keys an endpoint, URL or echoed reply may carry into a message."""
+    for pattern, replacement in _SECRETS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+_FENCED = re.compile(r"```[a-zA-Z]*\s*([\s\S]*?)\s*```")
+
+
+def _json_candidates(text: str):
+    """The whole reply, then fenced blocks, then each top-level ``{...}``/``[...]``.
+
+    A span inside an earlier span is never offered: when an outer object
+    fails to parse, an object quoted inside it must not stand in for it. A
+    span left open (a reply cut at the token limit) ends the scan.
+    """
+    text = text.strip()
+    if not text:
+        return
+    yield text
+    for match in _FENCED.finditer(text):
+        yield match.group(1).strip()
+    covered = 0
+    for start, opener in ((i, ch) for i, ch in enumerate(text) if ch in "{["):
+        if start < covered:
+            continue
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_string = escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    covered = i + 1
+                    yield text[start:covered]
+                    break
+        else:
+            return
+
+
+def parse_json_reply(text: str, expect=(dict, list)):
+    """The JSON value an LLM reply carries, preferring types in ``expect`` order.
+
+    Models wrap JSON in code fences or prose; candidates are the reply as-is,
+    then fenced blocks, then each top-level object or array. The first
+    candidate of the first type in ``expect`` wins, so a stray ``[1]`` in prose
+    never beats the object after it. Raises ValueError when there is none.
+    """
+    kinds = expect if isinstance(expect, tuple) else (expect,)
+    values = []
+    for candidate in _json_candidates(text or ""):
+        try:
+            values.append(json.loads(candidate))
+        except json.JSONDecodeError:
+            continue
+    for kind in kinds:
+        for value in values:
+            if isinstance(value, kind):
+                return value
+    raise ValueError("LLM response held no JSON object")
 
 
 # ==================== OLLAMA ====================
@@ -254,7 +440,7 @@ class OllamaProvider(LLMProvider):
             with urlopen(f"{self.endpoint}/api/tags", timeout=5) as resp:
                 data = json.loads(resp.read())
         except (URLError, HTTPError, OSError, json.JSONDecodeError) as e:
-            return False, f"Cannot reach Ollama at {self.endpoint}: {e}"
+            return False, redact_secrets(f"Cannot reach Ollama at {self.endpoint}: {e}")
         names = {m.get("name", "") for m in data.get("models", []) or []}
         # Ollama tags may or may not include ':latest' — accept either form
         wanted = {self.model, f"{self.model}:latest"}
@@ -272,6 +458,7 @@ class OllamaProvider(LLMProvider):
         json_mode: bool = True,
         think: Optional[bool] = None,
     ) -> LLMResponse:
+        self._refuse_unaccepted_external()
         options: dict = {"temperature": 0.1}
         if self.num_ctx is not None:
             options["num_ctx"] = self.num_ctx
@@ -292,7 +479,7 @@ class OllamaProvider(LLMProvider):
             # only when the caller explicitly opts in/out so the wire format
             # stays minimal for the common case.
             body["think"] = think
-        data = _http_post_json(f"{self.endpoint}/api/chat", body, headers={}, timeout=self.timeout)
+        data = post_json(f"{self.endpoint}/api/chat", body, headers={}, timeout=self.timeout)
         text = (data.get("message") or {}).get("content", "")
         if not text:
             raise LLMError(f"Empty response from Ollama (model={self.model})")
@@ -337,21 +524,17 @@ class OpenAICompatProvider(LLMProvider):
     def _resolve_url(self) -> str:
         if not self.endpoint:
             raise LLMError("openai-compat provider requires --llm-endpoint")
-        url = self.endpoint.rstrip("/")
-        if url.endswith("/chat/completions"):
-            return url
-        if not url.endswith("/v1"):
-            url = f"{url}/v1"
-        return f"{url}/chat/completions"
+        return resolve_openai_url(self.endpoint, "chat/completions")
 
     def _models_url(self) -> str:
-        base = self.endpoint.rstrip("/")
-        base = base.removesuffix("/chat/completions").removesuffix("/v1")
-        return f"{base}/v1/models"
+        return resolve_openai_url(
+            self.endpoint.rstrip("/").removesuffix("/chat/completions"), "models"
+        )
 
     def served_models(self) -> list[str]:
         """Model ids the endpoint lists; ``[]`` when it cannot be read."""
         req = Request(self._models_url())
+        # An environment key reaches an external endpoint only after consent.
         if self.api_key and (
             self.api_key_source != "env"
             or not self.is_external_service
@@ -375,10 +558,10 @@ class OpenAICompatProvider(LLMProvider):
         try:
             models = self.served_models()
         except (URLError, HTTPError, OSError, ValueError) as e:
-            return False, f"Cannot reach {self.endpoint}: {e}"
+            return False, redact_secrets(f"Cannot reach {self.endpoint}: {e}")
         if self.model == "auto":
             if not models:
-                return False, f"{self.endpoint} lists no models to pick from"
+                return False, redact_secrets(f"{self.endpoint} lists no models to pick from")
             self.model = models[0]
         elif models and self.model not in models:
             # A gateway may list only part of what it routes, or spell a model
@@ -388,7 +571,7 @@ class OpenAICompatProvider(LLMProvider):
                 "model %r is not in the list served at %s (%s); continuing. "
                 "Use --llm-model auto to follow the server.",
                 self.model,
-                self.endpoint,
+                redact_secrets(self.endpoint),
                 ", ".join(models[:8]),
             )
         return True, "ok"
@@ -422,17 +605,18 @@ class OpenAICompatProvider(LLMProvider):
             body["response_format"] = {"type": "json_object"}
         if think is False:
             body["reasoning_effort"] = "none"
+        self._refuse_unaccepted_external()
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         url = self._resolve_url()
         try:
-            data = _http_post_json(url, body, headers=headers, timeout=self.timeout)
+            data = post_json(url, body, headers=headers, timeout=self.timeout)
         except LLMError as e:
             if "reasoning_effort" not in body or "HTTP 400" not in str(e):
                 raise
             body.pop("reasoning_effort")
-            data = _http_post_json(url, body, headers=headers, timeout=self.timeout)
+            data = post_json(url, body, headers=headers, timeout=self.timeout)
         try:
             choice = data["choices"][0]
             text = choice["message"]["content"]
@@ -497,6 +681,7 @@ class AnthropicProvider(LLMProvider):
     ) -> LLMResponse:
         if not self.api_key:
             raise LLMError("Anthropic provider requires ANTHROPIC_API_KEY env or --llm-api-key")
+        self._refuse_unaccepted_external()
         sys_prompt = system
         if json_mode:
             sys_prompt += "\n\nRespond with valid JSON only, no prose."
@@ -511,7 +696,7 @@ class AnthropicProvider(LLMProvider):
             "X-API-Key": self.api_key,
             "anthropic-version": self.API_VERSION,
         }
-        data = _http_post_json(
+        data = post_json(
             f"{self.endpoint}/v1/messages", body, headers=headers, timeout=self.timeout
         )
         try:

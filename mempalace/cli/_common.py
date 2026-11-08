@@ -64,12 +64,9 @@ def _gather_origin_samples(project_dir) -> list:
     signal that lives past the first N chars of a file must still trip
     detection, so we read the whole file up to the cap.
 
-    Skips mempalace's own per-project artifacts (``entities.json``,
-    ``mempalace.yaml``) so a re-run of ``mempalace init`` produces the
-    same classification result it did on the first run. Without this
-    filter, the first run writes entities.json into the corpus, the
-    second run picks it up as a sample, and the Tier-1 density math
-    drifts (different total_chars). That makes init non-idempotent.
+    ``scan_for_detection`` leaves out mempalace's own per-project files, so
+    a re-run of ``mempalace init`` samples what the first run did and the
+    Tier-1 density math stays the same.
 
     Returns a list of strings (one per readable file). Empty list when
     the project has no readable text.
@@ -80,8 +77,6 @@ def _gather_origin_samples(project_dir) -> list:
     samples: list = []
     total_chars = 0
     for filepath in files:
-        if filepath.name in _MEMPALACE_PROJECT_FILES:
-            continue
         if total_chars >= _PASS_ZERO_TOTAL_CAP:
             break
         try:
@@ -126,8 +121,9 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
     stderr; init never blocks on them.
     """
     import json
-    from datetime import datetime, timezone
     from pathlib import Path
+
+    from ..timeutil import utc_now_iso
 
     samples = _gather_origin_samples(project_dir)
     if not samples:
@@ -145,8 +141,8 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
     # MERGE-FIELDS, NOT REPLACE: Tier 2's persona/user/platform extraction
     # is the whole reason to run it, but a weak local model (e.g. Ollama
     # gemma4:e4b) can return a wrong likely_ai_dialogue/confidence call
-    # that overrides a confident heuristic answer. Per @igorls's review of
-    # PR #1211: keep the heuristic's likely_ai_dialogue + confidence
+    # that overrides a confident heuristic answer. So keep the heuristic's
+    # likely_ai_dialogue + confidence
     # (don't let a weak LLM flip a confident regex answer), and merge in
     # LLM's persona-related fields + combined evidence.
     if llm_provider is not None:
@@ -181,11 +177,11 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
 
     wrapped = {
         "schema_version": 1,
-        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "detected_at": utc_now_iso(),
         "result": result.to_dict(),
     }
 
-    origin_path = Path(palace_dir).expanduser() / ".mempalace" / "origin.json"
+    origin_path = Path(palace_dir).expanduser() / paths.DIRNAME / "origin.json"
     try:
         origin_path.parent.mkdir(parents=True, exist_ok=True)
         with open(origin_path, "w", encoding="utf-8") as f:
@@ -213,7 +209,7 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     """If project_dir is a git repo, ensure MemPalace's per-project files
     are listed in .gitignore so they don't get committed by accident.
 
-    Returns True if .gitignore was updated, False otherwise. Issue #185:
+    Returns True if .gitignore was updated, False otherwise.
     `mempalace init` writes mempalace.yaml + entities.json into the
     project root, where they previously had no protection against being
     staged into git.
@@ -235,8 +231,14 @@ def _ensure_mempalace_files_gitignored(project_dir) -> bool:
     existing = (
         gitignore.read_text(encoding="utf-8", errors="replace") if gitignore.is_file() else ""
     )
+    from ..project_config import ENTITIES_FILENAME, PROJECT_CONFIG_FILENAMES, find_project_config
+
+    # The config the project actually uses: a kept ``mempalace.yml`` or a
+    # legacy ``mempal.yaml`` needs the protection as much as the default name.
+    config_path = find_project_config(project_path)
+    config_name = config_path.name if config_path else PROJECT_CONFIG_FILENAMES[0]
     existing_lines = {line.strip() for line in existing.splitlines()}
-    missing = [p for p in _MEMPALACE_PROJECT_FILES if p not in existing_lines]
+    missing = [p for p in (config_name, ENTITIES_FILENAME) if p not in existing_lines]
     if not missing:
         return False
     prefix = "" if not existing or existing.endswith("\n") else "\n"
@@ -257,7 +259,7 @@ def _exit_on_misspelled_embedding_model():
     from ..embedding import UnknownEmbeddingModelError
 
     try:
-        MempalaceConfig().embedding_model
+        _ = MempalaceConfig().embedding_model  # reading it validates the name
     except UnknownEmbeddingModelError as exc:
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)

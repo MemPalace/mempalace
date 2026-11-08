@@ -5,10 +5,10 @@ import os
 
 import pytest
 
+from mempalace import embedding, palace, repair
+from mempalace.backends._sidecar import write_embedder_sidecar
 from mempalace.backends.base import EmbedderIdentity, EmbedderIdentityMismatchError
 from mempalace.backends.chroma import ChromaBackend
-from mempalace.backends._sidecar import write_embedder_sidecar
-from mempalace import embedding, palace, repair
 
 
 class _FakeEmbeddingGemma2:
@@ -68,8 +68,9 @@ def test_rebuild_index_migrates_old_identity_and_preserves_drawers(
 
     embedded_documents = []
 
-    def _fake_embed_texts(texts, *, query=False, metadatas=None):
+    def _fake_embed_texts(texts, *, query=False, metadatas=None, embedder=None):
         assert query is False
+        assert embedder is fake_ef
         embedded_documents.append((list(texts), list(metadatas or [])))
         return [[1.0] + [0.0] * 127 for _ in texts]
 
@@ -373,7 +374,8 @@ def test_sqlite_rebuild_text_uses_metadata_and_records_identity(
 
     from mempalace.backends import embedding_wrapper
 
-    def embed_documents(texts, *, metadatas=None):
+    def embed_documents(texts, *, metadatas=None, embedder=None):
+        assert embedder is fake_provider
         calls.append((list(texts), list(metadatas or [])))
         return [[1.0] + [0.0] * 127 for _ in texts]
 

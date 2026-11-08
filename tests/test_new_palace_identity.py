@@ -11,11 +11,10 @@ import json
 
 import pytest
 import yaml
-
-from mempalace.backends.base import EmbedderIdentity, EmbedderIdentityRecordError
-
 from test_pgvector_backend import fake_pgvector  # noqa: F401  (fixture)
 from test_qdrant_backend import fake_qdrant  # noqa: F401  (fixture)
+
+from mempalace.backends.base import EmbedderIdentity, EmbedderIdentityRecordError
 
 
 @pytest.fixture(autouse=True)
@@ -102,8 +101,9 @@ def test_a_write_open_that_cannot_record_refuses(tmp_path, monkeypatch):
     """A brand-new collection whose identity cannot be recorded refuses the
     write open instead of filing unprotected rows; a read open never records,
     so it is unaffected."""
-    from mempalace import palace as P
     from test_embedder_identity import _qdrant_collection
+
+    from mempalace import palace as P
 
     monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
     col = _qdrant_collection(tmp_path, write_marker=False)
@@ -114,7 +114,7 @@ def test_a_write_open_that_cannot_record_refuses(tmp_path, monkeypatch):
 
     from mempalace.backends import _sidecar
 
-    monkeypatch.setattr(_sidecar, "_write_atomically", _fail)
+    monkeypatch.setattr(_sidecar, "_atomic_write_json", _fail)
     P._enforce_embedder_identity(col, str(tmp_path), "mempalace_drawers", create=False)
     with pytest.raises(EmbedderIdentityRecordError, match="Read-only file system"):
         P._enforce_embedder_identity(col, str(tmp_path), "mempalace_drawers", create=True)
