@@ -57,6 +57,7 @@ TOOLS = {
                 },
                 "search": {
                     "type": "boolean",
+                    "x-mempalace-strict": True,
                     "description": "Rank whole-word matches across facts, using entity as search text (default false).",
                 },
                 "limit": {
@@ -1380,3 +1381,17 @@ SUPPORTED_PROTOCOL_VERSIONS = [
     "2025-03-26",
     "2024-11-05",
 ]
+
+
+for _kg_read_name in (
+    "mempalace_kg_query",
+    "mempalace_kg_timeline",
+    "mempalace_kg_stats",
+    "mempalace_kg_list_wings",
+):
+    TOOLS[_kg_read_name]["input_schema"]["properties"]["thread_scope"] = {
+        "type": "object",
+        "description": "Set by the Commonplace server",
+    }
+
+del _kg_read_name

@@ -25,7 +25,7 @@ def world():
     opener = Mock(return_value=store)
     private = Mock(readable=Mock(return_value=True))
     recall = Recall(opener, private=private)
-    ctx = SimpleNamespace(recall=recall, _stores={principal.workspace_id: store})
+    ctx = SimpleNamespace(recall=recall, store_for=opener, _stores={principal.workspace_id: store})
     return SimpleNamespace(
         principal=principal,
         store=store,
@@ -635,6 +635,12 @@ def test_fact_search_is_gated_before_cli_rendering(world, monkeypatch):
         ]
     }
     workers.call_tool.side_effect = [
+        {
+            "probe": {
+                "facts": [_search_descriptor("hidden", world.thread.id, "private_threads")],
+                "next": None,
+            }
+        },
         facts,
         {"results": [], "cli_output": "No drawers"},
     ]
@@ -748,8 +754,21 @@ def test_fact_links_need_their_own_thread_readability(world, field):
     assert gate(world.gateway, world.principal, "kg_read", {"facts": [fact]})["facts"][0] is fact
 
 
+def _search_descriptor(identifier, thread, wing=None):
+    return {
+        "id": identifier,
+        "wing": wing,
+        "threads": [thread],
+        "sensitivity": "internal",
+        "source_thread": thread,
+        "source_seq_start": None,
+        "source_seq_end": None,
+        "sources": [{"source_thread": thread}],
+    }
+
+
 @pytest.mark.parametrize("limit,fetch", [(5, 20), (40, 100)])
-def test_fact_search_overfetches_before_filtering_and_truncation(world, limit, fetch):
+def test_fact_search_projects_before_truncation(world, limit, fetch):
     from commonplace.gateway import Mediator
 
     principal = replace(
@@ -770,11 +789,27 @@ def test_fact_search_overfetches_before_filtering_and_truncation(world, limit, f
         for i in range(limit + 2)
     ]
     workers = Mock()
-    workers.call_tool.return_value = {"facts": hidden + readable}
+
+    def projected(principal, name, args):
+        assert name == "mempalace_kg_query" and args["search"] is True
+        scope = args["thread_scope"]
+        if scope.get("probe"):
+            descriptors = [
+                _search_descriptor(row["id"], row["source_thread"], row.get("wing"))
+                for row in hidden + readable
+            ]
+            return {
+                "probe": {"facts": sorted(descriptors, key=lambda row: row["id"]), "next": None}
+            }
+        assert {row["id"] for row in scope["allow"]} == {row["id"] for row in readable}
+        return {"facts": readable}
+
+    workers.call_tool.side_effect = projected
     mediator = Mediator(Mock(), workers)
     mediator.gateway = world.gateway
     result = mediator._search_facts(principal, {"query": "sample", "limit": limit})
     assert result["facts"] == readable[:limit]
+    assert workers.call_tool.call_count == 2
     assert workers.call_tool.call_args.args[2]["limit"] == fetch
 
 

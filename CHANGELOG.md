@@ -41,6 +41,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- KG search requires a JSON boolean for `search`; string booleans are refused.
+  Search fact enrichment omits `facts_error` and uses empty facts on failure,
+  preserving the same public shape when no eligible facts exist.
+- KG reads retain explicit worker argument errors, including `-32602` for
+  malformed pagination; null pagination uses protocol defaults. Limited readers'
+  shorthand wing filters resolve to stored names as before, with visible-only
+  counts and pages.
+
 - Imported-history listing and thread reads without reader consent return 404
   instead of 403. Connection imports use `import-private:<user>:<source>:<id>`;
   incomplete three-part identities are refused rather than granted reader access.

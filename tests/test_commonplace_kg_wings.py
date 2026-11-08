@@ -183,7 +183,7 @@ def test_stats_still_need_every_wing(hub):
         ("mempalace_kg_timeline", {}),
     ],
 )
-def test_scoped_reads_list_fact_wings_without_calling_stats(hub, monkeypatch, name, args):
+def test_scoped_reads_probe_facts_without_calling_stats(hub, monkeypatch, name, args):
     from mempalace.knowledge_graph import KnowledgeGraph
 
     _seed(hub)
@@ -192,7 +192,7 @@ def test_scoped_reads_list_fact_wings_without_calling_stats(hub, monkeypatch, na
     original = hub.gateway.mediator.workers.call_tool
 
     def worker_call(principal, name, arguments):
-        calls.append(name)
+        calls.append((name, arguments.get("thread_scope", {})))
         assert name != "mempalace_kg_stats"
         return original(principal, name, arguments)
 
@@ -205,7 +205,9 @@ def test_scoped_reads_list_fact_wings_without_calling_stats(hub, monkeypatch, na
     assert result is not None, text
     facts = result["facts"] if name == "mempalace_kg_query" else result["timeline"]
     assert [f["object"] for f in facts] == ["sqlite"]
-    assert calls.count("mempalace_kg_list_wings") == 1
+    assert calls[0] == ("mempalace_kg_list_wings", {})
+    assert len(calls) == 3 and all(tool == name for tool, _ in calls[1:])
+    assert calls[1][1].get("probe") is True and "allow" in calls[2][1]
 
 
 def test_fact_wing_list_does_not_expose_hidden_names_to_scoped_clients(hub):

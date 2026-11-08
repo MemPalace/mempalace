@@ -918,7 +918,7 @@ playbooks and the original wider orchestration acceptance remain separate work.
   as before this projection; content reads retain their separate range gate.
   Search `total_before_filter` can include hidden candidates inside a visible
   wing before the response gate filters them.
-- Other overview and KG page counts, legacy
+- Other overview, legacy
   provenance and owner search-index progress remain separate residuals.
 
 ### Visible logical drawer pagination
@@ -1000,8 +1000,6 @@ playbooks and the original wider orchestration acceptance remain separate work.
 
 ### Thread-boundary residuals
 
-- Read counts in `kg_query.count`, `kg_timeline.count` and
-  `kg_timeline.total` can include hidden items.
 - Token-free plain-file provenance still has no local association proof on read.
   Typed drawer/closet citations now resolve current local metadata as described
   below; foreign identifiers already stored before this change are not purged.
@@ -1474,3 +1472,23 @@ These measurements are informational, not a merge threshold or a guarantee of
 zero latency overhead. Concurrent producer contention and a full queue can drop
 records; coverage claims require loss counts and complete begin/end pairs for
 the exported interval, not only sequential scratch results.
+
+
+### D1-visible KG pages and aggregates
+
+- Every authenticated KG query mode and timeline authorizes wing, sensitivity and original source sets before counts, entity labels, candidates and pagination. Stats derive participating entities, predicates and wings from visible facts; orphan entities do not contribute.
+- Search mode and drawer-search fact enrichment use the same metadata probe, allow descriptors and final read snapshot. Scoped search copies the authorized snapshot and uses a private in-memory lexical index with the same tokenizer, query-specific name handling, selective-term rule, BM25 seeds, 50-key candidate cap and history expansion as the local scorer. Document frequencies come only from authorized facts; hidden facts cannot affect scores, seeds or pages. Local unscoped reads keep their existing index.
+- Metadata descriptor pages contain at most 500 facts. Authorization uses the workspace reader, including owner and imported source-range rules, within the shared worker request deadline. The final snapshot excludes new or changed descriptors before copying fact text. The palace lock and read transaction are released after the copy, before index construction or scoring. One absolute gateway expiry is carried to workers; copy/scan/scoring loops check it, SQLite progress handlers interrupt long statements, and temporary indexes close on failure. Authority caches last one response: a revocation during a request takes effect on the next request.
+- `kg_query.search` requires a boolean at the authenticated gateway and is strict in the worker protocol; other tools retain their normal unknown-key validation. Declared pagination keys follow protocol integer conversion and minimum/maximum validation; undeclared keys return the worker-compatible `-32602` unknown-parameter error before projection. Malformed declared arguments and missing required entity retain worker-compatible protocol errors; data-independent entity/date/direction refusals retain their handler error results. An offset outside SQLite integer range retains the generic worker error. Malformed pagination returns the worker-compatible `-32602` validation error; null selects the protocol default. Non-owner wing filters first check the raw spelling against policy, then resolve matching canonical names to stored wing spellings; owners and wildcard readers retain literal filtering; string wing names from sees-all readers bypass the raw policy refusal; the worker validates names, while per-fact wing policy and the final allow-list still enforce visibility. Schema/required-argument validation and the handler retain their existing error shapes and order. Limited readers still get the policy refusal. The final authorized allow-list still bounds all results. An in-process scoped search without its detached search snapshot refuses global-index fallback. Incomplete search proof on public reads returns exactly `{"facts": []}`; other reads preserve their empty operation envelope without partial totals or raw errors.
+- Fact text, temporal buckets and any-readable-source mixed facts remain intact; citation scrubbing follows eligibility. Reads do not create a missing graph or write an intent log. These projections preserve local unscoped reads, O4 stored rows, O8 external-id limitations and remaining provenance exceptions. D9.1 = A and D9.2 = A remain LOCKED, including accepted quota deferral caused by actually blocked readable work.
+
+
+### Scoped KG search cost
+
+- Authorized snapshot copy and temporary lexical indexing use O(facts + entities + sources + text bytes) space and work linear in the copied corpus, plus the existing candidate SQL and ranking costs. There is no hard corpus row cap. The 50-key seed cap controls candidate semantics, not corpus size; a deadline returns empty rather than partial facts.
+- Synthetic worker-side measurements (median of three, queries `Acme`, `uses`, `uses Acme`): 1,968 facts took 82.5 ms for metadata enumeration, 518.6–681.3 ms for scoped snapshot/index/search, and 3.8–31.5 ms for local indexed search. At 9,808 facts these were 478.8 ms, 2,563.7–2,924.4 ms and 4.1–181.3 ms respectively. The scoped total includes descriptor revalidation and copying; no palace lock is retained during index construction or scoring.
+- These measurements exclude gateway per-row authorization and network round trips, use synthetic data, and depend on runtime load. They describe cost rather than a latency guarantee or merge threshold. Performance does not justify truncating authorized enumeration. Cooperative worker expiry bounds work, and lock/deadline regressions verify cancellation and cleanup.
+
+### Search enrichment compatibility note
+
+The public search response deliberately omits `facts_error`, including on failed fact enrichment. A failure-only marker could distinguish hidden-present and hidden-absent worlds and break response equality. Failed enrichment therefore preserves drawers and returns the same empty facts shape as no eligible facts. The Unreleased changelog records this public-shape change, strict KG search booleans and restored argument/wing-filter compatibility; clients should no longer use `facts_error` as an availability signal.

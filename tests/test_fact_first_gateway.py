@@ -42,7 +42,7 @@ def plant(hub):
 
 
 @pytest.mark.parametrize("wing", [None, "shared"])
-def test_search_matches_scoped_kg_visibility_and_makes_one_fact_lookup(hub, monkeypatch, wing):
+def test_search_matches_scoped_kg_visibility_with_probe_and_final_read(hub, monkeypatch, wing):
     plant(hub)
     token = hub.token(
         "reader",
@@ -71,10 +71,14 @@ def test_search_matches_scoped_kg_visibility_and_makes_one_fact_lookup(hub, monk
     assert result["facts"] and result["results"]
     assert not any(value in raw for value in ("private-value", "hidden-value"))
     assert (
-        sum(name == "mempalace_kg_query" and args.get("search", False) for name, args in calls) == 1
+        sum(name == "mempalace_kg_query" and args.get("search", False) for name, args in calls) == 2
     )
-    # Wing enumeration belongs to the shared KG policy path, owned by #40.
-    assert sum(name in ("mempalace_kg_stats", "mempalace_kg_list_wings") for name, _ in calls) == 1
+    # Limited readers resolve stored wing spellings before the scoped search.
+    assert sum(name == "mempalace_kg_stats" for name, _ in calls) == 0
+    assert [args for name, args in calls if name == "mempalace_kg_list_wings"] == [{}]
+    kg_calls = [args for name, args in calls if name == "mempalace_kg_query"]
+    assert kg_calls[0]["thread_scope"]["probe"] is True
+    assert "allow" in kg_calls[1]["thread_scope"]
 
 
 @pytest.mark.parametrize(
@@ -119,7 +123,7 @@ def test_failed_fact_scope_check_does_not_gate_drawers_or_widen_scope(hub, monke
     def broken(principal, name, arguments):
         return (
             {"error": "fact index unavailable"}
-            if name in ("mempalace_kg_stats", "mempalace_kg_list_wings")
+            if name == "mempalace_kg_query" and arguments.get("thread_scope", {}).get("probe")
             else original(principal, name, arguments)
         )
 
@@ -130,7 +134,7 @@ def test_failed_fact_scope_check_does_not_gate_drawers_or_widen_scope(hub, monke
 
 
 @pytest.mark.parametrize("wing", [None, "shared"])
-def test_unexpected_fact_worker_error_keeps_drawers_and_generic_marker(hub, monkeypatch, wing):
+def test_unexpected_fact_worker_error_keeps_drawers_and_empty_facts(hub, monkeypatch, wing):
     plant(hub)
     token = hub.token(
         "reader", profile="full", scopes=["memory:read", "kg:read"], read_wings=["shared"]
@@ -147,7 +151,7 @@ def test_unexpected_fact_worker_error_keeps_drawers_and_generic_marker(hub, monk
     monkeypatch.setattr(hub.gateway.mediator.workers, "call_tool", broken)
     combined, raw = hub.call(token, "mempalace_search", **args)
     assert combined["results"] == plain["results"]
-    assert combined["facts"] == [] and combined["facts_error"] == "unavailable"
+    assert combined["facts"] == [] and "facts_error" not in combined
     assert "private detail" not in raw
 
 
@@ -249,7 +253,8 @@ def test_fact_query_sanitizer_warns_once_through_gateway(hub, monkeypatch, caplo
     if tool == "mempalace_kg_query":
         assert len(warnings()) == 1
     else:
-        assert fact_warnings == [1]
+        # The metadata-only probe does not sanitize or rank fact content.
+        assert fact_warnings == [0, 1]
 
 
 @pytest.mark.parametrize("owner", [False, True])

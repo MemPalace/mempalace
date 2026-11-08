@@ -83,7 +83,14 @@ def search_facts(
     decay; approved facts never decay, including approved history. Tool callers
     can pass their already sanitized query without running the sanitizer again.
     """
+    from ..knowledge_graph import _read_ids
     from . import _resolve_stop_words
+
+    def check_deadline():
+        if _read_ids.get() is not None:
+            from commonplace.rules import checks
+
+            checks.remaining(0)
 
     if not query_is_sanitized:
         query = sanitize_query(query)["clean_query"]
@@ -115,8 +122,10 @@ def search_facts(
     }
     total_weight = sum(idf.values())
     for row in rows:
+        check_deadline()
         text = " ".join((row["subject_name"], row["predicate"], row["object_name"]))
         lexical = sum(idf[word] for word in words & _words(text, stop_words)) / total_weight
+        check_deadline()
         if lexical == 0:  # FTS token boundaries can be broader than our tokenizer.
             continue
         start, end = _instant(row["valid_from"]), _instant(row["valid_to"], end=True)
@@ -188,15 +197,18 @@ def search_facts(
     # without promoting unrelated, weak current matches above relevant history.
     groups = defaultdict(list)
     for fact in facts:
+        check_deadline()
         groups[(fact["subject"], fact["predicate"])].append(fact)
     queues = list(groups.values())
     heap = []
     for index, group in enumerate(queues):
+        check_deadline()
         group.sort(key=lambda f: (not f["current"], -f["score"], f["id"]))
         heap.append((-group[0]["score"], group[0]["id"], index, 0))
     heapq.heapify(heap)
     ranked = []
     while heap and (limit is None or len(ranked) < max(1, limit)):
+        check_deadline()
         _, _, group_index, offset = heapq.heappop(heap)
         group = queues[group_index]
         ranked.append(group[offset])

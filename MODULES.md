@@ -59,6 +59,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Graph inputs are authorized before traversal, ranking and statistics; explicit totals reuse endpoint and label proof.
 
+  - KG read guarantees include both query modes, protocol compatibility, deadline cleanup, measured cost and the response-local authority window.
+
   - Documents citation omission and backend proof limits separately from fact eligibility.
 
   - Records current typed citation proof and raw path authorization before display conversion.
@@ -138,7 +140,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
-  - Keeps unavailable citation links absent without changing visible facts.
+
+  - Keeps unavailable citation links absent without changing visible facts; documents scoped-search snapshot refusal, validation compatibility and the deliberate omission of failure-only fact markers, with Unreleased notes and sees-all string-wing validation ordering and per-fact visibility.
 
   - Unproved citations disappear without removing readable fact text; plain-file proof remains a separate decision.
 
@@ -181,6 +184,7 @@ Format (read by `commonplace orch docs-check`):
   - Legacy graph, default-backend and caller-error regressions accompany the documented contract.
 
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
+
 
   - Memory-map and capped-backend regressions verify the documented failure policy.
 
@@ -232,6 +236,9 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - The Admin API guide documents legacy-column defaults and enabled, unrevoked grant eligibility.
+  - Unreleased notes record KG argument compatibility, wing aliases and intentional search response changes.
+  - One Unreleased Changed section records KG argument compatibility, wing aliases and intentional search response changes.
+  - One consistently spaced Unreleased Changed section records KG argument compatibility, wing aliases and intentional search response changes.
 
   - Admin docs pin current-member connection listing, matching inventory counts, exact-route card navigation and cursor-preserving Retry.
 
@@ -431,6 +438,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Hallway probes return bounded metadata pages in storage order; final reads revalidate exact descriptors.
 
+  - KG search reuses the local tokenizer, selective terms and 50-seed candidate rules on a detached authorized index; deadline checks stop copy, indexing and scoring work. Scoped search requires its detached snapshot.
+
   - Scoped wing and taxonomy counts use bounded metadata-only identity pages, normalize absent/null/question-mark loci to unknown, exclude bookkeeping, and revalidate concrete descriptors in fresh snapshots. Local unscoped readers retain their conventions.
   - Exact non-Chroma physical citation ids remain supported without document hydration.
 
@@ -460,6 +469,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
+
   - Incomplete acquisition or invalid descriptors discard all projected output. New or changed metadata cannot inherit an earlier allow descriptor.
   - Non-Chroma logical citations fail closed because the collection API cannot guarantee ordered snapshot enumeration.
 
@@ -485,6 +495,7 @@ Format (read by `commonplace orch docs-check`):
   - Default Chroma and exact-backend witnesses cover placeholders, registry rows, numeric halls and collection fallback.
 
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
+
 
   - Presence and private read-scope tests exercise SQLite, compact, Chroma, facet and generic metadata paths, unknown values, batching and races.
   - Capped-backend tests place a hidden chunk beyond the first short metadata page.
@@ -532,6 +543,7 @@ Format (read by `commonplace orch docs-check`):
   - Graph regressions compare scoped responses with local readable outputs on exact and default Chroma backends.
 
   - Graph inputs are authorized before traversal, ranking and statistics; explicit totals reuse endpoint and label proof.
+
 
   - Citation failure cases compare complete surviving facts with readable controls.
 
@@ -680,6 +692,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
+
   - Deadline tests assert no worker calls; closet probes assert invocation and a readable positive result.
 
   - Only named public AssertionErrors count as base regressions; readable citations and plain-file display remain controls.
@@ -728,6 +741,8 @@ Format (read by `commonplace orch docs-check`):
   - Question-mark placements, registry rows, null labels, unknown names, argument coercion and Chroma fallback ties have dedicated witnesses.
 
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
+
+  - `tests/test_card253_s07.py` covers local/scoped parity, stop-word names, candidate caps, refusal scope, cooperative deadline cleanup and lock release alongside KG visibility and source-snapshot guards; hidden-present parity guards and missing-snapshot/unknown-key regressions cover defensive reads; literal/shorthand readers and malformed-argument protocol/handler regressions and owner/wildcard blank and canonical-empty wing cases cover compatibility, legacy hidden facts and error-shape equality.
 
   - Regression selections cover owner maps and capped non-Chroma logical citation proof.
 
@@ -810,6 +825,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Graph inputs are authorized before traversal, ranking and statistics; explicit totals reuse endpoint and label proof.
 
+  - Only KG query enforces strict search booleans; other tools retain normal unknown-key handling. KG reads preserve protocol errors for unknown keys and malformed pages; non-owner shorthand filters resolve to stored names after raw policy checks. Sees-all string wing names retain worker validation and literal filtering; per-fact policy and final allow-lists still enforce visibility. Fact enrichment and KG search share projection, worker expiry and fixed empty failures.
+
   - Private association requests carry the authenticated workspace and are unavailable as public operations.
   - Authenticated explicit tunnel reads use request-local endpoint and drawer proof for owners and connections without altering mutation authorization.
 
@@ -850,6 +867,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
+
   - Worker failures remove only the affected citation, with no other-workspace fallback.
 
   - Incomplete drawer membership proof returns an empty pagination envelope; changed metadata cannot authorize a sibling chunk.
@@ -872,6 +890,7 @@ Format (read by `commonplace orch docs-check`):
   - Unknown/missing graph arguments and traversal types exercise full gateway RPC responses.
 
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
+
 
   - Public typed citation tests cover trusted members, owner sessions and workspace isolation.
 
@@ -1220,6 +1239,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Graph inputs are authorized before traversal, ranking and statistics; explicit totals reuse endpoint and label proof.
 
+  - Bounded KG authorization carries one expiry to workers; changed descriptors are excluded, and the palace lock is released after copying the authorized search snapshot. Authority caches last one response. Declared KG arguments retain schema/required-parameter errors and data-independent handler refusals; acquisition failures remain empty.
+
   - Outgoing typed citations require current wing and thread authority plus snapshot revalidation; raw source_file tokens are authorized before basename display.
   - Tunnel projection validates names before acquisition, pages by identity and preserves live readable associations across non-association updates.
 
@@ -1281,6 +1302,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Incomplete graph metadata or tunnel proof returns the operation’s empty public envelope without global counts.
 
+
   - Association faults or revoked authority omit citations after original-source fact eligibility; words remain verbatim.
 
   - Incomplete drawer membership proof returns an empty pagination envelope; changed metadata cannot authorize a sibling chunk.
@@ -1312,6 +1334,7 @@ Format (read by `commonplace orch docs-check`):
   - Literal placeholders, registry rows, null tunnel labels and malformed schema guards cover projection compatibility.
 
   - Readable graph controls, hidden bridges/top-N candidates, both statistics paths and bounded projection fault guards exercise the read boundary.
+
 
   - Typed citation tests cover moved targets, legacy chunk handles, raw directories and revoked authority.
 

@@ -298,9 +298,9 @@ def _hallway_text_visible(value, access):
         return False
 
 
-def gate(gateway, principal, rule, result):
+def gate(gateway, principal, rule, result, *, access=None):
     """Scrub mirror words, caching access decisions only within this response."""
-    access = reader(gateway, principal)
+    access = access or reader(gateway, principal)
     can_read = access
     import_allowed = access.import_allowed
     reader_recall = access.recall

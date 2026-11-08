@@ -670,3 +670,58 @@ def tool_kg_stats():
 def tool_kg_list_wings():
     """List fact wings without counting entities, facts or predicates."""
     return {"wings": _call_kg(lambda kg: kg.list_wings(), read=True)}
+
+
+def _scoped_kg_read(handler):
+    from functools import wraps
+
+    @wraps(handler)
+    def scoped(*args, thread_scope=None, **kwargs):
+        if thread_scope is None:
+            return handler(*args, **kwargs)
+        import time
+
+        from commonplace.gateway import WORKER_TIMEOUT_S
+        from commonplace.rules import checks
+
+        search = (
+            handler.__name__ == "tool_kg_query"
+            and signature.bind_partial(*args, **kwargs).arguments.get("search") is True
+        )
+        expiry = thread_scope.get("deadline")
+        timeout = WORKER_TIMEOUT_S if expiry is None else max(0, expiry - time.time())
+        try:
+            with checks.deadline(timeout):
+                if thread_scope.get("probe") is True:
+                    return {
+                        "probe": _call_kg(
+                            lambda kg: kg.read_candidates(thread_scope.get("after")), read=True
+                        )
+                    }
+                return _call_kg(
+                    lambda kg: kg.read_projection(
+                        thread_scope["allow"], lambda: handler(*args, **kwargs), search=search
+                    ),
+                    read=True,
+                )
+        except TimeoutError:
+            if search:
+                return {"facts": []}
+            raise
+
+    import inspect
+
+    signature = inspect.signature(handler)
+    scoped.__signature__ = signature.replace(
+        parameters=[
+            *signature.parameters.values(),
+            inspect.Parameter("thread_scope", inspect.Parameter.KEYWORD_ONLY, default=None),
+        ]
+    )
+    return scoped
+
+
+tool_kg_query = _scoped_kg_read(tool_kg_query)
+tool_kg_timeline = _scoped_kg_read(tool_kg_timeline)
+tool_kg_stats = _scoped_kg_read(tool_kg_stats)
+tool_kg_list_wings = _scoped_kg_read(tool_kg_list_wings)
