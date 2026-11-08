@@ -717,6 +717,7 @@ def test_ollama_provider_defaultendpoint_is_local():
     )
 
 
+@pytest.mark.resolves_dns
 def test_single_label_hostname_is_local_only_when_it_resolves_privately(monkeypatch):
     import socket
 
@@ -920,6 +921,7 @@ def test_private_ip_literals_stay_local_and_neighbours_do_not():
         assert not endpoint_is_local(url), url
 
 
+@pytest.mark.resolves_dns
 def test_dot_local_names_are_resolved_not_trusted(monkeypatch):
     """Office networks reuse .local for unicast DNS; the suffix proves nothing."""
     import socket
@@ -1031,6 +1033,7 @@ def test_trailing_dot_localhost_is_local_and_backslash_netloc_is_not():
     assert not endpoint_is_local("http://evil.com\\@localhost:11434/v1")
 
 
+@pytest.mark.resolves_dns
 def test_docker_host_is_resolved_not_trusted(monkeypatch):
     import socket
 
@@ -1048,6 +1051,7 @@ def test_docker_host_is_resolved_not_trusted(monkeypatch):
     assert not endpoint_is_local("http://host.docker.internal:11434")
 
 
+@pytest.mark.resolves_dns
 def test_resolution_uses_the_hostname_with_its_trailing_dot(monkeypatch):
     import socket
 

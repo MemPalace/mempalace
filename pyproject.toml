@@ -258,6 +258,7 @@ markers = [
     "benchmark: scale/performance benchmark tests",
     "slow: tests that take more than 30 seconds",
     "stress: destructive scale tests (100K+ drawers)",
+    "resolves_dns: the test drives llm_client's hostname resolution itself (conftest otherwise refuses DNS)",
 ]
 filterwarnings = [
     # Many tests build raw-chromadb palaces directly (no recorded embedder
