@@ -461,6 +461,63 @@ def test_codex_jsonl_prefers_event_msg_over_response_item():
     assert result.count("> Q") == 1
 
 
+def _codex_kinded_user(*blocks):
+    """A role=user response_item whose blocks carry Codex content kinds."""
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text} for _, text in blocks],
+        "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": [kind for kind, _ in blocks],
+            "turn_id": "t1",
+        },
+    }
+
+
+def test_codex_kinds_skip_injected_context_without_a_known_prefix():
+    """Context kinds are skipped however the text opens, the prefix list notwithstanding."""
+    from mempalace.normalize import codex_response_message
+
+    for kind, text in (
+        ("goal.internal_context", "<codex_internal_context>goal</codex_internal_context>"),
+        ("additional_content.codex_apps_open_page", "<app_page>docs</app_page>"),
+        ("user.heartbeat", "<heartbeat>tick</heartbeat>"),
+        ("agents_md.instructions", "Project rules: always run the linter"),
+    ):
+        assert codex_response_message(_codex_kinded_user((kind, text))) is None, kind
+
+
+def test_codex_kinds_keep_user_text_and_drop_image_tags():
+    from mempalace.normalize import codex_response_message
+
+    payload = _codex_kinded_user(
+        ("user.text", "look at this"),
+        ("user.text", "<image name=[Image #1]>"),
+        ("user.image", "ignored"),
+        ("user.text", "</image>"),
+        ("environments.environment_context", "<environment_context>cwd</environment_context>"),
+    )
+    assert codex_response_message(payload) == ("user", "look at this")
+
+
+def test_codex_kinds_keep_user_text_that_opens_like_a_context_tag():
+    """With kinds present, a user's own words are kept even if they start like context."""
+    from mempalace.normalize import codex_response_message
+
+    payload = _codex_kinded_user(("user.text", "<user_instructions> is the tag I meant"))
+    assert codex_response_message(payload) == ("user", "<user_instructions> is the tag I meant")
+
+
+def test_codex_kinds_that_do_not_line_up_fall_back_to_prefixes():
+    from mempalace.normalize import codex_response_message
+
+    payload = _codex_kinded_user(("user.text", "<environment_context>cwd</environment_context>"))
+    payload["internal_chat_message_metadata_passthrough"]["content_item_kinds"] = []
+    assert codex_response_message(payload) is None
+    payload["content"][0]["text"] = "plain question"
+    assert codex_response_message(payload) == ("user", "plain question")
+
+
 def test_codex_jsonl_non_string_message():
     lines = [
         json.dumps({"type": "session_meta"}),

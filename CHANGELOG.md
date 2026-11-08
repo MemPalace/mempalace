@@ -17,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Codex CLI 0.166 rollouts that record the conversation only as
+  `response_item` messages are mined again; the Stop and PreCompact hooks
+  logged "0 exchanges" and saved nothing for them. A user message keeps only
+  the blocks Codex marks `user.text`, so injected environment, AGENTS.md and
+  app context is not filed as something the user said; rollouts without that
+  metadata skip messages that open with a known context tag.
 - Stop and PreCompact diary checkpoints are filed through a running
   `mempalace serve` hub. The hub holds the palace writer lease for its whole
   lifetime, so the checkpoint's own write was refused for as long as a hub

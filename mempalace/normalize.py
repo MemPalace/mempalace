@@ -454,6 +454,7 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
 
 
 # Codex injects these as role=user messages; they are context, not turns.
+# Used only for rollouts that carry no per-block content kinds.
 _CODEX_SYNTHETIC_USER_PREFIXES = (
     "<environment_context>",
     "<user_instructions>",
@@ -463,11 +464,36 @@ _CODEX_SYNTHETIC_USER_PREFIXES = (
 )
 
 
+# The text blocks Codex wraps around a pasted image: ``<image name=[Image #1]>``
+# and ``</image>``. They carry no words of the user's.
+_CODEX_IMAGE_TAG = re.compile(r"</?image\b[^>]*>")
+
+
+def _codex_user_kinds(payload: dict, blocks: list) -> Optional[list]:
+    """Per-block content kinds of a role=user message, or None when absent.
+
+    Codex records one kind per content block (``user.text``, ``user.image``,
+    ``environments.environment_context``, ``agents_md.instructions``, ...) in
+    ``internal_chat_message_metadata_passthrough``. A list that does not line
+    up with the blocks cannot be trusted and counts as absent.
+    """
+    meta = payload.get("internal_chat_message_metadata_passthrough")
+    kinds = meta.get("content_item_kinds") if isinstance(meta, dict) else None
+    if not isinstance(kinds, list) or len(kinds) != len(blocks):
+        return None
+    return kinds
+
+
 def codex_response_message(payload: dict) -> Optional[tuple]:
     """Return (role, text) for a Codex response_item message payload.
 
     Only user and assistant messages count; developer/system messages and
     synthetic context that Codex sends as role=user are skipped.
+
+    A role=user message keeps only the blocks Codex marks ``user.text``, so
+    injected context (environment, AGENTS.md, app pages, heartbeats) never
+    reads as something the user said. Rollouts without that metadata fall
+    back to skipping messages that open with a known context tag.
     """
     if payload.get("type") != "message":
         return None
@@ -478,15 +504,19 @@ def codex_response_message(payload: dict) -> Optional[tuple]:
     if not isinstance(blocks, list):
         return None
     want = "input_text" if role == "user" else "output_text"
-    parts = [
-        b["text"]
-        for b in blocks
-        if isinstance(b, dict) and b.get("type") == want and isinstance(b.get("text"), str)
-    ]
+    kinds = _codex_user_kinds(payload, blocks) if role == "user" else None
+    parts = []
+    for i, b in enumerate(blocks):
+        if not (isinstance(b, dict) and b.get("type") == want and isinstance(b.get("text"), str)):
+            continue
+        if kinds is not None:
+            if kinds[i] != "user.text" or _CODEX_IMAGE_TAG.fullmatch(b["text"].strip()):
+                continue
+        parts.append(b["text"])
     text = "\n".join(parts).strip()
     if not text:
         return None
-    if role == "user" and text.startswith(_CODEX_SYNTHETIC_USER_PREFIXES):
+    if kinds is None and role == "user" and text.startswith(_CODEX_SYNTHETIC_USER_PREFIXES):
         return None
     return role, text
 
