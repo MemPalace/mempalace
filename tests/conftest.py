@@ -217,6 +217,39 @@ def _reset_loaded_mcp_writer_state(mcp_server) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_dns_lookups(request, monkeypatch):
+    """Keep the suite off the resolver.
+
+    ``llm_client.endpoint_is_local`` resolves a single-label host (``gpu-box``),
+    a ``.local`` name or ``host.docker.internal`` through ``getaddrinfo`` to
+    decide whether an endpoint is on the user's network, and every
+    ``OpenAICompatEmbeddingFunction`` construction runs that check. A failed
+    lookup of a placeholder such as ``http://h`` costs about 2.7 s on Windows
+    (milliseconds on Linux), which put several minutes of DNS timeouts into
+    the Windows CI run, and a real name makes the suite depend on outbound
+    DNS from the runner.
+
+    Tests use literal addresses (``127.0.0.1``) or dotted names, which never
+    resolve. One that must drive the resolver itself opts out with
+    ``@pytest.mark.resolves_dns`` and stubs ``socket.getaddrinfo``.
+    """
+    if request.node.get_closest_marker("resolves_dns"):
+        yield
+        return
+    import mempalace.llm_client as llm_client
+
+    def _refuse(host):
+        raise AssertionError(
+            f"test asked DNS to resolve {host!r}; use a literal address such as "
+            "127.0.0.1 (or a dotted name, which is judged external without a "
+            "lookup), or mark the test @pytest.mark.resolves_dns"
+        )
+
+    monkeypatch.setattr(llm_client, "_resolves_private", _refuse)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _release_palace_anchors():
     """Close anchor connections on ``chroma.sqlite3`` after each test.
 
