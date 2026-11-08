@@ -341,8 +341,12 @@ Existing raw event emission can still fail after the board commit.
 
 Report installation registers recovery without resolving workspace directories.
 Recovery installs the report reset trigger only when all watched task columns
-exist; BoardStore installs it after migrating legacy task columns. This prevents
-missing-column trigger failures in task writes before that migration.
+exist and removes an existing incomplete trigger otherwise. For sources missing
+only `heartbeat_at`, this keeps raw status writes usable until BoardStore adds
+that column and installs the trigger. The other watched columns belong to the
+base schema; BoardStore does not add them during this migration. Until migration,
+no episodes are recorded, while reporting is enabled, a pass that reaches a coordinated task logs an error, and watched writes do
+not bump `report_reset_rev`. Product writers open BoardStore before writing.
 The first dispatcher scan recovers and migrates existing board databases without creating
 workspace directories, followed by monotonic 30-second scan deadlines independent
 of requests and webhook traffic. Source initialization is cached by database path,

@@ -547,6 +547,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:**
 
+  - Legacy report-source tests quiesce hold, chat and phone workers and verify removal of a pre-existing invalid reset trigger before raw status writes.
+
   - Overview witnesses separate old-head behavioral regressions from the original-base fail-closed contract, with exact facet-call sequences and both lazy SQLite error classes.
 
   - Assertion-only review witnesses pin public facet compatibility, real-wrapper projected retry, refusal envelopes and negative-cache invalidation.
@@ -1219,7 +1221,7 @@ Format (read by `commonplace orch docs-check`):
   - Source outboxes and observed stuck episodes, internal seat bindings, publication receipts and reserved report dispatch.
   - Report installation touches only control state; dispatcher passes resolve existing board databases without creating workspace directories, migrate sources lazily by path, inode and SQLite schema version, and isolate workspace failures, including publication ProgrammingError, with diagnostics that omit exception text and local values. Ordinary data writes retain the initialization cache; a new inode or a changed schema version triggers initialization again.
   - Recovery skips zero-byte sources before connecting and uses a read-only base-schema probe for nonempty sources. Missing `boards` or `tasks` defers all report writes and migrations until a later pass, leaving creator initialization unblocked.
-  - Report source initialization installs its reset trigger only when every watched task column exists. Legacy status writes remain usable until BoardStore adds missing columns and installs the trigger; `tests/test_project_report_legacy_source.py` covers pump recovery and subsequent migration.
+  - Report source initialization installs its reset trigger only when every watched task column exists and removes an existing incomplete trigger otherwise. For sources missing only `heartbeat_at`, raw status writes remain usable until BoardStore adds that column and installs the trigger; other watched columns belong to the base schema and are not added by this migration. Until migration, no episodes are recorded, while reporting is enabled, a pass that reaches a coordinated task logs an error, and watched writes do not bump `report_reset_rev`. Product writers open BoardStore before writing. `tests/test_project_report_legacy_source.py` covers pump recovery, stale-trigger removal and subsequent migration.
   - The optional read-only runner input to shared usage accounting.
 
 

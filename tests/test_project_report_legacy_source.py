@@ -14,6 +14,11 @@ from tests.test_admin_runtime_api import OLD, runtime as runtime, task
 def legacy_source(hub, runtime):
     webhooks.stop(hub.gateway)
     assert not hub.gateway.webhooks.thread.is_alive(), "report dispatcher did not stop within 7s"
+    for name in ("hold_worker", "chat_worker", "phone_push"):
+        worker = getattr(hub.gateway, name, None)
+        if worker is not None:
+            worker.stop()
+            assert worker.thread is None or not worker.thread.is_alive(), f"{name} did not stop"
     task(runtime, 1, claim=OLD)
     with runtime[0].connection() as conn:
         conn.execute("DROP TRIGGER IF EXISTS project_report_reset")
@@ -58,3 +63,23 @@ def test_source_requires_every_watched_column_before_installing_trigger(missing)
             conn.execute("SELECT 1 FROM sqlite_master WHERE name='project_report_reset'").fetchone()
             is None
         ), f"report trigger references missing {missing}"
+
+
+def test_pump_removes_preexisting_legacy_report_trigger(hub, runtime):
+    legacy_source(hub, runtime)
+    with runtime[0].connection() as conn:
+        conn.execute(
+            "CREATE TRIGGER project_report_reset AFTER UPDATE OF "
+            + ",".join(reports.WATCHED)
+            + " ON tasks WHEN "
+            + " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in reports.WATCHED)
+            + " BEGIN UPDATE tasks SET report_reset_rev=OLD.report_reset_rev+1 WHERE id=NEW.id; END"
+        )
+    hub.gateway.project_reports.pass_once()
+    with runtime[0].connection() as conn:
+        assert (
+            conn.execute("SELECT 1 FROM sqlite_master WHERE name='project_report_reset'").fetchone()
+            is None
+        ), "report recovery retained a trigger referencing missing heartbeat_at"
+        conn.execute("UPDATE tasks SET status='todo', claim_until=NULL WHERE id=1")
+        assert conn.execute("SELECT status FROM tasks WHERE id=1").fetchone()[0] == "todo"
