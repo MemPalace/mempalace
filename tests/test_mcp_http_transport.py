@@ -742,6 +742,65 @@ class TestRWLockYield:
         lock.release_read()
 
 
+class TestRWLockReaderOnlyHandoff:
+    """A hallway CPU stage yields to reads but never another mutation."""
+
+    def test_queued_reader_runs_without_admitting_waiting_writer(self):
+        lock = mcp._RWLock()
+        order = []
+        lock.acquire_write()
+
+        def reader():
+            with lock.read_lock():
+                order.append("reader")
+
+        def other_writer():
+            with lock:
+                order.append("other writer")
+
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        writer_thread = threading.Thread(target=other_writer, daemon=True)
+        reader_thread.start()
+        time.sleep(0.05)
+        writer_thread.start()
+        time.sleep(0.05)
+        assert lock._waiting_readers >= 1
+        assert lock._waiting_writers >= 1
+
+        try:
+            assert lock.yield_to_waiting_readers() is True
+            order.append("mine resumed")
+            assert order == ["reader", "mine resumed"]
+            assert lock.owns_write()
+        finally:
+            lock.release_write()
+        reader_thread.join(timeout=2)
+        writer_thread.join(timeout=2)
+        assert order == ["reader", "mine resumed", "other writer"]
+
+    def test_no_reader_does_not_yield_to_writer(self):
+        lock = mcp._RWLock()
+        lock.acquire_write()
+        entered = threading.Event()
+
+        def other_writer():
+            with lock:
+                entered.set()
+
+        thread = threading.Thread(target=other_writer, daemon=True)
+        thread.start()
+        time.sleep(0.05)
+        try:
+            assert lock._waiting_writers >= 1
+            assert lock.yield_to_waiting_readers() is False
+            assert lock.owns_write()
+            assert not entered.is_set()
+        finally:
+            lock.release_write()
+        assert entered.wait(timeout=2)
+        thread.join(timeout=2)
+
+
 def test_healthz_ok(http_server):
     port, _ = http_server
     status, body = _get(port, "/healthz")

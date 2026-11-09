@@ -21,6 +21,8 @@ class _RWLock:
         self._writer_ident = None
         self._waiting_writers = 0
         self._waiting_readers = 0
+        self._reader_entries = 0
+        self._readers_only_handoff = False
         # True while a yielding writer lets queued readers in (yield_write).
         self._handoff = False
 
@@ -33,6 +35,7 @@ class _RWLock:
             finally:
                 self._waiting_readers -= 1
             self._readers += 1
+            self._reader_entries += 1
             if self._handoff:
                 self._cond.notify_all()
 
@@ -42,6 +45,9 @@ class _RWLock:
             if self._writer or (self._waiting_writers and not self._handoff):
                 return False
             self._readers += 1
+            self._reader_entries += 1
+            if self._handoff:
+                self._cond.notify_all()
             return True
 
     def owns_write(self) -> bool:
@@ -57,7 +63,7 @@ class _RWLock:
         with self._cond:
             self._waiting_writers += 1
             try:
-                while self._writer or self._readers:
+                while self._writer or self._readers or self._readers_only_handoff:
                     self._cond.wait()
                 self._writer = True
                 self._writer_ident = threading.get_ident()
@@ -106,6 +112,44 @@ class _RWLock:
                 self._writer_ident = threading.get_ident()
             finally:
                 self._waiting_writers -= 1
+            return True
+
+    def yield_to_waiting_readers(self) -> bool:
+        """Serve readers already queued during a CPU-only writer section.
+
+        Unlike yield_write(), no other writer may enter during this handoff:
+        the source mine still owns its mutation transaction. Call only after
+        materializing the relevant backend snapshot, when the current stage
+        does not touch mutable backend handles.
+        """
+        with self._cond:
+            if not self._writer or self._writer_ident != threading.get_ident():
+                return False
+            if not self._waiting_readers:
+                return False
+
+            # Freeze the number of readers owed one turn; newly arriving
+            # readers are not allowed to prolong the handoff indefinitely.
+            target = self._reader_entries + self._waiting_readers
+            self._readers_only_handoff = True
+            self._handoff = True
+            self._writer = False
+            self._writer_ident = None
+            self._waiting_writers += 1
+            self._cond.notify_all()
+            try:
+                while self._reader_entries < target:
+                    self._cond.wait()
+                self._handoff = False
+                while self._writer or self._readers:
+                    self._cond.wait()
+                self._writer = True
+                self._writer_ident = threading.get_ident()
+            finally:
+                self._handoff = False
+                self._readers_only_handoff = False
+                self._waiting_writers -= 1
+                self._cond.notify_all()
             return True
 
     def read_lock(self):
@@ -698,7 +742,10 @@ def _http_dispatch(request):
         locks = (
             _HTTP_MINE_LOCK,
             _HTTP_REQUEST_LOCK,
-            mine_yield_hook(_HTTP_REQUEST_LOCK.yield_write),
+            mine_yield_hook(
+                _HTTP_REQUEST_LOCK.yield_write,
+                readers_fn=_HTTP_REQUEST_LOCK.yield_to_waiting_readers,
+            ),
         )
         with _http_call_timing(tool_name, "write", locks):
             return handle_request(request)

@@ -959,6 +959,10 @@ def compute_hallways_for_wing(
     if not metadatas:
         return []
 
+    # This phase only consumes a materialized metadata snapshot: it is safe
+    # to serve queued Hub readers here without permitting another writer.
+    from .palace import mine_yield_readers_point
+
     # 2. Walk drawers, counting entity-pair co-occurrence + tracking rooms.
     # pair_counts: {(entity_a, entity_b): count} — keys always sorted to
     # canonicalize the (a, b) vs (b, a) symmetry.
@@ -971,7 +975,9 @@ def compute_hallways_for_wing(
     pair_rooms: dict[tuple[str, str], set[str]] = defaultdict(set)
     file_keys = _wing_file_keys(metadatas)
 
-    for meta in metadatas:
+    for index, meta in enumerate(metadatas):
+        if index and index % 256 == 0:
+            mine_yield_readers_point()
         if not isinstance(meta, dict):
             continue
         # Sentinel drawers carry no real content — skip them.
@@ -1024,6 +1030,10 @@ def compute_hallways_for_wing(
     #    connection weights accumulated through use — defeating the
     #    living-connection layer entirely. Only this wing's rows are read:
     #    other wings' records are neither loaded nor rewritten.
+    # Give queued readers one more chance before starting the SQLite write
+    # transaction; no hallway transaction is open at this boundary.
+    mine_yield_readers_point()
+
     # Read → materialize → write in one transaction under the hallway lock,
     # so a concurrent writer cannot replace the wing from the same snapshot.
     with _hallway_file_lock(config), _writing(config) as conn:

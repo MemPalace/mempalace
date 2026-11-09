@@ -1259,3 +1259,23 @@ class TestAmbiguousRecordsNeverBridgeFiles:
 
         out = _analyze_hallways([dict(r) for r in self.RECORDS])
         assert (out["self_links"], out["duplicates"]) == (0, 0)
+
+def test_hallway_cpu_phase_yields_readers_after_snapshot(monkeypatch):
+    """A large in-memory hallway derivation periodically offers a read handoff."""
+    from mempalace.palace import mine_yield_hook
+
+    class ReachedReadHandoff(Exception):
+        pass
+
+    reached = []
+
+    def readers_only():
+        reached.append(True)
+        raise ReachedReadHandoff
+
+    monkeypatch.setattr(hallways_mod, "_wing_metadata_from_sqlite", lambda _col, _wing: [{}] * 300)
+    with mine_yield_hook(lambda: False, readers_fn=readers_only):
+        with pytest.raises(ReachedReadHandoff):
+            hallways_mod.compute_hallways_for_wing("wing_project", col=object(), min_count=1)
+    assert reached == [True]
+
