@@ -654,9 +654,21 @@ class OpenAICompatProvider(LLMProvider):
 
 
 class AnthropicProvider(LLMProvider):
+    """Anthropic Messages API.
+
+    ``temperature`` is sent only when the caller sets it, because current
+    Claude models reject the field with HTTP 400; older models that still
+    accept it use the API default unless one is passed. ``max_tokens`` is the
+    output budget; a room
+    proposal over a large sample can need several thousand tokens of JSON,
+    and an answer cut off at the budget raises instead of failing later as
+    a JSON parse error.
+    """
+
     name = "anthropic"
     DEFAULT_ENDPOINT = "https://api.anthropic.com"
     API_VERSION = "2023-06-01"
+    DEFAULT_MAX_TOKENS = 8192
 
     def __init__(
         self,
@@ -664,6 +676,8 @@ class AnthropicProvider(LLMProvider):
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         timeout: int = 120,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
         **_: object,
     ):
         if api_key:
@@ -680,6 +694,8 @@ class AnthropicProvider(LLMProvider):
             timeout=timeout,
             api_key_source=source,
         )
+        self.max_tokens = int(max_tokens) if max_tokens else self.DEFAULT_MAX_TOKENS
+        self.temperature = temperature
 
     def check_available(self) -> tuple[bool, str]:
         if not self.api_key:
@@ -701,13 +717,14 @@ class AnthropicProvider(LLMProvider):
         sys_prompt = system
         if json_mode:
             sys_prompt += "\n\nRespond with valid JSON only, no prose."
-        body = {
+        body: dict = {
             "model": self.model,
-            "max_tokens": 2048,
-            "temperature": 0.1,
+            "max_tokens": self.max_tokens,
             "system": sys_prompt,
             "messages": [{"role": "user", "content": user}],
         }
+        if self.temperature is not None:
+            body["temperature"] = self.temperature
         headers = {
             "X-API-Key": self.api_key,
             "anthropic-version": self.API_VERSION,
@@ -721,6 +738,11 @@ class AnthropicProvider(LLMProvider):
             )
         except (AttributeError, TypeError) as e:
             raise LLMError(f"Unexpected response shape: {e}") from e
+        if isinstance(data, dict) and data.get("stop_reason") == "max_tokens":
+            raise LLMError(
+                f"Anthropic response was cut off at max_tokens={self.max_tokens} "
+                f"(model={self.model}); raise max_tokens or send a smaller request"
+            )
         if not text:
             raise LLMError(f"Empty response from Anthropic (model={self.model})")
         return LLMResponse(text=text, model=self.model, provider=self.name, raw=data)

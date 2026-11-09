@@ -689,6 +689,52 @@ def test_anthropic_joins_multiple_text_blocks():
     assert resp.text == "part one. part two."
 
 
+def _anthropic_body(**provider_kwargs):
+    """Send one classify call and return the JSON body that went on the wire."""
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["body"] = json.loads(req.data)
+        return _mock_anthropic_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = AnthropicProvider(model="claude-sonnet-5-5", api_key="sk-ant", **provider_kwargs)
+        p.external_use_accepted = True
+        p.classify("s", "u")
+    return captured["body"]
+
+
+def test_anthropic_omits_temperature_by_default():
+    body = _anthropic_body()
+    assert "temperature" not in body
+    assert body["max_tokens"] == AnthropicProvider.DEFAULT_MAX_TOKENS
+
+
+def test_anthropic_sends_temperature_and_max_tokens_when_set():
+    body = _anthropic_body(temperature=0.1, max_tokens=16000)
+    assert body["temperature"] == 0.1
+    assert body["max_tokens"] == 16000
+
+
+def test_get_provider_forwards_anthropic_budget():
+    p = get_provider("anthropic", "claude-sonnet-5-5", api_key="sk-ant", max_tokens=12000)
+    assert p.max_tokens == 12000
+    assert p.temperature is None
+
+
+def test_anthropic_truncated_response_raises():
+    mock = MagicMock()
+    payload = {"content": [{"type": "text", "text": '{"rooms": ['}], "stop_reason": "max_tokens"}
+    mock.read.return_value = json.dumps(payload).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        p = AnthropicProvider(model="claude-sonnet-5-5", api_key="sk-ant", max_tokens=100)
+        p.external_use_accepted = True
+        with pytest.raises(LLMError, match="cut off at max_tokens=100"):
+            p.classify("s", "u")
+
+
 def test_anthropic_no_key_raises_on_classify(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     p = AnthropicProvider(model="claude-haiku")

@@ -53,11 +53,17 @@ jobs:
       # deliberately run with no reruns so genuine regressions surface there.
       # Same pyproject gate as Linux. tests/coverage_gate.py switches Windows
       # to [tool.mempalace.coverage] fail_under_windows.
+      # The runner's TEMP is on the OS disk; runner.temp is on the local
+      # scratch disk, the faster of the two. Every palace a test builds goes
+      # under pytest's tmp_path, which follows TEMP.
       - run: >-
           python -m pytest tests/ -v --ignore=tests/benchmarks -n auto --dist loadfile
           --cov=mempalace --cov-report=term-missing --durations=25 --reruns 2
           --reruns-delay 5 --only-rerun
           "Failed to apply logs to the hnsw segment writer|Error creating hnsw segment reader: Nothing found on disk"
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
 
   test-macos:
     runs-on: macos-latest
