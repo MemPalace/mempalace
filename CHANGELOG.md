@@ -17,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `mempalace serve` binds its HTTP server without resolving the bind address
+  back to a name. `http.server` does that lookup on every bind, and on a host
+  with slow or absent reverse DNS for the address it blocked startup until the
+  resolver gave up (35 s on one hosted CI runner), which looked like the server
+  never coming up. The daemon's server already skipped the lookup; both now
+  share one bind step.
 - Stop and PreCompact diary checkpoints are filed through a running
   `mempalace serve` hub. The hub holds the palace writer lease for its whole
   lifetime, so the checkpoint's own write was refused for as long as a hub
