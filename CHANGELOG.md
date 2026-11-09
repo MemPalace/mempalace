@@ -8,15 +8,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Fixed
-
-- `mempalace serve` binds its HTTP server without resolving the bind address
-  back to a name. `http.server` does that lookup on every bind, and on a host
-  with slow or absent reverse DNS for the address it blocked startup until the
-  resolver gave up (35 s on one hosted CI runner), which looked like the server
-  never coming up. The daemon's server already skipped the lookup; both now
-  share one bind step.
-
 ---
 
 ## [3.12.0] — 2026-11-09
@@ -523,6 +514,12 @@ requires Python 3.10.
 
 ### Bug Fixes
 
+- `mempalace serve` binds its HTTP server without resolving the bind address
+  back to a name. `http.server` does that lookup on every bind, and on a host
+  with slow or absent reverse DNS for the address it blocked startup until the
+  resolver gave up (35 s on one hosted CI runner), which looked like the server
+  never coming up. The daemon's server already skipped the lookup; both now
+  share one bind step.
 - Codex CLI 0.166 rollouts that record the conversation only as
   `response_item` messages are mined again; the Stop and PreCompact hooks
   logged "0 exchanges" and saved nothing for them. A user message keeps only
@@ -1080,6 +1077,7 @@ requires Python 3.10.
 - [#2963](https://github.com/MemPalace/mempalace/pull/2963) ci: run the suite in parallel and cancel superseded PR runs (items A and B from #2961)
 - [#2964](https://github.com/MemPalace/mempalace/pull/2964) fix(llm): stop sending temperature to Anthropic and raise its token budget
 - [#2965](https://github.com/MemPalace/mempalace/pull/2965) test: stop the suite waiting on the kernel and the resolver
+- [#2966](https://github.com/MemPalace/mempalace/pull/2966) fix(mcp): bind the HTTP server without a reverse DNS lookup
 - [#2968](https://github.com/MemPalace/mempalace/pull/2968) test(dsh): wait on the hook queue instead of fixed ticks
 ---
 
