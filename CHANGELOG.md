@@ -17,6 +17,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Codex CLI 0.166 rollouts that record the conversation only as
+  `response_item` messages are mined again; the Stop and PreCompact hooks
+  logged "0 exchanges" and saved nothing for them. A user message keeps only
+  the blocks Codex marks `user.text`, so injected environment, AGENTS.md and
+  app context is not filed as something the user said; rollouts without that
+  metadata skip messages that open with a known context tag. Sub-agent
+  rollouts are not read this way: their user messages are written by another
+  agent, and Codex's reviewer is handed whole transcripts of other sessions.
 - The Anthropic provider no longer sends `temperature`, which current Claude
   models reject with HTTP 400, so `rooms propose` and `kg normalize` failed on
   them; a caller can still pass one. The output budget is 8192 tokens instead
