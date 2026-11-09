@@ -217,6 +217,68 @@ def _reset_loaded_mcp_writer_state(mcp_server) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_dns_lookups(request, monkeypatch):
+    """Keep the suite off the resolver.
+
+    ``llm_client.endpoint_is_local`` resolves a single-label host (``gpu-box``),
+    a ``.local`` name or ``host.docker.internal`` through ``getaddrinfo`` to
+    decide whether an endpoint is on the user's network, and every
+    ``OpenAICompatEmbeddingFunction`` construction runs that check. A failed
+    lookup of a placeholder such as ``http://h`` costs about 2.7 s on Windows
+    (milliseconds on Linux), which put several minutes of DNS timeouts into
+    the Windows CI run, and a real name makes the suite depend on outbound
+    DNS from the runner.
+
+    Tests use literal addresses (``127.0.0.1``) or dotted names, which never
+    resolve. One that must drive the resolver itself opts out with
+    ``@pytest.mark.resolves_dns`` and stubs ``socket.getaddrinfo``.
+    """
+    if request.node.get_closest_marker("resolves_dns"):
+        yield
+        return
+    import mempalace.llm_client as llm_client
+
+    def _refuse(host):
+        raise AssertionError(
+            f"test asked DNS to resolve {host!r}; use a literal address such as "
+            "127.0.0.1 (or a dotted name, which is judged external without a "
+            "lookup), or mark the test @pytest.mark.resolves_dns"
+        )
+
+    monkeypatch.setattr(llm_client, "_resolves_private", _refuse)
+    yield
+
+
+def _server_bind_without_reverse_dns(self):
+    import socketserver
+
+    socketserver.TCPServer.server_bind(self)
+    host, port = self.server_address[:2]
+    self.server_name = host
+    self.server_port = port
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_reverse_dns_on_http_server_bind():
+    """Bind test HTTP servers without resolving the address back to a name.
+
+    ``http.server.HTTPServer.server_bind`` sets ``server_name`` through
+    ``socket.getfqdn(host)``, a reverse lookup of the bind address. On a
+    runner whose resolver has no answer for loopback, that lookup waits out
+    the resolver's timeout: the first server each xdist worker started on the
+    hosted macOS runner took 35 s to bind. Nothing reads the name (only CGI
+    handling does), so bind as ``TCPServer`` does and keep the literal host,
+    the way ``mempalace.daemon`` already does for its own server.
+    Session-scoped so module-scoped server fixtures are covered too.
+    """
+    import http.server
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(http.server.HTTPServer, "server_bind", _server_bind_without_reverse_dns)
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _release_palace_anchors():
     """Close anchor connections on ``chroma.sqlite3`` after each test.
 

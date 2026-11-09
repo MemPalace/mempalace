@@ -1299,7 +1299,10 @@ def _http_serve_logstream_stream(handler) -> None:
                 else _call_logstream(lambda ls: ls.list_events(limit=_SSE_BATCH_LIMIT, **filters))
             )
             for event in events:
-                frame = f"id: {event['id']}\nevent: logstream\ndata: {dumps_internal(event)}\n\n"
+                # One SSE field per id: a line break in an id (a remote event
+                # applied before ids were checked) must not open another field.
+                event_id = str(event["id"]).replace("\r", " ").replace("\n", " ")
+                frame = f"id: {event_id}\nevent: logstream\ndata: {dumps_internal(event)}\n\n"
                 handler.wfile.write(frame.encode("utf-8"))
                 cursor = event["id"]
                 last_write = time.monotonic()
@@ -1361,6 +1364,8 @@ def _build_http_server(host: str, port: int):
     import socket
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+    from .._net import bind_without_reverse_dns
+
     auth_token = _http_resolve_token(host)
 
     # Resolve TLS before bind so a bad cert/key fails loudly rather than at the
@@ -1384,7 +1389,10 @@ def _build_http_server(host: str, port: int):
                 # Reserve the port before binding, so a server that binds it
                 # later fails instead of sharing it.
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
-            super().server_bind()
+            # Not super().server_bind(): HTTPServer's resolves the bind address
+            # back to a name, and a host without reverse DNS for it waits out
+            # the resolver before the first request is served.
+            bind_without_reverse_dns(self)
 
         # socketserver's default listen backlog is 5. The palace RWLock means
         # one slow request can hold every handler thread while new sessions

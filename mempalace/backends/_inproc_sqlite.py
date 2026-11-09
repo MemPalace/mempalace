@@ -125,7 +125,11 @@ _holders: dict[str, "_Holder"] = {}
 # mempalace.backends pulls Chroma into the process whose only job is to hold
 # an idle WAL connection open.
 _HOLD_SCRIPT = """
-import os, sqlite3, sys
+import sys
+# -c puts the cwd first on sys.path, and the cwd may be an untrusted
+# checkout: drop it before anything else is imported.
+if sys.path and sys.path[0] == '': del sys.path[0]
+import os, sqlite3
 from urllib.request import pathname2url
 
 db_path = sys.argv[1]
