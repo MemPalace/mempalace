@@ -2,7 +2,7 @@
 
 import json
 import os
-import subprocess
+import stat
 from pathlib import Path
 
 import pytest
@@ -378,25 +378,18 @@ def test_nonportable_raw_keys_are_not_probed_as_artifact_paths(tmp_path, monkeyp
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory junction")
 @pytest.mark.parametrize("build", BUILDERS)
 def test_legacy_artifacts_refuse_junction_state_directory(tmp_path, build):
+    # The same call CPython's own tests use to make a junction. A PowerShell
+    # ``New-Item -ItemType Junction`` did the job before at about 2 s a spawn.
+    import _winapi
+
     outside = tmp_path / "outside"
     outside.mkdir()
     palace = tmp_path / "palace"
     palace.mkdir()
     for folder in ("wings", "rooms"):
-        link = str(palace / folder).replace("'", "''")
-        target = str(outside).replace("'", "''")
-        subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                f"New-Item -ItemType Junction -Path '{link}' -Target '{target}' | Out-Null",
-            ],
-            check=True,
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        _winapi.CreateJunction(str(outside), str(palace / folder))
+        attributes = os.lstat(palace / folder).st_file_attributes
+        assert attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT, folder
     with pytest.raises(ValueError, match="symlink|reparse|junction"):
         build(MempalaceConfig(palace_path=str(palace)), LEGACY_WING)
     assert list(outside.iterdir()) == []
