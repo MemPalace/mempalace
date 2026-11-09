@@ -414,6 +414,9 @@ def search_memories(
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
+            # Supersession stamp (supersedes linkage): a stale handoff
+            # self-identifies in the read path that surfaces it.
+            "superseded_by": meta.get("superseded_by"),
             # source_file is the basename (display); source_path is the full
             # stored value, the round-trippable key for the source_file filter.
             "source_file": Path(source).name if source else "?",

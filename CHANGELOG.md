@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **`supersedes` linkage between drawers.** `add_drawer` and the
+  `checkpoint` items accept a `supersedes` drawer id (or ids): the new
+  drawer carries `supersedes` metadata and every physical row of each
+  target is stamped `superseded_by` (chunked targets resolve via their
+  chunks' `parent_drawer_id`; the stamp merges into current metadata so it
+  is backend-safe, and the idempotent already-exists re-file path
+  re-stamps). Search hits project `superseded_by`, so a handoff checkpoint
+  that says "for next session" self-identifies as stale in the read path
+  that surfaces it once its closure is filed. Unresolvable targets are
+  reported in `supersedes_unresolved` and never fail the filing.
+
 ---
 
 ## [3.12.0] — 2026-11-09
