@@ -31,6 +31,15 @@ from mempalace._env import env_float, env_str, parse_bool
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.config import MempalaceConfig, normalize_wing_name
 from mempalace.fsio import decode_source
+from mempalace.hook_remote import (
+    REMOTE_TOKEN_ENV,
+    REMOTE_URL_ENV,
+    RemoteCallFailed,
+    RemoteConfigError,
+    RemoteTarget,
+    call_tool,
+    resolve_remote_target,
+)
 from mempalace.normalize import codex_response_message
 from mempalace.timeutil import utc_now_iso
 from mempalace.write_routing import (
@@ -92,7 +101,12 @@ def _palace_root_exists() -> bool:
     either path (or a broken symlink) is treated as absent — otherwise the
     kill-switch would be bypassed and ``STATE_DIR.mkdir()`` would later crash
     on ``NotADirectoryError``.
+
+    A remote URL in the environment is an explicit request to run the hooks, so
+    it also passes. A remote-only client has no local palace directory at all.
     """
+    if env_str(REMOTE_URL_ENV):
+        return True
     if PALACE_ROOT.is_dir():
         return True
     try:
@@ -568,6 +582,11 @@ class HookWriteRouting:
     decision: Optional[WriteRoutingDecision]
     source: str
     error: Optional[str] = None
+    remote: Optional[RemoteTarget] = None
+
+    @property
+    def use_remote(self) -> bool:
+        return self.remote is not None
 
     @property
     def use_daemon(self) -> bool:
@@ -581,7 +600,7 @@ class HookWriteRouting:
     def notice(self) -> str:
         if self.error is not None:
             return (
-                "MemPalace hook writes were skipped because write-routing "
+                "MemPalace hook writes were skipped because hook routing "
                 f"configuration is invalid: {self.error}. No direct ChromaDB "
                 "fallback was attempted."
             )
@@ -623,8 +642,38 @@ def _resolve_configured_hook_policy() -> ResolvedWriteRoutingPolicy:
     )
 
 
+def _resolve_hook_remote() -> Optional[RemoteTarget]:
+    """The configured remote server, or None for the local palace.
+
+    Raises ``RemoteConfigError`` when one is configured but unusable.
+    """
+    try:
+        config = MempalaceConfig()
+        url, token = config.hook_remote_url, config.hook_remote_token
+    except Exception:
+        # An unreadable config must not hide a remote URL set in the environment.
+        url, token = env_str(REMOTE_URL_ENV, ""), env_str(REMOTE_TOKEN_ENV, "")
+    # Stand-in config objects may not carry these settings at all.
+    if not isinstance(url, str) or not isinstance(token, str):
+        return None
+    return resolve_remote_target(url, token)
+
+
 def _compute_hook_write_routing() -> HookWriteRouting:
-    """Resolve hook policy and probe daemon liveness at most once."""
+    """Resolve hook policy and probe daemon liveness at most once.
+
+    A configured remote server overrides the local policy: no daemon probe, no
+    direct write.
+    """
+
+    try:
+        remote = _resolve_hook_remote()
+    except RemoteConfigError as exc:
+        routing = HookWriteRouting(decision=None, source="remote", error=str(exc))
+        _log(routing.notice)
+        return routing
+    if remote is not None:
+        return HookWriteRouting(decision=None, source="remote", remote=remote)
 
     try:
         resolved = _resolve_configured_hook_policy()
@@ -696,6 +745,51 @@ def _log_hook_write_blocked(routing: HookWriteRouting, operation: str) -> None:
 
 def _blocked_hook_output(routing: HookWriteRouting) -> dict:
     return {"systemMessage": routing.notice}
+
+
+def _log_remote_mine_skipped(operation: str) -> None:
+    _log(f"Skipped {operation}: a remote server cannot read files on this machine.")
+
+
+def _remote_error_path() -> Path:
+    return STATE_DIR / "remote_last_error"
+
+
+def _record_remote_failure(reason: str) -> None:
+    """Log a failed remote write and keep it for the next hook to report."""
+    _log(f"Remote diary checkpoint failed: {reason}. Nothing was written locally.")
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _remote_error_path().write_text(
+            json.dumps({"reason": reason, "ts": utc_now_iso()}), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def _clear_remote_failure() -> None:
+    try:
+        _remote_error_path().unlink()
+    except OSError:
+        pass
+
+
+def _with_remote_failure_notice(output: dict) -> dict:
+    """Add the last remote failure to a hook's output, one time per failure."""
+    path = _remote_error_path()
+    try:
+        failure = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(failure, dict) or failure.get("reported"):
+            return output
+        path.write_text(json.dumps({**failure, "reported": True}), encoding="utf-8")
+    except (OSError, ValueError):
+        return output
+    notice = (
+        f"MemPalace could not save to the remote server ({failure.get('reason', 'unknown')}, "
+        f"{failure.get('ts', 'unknown time')}). Details are in {STATE_DIR / 'hook.log'}."
+    )
+    existing = output.get("systemMessage")
+    return {**output, "systemMessage": f"{existing}\n{notice}" if existing else notice}
 
 
 def _submit_daemon_job(
@@ -775,6 +869,9 @@ def _maybe_auto_ingest():
     if routing.blocked:
         _log_hook_write_blocked(routing, "project auto-ingest")
         return
+    if routing.use_remote:
+        _log_remote_mine_skipped("project auto-ingest")
+        return
 
     for mine_dir, mode in targets:
         try:
@@ -814,6 +911,9 @@ def _mine_sync():
     routing = _current_hook_write_routing()
     if routing.blocked:
         _log_hook_write_blocked(routing, "synchronous project mine")
+        return
+    if routing.use_remote:
+        _log_remote_mine_skipped("synchronous project mine")
         return
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1130,6 +1230,10 @@ def _apply_diary_checkpoint(payload: dict) -> bool:
     runs. The entry therefore goes to the hub when a writable one is serving
     this palace, the same way the hook's transcript mine is forwarded, and is
     written here only when none answers. Only that fallback imports mcp_server.
+
+    A configured remote server takes the entry instead, and a failure there
+    ends the checkpoint: no path below it may run, or the entry would land in
+    the local palace.
     """
     from .hub_client import forward_tool_call
 
@@ -1142,19 +1246,37 @@ def _apply_diary_checkpoint(payload: dict) -> bool:
         "topic": str(payload.get("topic") or "checkpoint"),
         "wing": str(payload.get("wing") or ""),
     }
-    handled, result = forward_tool_call(
-        MempalaceConfig().palace_path, "mempalace_diary_write", arguments
-    )
-    if handled and result is None:
-        # The hub took the request but gave no readable answer. The entry may
-        # already be filed, so it is not written again here; the save marker
-        # stays put and the next Stop files a fresh checkpoint.
-        _log("Diary checkpoint sent to the palace hub, which did not report back")
+    try:
+        remote = _resolve_hook_remote()
+    except RemoteConfigError as exc:
+        _record_remote_failure(str(exc))
         return False
-    if handled:
-        _log("Diary checkpoint forwarded to the palace hub")
+    if remote is None and payload.get("remote"):
+        # Queued for a remote server that this process can no longer see.
+        _record_remote_failure("remote configuration is not available")
+        return False
+    if remote is not None:
+        try:
+            result = call_tool(remote, "mempalace_diary_write", arguments)
+        except RemoteCallFailed as exc:
+            _record_remote_failure(str(exc))
+            return False
+        _clear_remote_failure()
+        _log("Diary checkpoint sent to the remote server")
     else:
-        result = _diary_write_in_process(arguments)
+        handled, result = forward_tool_call(
+            MempalaceConfig().palace_path, "mempalace_diary_write", arguments
+        )
+        if handled and result is None:
+            # The hub took the request but gave no readable answer. The entry may
+            # already be filed, so it is not written again here; the save marker
+            # stays put and the next Stop files a fresh checkpoint.
+            _log("Diary checkpoint sent to the palace hub, which did not report back")
+            return False
+        if handled:
+            _log("Diary checkpoint forwarded to the palace hub")
+        else:
+            result = _diary_write_in_process(arguments)
     if not result.get("success"):
         # The save marker stays put, so the next Stop files a fresh checkpoint.
         _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
@@ -1306,6 +1428,7 @@ def _save_diary_direct(
                 "exchange_count": exchange_count,
                 "ack_ts": utc_now_iso(),
                 "ingest_transcript": transcript_path,
+                "remote": routing.use_remote,
             }
         )
         if queued:
@@ -1340,6 +1463,9 @@ def _ingest_transcript(transcript_path: str):
     routing = _current_hook_write_routing()
     if routing.blocked:
         _log_hook_write_blocked(routing, "transcript ingest")
+        return
+    if routing.use_remote:
+        _log_remote_mine_skipped("transcript ingest")
         return
 
     wing = _project_wing(str(path))
@@ -1697,12 +1823,14 @@ def hook_stop(data: dict, harness: str):
                     )
                 elif queued:
                     _output(
-                        {
-                            "systemMessage": f"\u2726 checkpoint queued \u2014 {messages_folded} messages being woven into the palace{tag}",
-                        }
+                        _with_remote_failure_notice(
+                            {
+                                "systemMessage": f"\u2726 checkpoint queued \u2014 {messages_folded} messages being woven into the palace{tag}",
+                            }
+                        )
                     )
                 else:
-                    _output({})
+                    _output(_with_remote_failure_notice({}))
             else:
                 # Legacy: block and ask Claude to save via MCP tools.
                 # Marker advances before confirmed save — best-effort; if Claude
@@ -1717,7 +1845,7 @@ def hook_stop(data: dict, harness: str):
                 reason = STOP_BLOCK_REASON + f" Write diary entry to wing={project_wing}."
                 _output({"decision": "block", "reason": reason})
     else:
-        _output({})
+        _output(_with_remote_failure_notice({}))
 
 
 def hook_session_start(data: dict, harness: str):
@@ -1884,6 +2012,19 @@ def hook_precompact(data: dict, harness: str):
         if routing.blocked:
             _log_hook_write_blocked(routing, "precompact flush")
             _output(_blocked_hook_output(routing))
+            return
+
+        if routing.use_remote:
+            # This hook only mines, and a remote server cannot read this
+            # machine's files, so the diary entry is what survives compaction.
+            if transcript_path:
+                _save_diary_direct(
+                    transcript_path,
+                    session_id,
+                    wing=_project_wing(transcript_path),
+                    agent_name=_diary_agent_for_harness(harness),
+                )
+            _output(_with_remote_failure_notice({}))
             return
 
         # Capture tool output via our normalize path before compaction loses it
