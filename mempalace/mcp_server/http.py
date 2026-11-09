@@ -21,21 +21,28 @@ class _RWLock:
         self._writer_ident = None
         self._waiting_writers = 0
         self._waiting_readers = 0
-        self._reader_entries = 0
+        self._waiting_reader_tokens = set()
         self._readers_only_handoff = False
         # True while a yielding writer lets queued readers in (yield_write).
         self._handoff = False
 
     def acquire_read(self) -> None:
         with self._cond:
+            # A unique ticket identifies each reader already waiting when a
+            # CPU-only writer handoff begins; later arrivals must not satisfy
+            # the promise made to the original waiters.
+            ticket = object()
+            self._waiting_reader_tokens.add(ticket)
             self._waiting_readers += 1
             try:
                 while self._writer or (self._waiting_writers and not self._handoff):
                     self._cond.wait()
             finally:
                 self._waiting_readers -= 1
+                self._waiting_reader_tokens.discard(ticket)
+                if self._handoff:
+                    self._cond.notify_all()
             self._readers += 1
-            self._reader_entries += 1
             if self._handoff:
                 self._cond.notify_all()
 
@@ -45,7 +52,6 @@ class _RWLock:
             if self._writer or (self._waiting_writers and not self._handoff):
                 return False
             self._readers += 1
-            self._reader_entries += 1
             if self._handoff:
                 self._cond.notify_all()
             return True
@@ -128,9 +134,10 @@ class _RWLock:
             if not self._waiting_readers:
                 return False
 
-            # Freeze the number of readers owed one turn; newly arriving
-            # readers are not allowed to prolong the handoff indefinitely.
-            target = self._reader_entries + self._waiting_readers
+            # Freeze the exact queued readers owed a turn. A newly arriving
+            # opportunistic reader cannot satisfy this obligation in place of
+            # a reader already blocked when the mine yielded.
+            owed = set(self._waiting_reader_tokens)
             self._readers_only_handoff = True
             self._handoff = True
             self._writer = False
@@ -138,7 +145,7 @@ class _RWLock:
             self._waiting_writers += 1
             self._cond.notify_all()
             try:
-                while self._reader_entries < target:
+                while not owed.isdisjoint(self._waiting_reader_tokens):
                     self._cond.wait()
                 self._handoff = False
                 while self._writer or self._readers:
