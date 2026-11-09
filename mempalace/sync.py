@@ -1,5 +1,5 @@
 """
-sync.py — Gitignore-aware drawer prune (#1252).
+sync.py — Gitignore-aware drawer prune.
 
 Removes drawers whose source files are now gitignored, deleted, or moved
 out of the project. Reuses the same GitignoreMatcher infrastructure that
@@ -18,15 +18,16 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Final, Literal, Optional, TypedDict
 
+from .metadata_types import is_bookkeeping
 from .miner import is_gitignored, load_gitignore_matcher
 from .palace import (
     MineAlreadyRunning,
+    drawers_removed,
     get_closets_collection,
     get_collection,
     mine_palace_lock,
 )
 from .source_identity import directory_identity
-
 
 logger = logging.getLogger(__name__)
 _BATCH = 1000
@@ -121,13 +122,16 @@ def _is_registry_row(meta: dict, drawer_id: str) -> bool:
     Deleting a `_reg_*` sentinel makes the next mine pass re-chunk and re-embed
     the entire transcript even though its content has not changed.
     """
-    if (meta or {}).get("room") == "_registry":
-        return True
-    if (meta or {}).get("ingest_mode") == "registry":
+    meta = meta or {}
+    if meta.get("ingest_mode") == "registry":
         return True
     if drawer_id and drawer_id.startswith("_reg_"):
         return True
-    return False
+    # A project can name a real room "_registry"; its drawers have a chunk
+    # index and a drawer_ id, and are pruned like any other.
+    return meta.get("room") == "_registry" and (
+        "chunk_index" not in meta or not str(drawer_id or "").startswith("drawer_")
+    )
 
 
 # ``Final`` keeps these literal types rather than widening them to ``str``,
@@ -154,8 +158,7 @@ _SURVIVOR_PROBE_LIMIT: Final = 8
 # 32,763 raises ``too many SQL variables``. That ceiling is the backend's,
 # not the one the SQLite reachable from Python reports, which is 250,000.
 # ``closet_llm`` works around the same number from the other side,
-# paginating a fetch whose returned rows would bind past it (#802, #850,
-# #1073). 500 sits sixty-five times under it, which leaves room for the
+# paginating a fetch whose returned rows would bind past it. 500 sits sixty-five times under it, which leaves room for the
 # matching rows a survivor probe also asks the metadata of, since those bind
 # a variable each as well; a batch the backend still refuses is halved rather
 # than assumed to fit.
@@ -394,9 +397,14 @@ def _classify_under_identity(
 
 
 def _iter_drawer_metadata(col, wing: Optional[str]):
-    """Yield (id, metadata) tuples from the drawers collection in batches."""
+    """Yield (id, metadata) tuples from the drawers collection in batches.
+
+    A wing reads every spelling its project was filed under.
+    """
+    from .search_util import build_where_filter
+
     offset = 0
-    where = {"wing": wing} if wing else None
+    where = build_where_filter(wing, col=col) or None
     while True:
         kwargs = {"include": ["metadatas"], "limit": _BATCH, "offset": offset}
         if where:
@@ -510,11 +518,7 @@ def _is_bookkeeping_row(meta: dict, drawer_id: str) -> bool:
     a real file and goes when the file does. Widening it would keep those
     sentinels for good instead.
     """
-    if _is_registry_row(meta, drawer_id):
-        return True
-    if (meta or {}).get("is_sentinel"):
-        return True
-    return bool(drawer_id) and drawer_id.startswith("sentinel_")
+    return is_bookkeeping(meta, drawer_id) or _is_registry_row(meta, drawer_id)
 
 
 def _source_holds_nothing(col, source) -> bool:
@@ -962,6 +966,7 @@ def sync_palace(
             return report
 
         report["removed_drawers"] = _delete_in_batches(col, removable_ids, batch_size, wal_log)
+        drawers_removed(palace_path, aaak_ids=removable_ids)
 
         closets_removed = 0
         try:

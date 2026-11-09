@@ -13,12 +13,11 @@ Covers:
   4. The Qdrant scroll page size constant is 4096, not 256.
 """
 
-import types
 import sys
+import types
 from unittest import mock
 
 import pytest
-
 
 # ── Stub heavy deps so we can import mempalace modules in isolation ─────────
 #
@@ -71,14 +70,13 @@ def _stub_heavy_deps(monkeypatch):
 # during this file's first import below and during every test.
 import numpy  # noqa: E402,F401
 
+from mempalace.backends import qdrant as qdrant_mod  # noqa: E402
 from mempalace.backends.base import (  # noqa: E402
     BaseCollection,
     GetResult,
     PalaceRef,
 )
-from mempalace.backends import qdrant as qdrant_mod  # noqa: E402
 from mempalace.backends.qdrant import QdrantCollection, _QdrantConfig  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # 1. BaseCollection default get_all_metadata()
@@ -541,28 +539,7 @@ class TestScrollPageSizeBump:
 # this is a deliberate, explicitly-labeled VERBATIM COPY of the real
 # function -- not a live import. If mcp_server._fetch_all_metadata() is
 # ever edited, this copy must be updated to match by hand; there is no
-# automatic link between the two. (Diagnosed during review on #1832 after
-# two successive ImportErrors chasing the stub graph -- see PR discussion.)
-#
-# Real source as of this writing (mempalace/mcp_server.py):
-#
-#     def _fetch_all_metadata(col, where=None):
-#         get_all = getattr(col, "get_all_metadata", None)
-#         if callable(get_all):
-#             return get_all(where=where)
-#         total = col.count()
-#         all_meta = []
-#         offset = 0
-#         while offset < total:
-#             kwargs = {"include": ["metadatas"], "limit": 1000, "offset": offset}
-#             if where:
-#                 kwargs["where"] = where
-#             batch = col.get(**kwargs)
-#             if not batch["metadatas"]:
-#                 break
-#             all_meta.extend(batch["metadatas"])
-#             offset += len(batch["metadatas"])
-#         return all_meta
+# automatic link between the two.
 
 
 def _fetch_all_metadata_under_test(col, where=None):

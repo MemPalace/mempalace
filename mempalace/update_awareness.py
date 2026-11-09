@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
-import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from . import paths
+from .fsio import atomic_publish, read_published_bytes
+from .timeutil import utc_now
 from .version import __version__
-
 
 _POLICY_FILE = "updates.json"
 _CACHE_FILE = "updates-cache.json"
@@ -36,12 +36,12 @@ def _installer_action(installer: str) -> dict:
 
 
 def _config_dir(value=None) -> Path:
-    return Path(value) if value is not None else Path(os.path.expanduser("~/.mempalace"))
+    return Path(value) if value is not None else paths.state_home()
 
 
 def _read_json(name: str, config_dir=None) -> dict:
     try:
-        value = json.loads((_config_dir(config_dir) / name).read_text(encoding="utf-8"))
+        value = json.loads(read_published_bytes(_config_dir(config_dir) / name).decode("utf-8"))
     except (FileNotFoundError, OSError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
@@ -50,17 +50,13 @@ def _read_json(name: str, config_dir=None) -> dict:
 def _write_json(name: str, value: dict, config_dir=None) -> None:
     directory = _config_dir(config_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=".updates-", suffix=".json", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(temporary, directory / name)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+
+    def body(handle) -> None:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+    # fsio retries a rename that a reader of the cache briefly blocks on Windows.
+    atomic_publish(directory / name, body)
 
 
 def configure_updates(
@@ -146,7 +142,7 @@ def check_updates(
     if not enabled and not force:
         return {"enabled": False, "installed": installed_version, "checked": False}
 
-    now = now or datetime.now(timezone.utc)
+    now = now or utc_now()
     attempted_at = cache.get("attempted_at") or cache.get("checked_at")
     if not force and attempted_at:
         try:

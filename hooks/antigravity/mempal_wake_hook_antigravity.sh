@@ -110,19 +110,32 @@ WING=$(mempal_infer_wing "$WORKSPACE_PATH")
 mempal_log "preInvocation" "$CONVERSATION_ID" "WAKE injection wing=$WING invocationNum=$INVOCATION_NUM"
 
 OUTPUT=$("$MEMPAL_PYTHON_BIN" -c "
-import json, subprocess, sys
+import sys
+# The workspace may be an untrusted checkout: never import from it.
+# PYTHONSAFEPATH (exported by lib/common.sh) covers Python 3.11+; this
+# drops the empty sys.path entry -c adds on 3.10.
+if sys.path and sys.path[0] == '': del sys.path[0]
+import json, subprocess
 
 wing = sys.argv[1]
 timeout_s = 0.5  # 500 ms
 
-# Invoke as ``[sys.executable, '-m', 'mempalace', ...]`` rather than
-# the bare ``mempalace`` console script. sys.executable is the same
-# Python that resolved MEMPAL_PYTHON in lib/common.sh, so this binds
-# the wake-up call to the correct interpreter (and its installed
-# mempalace package) even when the venv's bin/ isn't on PATH.
+# Invoke through sys.executable rather than the bare ``mempalace``
+# console script. sys.executable is the same Python that resolved
+# MEMPAL_PYTHON in lib/common.sh, so this binds the wake-up call to the
+# correct interpreter (and its installed mempalace package) even when
+# the venv's bin/ isn't on PATH. The launcher is the one lib/common.sh
+# uses: it runs mempalace/__main__.py without putting the workspace on
+# sys.path, where ``-m mempalace`` would look first.
+safe_main = (
+    'import sys\n'
+    'if sys.path and sys.path[0] == \"\": del sys.path[0]\n'
+    'import runpy\n'
+    'runpy.run_module(\"mempalace\", run_name=\"__main__\", alter_sys=True)\n'
+)
 try:
     completed = subprocess.run(
-        [sys.executable, '-m', 'mempalace', 'wake-up', '--wing', wing],
+        [sys.executable, '-c', safe_main, 'wake-up', '--wing', wing],
         capture_output=True,
         text=True,
         timeout=timeout_s,

@@ -4,11 +4,21 @@ if __name__ != "mempalace.cli":
 
 
 def cmd_search(args):
+    from ..query_sanitizer import sanitize_query, sanitizer_report
+
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    report = sanitizer_report(sanitize_query(args.query))
+    if report:
+        args.query = report["clean_query"]
+        print(
+            f"Query sanitized ({report['method']}): {report['original_length']} -> "
+            f"{report['clean_length']} chars; searching for: {args.query}",
+            file=sys.stderr,
+        )
     if _search_args_forwardable(args) and _forward_search_to_hub(args, palace_path):
         return
 
-    from ..searcher import search, SearchError
+    from ..searcher import SearchError, search
 
     experimental = {}
     if getattr(args, "include_media", False):
@@ -46,8 +56,9 @@ def cmd_wakeup(args):
 
 def cmd_split(args):
     """Split concatenated transcript mega-files into per-session files."""
-    from ..split_mega_files import main as split_main
     import sys
+
+    from ..split_mega_files import main as split_main
 
     # Rebuild argv for split_mega_files argparse
     # Expand ~ and resolve to absolute path so split_mega_files sees a real path
@@ -164,8 +175,19 @@ def cmd_hallways(args):
         print(f"    {label}")
 
 
+def cmd_export(args):
+    from ..exporter import export_palace
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    export_palace(palace_path, os.path.expanduser(args.output_dir))
+
+
 def cmd_status(args):
+    from ..knowledge_graph import knowledge_graph_notice
     from ..miner import status
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     status(palace_path=palace_path)
+    notice = knowledge_graph_notice(palace_path, explicit=bool(args.palace))
+    if notice:
+        print(f"\n  Note: {notice}")

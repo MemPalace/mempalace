@@ -1,10 +1,10 @@
 import json
 import stat
-import tracemalloc
 from unittest.mock import patch
 
+import pytest
+
 from mempalace.normalize import (
-    MAX_IN_MEMORY_FILE_SIZE,
     _SLACK_PROVENANCE_FOOTER,
     _extract_content,
     _format_tool_result,
@@ -15,9 +15,9 @@ from mempalace.normalize import (
     _try_claude_ai_json,
     _try_claude_code_jsonl,
     _try_codex_jsonl,
+    _try_continue_json,
     _try_gemini_json,
     _try_gemini_jsonl,
-    _try_continue_json,
     _try_normalize_json,
     _try_normalize_json_split,
     _try_pi_jsonl,
@@ -26,7 +26,6 @@ from mempalace.normalize import (
     normalize_conversations,
     strip_noise,
 )
-
 
 # ── normalize() top-level ──────────────────────────────────────────────
 
@@ -55,11 +54,8 @@ def test_empty(tmp_path):
 
 def test_normalize_io_error():
     """normalize raises IOError for unreadable file."""
-    try:
+    with pytest.raises(IOError, match="Could not read"):
         normalize("/nonexistent/path/file.txt")
-        assert False, "Should have raised"
-    except IOError as e:
-        assert "Could not read" in str(e)
 
 
 def test_normalize_already_has_markers(tmp_path):
@@ -87,127 +83,118 @@ def test_normalize_whitespace_only(tmp_path):
     assert result.strip() == ""
 
 
-def test_known_jsonl_formats_bypass_full_file_read(tmp_path):
-    """Known JSONL schemas use the streaming path in both public entry points."""
+def test_known_jsonl_streams_preserve_current_parsers_and_mtime(tmp_path):
+    """Both public entry points stream known formats without full-file reads."""
+    from mempalace.normalize import normalize_conversations_with_mtime
+
     cases = {
-        "claude.jsonl": (
-            _try_claude_code_jsonl,
-            [
-                {"type": "human", "message": {"content": "Q"}},
-                {"type": "assistant", "message": {"content": "A"}},
-            ],
-        ),
-        "codex.jsonl": (
-            _try_codex_jsonl,
-            [
-                {"type": "session_meta", "payload": {}},
-                {"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}},
-                {"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}},
-            ],
-        ),
-        "gemini.jsonl": (
-            _try_gemini_jsonl,
-            [
-                {"type": "session_metadata", "sessionId": "s"},
-                {"type": "user", "content": [{"text": "Q"}]},
-                {"type": "gemini", "content": [{"text": "A"}]},
-            ],
-        ),
-        "pi.jsonl": (
-            _try_pi_jsonl,
-            [
-                {"type": "session", "version": 1},
-                {"type": "message", "message": {"role": "user", "content": "Q"}},
-                {"type": "message", "message": {"role": "assistant", "content": "A"}},
-            ],
-        ),
+        "claude": [
+            {"type": "human", "message": {"content": "Q"}},
+            {"type": "assistant", "message": {"content": "A"}},
+        ],
+        "codex": [
+            {"type": "session_meta", "payload": {}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}},
+        ],
+        "gemini": [
+            {"type": "session_metadata", "sessionId": "s"},
+            {"type": "user", "content": [{"text": "Q"}]},
+            {"type": "gemini", "content": [{"text": "A"}]},
+        ],
+        "pi": [
+            {"type": "session", "version": 1},
+            {"type": "message", "message": {"role": "user", "content": "Q"}},
+            {"type": "message", "message": {"role": "assistant", "content": "A"}},
+        ],
     }
-
-    for filename, (parser, entries) in cases.items():
-        content = "\n".join(json.dumps(entry) for entry in entries)
-        source = tmp_path / filename
-        source.write_text(content, encoding="utf-8")
-        expected = parser(content)
-
-        with patch(
-            "mempalace.normalize._read_transcript_file",
-            side_effect=AssertionError("known JSONL must not be read in full"),
+    for name, entries in cases.items():
+        source = tmp_path / f"{name}.jsonl"
+        raw = "\n".join(json.dumps(entry) for entry in entries)
+        source.write_text(raw, encoding="utf-8")
+        expected = _try_normalize_json(raw)
+        with (
+            patch("mempalace.normalize._read_transcript_file", side_effect=AssertionError()),
+            patch(
+                "mempalace.normalize._read_transcript_file_with_mtime",
+                side_effect=AssertionError(),
+            ),
         ):
             assert normalize(str(source)) == expected
-            assert normalize_conversations(str(source)) == [expected]
+            got, captured_mtime = normalize_conversations_with_mtime(str(source))
+            assert got == [expected]
+            assert captured_mtime == source.stat().st_mtime
 
 
-def test_known_jsonl_cannot_exceed_in_memory_limit(tmp_path):
-    """Streaming input stays capped while normalized output is materialized in memory."""
-    source = tmp_path / "codex.jsonl"
-    source.write_text(
-        "\n".join(
-            json.dumps(entry)
-            for entry in (
-                {"type": "session_meta", "payload": {}},
-                {"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}},
-                {"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}},
-            )
-        ),
-        encoding="utf-8",
+def test_jsonl_stream_falls_back_to_lossless_legacy_encoding(tmp_path):
+    """Invalid UTF-8 must not bypass the established Windows-1252 decoder."""
+    from mempalace.normalize import normalize_conversations_with_mtime
+
+    source = tmp_path / "legacy.jsonl"
+    source.write_bytes(
+        b'{"type":"session_meta","payload":{}}\n'
+        b'{"type":"event_msg","payload":{"type":"user_message","message":"caf'
+        + bytes([0xE9])
+        + b'"}}\n'
+        + b'{"type":"event_msg","payload":{"type":"agent_message","message":"A"}}\n'
     )
-
-    class _LargeRegularFile:
-        st_mode = stat.S_IFREG | 0o644
-        st_size = MAX_IN_MEMORY_FILE_SIZE + 1
-
-    with patch("mempalace.normalize.os.fstat", return_value=_LargeRegularFile()):
-        try:
-            normalize(str(source))
-            assert False, "Should have enforced the shared in-memory input cap"
-        except IOError as exc:
-            assert "too large" in str(exc).lower()
+    conversations, captured_mtime = normalize_conversations_with_mtime(str(source))
+    assert "café" in conversations[0]
+    assert captured_mtime == source.stat().st_mtime
 
 
-def test_known_jsonl_peak_memory_does_not_scale_with_ignored_source(tmp_path):
-    """Ignored JSONL records are consumed incrementally, not retained as one source string."""
-    source = tmp_path / "large-codex.jsonl"
-    ignored_line = (
-        json.dumps(
-            {
-                "type": "response_item",
-                "payload": {"type": "reasoning", "text": "x" * 2048},
-            }
-        )
+def test_known_jsonl_stream_avoids_full_source_memory_copies(tmp_path):
+    """Ignored large metadata should not allocate source-sized strings."""
+    import tracemalloc
+
+    source = tmp_path / "long-codex.jsonl"
+    ignored = (
+        json.dumps({"type": "response_item", "payload": {"type": "reasoning", "text": "x" * 2048}})
         + "\n"
     )
     with source.open("w", encoding="utf-8") as stream:
         stream.write(json.dumps({"type": "session_meta", "payload": {}}) + "\n")
         for _ in range(6144):
-            stream.write(ignored_line)
+            stream.write(ignored)
         stream.write(
             json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}})
             + "\n"
         )
         stream.write(
-            json.dumps(
-                {
-                    "type": "event_msg",
-                    "payload": {"type": "agent_message", "message": "A"},
-                }
-            )
+            json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}})
             + "\n"
         )
-
-    source_size = source.stat().st_size
-    assert source_size >= 12 * 1024 * 1024
-
+    assert source.stat().st_size >= 12 * 1024 * 1024
     tracemalloc.start()
     try:
-        result = normalize(str(source))
+        output = normalize(str(source))
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
+    assert output == "> Q\nA\n"
+    assert peak < source.stat().st_size // 3
 
-    assert result == "> Q\nA\n"
-    assert peak < source_size // 3, (
-        f"streaming normalization peaked at {peak} bytes for a {source_size}-byte source"
-    )
+
+def test_known_jsonl_size_cap_applies_before_stream_read(tmp_path):
+    """Oversized fstat results must block the known-schema streaming path."""
+    from types import SimpleNamespace
+
+    from mempalace.fsio import open_source_file
+    from mempalace.normalize import normalize_conversations_with_mtime
+
+    source = tmp_path / "oversized.jsonl"
+    source.write_text('{"type":"session_meta","payload":{}}\n', encoding="utf-8")
+
+    def oversized_open(path):
+        fd, stat_result = open_source_file(path)
+        return fd, SimpleNamespace(
+            st_size=500 * 1024 * 1024 + 1,
+            st_mtime=stat_result.st_mtime,
+        )
+
+    with patch("mempalace.normalize.open_source_file", side_effect=oversized_open):
+        with pytest.raises(IOError, match="too large"):
+            normalize_conversations_with_mtime(str(source))
 
 
 # ── _extract_content ───────────────────────────────────────────────────
@@ -550,6 +537,115 @@ def test_codex_jsonl_skips_non_event_msg():
     assert "X" not in result.split("> Q")[0]
 
 
+def _codex_item(role, text, kind):
+    return json.dumps(
+        {
+            "type": "response_item",
+            "payload": {"type": "message", "role": role, "content": [{"type": kind, "text": text}]},
+        }
+    )
+
+
+def test_codex_jsonl_response_item_only_rollout():
+    """Codex 0.166 rollouts can carry the turns only as response_item messages."""
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        _codex_item("developer", "sandbox rules", "input_text"),
+        _codex_item("user", "<environment_context>cwd</environment_context>", "input_text"),
+        _codex_item("user", "Q", "input_text"),
+        _codex_item("assistant", "A", "output_text"),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result is not None
+    assert "> Q" in result
+    assert "A" in result
+    assert "sandbox rules" not in result
+    assert "environment_context" not in result
+
+
+def test_codex_jsonl_prefers_event_msg_over_response_item():
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {}}),
+        _codex_item("user", "Q", "input_text"),
+        json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}}),
+        _codex_item("assistant", "A", "output_text"),
+        json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}}),
+    ]
+    result = _try_codex_jsonl("\n".join(lines))
+    assert result.count("> Q") == 1
+
+
+def _codex_kinded_user(*blocks):
+    """A role=user response_item whose blocks carry Codex content kinds."""
+    return {
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text} for _, text in blocks],
+        "internal_chat_message_metadata_passthrough": {
+            "content_item_kinds": [kind for kind, _ in blocks],
+            "turn_id": "t1",
+        },
+    }
+
+
+def test_codex_kinds_skip_injected_context_without_a_known_prefix():
+    """Context kinds are skipped however the text opens, the prefix list notwithstanding."""
+    from mempalace.normalize import codex_response_message
+
+    for kind, text in (
+        ("goal.internal_context", "<codex_internal_context>goal</codex_internal_context>"),
+        ("additional_content.codex_apps_open_page", "<app_page>docs</app_page>"),
+        ("user.heartbeat", "<heartbeat>tick</heartbeat>"),
+        ("agents_md.instructions", "Project rules: always run the linter"),
+    ):
+        assert codex_response_message(_codex_kinded_user((kind, text))) is None, kind
+
+
+def test_codex_kinds_keep_user_text_and_drop_image_tags():
+    from mempalace.normalize import codex_response_message
+
+    payload = _codex_kinded_user(
+        ("user.text", "look at this"),
+        ("user.text", "<image name=[Image #1]>"),
+        ("user.image", "ignored"),
+        ("user.text", "</image>"),
+        ("environments.environment_context", "<environment_context>cwd</environment_context>"),
+    )
+    assert codex_response_message(payload) == ("user", "look at this")
+
+
+def test_codex_kinds_keep_user_text_that_opens_like_a_context_tag():
+    """With kinds present, a user's own words are kept even if they start like context."""
+    from mempalace.normalize import codex_response_message
+
+    payload = _codex_kinded_user(("user.text", "<user_instructions> is the tag I meant"))
+    assert codex_response_message(payload) == ("user", "<user_instructions> is the tag I meant")
+
+
+def test_codex_subagent_rollout_gets_no_response_item_fallback():
+    """A sub-agent's role=user messages come from another agent, not the user."""
+    meta = {"type": "session_meta", "payload": {"source": {"subagent": {"other": "guardian"}}}}
+    lines = [
+        json.dumps(meta),
+        json.dumps({"type": "response_item", "payload": _codex_kinded_user(("user.text", "Q"))}),
+        _codex_item("assistant", "A", "output_text"),
+    ]
+    assert _try_codex_jsonl("\n".join(lines)) is None
+    meta["payload"]["source"] = "vscode"
+    lines[0] = json.dumps(meta)
+    assert "> Q" in _try_codex_jsonl("\n".join(lines))
+
+
+def test_codex_kinds_that_do_not_line_up_fall_back_to_prefixes():
+    from mempalace.normalize import codex_response_message
+
+    payload = _codex_kinded_user(("user.text", "<environment_context>cwd</environment_context>"))
+    payload["internal_chat_message_metadata_passthrough"]["content_item_kinds"] = []
+    assert codex_response_message(payload) is None
+    payload["content"][0]["text"] = "plain question"
+    assert codex_response_message(payload) == ("user", "plain question")
+
+
 def test_codex_jsonl_non_string_message():
     lines = [
         json.dumps({"type": "session_meta"}),
@@ -821,7 +917,7 @@ class TestGeminiJson:
         assert "Why did the chicken cross the road?" in result
 
     def test_multi_part_text_joined(self):
-        """Multiple text parts within a single message are joined with spaces."""
+        """Text parts within one message concatenate as written, as Gemini reads them."""
         data = {
             "contents": [
                 {
@@ -836,7 +932,7 @@ class TestGeminiJson:
         }
         result = _try_gemini_json(data)
         assert result is not None
-        assert "Part one. Part two." in result
+        assert "Part one.Part two." in result
 
     def test_non_text_parts_skipped(self):
         """``inline_data`` / ``function_call`` parts are skipped; only ``text`` is extracted."""
@@ -1797,16 +1893,32 @@ def test_try_normalize_json_valid_but_unknown_schema():
 
 def test_messages_to_transcript_basic():
     msgs = [("user", "Q"), ("assistant", "A")]
-    with patch("mempalace.normalize.spellcheck_user_text", side_effect=lambda x: x, create=True):
-        result = _messages_to_transcript(msgs, spellcheck=False)
+    result = _messages_to_transcript(msgs)
     assert "> Q" in result
     assert "A" in result
+
+
+def test_messages_to_transcript_keeps_user_text_even_with_a_speller():
+    """User turns are never spell-corrected on the way to a transcript, even
+    when autocorrect is installed: correction is an opt-in miner step."""
+
+    class _Speller:
+        def __call__(self, word):
+            return {"knoe": "know", "befor": "before"}.get(word, word)
+
+    msgs = [("user", "i knoe the question befor"), ("assistant", "ok")]
+    with (
+        patch("mempalace.spellcheck._get_speller", return_value=_Speller()),
+        patch("mempalace.spellcheck._get_system_words", return_value=set()),
+    ):
+        result = _messages_to_transcript(msgs)
+    assert "> i knoe the question befor" in result
 
 
 def test_messages_to_transcript_consecutive_users():
     """Two user messages in a row (no assistant between)."""
     msgs = [("user", "Q1"), ("user", "Q2"), ("assistant", "A")]
-    result = _messages_to_transcript(msgs, spellcheck=False)
+    result = _messages_to_transcript(msgs)
     assert "> Q1" in result
     assert "> Q2" in result
 
@@ -1814,7 +1926,7 @@ def test_messages_to_transcript_consecutive_users():
 def test_messages_to_transcript_assistant_first():
     """Leading assistant message (no user before it)."""
     msgs = [("assistant", "preamble"), ("user", "Q"), ("assistant", "A")]
-    result = _messages_to_transcript(msgs, spellcheck=False)
+    result = _messages_to_transcript(msgs)
     assert "preamble" in result
     assert "> Q" in result
 
@@ -2033,11 +2145,8 @@ def test_normalize_rejects_large_file(tmp_path):
         st_size = 600 * 1024 * 1024
 
     with patch("mempalace.normalize.os.fstat", return_value=_HugeStat()):
-        try:
+        with pytest.raises(IOError, match="(?i)too large"):
             normalize(str(big))
-            assert False, "Should have raised IOError"
-        except IOError as e:
-            assert "too large" in str(e).lower()
 
 
 # ── strip_noise() — verbatim-safety boundary tests ─────────────────────
@@ -2172,12 +2281,15 @@ class TestStripNoiseRemovesSystemChrome:
             assert tag not in out, f"{tag} leaked into output"
             assert "Real." in out
 
-    def test_collapses_excessive_blank_lines(self):
+    def test_keeps_blank_lines_when_nothing_is_stripped(self):
         text = "line one\n\n\n\n\n\nline two"
+        assert strip_noise(text) == text
+
+    def test_collapses_the_blank_lines_a_removal_leaves(self):
+        text = "line one\n\n<system-reminder>\nnote\n</system-reminder>\n\n\n\nline two"
         out = strip_noise(text)
         assert "line one" in out
         assert "line two" in out
-        # Should collapse to no more than 3 newlines
         assert "\n\n\n\n" not in out
 
 
@@ -2291,3 +2403,80 @@ def test_pi_jsonl_invalid_lines_skipped():
     ]
     result = _try_pi_jsonl("\n".join(lines))
     assert result is not None
+
+
+# ── ChatGPT active branch / Slack null user (W1-09) ──────────────────
+
+
+def _chatgpt_node(node_id, parent, children, role=None, text=None):
+    message = None
+    if role is not None:
+        message = {"author": {"role": role}, "content": {"parts": [text]}}
+    return node_id, {"id": node_id, "parent": parent, "children": children, "message": message}
+
+
+def test_chatgpt_follows_the_branch_current_node_ends_on():
+    """A regenerated answer forks the tree; the export keeps both branches.
+    Only the branch ``current_node`` points at is the conversation the user
+    kept, so the abandoned first draft must not be filed."""
+    nodes = dict(
+        [
+            _chatgpt_node("root", None, ["u1"]),
+            _chatgpt_node("u1", "root", ["a_old", "a_new"], "user", "what is a palace"),
+            _chatgpt_node("a_old", "u1", ["u_old"], "assistant", "abandoned draft"),
+            _chatgpt_node("u_old", "a_old", [], "user", "abandoned follow-up"),
+            _chatgpt_node("a_new", "u1", ["u2"], "assistant", "kept answer"),
+            _chatgpt_node("u2", "a_new", ["a2"], "user", "and a drawer"),
+            _chatgpt_node("a2", "u2", [], "assistant", "kept second answer"),
+        ]
+    )
+    result = _try_chatgpt_json({"mapping": nodes, "current_node": "a2"})
+    assert result is not None
+    assert "kept answer" in result
+    assert "kept second answer" in result
+    assert "abandoned" not in result
+
+
+def test_chatgpt_without_current_node_still_walks_from_the_root():
+    nodes = dict(
+        [
+            _chatgpt_node("root", None, ["u1"]),
+            _chatgpt_node("u1", "root", ["a1"], "user", "hello"),
+            _chatgpt_node("a1", "u1", [], "assistant", "hi there"),
+        ]
+    )
+    result = _try_chatgpt_json({"mapping": nodes})
+    assert "> hello" in result
+    assert "hi there" in result
+
+
+@pytest.mark.parametrize("current_node", ["root", "missing", "u1"])
+def test_chatgpt_falls_back_to_the_root_walk_when_current_node_is_too_short(current_node):
+    """A current_node that is the root, unknown, or too early to hold an
+    exchange must not lose the conversation: the root walk still files it."""
+    nodes = dict(
+        [
+            _chatgpt_node("root", None, ["u1"]),
+            _chatgpt_node("u1", "root", ["a1"], "user", "hello"),
+            _chatgpt_node("a1", "u1", [], "assistant", "hi there"),
+        ]
+    )
+    result = _try_chatgpt_json({"mapping": nodes, "current_node": current_node})
+    assert result is not None
+    assert "> hello" in result
+    assert "hi there" in result
+
+
+def test_slack_null_user_is_filed_as_unknown():
+    """Slack exports carry ``"user": null`` for bots and deleted accounts.
+    Those turns are kept under "unknown" instead of aborting the parse."""
+    data = [
+        {"type": "message", "user": "U1", "text": "first"},
+        {"type": "message", "user": None, "text": "from a deleted account"},
+        {"type": "message", "user": "U1", "text": None},
+        {"type": "message", "user": "U2", "text": "reply"},
+    ]
+    result = _try_slack_json(data)
+    assert result is not None
+    assert "[unknown] from a deleted account" in result
+    assert "[U2] reply" in result

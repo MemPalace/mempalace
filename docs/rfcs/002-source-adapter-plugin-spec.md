@@ -237,8 +237,8 @@ Adapters MAY define their own transformation names for behaviors the reserved li
 
 | Module | Declared transformations |
 |---|---|
-| `filesystem` (current `miner.py`) | `utf8_replace_invalid`, `whitespace_trim` |
-| `conversations` (current `convo_miner.py` + `normalize.py`) | `utf8_replace_invalid`, `newline_normalize`, `line_trim`, `line_join_spaces`, `blank_line_drop`, `whitespace_collapse_internal`, `strip_tool_chrome`, `tool_result_truncate`, `tool_result_omitted`, `spellcheck_user`, `synthesized_marker`, `speaker_role_assignment` |
+| `filesystem` (current `miner.py`) | `newline_normalize`, `whitespace_trim` |
+| `conversations` (current `convo_miner.py` + `normalize.py`) | `newline_normalize`, `line_trim`, `line_join_spaces`, `blank_line_drop`, `whitespace_collapse_internal`, `strip_tool_chrome`, `tool_result_truncate`, `tool_result_omitted`, `spellcheck_user`, `synthesized_marker`, `speaker_role_assignment`, `conversations.tool_input_summarize`, `conversations.content_block_drop` |
 
 The filesystem adapter is nearly byte-preserving today; the conversations adapter is extensively transformed. Both are honest after this spec lands because both are fully declared.
 
@@ -574,7 +574,7 @@ This aligns with the existing architecture in `CLAUDE.md` ("Knowledge Graph: ENT
 
 ### 5.6 Source encoding and newline
 
-Current ingesters handle encoding lossily (`errors="replace"` in `miner.py:595` and `normalize.py:124`) and do not record original encoding. The spec does **not** require per-drawer `source_encoding` / `source_newline` — most runs are uniform UTF-8 / LF, and storing the same value on every drawer wastes bytes.
+The in-tree ingesters decode without loss through `fsio.decode_source`, so no byte becomes U+FFFD. Valid UTF-8 is read as is (a byte-order mark is dropped). A file that is UTF-8 apart from stray bytes, meaning it has a byte-order mark or its valid multi-byte characters outnumber its stray bytes, keeps its UTF-8 text and holds each stray byte as a lone surrogate U+DC80-U+DCFF (`surrogateescape`), which the stored-text layer keeps reversibly. Only a file with no UTF-8 in it at all is read as a legacy encoding: WHATWG windows-1252, with its five undefined bytes as the C1 controls of the same number. A drawer whose source was not plain UTF-8 carries `source_encoding`: `utf-8-sig`, `utf-8+surrogateescape`, `utf-8-sig+surrogateescape` or `windows-1252`. `fsio.encode_source(text, source_encoding)` gives the source bytes back. The spec does **not** require per-drawer `source_encoding` / `source_newline` — most runs are uniform UTF-8 / LF, and storing the same value on every drawer wastes bytes.
 
 Instead: adapters that handle non-UTF-8 or non-LF sources record the values once on the adapter's `SourceSummary` and per-drawer only when a specific drawer diverges from the adapter default. The `utf8_replace_invalid` declared transformation (§1.4) already communicates that lossy decoding happened; specific drawer-level provenance is opt-in.
 

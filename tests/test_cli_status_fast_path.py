@@ -46,7 +46,7 @@ class _LegacyCollection:
 @pytest.fixture
 def _stub_deps(monkeypatch):
     monkeypatch.setattr(
-        "mempalace.backends.chroma._sqlite_wing_room_counts",
+        "mempalace.backends.chroma_sqlite._sqlite_wing_room_counts",
         lambda palace_path, collection_name: None,
     )
     monkeypatch.setattr(

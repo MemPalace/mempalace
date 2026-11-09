@@ -9,7 +9,6 @@ stay discoverable under the new name, merging collisions. IDs are left untouched
 
 from mempalace.migrate import migrate_wing_names, plan_wing_renames
 
-
 # --- pure planner ---------------------------------------------------------
 
 

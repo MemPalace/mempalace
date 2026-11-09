@@ -11,10 +11,10 @@ import argparse
 import ast
 import html
 import json
-from pathlib import Path
 import re
 import sys
 import unicodedata
+from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 try:

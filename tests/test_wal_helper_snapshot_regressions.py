@@ -5,8 +5,6 @@ import os
 import sqlite3
 
 import pytest
-
-from mempalace.backends import _inproc_sqlite
 from test_inproc_sqlite_locks import (
     _EXTERNAL_CLOSE,
     _EXTERNAL_SQLITE_WRITE,
@@ -20,6 +18,8 @@ from test_inproc_sqlite_locks import (
     _run,
     _sidecar_inodes,
 )
+
+from mempalace.backends import _inproc_sqlite
 
 
 def _force_helper(monkeypatch):

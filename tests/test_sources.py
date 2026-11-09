@@ -35,7 +35,6 @@ from mempalace.sources.transforms import (
     whitespace_trim,
 )
 
-
 # ---------------------------------------------------------------------------
 # Minimal conforming adapter used as a fixture across tests
 # ---------------------------------------------------------------------------
