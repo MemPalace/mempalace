@@ -329,6 +329,78 @@ class TestPalaceReadsDoNotStarveTheHub:
         assert search_at < names.index("m:file2:end"), "the read waited for the whole mine"
         assert names[search_at - 1].endswith(":end"), f"read ran inside a file: {names}"
 
+    def test_reader_progress_inside_cpu_phase_does_not_admit_mutation(
+        self, http_server, monkeypatch
+    ):
+        """An HTTP mine's CPU handoff permits a search, not a competing write."""
+        from mempalace.palace import mine_yield_readers_point
+
+        port, _ = http_server
+        cpu_started = threading.Event()
+        resume_cpu = threading.Event()
+        finish_mine = threading.Event()
+        read_ran = threading.Event()
+        other_write_ran = threading.Event()
+        errors = []
+
+        def in_cpu_mine(**_kwargs):
+            cpu_started.set()
+            assert resume_cpu.wait(timeout=5)
+            assert mine_yield_readers_point() is True
+            assert not other_write_ran.is_set()
+            assert finish_mine.wait(timeout=5)
+            return {"success": True}
+
+        def read(**_kwargs):
+            read_ran.set()
+            return {"query": "needle", "results": []}
+
+        def other_write(**_kwargs):
+            other_write_ran.set()
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", in_cpu_mine)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", read)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_add_drawer"], "handler", other_write)
+
+        def call(name, args, request_id):
+            try:
+                self._call(port, name, args, req_id=request_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        mine_thread = threading.Thread(
+            target=call, args=("mempalace_mine", {"source": "project"}, 951), daemon=True
+        )
+        read_thread = threading.Thread(
+            target=call, args=("mempalace_search", {"query": "needle"}, 952), daemon=True
+        )
+        write_thread = threading.Thread(
+            target=call, args=("mempalace_add_drawer", {"text": "x"}, 953), daemon=True
+        )
+        mine_thread.start()
+        assert cpu_started.wait(timeout=5)
+        read_thread.start()
+        deadline = time.monotonic() + 5
+        while mcp._HTTP_REQUEST_LOCK._waiting_readers == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert mcp._HTTP_REQUEST_LOCK._waiting_readers > 0
+
+        write_thread.start()
+        try:
+            resume_cpu.set()
+            assert read_ran.wait(timeout=5), "a reader was not served inside hallway CPU work"
+            assert not other_write_ran.is_set(), "a competing mutation slipped into CPU work"
+        finally:
+            finish_mine.set()
+            resume_cpu.set()
+            mine_thread.join(timeout=5)
+            read_thread.join(timeout=5)
+            write_thread.join(timeout=5)
+        assert not any(t.is_alive() for t in (mine_thread, read_thread, write_thread))
+        assert other_write_ran.is_set()
+        assert not errors, errors
+
     def test_a_second_mine_waits_for_the_first(self, http_server, monkeypatch):
         port, _ = http_server
         log: list = []
