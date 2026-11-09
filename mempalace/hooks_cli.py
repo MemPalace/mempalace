@@ -1834,10 +1834,8 @@ def _clear_session_last_save(session_id: str) -> None:
         (STATE_DIR / f"{session_id}_last_save").unlink()
     except OSError:
         pass
-    try:
-        (STATE_DIR / f"{session_id}_last_save.lock").unlink()
-    except OSError:
-        pass
+    # The ``.lock`` file stays: a checkpoint child may still hold it, and a
+    # new writer would lock a fresh inode beside it and roll the marker back.
 
 
 def hook_session_end(data: dict, harness: str):

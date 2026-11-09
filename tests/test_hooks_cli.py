@@ -835,6 +835,60 @@ def test_save_marker_compare_and_write_is_atomic_across_writers(tmp_path):
     assert (tmp_path / "s_last_save").read_text(encoding="utf-8") == "45"
 
 
+def _old_marker_writer(state_dir, has_read, release):
+    """Spawned writer: take the real marker lock, read, pause, then write 30."""
+    hooks_cli_mod.STATE_DIR = Path(state_dir)
+    real_read = hooks_cli_mod._read_save_marker
+
+    def read_then_pause(marker):
+        value = real_read(marker)
+        has_read.set()
+        release.wait(10)
+        return value
+
+    hooks_cli_mod._read_save_marker = read_then_pause
+    hooks_cli_mod._advance_save_marker("s", 30)
+
+
+def _new_marker_writer(state_dir):
+    hooks_cli_mod.STATE_DIR = Path(state_dir)
+    hooks_cli_mod._advance_save_marker("s", 45)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock follows the inode")
+def test_session_end_cleanup_keeps_the_marker_lock_a_writer_still_holds(tmp_path):
+    """A checkpoint child can outlive SessionEnd. If cleanup unlinks the lock
+    file, a new writer locks a fresh inode and runs beside the old child,
+    which then rolls the marker back from 45 to 30."""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    has_read = ctx.Event()
+    release = ctx.Event()
+    (tmp_path / "s_last_save").write_text("15", encoding="utf-8")
+    old = ctx.Process(target=_old_marker_writer, args=(str(tmp_path), has_read, release))
+    new = ctx.Process(target=_new_marker_writer, args=(str(tmp_path),))
+    try:
+        old.start()
+        assert has_read.wait(30), "old writer never took the lock"
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            hooks_cli_mod._clear_session_last_save("s")
+        new.start()
+        new.join(3)  # with the lock kept, it waits here for the old writer
+        release.set()
+        old.join(30)
+        new.join(30)
+        assert old.exitcode == 0 and new.exitcode == 0
+    finally:
+        release.set()
+        for proc in (old, new):
+            if proc.is_alive():
+                proc.terminate()
+            if proc.pid is not None:
+                proc.join(5)
+    assert (tmp_path / "s_last_save").read_text(encoding="utf-8") == "45"
+
+
 def test_ingest_transcript_reports_spawn_failure_as_not_dispatched(tmp_path):
     transcript = tmp_path / "session.jsonl"
     transcript.write_text("x" * 200)
