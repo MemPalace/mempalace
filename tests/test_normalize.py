@@ -83,7 +83,6 @@ def test_normalize_whitespace_only(tmp_path):
     assert result.strip() == ""
 
 
-
 def test_known_jsonl_streams_preserve_current_parsers_and_mtime(tmp_path):
     """Both public entry points stream known formats without full-file reads."""
     from mempalace.normalize import normalize_conversations_with_mtime
@@ -150,9 +149,7 @@ def test_known_jsonl_stream_avoids_full_source_memory_copies(tmp_path):
 
     source = tmp_path / "long-codex.jsonl"
     ignored = (
-        json.dumps(
-            {"type": "response_item", "payload": {"type": "reasoning", "text": "x" * 2048}}
-        )
+        json.dumps({"type": "response_item", "payload": {"type": "reasoning", "text": "x" * 2048}})
         + "\n"
     )
     with source.open("w", encoding="utf-8") as stream:
@@ -164,9 +161,7 @@ def test_known_jsonl_stream_avoids_full_source_memory_copies(tmp_path):
             + "\n"
         )
         stream.write(
-            json.dumps(
-                {"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}}
-            )
+            json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}})
             + "\n"
         )
     assert source.stat().st_size >= 12 * 1024 * 1024
@@ -200,7 +195,6 @@ def test_known_jsonl_size_cap_applies_before_stream_read(tmp_path):
     with patch("mempalace.normalize.open_source_file", side_effect=oversized_open):
         with pytest.raises(IOError, match="too large"):
             normalize_conversations_with_mtime(str(source))
-
 
 
 # ── _extract_content ───────────────────────────────────────────────────

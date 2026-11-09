@@ -176,7 +176,6 @@ def _read_transcript_file_with_mtime(filepath: str) -> Tuple[str, float]:
     return text, mtime
 
 
-
 @contextmanager
 def _open_jsonl_lines(filepath: str):
     """Open validated UTF-8 JSONL with the mtime from the initial fstat."""
@@ -187,8 +186,7 @@ def _open_jsonl_lines(filepath: str):
     with os.fdopen(fd, "rb") as raw:
         if st.st_size > _MAX_TRANSCRIPT_BYTES:
             raise IOError(
-                f"Could not read {filepath}: file too large "
-                f"({st.st_size // (1024 * 1024)} MB)"
+                f"Could not read {filepath}: file too large ({st.st_size // (1024 * 1024)} MB)"
             )
         bom = raw.read(3) == b"\xef\xbb\xbf"
         raw.seek(0)
