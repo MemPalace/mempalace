@@ -18,7 +18,6 @@ from mempalace.convo_miner import (
 from mempalace.palace import _source_file_delete_ids, file_already_mined
 
 
-
 def test_normalization_failure_remains_retryable_without_registry_sentinel(
     tmp_path, monkeypatch
 ):
@@ -42,7 +41,6 @@ def test_normalization_failure_remains_retryable_without_registry_sentinel(
         )
         is None
     )
-
 
 
 class TestChunkExchanges:
