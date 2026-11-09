@@ -133,13 +133,14 @@ canonical UX and what we recommend.
    `antigravity_hook.log` — `count` and `interval` should both be
    visible. Mining only triggers when `count % interval == 0`.
 2. Ensure a Python that can import `mempalace` is reachable. The hook
-   runs `"$MEMPAL_PYTHON_BIN" -m mempalace`, where `MEMPAL_PYTHON_BIN`
-   is resolved (in order) from `$MEMPAL_PYTHON`, the
+   runs mempalace through `"$MEMPAL_PYTHON_BIN"` (with `PYTHONSAFEPATH=1`
+   and a launcher that never imports from the workspace), where
+   `MEMPAL_PYTHON_BIN` is resolved (in order) from `$MEMPAL_PYTHON`, the
    `mempalace-mcp` / `mempalace` console-script shebang on `$PATH`,
    then `python3`. A failed probe logs:
 
    ```
-   ERROR: mempalace is not runnable via <python> -m mempalace; install mempalace or set MEMPAL_PYTHON
+   ERROR: mempalace is not runnable via <python>; install mempalace or set MEMPAL_PYTHON
    ```
 
    On a GUI-launched Antigravity the harness `PATH` may differ from

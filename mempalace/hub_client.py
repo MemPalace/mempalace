@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 from typing import Mapping
 
+from . import _net
 from ._env import env_bool, env_str
 from .stored_text import EXACT_WIRE_HEADER, dumps_internal
 
@@ -18,6 +19,10 @@ logger = logging.getLogger(__name__)
 HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
 HUB_PROXY_TIMEOUT_S = 600.0
 HUB_HEALTH_TIMEOUT_S = 0.75
+# A hook-budgeted caller cannot wait the proxy's 600 s, but a palace write
+# queues behind whatever the hub is already running, so this is long enough
+# that a slow-but-live hub is not mistaken for a dead one.
+HUB_TOOL_TIMEOUT_S = 120.0
 
 # Every setting that changes what a hub search returns, as
 # (MempalaceConfig attribute, env vars that override it, scope). The CLI keeps
@@ -221,7 +226,7 @@ class HubClient:
         """Whether ``/healthz`` answers 200 within ``timeout``."""
         request = urllib.request.Request(f"{self.base_url}/healthz", headers=hub_request_headers())
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with _net.urlopen(request, timeout=timeout) as response:
                 return response.status == 200
         except (urllib.error.URLError, OSError, ValueError):
             return False
@@ -258,14 +263,16 @@ class HubClient:
         from . import server_registry
 
         *earlier, last = server_registry.load_server_tokens(self.palace_path) or ("",)
+        # ``_net.urlopen`` follows no redirect: the token travels only to the
+        # hub recorded in serverinfo.json, never to wherever a reply points.
         for token in earlier:
             try:
-                return urllib.request.urlopen(self._request(url, body, token), timeout=timeout)
+                return _net.urlopen(self._request(url, body, token), timeout=timeout)
             except urllib.error.HTTPError as exc:
                 if exc.code != 401:
                     raise
                 exc.close()
-        return urllib.request.urlopen(self._request(url, body, last), timeout=timeout)
+        return _net.urlopen(self._request(url, body, last), timeout=timeout)
 
     @staticmethod
     def _request(url: str, body: bytes, token: str):
@@ -281,3 +288,60 @@ def tool_result(payload: Mapping):
     Raises KeyError, IndexError, TypeError or ValueError when it has none.
     """
     return json.loads(payload["result"]["content"][0]["text"])
+
+
+def forward_tool_call(
+    palace_path: str | None,
+    tool_name: str,
+    arguments: Mapping[str, object],
+    *,
+    timeout: float = HUB_TOOL_TIMEOUT_S,
+) -> tuple[bool, dict | None]:
+    """Run one MCP tool in the palace's live, writable hub.
+
+    Returns ``(handled, result)``, and the first element is the whole contract:
+
+    - ``(False, None)``: no writable hub is serving this palace, so the caller
+      still has the write to do itself.
+    - ``(True, result)``: the hub answered. ``result`` is the tool's own return
+      value, a ``{"success": False, ...}`` refusal included.
+    - ``(True, None)``: the hub accepted the request but did not answer in a
+      shape this client can read. The write may have landed, so the caller must
+      not repeat it.
+
+    A live hub holds the palace writer lease for its lifetime, so once one is
+    answering an in-process write would be refused anyway. A failure after the
+    health probe therefore reports ``handled=True`` instead of inviting a retry
+    that could file the same verbatim content twice. HTTP 401 is the exception:
+    the hub's auth gate rejects it before dispatch, so the write is left to the
+    caller.
+    """
+    hub = HubClient.discover(palace_path)
+    if hub is None or hub.read_only or not hub.healthy():
+        return False, None
+    try:
+        payload = hub.call_tool(tool_name, arguments, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code == 401:
+            return False, None
+        return True, {"success": False, "error": f"hub refused {tool_name} ({exc.code})"}
+    except Exception:
+        logger.debug("hub tool call %s did not complete", tool_name, exc_info=True)
+        return True, None
+    if not isinstance(payload, dict):
+        logger.debug("hub returned no usable %s response", tool_name)
+        return True, None
+    error = payload.get("error")
+    if error:
+        message = error.get("message") if isinstance(error, dict) else None
+        return True, {"success": False, "error": message or "unknown error"}
+    try:
+        result = tool_result(payload)
+    except (KeyError, IndexError, TypeError, ValueError):
+        logger.debug("hub returned an unrecognized %s response", tool_name)
+        return True, None
+    if not isinstance(result, dict):
+        logger.debug("hub returned a non-mapping %s result", tool_name)
+        return True, None
+    return True, result
