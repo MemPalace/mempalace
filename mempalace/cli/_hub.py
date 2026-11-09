@@ -122,6 +122,17 @@ def _print_hub_search_result(args, result: dict) -> bool:
     return True
 
 
+def _abort_live_hub_search(reason: str) -> None:
+    """Reject a second HNSW load when a compatible live hub cannot serve us."""
+    print(
+        f"mempalace: {reason}; not falling back to a local search because that "
+        "would load a second HNSW index. Fix the hub credentials or health, "
+        f"or set {_HUB_FORWARD_ENV}=0 to explicitly opt into a direct search.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _forward_search_to_hub(args, palace_path: str) -> bool:
     """Run a CLI search in the palace's HTTP hub, if one is alive.
 
@@ -135,8 +146,12 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
     hub = HubClient.discover(palace_path, include_self=True)
     if hub is None or "search_cli_compatible" not in hub.capabilities:
         return False
-    if not search_fingerprint_matches(hub.info, palace_path) or not hub.healthy():
+    # A compatible, configuration-matching hub already owns the palace index.
+    # A transient health failure must not cold-load a second copy.
+    if not search_fingerprint_matches(hub.info, palace_path):
         return False
+    if not hub.healthy():
+        _abort_live_hub_search("the registered palace hub is not responding")
 
     arguments = {
         "query": args.query,
@@ -152,11 +167,9 @@ def _forward_search_to_hub(args, palace_path: str) -> bool:
         payload = hub.call_tool("mempalace_search", arguments, timeout=_HUB_SEARCH_TIMEOUT_S)
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
-            # Authentication failed before the Hub accepted the search, so
-            # direct execution is still safe. This covers Hubs started with
-            # an explicit/env token that is intentionally not persisted in
-            # the per-palace token file, as well as a stale local token.
-            return False
+            # Authentication was refused before dispatch, but the hub still
+            # owns the palace index. Retrying locally would duplicate its RSS.
+            _abort_live_hub_search("the registered palace hub rejected authentication")
         print(f"mempalace: hub rejected search ({exc.code} {exc.reason})", file=sys.stderr)
         sys.exit(1)
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
