@@ -23,8 +23,11 @@ def _write_session(path, label, count=3):
     turns = []
     for index in range(count):
         turns.append(
-            f"> {label} question {index} " + "asked " * 30 + "\n"
-            + f"{label} answer {index} " + "verbatim " * 45
+            f"> {label} question {index} "
+            + "asked " * 30
+            + "\n"
+            + f"{label} answer {index} "
+            + "verbatim " * 45
         )
     path.write_text("\n\n".join(turns) + "\n", encoding="utf-8")
 
