@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `mempalace serve` binds its HTTP server without resolving the bind address
+  back to a name. `http.server` does that lookup on every bind, and on a host
+  with slow or absent reverse DNS for the address it blocked startup until the
+  resolver gave up (35 s on one hosted CI runner), which looked like the server
+  never coming up. The daemon's server already skipped the lookup; both now
+  share one bind step.
+
 ---
 
 ## [3.12.0] — 2026-11-09
