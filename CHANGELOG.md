@@ -25,6 +25,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   metadata skip messages that open with a known context tag. Sub-agent
   rollouts are not read this way: their user messages are written by another
   agent, and Codex's reviewer is handed whole transcripts of other sessions.
+- The Anthropic provider no longer sends `temperature`, which current Claude
+  models reject with HTTP 400, so `rooms propose` and `kg normalize` failed on
+  them; a caller can still pass one. The output budget is 8192 tokens instead
+  of 2048 and can be set with `max_tokens`, and an answer cut off at the budget
+  now says so instead of failing as a JSON parse error.
 - Stop and PreCompact diary checkpoints are filed through a running
   `mempalace serve` hub. The hub holds the palace writer lease for its whole
   lifetime, so the checkpoint's own write was refused for as long as a hub
