@@ -52,10 +52,6 @@ def _mine(source_dir, palace_path):
     mine_convos(str(source_dir), palace_path, wing="sessions", extract_mode="exchange")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="P1: positional-ID upsert can overwrite prior verbatim text before batch failure",
-)
 def test_second_batch_failure_preserves_every_previous_document(tmp_path, monkeypatch):
     """Crash after one successful changed-chunk upsert must not destroy history."""
     source_dir = tmp_path / "sessions"
@@ -89,13 +85,15 @@ def test_second_batch_failure_preserves_every_previous_document(tmp_path, monkey
     assert writes >= 2, "test did not reach the intended failure window"
 
     # IDs/counts alone are insufficient: compare the actual original text.
-    assert before.issubset(_documents(palace_path, session))
+    after = _documents(palace_path, session)
+    if not before.issubset(after):
+        pytest.xfail(
+            "P1 reproduced: the first changed batch overwrote verbatim text from "
+            "the last published generation"
+        )
+    assert before.issubset(after)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Issue #1593: ordinary re-mine still overwrites/prunes earlier conversation versions",
-)
 def test_successful_rewrite_is_additive_in_verbatim_conversation_history(tmp_path):
     """A successful transcript rewrite must preserve prior authored content."""
     source_dir = tmp_path / "sessions"
@@ -111,5 +109,10 @@ def test_successful_rewrite_is_additive_in_verbatim_conversation_history(tmp_pat
     _touch_after_write(session)
     _mine(source_dir, palace_path)
     after = _documents(palace_path, session)
-    assert previous.issubset(after)
     assert any("replacement question" in text for text in after)
+    if not previous.issubset(after):
+        pytest.xfail(
+            "Issue #1593 reproduced: successful re-mine pruned/overwrote "
+            "the previous authored conversation"
+        )
+    assert previous.issubset(after)
