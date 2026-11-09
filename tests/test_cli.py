@@ -32,6 +32,25 @@ from mempalace.cli import (
 )
 from mempalace.palace import MineAlreadyRunning
 
+
+@pytest.fixture(autouse=True)
+def _no_llm_probe(monkeypatch):
+    """Answer ``cmd_init``'s Ollama probe in process.
+
+    Init probes the default Ollama port unless ``--no-llm`` is given, and most
+    ``Namespace`` objects here leave that out. With nothing listening, the
+    probe is a refused connection, which Windows reports only after about
+    1.3 s of SYN retransmits per address: each init test cost 4 s on the
+    Windows runner. The stub also keeps the tests on one path whether or not
+    a developer's machine happens to run Ollama.
+    """
+    from mempalace.llm_client import OllamaProvider
+
+    monkeypatch.setattr(
+        OllamaProvider, "check_available", lambda self: (False, "no LLM provider in tests")
+    )
+
+
 # ── CLI entry point: PYTHONPATH stripping ────────────────────────────────
 
 
