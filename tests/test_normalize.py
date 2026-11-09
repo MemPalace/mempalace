@@ -181,26 +181,23 @@ def test_known_jsonl_stream_avoids_full_source_memory_copies(tmp_path):
 
 
 def test_known_jsonl_size_cap_applies_before_stream_read(tmp_path):
-    """A forged oversized fstat still blocks the recognized streaming path."""
+    """Oversized fstat results must block the known-schema streaming path."""
+    from types import SimpleNamespace
+
+    from mempalace.fsio import open_source_file
     from mempalace.normalize import normalize_conversations_with_mtime
 
     source = tmp_path / "oversized.jsonl"
     source.write_text('{"type":"session_meta","payload":{}}\n', encoding="utf-8")
-    real_fstat = __import__("os").fstat
 
-    def oversized_stat(fd):
-        from types import SimpleNamespace
-
-        actual = real_fstat(fd)
-        return SimpleNamespace(st_size=500 * 1024 * 1024 + 1, st_mtime=actual.st_mtime)
-
-    with patch("mempalace.normalize.open_source_file") as opened:
-        import os
-
-        opened.side_effect = lambda path: (
-            os.open(path, os.O_RDONLY),
-            oversized_stat(os.open(path, os.O_RDONLY)),
+    def oversized_open(path):
+        fd, stat_result = open_source_file(path)
+        return fd, SimpleNamespace(
+            st_size=500 * 1024 * 1024 + 1,
+            st_mtime=stat_result.st_mtime,
         )
+
+    with patch("mempalace.normalize.open_source_file", side_effect=oversized_open):
         with pytest.raises(IOError, match="too large"):
             normalize_conversations_with_mtime(str(source))
 
