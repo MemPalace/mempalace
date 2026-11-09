@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **`hooks.mine_transcript` now turns off the hooks' transcript mine.** A config file could set the key, but nothing read it, so the only way to stop archiving every session verbatim was to turn off `hooks.auto_save` and lose the diary checkpoints with it. The Stop, SessionEnd and PreCompact hooks now skip the transcript mine when it is false and keep filing checkpoints; PreCompact files a checkpoint in place of the mine. (#2403)
+- **A failed diary checkpoint no longer re-fires the transcript mine on every Stop.** The Stop hook's save marker advanced only when the diary filed, while the transcript mine ran either way, inline or in the queued checkpoint child. When the diary kept failing (no writable hub and the local lock refused), every Stop started another full mine. The marker now advances when the diary filed or the mine is in flight, including a mine that is already running, stays put when nothing succeeded, and never moves backwards. (#2403)
+
 ---
 
 ## [3.12.0] — 2026-11-09

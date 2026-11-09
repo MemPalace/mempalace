@@ -1040,6 +1040,7 @@ def run_detached_diary_checkpoint(payload_path: str) -> None:
     from .miner import _arm_hook_mine_exit_watchdog, _cleanup_mine_pid_file
 
     exit_code = 0
+    filed = False
     try:
         path = Path(payload_path)
         try:
@@ -1049,7 +1050,7 @@ def run_detached_diary_checkpoint(payload_path: str) -> None:
             payload = None
         try:
             if payload is not None:
-                _apply_diary_checkpoint(payload)
+                filed = _apply_diary_checkpoint(payload)
         finally:
             try:
                 path.unlink()
@@ -1061,7 +1062,10 @@ def run_detached_diary_checkpoint(payload_path: str) -> None:
         with _hook_write_routing_context():
             transcript = payload.get("ingest_transcript")
             if isinstance(transcript, str) and transcript:
-                _ingest_transcript(transcript)
+                # A failed diary with the mine in flight still advances the
+                # marker, or every Stop would queue another full mine.
+                if _ingest_transcript(transcript) and not filed:
+                    _advance_payload_save_marker(payload)
             _maybe_auto_ingest()
     except SystemExit as exc:
         exit_code = (
@@ -1122,6 +1126,30 @@ def _diary_write_in_process(arguments: dict) -> dict:
     return result
 
 
+def _advance_save_marker(session_id: str, exchange_count) -> None:
+    """Move the Stop hook's save marker forward to ``exchange_count``.
+
+    Never moves it back: a checkpoint child that finishes after a newer Stop
+    already advanced the marker would otherwise re-arm a save.
+    """
+    if not isinstance(exchange_count, int) or isinstance(exchange_count, bool):
+        return
+    marker = STATE_DIR / f"{_sanitize_session_id(session_id)}_last_save"
+    try:
+        if int(marker.read_text(encoding="utf-8").strip()) >= exchange_count:
+            return
+    except (OSError, ValueError):
+        pass
+    try:
+        marker.write_text(str(exchange_count), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _advance_payload_save_marker(payload: dict) -> None:
+    _advance_save_marker(str(payload.get("session_id") or "unknown"), payload.get("exchange_count"))
+
+
 def _apply_diary_checkpoint(payload: dict) -> bool:
     """File the checkpoint and write its ack.
 
@@ -1168,15 +1196,7 @@ def _apply_diary_checkpoint(payload: dict) -> bool:
         )
     except OSError:
         pass
-    exchange_count = payload.get("exchange_count")
-    if isinstance(exchange_count, int) and not isinstance(exchange_count, bool):
-        session_id = _sanitize_session_id(str(payload.get("session_id") or "unknown"))
-        try:
-            (STATE_DIR / f"{session_id}_last_save").write_text(
-                str(exchange_count), encoding="utf-8"
-            )
-        except OSError:
-            pass
+    _advance_payload_save_marker(payload)
     if payload.get("toast"):
         _desktop_toast(f"Checkpoint saved \u2014 {messages_folded} messages archived")
     return True
@@ -1321,26 +1341,35 @@ def _save_diary_direct(
     return {"drawers_filed": 0, "messages_folded": 0}
 
 
-def _ingest_transcript(transcript_path: str):
-    """Mine a Claude Code session transcript into the palace as a conversation."""
+def _ingest_transcript(transcript_path: str) -> bool:
+    """Mine a Claude Code session transcript into the palace as a conversation.
+
+    Returns True only when the mine is in flight: handed to the daemon,
+    spawned, or already running. Callers advance the Stop hook's save marker
+    on it, so anything else, including a mine that is turned off, returns
+    False and leaves a failed diary checkpoint to retry at the next fire.
+    """
     path = _validate_transcript_path(transcript_path)
     if path is None:
-        return
+        return False
     try:
         if not path.is_file() or path.stat().st_size < 100:
-            return
+            return False
     except OSError:
-        return
+        return False
 
     try:
-        MempalaceConfig()  # validate config loads
+        # Also validates that config loads at all.
+        if not MempalaceConfig().hooks_mine_transcript:
+            _log("Transcript ingest skipped (hooks.mine_transcript is false)")
+            return False
     except Exception:
-        return
+        return False
 
     routing = _current_hook_write_routing()
     if routing.blocked:
         _log_hook_write_blocked(routing, "transcript ingest")
-        return
+        return False
 
     wing = _project_wing(str(path))
     try:
@@ -1357,24 +1386,29 @@ def _ingest_transcript(transcript_path: str):
                     dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
                     wait=False,
                 )
-                _log(f"Transcript ingest submitted to daemon: {path.name}")
             except Exception as exc:
                 # Daemon accepted context — don't fall back (would double-mine).
+                # The dedupe key makes a resubmit at the next fire safe.
                 _log(f"Daemon transcript ingest failed: {exc}")
-            return
+                return False
+            _log(f"Transcript ingest submitted to daemon: {path.name}")
+            return True
 
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
         # in here too — repeated Stop/PreCompact fires for the same
-        # transcript should not stack up parallel ingest mines.
-        _spawn_mine(_mempalace_command("mine", str(path), "--mode", "convos", "--wing", wing))
-        _log(f"Transcript ingest started: {path.name} -> {wing}")
+        # transcript should not stack up parallel ingest mines. A False
+        # return means a live mine already holds the slot: still in flight.
+        if _spawn_mine(_mempalace_command("mine", str(path), "--mode", "convos", "--wing", wing)):
+            _log(f"Transcript ingest started: {path.name} -> {wing}")
+        return True
     except OSError:
-        pass
+        return False
     except Exception as exc:
         # Non-daemon ingest spawn path failed. Hooks must never crash the
         # user's shell — log and continue (not a daemon failure; the daemon
         # block above handles its own errors).
         _log(f"transcript ingest hook failed: {exc}")
+        return False
 
 
 SUPPORTED_HARNESSES = {"claude-code", "codex", "dsh"}
@@ -1673,23 +1707,24 @@ def hook_stop(data: dict, harness: str):
                         exchange_count=exchange_count,
                     )
                 queued = result.get("checkpoint_queued", False)
+                ingest_in_flight = False
                 if not queued:
                     if transcript_path:
-                        _ingest_transcript(transcript_path)
+                        ingest_in_flight = _ingest_transcript(transcript_path)
                     _maybe_auto_ingest()
-                # Only advance the save marker after a genuine drawer was filed
-                #: the legacy "count" was the compressed-message count and
-                # was misread as a storage count. Report each unit truthfully. A
-                # queued checkpoint's child advances the marker once it has filed.
+                # Advance the save marker when a drawer was filed OR the
+                # transcript ingest is in flight. Gating it on the diary alone
+                # meant a diary that kept failing re-fired the full transcript
+                # mine on every Stop. Only when nothing succeeded does the
+                # marker stay put, so the next Stop retries. A queued
+                # checkpoint's child advances the marker itself.
                 drawers_filed = result.get("drawers_filed", 0)
                 messages_folded = result.get("messages_folded", 0)
                 themes = result.get("themes", [])
                 tag = " \u2014 " + ", ".join(themes) if themes else ""
+                if drawers_filed > 0 or ingest_in_flight:
+                    _advance_save_marker(session_id, exchange_count)
                 if drawers_filed > 0:
-                    try:
-                        last_save_file.write_text(str(exchange_count), encoding="utf-8")
-                    except OSError:
-                        pass
                     _output(
                         {
                             "systemMessage": f"\u2726 {drawers_filed} checkpoint saved \u2014 {messages_folded} messages woven into the palace{tag}",
@@ -1886,9 +1921,28 @@ def hook_precompact(data: dict, harness: str):
             _output(_blocked_hook_output(routing))
             return
 
+        try:
+            config = MempalaceConfig()
+            mine_transcript = config.hooks_mine_transcript
+            toast = config.hook_desktop_toast
+        except Exception:
+            mine_transcript = True
+            toast = False
+
         # Capture tool output via our normalize path before compaction loses it
         if transcript_path:
-            _ingest_transcript(transcript_path)
+            if mine_transcript:
+                _ingest_transcript(transcript_path)
+            else:
+                # With the transcript mine off this hook would capture nothing
+                # before context is dropped, so file a diary checkpoint instead.
+                _save_diary_direct(
+                    transcript_path,
+                    session_id,
+                    wing=_project_wing(transcript_path),
+                    toast=toast,
+                    agent_name=_diary_agent_for_harness(harness),
+                )
 
         # Mine MEMPAL_DIR synchronously so project data lands before
         # compaction proceeds. Transcript convos were already kicked off
