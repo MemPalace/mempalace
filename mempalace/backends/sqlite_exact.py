@@ -294,7 +294,7 @@ def sqlite_wing_room_counts(
                 " NOT IN (1, 'true', 'True', '1')"
             )
             total_row = conn.execute(
-                f"SELECT COUNT(*) FROM documents WHERE collection_id = ? AND {not_bookkeeping}",
+                f"SELECT COUNT(DISTINCT COALESCE(json_extract(metadata_json, '$.parent_drawer_id'), json_extract(metadata_json, '$.parent_entry_id'), id)) FROM documents WHERE collection_id = ? AND {not_bookkeeping}",
                 (collection_id,),
             ).fetchone()
             total = int(total_row[0]) if total_row and total_row[0] is not None else 0
@@ -304,7 +304,7 @@ def sqlite_wing_room_counts(
             room_expr = "room" if locus else "json_extract(metadata_json, '$.room')"
             for wing, room, n in conn.execute(
                 f"""
-                SELECT {wing_expr}, {room_expr}, COUNT(*)
+                SELECT {wing_expr}, {room_expr}, COUNT(DISTINCT COALESCE(json_extract(metadata_json, '$.parent_drawer_id'), json_extract(metadata_json, '$.parent_entry_id'), id))
                 FROM documents
                 WHERE collection_id = ? AND {not_bookkeeping}
                 GROUP BY 1, 2
@@ -398,7 +398,8 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
             rows = list(
                 conn.execute(
                     f"""
-                    SELECT {room_expr}, {wing_expr}, {hall_expr}, COUNT(*),
+                    SELECT {room_expr}, {wing_expr}, {hall_expr},
+                           COUNT(DISTINCT COALESCE(json_extract(metadata_json, '$.parent_drawer_id'), json_extract(metadata_json, '$.parent_entry_id'), id)),
                            COALESCE(MAX(json_extract(metadata_json, '$.date')), '')
                     FROM documents
                     WHERE collection_id = ?

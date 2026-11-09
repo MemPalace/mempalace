@@ -56,6 +56,92 @@ class TestReadTools:
         assert "project" in result["wings"]
         assert "notes" in result["wings"]
 
+    def test_count_readers_report_logical_not_physical(self, monkeypatch, config, palace_path, kg):
+        """Regression for #2544: status / list_wings / list_rooms / get_taxonomy /
+        graph_stats must all report LOGICAL drawer counts (collapsed across
+        chunk rows), consistent with ``tool_list_drawers["total"]``.
+
+        On HEAD these readers read ``COUNT(*)`` of physical chunk rows on their
+        fast paths, so whenever a drawer is chunked into multiple rows they
+        over-report by the chunk factor. This test FAILs pre-fix and PASSes
+        once the readers collapse to logical drawers.
+
+        Seed one chunked drawer in each of two wings under a shared room name:
+        2 logical drawers, but 2*N physical rows (N > 1). All five count readers
+        must agree with the logical oracle; on HEAD each reports 2*N instead.
+        The two-wing shape is required so graph_stats exposes the drawer count
+        (its only drawer-count field, ``top_tunnels[].count``, only surfaces
+        rooms spanning >=2 wings).
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import (
+            tool_add_drawer,
+            tool_status,
+            tool_list_wings,
+            tool_list_rooms,
+            tool_get_taxonomy,
+            tool_graph_stats,
+            tool_list_drawers,
+        )
+
+        content = "X" * 10000  # well above chunk_size (800) → multiple chunks
+        r1 = tool_add_drawer(wing="alpha", room="shared", content=content)
+        r2 = tool_add_drawer(wing="beta", room="shared", content=content)
+        assert r1["success"] is True and r2["success"] is True
+        # Sanity: each drawer really is chunked into >1 physical row, otherwise
+        # physical == logical and the regression would not be visible here.
+        assert r1["chunks"] > 1, f"expected alpha drawer to chunk, got chunks={r1['chunks']}"
+        assert r2["chunks"] > 1, f"expected beta drawer to chunk, got chunks={r2['chunks']}"
+
+        # Oracle: logical drawer count (collapsed across chunk rows). Two drawers,
+        # one per wing. tool_list_drawers is the correct baseline even on HEAD —
+        # the other five readers are what drift from it.
+        listing = tool_list_drawers()
+        logical_total = listing["total"]
+        assert logical_total == 2, (
+            f"expected 2 logical drawers (one per wing), got {logical_total}; "
+            f"oracle itself is mis-collapsing"
+        )
+
+        # 1. status
+        st = tool_status()
+        assert st["total_drawers"] == logical_total, (
+            f"status.total_drawers={st['total_drawers']} != logical {logical_total} "
+            f"(physical chunk-row leak)"
+        )
+
+        # 2. list_wings
+        lw = tool_list_wings()
+        lw_sum = sum(lw["wings"].values())
+        assert lw_sum == logical_total, (
+            f"list_wings sum={lw_sum} != logical {logical_total} (physical chunk-row leak)"
+        )
+
+        # 3. list_rooms
+        lr = tool_list_rooms()
+        lr_sum = sum(lr["rooms"].values())
+        assert lr_sum == logical_total, (
+            f"list_rooms sum={lr_sum} != logical {logical_total} (physical chunk-row leak)"
+        )
+
+        # 4. get_taxonomy
+        gt = tool_get_taxonomy()
+        tax_total = sum(sum(room_counts.values()) for room_counts in gt["taxonomy"].values())
+        assert tax_total == logical_total, (
+            f"get_taxonomy total={tax_total} != logical {logical_total} (physical chunk-row leak)"
+        )
+
+        # 5. graph_stats — shared room across two wings → tunnel drawer count
+        g = tool_graph_stats()
+        shared = [t for t in g.get("top_tunnels", []) if t["room"] == "shared"]
+        assert shared, f"shared room not surfaced in top_tunnels: {g.get('top_tunnels')}"
+        assert shared[0]["count"] == logical_total, (
+            f"graph_stats shared-tunnel count={shared[0]['count']} != logical {logical_total} "
+            f"(physical chunk-row leak)"
+        )
+
     def test_status_sqlite_exact_backend_has_no_hnsw_fields(
         self, monkeypatch, config, palace_path, kg
     ):
