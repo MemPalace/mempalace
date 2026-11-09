@@ -7,7 +7,7 @@ if __name__ != "mempalace.mcp_server":
 
 TOOLS = {
     "mempalace_status": {
-        "description": "Palace overview — total drawers, wing and room counts",
+        "description": "Palace overview — total drawers, wing and room counts, chunk storage structure",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_status,
     },

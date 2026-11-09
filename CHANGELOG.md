@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `mempalace_status` now reports `storage_structure` on the Chroma backend:
+  logical drawers vs physical embedding rows vs parentless chunk groups.
+  Chunked drawers are stored as `<drawer_id>_chunk_NNNNNN` rows only — no
+  parent embedding row is ever written — so a nonzero
+  `parentless_chunk_groups` is expected storage structure, not a lost write.
+  Audit chunked drawers through the `parent_drawer_id` / `parent_entry_id`
+  join, never by assuming `embedding_id == drawer_id`. See #2752; the
+  logical-counting units match unmerged PR #2545.
+
 ### Fixed
 
 - `mempalace serve` binds its HTTP server without resolving the bind address
