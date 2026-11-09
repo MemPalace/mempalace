@@ -19,15 +19,16 @@ Supported:
 No API key. No internet. Everything local.
 """
 
+import io
 import json
 import os
 import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
-from .fsio import read_source_text
+from .fsio import open_source_file, read_source_text
 
 
 class UnparsedCodexTranscriptError(ValueError):
@@ -175,11 +176,83 @@ def _read_transcript_file_with_mtime(filepath: str) -> Tuple[str, float]:
     return text, mtime
 
 
+
+@contextmanager
+def _open_jsonl_lines(filepath: str):
+    """Open validated UTF-8 JSONL with the mtime from the initial fstat."""
+    try:
+        fd, st = open_source_file(filepath)
+    except OSError as exc:
+        raise IOError(f"Could not read {filepath}: {exc}") from exc
+    with os.fdopen(fd, "rb") as raw:
+        if st.st_size > _MAX_TRANSCRIPT_BYTES:
+            raise IOError(
+                f"Could not read {filepath}: file too large "
+                f"({st.st_size // (1024 * 1024)} MB)"
+            )
+        bom = raw.read(3) == b"\xef\xbb\xbf"
+        raw.seek(0)
+        with io.TextIOWrapper(raw, encoding="utf-8-sig", errors="strict", newline=None) as lines:
+            yield lines, st.st_mtime, ("utf-8-sig" if bom else "utf-8")
+
+
+def _detect_jsonl_line_parser(lines: Iterable[str]):
+    """Select an existing parser from at most the first 1,000 records."""
+    for index, raw_line in enumerate(lines):
+        if index >= 1000:
+            break
+        try:
+            entry = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("type")
+        if kind == "session_meta":
+            return _try_codex_jsonl_lines
+        if kind == "session_metadata":
+            return _try_gemini_jsonl_lines
+        if kind == "session" and "version" in entry:
+            return _try_pi_jsonl_lines
+        if kind in ("human", "user", "assistant") and isinstance(entry.get("message"), dict):
+            return _try_claude_code_jsonl_lines
+    return None
+
+
+def _try_normalize_jsonl_file(filepath: str) -> Optional[Tuple[str, float, str]]:
+    """Stream known UTF-8 JSONL; use the original lossless reader otherwise."""
+    try:
+        with _open_jsonl_lines(filepath) as (lines, source_mtime, encoding):
+            parser = _detect_jsonl_line_parser(lines)
+            if parser is None:
+                return None
+            lines.seek(0)
+            normalized = _attempt(parser, lines)
+    except UnicodeDecodeError:
+        return None
+    if not normalized:
+        if parser is _try_codex_jsonl_lines:
+            raise UnparsedCodexTranscriptError(
+                "Codex rollout contains no complete supported conversation; "
+                "refusing raw JSON fallback"
+            )
+        return None
+    run = _NORMALIZE_RUN.get()
+    if run is not None:
+        run.encoding = encoding
+    return normalized, source_mtime, encoding
+
+
 def normalize(filepath: str) -> str:
     """
     Load a file and normalize to transcript format if it's a chat export.
     Plain text files pass through unchanged.
     """
+    if Path(filepath).suffix.lower() == ".jsonl":
+        streamed = _try_normalize_jsonl_file(filepath)
+        if streamed is not None:
+            return streamed[0]
+
     content = _read_transcript_file(filepath)
 
     if not content.strip():
@@ -213,6 +286,10 @@ def normalize_conversations(filepath: str) -> list:
 
 def normalize_conversations_with_mtime(filepath: str) -> Tuple[list, float]:
     """``normalize_conversations`` plus the mtime of the bytes it read."""
+    if Path(filepath).suffix.lower() == ".jsonl":
+        streamed = _try_normalize_jsonl_file(filepath)
+        if streamed is not None:
+            return [streamed[0]], streamed[1]
     content, mtime = _read_transcript_file_with_mtime(filepath)
     return _split_conversations(content, filepath), mtime
 
@@ -323,11 +400,18 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
 
 def _try_claude_code_jsonl(content: str) -> Optional[str]:
     """Claude Code JSONL sessions."""
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    return _try_claude_code_jsonl_lines(content.split("\n"))
+
+
+def _try_claude_code_jsonl_lines(lines: Iterable[str]) -> Optional[str]:
+    """Consume recognized JSONL incrementally."""
     messages = []
     tool_use_map = {}  # tool_use_id → tool_name
 
-    for line in lines:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -400,12 +484,19 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
     Codex's reviewer, which is handed whole transcripts of other sessions,
     so none of them are the user's words.
     """
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    return _try_codex_jsonl_lines(content.split("\n"))
+
+
+def _try_codex_jsonl_lines(lines: Iterable[str]) -> Optional[str]:
+    """Consume recognized JSONL incrementally."""
     messages = []
     response_messages = []
     has_session_meta = False
     is_subagent = False
-    for line in lines:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -549,10 +640,17 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
     single message's content array are concatenated in order with nothing
     between them, as Gemini's own clients read a message.
     """
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    return _try_gemini_jsonl_lines(content.split("\n"))
+
+
+def _try_gemini_jsonl_lines(lines: Iterable[str]) -> Optional[str]:
+    """Consume recognized JSONL incrementally."""
     messages = []
     has_session_metadata = False
-    for line in lines:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -613,10 +711,17 @@ def _try_pi_jsonl(content: str) -> Optional[str]:
 
     Format documented at github.com/badlogic/pi-mono session.md.
     """
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    return _try_pi_jsonl_lines(content.split("\n"))
+
+
+def _try_pi_jsonl_lines(lines: Iterable[str]) -> Optional[str]:
+    """Consume recognized JSONL incrementally."""
     messages = []
     has_session_header = False
-    for line in lines:
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
