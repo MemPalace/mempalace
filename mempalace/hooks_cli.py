@@ -1136,14 +1136,47 @@ def _advance_save_marker(session_id: str, exchange_count) -> None:
         return
     marker = STATE_DIR / f"{_sanitize_session_id(session_id)}_last_save"
     try:
-        if int(marker.read_text(encoding="utf-8").strip()) >= exchange_count:
-            return
-    except (OSError, ValueError):
-        pass
-    try:
-        marker.write_text(str(exchange_count), encoding="utf-8")
+        with _save_marker_lock(marker):
+            if _read_save_marker(marker) >= exchange_count:
+                return
+            marker.write_text(str(exchange_count), encoding="utf-8")
     except OSError:
+        # Lock or write failed: the marker stays put and the next Stop retries.
         pass
+
+
+@contextmanager
+def _save_marker_lock(marker: Path):
+    """Hold an exclusive cross-process lock on ``marker`` for a read-compare-write.
+
+    ``palace.mine_lock`` would do, but importing ``mempalace.palace`` costs over
+    a second, far past the hook budget.
+    """
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    with open(marker.with_name(marker.name + ".lock"), "a+b") as fh:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            yield
+
+
+def _read_save_marker(marker: Path) -> int:
+    """The exchange count a save marker holds, or 0 when it is missing or unreadable."""
+    try:
+        return int(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
 
 
 def _advance_payload_save_marker(payload: dict) -> None:
@@ -1210,8 +1243,12 @@ def _save_diary_direct(
     *,
     agent_name: str,
     exchange_count: Optional[int] = None,
+    wait: bool = True,
 ) -> dict:
     """Queue a diary checkpoint without importing ``mempalace.mcp_server``.
+
+    ``wait=False`` hands the checkpoint to the daemon without waiting on it,
+    for a hook that must not block on a busy daemon.
 
     The daemon path still waits on a job. The direct path spawns a detached
     child (``run_detached_diary_checkpoint``) and returns immediately with
@@ -1266,15 +1303,20 @@ def _save_diary_direct(
         if routing.use_daemon:
             from .daemon import DaemonWaitTimeout
 
+            daemon_args = {
+                "agent_name": agent_name,
+                "entry": entry,
+                "topic": "checkpoint",
+                "wing": wing,
+            }
+            if not wait:
+                _submit_daemon_job("diary_write", daemon_args, priority=10, wait=False)
+                _log("Diary checkpoint submitted to daemon")
+                return {"drawers_filed": 0, "messages_folded": len(messages), "themes": themes}
             try:
                 job = _submit_daemon_job(
                     "diary_write",
-                    {
-                        "agent_name": agent_name,
-                        "entry": entry,
-                        "topic": "checkpoint",
-                        "wing": wing,
-                    },
+                    daemon_args,
                     priority=10,
                     wait=True,
                     timeout=30,
@@ -1396,11 +1438,14 @@ def _ingest_transcript(transcript_path: str) -> bool:
 
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
         # in here too — repeated Stop/PreCompact fires for the same
-        # transcript should not stack up parallel ingest mines. A False
-        # return means a live mine already holds the slot: still in flight.
-        if _spawn_mine(_mempalace_command("mine", str(path), "--mode", "convos", "--wing", wing)):
+        # transcript should not stack up parallel ingest mines. A skip is in
+        # flight only when a live mine holds the slot, not when a stale slot
+        # could not be reclaimed.
+        cmd = _mempalace_command("mine", str(path), "--mode", "convos", "--wing", wing)
+        if _spawn_mine(cmd):
             _log(f"Transcript ingest started: {path.name} -> {wing}")
-        return True
+            return True
+        return _mine_already_running(cmd)
     except OSError:
         return False
     except Exception as exc:
@@ -1663,12 +1708,7 @@ def hook_stop(data: dict, harness: str):
     # Track last save point
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     last_save_file = STATE_DIR / f"{session_id}_last_save"
-    last_save = 0
-    if last_save_file.is_file():
-        try:
-            last_save = int(last_save_file.read_text().strip())
-        except (ValueError, OSError):
-            last_save = 0
+    last_save = _read_save_marker(last_save_file)
 
     since_last = exchange_count - last_save
 
@@ -1792,6 +1832,10 @@ def _clear_session_last_save(session_id: str) -> None:
     """
     try:
         (STATE_DIR / f"{session_id}_last_save").unlink()
+    except OSError:
+        pass
+    try:
+        (STATE_DIR / f"{session_id}_last_save.lock").unlink()
     except OSError:
         pass
 
@@ -1929,6 +1973,10 @@ def hook_precompact(data: dict, harness: str):
             mine_transcript = True
             toast = False
 
+        if transcript_path and _validate_transcript_path(transcript_path) is None:
+            _log(f"WARNING: transcript_path rejected by validator: {transcript_path!r}")
+            transcript_path = ""
+
         # Capture tool output via our normalize path before compaction loses it
         if transcript_path:
             if mine_transcript:
@@ -1942,6 +1990,7 @@ def hook_precompact(data: dict, harness: str):
                     wing=_project_wing(transcript_path),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
+                    wait=False,
                 )
 
         # Mine MEMPAL_DIR synchronously so project data lands before
