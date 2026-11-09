@@ -78,12 +78,12 @@ class TestReadTools:
         del _client
         from mempalace.mcp_server import (
             tool_add_drawer,
-            tool_status,
-            tool_list_wings,
-            tool_list_rooms,
             tool_get_taxonomy,
             tool_graph_stats,
             tool_list_drawers,
+            tool_list_rooms,
+            tool_list_wings,
+            tool_status,
         )
 
         content = "X" * 10000  # well above chunk_size (800) → multiple chunks
