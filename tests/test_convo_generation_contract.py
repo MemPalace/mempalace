@@ -217,6 +217,32 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
     palace_path = str(tmp_path / "palace")
     _write_session(session, "A", count=3)
     _mine(source_dir, palace_path)
+
+    # Exercise the public MCP API before the injected failure as well: the
+    # tool deliberately exposes the source basename instead of the full
+    # local path (see _response_safe_meta). A full-path comparison silently
+    # selects zero rows and never reaches the generation-visibility check.
+    from mempalace import mcp_server
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setattr(mcp_server, "_config", MempalaceConfig(palace_path=palace_path))
+    monkeypatch.setattr(
+        mcp_server, "_get_collection", lambda *args, **kwargs: get_collection(palace_path)
+    )
+
+    def public_session_previews():
+        listing = mcp_server.tool_list_drawers(limit=100)
+        assert "error" not in listing, listing
+        return [
+            row.get("content_preview") or ""
+            for row in listing["drawers"]
+            if (row.get("metadata") or {}).get("source_file") == session.name
+        ]
+
+    initial_public = public_session_previews()
+    assert len(initial_public) >= 3, "public listing did not expose the initial snapshot"
+    assert all("A question" in text for text in initial_public)
+
     _write_session(session, "B", count=3)
     _touch_after_write(session)
 
@@ -243,20 +269,7 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
 
     # Raw Chroma rows are allowed to contain unpublished staging records.
     # The user-visible contract is the MCP listing, not the storage internals.
-    from mempalace import mcp_server
-    from mempalace.config import MempalaceConfig
-
-    monkeypatch.setattr(mcp_server, "_config", MempalaceConfig(palace_path=palace_path))
-    monkeypatch.setattr(
-        mcp_server, "_get_collection", lambda *args, **kwargs: get_collection(palace_path)
-    )
-    listing = mcp_server.tool_list_drawers(limit=100)
-    assert "error" not in listing, listing
-    public = [
-        row.get("content_preview") or ""
-        for row in listing["drawers"]
-        if (row.get("metadata") or {}).get("source_file") == str(session)
-    ]
+    public = public_session_previews()
     assert public, "no prior complete content is visible after the interrupted pass"
     if any("B question" in text for text in public):
         pytest.xfail(
