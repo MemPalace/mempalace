@@ -9,7 +9,10 @@ The tests must fail normally on content loss; future staging and commit-marker
 filters require their own read-visibility regressions.
 """
 
+import json
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -93,6 +96,37 @@ def test_second_batch_failure_preserves_every_previous_document(tmp_path, monkey
     # IDs/counts alone are insufficient: compare the actual original text.
     after = _documents(palace_path, session)
     assert before.issubset(after), "old verbatim text was lost after batch failure"
+
+    # A separate process is a fresh SQLite reader, not the in-process Chroma
+    # cache. Verify the *entire* old snapshot was durably filed before the
+    # interrupted positional overwrite. This does not establish atomic PUBLIC
+    # visibility: raw SQLite can still contain unpublished B rows.
+    probe = (
+        "import json, sqlite3, sys\n"
+        "with sqlite3.connect(sys.argv[1]) as db:\n"
+        "    rows = db.execute(\n"
+        "        \"SELECT doc.string_value FROM embedding_metadata AS doc \"\n"
+        "        \"JOIN embedding_metadata AS src ON src.id = doc.id \"\n"
+        "        \"AND src.key = 'source_file' \"\n"
+        "        \"JOIN embedding_metadata AS mode ON mode.id = doc.id \"\n"
+        "        \"AND mode.key = 'extract_mode' \"\n"
+        "        \"WHERE doc.key = 'chroma:document' \"\n"
+        "        \"AND src.string_value = ? AND mode.string_value = 'exchange'\",\n"
+        "        (sys.argv[2],),\n"
+        "    ).fetchall()\n"
+        "print(json.dumps([doc for (doc,) in rows]))\n"
+    )
+    read_back = subprocess.run(
+        [sys.executable, "-c", probe, os.path.join(palace_path, "chroma.sqlite3"), str(session)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert read_back.returncode == 0, read_back.stderr
+    assert before.issubset(set(json.loads(read_back.stdout))), (
+        "a fresh reader process cannot recover all pre-failure A contents"
+    )
 
 
 def test_successful_rewrite_is_additive_in_verbatim_conversation_history(tmp_path):
