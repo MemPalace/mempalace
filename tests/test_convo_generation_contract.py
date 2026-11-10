@@ -105,10 +105,10 @@ def test_second_batch_failure_preserves_every_previous_document(tmp_path, monkey
         "import json, sqlite3, sys\n"
         "with sqlite3.connect(sys.argv[1]) as db:\n"
         "    rows = db.execute(\n"
-        "        \"SELECT doc.string_value FROM embedding_metadata AS doc \"\n"
-        "        \"JOIN embedding_metadata AS src ON src.id = doc.id \"\n"
+        '        "SELECT doc.string_value FROM embedding_metadata AS doc "\n'
+        '        "JOIN embedding_metadata AS src ON src.id = doc.id "\n'
         "        \"AND src.key = 'source_file' \"\n"
-        "        \"JOIN embedding_metadata AS mode ON mode.id = doc.id \"\n"
+        '        "JOIN embedding_metadata AS mode ON mode.id = doc.id "\n'
         "        \"AND mode.key = 'extract_mode' \"\n"
         "        \"WHERE doc.key = 'chroma:document' \"\n"
         "        \"AND src.string_value = ? AND mode.string_value = 'exchange'\",\n"
