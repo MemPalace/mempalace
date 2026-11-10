@@ -240,8 +240,9 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
         ]
 
     initial_public = public_session_previews()
-    assert len(initial_public) >= 3, "public listing did not expose the initial snapshot"
-    assert all("A question" in text for text in initial_public)
+    initial_snapshot = set(initial_public)
+    assert len(initial_snapshot) >= 3, "public listing did not expose the initial snapshot"
+    assert all("A question" in text for text in initial_snapshot)
 
     _write_session(session, "B", count=3)
     _touch_after_write(session)
@@ -270,7 +271,9 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
     # Raw Chroma rows are allowed to contain unpublished staging records.
     # The user-visible contract is the MCP listing, not the storage internals.
     public = public_session_previews()
-    assert public, "no prior complete content is visible after the interrupted pass"
+    assert initial_snapshot.issubset(set(public)), (
+        "interrupted generation hid part of the previously published A snapshot"
+    )
     if any("B question" in text for text in public):
         pytest.xfail(
             "MCP listing leaks an incomplete replacement after the first "
