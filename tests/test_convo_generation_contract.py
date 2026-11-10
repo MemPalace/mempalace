@@ -1,13 +1,12 @@
 """Executable reproductions for the conversation generation publication contract.
 
-The current `write_file_drawers` write-then-prune path stamps an incomplete
-chunk_total, but an upsert into a deterministic positional ID can already
-replace the previous verbatim text before the next batch fails. These expected
-failures are deliberately isolated until immutable physical generations and
-commit-marker visibility are implemented together.
+A new per-source history backup protects prior conversation text even if a
+later positional upsert fails. These assertions exercise the real content
+preservation gate, not merely stable IDs or drawer counts. Generation-wide
+atomic visibility remains a separate, unsolved contract.
 
-Do not remove xfail merely to make CI green: make each assertion pass, then
-remove its marker and validate get/list/search/SQLite visibility separately.
+The tests must fail normally on content loss; future staging and commit-marker
+filters require their own read-visibility regressions.
 """
 
 import os
@@ -77,6 +76,10 @@ def test_second_batch_failure_preserves_every_previous_document(tmp_path, monkey
 
     def interrupt_second_upsert(collection, *args, **kwargs):
         nonlocal writes
+        # History backups are expected before the current write; inject the
+        # failure *after* the first actual replacement has been persisted.
+        if all("_hist_" in drawer_id for drawer_id in kwargs.get("ids", [])):
+            return original_upsert(collection, *args, **kwargs)
         writes += 1
         if writes == 2:
             raise RuntimeError("injected second-batch write failure")
@@ -89,12 +92,7 @@ def test_second_batch_failure_preserves_every_previous_document(tmp_path, monkey
 
     # IDs/counts alone are insufficient: compare the actual original text.
     after = _documents(palace_path, session)
-    if not before.issubset(after):
-        pytest.xfail(
-            "P1 reproduced: the first changed batch overwrote verbatim text from "
-            "the last published generation"
-        )
-    assert before.issubset(after)
+    assert before.issubset(after), "old verbatim text was lost after batch failure"
 
 
 def test_successful_rewrite_is_additive_in_verbatim_conversation_history(tmp_path):
@@ -113,9 +111,4 @@ def test_successful_rewrite_is_additive_in_verbatim_conversation_history(tmp_pat
     _mine(source_dir, palace_path)
     after = _documents(palace_path, session)
     assert any("replacement question" in text for text in after)
-    if not previous.issubset(after):
-        pytest.xfail(
-            "Issue #1593 reproduced: successful re-mine pruned/overwrote "
-            "the previous authored conversation"
-        )
-    assert previous.issubset(after)
+    assert previous.issubset(after), "successful re-mine destroyed prior history"
