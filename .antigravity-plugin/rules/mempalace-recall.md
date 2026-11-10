@@ -1,18 +1,12 @@
-# MemPalace recall
+---
+trigger: model_decision
+description: Recall protocol for MemPalace — search the palace before answering about past work, people, projects, or prior decisions.
+---
 
-Before answering anything that may already be in the user's memory
-palace — past work, prior decisions, a person, a project, or "what did
-we do / decide / discuss last time?" — search the palace first:
+# MemPalace Recall Rule
 
-1. Call `mempalace_search` with a short keyword query. Use
-   `mempalace_kg_query` for relational or time-bound facts.
-2. Quote the drawer's **verbatim** text. Never summarize or paraphrase
-   stored content.
-3. If results are empty, say so — do not invent an answer. If the MCP
-   server is unavailable, surface the error; do not fall back to guessing.
+Before answering a question about past work, a person, a project, or a prior decision, search the user's memory palace via the `mempalace` MCP server (`palace_query` with `FIND` for semantic search, `palace_query` with `KG` for entity/temporal facts) and quote any matching drawer verbatim rather than guessing.
 
-Skip recall for pure greenfield work with no memory relevance (renaming
-a variable, fixing a typo). Recall is question-driven, not reflexive.
+ If `palace_query` is not loaded, fall back to `mempalace_search` / `mempalace_kg_query` / `mempalace_check_duplicate`.
 
-Full protocol: <https://github.com/MemPalace/mempalace/blob/main/integrations/shared/recall-protocol.md>. Deeper guidance:
-the `mempalace-recall` skill.
+Follow the full protocol in the `mempalace-recall` skill — single source of truth at [`integrations/shared/recall-protocol.md`](https://github.com/MemPalace/mempalace/blob/main/integrations/shared/recall-protocol.md).

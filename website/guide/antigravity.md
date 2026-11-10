@@ -11,7 +11,9 @@ PreInvocation) for background mining and startup memory injection.
 | Surface         | Antigravity component                                      |
 |-----------------|------------------------------------------------------------|
 | MCP server      | `mempalace` (stdio, runs `mempalace-mcp`)                  |
-| Skill           | `mempalace` (in-plugin `skills/mempalace/SKILL.md`)        |
+| UI Extension    | `MemPalace` Aux Pane (`Extensions > MemPalace`, `sidecar://mempalace/palace/`) |
+| Skills          | `mempalace` and `mempalace-recall` (`skills/*/SKILL.md`)   |
+| Rule            | `mempalace-recall` (`rules/mempalace-recall.md`, `trigger: model_decision`) |
 | Stop hook       | `mempalace-save` — background-mines the conversation        |
 | PreInvocation   | `mempalace-wake` — injects memory on the first model call   |
 

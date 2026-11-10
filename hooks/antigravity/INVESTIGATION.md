@@ -71,15 +71,41 @@ entry, proving the shape matches and the binary is on PATH.
 >     └── <rule-name>.md
 > ```
 
-Manifest schema (verified):
+Manifest schema (verified against `https://antigravity.google/docs/build-plugins/` and `agy plugin validate --strict`):
 
 ```json
 {
-  "name": "my-custom-plugin"
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "mempalace",
+  "displayName": "MemPalace",
+  "version": "3.12.0",
+  "description": "Local-first verbatim AI memory palace: semantic recall, temporal knowledge graph, auto-save hooks, and multi-agent logstream coordination.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Search my memory palace for recent architectural decisions",
+    "Show my palace status, wings, rooms, and knowledge graph stats",
+    "Check my MemPalace logstream inbox for open agent tasks"
+  ],
+  "author": {
+    "name": "MemPalace",
+    "url": "https://github.com/MemPalace/mempalace"
+  },
+  "homepage": "https://github.com/MemPalace/mempalace",
+  "repository": "https://github.com/MemPalace/mempalace",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "palace",
+    "recall",
+    "knowledge-graph",
+    "mcp",
+    "chromadb",
+    "coordination"
+  ]
 }
 ```
 
-> The name field is optional and defaults to the directory name if omitted.
+We also ship an Aux Pane UI Extension under `sidecars/palace/` (`sidecar.json` with `SIDECAR_UI_ENTRYPOINT_AUX_PANE` and `sidecar_sdk`), which registers `Extensions > MemPalace` in the Aux Pane `+` menu (`sidecar://mempalace/palace/`).
 
 Install locations (verified):
 

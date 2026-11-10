@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="mp-bg" x1="14" y1="14" x2="114" y2="114" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E2235"/>
+      <stop offset="100%" stop-color="#11131F"/>
+    </linearGradient>
+    <linearGradient id="mp-gold" x1="28" y1="26" x2="100" y2="102" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FDE68A"/>
+      <stop offset="50%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+    <linearGradient id="mp-accent" x1="36" y1="36" x2="92" y2="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 10% transparent margin: emblem sits at [14..114] (100x100 inside 128x128) -->
+  <rect x="14" y="14" width="100" height="100" rx="22" fill="url(#mp-bg)" stroke="#3B4262" stroke-width="2"/>
+
+  <!-- Classical Palace Pediment (Roof / Architrave) -->
+  <path d="M64 26L98 44H30L64 26Z" fill="url(#mp-gold)" opacity="0.95"/>
+  <rect x="30" y="46" width="68" height="5" rx="2" fill="url(#mp-gold)"/>
+
+  <!-- Three Wings / Columns -->
+  <rect x="36" y="55" width="9" height="32" rx="2.5" fill="#E2E8F0"/>
+  <rect x="59.5" y="55" width="9" height="32" rx="2.5" fill="#E2E8F0"/>
+  <rect x="83" y="55" width="9" height="32" rx="2.5" fill="#E2E8F0"/>
+
+  <!-- Knowledge Graph Tunnels Connecting Wings -->
+  <path d="M40.5 71L64 61L87.5 71" stroke="url(#mp-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="40.5" cy="71" r="4" fill="#38BDF8" stroke="#11131F" stroke-width="1.5"/>
+  <circle cx="64" cy="61" r="4.5" fill="#F59E0B" stroke="#11131F" stroke-width="1.5"/>
+  <circle cx="87.5" cy="71" r="4" fill="#38BDF8" stroke="#11131F" stroke-width="1.5"/>
+
+  <!-- Palace Foundation / Stylobate Steps -->
+  <rect x="30" y="90" width="68" height="5" rx="2" fill="url(#mp-gold)"/>
+  <rect x="25" y="97" width="78" height="5" rx="2.5" fill="url(#mp-gold)" opacity="0.85"/>
+</svg>
