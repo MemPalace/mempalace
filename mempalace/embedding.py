@@ -41,6 +41,12 @@ in ``~/.mempalace/config.json``):
 * ``coreml`` — Apple Core ML (macOS; see the model restrictions below)
 * ``dml`` — DirectML (Windows / AMD / Intel GPUs)
 
+``onnxruntime-gpu`` / ``onnxruntime-directml`` and chromadb's CPU
+``onnxruntime`` install into the same ``onnxruntime/`` package directory, so an
+install or upgrade can leave the CPU build active even though the accelerator
+extra is installed (issue #2981). The one-time warning in that case explains
+how to reinstall the accelerator wheel last.
+
 ``embeddinggemma2`` runs on PyTorch rather than ONNX Runtime and reads the same
 setting: ``auto`` (CUDA ▸ MPS ▸ CPU), ``cuda``, ``mps`` or ``cpu``. The
 ONNX-only ``coreml`` and ``dml`` read as ``auto`` there, and ``mps`` reads as
@@ -125,6 +131,51 @@ _DEVICE_EXTRA = {
     "coreml": "mempalace[coreml]",
     "dml": "mempalace[dml]",
 }
+
+# Accelerator ONNX Runtime wheels that install into the same ``onnxruntime/``
+# package directory as chromadb's CPU ``onnxruntime`` dependency: whichever
+# wheel is written last wins, so an install/upgrade can silently leave the CPU
+# build in place and the accelerator provider unavailable (issue #2981).
+# Value: (PyPI distribution prefix, package to reinstall).
+_ACCELERATOR_WHEEL = {
+    "cuda": "onnxruntime-gpu",
+    "dml": "onnxruntime-directml",
+}
+
+
+def _distribution_installed(name: str) -> bool:
+    """Whether the distribution ``name`` is installed in this interpreter."""
+    try:
+        from importlib import metadata
+    except ImportError:  # pragma: no cover - Python < 3.8
+        return False
+    try:
+        metadata.distribution(name)
+    except metadata.PackageNotFoundError:
+        return False
+    except Exception:  # pragma: no cover - defensive
+        return False
+    return True
+
+
+def _overlapping_wheel_hint(device: str) -> Optional[str]:
+    """Explain an adapter wheel that is installed but not active (issue #2981).
+
+    Returns ``None`` when the accelerator distribution is not installed at all:
+    ``Install mempalace[dml]`` already covers that case.
+    """
+    wheel = _ACCELERATOR_WHEEL.get(device)
+    if wheel is None or not _distribution_installed(wheel):
+        return None
+    return (
+        f"{wheel} is installed but its execution provider is not active: it and "
+        f"chromadb's CPU onnxruntime both install into the same onnxruntime/ package "
+        f"directory, so the CPU build can overwrite the accelerator build. Reinstall "
+        f"the accelerator wheel last — "
+        f"uv: 'uv pip install --reinstall-package {wheel} {wheel}', "
+        f"pip: 'pip install --force-reinstall --no-deps {wheel}'."
+    )
+
 
 _AUTO_ORDER = [
     ("CUDAExecutionProvider", "cuda"),
@@ -253,6 +304,9 @@ def _resolve_providers(device: str, model: Optional[str] = None) -> tuple[list, 
                 preferred,
                 extra,
             )
+            hint = _overlapping_wheel_hint(device)
+            if hint:
+                logger.warning("%s", hint)
         return (["CPUExecutionProvider"], "cpu")
 
     return (requested, device)
