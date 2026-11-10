@@ -881,6 +881,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_backup_online_enumeration.py` forces SQLite sidecar cleanup and the writer/workspace-lookup freeze interleaving, and checks that missing user files, unsafe paths and new directory creation remain guarded.
 
+  - `tests/test_commonplace_rules_inject.py` runs its functional tests on a frozen deadline clock, so a loaded host cannot spend the 80 ms injection budget and turn the injected text empty; `tests/test_commonplace_rules_inject_slow_host.py` with `tests/_slow_host_plugin.py` re-runs a functional selection with a clock that burns the whole budget on every read. The locked-store setup retries until background listener threads release the store.
+
   - `tests/test_commonplace_rules_inject.py::test_locked_store_uses_remaining_deadline` checks locked-store fallback and remaining connection/statement waits with a fake clock; the separate timing test retains the informational wall-clock budget.
 
   - `tests/test_chroma_client_lifecycle.py::test_session_evicts_dropped_system_before_opening_missing_database` checks eviction before client construction without depending on SQLite pool scheduling; the external-rebuild probe checks the replacement's exact drawer ids.

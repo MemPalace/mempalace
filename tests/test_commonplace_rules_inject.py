@@ -7,7 +7,7 @@ import sqlite3
 import sys
 from contextlib import closing, contextmanager
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter, sleep
 from types import SimpleNamespace
 
 import pytest
@@ -56,6 +56,16 @@ def rules_surface_only(monkeypatch):
         "commonplace.session",
         SimpleNamespace(initialize_context=lambda *_a, **_k: ""),
     )
+
+
+@pytest.fixture(autouse=True)
+def frozen_deadline_clock(request, monkeypatch):
+    # Production gives injection an 80 ms budget and fails open to empty text
+    # when it runs out. A loaded host burns that budget on its own, so every
+    # functional assertion here runs on a clock that never advances. Expiry is
+    # covered by the tests that drive their own clock or run as `timing`.
+    if request.node.get_closest_marker("timing") is None:
+        monkeypatch.setattr(checks, "monotonic", lambda: 0.0)
 
 
 @pytest.fixture
@@ -111,6 +121,22 @@ def initialize(local, worker=None):
 
 def injected(local, worker=None):
     return initialize(local, worker)["result"].get("instructions", "")
+
+
+def lock_exclusively(conn, wait=10.0):
+    # Leaving WAL mode and taking the lock fail at once, without waiting, while
+    # any other connection to the store is open. Process-global listener threads
+    # read the boards store in the background, so retry until they let go.
+    end = perf_counter() + wait
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.execute("BEGIN EXCLUSIVE")
+            return
+        except sqlite3.OperationalError:
+            if perf_counter() >= end:
+                raise
+            sleep(0.01)
 
 
 def row(text="Do the work.", kind="limit", scope="global", scope_ref=None, id=1):
@@ -324,12 +350,13 @@ def test_500_rules_omission_counts_order_determinism_and_exact_fit():
 def test_snapshot_served_state_and_no_binding_served_or_events(local, monkeypatch):
     store = RuleStore(local.directory)
     assert local.db.rule_stores(local.workspace) is None
-    monkeypatch.setattr(events, "emit", lambda *_a, **_k: pytest.fail("event emitted"))
-    assert initialize(local) == LEGACY
-    assert local.db.rule_stores(local.workspace) is None
-    with store.read() as conn:
-        assert conn.execute("SELECT count(*) FROM agent_served").fetchone()[0] == 0
-    monkeypatch.undo()
+    with monkeypatch.context() as scoped:
+        # Undo only this guard: the autouse clock and surface patches stay.
+        scoped.setattr(events, "emit", lambda *_a, **_k: pytest.fail("event emitted"))
+        assert initialize(local) == LEGACY
+        assert local.db.rule_stores(local.workspace) is None
+        with store.read() as conn:
+            assert conn.execute("SELECT count(*) FROM agent_served").fetchone()[0] == 0
     local.owner.create("*", "accepted", "limit")
     local.owner.set_check("*", "enforce")
     first = injected(local)
@@ -544,8 +571,7 @@ def test_locked_store_uses_remaining_deadline(local, store, monkeypatch):
             yield conn
 
     with closing(connect(path, isolation_level=None)) as blocker:
-        blocker.execute("PRAGMA journal_mode=DELETE")
-        blocker.execute("BEGIN EXCLUSIVE")
+        lock_exclusively(blocker)
         monkeypatch.setattr(checks.sqlite3, "connect", tracked)
         monkeypatch.setattr(checks, "connection", delayed)
         assert initialize(local) == LEGACY
@@ -565,8 +591,7 @@ def test_locked_store_stays_inside_overall_deadline(local, store):
     local.owner.create("*", "visible", "limit")
     path = local.directory / f"{store}.sqlite3"
     blocker = sqlite3.connect(path, isolation_level=None)
-    blocker.execute("PRAGMA journal_mode=DELETE")
-    blocker.execute("BEGIN EXCLUSIVE")
+    lock_exclusively(blocker)
     start = perf_counter()
     result = initialize(local)
     elapsed = perf_counter() - start
