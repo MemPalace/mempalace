@@ -390,7 +390,11 @@ def prefetch_mined_set(
 
 # The keys file_already_mined() reads when called without an extract_mode.
 _PROJECT_MINED_KEYS = (
-    "source_file", "source_mtime", "chunk_total", "normalize_version", "historical_version"
+    "source_file",
+    "source_mtime",
+    "chunk_total",
+    "normalize_version",
+    "historical_version",
 )
 
 

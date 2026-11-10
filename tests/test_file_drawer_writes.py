@@ -212,9 +212,7 @@ def test_convo_rewrite_retains_verbatim_prior_text_as_history(tmp_path):
     _touch(convo.doc)
     convo.mine()
     all_rows = _rows(convo.palace, convo.doc)
-    history = {
-        doc for doc, meta in all_rows if meta.get("historical_version") is True
-    }
+    history = {doc for doc, meta in all_rows if meta.get("historical_version") is True}
     assert before.issubset(history)
     assert len(convo.rows()) == 1
     assert "question 9" in convo.rows()[0][0]

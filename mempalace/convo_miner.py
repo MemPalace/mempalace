@@ -719,7 +719,7 @@ def _file_chunks_locked(
             drawers,
             extract_mode=extract_mode,
             preserve_convo_history=True,
-            aaak_col=aaak_col
+            aaak_col=aaak_col,
         )
     return drawers_added, room_counts_delta, False
 

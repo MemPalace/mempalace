@@ -151,7 +151,6 @@ def _upsert(collection, rows: list, embeddings=None) -> None:
     )
 
 
-
 def _backup_changed_conversation_drawers(
     collection, source_file: str, extract_mode: str, drawers: list
 ) -> None:
