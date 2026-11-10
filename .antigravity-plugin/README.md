@@ -9,16 +9,26 @@ This directory is the source of truth for what gets installed at
 
 ```
 .antigravity-plugin/
-├── plugin.json            # marker manifest (verified minimal schema)
+├── plugin.json            # full https://antigravity.google/schemas/v1/plugin.json manifest
+├── assets/
+│   └── logo.svg           # 128x128 1:1 square plugin emblem
 ├── mcp_config.json        # auto-registers the mempalace-mcp stdio server
 ├── hooks.json.tmpl        # template — installer renders to hooks.json
+├── sidecars/
+│   └── palace/            # Aux Pane UI Extension ("Extensions > MemPalace")
+│       ├── sidecar.json   # SIDECAR_UI_ENTRYPOINT_AUX_PANE view definition
+│       ├── main.mjs       # Node sidecar_sdk server & persistent Python bridge manager
+│       ├── bridge.py      # Persistent JSON-over-stdio MemPalace worker
+│       ├── index.html     # 4-tab Palace Explorer + Coordination Hub UI
+│       ├── styles.css     # Host theme-synced styling
+│       └── app.js         # Recall, Palace Browser, Knowledge Graph & Logstream client
 ├── skills/
 │   ├── mempalace/
-│   │   └── SKILL.md       # ops skill: setup, mine, status, CLI delegation
+│   │   └── SKILL.md       # ops skill: setup, mine, status, UI extension pill
 │   └── mempalace-recall/
 │       └── SKILL.md       # recall-only skill: search-before-answer protocol
 ├── rules/
-│   └── mempalace-recall.md # optional recall rule (complements the skill)
+│   └── mempalace-recall.md # recall rule (trigger: model_decision)
 └── README.md              # this file
 ```
 

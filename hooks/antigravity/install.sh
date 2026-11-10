@@ -304,16 +304,19 @@ log info "install dir: $INSTALL_DIR"
 
 # ── Install: directories ─────────────────────────────────────────────
 run mkdir -p "$INSTALL_DIR" \
+    "$INSTALL_DIR/assets" \
     "$INSTALL_DIR/skills/mempalace" \
     "$INSTALL_DIR/skills/mempalace-recall" \
     "$INSTALL_DIR/rules" \
+    "$INSTALL_DIR/sidecars/palace" \
     "$INSTALL_DIR/hooks" \
     "$INSTALL_DIR/hooks/lib"
 
-# ── Install: plugin metadata ─────────────────────────────────────────
+# ── Install: plugin metadata & assets ────────────────────────────────
 copy_file "$PLUGIN_SRC/plugin.json"     "$INSTALL_DIR/plugin.json"
 copy_file "$PLUGIN_SRC/mcp_config.json" "$INSTALL_DIR/mcp_config.json"
 copy_file "$PLUGIN_SRC/README.md"       "$INSTALL_DIR/README.md"
+copy_file "$PLUGIN_SRC/assets/logo.svg" "$INSTALL_DIR/assets/logo.svg"
 
 # ── Install: skills (real files, no symlinks at the discovery path) ──
 copy_file "$PLUGIN_SRC/skills/mempalace/SKILL.md" \
@@ -324,13 +327,19 @@ copy_file "$PLUGIN_SRC/skills/mempalace-recall/SKILL.md" \
 # ── Install: optional recall rule ────────────────────────────────────
 #
 # Antigravity discovers markdown rules under the plugin's rules/
-# directory. This one is recall-only and intentionally lightweight —
-# it complements the mempalace-recall skill. Shipping it as a plugin
-# rule (not an always-on global rule) keeps it scoped to recall-
-# relevant turns, honouring MemPalace's "memory should feel instant"
-# budget.
+# directory. This one uses `trigger: model_decision` so it activates on
+# recall-relevant turns, complementing the mempalace-recall skill and
+# honouring MemPalace's "memory should feel instant" budget.
 copy_file "$PLUGIN_SRC/rules/mempalace-recall.md" \
     "$INSTALL_DIR/rules/mempalace-recall.md"
+
+# ── Install: Aux Pane UI Extension (sidecars/palace) ─────────────────
+copy_file "$PLUGIN_SRC/sidecars/palace/sidecar.json" "$INSTALL_DIR/sidecars/palace/sidecar.json"
+copy_file "$PLUGIN_SRC/sidecars/palace/main.mjs"     "$INSTALL_DIR/sidecars/palace/main.mjs"
+copy_file "$PLUGIN_SRC/sidecars/palace/bridge.py"    "$INSTALL_DIR/sidecars/palace/bridge.py"
+copy_file "$PLUGIN_SRC/sidecars/palace/index.html"   "$INSTALL_DIR/sidecars/palace/index.html"
+copy_file "$PLUGIN_SRC/sidecars/palace/styles.css"   "$INSTALL_DIR/sidecars/palace/styles.css"
+copy_file "$PLUGIN_SRC/sidecars/palace/app.js"       "$INSTALL_DIR/sidecars/palace/app.js"
 
 # ── Install: hooks ───────────────────────────────────────────────────
 copy_file "$HOOKS_SRC/lib/common.sh"                    "$INSTALL_DIR/hooks/lib/common.sh"
