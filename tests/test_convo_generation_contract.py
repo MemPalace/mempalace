@@ -246,9 +246,7 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
     from mempalace import mcp_server
     from mempalace.config import MempalaceConfig
 
-    monkeypatch.setattr(
-        mcp_server, "_config", MempalaceConfig(palace_path=palace_path)
-    )
+    monkeypatch.setattr(mcp_server, "_config", MempalaceConfig(palace_path=palace_path))
     monkeypatch.setattr(
         mcp_server, "_get_collection", lambda *args, **kwargs: get_collection(palace_path)
     )
