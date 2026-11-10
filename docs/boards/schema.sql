@@ -57,9 +57,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     approved_by TEXT,
     review_kind TEXT,
     review_context TEXT,
-    ask           TEXT,                             -- set while status = 'review': the question for the person
+    ask           TEXT,                             -- set while status = 'review': the question for the recipient
     ask_options   TEXT,                             -- JSON array of short choices, or NULL for free text
-    ask_to        TEXT,                             -- actor ref of the person asked (default: board owner)
+    ask_to        TEXT,                             -- recipient actor ref (authorized coordinator or person; legacy default: owner)
     return_to     TEXT,                             -- actor ref the card goes back to after the decision
     flags         TEXT,                             -- JSON array from the §9 injection check, e.g. ["curl_pipe"]
     version       INTEGER NOT NULL DEFAULT 1,       -- bumped on every change; web UI sends it back on drag

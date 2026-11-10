@@ -3,7 +3,7 @@
     "mcp": {
       "tools": [
         {
-          "description": "Ask and end the turn. Subagent questions go to the live board coordinator when available; otherwise the owner.",
+          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -18,6 +18,9 @@
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "person_reason": {
+                "type": "string"
               },
               "question": {
                 "type": "string"
@@ -111,7 +114,7 @@
           "name": "board_set"
         },
         {
-          "description": "Answer a review as its owner or addressed live coordinator. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
+          "description": "Answer a review as its owner or addressed live coordinator. Never answer your own ask. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -1535,7 +1538,7 @@
           "name": "task_take_next"
         },
         {
-          "description": "Update your card; move todo to doing, or held work to review/done. Review requires question, context and at least two options. Requesters may edit their own review details while preserving the open ask. Assignee edits and ask withdrawal to todo/doing are prepared for future agent-directed reviews; current APIs create person-directed reviews, which agents cannot withdraw or complete. Reopen done to todo (status only). Save a lesson with done. Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. callstack takes the JSON from python -m commonplace.callstack.",
+          "description": "Update your card; move todo to doing, or held work to review/done. Review requires question, context and at least two options. Agent questions go to the authorized board coordinator by default; person_reason explains why a person is required. Without a coordinator they reach the owner. Requesters may edit their review details. A live authorized coordinator may withdraw only its own agent-directed ask to todo/doing, preserving history; person decisions cannot be withdrawn by agents. Reopen done to todo (status only). Save a lesson with done. Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. callstack takes the JSON from python -m commonplace.callstack.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -1586,6 +1589,9 @@
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "person_reason": {
+                "type": "string"
               },
               "pr": {
                 "type": [
@@ -1825,7 +1831,7 @@
     "mcp": {
       "tools": [
         {
-          "description": "Ask and end the turn. Subagent questions go to the live board coordinator when available; otherwise the owner.",
+          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -1840,6 +1846,9 @@
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "person_reason": {
+                "type": "string"
               },
               "question": {
                 "type": "string"
@@ -1910,7 +1919,7 @@
           "name": "board_own_wing"
         },
         {
-          "description": "Answer a review as its owner or addressed live coordinator. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
+          "description": "Answer a review as its owner or addressed live coordinator. Never answer your own ask. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -2486,7 +2495,7 @@
           "name": "task_take_next"
         },
         {
-          "description": "Update your card; move todo to doing, or held work to review/done. Review requires question, context and at least two options. Requesters may edit their own review details while preserving the open ask. Assignee edits and ask withdrawal to todo/doing are prepared for future agent-directed reviews; current APIs create person-directed reviews, which agents cannot withdraw or complete. Reopen done to todo (status only). Save a lesson with done. Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. callstack takes the JSON from python -m commonplace.callstack.",
+          "description": "Update your card; move todo to doing, or held work to review/done. Review requires question, context and at least two options. Agent questions go to the authorized board coordinator by default; person_reason explains why a person is required. Without a coordinator they reach the owner. Requesters may edit their review details. A live authorized coordinator may withdraw only its own agent-directed ask to todo/doing, preserving history; person decisions cannot be withdrawn by agents. Reopen done to todo (status only). Save a lesson with done. Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. callstack takes the JSON from python -m commonplace.callstack.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -2537,6 +2546,9 @@
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "person_reason": {
+                "type": "string"
               },
               "pr": {
                 "type": [
@@ -2646,7 +2658,7 @@
     "mcp": {
       "tools": [
         {
-          "description": "Ask and end the turn. Subagent questions go to the live board coordinator when available; otherwise the owner.",
+          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -2661,6 +2673,9 @@
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "person_reason": {
+                "type": "string"
               },
               "question": {
                 "type": "string"
@@ -2754,7 +2769,7 @@
           "name": "board_set"
         },
         {
-          "description": "Answer a review as its owner or addressed live coordinator. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
+          "description": "Answer a review as its owner or addressed live coordinator. Never answer your own ask. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -4178,7 +4193,7 @@
           "name": "task_take_next"
         },
         {
-          "description": "Update your card; move todo to doing, or held work to review/done. Review requires question, context and at least two options. Requesters may edit their own review details while preserving the open ask. Assignee edits and ask withdrawal to todo/doing are prepared for future agent-directed reviews; current APIs create person-directed reviews, which agents cannot withdraw or complete. Reopen done to todo (status only). Save a lesson with done. Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. callstack takes the JSON from python -m commonplace.callstack.",
+          "description": "Update your card; move todo to doing, or held work to review/done. Review requires question, context and at least two options. Agent questions go to the authorized board coordinator by default; person_reason explains why a person is required. Without a coordinator they reach the owner. Requesters may edit their review details. A live authorized coordinator may withdraw only its own agent-directed ask to todo/doing, preserving history; person decisions cannot be withdrawn by agents. Reopen done to todo (status only). Save a lesson with done. Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. callstack takes the JSON from python -m commonplace.callstack.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -4229,6 +4244,9 @@
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "person_reason": {
+                "type": "string"
               },
               "pr": {
                 "type": [

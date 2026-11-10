@@ -261,13 +261,13 @@ def add(
                 "task_comment": "Append a comment and renew your claim.",
                 "task_take_next": "Claim ready work reserved for you or available in your board scope. You may also claim your own backlog by number. Pending child proposals require parent approval; other reservations and person decisions stay protected.",
                 "task_update": "Update your card; move todo to doing, or held work to review/done. Review requires question, context and at least two options. "
-                "Requesters may edit their own review details while preserving the open ask. Assignee edits and ask withdrawal to todo/doing are prepared for future agent-directed reviews; current APIs create person-directed reviews, which agents cannot withdraw or complete. "
+                "Agent questions go to the authorized board coordinator by default; person_reason explains why a person is required. Without a coordinator they reach the owner. Requesters may edit their review details. A live authorized coordinator may withdraw only its own agent-directed ask to todo/doing, preserving history; person decisions cannot be withdrawn by agents. "
                 "Reopen done to todo (status only). Save a lesson with done. "
                 "Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. "
                 "callstack takes the JSON from python -m commonplace.callstack.",
                 "task_handoff": "Hand off work with a note, or ask a person and end the turn.",
-                "ask": "Ask and end the turn. Subagent questions go to the live board coordinator when available; otherwise the owner.",
-                "decide": "Answer a review as its owner or addressed live coordinator. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
+                "ask": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
+                "decide": "Answer a review as its owner or addressed live coordinator. Never answer your own ask. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
                 "needs_me": "Read the visible decision queue and origin releases. Eligible coordinators receive origin work without decide authority; signed-in owners receive release or configuration recovery only when needed. Ask authority remains separate.",
             }[name],
             input_schema=input_schema,
@@ -453,6 +453,7 @@ def register_tools():
                     "reason",
                     "question",
                     "context",
+                    "person_reason",
                 )
             },
         },
@@ -467,7 +468,14 @@ def register_tools():
     )
     add(
         "ask",
-        {"question": STRING, "options": ARRAY, "context": STRING, "board": STRING, "task": TASK},
+        {
+            "question": STRING,
+            "options": ARRAY,
+            "context": STRING,
+            "board": STRING,
+            "task": TASK,
+            "person_reason": STRING,
+        },
         ("question",),
         write=True,
     )

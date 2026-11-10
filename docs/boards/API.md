@@ -28,7 +28,8 @@ Card tools return short plain text, one fact per line. Chat tools return JSON wi
 | `task_heartbeat` | `task` | slim, standard, full |
 | `task_approve` | `task`, `approve?`, `version?`, `reason?`, `escalate?` | slim, standard, full |
 | `board_add` | `slug`, `name?`, `wing?`, `repo?` | all profiles; trusted tokens or signed-in users |
-| `task_update` | `task`, `title?`, `body?`, `status?` (`backlog` \| `todo` \| `doing` \| `review` \| `done`), `before?`, `after?`, `link?`, `unlink?`, `lesson?`, `reason?` (review returns only) | slim, standard, full |
+| `task_update` | `task`, `title?`, `body?`, `status?` (`backlog` \| `todo` \| `doing` \| `review` \| `done`), `before?`, `after?`, `link?`, `unlink?`, `lesson?`, `reason?` (review returns only), `person_reason?` (opening review only) | slim, standard, full |
+| `ask` | `question`, `options?`, `context?`, `board?`, `task?`, `person_reason?` | slim, standard, full |
 | `task_handoff` | `task`, `to`, `note`, `options?` | slim, standard, full |
 | `needs_me` | `format?` (`list` \| `digest`) | slim, standard, full; owners or trusted, unrestricted member connections |
 
@@ -151,7 +152,7 @@ Claims and expiries use `BEGIN IMMEDIATE`, so concurrent agents never take the s
 
 Only the holder of a `doing` card, or a person, may change it. Anyone else gets `no: #142 is held by conn:codex:example until 14:30Z`.
 
-- Agents may claim available `todo` cards with `task_update status=doing` as well as `task_take_next`. Only their own cards may be completed. They may move free or self-reserved `todo` cards to `review`, and held `doing` cards to `review` or `done`. A status-only update can reopen `done` to `todo`; other edits to completed cards remain blocked. Requesters may maintain their review feedback, but agents cannot close or withdraw person-directed reviews. Withdrawal handling below is prepared for future agent-directed asks. Person decisions require `decide` by a signed-in workspace owner; agent-claimed approval never counts as a person's answer.
+- Agents may claim available `todo` cards with `task_update status=doing` as well as `task_take_next`. Only their own cards may be completed. They may move free or self-reserved `todo` cards to `review`, and held `doing` cards to `review` or `done`. A status-only update can reopen `done` to `todo`; other edits to completed cards remain blocked. Requesters may maintain their review feedback, but agents cannot close or withdraw person-directed reviews. An authorized coordinator may withdraw its own agent-directed ask as described below. Person decisions require `decide` by a signed-in workspace owner; agent-claimed approval never counts as a person's answer.
 - Trusted, unrestricted board writers may promote an available `backlog` card to `todo`, or pick it up with `status=doing`. Restricted-origin cards require a person's release. Promotion preserves the caller's reservation. An open ask or a person in `assignee` or `ask_to` blocks agent moves. A person in `return_to` additionally blocks backlog pickup; stale return markers on released `todo` or `done` cards do not block normal moves or annotations.
 - Completed-card exception for trusted, unrestricted board writers: an update containing only `lesson`, `pr` and/or `link` may annotate a `done` card without reopening it. Optional `status=done` is accepted. Removing links and other edits stay frozen. These annotations emit the normal link history and `card.updated` event, preserving completion time and status.
 - `status: "done"` closes the card. On a board with `done_needs_review`, an agent's `done` moves the card to `review` instead, with a substantive completion question, the card context, and options to accept or return the work.
@@ -173,22 +174,31 @@ their `review` cards. Editing preserves the ask,
 options and recipient, so an ask addressed to a person remains in that
 person's `needs_me` queue. Other agents cannot edit or return the card.
 
-Current tools and HTTP routes create only person-directed review asks and
-clear the assignee. Assignee editing and agent-directed withdrawal handling
-are prepared for agent-to-agent review asks once such asks can be created;
-there is no public creation path for them today.
+Agent `ask` calls and `task_update status=review` questions default to the board's
+authorized live coordinator. The coordinator needs memory read/write, board-wing
+read/write and visible `space_read`, `space_post`, `needs_me` and `decide`.
+Supply `person_reason` (nonempty text, at most 500 characters) to explain why a
+person is needed. It targets the owner and appends the verbatim reason to context
+and opening history. Without an authorized coordinator the owner receives the
+ask. Completion reviews, person callers and explicit person handoffs retain their
+route. Existing asks are not rewritten. If a recipient becomes unavailable or is
+replaced, owner queue recovery preserves the stored question. Status text never
+hides a person decision or an item needing person release.
 
-For an agent-directed ask, the assignee or requester may move `review` to `todo`
-or `doing` by withdrawing its ask, with optional edits and a `reason` in the
-same update. The transaction clears `ask`, `ask_options`, `ask_to` and
-`return_to` together with the status change. It preserves the invariant that
-exactly the review cards have open asks. A person in `assignee`, `ask_to` or
-`return_to` blocks these moves; a missing recipient defaults to a person and
-also blocks them. The refusal is `waiting on a person, they must answer via decide`.
-A move to `doing` assigns the caller and starts the normal claim expiry.
-Agents cannot complete person-directed review cards, including their own asks
-and completion reviews on boards with `done_needs_review`. Only a signed-in
-workspace owner can answer through `decide`; trusted agents cannot relay approval.
+Only the currently authorized coordinator may withdraw a decision ask it requested
+itself, addressed to itself, by moving `review` to `todo` or `doing`, with optional
+feedback edits and `reason` in the same update. Merely holding or creating the card
+does not grant withdrawal rights. The transaction clears the open ask fields and
+preserves its original text, recipient, choices and optional reason in history.
+A move to `doing` assigns the caller and starts the normal claim expiry. Person
+recipients (including the default owner), person assignees, person return targets
+and completion reviews block agent withdrawal. Other agents, member people and
+coordinators appointed on other boards are refused.
+Agents cannot complete review cards or relay person approval. Only a signed-in
+workspace owner can answer a person-directed decision. Addressed live coordinators
+may answer other requesters' agent-directed decisions or escalate them with a reason;
+this recipient authority grants no right to withdraw someone else's ask. Agents
+cannot answer their own asks.
 
 All profiles may maintain their own review feedback. Person rules are unchanged. Edits emit `edit` / `card.updated`; the event's `text` is JSON
 with the previous values of changed title, body, checks and labels, plus
@@ -232,8 +242,8 @@ An agent can also hand off a card it does not hold, but only from `todo`, only w
 | doing → todo | `task_handoff` (holder) | yes |
 | doing → review | `task_update` or `task_handoff` to a person (holder) | yes |
 | doing → done | `task_update` (holder) | yes |
-| review → done | person-directed reviews cannot be completed by agents | `decide` only |
-| review → todo / doing | person decisions require `decide` (never own asks); withdrawal by a trusted assignee/requester is prepared for future agent-directed asks | `decide` only |
+| review → done | `decide` by the addressed live coordinator; never self-answer | `decide` only |
+| review → todo / doing | authorized coordinator withdraws only its own agent-directed decision; otherwise `decide` | `decide` only |
 | todo → review | `task_update` or `task_handoff` to a person (free or self-reserved) | yes |
 | todo → done | `task_update` | no |
 | done → todo | status-only `task_update` | yes |
@@ -357,7 +367,7 @@ answers its own ask.
 
 Agent `approvals` contains actionable proposals and plan reviews with roles and reasons. Heartbeat and startup approval reads use the same Needs-me read gate. `approvals_truncated` is a sibling boolean, never a bucket. Scans prefilter related rows, check board visibility before roles, and stop at 200 role checks (60 at session startup). Heartbeat and session startup quote titles and show a truncation note directing the caller to needs_me. Startup reads never create or migrate a board store. Owner plan rows have approve/reject actions; agent rows have notification only.
 
-Owner-role tokens may configure a board's coordinator through `board_set` when their normal profile, trust, scope and board-write permissions allow it. This is delegated configuration authority, distinct from a person's decision: only a signed-in owner answers `decide` or recovers rejected proposals. Member-role tokens cannot configure boards.
+Owner-role tokens may configure a board's coordinator through `board_set` when their normal profile, trust, scope and board-write permissions allow it. This is delegated configuration authority, distinct from a person's decision: only a signed-in owner answers person-directed decisions or recovers rejected proposals; coordinator answers require separate recipient authority. Member-role tokens cannot configure boards.
 
 `GET /api/needs-me/digest` accepts the same owner session or permitted bearer token as
 `GET /api/needs-me`, with the same wing visibility. It returns
@@ -415,11 +425,12 @@ All bodies are JSON. Writes send the card's `version`; a stale one gets `409` wi
 
 ### decide
 
-Only a signed-in workspace owner can decide. This applies to every agent
-connection, including legacy agent-directed review rows. Current public ask
-routes create person-directed questions; agent-directed answers through `decide`
-are unsupported. Agent connections cannot relay
-or claim a person's approval. The schema accepts an optional integer `version`.
+A signed-in workspace owner may decide. An agent may decide only when it is the
+addressed, currently authorized live coordinator for this board and the review is
+an agent-directed decision from another requester. It may escalate an addressed
+ask, including its own, using `then=escalate` with a nonempty reason in `reply`.
+Agents never answer their own asks or relay a person's approval. Delayed person
+approval holds remain restricted to signed-in owners. The schema accepts an optional integer `version`.
 Send the version read from the card to reject a decision if feedback has since
 changed it. HTTP requires `version`.
 A version clash leaves the open ask and card unchanged.
@@ -434,6 +445,7 @@ A version clash leaves the open ask and card unchanged.
 - `todo`: back to `todo`, free for any agent.
 - `done`: closed.
 - `backlog`: parked.
+- `escalate`: addressed coordinator only; preserve the ask and route it to the owner, with a required reason in `reply`.
 
 The server writes one `decide` event (choice and reply verbatim), clears `ask`, `ask_options` and `ask_to`, and moves the card.
 

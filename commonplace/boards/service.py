@@ -505,7 +505,10 @@ def needs_me(
                 if handoff and handoff["reason"]:
                     why += " Reason: " + json.dumps(handoff["reason"], ensure_ascii=False)
             if own_ask:
-                actions = ["answer", "escalate"]
+                actions = [
+                    "withdraw" if row["return_to"] == principal.actor else "answer",
+                    "escalate",
+                ]
             item.update(why=why, actions=actions if principal.person or own_ask else [])
             result[kind].append(item)
     result["count"] = len({c["number"] for bucket in result.values() for c in bucket})
@@ -574,6 +577,25 @@ class BoardService:
         ):
             return q
         return None
+
+    def _ask_recipient(self, board, person_reason=None):
+        if person_reason is not None:
+            validate_text(person_reason, "person_reason", required=True, limit=500)
+        if not self.principal.person and person_reason is None:
+            coordinator = self._ask_coordinator(board)
+            if coordinator is not None:
+                return coordinator.actor
+        return self._owner_actor()
+
+    @staticmethod
+    def _ask_context(context, person_reason):
+        validate_text(context, "context")
+        return validate_text(
+            context + "\n\nPerson needed: " + person_reason
+            if person_reason is not None
+            else context,
+            "context",
+        )
 
     def _ask_owner(self, row):
         """Recover a routed question when its addressed coordinator stops being available."""
@@ -2989,6 +3011,18 @@ class BoardService:
             and self.principal.actor in (row["assignee"], row["return_to"])
         )
 
+    def _can_withdraw_review(self, row):
+        coordinator = self._ask_coordinator(
+            {"coordinator": row["board_coordinator"], "wing": row["board_wing"]}
+        )
+        return (
+            coordinator is not None
+            and coordinator.actor == self.principal.actor
+            and row["return_to"] == self.principal.actor
+            and row["ask_to"] == self.principal.actor
+            and row["review_kind"] == "decision"
+        )
+
     def _transition(self, row, status, *, origin_release=False):
         if status not in STATUSES:
             raise ToolError("no: invalid status")
@@ -3030,14 +3064,17 @@ class BoardService:
             old == "review"
             and not self.principal.person
             and (
-                (row["review_kind"] == "decision" and self.principal.parent_agent)
-                or not (row["ask_to"] or "").startswith("conn:")
+                not (row["ask_to"] or "").startswith("conn:")
                 or any((row[key] or "").startswith("user:") for key in ("assignee", "return_to"))
             )
         ):
             raise ToolError("no: waiting on a person, they must answer via decide")
-        if old == "review" and not (not self.principal.person and status == "done"):
-            if self._review_editor(row) and status in ("todo", "doing"):
+        if old == "review":
+            if (
+                not self.principal.person
+                and status in ("todo", "doing")
+                and self._can_withdraw_review(row)
+            ):
                 return
             raise ToolError("no: use decide to move a card from review")
         if self.principal.person:
@@ -3070,7 +3107,6 @@ class BoardService:
                 ("doing", "review"),
                 ("todo", "done"),
                 ("doing", "done"),
-                ("review", "done"),
                 ("done", "todo"),
                 ("doing", "backlog"),
             }:
@@ -3174,7 +3210,7 @@ class BoardService:
             ]
         return json.dumps(previous, ensure_ascii=False) if previous else None
 
-    def _open_review(self, row, args, updates, done_review):
+    def _open_review(self, row, board, args, updates, done_review):
         question, offered = review_request(
             args.get(
                 "question",
@@ -3191,12 +3227,19 @@ class BoardService:
                 review_context(row, updates),
             ),
         )
-        updates["review_context"] = args.get("context", review_context(row, updates))
+        recipient = (
+            self._owner_actor()
+            if done_review
+            else self._ask_recipient(board, args.get("person_reason"))
+        )
+        updates["review_context"] = self._ask_context(
+            args.get("context", review_context(row, updates)), args.get("person_reason")
+        )
         updates.update(
             status="review",
             ask=question,
             ask_options=json.dumps(offered),
-            ask_to=self._owner_actor(),
+            ask_to=recipient,
             return_to=self.principal.actor,
             done_at=None,
             review_kind="completion" if done_review else "decision",
@@ -3295,6 +3338,7 @@ class BoardService:
             "question",
             "options",
             "context",
+            "person_reason",
         }
         with self.transaction() as conn:
             row, board = self._get(conn, task)
@@ -3313,9 +3357,16 @@ class BoardService:
             )
             self._write(board, row=row, content_edit=content_edit or inactive_annotation)
             self._version(conn, row, version)
-            if set(args) - permitted or (
-                "reason" in args
-                and not (row["status"] == "review" and args.get("status") in ("todo", "doing"))
+            if (
+                set(args) - permitted
+                or (
+                    "reason" in args
+                    and not (row["status"] == "review" and args.get("status") in ("todo", "doing"))
+                )
+                or (
+                    "person_reason" in args
+                    and (args.get("status") != "review" or row["status"] == "review")
+                )
             ):
                 raise ToolError("no: unknown update field")
             self._holder(
@@ -3331,7 +3382,7 @@ class BoardService:
             # The agent that asked for review may still refresh the PR's call tree.
             refresh = set(args) == {"callstack"} and row["return_to"] == self.principal.actor
             feedback = (
-                self._review_editor(row)
+                (self._review_editor(row) or self._can_withdraw_review(row))
                 and set(args)
                 <= {"title", "body", "checks", "labels", "link", "unlink", "status", "reason"}
                 and args.get("status", "review") in ("review", "todo", "doing")
@@ -3426,7 +3477,7 @@ class BoardService:
                     status == "done" and board["done_needs_review"] and not self.principal.person
                 ):
                     done_review = status == "done"
-                    self._open_review(row, args, updates, done_review)
+                    self._open_review(row, board, args, updates, done_review)
             self._position(conn, row, updates, args.get("before"), args.get("after"))
             review_edit_text = self._review_edit_text(conn, row, args, updates)
             from commonplace.projects import reports
@@ -3614,12 +3665,14 @@ class BoardService:
             )
         return self._start_assignment(result)
 
-    def ask(self, question, options=None, board=None, task=None, context=""):
+    def ask(self, question, options=None, board=None, task=None, context="", person_reason=None):
         with self.transaction() as conn:
             if task is not None:
                 row, b = self._get(conn, task)
                 if board is not None and self._board(conn, board)["id"] != b["id"]:
                     raise ToolError("no: card not found")
+                recipient = self._ask_recipient(b, person_reason)
+                context = self._ask_context(context or review_context(row), person_reason)
                 return self._handoff(
                     conn,
                     row,
@@ -3628,25 +3681,22 @@ class BoardService:
                     question,
                     options,
                     context or None,
-                    ask_to=(q.actor if (q := self._ask_coordinator(b)) else None)
-                    if self.principal.parent_agent
-                    else None,
+                    ask_to=recipient,
                 )
             b = self._board(conn, board, create=True)
             self._write(b, submission=True)
             self._expire(conn, b)
             question = validate_text(question, "question", required=True, limit=5000)
+            recipient = self._ask_recipient(b, person_reason)
             return self._new_card(
                 conn,
                 b,
                 title=question,
-                body=context,
+                body=self._ask_context(context, person_reason),
                 status="review",
                 ask=question,
                 options=choices(options),
-                target=(q.actor if (q := self._ask_coordinator(b)) else self._owner_actor())
-                if self.principal.parent_agent
-                else self._owner_actor(),
+                target=recipient,
             )
 
     def decide(self, task, choice=None, reply=None, then="return", version=None):
@@ -3689,6 +3739,8 @@ class BoardService:
                     conn, row["id"], "card.review_needed", ask_to=target, return_to=row["return_to"]
                 )
                 return self._card(conn, task_row(conn, row["id"]), p)
+            if not p.person and row["return_to"] == p.actor:
+                raise ToolError("no: cannot answer your own ask; withdraw it or escalate")
             if then not in ("return", "todo", "done", "backlog"):
                 raise ToolError("no: invalid decision destination")
             if choice is not None:

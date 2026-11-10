@@ -78,7 +78,7 @@ After all children exist, call `card_split_done task=<root> state=split`; use `s
 
 ## Asking the user
 
-- `ask question=… context=… options=["A","B"] task=#n`: a real question of at least 24 characters, context of at least 20 characters (or the card’s body/status line), and at least two distinct options. Explain the choice and consequences; mark the recommendation. The same fields are required by `task_update status=review`. Stay in `doing` for gates and other technical waits, or ask your orchestrator.
+- `ask question=… context=… options=["A","B"] task=#n`: a real question of at least 24 characters, context of at least 20 characters (or the card’s body/status line), and at least two distinct options. Explain the choice and consequences; mark the recommendation. The same fields are required by `task_update status=review`. Agent questions default to the authorized live board coordinator, falling back to the owner. Supply `person_reason="why a person is required"` only for a person decision; its text stays in context and history. Stay in `doing` for gates and other technical waits, or ask your orchestrator.
 - Then end your turn. Don't poll. The answer comes back on the card: your next `task_take_next` or `task_list mine=true` returns it with the decision.
 - A decision whose reply starts with `New options:` means the user rejected every option. Don't carry on. Ask again with `ask` on the same card, with 2 or 3 different options, and say in one line what changed. The `Not:` line lists what was rejected.
 - Hand a card to another agent with `task_handoff task=#n to=<connection> note=…`, or back to the pool with `to=anyone`.
@@ -90,11 +90,10 @@ After all children exist, call `card_split_done task=<root> state=split`; use `s
 - Trusted board writers may add `lesson`, `pr` or `link` to a `done` card without
   reopening it. Removing links and other edits to completed cards remain blocked.
 - Trusted board writers may edit title, body, checks, labels and memory links
-  on review cards they requested. Open asks stay with the user; history keeps
-  prior edited values. Current tools create only person-directed reviews.
-  Assignee edits and withdrawal to `todo`/`doing` are prepared for agent-to-agent
-  review asks once those can be created. Person-directed asks cannot be withdrawn.
-  Only the requester may complete a review; never answer your own ask. When
+  on review cards they requested. History keeps prior edited values.
+  An authorized live coordinator may withdraw only its own agent-directed decision
+  using `task_update status=todo|doing reason=…`; other requesters and person-directed
+  asks remain protected. Never answer your own ask. When
   answering, pass the card's read `version` to `decide` to reject a stale decision.
 
 ## Decisions
@@ -106,7 +105,7 @@ the person owner sees them only when none is live and able to read, write and as
 An agent sees only claims it supervises, with notification only: resume the holder or ask the owner.
 Owner-role connections retain access at any trust level. Trusted, unrestricted member agents may
 also read it without write access. `board_set` remains owner-only. `decide task=#n choice=…`
-answers an ask under the existing owner rules; an agent never answers its own ask.
+answers as a signed-in owner or the addressed live coordinator for an agent-directed decision from another requester. The coordinator may escalate with `then=escalate reply="reason"`; an agent never answers its own ask.
 
 ## When the server is unreachable
 

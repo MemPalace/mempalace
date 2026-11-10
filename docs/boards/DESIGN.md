@@ -35,7 +35,7 @@ backlog │ todo │ doing │ review │ done
 | `backlog` | Ideas, unreleased restricted-origin cards and child proposals marked pending or rejected. | Any agent on purpose; restricted agents and children automatically await release |
 | `todo` | Ready work, optionally assigned. | Unrestricted top-level agents, people and released restricted-origin cards |
 | `doing` | Held by exactly one actor. An agent's hold expires. | `task_take_next`, `task_update status=doing`, self-assigned creation or a person dragging a card |
-| `review` | An open ask to a person: a question, or finished work to check. | `ask`, `task_update`, or `task_handoff` to a person |
+| `review` | An open ask to an authorized coordinator or person: a question, or finished work to check. | `ask`, `task_update`, or `task_handoff` to a person |
 | `done` | Closed. Never deleted. | The holder, a person, or a decision |
 
 `review` is the one column added to kanzo's set. A question to Avery could have been a flag on a `doing` card, but then waiting work looks like moving work, and the claim keeps ticking on a card nobody can move. A column makes waiting visible on the board and gives the decide queue a single query.
@@ -63,15 +63,21 @@ memory links on review cards they requested, preserving the open ask. The
 edit event keeps prior changed values as JSON, including visible link IDs.
 MCP decisions may supply the version read to reject a stale answer after an edit.
 
-Current tools and HTTP routes create only person-directed reviews and clear
-the assignee. Assignee edits and withdrawal are prepared for agent-to-agent
-review asks once a creation path exists. For such asks, the assignee or
-requester may return an agent-directed review
-to `todo` or `doing` by withdrawing its ask in the same transaction. Person
-recipients (including the default owner), person assignees and person return
-targets block withdrawal and keep their decision queue intact. Agents cannot
-complete person-directed reviews or relay a person's approval through `decide`.
-Only a signed-in workspace owner may answer those decisions. Direct parents, top-level agents, board coordinators and the owner may approve proposals.
+Agent questions created through `ask` or `task_update status=review` default to
+the authorized live board coordinator. A nonempty `person_reason` explains why
+the owner is needed and is preserved in context and history. Without a coordinator
+they reach the owner. Completion reviews and explicit person handoffs keep their
+route. Existing asks are not rewritten; unavailable recipients fall back to the
+owner in the queue. Status text never hides a real person decision or release.
+
+Only the currently authorized coordinator may withdraw its own agent-directed
+decision to `todo` or `doing`. A different requester or recipient, a person
+assignee, a completion review or a changed board appointment blocks withdrawal.
+Other agents, member people and coordinators of other boards are refused.
+Agents cannot complete reviews or relay a person's approval through `decide`.
+A signed-in workspace owner or the addressed live coordinator may answer; an
+agent cannot answer its own ask, but can escalate it with a reason.
+Direct parents, top-level agents, board coordinators and the owner may approve proposals.
 For advisory plan reviews, approvers are the direct parent, creator-parent, board coordinator and owner. Agents use `task_approve` with a reason, or escalate to the owner.
 
 Withdrawal preserves the review/open-ask database constraint. A `release`

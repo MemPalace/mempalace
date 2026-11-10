@@ -281,6 +281,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Board design also documents coordinator release of restricted-origin cards.
 
+  - Board API and design documentation state default coordinator routing, audited person reasons, owner recovery and coordinator-only withdrawal of its own asks; existing asks retain their stored data.
+
   - Contributor test instructions state that the default run excludes the `timing` lane and that timing results are informational, never a merge gate.
 
   - Board API and design prose describe deliberate origin release, fail-closed provenance and signed-in owner recovery separately from proposal/plan review.
@@ -566,6 +568,8 @@ Format (read by `commonplace orch docs-check`):
   - Synthetic legacy safety-stop cases and explicitly classified transcript-only fixture updates.
   - `tests/test_backup_online_processes.py` reproduces separate backup/gateway ancestry and preserves foreign-writer and paused-worker refusals using a synthetic `/proc`.
   - The canonical Space REST matrix and base-captured profile/tool schemas.
+
+  - Card339 regressions exercise MCP and HTTP routing, owner fallback, person queue visibility, withdrawal history and authorization refusals. The pinned Space tool contract records the optional person_reason parameter and matching ask/review descriptions without changing tool names or profile visibility.
 
   - `tests/test_commonplace_subagent_asks.py` covers released-card questions and coordinator routing, answers, escalation and recovery.
 
@@ -1024,6 +1028,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The agent skill stays below 120 lines and links to the full opt-in splitting guide for delivery details.
 
+  - The shipped agent skill routes routine questions to the authorized board coordinator, documents explicit person_reason and owner fallback, and permits only the coordinator to withdraw its own agent-directed decision while preserving history. Person decisions and self-approval remain protected.
+
   - The agent playbook requires inbox reads at session start, on wakes and every 10 minutes, stable keys, and completion markers.
 
   - CLI commands act through the same services as the network routes; installers never change trust policy; hooks fail open.
@@ -1091,7 +1097,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Holders may annotate an inactive status line without activation.
 
-  - Subagent asks on released cards reach the live board coordinator, which may answer or escalate with a reason; absent a live coordinator the owner route remains, including asks already routed before a coordinator becomes unavailable or is replaced.
+  - All agent asks and review questions default to the authorized live board coordinator. Explicit person_reason is audited and routes to the owner; completion reviews and person handoffs retain their route. Missing or unavailable coordinators fall back to the owner without rewriting asks. Only a currently authorized coordinator may withdraw its own agent-directed decision to todo/doing; recipient, requester and current board appointment are checked. Person decisions and other requesters remain protected, and agents cannot answer their own asks. Withdrawal preserves history.
 
 - **How it fails:**
 
@@ -1111,7 +1117,7 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`, `tests/test_commonplace_webhooks.py`.
 
-  - `tests/test_commonplace_subagent_asks.py` checks question routing and recipient authority.
+  - `tests/test_commonplace_subagent_asks.py` and `tests/test_commonplace_agent_asks.py` check generic question routing, owner fallback, explicit person reasons, recipient authority and withdrawal guards through MCP and HTTP.
 
 
 ## runner

@@ -2277,7 +2277,7 @@ def test_stale_person_decide_after_review_edit_is_a_version_clash(hub, env):
     assert event["kind"] == "card.decided" and event["actor"] == person.actor
 
 
-def test_public_review_creation_is_person_directed_and_agent_handoff_stays_todo(hub, env):
+def test_without_coordinator_reviews_are_person_directed_and_agent_handoff_stays_todo(hub, env):
     _token, agent, person, _cookie, _owner = env
     worker = service(hub, agent)
     hub.owner_token("review-recipient")
@@ -2325,15 +2325,16 @@ def test_trusted_review_return_withdraws_agent_ask(
 ):
     _token, agent, _person, _cookie, owner = env
     token, principal, worker = review_worker(hub, member=True)
+    owner.board_set("work", principal.actor)
     requester = worker if relation == "requester" else service(hub, agent)
     ask_text += " Which approach should we take?"
     waiting = requester.ask(ask_text, board="work", context=REVIEW_CONTEXT, options=REVIEW_OPTIONS)
     number = waiting["number"]
-    recipient = agent.actor if relation == "requester" else principal.actor
+    recipient = principal.actor
     if relation == "assignee-other-agent":
         peer = hub.owner_token("review-recipient")
         recipient = hub.gateway.authenticate(f"Bearer {peer}").actor
-    # Agent-directed reviews have no public creation path yet.
+    # Historical assignees never grant authority to withdraw another requester's ask.
     with owner.store.transaction() as conn:
         conn.execute(
             "UPDATE tasks SET ask_to=?,assignee=? WHERE id=?",
@@ -2347,6 +2348,22 @@ def test_trusted_review_return_withdraws_agent_ask(
     args = {"status": status, "title": "After feedback", "checks": "pending"}
     if reason is not None:
         args["reason"] = reason
+    if relation != "requester":
+        if surface == "mcp":
+            assert not mcp(hub, token, "task_update", task=number, **args)[0]
+        else:
+            assert (
+                api(
+                    hub,
+                    token,
+                    "PATCH",
+                    f"/api/cards/{number}",
+                    {"version": before["version"], **args},
+                )[0]
+                == 403
+            )
+        assert owner.task_show(number) == before
+        return
     if surface == "mcp":
         assert mcp(hub, token, "task_update", task=number, **args)[0]
     else:
@@ -2400,7 +2417,8 @@ def test_trusted_review_return_withdraws_agent_ask(
 
 def test_review_withdrawal_empty_reason_is_null(hub, env):
     _token, agent, _person, _cookie, owner = env
-    _token, _principal, worker = review_worker(hub)
+    _token, principal, worker = review_worker(hub)
+    owner.board_set("work", principal.actor)
     waiting = worker.ask(
         "Future agent review Which approach should we take?",
         board="work",
@@ -2408,8 +2426,6 @@ def test_review_withdrawal_empty_reason_is_null(hub, env):
         options=REVIEW_OPTIONS,
     )
     number = waiting["number"]
-    with owner.store.transaction() as conn:
-        conn.execute("UPDATE tasks SET ask_to=? WHERE id=?", (agent.actor, number))
     worker.task_update(number, status="todo", reason="")
     with owner.store.connection() as conn:
         event = conn.execute(
@@ -2526,7 +2542,7 @@ def test_review_assignee_cannot_complete_another_requesters_card(hub, env):
         {"scopes": ["memory:read"]},
     ],
 )
-def test_review_feedback_requires_trusted_board_writer(hub, env, policy):
+def test_review_feedback_preserves_profile_access_without_withdrawal_authority(hub, env, policy):
     _token, agent, _person, _cookie, owner = env
     token, principal, worker = review_worker(hub, **policy)
     waiting = service(hub, agent).ask(
@@ -2547,7 +2563,7 @@ def test_review_feedback_requires_trusted_board_writer(hub, env, policy):
         {"status": "todo"},
         {"status": "doing"},
     ):
-        if not principal.policy.has_scope("memory:write"):
+        if not principal.policy.has_scope("memory:write") or "status" in args:
             with pytest.raises(ToolError):
                 worker.task_update(waiting["number"], **args)
             assert not mcp(hub, token, "task_update", task=waiting["number"], **args)[0]
@@ -2558,7 +2574,7 @@ def test_review_feedback_requires_trusted_board_writer(hub, env, policy):
     if not principal.policy.has_scope("memory:write"):
         assert owner.task_show(waiting["number"]) == before
     else:
-        assert owner.task_show(waiting["number"])["status"] == "doing"
+        assert owner.task_show(waiting["number"])["status"] == "review"
 
 
 @pytest.mark.parametrize(
@@ -2591,15 +2607,14 @@ def test_review_feedback_keeps_other_update_fields_blocked(hub, env, args):
 @pytest.mark.parametrize("reason", [None, 12, [], {"text": "no"}])
 def test_review_withdrawal_validates_reason_before_mutation(hub, env, reason):
     _token, agent, _person, _cookie, owner = env
-    token, _principal, worker = review_worker(hub)
+    token, principal, worker = review_worker(hub)
+    owner.board_set("work", principal.actor)
     waiting = worker.ask(
         "Agent feedback Which approach should we take?",
         board="work",
         context=REVIEW_CONTEXT,
         options=REVIEW_OPTIONS,
     )
-    with owner.store.transaction() as conn:
-        conn.execute("UPDATE tasks SET ask_to=? WHERE id=?", (agent.actor, waiting["number"]))
     before = owner.task_show(waiting["number"])
     emitted = events.after(hub.db, hub.workspace)
     assert not mcp(hub, token, "task_update", task=waiting["number"], status="todo", reason=reason)[
@@ -2614,6 +2629,7 @@ def test_review_withdrawal_validates_reason_before_mutation(hub, env, reason):
 def test_withdrawal_reason_migrates_existing_history_and_preserves_invariant(hub, env):
     _token, agent, _person, _cookie, owner = env
     _token, principal, worker = review_worker(hub)
+    owner.board_set("work", principal.actor)
     waiting = worker.ask(
         "  Original ask\n Which approach should we take?",
         board="work",
@@ -2622,7 +2638,6 @@ def test_withdrawal_reason_migrates_existing_history_and_preserves_invariant(hub
     )
     number = waiting["number"]
     with owner.store.transaction() as conn:
-        conn.execute("UPDATE tasks SET ask_to=? WHERE id=?", (agent.actor, number))
         conn.execute("ALTER TABLE task_events DROP COLUMN reason")
         original = [dict(row) for row in conn.execute("SELECT * FROM task_events ORDER BY id")]
     restarted = service(hub, principal)

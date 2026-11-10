@@ -99,7 +99,8 @@ def make_coordinator_unavailable(hub, fresh, orch, unavailable):
         elif unavailable == "restricted":
             policy["trust"] = "untrusted"
         else:
-            policy["tools"] = sorted(orch.principal.policy.tool_names() - {"decide"})
+            missing = "needs_me" if unavailable == "no-needs" else "decide"
+            policy["tools"] = sorted(orch.principal.policy.tool_names() - {missing})
         hub.db._conn.execute(
             "UPDATE connections SET policy=? WHERE id=?", (json.dumps(policy), orch.id)
         )
@@ -149,9 +150,9 @@ def test_no_live_coordinator_keeps_owner_route(hub, fresh, unavailable, when):
     assert answered["assignee"] == sub.principal.actor
 
 
-def test_owner_and_top_level_asks_keep_owner_route(fresh):
+def test_person_asks_keep_owner_route(fresh):
     orch = seat(fresh)
-    for caller in (fresh.owner, orch.work, fresh.connect("independent").work):
+    for caller in (fresh.owner,):
         asked = caller.ask(
             REVIEW_QUESTION, options=REVIEW_OPTIONS, board="work", context=REVIEW_CONTEXT
         )
