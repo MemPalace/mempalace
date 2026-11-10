@@ -440,6 +440,58 @@ def test_claude_code_jsonl_keeps_source_tool_without_is_meta():
     assert "KEEP" in result
 
 
+def test_claude_code_jsonl_skips_slash_command_skill_body():
+    # A skill started as a slash command (or by a /loop tick) is injected
+    # with isMeta and the preamble header but no sourceToolUseID.
+    lines = [
+        json.dumps({"type": "user", "message": {"content": "Q"}}),
+        json.dumps(
+            {
+                "type": "user",
+                "isMeta": True,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Base directory for this skill: /x\n\nSLASH-BODY"}
+                    ],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "user",
+                "isMeta": True,
+                "message": {"content": "Base directory for this skill: /y\n\nSTRING-BODY"},
+            }
+        ),
+        json.dumps({"type": "assistant", "message": {"content": "A"}}),
+    ]
+    result = _try_claude_code_jsonl("\n".join(lines))
+    assert "SLASH-BODY" not in result
+    assert "STRING-BODY" not in result
+    assert "> Q" in result
+
+
+def test_claude_code_jsonl_keeps_is_meta_loop_prompt():
+    # /loop tick prompts are isMeta without the header: they stay.
+    lines = [
+        json.dumps({"type": "user", "isMeta": True, "message": {"content": "LOOP-TICK check CI"}}),
+        json.dumps({"type": "assistant", "message": {"content": "A"}}),
+    ]
+    assert "LOOP-TICK" in _try_claude_code_jsonl("\n".join(lines))
+
+
+def test_claude_code_jsonl_keeps_typed_skill_header():
+    # A person typing the header is not isMeta, so the message stays.
+    lines = [
+        json.dumps(
+            {"type": "user", "message": {"content": "Base directory for this skill: TYPED"}}
+        ),
+        json.dumps({"type": "assistant", "message": {"content": "A"}}),
+    ]
+    assert "TYPED" in _try_claude_code_jsonl("\n".join(lines))
+
+
 def test_claude_code_jsonl_only_skill_bodies_is_not_a_conversation():
     lines = [
         _skill_body_entry("SKILL-ONE"),
