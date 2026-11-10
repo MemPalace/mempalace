@@ -243,6 +243,68 @@ def test_failed_current_write_retry_does_not_clone_history_twice(tmp_path, monke
     assert any("B question" in text for text in _documents(palace_path, session))
 
 
+
+def test_interrupted_b_generation_is_not_archived_when_retry_writes_c(tmp_path, monkeypatch):
+    """B was never published: retrying with C may not turn partial B into history."""
+    source_dir = tmp_path / "sessions"
+    source_dir.mkdir()
+    session = source_dir / "session.txt"
+    palace_path = str(tmp_path / "palace")
+    _write_session(session, "A", count=3)
+    _mine(source_dir, palace_path)
+    original_a = _documents(palace_path, session)
+    assert len(original_a) >= 3
+
+    _write_session(session, "B", count=3)
+    _touch_after_write(session)
+
+    import mempalace.palace as palace
+
+    monkeypatch.setattr(palace, "DRAWER_UPSERT_BATCH_SIZE", 1)
+    collection = get_collection(palace_path)
+    original_upsert = type(collection).upsert
+    current_batches = 0
+
+    def fail_second_current(self, *args, **kwargs):
+        nonlocal current_batches
+        ids = kwargs.get("ids") or []
+        if ids and any("_hist_" not in drawer_id for drawer_id in ids):
+            current_batches += 1
+            if current_batches == 2:
+                raise RuntimeError("injected halfway through unpublished B")
+        return original_upsert(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(collection), "upsert", fail_second_current)
+    with pytest.raises(MineFileErrors):
+        _mine(source_dir, palace_path)
+    assert current_batches == 2
+    failed_rows = get_collection(palace_path).get(
+        where={"source_file": str(session)}, include=["documents", "metadatas"]
+    )
+    assert any(
+        "B question" in doc and (meta or {}).get("historical_version") is not True
+        for doc, meta in zip(failed_rows["documents"], failed_rows["metadatas"])
+    ), "failure injection never persisted any unpublished B row"
+
+    # The source is rewritten again without B ever being committed. The prior
+    # A snapshot must survive, but the in-flight B fragment must not be
+    # promoted to a historical_version and become publicly searchable.
+    monkeypatch.setattr(type(collection), "upsert", original_upsert)
+    _write_session(session, "C", count=3)
+    _touch_after_write(session)
+    _mine(source_dir, palace_path)
+
+    rows = get_collection(palace_path).get(
+        where={"source_file": str(session)}, include=["documents", "metadatas"]
+    )
+    docs = set(rows["documents"])
+    assert original_a.issubset(docs), "the committed A snapshot was lost"
+    assert any("C question" in doc for doc in docs)
+    assert not any("B question" in doc for doc in docs), (
+        "an unpublished B fragment was incorrectly promoted into immutable history"
+    )
+
+
 def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, monkeypatch):
     """Future generation gate: an interrupted mine must not expose mixed rows."""
     source_dir = tmp_path / "sessions"

@@ -161,6 +161,11 @@ def _backup_changed_conversation_drawers(
     from ..ids import make_convo_history_id
 
     desired = {drawer_id: document for drawer_id, document, _ in drawers}
+    # A failed positional replacement can leave B rows next to the old A
+    # snapshot. Never promote those *unpublished* rows to immutable history
+    # on the next attempt: check each filed generation's completion first.
+    candidates = []
+    generation_counts = {}
     backup_rows = []
     offset = 0
     while True:
@@ -188,19 +193,36 @@ def _backup_changed_conversation_drawers(
                 continue
             if not isinstance(old_text, str):
                 raise RuntimeError("old conversation text unavailable; refusing an unsafe re-mine")
-            if desired.get(original_id) == old_text:
-                continue
-            history_id = make_convo_history_id(original_id, old_text)
-            historical = {
-                **old_meta,
-                "source_file": source_file,
-                "historical_version": True,
-                "history_source_drawer_id": original_id,
-            }
-            backup_rows.append((history_id, old_text, historical))
+            key = (old_meta.get("source_mtime"), old_meta.get("filed_at"))
+            generation = generation_counts.setdefault(key, [0, 0])
+            generation[0] += 1
+            declared = old_meta.get("chunk_total")
+            if declared is not None:
+                if not _is_plain_number(declared) or declared < 0:
+                    generation[1] = float("inf")
+                else:
+                    generation[1] = max(generation[1], declared)
+            candidates.append((original_id, old_text, old_meta, key))
         if len(ids) < 1000:
             break
         offset += len(ids)
+
+    for original_id, old_text, old_meta, key in candidates:
+        seen, expected = generation_counts[key]
+        if seen < expected:
+            # An interrupted positional upsert or unfinished metadata
+            # finalize must not become a published historical version.
+            continue
+        if desired.get(original_id) == old_text:
+            continue
+        history_id = make_convo_history_id(original_id, old_text)
+        historical = {
+            **old_meta,
+            "source_file": source_file,
+            "historical_version": True,
+            "history_source_drawer_id": original_id,
+        }
+        backup_rows.append((history_id, old_text, historical))
 
     # Snapshot the backup set before writing: this scan must not page across
     # historical rows added by our own writes.
