@@ -243,7 +243,6 @@ def test_failed_current_write_retry_does_not_clone_history_twice(tmp_path, monke
     assert any("B question" in text for text in _documents(palace_path, session))
 
 
-
 def test_interrupted_b_generation_is_not_archived_when_retry_writes_c(tmp_path, monkeypatch):
     """B was never published: retrying with C may not turn partial B into history."""
     source_dir = tmp_path / "sessions"
