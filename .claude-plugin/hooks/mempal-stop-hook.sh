@@ -1,24 +1,7 @@
 #!/bin/bash
-# MemPalace Stop Hook — thin wrapper calling Python CLI
-# All logic lives in mempalace.hooks_cli for cross-harness extensibility
-run_mempalace_hook() {
-  if command -v mempalace >/dev/null 2>&1; then
-    mempalace hook run "$@"
-    return $?
-  fi
-
-  if command -v python3 >/dev/null 2>&1 && python3 -c "import mempalace" >/dev/null 2>&1; then
-    python3 -m mempalace hook run "$@"
-    return $?
-  fi
-
-  if command -v python >/dev/null 2>&1 && python -c "import mempalace" >/dev/null 2>&1; then
-    python -m mempalace hook run "$@"
-    return $?
-  fi
-
-  echo "MemPalace hook error: could not find a runnable mempalace command or module" >&2
-  return 1
-}
-
-run_mempalace_hook --hook stop --harness claude-code
+# MemPalace Stop hook for the Claude Code plugin. `mempalace hook run` does the
+# work; mempal_hook_run.sh next to this file picks the interpreter. A missing
+# mempalace exits 1 so Claude Code reports the hook as failed.
+here="${BASH_SOURCE[0]%/*}"
+[ "$here" = "${BASH_SOURCE[0]}" ] && here=.
+exec "${BASH:-bash}" "$here/mempal_hook_run.sh" --on-missing=error --hook stop --harness claude-code

@@ -6,8 +6,7 @@ if __name__ != "mempalace.mcp_server":
 def _startup_preflight() -> None:
     """Startup SQLite integrity + HNSW capacity probes, off the protocol thread.
 
-    Runs the same checks the stdio loop used to run synchronously before
-    reading the first request. Failures must never take down the server: the
+    Failures must never take down the server: the
     lazy consumers (_ensure_sqlite_integrity_status, _get_client) re-run or
     re-check on demand, so an exception here only loses the early warning.
     """
@@ -38,59 +37,24 @@ def _drop_broken_stdout() -> None:
 
 # Stdio→hub proxying. When a long-lived HTTP hub (`mempalace serve`) owns
 # this palace, a stdio server spawned by an agent harness must not open its
-# own Chroma handles: it could only ever be a read-only peer (writer lease,
-# #1818), and racing writers are exactly what corrupted FTS5 indexes in the
-# wild. Instead the stdio process forwards every JSON-RPC request to the hub
+# own Chroma handles: it could only ever be a read-only peer (writer lease),
+# and racing writers corrupt FTS5 indexes. Instead the stdio process forwards every JSON-RPC request to the hub
 # verbatim, adding the local bearer token. This makes stdio-only harnesses
 # (plugins, desktop apps) share the hub with zero client-side reconfiguration.
 # Shares the CLI forwarder's kill switch (MEMPALACE_HUB_FORWARD=0).
-_HUB_FORWARD_ENV = "MEMPALACE_HUB_FORWARD"
-_HUB_PROXY_TIMEOUT_S = 600.0
 _hub_proxy_announced = False
 
 
 def _hub_proxy_target():
-    """Return (base_url, headers) for a live hub serving our palace, or None."""
+    """The live hub serving our palace, or None."""
     global _hub_proxy_announced
-    if _truthy_env_off(_HUB_FORWARD_ENV):
-        return None
-    try:
-        from .. import server_registry
+    from ..hub_client import HubClient
 
-        info = server_registry.read_live_serverinfo(_config.palace_path)
-        if not info or info.get("pid") == os.getpid():
-            return None
-        base_url = server_registry.client_base_url(info)
-        headers = {"Content-Type": "application/json"}
-    except Exception:
-        logger.debug("hub discovery failed; serving locally", exc_info=True)
-        return None
-    if not _hub_proxy_announced:
+    hub = HubClient.discover(_config.palace_path)
+    if hub is not None and not _hub_proxy_announced:
         _hub_proxy_announced = True
-        logger.info("Live palace hub detected at %s; proxying stdio requests to it", base_url)
-    return base_url, headers
-
-
-def _truthy_env_off(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"0", "false", "no", "off"}
-
-
-def _forward_request_to_hub(base_url: str, headers: dict, request: dict, palace_path: str):
-    """POST one JSON-RPC request to the hub; None for notifications (202)."""
-    from .. import server_registry
-
-    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
-    with server_registry.urlopen_with_server_tokens(
-        palace_path,
-        f"{base_url}/mcp",
-        data=body,
-        headers=headers,
-        timeout=_HUB_PROXY_TIMEOUT_S,
-    ) as resp:
-        raw = resp.read()
-    if not raw:
-        return None
-    return json.loads(raw.decode("utf-8"))
+        logger.info("Live palace hub detected at %s; proxying stdio requests to it", hub.base_url)
+    return hub
 
 
 def _request_is_mutating(request: dict) -> bool:
@@ -117,49 +81,53 @@ def _dispatch_stdio_request(request: dict):
     mutating call that failed mid-flight must NOT be replayed locally (the
     hub may still be executing it), so it surfaces as a JSON-RPC error.
     """
-    import http.client
     import urllib.error
 
-    target = _hub_proxy_target()
-    if target is None:
+    from ..hub_client import FORWARD_ERRORS, proxy_error_response
+
+    hub = _hub_proxy_target()
+    if hub is None:
         return handle_request(request)
-    base_url, headers = target
     try:
         from ..mcp_proxy import _annotate_forwarded_update_status
 
-        return _annotate_forwarded_update_status(
-            request,
-            _forward_request_to_hub(base_url, headers, request, _config.palace_path),
-        )
-    except (
-        urllib.error.URLError,
-        OSError,
-        TimeoutError,
-        ValueError,
-        http.client.HTTPException,
-    ) as exc:
+        return _annotate_forwarded_update_status(request, hub.post(request))
+    except FORWARD_ERRORS as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):
-            logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
+            logger.warning(
+                "Hub at %s unreachable (%s); handling request locally", hub.base_url, exc
+            )
             return handle_request(request)
-        if request.get("id") is None:
+        return proxy_error_response(request, hub.base_url, exc)
+
+
+def _stdio_reply(line: str, dispatch) -> Optional[str]:
+    """The JSON-RPC text owed for one stdio line, or None when none is owed.
+
+    Shared by this server and the light server's stdio loop.
+    """
+    try:
+        request = json.loads(line)
+    except Exception as exc:
+        # ValueError (digit limit) and RecursionError (nesting) are still
+        # parse failures, so answer -32700 with a null id the way the HTTP
+        # transport does. The type is in the log because MemoryError has
+        # no message of its own.
+        logger.error("Server error: %s: %s", type(exc).__name__, exc)
+        return dumps_client(_json_rpc_parse_error())
+    try:
+        response = dispatch(request)
+    except Exception:
+        # Log with the traceback: the client only gets a generic -32603, so
+        # the stack is the only record of what failed.
+        logger.exception("Server error")
+        req_id = request.get("id") if isinstance(request, dict) else None
+        if req_id is None:
+            # A notification is owed no response, failure included.
             return None
-        return {
-            "jsonrpc": "2.0",
-            "id": request.get("id"),
-            "error": {
-                "code": -32000,
-                "message": f"palace hub proxy failed: {exc}",
-                "data": {
-                    "hub": base_url,
-                    "hint": (
-                        "The palace hub did not complete this request. Mutating tools "
-                        "are not replayed locally — the hub may still be executing the "
-                        "call. Check the hub process, then retry."
-                    ),
-                },
-            },
-        }
+        return dumps_client(_json_rpc_internal_error(req_id))
+    return None if response is None else dumps_client(response)
 
 
 def _run_stdio_loop() -> None:
@@ -181,9 +149,9 @@ def _run_stdio_loop() -> None:
     # Pre-flight in a background thread: PRAGMA quick_check reads every page
     # of chroma.sqlite3 (20s+ on multi-GB palaces) and running it before the
     # protocol loop starves the client's initialize timeout, even though the
-    # handshake itself never touches the database. The #1222 intent (warnings
-    # visible at startup rather than on first use) is preserved — the probe
-    # starts now and logs as soon as it finishes; tool calls that need the
+    # handshake itself never touches the database. Warnings still show at
+    # startup rather than on first use: the probe starts now and logs as soon
+    # as it finishes; tool calls that need the
     # verdict serialize on _sqlite_integrity_refresh_lock via
     # _ensure_sqlite_integrity_status instead of re-running the probe.
     threading.Thread(
@@ -194,11 +162,11 @@ def _run_stdio_loop() -> None:
 
     # Opt-in: pre-load the embedder so the first chromadb-write tool call
     # does not pay the ONNX/CoreML cold-load tax under the MCP client
-    # timeout (#1495). Default off — preserves current startup latency.
+    # timeout. Default off — preserves current startup latency.
     _maybe_eager_warmup_embedder()
 
     # Idle auto-exit: release ChromaDB file handles from stale servers
-    # that outlived their Claude Code session (#1552).
+    # that outlived their Claude Code session.
     _start_idle_exit_watchdog()
 
     # Say so when a chromadb write stops coming back, from a thread the stuck
@@ -225,35 +193,10 @@ def _run_stdio_loop() -> None:
         if not line:
             continue
 
-        payload = None
         try:
-            request = json.loads(line)
+            payload = _stdio_reply(line, _dispatch_stdio_request)
         except KeyboardInterrupt:
             break
-        except Exception as exc:
-            # ValueError (digit limit) and RecursionError (nesting) are still
-            # parse failures, so answer -32700 with a null id the way the HTTP
-            # transport does. The type is in the log because MemoryError has
-            # no message of its own.
-            logger.error("Server error: %s: %s", type(exc).__name__, exc)
-            payload = json.dumps(_json_rpc_parse_error(), ensure_ascii=False)
-        else:
-            try:
-                response = _dispatch_stdio_request(request)
-                if response is not None:
-                    payload = json.dumps(response, ensure_ascii=False)
-            except KeyboardInterrupt:
-                break
-            except Exception:
-                # Log with the traceback: the client only gets a generic
-                # -32603, so the stack is the only record of what failed.
-                logger.exception("Server error")
-                req_id = request.get("id") if isinstance(request, dict) else None
-                if req_id is None:
-                    # A notification is owed no response, failure included.
-                    continue
-                payload = json.dumps(_json_rpc_internal_error(req_id), ensure_ascii=False)
-
         if payload is None:
             continue
         try:
@@ -282,34 +225,18 @@ def _writer_wait_seconds() -> float:
     behaviour of refusing immediately. A value that is not a finite,
     non-negative number falls back to the default with a warning.
     """
-    import math
-
-    raw = os.environ.get(_MCP_WRITER_WAIT_SECONDS_ENV, "").strip()
-    if not raw:
-        return _MCP_WRITER_WAIT_SECONDS_DEFAULT
-    try:
-        seconds = float(raw)
-    except ValueError:
-        seconds = -1.0
-    if not math.isfinite(seconds) or seconds < 0:
-        logger.warning(
-            "Invalid %s=%r; using default %.0f s",
-            _MCP_WRITER_WAIT_SECONDS_ENV,
-            raw,
-            _MCP_WRITER_WAIT_SECONDS_DEFAULT,
-        )
-        return _MCP_WRITER_WAIT_SECONDS_DEFAULT
-    return seconds
+    seconds = env_float(_MCP_WRITER_WAIT_SECONDS_ENV, _MCP_WRITER_WAIT_SECONDS_DEFAULT)
+    return seconds if seconds >= 0 else _MCP_WRITER_WAIT_SECONDS_DEFAULT
 
 
 def _acquire_writer_lease_for_http_startup() -> tuple[bool, str]:
     """Acquire the writer lease for writable HTTP startup, waiting if a peer holds it.
 
-    #2500: refusing at once turned a transient holder into an outage. A peer
+    Refusing at once would turn a transient holder into an outage. A peer
     session's MCP server, a hook-driven mine or a CLI write that holds the
     lease releases it when it finishes, but ``SystemExit(2)`` before binding
-    meant nothing retried, and under ``Restart=always`` the unit restarted
-    forever without ever starting. The server now retries for a bounded time
+    means nothing retries, and under ``Restart=always`` the unit would restart
+    forever without ever starting. So the server retries for a bounded time
     with backoff, logging once when the wait starts, and still exits 2 when
     the wait runs out so a supervisor sees a terminal failure.
 
@@ -360,7 +287,7 @@ def _run_http_loop() -> None:
     # A writable HTTP server is a long-lived storage client, so it must own the
     # local palace before it binds. Refusing at startup avoids advertising a
     # writable service that will only fail (or race) on its first mutation.
-    # A peer holding the lease is waited out for a bounded time first (#2500).
+    # A peer holding the lease is waited out for a bounded time first.
     # Explicit read-only HTTP remains safe to run beside the one writer owner.
     owns_writer_lease = False
     if not _READ_ONLY:
@@ -379,8 +306,7 @@ def _run_http_loop() -> None:
         _start_idle_exit_watchdog()
         _start_write_stall_watchdog()
 
-        raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
-        if raw_warmup in _WARMUP_TRUTHY:
+        if env_bool("MEMPALACE_EAGER_WARMUP", False):
 
             def _warmup_with_lock():
                 with _HTTP_REQUEST_LOCK:
@@ -391,9 +317,6 @@ def _run_http_loop() -> None:
                 name="mcp-http-eager-warmup",
                 daemon=True,
             ).start()
-        elif raw_warmup and raw_warmup not in _WARMUP_FALSY:
-            # Keep the same warning behavior as stdio mode for typo values.
-            _maybe_eager_warmup_embedder()
 
         _serve_http(_args.host, _args.port)
     finally:
@@ -413,7 +336,7 @@ def _install_shutdown_signal_handlers() -> None:
     when the lock is acquired. CPython's default disposition for SIGTERM and
     SIGHUP is immediate termination, which skips ``atexit`` and leaves
     ``mine_palace_*.lock`` naming a dead PID until a contender's liveness
-    check reclaims it (#2205). Calling ``sys.exit(0)`` from the handler
+    check reclaims it. Calling ``sys.exit(0)`` from the handler
     unwinds the synchronous stdio/http loop and runs the existing release
     path. SIGHUP is Unix-only (SSH session disconnect); Windows only gets
     SIGTERM. Handlers are best-effort — signal registration only works from
@@ -440,9 +363,9 @@ def main():
 
     Parses ``sys.argv`` and applies ``--palace`` / ``--backend`` / ``--read-only``
     to the process, including ``MEMPALACE_PALACE_PATH`` and ``MEMPALACE_BACKEND``
-    in ``os.environ``; importing the package parses no argv (#2528).
+    in ``os.environ``; importing the package parses no argv.
 
-    Side effect: pops ``PYTHONPATH`` from ``os.environ`` (see #1423) so any
+    Side effect: pops ``PYTHONPATH`` from ``os.environ`` so any
     subprocess this server spawns inherits a clean env. Host applications that
     call ``main()`` programmatically should be aware that the parent process
     loses ``PYTHONPATH`` as well. Library imports do NOT trigger this side
@@ -451,8 +374,7 @@ def main():
     Transports:
     - ``stdio`` remains the default for existing Claude/MCP deployments.
     - ``http`` is opt-in and serves JSON-RPC POSTs at ``/mcp`` in the same
-      process, avoiding the long-lived stdio framing failure surface from
-      #1801.
+      process, avoiding the long-lived stdio framing failure surface.
     """
     global _args
 

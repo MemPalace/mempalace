@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from mempalace import cli, mcp_proxy, server_registry
+from mempalace import cli, hub_client, server_registry
 from mempalace.config import MempalaceConfig
 
 
@@ -53,6 +53,7 @@ def _mine_args(source_dir, **overrides):
         extract="exchange",
         max_chunks_per_file=None,
         kg_extract=False,
+        include_subagents=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -104,7 +105,8 @@ class TestServerRegistry:
     def test_shares_directory_with_server_token(self, isolated_home):
         palace = str(isolated_home / "palace")
         assert (
-            server_registry.serverinfo_path(palace).parent == cli._server_token_path(palace).parent
+            server_registry.serverinfo_path(palace).parent
+            == server_registry.server_token_path(palace).parent
         )
 
     def test_dead_pid_record_is_ignored(self, isolated_home):
@@ -157,13 +159,13 @@ class TestServerRegistry:
         token_path.write_text("palace-b-token\n")
         monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "palace-a-token")
 
-        assert server_registry.load_server_token(palace) == "palace-b-token"
+        assert server_registry.load_server_tokens(palace)[0] == "palace-b-token"
 
     def test_process_environment_is_fallback_without_palace_token(self, isolated_home, monkeypatch):
         palace = str(isolated_home / "palace")
         monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "explicit-token")
 
-        assert server_registry.load_server_token(palace) == "explicit-token"
+        assert server_registry.load_server_tokens(palace) == ("explicit-token",)
 
 
 # ── mine forwarding ──────────────────────────────────────────────────
@@ -172,12 +174,21 @@ class TestServerRegistry:
 class _FakeHub:
     """Minimal /healthz + /mcp endpoint standing in for `mempalace serve`."""
 
-    def __init__(self, mine_result=None, search_result=None, rpc_error=None, required_token=None):
+    def __init__(
+        self,
+        mine_result=None,
+        search_result=None,
+        sync_result=None,
+        rpc_error=None,
+        required_token=None,
+        diary_result=None,
+    ):
         self.requests = []
         self.auth_headers = []
         outer = self
 
         mine_result = mine_result or {"success": True, "mode": "convos", "output": "filed 1"}
+        diary_result = diary_result or {"success": True, "entry_id": "diary_1"}
         search_result = search_result or {
             "query": "needle",
             "filters": {"wing": None, "room": None},
@@ -191,6 +202,20 @@ class _FakeHub:
                     "bm25_score": 1.25,
                 }
             ],
+        }
+        sync_result = sync_result or {
+            "success": True,
+            "scanned": 10,
+            "kept": 8,
+            "gitignored": 1,
+            "missing": 1,
+            "unresolved": 0,
+            "no_source": 0,
+            "out_of_scope": 0,
+            "by_source": {},
+            "unresolved_by_source": {},
+            "removed_drawers": 0,
+            "removed_closets": 0,
         }
 
         class Handler(BaseHTTPRequestHandler):
@@ -220,7 +245,14 @@ class _FakeHub:
                     payload = {"jsonrpc": "2.0", "id": request.get("id"), "error": rpc_error}
                 else:
                     tool_name = request.get("params", {}).get("name")
-                    tool_result = search_result if tool_name == "mempalace_search" else mine_result
+                    if tool_name == "mempalace_search":
+                        tool_result = search_result
+                    elif tool_name == "mempalace_sync":
+                        tool_result = sync_result
+                    elif tool_name == "mempalace_diary_write":
+                        tool_result = diary_result
+                    else:
+                        tool_result = mine_result
                     payload = {
                         "jsonrpc": "2.0",
                         "id": request.get("id"),
@@ -264,6 +296,19 @@ def _register_hub(palace, hub, read_only=False, capabilities=None, search_config
         capabilities=capabilities,
         search_config_fingerprint=search_config_fingerprint,
     )
+
+
+def _disown_record(palace):
+    """Re-stamp the serverinfo pid so the record looks like another process's
+    hub. ``write_serverinfo`` records our own pid, which a client correctly
+    refuses to dial — that is the "I am the hub" guard, not a missing hub."""
+    path = server_registry.serverinfo_path(palace)
+    record = json.loads(path.read_text())
+    parent_pid = os.getppid()
+    assert parent_pid != os.getpid()
+    assert server_registry._pid_alive(parent_pid)
+    record["pid"] = parent_pid
+    path.write_text(json.dumps(record))
 
 
 class TestForwardMineToHub:
@@ -375,6 +420,49 @@ class TestForwardMineToHub:
             assert "read-only server" in capsys.readouterr().err
         finally:
             hub.stop()
+
+
+def _sync_args(source_dir=None, **overrides):
+    defaults = dict(
+        dir=str(source_dir) if source_dir else None,
+        root=[],
+        palace=None,
+        backend=None,
+        global_backend=None,
+        wing=None,
+        dry_run=True,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+class TestForwardSyncToHub:
+    def test_forwards_when_hub_alive(self, isolated_home, tmp_path, fake_hub, capsys):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        args = _sync_args(tmp_path / "convos")
+        handled = cli._forward_sync_to_hub(args, palace)
+        assert handled is True
+        (request,) = fake_hub.requests
+        assert request["params"]["name"] == "mempalace_sync"
+        arguments = request["params"]["arguments"]
+        assert arguments["apply"] is False
+        assert arguments["project_dir"] == os.path.abspath(str(tmp_path / "convos"))
+        out = capsys.readouterr().out
+        assert "forwarding sync to palace hub" in out
+        assert "DRY RUN" in out
+
+    def test_no_hub_returns_false(self, isolated_home, tmp_path):
+        palace = str(isolated_home / "palace")
+        assert cli._forward_sync_to_hub(_sync_args(tmp_path), palace) is False
+
+    def test_multi_root_stays_direct(self, tmp_path):
+        args = _sync_args(tmp_path / "a", root=[str(tmp_path / "b")])
+        assert cli._sync_args_forwardable(args) is False
+
+    def test_explicit_backend_is_not_forwardable(self, tmp_path):
+        args = _sync_args(tmp_path, backend="chroma")
+        assert cli._sync_args_forwardable(args) is False
 
 
 class TestForwardSearchToHub:
@@ -745,7 +833,9 @@ class TestForwardSearchToHub:
         ],
     )
     def test_per_invocation_search_override_is_not_forwardable(self, monkeypatch, env_name):
-        for name in cli._SEARCH_OVERRIDE_ENV_VARS:
+        from mempalace.hub_client import SEARCH_OVERRIDE_ENV_VARS
+
+        for name in SEARCH_OVERRIDE_ENV_VARS:
             monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv(env_name, "en")
         assert cli._search_args_forwardable(_search_args()) is False
@@ -756,6 +846,283 @@ class TestForwardSearchToHub:
         assert cli._search_args_forwardable(_search_args()) is True
 
 
+def _checkpoint_payload():
+    """The payload ``_save_diary_direct`` hands the detached checkpoint child."""
+    return {
+        "entry": "CHECKPOINT:2026-09-29|msgs:3",
+        "agent_name": "claude",
+        "topic": "checkpoint",
+        "wing": "wing_project",
+        "messages_folded": 3,
+        "session_id": "sess1",
+        "exchange_count": 3,
+        "ack_ts": "2026-09-29T00:00:00Z",
+    }
+
+
+class TestForwardDiaryWriteToHub:
+    """The save-hook diary checkpoint must reach a hub that holds the writer
+    lease (#2614).
+
+    A long-lived ``mempalace serve`` is the palace's only writer, so an
+    in-process ``tool_diary_write`` is refused for as long as it runs and the
+    per-save checkpoint is lost. The transcript mine survives only because
+    ``cmd_mine`` forwards to the hub; the diary path had no such forward.
+    """
+
+    def test_forwards_the_checkpoint_and_returns_the_hub_result(self, isolated_home, fake_hub):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+
+        handled, result = hub_client.forward_tool_call(
+            palace,
+            "mempalace_diary_write",
+            {"agent_name": "claude", "entry": "CHECKPOINT:2026-09-29", "topic": "checkpoint"},
+        )
+
+        assert handled is True
+        assert result == {"success": True, "entry_id": "diary_1"}
+        (request,) = fake_hub.requests
+        assert request["method"] == "tools/call"
+        assert request["params"]["name"] == "mempalace_diary_write"
+        assert request["params"]["arguments"] == {
+            "agent_name": "claude",
+            "entry": "CHECKPOINT:2026-09-29",
+            "topic": "checkpoint",
+        }
+
+    def test_no_hub_leaves_the_write_to_the_caller(self, isolated_home):
+        assert hub_client.forward_tool_call(
+            str(isolated_home / "palace"), "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+
+    def test_read_only_hub_leaves_the_write_to_the_caller(self, isolated_home, fake_hub):
+        # A read-only hub refuses every palace write, so forwarding would turn
+        # a working in-process write into a refusal.
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, read_only=True)
+        _disown_record(palace)
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+        assert fake_hub.requests == []
+
+    def test_kill_switch_leaves_the_write_to_the_caller(self, isolated_home, fake_hub, monkeypatch):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+        monkeypatch.setenv("MEMPALACE_HUB_FORWARD", "0")
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+        assert fake_hub.requests == []
+
+    def test_unreachable_listener_leaves_the_write_to_the_caller(self, isolated_home):
+        # Bind-then-close: the recorded pid is alive, but nothing is listening.
+        # Without the health probe the write would be handed to a dead socket
+        # and the in-process fallback lost.
+        probe = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        dead_port = probe.server_address[1]
+        probe.server_close()
+        palace = str(isolated_home / "palace")
+        server_registry.write_serverinfo(
+            palace, host="127.0.0.1", port=dead_port, scheme="http", read_only=False
+        )
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+
+    def test_hub_refusal_is_a_result_not_a_retry_prompt(self, isolated_home):
+        # The hub answered, so the write may already be filed. Reporting it as
+        # a result keeps the caller from filing the same content twice.
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(diary_result={"success": False, "error": "wing already exists"})
+        try:
+            _register_hub(palace, hub)
+            _disown_record(palace)
+            handled, result = hub_client.forward_tool_call(
+                palace, "mempalace_diary_write", {"agent_name": "claude"}
+            )
+            assert handled is True
+            assert result == {"success": False, "error": "wing already exists"}
+        finally:
+            hub.stop()
+
+    def test_jsonrpc_error_becomes_a_failed_result(self, isolated_home):
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(rpc_error={"code": -32003, "message": "read-only server"})
+        try:
+            _register_hub(palace, hub)
+            _disown_record(palace)
+            handled, result = hub_client.forward_tool_call(
+                palace, "mempalace_diary_write", {"agent_name": "claude"}
+            )
+            assert handled is True
+            assert result == {"success": False, "error": "read-only server"}
+        finally:
+            hub.stop()
+
+    def test_unanswered_request_reports_handled_with_no_result(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        # A transport failure after the hub was probed may still have been
+        # accepted upstream; `handled=True, result=None` says "do not retry".
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+        monkeypatch.setattr(
+            hub_client.HubClient,
+            "post",
+            lambda *a, **kw: (_ for _ in ()).throw(OSError("connection reset")),
+        )
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (True, None)
+
+    def test_retries_process_token_after_stale_palace_token_401(self, isolated_home, monkeypatch):
+        # A hub restarted with an explicit token keeps a generated palace
+        # credential on disk that it no longer accepts. The second local
+        # credential has to be tried or the checkpoint is lost to a 401.
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="current-token")
+        try:
+            _register_hub(palace, hub)
+            _disown_record(palace)
+            server_registry.server_token_path(palace).write_text("stale-token")
+            monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
+
+            handled, result = hub_client.forward_tool_call(
+                palace, "mempalace_diary_write", {"agent_name": "claude"}
+            )
+
+            assert (handled, result) == (True, {"success": True, "entry_id": "diary_1"})
+            assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
+        finally:
+            hub.stop()
+
+    def test_unauthenticated_hub_leaves_the_write_to_the_caller(self, isolated_home):
+        # The auth gate rejects before dispatch, so nothing was written and the
+        # caller's own write is still valid.
+        palace = str(isolated_home / "palace")
+        hub = _FakeHub(required_token="actual-token")
+        try:
+            _register_hub(palace, hub)
+            _disown_record(palace)
+            assert hub_client.forward_tool_call(
+                palace, "mempalace_diary_write", {"agent_name": "claude"}
+            ) == (False, None)
+            assert hub.requests == []
+        finally:
+            hub.stop()
+
+    def test_unparsable_response_reports_handled_with_no_result(
+        self, isolated_home, fake_hub, monkeypatch
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+        monkeypatch.setattr(
+            hub_client.HubClient,
+            "post",
+            lambda *a, **kw: {"jsonrpc": "2.0", "id": 1},
+        )
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (True, None)
+
+    def test_own_hub_is_not_forwarded_to_itself(self, isolated_home):
+        # A stdio server running inside the hub process would otherwise forward
+        # every call to itself over HTTP.
+        palace = str(isolated_home / "palace")
+        server_registry.write_serverinfo(
+            palace, host="127.0.0.1", port=8765, scheme="http", read_only=False
+        )
+        assert hub_client.forward_tool_call(
+            palace, "mempalace_diary_write", {"agent_name": "claude"}
+        ) == (False, None)
+
+    def test_save_hook_checkpoint_is_filed_by_the_live_hub(
+        self, isolated_home, fake_hub, monkeypatch, tmp_path
+    ):
+        """End-to-end #2614: with a hub holding the writer lease, the Stop-hook
+        checkpoint is filed *by the hub*. The reporter saw it refused with
+        "another mine is in progress ... held by PID <hub>" on every save.
+
+        The in-process write is also what pulled ~77 MB of chromadb into a
+        hook-budgeted process, so a forwarded checkpoint must not import the
+        storage stack at all.
+        """
+        from mempalace import hooks_cli
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        _disown_record(palace)
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", palace)
+        monkeypatch.setattr(hooks_cli, "STATE_DIR", tmp_path)
+
+        real_import = builtins.__import__
+
+        def import_without_storage_stack(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "mempalace.mcp_server" or (level and name == "mcp_server"):
+                raise AssertionError("a forwarded checkpoint must not import the storage stack")
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", import_without_storage_stack)
+
+        assert hooks_cli._apply_diary_checkpoint(_checkpoint_payload()) is True
+
+        (request,) = fake_hub.requests
+        assert request["params"]["name"] == "mempalace_diary_write"
+        arguments = request["params"]["arguments"]
+        assert arguments["agent_name"] == "claude"
+        assert arguments["wing"] == "wing_project"
+        assert arguments["topic"] == "checkpoint"
+        assert arguments["entry"].startswith("CHECKPOINT:")
+        # The ack marker still advances, so the next save is not re-triggered.
+        assert (tmp_path / "last_checkpoint").exists()
+
+    def test_save_hook_checkpoint_falls_back_in_process_when_no_hub(
+        self, isolated_home, monkeypatch, tmp_path
+    ):
+        from mempalace import hooks_cli
+
+        palace = str(isolated_home / "palace")
+        monkeypatch.setenv("MEMPALACE_PALACE_PATH", palace)
+        monkeypatch.setattr(hooks_cli, "STATE_DIR", tmp_path)
+
+        written = {}
+
+        def fake_write_locked(tool_diary_write, **kwargs):
+            written.update(kwargs)
+            return {"success": True, "entry_id": "diary_local"}
+
+        monkeypatch.setattr(hooks_cli, "_diary_write_locked", fake_write_locked)
+
+        assert hooks_cli._apply_diary_checkpoint(_checkpoint_payload()) is True
+
+        assert written["agent_name"] == "claude"
+        assert written["wing"] == "wing_project"
+        assert written["topic"] == "checkpoint"
+        assert (tmp_path / "last_checkpoint").exists()
+
+    def test_unanswered_hub_checkpoint_is_not_written_again(self, monkeypatch, tmp_path):
+        # The hub may already have filed it; a second, in-process write would
+        # store the same verbatim entry twice.
+        from mempalace import hooks_cli
+
+        monkeypatch.setattr(hooks_cli, "STATE_DIR", tmp_path)
+        monkeypatch.setattr(hub_client, "forward_tool_call", lambda *a, **kw: (True, None))
+
+        def refuse_local_write(*args, **kwargs):
+            raise AssertionError("the checkpoint must not be written in-process as well")
+
+        monkeypatch.setattr(hooks_cli, "_diary_write_locked", refuse_local_write)
+
+        assert hooks_cli._apply_diary_checkpoint(_checkpoint_payload()) is False
+        assert not (tmp_path / "last_checkpoint").exists()
+
+
 class TestForwardability:
     def test_plain_convo_mine_is_forwardable(self, tmp_path):
         assert cli._mine_args_forwardable(_mine_args(tmp_path), []) is True
@@ -763,6 +1130,10 @@ class TestForwardability:
     def test_project_include_ignored_is_forwardable(self, tmp_path):
         args = _mine_args(tmp_path, mode="projects")
         assert cli._mine_args_forwardable(args, [".agents/handoffs/note.md"]) is True
+
+    def test_convo_include_subagents_is_forwardable(self, tmp_path):
+        args = _mine_args(tmp_path, include_subagents=True)
+        assert cli._mine_args_forwardable(args, []) is True
 
     @pytest.mark.parametrize(
         "overrides,include_ignored",
@@ -856,7 +1227,7 @@ class TestStdioProxy:
             hub.stop()
 
     def test_dynamic_proxy_status_adds_local_client_update_state(self, proxied_palace, monkeypatch):
-        from mempalace import mcp_server, mcp_proxy
+        from mempalace import mcp_proxy, mcp_server
 
         hub = _FakeHub(mine_result={"updates": {"server": {"enabled": True, "installed": "3.9.0"}}})
         try:
@@ -973,7 +1344,7 @@ class TestStdioProxy:
         def broken_off(*a):
             raise error
 
-        monkeypatch.setattr(mcp_server, "_forward_request_to_hub", broken_off)
+        monkeypatch.setattr(hub_client.HubClient, "post", broken_off)
         write = {
             "jsonrpc": "2.0",
             "id": 9,
@@ -1032,12 +1403,8 @@ class TestThinStdioProxyTokenRetry:
             monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "current-token")
             request = {"jsonrpc": "2.0", "id": 7, "method": "tools/list"}
 
-            response = mcp_proxy._forward(
-                f"http://127.0.0.1:{hub.port}",
-                {"Content-Type": "application/json"},
-                request,
-                palace,
-            )
+            client = hub_client.HubClient(palace, {"host": "127.0.0.1", "port": hub.port})
+            response = client.post(request)
 
             assert response["id"] == 7
             assert hub.auth_headers == ["Bearer stale-token", "Bearer current-token"]
@@ -1074,6 +1441,7 @@ class TestServeHttpRegistersServerinfo:
         assert observed["during"]["port"] == 12345
         assert observed["during"]["read_only"] is mcp_server._READ_ONLY
         assert "mine_include_ignored" in observed["during"]["capabilities"]
+        assert "mine_include_subagents" in observed["during"]["capabilities"]
         # After shutdown the record is gone — no stale forwarding target.
         assert server_registry.read_live_serverinfo(palace) is None
 
@@ -1159,7 +1527,7 @@ class TestCmdMineIntegration:
         def uncertain(*args, **kwargs):
             raise TimeoutError("response lost after submission")
 
-        monkeypatch.setattr(server_registry, "urlopen_with_server_tokens", uncertain)
+        monkeypatch.setattr(hub_client.HubClient, "post", uncertain)
         args = _mine_args(
             tmp_path / "project", palace=palace, mode="projects", include_ignored=["notes"]
         )
@@ -1167,6 +1535,95 @@ class TestCmdMineIntegration:
             cli.cmd_mine(args)
         assert exc.value.code == 1
         assert "not retrying directly" in capsys.readouterr().err
+
+    def test_include_subagents_routes_through_hub(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch
+    ):
+        from mempalace import convo_miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub, capabilities=["mine_include_subagents"])
+        monkeypatch.setattr(
+            convo_miner, "mine_convos", lambda **kw: pytest.fail("must not open a local writer")
+        )
+        args = _mine_args(
+            tmp_path / "convos", palace=palace, include_subagents=True, agent="test-agent"
+        )
+        cli.cmd_mine(args)
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"] == {
+            "source": str(tmp_path / "convos"),
+            "mode": "convos",
+            "agent": "test-agent",
+            "limit": 0,
+            "dry_run": False,
+            "extract": "exchange",
+            "include_subagents": True,
+        }
+
+    def test_include_subagents_old_hub_refused_without_local_fallback(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch, capsys
+    ):
+        from mempalace import convo_miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(
+            convo_miner,
+            "mine_convos",
+            lambda **kw: pytest.fail("must not fall back to a local writer"),
+        )
+        args = _mine_args(tmp_path / "convos", palace=palace, include_subagents=True)
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_mine(args)
+        assert exc.value.code == 1
+        assert fake_hub.requests == []
+        error = capsys.readouterr().err
+        assert "--include-subagents" in error
+        assert "upgrade" in error.lower() and "restart" in error.lower()
+
+    def test_convo_mine_without_include_subagents_still_reaches_old_hub(
+        self, isolated_home, tmp_path, fake_hub
+    ):
+        # The argument is sent only when set, so hubs that predate it keep
+        # taking the save hooks' plain convos mines.
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        cli.cmd_mine(_mine_args(tmp_path / "convos", palace=palace))
+        (request,) = fake_hub.requests
+        assert "include_subagents" not in request["params"]["arguments"]
+
+    def test_include_subagents_outside_convos_mode_is_not_forwarded(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch
+    ):
+        # The direct path ignores the flag outside convos mode; the hub path
+        # must not turn it into an old-hub refusal or a tool argument.
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(miner, "mine", lambda **kw: pytest.fail("must not open a local writer"))
+        args = _mine_args(
+            tmp_path / "project", palace=palace, mode="projects", include_subagents=True
+        )
+        cli.cmd_mine(args)
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"]["mode"] == "projects"
+        assert "include_subagents" not in request["params"]["arguments"]
+
+    def test_mine_without_mode_forwards_projects_mode(
+        self, isolated_home, tmp_path, fake_hub, monkeypatch
+    ):
+        # `mempalace mine <dir>` leaves --mode unset (None); the hub's tool
+        # refuses a null mode, so the forwarder must send the CLI's default.
+        from mempalace import miner
+
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(miner, "mine", lambda **kw: pytest.fail("must not open a local writer"))
+        cli.cmd_mine(_mine_args(tmp_path / "project", palace=palace, mode=None))
+        (request,) = fake_hub.requests
+        assert request["params"]["arguments"]["mode"] == "projects"
 
     def test_cmd_mine_routes_through_hub(self, isolated_home, tmp_path, fake_hub, monkeypatch):
         palace = str(isolated_home / "palace")

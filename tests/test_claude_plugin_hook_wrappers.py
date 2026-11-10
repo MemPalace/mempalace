@@ -110,10 +110,12 @@ def test_plugin_hook_wrapper_falls_back_to_importable_python(
     args_file = tmp_path / "args.txt"
     stdin_file = tmp_path / "stdin.json"
 
+    # The resolver probes with `-c <import check>` and launches with
+    # `-c <run_module code> hook run ...`; only the launch is recorded.
     python_stub = (
         "#!/bin/sh\n"
         'if [ "$1" = "-c" ]; then\n'
-        "  exit 0\n"
+        '  case "$2" in *run_module*) shift 2 ;; *) exit 0 ;; esac\n'
         "fi\n"
         f'printf \'%s\' "$*" > "{_shell_path(args_file)}"\n'
         f"{_capture_stdin_to(stdin_file)}"
@@ -128,7 +130,7 @@ def test_plugin_hook_wrapper_falls_back_to_importable_python(
     assert result.stdout == "{}\n"
     assert (
         args_file.read_text(encoding="utf-8")
-        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
+        == f"hook run --hook {hook_name} --harness claude-code"
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
 
@@ -170,7 +172,7 @@ def test_plugin_hook_wrapper_falls_back_to_python_when_python3_cannot_import(
             "python": (
                 "#!/bin/sh\n"
                 'if [ "$1" = "-c" ]; then\n'
-                "  exit 0\n"
+                '  case "$2" in *run_module*) shift 2 ;; *) exit 0 ;; esac\n'
                 "fi\n"
                 f'printf \'%s\' "$*" > "{_shell_path(args_file)}"\n'
                 f"{_capture_stdin_to(stdin_file)}"
@@ -186,7 +188,7 @@ def test_plugin_hook_wrapper_falls_back_to_python_when_python3_cannot_import(
     assert result.stdout == "{}\n"
     assert (
         args_file.read_text(encoding="utf-8")
-        == f"-m mempalace hook run --hook {hook_name} --harness claude-code"
+        == f"hook run --hook {hook_name} --harness claude-code"
     )
     assert stdin_file.read_text(encoding="utf-8") == payload
     assert not bad_python3_used.exists()

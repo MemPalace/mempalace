@@ -2,7 +2,7 @@
 
 ``mempalace serve`` (and ``mempalace-mcp --transport http``) is meant to be
 the single long-lived writer for a shared palace: once it performs its first
-mutating tool call it holds the per-palace MCP writer lease (#1818) for its
+mutating tool call it holds the per-palace MCP writer lease for its
 whole lifetime, and every other process is refused palace writes. That is
 correct for agents — they talk to the hub — but the background save hooks
 and the plain CLI still spawn short-lived ``mempalace mine`` processes,
@@ -24,12 +24,17 @@ that every reader ignores and the next hub overwrites.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
-import time
 from pathlib import Path
+
+from mempalace import paths
+from mempalace._env import env_str
+from mempalace._proc import pid_alive as _pid_alive
+from mempalace.fsio import atomic_write_text, read_published_bytes
+
+from .timeutil import utc_now_z
 
 logger = logging.getLogger(__name__)
 
@@ -39,24 +44,17 @@ _WILDCARD_HOSTS = {"0.0.0.0", "::", "[::]"}
 _TOKEN_ENV = "MEMPALACE_MCP_HTTP_TOKEN"
 
 
-def _canonical(palace_path: str) -> str:
-    return os.path.abspath(os.path.realpath(os.path.expanduser(palace_path)))
-
-
 def _utc_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return utc_now_z()
 
 
 def server_state_dir(palace_path: str) -> Path:
     """Per-palace state directory shared by the token and the serverinfo.
 
     Keyed by the canonical palace path so one hub per palace reuses a stable
-    directory across restarts. Must stay in sync with the token location used
-    by ``mempalace serve`` (see ``cli._server_token_path``, which delegates
-    here).
+    directory across restarts.
     """
-    key = hashlib.sha256(os.path.normcase(_canonical(palace_path)).encode("utf-8")).hexdigest()[:24]
-    return Path.home() / ".mempalace" / "server" / key
+    return paths.state_path("server", paths.palace_key(palace_path))
 
 
 def server_token_path(palace_path: str) -> Path:
@@ -68,10 +66,41 @@ def serverinfo_path(palace_path: str) -> Path:
 
 
 def _read_server_token_file(palace_path: str) -> str:
+    """The stored token, or "" when it is missing, unreadable or not text."""
     try:
-        return server_token_path(palace_path).read_text(encoding="utf-8").strip()
-    except OSError:
+        return read_published_bytes(server_token_path(palace_path)).decode("utf-8").strip()
+    except (OSError, ValueError):
         return ""
+
+
+def load_or_create_server_token(palace_path: str) -> tuple[str, bool]:
+    """Return ``(token, created)`` for the palace's HTTP bearer token.
+
+    Reuses the stored token so it is stable across restarts, or mints one.
+    Creation runs under a cross-process lock, so hubs starting together settle
+    on one token, and an empty or garbled file left by a crash is replaced.
+    The file is published 0600 by rename, so it is never readable half-written;
+    a symlink at the path is removed first, never written through.
+    """
+    import secrets
+
+    from .palace import mine_lock
+
+    path = server_token_path(palace_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(str(path.parent), 0o700)
+    except OSError:
+        pass
+    with mine_lock(str(path)):
+        existing = _read_server_token_file(palace_path)
+        if existing:
+            return existing, False
+        token = secrets.token_urlsafe(32)
+        if path.is_symlink():
+            path.unlink()
+        atomic_write_text(path, token + "\n")
+    return token, True
 
 
 def write_serverinfo(
@@ -103,12 +132,9 @@ def write_serverinfo(
         "read_only": bool(read_only),
         "capabilities": sorted(set(capabilities or [])),
         "search_config_fingerprint": search_config_fingerprint,
-        "palace_path": _canonical(palace_path),
+        "palace_path": paths.canonical_palace_path(palace_path),
     }
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh)
-        fh.write("\n")
+    atomic_write_text(path, json.dumps(payload) + "\n")
     return path
 
 
@@ -143,21 +169,9 @@ def write_mesh_state(palace_path: str, *, peers: dict, profiles: dict) -> Path:
         "peers": peers,
         "profiles": profiles,
     }
-    # Write-and-rename: readers in other processes must never observe a
-    # half-serialized estate, and this file is rewritten every sync round.
-    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh)
-            fh.write("\n")
-        os.replace(str(tmp), str(path))
-    except BaseException:
-        try:
-            os.unlink(str(tmp))
-        except OSError:
-            pass
-        raise
+    # Readers in other processes must never observe a half-serialized
+    # estate, and this file is rewritten every sync round.
+    atomic_write_text(path, json.dumps(payload) + "\n", follow_symlinks=False)
     return path
 
 
@@ -172,7 +186,7 @@ def read_mesh_state(palace_path: str) -> dict:
     """
     empty = {"peers": {}, "profiles": {}, "written_at": None, "writer_alive": False}
     try:
-        state = json.loads(mesh_state_path(palace_path).read_text(encoding="utf-8"))
+        state = json.loads(read_published_bytes(mesh_state_path(palace_path)).decode("utf-8"))
     except (OSError, ValueError):
         return empty
     if not isinstance(state, dict):
@@ -195,7 +209,7 @@ def clear_serverinfo(palace_path: str) -> None:
     """
     path = serverinfo_path(palace_path)
     try:
-        recorded = json.loads(path.read_text(encoding="utf-8"))
+        recorded = json.loads(read_published_bytes(path).decode("utf-8"))
     except (OSError, ValueError):
         return
     if recorded.get("pid") != os.getpid():
@@ -206,29 +220,6 @@ def clear_serverinfo(palace_path: str) -> None:
         logger.debug("serverinfo cleanup failed for %s", path, exc_info=True)
 
 
-def _pid_alive(pid) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    if os.name == "nt":  # pragma: no cover - exercised on Windows CI only
-        import ctypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
-
-
 def read_live_serverinfo(palace_path: str):
     """Return the hub record for this palace, or None.
 
@@ -237,7 +228,7 @@ def read_live_serverinfo(palace_path: str):
     """
     path = serverinfo_path(palace_path)
     try:
-        info = json.loads(path.read_text(encoding="utf-8"))
+        info = json.loads(read_published_bytes(path).decode("utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(info, dict):
@@ -271,49 +262,9 @@ def load_server_tokens(palace_path: str) -> tuple[str, ...]:
     while an older generated palace credential remains on disk.
     """
     palace_token = _read_server_token_file(palace_path)
-    process_token = os.environ.get(_TOKEN_ENV, "").strip()
+    process_token = env_str(_TOKEN_ENV, "")
     candidates = []
     for token in (palace_token, process_token):
         if token and token not in candidates:
             candidates.append(token)
     return tuple(candidates)
-
-
-def load_server_token(palace_path: str) -> str:
-    """Return the preferred Hub bearer token, or "" when none is configured."""
-    candidates = load_server_tokens(palace_path)
-    return candidates[0] if candidates else ""
-
-
-def urlopen_with_server_tokens(
-    palace_path: str,
-    url: str,
-    *,
-    data=None,
-    headers=None,
-    timeout=None,
-):
-    """Open one Hub request, retrying only a pre-acceptance HTTP 401.
-
-    At most two distinct local credentials exist.  A 401 means the Hub's
-    authentication gate rejected the request before dispatch, so trying the
-    second credential is safe even for mutating JSON-RPC calls.  Every other
-    HTTP or transport failure is surfaced immediately and is never replayed.
-    """
-    import urllib.error
-    import urllib.request
-
-    candidates = load_server_tokens(palace_path) or ("",)
-    for index, token in enumerate(candidates):
-        attempt_headers = dict(headers or {})
-        if token:
-            attempt_headers["Authorization"] = f"Bearer {token}"
-        else:
-            attempt_headers.pop("Authorization", None)
-        request = urllib.request.Request(url, data=data, headers=attempt_headers)
-        try:
-            return urllib.request.urlopen(request, timeout=timeout)
-        except urllib.error.HTTPError as exc:
-            if exc.code != 401 or index + 1 >= len(candidates):
-                raise
-            exc.close()

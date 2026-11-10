@@ -22,8 +22,8 @@ from .sqlite_exact import (
     _DB_FILENAME,
     SQLiteExactBackend,
     SQLiteExactCollection,
-    _SnapshotChanged,
     _as_vector_array,
+    _SnapshotChanged,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,26 @@ except (ImportError, ValueError):
 
 class _NativeUnavailable(Exception):
     """Leave the native cursor before entering the Python fallback."""
+
+
+def _native_wings(where) -> Optional[tuple]:
+    """The wings a native query keeps: ``()`` for all, ``None`` when it cannot.
+
+    The native index filters on one ``wing`` at a time, so it takes no
+    filter, ``{"wing": w}``, or ``{"wing": {"$in": [w, ...]}}``.
+    """
+    if not where:
+        return ()
+    if not isinstance(where, dict) or set(where) != {"wing"}:
+        return None
+    value = where["wing"]
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, dict) and set(value) == {"$in"}:
+        wings = value["$in"]
+        if isinstance(wings, list) and wings and all(isinstance(w, str) for w in wings):
+            return tuple(dict.fromkeys(wings))
+    return None
 
 
 class RustExactCollection(SQLiteExactCollection):
@@ -90,14 +110,7 @@ class RustExactCollection(SQLiteExactCollection):
             _NativeVectorIndex is not None
             and not spec.embeddings
             and not where_document
-            and (
-                not where
-                or (
-                    isinstance(where, dict)
-                    and len(where) == 1
-                    and isinstance(where.get("wing"), str)
-                )
-            )
+            and _native_wings(where) is not None
         )
         if not can_use_native:
             # Fall back to base SQLiteExactCollection implementation
@@ -135,7 +148,7 @@ class RustExactCollection(SQLiteExactCollection):
             if native is None:
                 raise _NativeUnavailable()
 
-            filter_wing = where.get("wing") if where else None
+            wings = _native_wings(where)
             for query_vector in query_embeddings:
                 q = _as_vector_array(query_vector)
                 if expected_dim is not None and int(q.size) != expected_dim:
@@ -149,7 +162,15 @@ class RustExactCollection(SQLiteExactCollection):
                     outer_metas.append([])
                     outer_dists.append([])
                     continue
-                hits = native.query_parallel(q.tolist(), n_results, filter_wing)
+                if len(wings) <= 1:
+                    hits = native.query_parallel(q.tolist(), n_results, wings[0] if wings else None)
+                else:
+                    # The index filters on one wing: the top n of a union is
+                    # the top n of each wing's top n.
+                    hits = sorted(
+                        (h for w in wings for h in native.query_parallel(q.tolist(), n_results, w)),
+                        key=lambda h: float(h[1]),
+                    )[:n_results]
                 top_ids = [h[0] for h in hits]
                 top_dists = [float(h[1]) for h in hits]
                 docs_by_id: dict[str, str] = {}

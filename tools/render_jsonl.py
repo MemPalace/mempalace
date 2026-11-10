@@ -9,7 +9,7 @@ JSONL into a clean .txt so you can keep / read / share it without the tooling.
 Usage:
     python3 render_jsonl.py <input.jsonl> [output.txt]
 
-Stdlib only. Python 3.9+. Read-only on the input.
+Stdlib only. Python 3.10+. Read-only on the input.
 """
 
 import json

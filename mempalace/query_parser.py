@@ -19,11 +19,46 @@ class QueryParseError(ValueError):
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}([T ].*)?$")
 
 
-class QuotedToken(str):
-    """A DSL token that was written in quotes; never treated as a keyword flag."""
+class Token(str):
+    """DSL token that remembers its span in the stripped source."""
+
+    def __new__(cls, value: str, start: int, end: int):
+        obj = str.__new__(cls, value)
+        obj.start = start
+        obj.end = end
+        return obj
+
+
+class QuotedToken(Token):
+    """A DSL token that was written in quotes; never treated as a keyword flag.
+
+    The string value keeps historical escape expansion for filter values.
+    ``literal`` unescapes only quotes and backslashes, which is the form
+    stored as document text.
+    """
+
+    def __new__(cls, interpreted: str, literal: str, start: int, end: int):
+        obj = str.__new__(cls, interpreted)
+        obj.start = start
+        obj.end = end
+        obj.literal = literal
+        return obj
 
 
 _BARE_FLAGS = frozenset({"APPLY", "COMMIT", "PREVIEW", "DRY_RUN"})
+_SEARCH_KEYWORDS = frozenset(
+    {
+        "IN",
+        "LIMIT",
+        "SINCE",
+        "BEFORE",
+        "MAX_DIST",
+        "MAX_DISTANCE",
+        "STRATEGY",
+        "SOURCE",
+        "CONTEXT",
+    }
+)
 _EVENT_LIST_ORDER_FLAGS = frozenset(
     {
         "DESC",
@@ -98,6 +133,9 @@ _PQL_KEYS = frozenset(
         "DEPTH",
     }
 )
+# Free-text fields that are stored or matched against stored text. Filter
+# values (limit, flags, dates) still go through ``_parse_val``.
+_OPAQUE_TEXT_KEYS = frozenset({"content", "document", "text", "entry", "diff"})
 _KG_ADD_FLAGS = frozenset({"FROM", "TO", "VALID_FROM", "VALID_TO", "CLOSET", "DRAWER"})
 _KG_INVALIDATE_FLAGS = frozenset({"ENDED", "AT", "DATE"})
 _KG_SUPERSEDE_FLAGS = frozenset({"AT", "DATE"})
@@ -126,23 +164,29 @@ def tokenize_dsl(text: str) -> List[str]:
         # Check for quoted string
         if text[pos] in ('"', "'"):
             quote_char = text[pos]
-            start_pos = pos + 1
+            start_pos = pos
             pos += 1
             escaped = False
-            content = []
+            interpreted: list[str] = []
+            literal: list[str] = []
             while pos < length:
                 ch = text[pos]
                 if escaped:
-                    if ch == "n":
-                        content.append("\n")
+                    if ch in ('"', "'", "\\"):
+                        interpreted.append(ch)
+                        literal.append(ch)
+                    elif ch == "n":
+                        interpreted.append("\n")
+                        literal.append("\\n")
                     elif ch == "t":
-                        content.append("\t")
+                        interpreted.append("\t")
+                        literal.append("\\t")
                     elif ch == "r":
-                        content.append("\r")
-                    elif ch in ('"', "'", "\\"):
-                        content.append(ch)
+                        interpreted.append("\r")
+                        literal.append("\\r")
                     else:
-                        content.append("\\" + ch)
+                        interpreted.append("\\" + ch)
+                        literal.append("\\" + ch)
                     escaped = False
                 elif ch == "\\":
                     escaped = True
@@ -150,20 +194,21 @@ def tokenize_dsl(text: str) -> List[str]:
                     pos += 1
                     break
                 else:
-                    content.append(ch)
+                    interpreted.append(ch)
+                    literal.append(ch)
                 pos += 1
-            tokens.append(QuotedToken("".join(content)))
+            tokens.append(QuotedToken("".join(interpreted), "".join(literal), start_pos, pos))
             continue
 
         # Check for arrow symbols -> or =>
         if text[pos : pos + 2] in ("->", "=>"):
-            tokens.append(text[pos : pos + 2])
+            tokens.append(Token(text[pos : pos + 2], pos, pos + 2))
             pos += 2
             continue
 
         # Check for standalone colon or colon followed by space
         if text[pos] == ":" and (pos + 1 >= length or text[pos + 1].isspace()):
-            tokens.append(":")
+            tokens.append(Token(":", pos, pos + 1))
             pos += 1
             continue
 
@@ -177,7 +222,7 @@ def tokenize_dsl(text: str) -> List[str]:
             pos += 1
         word = text[start_pos:pos]
         if word:
-            tokens.append(word)
+            tokens.append(Token(word, start_pos, pos))
 
     return tokens
 
@@ -208,7 +253,7 @@ def _parse_key_value_tokens(
             k = tok[:-1].lower().strip()
             v = tokens[i + 1]
             if k:
-                result[k] = _parse_val(v)
+                result[k] = _coerce_field(k, v)
             i += 2
             continue
 
@@ -222,7 +267,7 @@ def _parse_key_value_tokens(
             k, v = tok.split(":", 1)
             k = k.lower().strip()
             if k:
-                result[k] = _parse_val(v)
+                result[k] = _coerce_field(k, v)
             i += 1
             continue
 
@@ -231,7 +276,7 @@ def _parse_key_value_tokens(
             k = tok.lower().strip()
             v = tokens[i + 2]
             if k:
-                result[k] = _parse_val(v)
+                result[k] = _coerce_field(k, v)
             i += 3
             continue
 
@@ -251,7 +296,7 @@ def _parse_key_value_tokens(
             ):
                 k = tok.lower().strip()
                 if k:
-                    result[k] = _parse_val(nxt)
+                    result[k] = _coerce_field(k, nxt)
                 i += 2
                 continue
 
@@ -293,6 +338,47 @@ def _parse_val(val: str) -> Any:
     return val
 
 
+def _stored_text(val: Any) -> str:
+    """Document text with quotes removed and only quote/backslash escapes applied."""
+    if isinstance(val, QuotedToken):
+        return val.literal
+    if val is None:
+        return ""
+    return str(val)
+
+
+def _coerce_field(key: str, val: Any) -> Any:
+    """Coerce filter values. Stored text fields stay strings."""
+    if key in _OPAQUE_TEXT_KEYS:
+        return _stored_text(val)
+    return _parse_val(val)
+
+
+def _put_key_value(params: dict, tok: str) -> None:
+    k, v = tok.split(":", 1)
+    params[k.lower()] = _coerce_field(k.lower(), v)
+
+
+def _verbatim_span(source: str, tokens: list) -> str:
+    """Join content tokens, keeping the whitespace written between adjacent ones.
+
+    Tokens separated by anything else (a keyword such as ``IN w/r``) join with
+    one space, so keywords never end up in the stored text.
+    """
+    if not tokens:
+        return ""
+    parts = [_stored_text(tokens[0])]
+    for prev, tok in zip(tokens, tokens[1:]):
+        gap = (
+            source[prev.end : tok.start]
+            if isinstance(prev, Token) and isinstance(tok, Token)
+            else " "
+        )
+        parts.append(gap if not gap.strip() else " ")
+        parts.append(_stored_text(tok))
+    return "".join(parts)
+
+
 def _is_known_flag_token(tok: str, flag_keys: frozenset) -> bool:
     """True when tok starts option flags, not when it merely contains a colon."""
     if isinstance(tok, QuotedToken):
@@ -321,6 +407,21 @@ def _split_object_and_flags(tokens: List[str], flag_keys: frozenset) -> Tuple[Li
 # ==============================================================================
 # 1. PALACE QUERY PARSER
 # ==============================================================================
+
+
+def _search_keyword(tok: str) -> str | None:
+    """Return the PQL keyword a token spells, or ``None`` when it is search text.
+
+    The default SEARCH/FIND clause receives natural language, so a keyword is the
+    written upper-case, unquoted spelling of a word in :data:`_SEARCH_KEYWORDS`.
+    Matching case-insensitively instead turned ordinary English words such as
+    ``in``, ``limit`` or ``source`` into filters: the word and the token after it
+    both left the search text, and a value like ``wing="the"`` narrowed the recall
+    to a wing that does not exist.
+    """
+    if isinstance(tok, QuotedToken) or not tok.isupper():
+        return None
+    return tok if tok in _SEARCH_KEYWORDS else None
 
 
 def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C901
@@ -507,8 +608,7 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
                 params["before"] = tokens[i + 1]
                 i += 2
             elif ":" in tokens[i]:
-                k, v = tokens[i].split(":", 1)
-                params[k.lower()] = _parse_val(v)
+                _put_key_value(params, tokens[i])
                 i += 1
             else:
                 i += 1
@@ -520,7 +620,7 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
         start_idx = 2 if first_tok == "CHECK" else 1
         if len(tokens) <= start_idx:
             raise QueryParseError("CHECK DUP requires content string")
-        content = tokens[start_idx]
+        content = _stored_text(tokens[start_idx])
         threshold = 0.9
         if len(tokens) > start_idx + 2 and tokens[start_idx + 1].upper() == "THRESHOLD":
             threshold = float(tokens[start_idx + 2])
@@ -563,8 +663,7 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
                 params["direction"] = tokens[i + 1].lower()
                 i += 2
             elif ":" in tokens[i]:
-                k, v = tokens[i].split(":", 1)
-                params[k.lower()] = _parse_val(v)
+                _put_key_value(params, tokens[i])
                 i += 1
             else:
                 i += 1
@@ -595,8 +694,7 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
                 params["wing"] = tokens[i + 1]
                 i += 2
             elif ":" in tokens[i]:
-                k, v = tokens[i].split(":", 1)
-                params[k.lower()] = _parse_val(v)
+                _put_key_value(params, tokens[i])
                 i += 1
             else:
                 params["wing"] = tokens[i]
@@ -612,7 +710,7 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
         if "/" in loc:
             w, r = loc.split("/", 1)
             return "follow_tunnels", {"wing": w, "room": r}
-        elif len(tokens) >= 3:
+        if len(tokens) >= 3:
             return "follow_tunnels", {"wing": tokens[1], "room": tokens[2]}
         raise QueryParseError("FOLLOW requires wing and room")
 
@@ -644,8 +742,7 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
                 params["wing"] = tokens[i + 1]
                 i += 2
             elif ":" in tokens[i]:
-                k, v = tokens[i].split(":", 1)
-                params[k.lower()] = _parse_val(v)
+                _put_key_value(params, tokens[i])
                 i += 1
             else:
                 i += 1
@@ -663,8 +760,8 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
     n = len(tokens)
     while i < n:
         tok = tokens[i]
-        tok_upper = tok.upper()
-        if tok_upper == "IN" and i + 1 < n:
+        keyword = _search_keyword(tok)
+        if keyword == "IN" and i + 1 < n:
             loc = tokens[i + 1]
             if "/" in loc:
                 w, r = loc.split("/", 1)
@@ -673,30 +770,29 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
             else:
                 params["wing"] = loc
             i += 2
-        elif tok_upper == "LIMIT" and i + 1 < n:
+        elif keyword == "LIMIT" and i + 1 < n:
             params["limit"] = int(tokens[i + 1])
             i += 2
-        elif tok_upper == "SINCE" and i + 1 < n:
+        elif keyword == "SINCE" and i + 1 < n:
             params["since"] = tokens[i + 1]
             i += 2
-        elif tok_upper == "BEFORE" and i + 1 < n:
+        elif keyword == "BEFORE" and i + 1 < n:
             params["before"] = tokens[i + 1]
             i += 2
-        elif tok_upper in ("MAX_DIST", "MAX_DISTANCE") and i + 1 < n:
+        elif keyword in ("MAX_DIST", "MAX_DISTANCE") and i + 1 < n:
             params["max_distance"] = float(tokens[i + 1])
             i += 2
-        elif tok_upper == "STRATEGY" and i + 1 < n:
+        elif keyword == "STRATEGY" and i + 1 < n:
             params["candidate_strategy"] = tokens[i + 1].lower()
             i += 2
-        elif tok_upper == "SOURCE" and i + 1 < n:
+        elif keyword == "SOURCE" and i + 1 < n:
             params["source_file"] = tokens[i + 1]
             i += 2
-        elif tok_upper == "CONTEXT" and i + 1 < n:
+        elif keyword == "CONTEXT" and i + 1 < n:
             params["context"] = tokens[i + 1]
             i += 2
         elif ":" in tok and not tok.startswith("http") and not isinstance(tok, QuotedToken):
-            k, v = tok.split(":", 1)
-            params[k.lower()] = _parse_val(v)
+            _put_key_value(params, tok)
             i += 1
         else:
             search_tokens.append(tok)
@@ -870,7 +966,7 @@ def parse_exec_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C9
                 d = json.loads(payload_str)
                 return "checkpoint", d
             except Exception as e:
-                raise QueryParseError(f"Invalid JSON in CHECKPOINT: {e}")
+                raise QueryParseError(f"Invalid JSON in CHECKPOINT: {e}") from e
         raise QueryParseError("CHECKPOINT requires JSON payload {items: [...], diary?: {...}}")
 
     # --- Mining & Sync ---
@@ -914,15 +1010,14 @@ def parse_exec_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C9
                 params["added_by"] = tokens[i + 1]
                 i += 2
             elif ":" in tok and not isinstance(tok, QuotedToken):
-                k, v = tok.split(":", 1)
-                params[k.lower()] = _parse_val(v)
+                _put_key_value(params, tok)
                 i += 1
             else:
                 content_tokens.append(tok)
                 i += 1
 
         if content_tokens and "content" not in params:
-            params["content"] = " ".join(content_tokens)
+            params["content"] = _verbatim_span(raw_text, content_tokens)
 
         if not params.get("content"):
             raise QueryParseError("ADD requires content to store")
@@ -1158,7 +1253,7 @@ def parse_exec_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C9
                     entry_tokens.append(tok)
                     i += 1
 
-            entry = " ".join(entry_tokens)
+            entry = _verbatim_span(raw_text, entry_tokens)
             params = {"agent_name": agent_name, "entry": entry}
             if topic:
                 params["topic"] = topic

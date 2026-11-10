@@ -142,7 +142,7 @@ class TestDiaryTools:
         _patch_mcp_server(monkeypatch, config, kg)
         _client, _col = _get_collection(palace_path, create=True)
         del _client
-        from mempalace.mcp_server import tool_diary_write, tool_diary_read
+        from mempalace.mcp_server import tool_diary_read, tool_diary_write
 
         w = tool_diary_write(
             agent_name="TestAgent",
@@ -290,6 +290,35 @@ class TestDiaryTools:
         r_scoped = tool_diary_read(agent_name="TestAgent", wing="wing_someproject")
         assert r_scoped["total"] == 1
         assert r_scoped["entries"][0]["content"] == "project-wing entry"
+
+    def test_diary_write_canonicalizes_explicit_wing_and_rejects_traversal(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Explicit diary wing is canonicalized (#2579) and invalid wings
+        return structured errors instead of raising uncaught ValueError."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_diary_write
+
+        written = tool_diary_write(
+            agent_name="TestAgent",
+            entry="scoped diary note",
+            topic="general",
+            wing="My-App",
+        )
+        assert written["success"] is True
+        stored = col.get(ids=[written["entry_id"]], include=["metadatas"])
+        assert stored["metadatas"][0]["wing"] == "my_app"
+
+        bad = tool_diary_write(
+            agent_name="TestAgent",
+            entry="traversal probe",
+            topic="general",
+            wing="../escape",
+        )
+        assert bad["success"] is False
+        assert "invalid path characters" in bad["error"]
 
     def test_diary_read_case_insensitive_agent(self, monkeypatch, config, palace_path, kg):
         """Regression for #1243: diary_read must be case-insensitive over

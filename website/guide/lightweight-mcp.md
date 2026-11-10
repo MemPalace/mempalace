@@ -1,6 +1,6 @@
 # Lightweight MCP Integration & Palace Query Language (PQL)
 
-The **MemPalace Lightweight MCP Server** reduces the MCP tool surface from **45 separate tools down to 3 high-density tools** (`palace_query`, `palace_exec`, `palace_coordinate`). This saves **>80–90% of schema context tokens** on every AI interaction while retaining 100% of underlying features, guarantees, and security checks.
+The **MemPalace Lightweight MCP Server** reduces the MCP tool surface from **47 separate tools down to 3 high-density tools** (`palace_query`, `palace_exec`, `palace_coordinate`). This saves **>80–90% of schema context tokens** on every AI interaction while retaining 100% of underlying features, guarantees, and security checks.
 
 ---
 
@@ -40,6 +40,8 @@ Both string DSL format (for fast natural-language generation) and structured JSO
 #### Search & Recall
 - `FIND <query> [IN <wing>[/<room>]] [LIMIT <n>] [SINCE <date>] [BEFORE <date>] [MAX_DIST <f>] [STRATEGY <vector|union>] [SOURCE <path>]`
 - `SEARCH <query> ...`
+- Clause keywords are the upper-case tokens themselves: a lower-case word such as
+  `in`, `limit`, `source` or `strategy` inside `<query>` stays search text.
 - Example: `FIND "jwt auth tokens" IN backend/auth LIMIT 5 SINCE 2026-01-01`
 - Example: `FIND "database migrations" IN wing_core`
 

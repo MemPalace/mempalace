@@ -98,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wings = index.wing_counts();
             println!("\nTaxonomy by Wing ({} total wings):", wings.len());
             let mut sorted_wings: Vec<_> = wings.into_iter().collect();
-            sorted_wings.sort_by(|a, b| b.1.cmp(&a.1));
+            sorted_wings.sort_by_key(|wing| std::cmp::Reverse(wing.1));
             for (wing, count) in sorted_wings.iter().take(15) {
                 println!("  - {:<30} : {:>6} docs", wing, count);
             }

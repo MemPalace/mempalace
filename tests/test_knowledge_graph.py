@@ -5,8 +5,11 @@ Covers: entity CRUD, triple CRUD, temporal queries, invalidation,
 timeline, stats, and edge cases (duplicate triples, ID collisions).
 """
 
-import pytest
+import json
 import sqlite3
+
+import pytest
+
 from mempalace.knowledge_graph import KnowledgeGraph
 
 
@@ -22,9 +25,75 @@ class TestEntityOperations:
     def test_add_entity_upsert(self, kg):
         kg.add_entity("Alice", entity_type="person")
         kg.add_entity("Alice", entity_type="engineer")
-        # Should not raise — INSERT OR REPLACE
         stats = kg.stats()
         assert stats["entities"] == 1
+
+    def test_readd_entity_merges_properties(self, kg):
+        kg.add_entity("alice", entity_type="person", properties={"birthday": "1990-01-01"})
+        kg.add_entity("Alice", entity_type="pet", properties={"team": "a", "birthday": None})
+        kg.add_entity("Alice")
+        row = (
+            sqlite3.connect(kg.db_path)
+            .execute("SELECT name, type, properties FROM entities WHERE id = 'alice'")
+            .fetchone()
+        )
+        assert row[:2] == ("Alice", "pet")
+        assert json.loads(row[2]) == {"birthday": "1990-01-01", "team": "a"}
+
+    def test_punctuation_keeps_names_distinct(self, kg):
+        assert kg.add_entity("O'Brien") == "o'brien"
+        assert kg.add_entity("OBrien") == "obrien"
+        assert kg.add_entity("my_project") == "my%5Fproject"
+        assert kg.add_entity("my project") == "my_project"
+        assert kg.add_entity("Straße") != kg.add_entity("Strasse")
+        assert kg.stats()["entities"] == 6
+
+
+class TestLegacyEntityIds:
+    """Rows written before ids kept punctuation stay reachable and keep their ids."""
+
+    @staticmethod
+    def _legacy_row(kg, eid, name):
+        with kg._lock:
+            conn = kg._conn()
+            with conn:
+                conn.execute("INSERT INTO entities (id, name) VALUES (?, ?)", (eid, name))
+                conn.execute(
+                    "INSERT INTO triples (id, subject, predicate, object) VALUES (?, ?, 'uses', ?)",
+                    (f"t_{eid}", eid, eid),
+                )
+
+    def test_every_spelling_that_used_to_map_to_a_row_still_reaches_it(self, kg):
+        self._legacy_row(kg, "my_project", "my_project")
+        self._legacy_row(kg, "obrien", "O'Brien")
+        for name in ("my project", "my_project", "My Project"):
+            assert kg.query_entity(name, direction="outgoing"), name
+        assert kg.query_entity("O'Brien", direction="outgoing")
+        assert kg.add_triple("O'Brien", "knows", "my_project").startswith(
+            "t_obrien_knows_my_project_"
+        )
+        assert kg.stats()["entities"] == 2
+
+    def test_distinct_rows_are_not_merged_by_folding(self, kg):
+        self._legacy_row(kg, "straße", "Straße")
+        self._legacy_row(kg, "strasse", "Strasse")
+        assert kg.query_entity("Straße", direction="outgoing")[0]["subject"] == "Straße"
+        assert kg.query_entity("Strasse", direction="outgoing")[0]["subject"] == "Strasse"
+
+    def test_legacy_row_keeps_its_name_and_is_reported(self, kg):
+        self._legacy_row(kg, "obrien", "O'Brien")
+        # Before this change "OBrien" and "O'Brien" shared the id; the row is reused, not split.
+        assert kg.add_entity("OBrien", properties={"role": "editor"}) == "obrien"
+        assert kg.query_entity("O'Brien", direction="outgoing")
+        assert kg.report_entity_id_collisions() == [
+            {
+                "id": "obrien",
+                "name": "O'Brien",
+                "current_id": "o'brien",
+                "legacy_id": "obrien",
+                "detail": "stored id left unchanged",
+            }
+        ]
 
 
 class TestTripleOperations:
@@ -42,6 +111,58 @@ class TestTripleOperations:
         tid1 = kg.add_triple("Alice", "knows", "Bob")
         tid2 = kg.add_triple("Alice", "knows", "Bob")
         assert tid1 == tid2
+
+    def test_identical_closed_interval_replay_returns_existing_id(self, kg):
+        # A retried historical assertion after an interruption must not create
+        # a second logical assertion (#2598).
+        kwargs = dict(
+            valid_from="2025-01-01T00:00:00Z",
+            valid_to="2025-02-01T00:00:00Z",
+            source_closet="synthetic-replay-fixture",
+        )
+        tid1 = kg.add_triple("Pilot History", "was", "Archived", **kwargs)
+        tid2 = kg.add_triple("Pilot History", "was", "Archived", **kwargs)
+        assert tid1 == tid2
+        rows = kg.query_entity("Pilot History", as_of="2025-01-15T00:00:00Z")
+        assert len(rows) == 1
+
+    def test_distinct_closed_intervals_stay_separate(self, kg):
+        # Recurring historical facts are genuinely different assertions.
+        tid1 = kg.add_triple(
+            "Alice",
+            "lived_in",
+            "Rome",
+            valid_from="2020-01-01T00:00:00Z",
+            valid_to="2020-12-31T00:00:00Z",
+        )
+        tid2 = kg.add_triple(
+            "Alice",
+            "lived_in",
+            "Rome",
+            valid_from="2023-01-01T00:00:00Z",
+            valid_to="2023-12-31T00:00:00Z",
+        )
+        assert tid1 != tid2
+
+    def test_closed_replay_with_different_provenance_stays_separate(self, kg):
+        # Independently sourced assertions of the same interval are distinct.
+        tid1 = kg.add_triple(
+            "Alice",
+            "lived_in",
+            "Rome",
+            valid_from="2020-01-01T00:00:00Z",
+            valid_to="2020-12-31T00:00:00Z",
+            source_closet="notebook-a",
+        )
+        tid2 = kg.add_triple(
+            "Alice",
+            "lived_in",
+            "Rome",
+            valid_from="2020-01-01T00:00:00Z",
+            valid_to="2020-12-31T00:00:00Z",
+            source_closet="notebook-b",
+        )
+        assert tid1 != tid2
 
     def test_invalidated_triple_allows_re_add(self, kg):
         tid1 = kg.add_triple("Alice", "works_at", "Acme")

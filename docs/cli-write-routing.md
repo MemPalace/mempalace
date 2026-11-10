@@ -49,13 +49,16 @@ The flags are mutually exclusive and override environment/config policy.
 On the direct route, compatible `mine` commands forward to a running HTTP hub
 for the same palace, since the hub holds its writer lease. Project mining with
 `--include-ignored` preserves the requested project-relative paths through this
-route; other ignored files remain excluded.
+route; other ignored files remain excluded. Conversation mining with
+`--include-subagents` likewise keeps scanning `subagents/` folders when the hub
+runs the mine.
 
-This requires a hub advertising the `mine_include_ignored` capability. If a
-running hub is older, the CLI asks you to upgrade MemPalace in the hub's
-environment and restart it before retrying. It does not drop the override,
-submit the mine, or attempt a competing local write. With no live hub, the
-existing local mining behavior remains available.
+These overrides require a hub advertising the matching capability
+(`mine_include_ignored` or `mine_include_subagents`). If a running hub is
+older, the CLI asks you to upgrade MemPalace in the hub's environment and
+restart it before retrying. It does not drop the override, submit the mine, or
+attempt a competing local write. With no live hub, the existing local mining
+behavior remains available.
 
 Other flags the hub cannot express, such as `--no-gitignore`, still use the
 local path. An uncertain hub submission is never replayed locally.

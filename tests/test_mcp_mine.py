@@ -46,6 +46,7 @@ def test_registered_in_tools():
     include_ignored = entry["input_schema"]["properties"]["include_ignored"]
     assert include_ignored["type"] == "array"
     assert include_ignored["items"]["type"] == "string"
+    assert entry["input_schema"]["properties"]["include_subagents"]["type"] == "boolean"
 
 
 # ── Guard rails ──────────────────────────────────────────────────────────
@@ -118,6 +119,31 @@ def test_include_ignored_is_rejected_for_non_project_modes(monkeypatch, config, 
     assert "projects" in result["error"]
 
 
+@pytest.mark.parametrize("include_subagents", ["false", "true", 1, 0, None, []])
+def test_non_boolean_include_subagents_is_rejected_before_ingestion(
+    monkeypatch, config, tmp_path, include_subagents
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+
+    def _unexpected_capture(_run):
+        pytest.fail("invalid include_subagents reached ingestion")
+
+    monkeypatch.setattr(mcp_server, "_capture_fd_stdout", _unexpected_capture)
+    arguments = {"source": str(tmp_path), "mode": "convos", "include_subagents": include_subagents}
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_mine", "arguments": arguments},
+        }
+    )
+    assert response["error"]["code"] == -32602
+    assert "include_subagents" in response["error"]["message"]
+
+
 # ── Dispatch + return contract ───────────────────────────────────────────
 
 
@@ -152,6 +178,99 @@ def test_projects_include_ignored_reaches_miner_with_existing_options(
         "dry_run": True,
         "include_ignored": paths,
     }
+
+
+@pytest.mark.parametrize("include_subagents", [True, False])
+def test_convos_include_subagents_reaches_convo_miner(
+    monkeypatch, config, tmp_path, include_subagents
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    observed = {}
+
+    def _mine_convos(**kwargs):
+        observed.update(kwargs)
+
+    monkeypatch.setattr("mempalace.convo_miner.mine_convos", _mine_convos)
+    result = mcp_server.tool_mine(
+        source=str(tmp_path), mode="convos", dry_run=True, include_subagents=include_subagents
+    )
+    assert result["success"] is True
+    assert observed["include_subagents"] is include_subagents
+
+
+def test_convos_mine_skips_subagents_unless_asked(monkeypatch, config, tmp_path):
+    """Default stays the CLI's: subagent folders are opt-in."""
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    session = tmp_path / "session"
+    (session / "subagents").mkdir(parents=True)
+    _write(session / "parent.txt", "> What is memory?\nMemory is persistence.\n")
+    _write(session / "subagents" / "agent.txt", "> Explore?\nExplored the tree.\n")
+
+    default = mcp_server.tool_mine(source=str(tmp_path), mode="convos", dry_run=True)
+    included = mcp_server.tool_mine(
+        source=str(tmp_path), mode="convos", dry_run=True, include_subagents=True
+    )
+    assert default["success"] is True and included["success"] is True
+    assert "agent.txt" not in default["output"]
+    assert "agent.txt" in included["output"]
+
+
+@pytest.mark.parametrize("mode", ["projects", "extract"])
+def test_include_subagents_is_ignored_by_non_convos_modes(monkeypatch, config, tmp_path, mode):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    calls = []
+
+    def _mine(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("mempalace.miner.mine", _mine)
+    monkeypatch.setattr("mempalace.format_miner.mine_formats", _mine)
+    result = mcp_server.tool_mine(
+        source=str(tmp_path), mode=mode, dry_run=True, include_subagents=True
+    )
+    assert result["success"] is True
+    assert len(calls) == 1
+    assert "include_subagents" not in calls[0]
+
+
+def test_include_subagents_passes_the_protocol_argument_whitelist(monkeypatch, config, tmp_path):
+    """The hub dispatches through handle_request, which rejects any argument
+    the schema does not declare -- the forwarded flag must survive it."""
+    import json
+
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    observed = {}
+    monkeypatch.setattr(
+        "mempalace.convo_miner.mine_convos", lambda **kwargs: observed.update(kwargs)
+    )
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "mempalace_mine",
+                "arguments": {
+                    "source": str(tmp_path),
+                    "mode": "convos",
+                    "dry_run": True,
+                    "include_subagents": True,
+                },
+            },
+        }
+    )
+    assert "error" not in response, response
+    payload = json.loads(response["result"]["content"][0]["text"])
+    assert payload["success"] is True, payload
+    assert observed["include_subagents"] is True
 
 
 @pytest.mark.parametrize("mode", ["projects", "convos", "extract"])
@@ -535,3 +654,41 @@ def test_generic_exception_carries_error_class(monkeypatch, config, tmp_dir):
     assert result["success"] is False
     assert "mine failed" in result["error"]
     assert result.get("error_class") == "RuntimeError"
+
+
+# ── Memory handed back after a mine (#2685) ──────────────────────────────
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_mine_returns_freed_heap_only_after_a_real_mine(monkeypatch, config, tmp_dir, dry_run):
+    """#2685: a long-lived server must trim the heap a mine freed, or its
+    resident size stays near the mine's peak. A dry run writes nothing and
+    skips it."""
+    from mempalace import mcp_server
+
+    trims = []
+    monkeypatch.setattr(mcp_server, "_return_freed_heap_to_os", lambda: trims.append(1))
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "convos")
+    os.makedirs(src)
+    _write(os.path.join(src, "chat.txt"), "> What is memory?\nMemory is persistence.\n")
+
+    result = mcp_server.tool_mine(source=src, mode="convos", wing="test_convos", dry_run=dry_run)
+
+    assert result["success"] is True
+    assert trims == ([] if dry_run else [1])
+
+
+def test_return_freed_heap_never_raises(monkeypatch):
+    """Platforms without ``malloc_trim`` must not turn a finished mine into an error."""
+    import ctypes
+
+    from mempalace import mcp_server
+
+    def no_libc(*_args, **_kwargs):
+        raise OSError("no libc")
+
+    monkeypatch.setattr(ctypes, "CDLL", no_libc)
+
+    mcp_server._return_freed_heap_to_os()

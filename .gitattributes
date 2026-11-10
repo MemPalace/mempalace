@@ -1,0 +1,3 @@
+# Shell scripts run under bash, which rejects CRLF line endings, so check
+# them out with LF on every platform.
+*.sh text eol=lf
