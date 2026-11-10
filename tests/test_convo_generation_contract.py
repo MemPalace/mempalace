@@ -241,18 +241,28 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
         _mine(source_dir, palace_path)
     assert replacement_batches == 2
 
-    snapshot = get_collection(palace_path).get(
-        where={"source_file": str(session)}, include=["documents", "metadatas"]
+    # Raw Chroma rows are allowed to contain unpublished staging records.
+    # The user-visible contract is the MCP listing, not the storage internals.
+    from mempalace import mcp_server
+    from mempalace.config import MempalaceConfig
+
+    monkeypatch.setattr(
+        mcp_server, "_config", MempalaceConfig(palace_path=palace_path)
     )
-    active = [
-        doc
-        for doc, meta in zip(snapshot["documents"], snapshot["metadatas"])
-        if (meta or {}).get("ingest_mode") == "convos"
-        and (meta or {}).get("historical_version") is not True
+    monkeypatch.setattr(
+        mcp_server, "_get_collection", lambda *args, **kwargs: get_collection(palace_path)
+    )
+    listing = mcp_server.tool_list_drawers(limit=100)
+    assert "error" not in listing, listing
+    public = [
+        row.get("content_preview") or ""
+        for row in listing["drawers"]
+        if (row.get("metadata") or {}).get("source_file") == str(session)
     ]
-    if any("B question" in text for text in active):
+    assert public, "no prior complete content is visible after the interrupted pass"
+    if any("B question" in text for text in public):
         pytest.xfail(
-            "generation publication still exposes an incomplete replacement "
-            "before the commit marker; requires staged IDs + read filtering"
+            "MCP listing leaks an incomplete replacement after the first "
+            "new batch; requires committed-generation filtering before limits"
         )
-    assert all("A question" in text for text in active)
+    assert all("A question" in text for text in public)
