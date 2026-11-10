@@ -75,6 +75,7 @@ class _Convo:
             (doc, meta)
             for doc, meta in _rows(self.palace, self.doc)
             if meta.get("extract_mode") == extract_mode
+            and meta.get("historical_version") is not True
         ]
 
 
@@ -198,6 +199,31 @@ def test_project_failed_stale_delete_keeps_text_and_converges(tmp_path, monkeypa
 
 
 # -- conversation miner -------------------------------------------------------
+
+
+def test_convo_rewrite_retains_verbatim_prior_text_as_history(tmp_path):
+    convo = _Convo(tmp_path)
+    convo.write(range(3))
+    convo.mine()
+    before = {doc for doc, _ in convo.rows()}
+    assert len(before) == 3
+
+    convo.write([9])
+    _touch(convo.doc)
+    convo.mine()
+    all_rows = _rows(convo.palace, convo.doc)
+    history = {
+        doc for doc, meta in all_rows if meta.get("historical_version") is True
+    }
+    assert before.issubset(history)
+    assert len(convo.rows()) == 1
+    assert "question 9" in convo.rows()[0][0]
+
+    # A no-op mining pass must not generate another physical copy.
+    before_ids = set(get_collection(convo.palace).get(where={"source_file": str(convo.doc)})["ids"])
+    convo.mine()
+    after_ids = set(get_collection(convo.palace).get(where={"source_file": str(convo.doc)})["ids"])
+    assert after_ids == before_ids
 
 
 def test_convo_remine_of_a_shorter_transcript_leaves_only_its_new_drawers(tmp_path):
