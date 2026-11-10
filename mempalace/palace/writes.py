@@ -16,9 +16,7 @@ class StaleDrawerPurgeFailed(RuntimeError):
     """
 
 
-def _source_file_delete_ids(
-    collection, source_file: str, extract_mode: Optional[str], *, preserve_history: bool = False
-) -> list:
+def _source_file_delete_ids(collection, source_file: str, extract_mode: Optional[str]) -> list:
     """Collect drawer IDs for one source file in one extraction mode's scope.
 
     ``extract_mode=None`` is every drawer for the path. Legacy conversation
@@ -38,7 +36,7 @@ def _source_file_delete_ids(
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
         for drawer_id, meta in zip(batch_ids, metadatas):
-            if preserve_history and (meta or {}).get("historical_version") is True:
+            if extract_mode is not None and (meta or {}).get("historical_version") is True:
                 continue
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
                 ids.append(drawer_id)
@@ -183,6 +181,11 @@ def _backup_changed_conversation_drawers(
                 continue
             if not _metadata_matches_extract_mode(old_meta, extract_mode):
                 continue
+            # Stale parser/chunker caches are not verified verbatim user
+            # history; keep the established migration contract that removes
+            # obsolete extraction noise instead of archiving it.
+            if not _meta_is_current(old_meta, extract_mode):
+                continue
             if not isinstance(old_text, str):
                 raise RuntimeError("old conversation text unavailable; refusing an unsafe re-mine")
             if desired.get(original_id) == old_text:
@@ -278,9 +281,7 @@ def write_file_drawers(
     try:
         stale = [
             drawer_id
-            for drawer_id in _source_file_delete_ids(
-                collection, source_file, extract_mode, preserve_history=preserve_convo_history
-            )
+            for drawer_id in _source_file_delete_ids(collection, source_file, extract_mode)
             if drawer_id not in fresh
         ]
         if stale:
