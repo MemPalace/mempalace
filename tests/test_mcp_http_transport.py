@@ -896,6 +896,43 @@ class TestRWLockReaderOnlyHandoff:
         assert not late_thread.is_alive()
         assert late_entered.is_set()
 
+    def test_late_reader_rejected_during_frozen_handoff(self):
+        """Exercise the frozen admission interval independently of scheduling."""
+        lock = mcp._RWLock()
+        entered = threading.Event()
+        started = threading.Event()
+
+        # The writer has yielded to previously queued readers. The existing
+        # handoff must not admit a late read, even with writer preference
+        # temporarily lifted for that original cohort.
+        with lock._cond:
+            lock._readers_only_handoff = True
+            lock._readers_only_owed = {object()}
+            lock._handoff = True
+            lock._waiting_writers = 1
+
+        def late_reader():
+            started.set()
+            with lock.read_lock():
+                entered.set()
+
+        thread = threading.Thread(target=late_reader, daemon=True)
+        thread.start()
+        try:
+            assert started.wait(timeout=2)
+            assert not entered.wait(timeout=0.15)
+            assert lock.try_acquire_read() is False
+        finally:
+            with lock._cond:
+                lock._readers_only_handoff = False
+                lock._readers_only_owed = set()
+                lock._handoff = False
+                lock._waiting_writers = 0
+                lock._cond.notify_all()
+            thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert entered.is_set()
+
     def test_no_reader_does_not_yield_to_writer(self):
         lock = mcp._RWLock()
         lock.acquire_write()

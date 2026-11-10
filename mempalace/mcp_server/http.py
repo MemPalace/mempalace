@@ -39,10 +39,7 @@ class _RWLock:
                 while (
                     self._writer
                     or (self._waiting_writers and not self._handoff)
-                    or (
-                        self._readers_only_handoff
-                        and ticket not in self._readers_only_owed
-                    )
+                    or (self._readers_only_handoff and ticket not in self._readers_only_owed)
                 ):
                     self._cond.wait()
             finally:
