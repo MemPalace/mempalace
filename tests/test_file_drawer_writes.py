@@ -417,6 +417,7 @@ def test_format_emptied_file_sentinel_replaces_drawers_under_the_file_lock(tmp_p
 
     assert calls == [(["/src/a.docx"], True), (["/src/a.docx"], False)]
 
+
 def test_history_backup_reuses_available_original_embeddings(monkeypatch):
     """Archiving must not re-embed old text when its stored vector is usable."""
     import mempalace.embedding as embedding

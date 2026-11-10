@@ -113,6 +113,7 @@ def test_successful_rewrite_is_additive_in_verbatim_conversation_history(tmp_pat
     assert any("replacement question" in text for text in after)
     assert previous.issubset(after), "successful re-mine destroyed prior history"
 
+
 def test_history_rewrite_a_to_b_to_a_never_duplicates_archived_versions(tmp_path):
     """A reversion is not a new historical version each time it is revisited."""
     source_dir = tmp_path / "sessions"
