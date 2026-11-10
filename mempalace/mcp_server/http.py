@@ -23,6 +23,7 @@ class _RWLock:
         self._waiting_readers = 0
         self._waiting_reader_tokens = set()
         self._readers_only_handoff = False
+        self._readers_only_owed = set()
         # True while a yielding writer lets queued readers in (yield_write).
         self._handoff = False
 
@@ -35,7 +36,14 @@ class _RWLock:
             self._waiting_reader_tokens.add(ticket)
             self._waiting_readers += 1
             try:
-                while self._writer or (self._waiting_writers and not self._handoff):
+                while (
+                    self._writer
+                    or (self._waiting_writers and not self._handoff)
+                    or (
+                        self._readers_only_handoff
+                        and ticket not in self._readers_only_owed
+                    )
+                ):
                     self._cond.wait()
             finally:
                 self._waiting_readers -= 1
@@ -49,7 +57,11 @@ class _RWLock:
     def try_acquire_read(self) -> bool:
         """Take the read side only if that needs no wait."""
         with self._cond:
-            if self._writer or (self._waiting_writers and not self._handoff):
+            if (
+                self._writer
+                or self._readers_only_handoff
+                or (self._waiting_writers and not self._handoff)
+            ):
                 return False
             self._readers += 1
             if self._handoff:
@@ -138,6 +150,7 @@ class _RWLock:
             # opportunistic reader cannot satisfy this obligation in place of
             # a reader already blocked when the mine yielded.
             owed = set(self._waiting_reader_tokens)
+            self._readers_only_owed = owed
             self._readers_only_handoff = True
             self._handoff = True
             self._writer = False
@@ -155,6 +168,7 @@ class _RWLock:
             finally:
                 self._handoff = False
                 self._readers_only_handoff = False
+                self._readers_only_owed = set()
                 self._waiting_writers -= 1
                 self._cond.notify_all()
             return True

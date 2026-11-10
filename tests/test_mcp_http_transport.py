@@ -850,6 +850,52 @@ class TestRWLockReaderOnlyHandoff:
         writer_thread.join(timeout=2)
         assert order == ["reader", "mine resumed", "other writer"]
 
+    def test_late_reader_cannot_extend_reader_only_handoff(self):
+        """Only the readers queued before the CPU yield may enter it."""
+        lock = mcp._RWLock()
+        initial_entered = threading.Event()
+        late_started = threading.Event()
+        late_entered = threading.Event()
+        observed = []
+
+        def late_reader():
+            late_started.set()
+            with lock.read_lock():
+                late_entered.set()
+
+        late_thread = threading.Thread(target=late_reader, daemon=True)
+
+        def initial_reader():
+            with lock.read_lock():
+                initial_entered.set()
+                late_thread.start()
+                if not late_started.wait(timeout=3):
+                    observed.append("late thread never started")
+                    return
+                observed.append(late_entered.wait(timeout=0.2))
+
+        initial_thread = threading.Thread(target=initial_reader, daemon=True)
+        lock.acquire_write()
+        initial_thread.start()
+        deadline = time.monotonic() + 3
+        while lock._waiting_readers == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert lock._waiting_readers == 1, "initial reader did not queue"
+        try:
+            assert lock.yield_to_waiting_readers() is True
+            assert initial_entered.is_set()
+            assert observed == [False], "a late reader entered the frozen handoff"
+            assert not late_entered.is_set()
+            assert lock.owns_write()
+            assert lock.try_acquire_read() is False
+        finally:
+            lock.release_write()
+        initial_thread.join(timeout=3)
+        late_thread.join(timeout=3)
+        assert not initial_thread.is_alive()
+        assert not late_thread.is_alive()
+        assert late_entered.is_set()
+
     def test_no_reader_does_not_yield_to_writer(self):
         lock = mcp._RWLock()
         lock.acquire_write()
