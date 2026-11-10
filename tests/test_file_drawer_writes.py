@@ -416,3 +416,52 @@ def test_format_emptied_file_sentinel_replaces_drawers_under_the_file_lock(tmp_p
     format_miner._register_file(None, "/src/b.docx", "w", "agent", empty=False)
 
     assert calls == [(["/src/a.docx"], True), (["/src/a.docx"], False)]
+
+def test_history_backup_reuses_available_original_embeddings(monkeypatch):
+    """Archiving must not re-embed old text when its stored vector is usable."""
+    import mempalace.palace as palace
+    import mempalace.embedding as embedding
+
+    previous = {
+        "source_file": "/transcripts/live.jsonl",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": palace.NORMALIZE_VERSION,
+        "convo_chunker_version": palace.CONVO_CHUNKER_VERSION,
+        "source_mtime": 1.0,
+        "chunk_index": 0,
+    }
+
+    class SavedCollection:
+        def get(self, ids=None, where=None, **kwargs):
+            if where is not None:
+                return {
+                    "ids": ["drawer_old"],
+                    "documents": ["original text"],
+                    "metadatas": [previous],
+                }
+            return {"ids": [], "documents": [], "metadatas": []}
+
+    coll = SavedCollection()
+    observed = []
+    monkeypatch.setattr(palace, "_stored_vectors", lambda _coll, _ids: {"drawer_old": [0.1, 0.2]})
+    monkeypatch.setattr(embedding, "probe_dimension", lambda: 2)
+    monkeypatch.setattr(palace, "assert_no_collisions", lambda *_args: None)
+    monkeypatch.setattr(
+        palace,
+        "_upsert",
+        lambda _coll, rows, embeddings=None: observed.append((rows, embeddings)),
+    )
+    palace._backup_changed_conversation_drawers(
+        coll,
+        "/transcripts/live.jsonl",
+        "exchange",
+        [("drawer_old", "replacement text", previous)],
+    )
+    assert len(observed) == 2
+    archived, reused_vectors = observed[0]
+    assert len(archived) == 1
+    assert archived[0][1] == "original text"
+    assert archived[0][2]["historical_version"] is True
+    assert reused_vectors == [[0.1, 0.2]]
+    assert observed[1][0] == []

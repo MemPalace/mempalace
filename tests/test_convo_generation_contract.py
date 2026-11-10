@@ -112,3 +112,146 @@ def test_successful_rewrite_is_additive_in_verbatim_conversation_history(tmp_pat
     after = _documents(palace_path, session)
     assert any("replacement question" in text for text in after)
     assert previous.issubset(after), "successful re-mine destroyed prior history"
+
+def test_history_rewrite_a_to_b_to_a_never_duplicates_archived_versions(tmp_path):
+    """A reversion is not a new historical version each time it is revisited."""
+    source_dir = tmp_path / "sessions"
+    source_dir.mkdir()
+    session = source_dir / "session.txt"
+    palace_path = str(tmp_path / "palace")
+
+    _write_session(session, "A", count=2)
+    _mine(source_dir, palace_path)
+    first = _documents(palace_path, session)
+    assert len(first) >= 2
+
+    _write_session(session, "B", count=2)
+    _touch_after_write(session)
+    _mine(source_dir, palace_path)
+    second = _documents(palace_path, session)
+    assert first.issubset(second)
+
+    _write_session(session, "A", count=2)
+    _touch_after_write(session)
+    _mine(source_dir, palace_path)
+    third = _documents(palace_path, session)
+    assert first.issubset(third)
+    assert second.issubset(third)
+
+    def history_ids():
+        rows = get_collection(palace_path).get(
+            where={"source_file": str(session)}, include=["metadatas"]
+        )
+        return {
+            drawer_id
+            for drawer_id, meta in zip(rows["ids"], rows["metadatas"])
+            if (meta or {}).get("historical_version") is True
+        }
+
+    stable = history_ids()
+    assert len(stable) >= 4
+
+    _write_session(session, "B", count=2)
+    _touch_after_write(session)
+    _mine(source_dir, palace_path)
+    assert history_ids() == stable, "A/B history rows multiplied on reversion"
+    assert first.union(second).issubset(_documents(palace_path, session))
+
+
+def test_failed_current_write_retry_does_not_clone_history_twice(tmp_path, monkeypatch):
+    """Backups written before a failed new pass remain idempotent on retry."""
+    source_dir = tmp_path / "sessions"
+    source_dir.mkdir()
+    session = source_dir / "session.txt"
+    palace_path = str(tmp_path / "palace")
+    _write_session(session, "A", count=2)
+    _mine(source_dir, palace_path)
+    _write_session(session, "B", count=2)
+    _touch_after_write(session)
+
+    collection = get_collection(palace_path)
+    old_upsert = type(collection).upsert
+    failed = False
+
+    def fail_current_upsert(self, *args, **kwargs):
+        nonlocal failed
+        if not failed and any("_hist_" not in i for i in kwargs.get("ids", [])):
+            failed = True
+            raise RuntimeError("injected before first current replacement")
+        return old_upsert(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(collection), "upsert", fail_current_upsert)
+    with pytest.raises(MineFileErrors):
+        _mine(source_dir, palace_path)
+    assert failed, "injection did not reach a current-version write"
+    before = get_collection(palace_path).get(
+        where={"source_file": str(session)}, include=["metadatas"]
+    )
+    hist_before = {
+        row_id
+        for row_id, meta in zip(before["ids"], before["metadatas"])
+        if (meta or {}).get("historical_version") is True
+    }
+    assert hist_before
+
+    monkeypatch.setattr(type(collection), "upsert", old_upsert)
+    _mine(source_dir, palace_path)
+    after = get_collection(palace_path).get(
+        where={"source_file": str(session)}, include=["metadatas"]
+    )
+    hist_after = {
+        row_id
+        for row_id, meta in zip(after["ids"], after["metadatas"])
+        if (meta or {}).get("historical_version") is True
+    }
+    assert hist_before == hist_after, "retry duplicated immutable backups"
+    assert any("B question" in text for text in _documents(palace_path, session))
+
+
+def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, monkeypatch):
+    """Future generation gate: an interrupted mine must not expose mixed rows."""
+    source_dir = tmp_path / "sessions"
+    source_dir.mkdir()
+    session = source_dir / "session.txt"
+    palace_path = str(tmp_path / "palace")
+    _write_session(session, "A", count=3)
+    _mine(source_dir, palace_path)
+    _write_session(session, "B", count=3)
+    _touch_after_write(session)
+
+    import mempalace.palace as palace
+
+    monkeypatch.setattr(palace, "DRAWER_UPSERT_BATCH_SIZE", 1)
+    collection = get_collection(palace_path)
+    original_upsert = type(collection).upsert
+    replacement_batches = 0
+
+    def fail_second_current(self, *args, **kwargs):
+        nonlocal replacement_batches
+        if all("_hist_" in i for i in kwargs.get("ids", [])):
+            return original_upsert(self, *args, **kwargs)
+        replacement_batches += 1
+        if replacement_batches == 2:
+            raise RuntimeError("injected before second current replacement")
+        return original_upsert(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(collection), "upsert", fail_second_current)
+    with pytest.raises(MineFileErrors):
+        _mine(source_dir, palace_path)
+    assert replacement_batches == 2
+
+    snapshot = get_collection(palace_path).get(
+        where={"source_file": str(session)}, include=["documents", "metadatas"]
+    )
+    active = [
+        doc
+        for doc, meta in zip(snapshot["documents"], snapshot["metadatas"])
+        if (meta or {}).get("ingest_mode") == "convos"
+        and (meta or {}).get("historical_version") is not True
+    ]
+    if any("B question" in text for text in active):
+        pytest.xfail(
+            "generation publication still exposes an incomplete replacement "
+            "before the commit marker; requires staged IDs + read filtering"
+        )
+    assert all("A question" in text for text in active)

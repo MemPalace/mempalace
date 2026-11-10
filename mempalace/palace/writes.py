@@ -218,7 +218,26 @@ def _backup_changed_conversation_drawers(
             to_file.append(row)
         if to_file:
             assert_no_collisions([(item_id, meta) for item_id, _, meta in to_file], collection)
-            _upsert(collection, to_file)
+            # The prior text already has an embedding. Re-embed only when the
+            # backend cannot return a compatible vector, e.g. after an embedder
+            # change or interrupted Chroma index persist.
+            source_ids = [meta["history_source_drawer_id"] for _, _, meta in to_file]
+            vectors = _stored_vectors(collection, source_ids)
+            dimension = 0
+            if vectors:
+                from ..embedding import probe_dimension
+
+                dimension = probe_dimension()
+            reuse, reuse_vectors, to_embed = [], [], []
+            for row in to_file:
+                vector = vectors.get(row[2]["history_source_drawer_id"])
+                if _reusable_vector(vector, dimension):
+                    reuse.append(row)
+                    reuse_vectors.append(vector)
+                else:
+                    to_embed.append(row)
+            _upsert(collection, reuse, embeddings=reuse_vectors)
+            _upsert(collection, to_embed)
 
 
 def write_file_drawers(
