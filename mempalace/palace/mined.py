@@ -36,6 +36,8 @@ def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
     """
     # An explicit null (or any non-number) is stale, never a TypeError that
     # aborts the whole prefetch: file_already_mined treats it as stale too.
+    if meta.get("historical_version") is True:
+        return False
     version = meta.get("normalize_version", 1)
     if not _is_plain_number(version) or version < NORMALIZE_VERSION:
         return False
@@ -74,6 +76,7 @@ _MINED_SCAN_KEYS = (
     "convo_chunker_version",
     "general_extractor_version",
     "wing",
+    "historical_version",
 )
 
 
@@ -234,6 +237,8 @@ def file_already_mined(
         ids = results.get("ids") or []
         for meta in results.get("metadatas") or []:
             meta = coerce_metadata_types(meta or {})
+            if meta.get("historical_version") is True:
+                continue
             if extract_mode is not None and not _metadata_matches_extract_mode(meta, extract_mode):
                 continue
             if not _is_comparable(meta, extract_mode):
@@ -325,6 +330,8 @@ def prefetch_mined_set(
         src = meta.get("source_file")
         if not src:
             return
+        if meta.get("historical_version") is True:
+            return
         if not _metadata_matches_extract_mode(meta, extract_mode):
             return
         if not _is_comparable(meta, extract_mode):
@@ -382,7 +389,9 @@ def prefetch_mined_set(
 
 
 # The keys file_already_mined() reads when called without an extract_mode.
-_PROJECT_MINED_KEYS = ("source_file", "source_mtime", "chunk_total", "normalize_version")
+_PROJECT_MINED_KEYS = (
+    "source_file", "source_mtime", "chunk_total", "normalize_version", "historical_version"
+)
 
 
 def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tuple]]:
@@ -433,6 +442,8 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
             meta = coerce_metadata_types(meta or {})
             src = meta.get("source_file")
             if src not in wanted or src in unprovable:
+                continue
+            if meta.get("historical_version") is True:
                 continue
             if not _is_comparable(meta) or not _is_plain_number(meta.get("normalize_version", 1)):
                 unprovable.add(src)

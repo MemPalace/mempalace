@@ -16,7 +16,9 @@ class StaleDrawerPurgeFailed(RuntimeError):
     """
 
 
-def _source_file_delete_ids(collection, source_file: str, extract_mode: Optional[str]) -> list:
+def _source_file_delete_ids(
+    collection, source_file: str, extract_mode: Optional[str], *, preserve_history: bool = False
+) -> list:
     """Collect drawer IDs for one source file in one extraction mode's scope.
 
     ``extract_mode=None`` is every drawer for the path. Legacy conversation
@@ -36,6 +38,8 @@ def _source_file_delete_ids(collection, source_file: str, extract_mode: Optional
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
         for drawer_id, meta in zip(batch_ids, metadatas):
+            if preserve_history and (meta or {}).get("historical_version") is True:
+                continue
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
                 ids.append(drawer_id)
         if not batch_ids:
@@ -147,6 +151,74 @@ def _upsert(collection, rows: list, embeddings=None) -> None:
     )
 
 
+
+def _backup_changed_conversation_drawers(
+    collection, source_file: str, extract_mode: str, drawers: list
+) -> None:
+    """Back up prior text before positional upserts can replace or prune it.
+
+    This protects verbatim content, but does not implement atomic generation
+    publication: uncommitted new chunks still require a separate visibility
+    gate before concurrent Hub reads can be enabled.
+    """
+    from ..ids import make_convo_history_id
+
+    desired = {drawer_id: document for drawer_id, document, _ in drawers}
+    backup_rows = []
+    offset = 0
+    while True:
+        page = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["documents", "metadatas"],
+        )
+        ids = page.get("ids") or []
+        documents = page.get("documents") or []
+        metadata = page.get("metadatas") or []
+        if len(ids) != len(documents) or len(ids) != len(metadata):
+            raise RuntimeError("incomplete old conversation snapshot; refusing an unsafe re-mine")
+        for original_id, old_text, old_meta in zip(ids, documents, metadata):
+            old_meta = old_meta or {}
+            if old_meta.get("historical_version") is True:
+                continue
+            if not _metadata_matches_extract_mode(old_meta, extract_mode):
+                continue
+            if not isinstance(old_text, str):
+                raise RuntimeError("old conversation text unavailable; refusing an unsafe re-mine")
+            if desired.get(original_id) == old_text:
+                continue
+            history_id = make_convo_history_id(original_id, old_text)
+            historical = {
+                **old_meta,
+                "source_file": source_file,
+                "historical_version": True,
+                "history_source_drawer_id": original_id,
+            }
+            backup_rows.append((history_id, old_text, historical))
+        if len(ids) < 1000:
+            break
+        offset += len(ids)
+
+    # Snapshot the backup set before writing: this scan must not page across
+    # historical rows added by our own writes.
+    for start in range(0, len(backup_rows), DRAWER_UPSERT_BATCH_SIZE):
+        batch = backup_rows[start : start + DRAWER_UPSERT_BATCH_SIZE]
+        ids = [row[0] for row in batch]
+        existing = collection.get(ids=ids, include=["documents"])
+        got = dict(zip(existing.get("ids") or [], existing.get("documents") or []))
+        to_file = []
+        for row in batch:
+            if row[0] in got:
+                if got[row[0]] != row[1]:
+                    raise RuntimeError("historical content-address collision; refusing re-mine")
+                continue
+            to_file.append(row)
+        if to_file:
+            assert_no_collisions([(item_id, meta) for item_id, _, meta in to_file], collection)
+            _upsert(collection, to_file)
+
+
 def write_file_drawers(
     collection,
     source_file: str,
@@ -154,6 +226,7 @@ def write_file_drawers(
     *,
     extract_mode: Optional[str] = None,
     prune: bool = True,
+    preserve_convo_history: bool = False,
     aaak_col=None,
 ) -> int:
     """File one source file's drawers: write the new ones, then drop the stale.
@@ -182,6 +255,10 @@ def write_file_drawers(
     :class:`StaleDrawerPurgeFailed` when the stale drawers could not be
     removed; an error in :data:`MINE_ABORTS` (a dead backend) propagates as is.
     """
+    if preserve_convo_history:
+        if extract_mode is None or not prune:
+            raise ValueError("conversation history requires a scoped pruning re-mine")
+        _backup_changed_conversation_drawers(collection, source_file, extract_mode, drawers)
     if prune:
         total = len(drawers)
         drawers = [(i, doc, {**meta, "chunk_total": total + 1}) for i, doc, meta in drawers]
@@ -202,7 +279,9 @@ def write_file_drawers(
     try:
         stale = [
             drawer_id
-            for drawer_id in _source_file_delete_ids(collection, source_file, extract_mode)
+            for drawer_id in _source_file_delete_ids(
+                collection, source_file, extract_mode, preserve_history=preserve_convo_history
+            )
             if drawer_id not in fresh
         ]
         if stale:

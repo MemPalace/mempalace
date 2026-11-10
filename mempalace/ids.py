@@ -97,6 +97,11 @@ def make_convo_drawer_id(
     )
 
 
+def make_convo_history_id(physical_id: str, content: str) -> str:
+    """Stable immutable backup identity for previous conversation contents."""
+    return f"{physical_id}_hist_{_delimited_sha256((physical_id, content), _HASH_TRUNC_DRAWER)}"
+
+
 def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:
     """Sentinel registry ID for the conversation miner zero-chunk-file path.
 
