@@ -303,7 +303,7 @@ def test_live_wait_and_concurrent_settings_post(account, monkeypatch, paid):
     routes = {}
     gateway = SimpleNamespace(
         db=a.db,
-        principal_for=lambda h: replace(a.principal, person=True, policy=person_policy()),
+        principal_for=lambda h: replace(a.principal, person=True, policy=person_policy("owner")),
         add_route=lambda method, path, handler: routes.update({(method, path): handler}),
     )
     capture.register(SimpleNamespace(control_db=a.db, gateway=gateway))
@@ -447,7 +447,7 @@ def test_pending_events_and_reset_never_wait(account, monkeypatch, after, wait):
 def test_ordinary_feed_matches_frozen_wire_snapshot(account, monkeypatch):
     a = account
     routes = {}
-    principal = replace(a.principal, person=True, policy=person_policy())
+    principal = replace(a.principal, person=True, policy=person_policy("owner"))
     gateway = SimpleNamespace(
         db=a.db,
         principal_for=lambda h: principal,

@@ -47,6 +47,10 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Private-read containment includes event cursor projection, indistinguishable unreadable write retries, readable tunnel endpoints, current-role token caps and explicit private-save notices.
+
+  - Documents owner-only person private reads, retained scoped shared projections and unavailable whole-palace operations for members.
+
   - Graph documentation describes SQLite affinity, native Compact values and read-only legacy schema ordering.
 
   - Documents backend graph order, numeric locus text parity and explicit tunnel compatibility residuals.
@@ -440,6 +444,10 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Local CLI and gated gateway CLI use the same pure drawer formatter, preserving headers, match scores, folded-copy labels, body whitespace conventions, empty results and BM25 fallback output. The gateway explicitly selects flat rows even when they carry import-authorization metadata; the owner default remains unchanged.
+
+  - Drawer retries retain replay status for readable owners while also returning request-derived fresh-write fields, allowing the gateway to hide replay status for unreadable wings.
+
   - Graph snapshots use local SQL locus expressions, including native booleans and integers outside int64; descriptors also bind stored sort values.
 
   - Graph page descriptors carry their source order key; grouped Chroma and exact numeric loci retain SQLite text casts.
@@ -549,6 +557,12 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:**
 
+  - Import-reader CLI regressions retain allowed row locations and verbatim text; union fixtures acquire a protected-room hit in the readable wing before testing the drawer gate. Source-path controls pin control/format-character refusal alongside ordinary-path preservation.
+
+  - Whole-response source-path and hidden-candidate regressions cover both search routes and wing selections; canonical output goldens and the three-backend union test distinguish raw owner rendering from the member's final gated render.
+
+  - Protected shared-room CLI regressions cover literal-wing and fan-out search with independently readable controls; owner renderer controls, both room-list paths, cited and uncited cross-workspace mutations, and all nine projected-read literal refusals retain their distinct boundaries.
+
   - Legacy report-source tests quiesce hold, chat and phone workers and verify removal of a pre-existing invalid reset trigger before raw status writes.
 
   - Overview witnesses separate old-head behavioral regressions from the original-base fail-closed contract, with exact facet-call sequences and both lazy SQLite error classes.
@@ -579,6 +593,12 @@ Format (read by `commonplace orch docs-check`):
   - Subagent question routing, proposal/release prerequisites and recipient authority regressions.
 
 - **Promises:**
+
+  - Restricted event regressions cover omitted webhook numbers, keyed opaque ids, authority changes, readable-set resets, cursor recovery and saved-but-unlinked notices. Restricted recovery checks retain exact event identity and internal deduplication without exposing public sequence fields. Authority lookup failures pin one redacted diagnostic and no enqueue. Shared fixtures also retain real member wildcard and literal-wing holders alongside owner-only private readers.
+
+  - `tests/test_person_private_scope_r1.py` covers event cursor equality, single/chunked unreadable writes, tunnel side effects and scrubbing, token mint/load role caps and private-save notices. Broad private-read fixtures use owner-held tokens so independent filer guards remain exercised.
+
+  - `tests/test_person_private_scope.py` checks authenticated owner/private and member/shared controls across thirty read variants, absent/hidden count parity, materialized hallways, isolated estate counts and unproven roles.
 
   - Graph parity fixtures include generated and absent locus schemas, Compact native values and large integers.
 
@@ -840,6 +860,8 @@ Format (read by `commonplace orch docs-check`):
   - Token tests distinguish missing selected capture credentials during initialization from import-only feed credential rejection.
   - GitHub lifecycle rendering runs in Node with deferred replies and synthetic roots, including logout during an outstanding status read.
   - `tests/test_spaces_contract.py`, `tests/spaces_surfaces.json` and the checked REST/public surface regressions.
+  - Surface snapshots include only the newly projected restricted reads; disabled-handoff comparisons preserve every other legacy field.
+  - Memory REST freshness doubles return the save result including its privacy notice; unreadable retry tests retain the fresh-write envelope and source redaction.
 
   - Focused presence and read-scope selections run alongside existing gateway, mirror, imported-history and mutation-scope regressions.
 
@@ -877,6 +899,12 @@ Format (read by `commonplace orch docs-check`):
   - Extension installation registers email shutdown before GitHub shutdown; HTTP server teardown closes both in that order before SQLite closes.
 
 - **Promises:**
+
+  - Restricted CLI-compatible search acquires structured hits and renders only after the final drawer gate, on literal-wing and fan-out paths. Its closed response vocabulary never includes structured hits; flat rendering ignores unrelated import metadata, the pure canonical formatter is shared with the owner worker path, and CLI argument restrictions remain.
+
+  - Tokens cannot be minted with private read for non-owner holders; PAT and durable-connection authentication cap loaded private/admin scopes to current ownership. Tunnel writes require readable endpoints and scrub outgoing results.
+
+  - Wildcard readers without private scope use existing input-authorized projections for overview, graph, KG, tunnels, hallways and drawer pages; unprojected whole-palace operations remain refused.
 
   - Only the explicit worker-memory observation opt-out is added to the worker environment allowlist; diagnostic data stays inside the existing per-workspace config directory.
 
@@ -989,6 +1017,10 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - OAuth authentication strips loaded private/admin scope when current workspace membership is not exactly owner, independently of token scope narrowing.
+
+  - Person private read scope requires the exact current workspace owner role. Omitted, missing and unexpected roles fail closed; members temporarily lose their own private wings too.
+
   - Imported-history consent: OAuth reader consent is separate and unticked; defaults and person policies exclude the reader, while refresh descendants cannot regain a dropped scope.
 
   - Enabled coordinator startup context includes unsplit inbox counts, without migrating boards.
@@ -1057,6 +1089,10 @@ Format (read by `commonplace orch docs-check`):
   - Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
 
 - **Promises:**
+
+  - Member event pages use one readable-board snapshot, an opaque access epoch and bounded SQL projection. Restricted webhook subscriptions omit public sequence fields and use opaque ids from independent server-only subscription keys, initialized on first use and durable across restarts. Neither keys nor sequence fields are exposed; raw event keys remain internal for replay deduplication without a counter or backfill. Subscription lookup exceptions log their type and stack locations while retaining fail-closed authority.
+
+  - Web feeds and webhooks share the current-principal event visibility rule; non-owner person feeds omit boardless/private events and use readable-log sequence numbers.
 
   - Owner assignments to active agent connections claim the card with a lease and a claim event.
 
@@ -1306,6 +1342,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - The final search gate proves source_path like source_file, including nested folded copies and media path/title aliases, and omits acquisition counts and truncation flags for restricted readers. Body text and arbitrary provenance labels are not scanned for private words.
+
   - Graph mediation validates and rechecks the descriptor-bound SQLite sort values before traversal and ranking.
 
   - Graph traversal and ranking preserve backend sibling order before caps; grouped stats preserve their distinct tie convention.
@@ -1477,6 +1515,10 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Saved-but-unlinked private notes retain their unreadable-author notice in the error response.
+
+  - Health-flagged notes remain private. HTTP and MCP saves explicitly tell an unreadable author that the note was saved privately and cannot be read for now.
+
   - Owner memory maps retain readable person relationships when a citation cannot be proved.
 
   - Owner HTTP progress always forwards the authenticated principal, returns only readable progress and disables response caching.
@@ -1616,6 +1658,12 @@ Format (read by `commonplace orch docs-check`):
   - The cookie-authenticated web app and the live console, including the owner orchestration switch, project seat-consent controls and default agent-limit display.
 
 - **Promises:**
+
+  - Event polling sends the readable-set epoch and refetches the open screen, including card details, before adopting a reset cursor. The owner feed resets non-empty member-era epochs; pre-deploy member tabs require a reload to resume live events.
+
+  - Non-owner person event feeds project payloads and cursors into visible events; private-only insertions do not change member responses.
+
+  - Admin callback eligibility reconstructs person policies with the queried membership role rather than assuming private read authority.
 
   - Sign-out and expiry stop an existing Admin controller; it is null until mounted.
 

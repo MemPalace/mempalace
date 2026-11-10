@@ -153,7 +153,7 @@ def http(env, tmp_path, monkeypatch):
         _Service(data, calls),
         _Recall(env.workspace, "other-workspace", calls),
     )
-    monkeypatch.setattr(memory_tools, "_save", lambda _ctx, args: ("memory", args["text"]))
+    monkeypatch.setattr(memory_tools, "_save", lambda _ctx, args: ("memory", args["text"], ""))
     monkeypatch.setattr(memory_tools, "_file_fact", lambda _ctx, _args: {"triple_id": 1})
     server = env.gateway.build_server("127.0.0.1", 0)
     thread = threading.Thread(

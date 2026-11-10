@@ -11,7 +11,12 @@ from commonplace import sessions
 from commonplace.handoff.models import ThreadMessage
 from commonplace.handoff.recall import Recall
 from mempalace.palace import get_closets_collection
-from tests._commonplace_helpers import functional_worker_transport, hub_fixture  # noqa: F401
+from tests._commonplace_helpers import (  # noqa: F401
+    assert_member_drawer_access,
+    functional_worker_transport,
+    hub_fixture,
+    shared_readers,
+)
 
 TOOLS = ["mempalace_kg_query", "mempalace_get_drawer", "mempalace_get_drawers"]
 SCOPES = ["memory:read", "private:read", "threads:read", "kg:read"]
@@ -22,7 +27,7 @@ def case(hub, kg, collection, config, monkeypatch, functional_worker_transport):
     h = hub
     h.supervisor.get(h.workspace)
     uid = h.db.create_user("reader@example.test")
-    h.db.add_member(h.workspace, uid, "member", actor=h.admin)
+    h.db.add_member(h.workspace, uid, "owner", actor=h.admin)
     token = h.token(
         "reader",
         user=uid,
@@ -41,7 +46,7 @@ def case(hub, kg, collection, config, monkeypatch, functional_worker_transport):
         assert p.policy.trust == "trusted" and p.policy.sees_all_wings
         assert all(p.policy.has_scope(scope) for scope in SCOPES)
         assert all(p.policy.refusal(tool) is None for tool in TOOLS)
-    assert not member.person and member.role == "member"
+    assert not member.person and member.role == "owner"
     assert owner.person and owner.role == "owner"
     store = h.gateway.handoff.store_for(h.workspace)
     c = SimpleNamespace(
@@ -300,3 +305,16 @@ def test_s09_real_lookup_spies(case, role):
     assert {"by_source", "by_source_family"} <= set(c.source_calls)
     assert c.lookups and all(w == c.h.workspace for w in c.lookups)
     assert any(name == "mempalace_get_drawers" for _, name, _ in c.calls)
+
+
+@pytest.mark.parametrize("kind", ["wildcard", "literal"])
+def test_member_shared_reader_contract(hub, shared_readers, kind):  # noqa: F811
+    principal = hub.db.authenticate_token(shared_readers[kind])
+    assert principal.role == "member" and not principal.person
+    assert not principal.policy.sees_all_wings
+    assert not principal.policy.has_scope("private:read")
+    assert principal.policy.can_read_wing("wing_fixture")
+    assert principal.policy.can_read_wing("shared")
+    assert not principal.policy.can_read_wing("private_notes")
+    assert not principal.policy.can_read_wing("private_chats")
+    assert_member_drawer_access(hub, shared_readers[kind])

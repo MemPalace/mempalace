@@ -3,9 +3,10 @@
 No passwords and no email. ``commonplace login-link <email>`` prints a link
 that works once within 15 minutes. Opening it sets an HttpOnly session
 cookie for 30 days. Only the SHA-256 of each link token and session id is
-stored. A signed-in person acts as ``user:<id>`` with the owner's full view
-of their workspace (people see everything in a workspace they belong to;
-scopes limit agents, not owners). Provider sign-in (:mod:`commonplace.social`)
+stored. A signed-in person acts as ``user:<id>`` with shared workspace
+access. Only a proven workspace owner receives private read access; other
+people cannot read even their own private wings. Provider sign-in
+(:mod:`commonplace.social`)
 ends in the same session through :func:`start_session`.
 """
 
@@ -59,10 +60,14 @@ def ensure_schema(db: ControlDB) -> None:
         db._conn.executescript(SCHEMA)
 
 
-def person_policy() -> Policy:
+def person_policy(role: Optional[str] = None) -> Policy:
+    """Only explicit workspace ownership proves private read authority."""
+    excluded = {"admin", "memory:import", "memory:import:read"}
+    if role != "owner":
+        excluded.add("private:read")
     return Policy.build(
         profile="full",
-        scopes=[s for s in SCOPES if s not in ("admin", "memory:import", "memory:import:read")],
+        scopes=[s for s in SCOPES if s not in excluded],
         read_wings=["*"],
         write_wings=["*"],
         trust="trusted",
@@ -85,7 +90,7 @@ def person_principal(db: ControlDB, user_id: str, workspace_id: str) -> Optional
         client="web",
         auth="session",
         role=role,
-        policy=person_policy(),
+        policy=person_policy(role),
         person=True,
     )
 

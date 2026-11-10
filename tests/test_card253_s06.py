@@ -16,7 +16,8 @@ def page_world(hub, collection, monkeypatch, request):
     monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
     monkeypatch.setattr(mcp, "_get_collection", lambda **kw: collection)
     member = hub.db.create_user("page-member@example.test")
-    hub.db.add_member(hub.workspace, member, "member", actor=hub.admin)
+    hub.db.add_member(hub.workspace, member, "owner", actor=hub.admin)
+    # Private-read fixture holders must be owners; filer boundaries remain independent.
     store = hub.gateway.handoff.store_for(hub.workspace)
     visible = store.store(
         hub.workspace, "visible", [ThreadMessage(0, "user", "message", "v", "v")], actor=member
@@ -38,7 +39,7 @@ def page_world(hub, collection, monkeypatch, request):
         trust="trusted",
     )
     principal = hub.db.authenticate_token(token)
-    assert principal.role != "owner" and principal.policy.sees_all_wings
+    assert principal.role == "owner" and principal.policy.sees_all_wings
     assert all(
         principal.policy.has_scope(s) for s in ("memory:read", "private:read", "threads:read")
     )
@@ -297,7 +298,7 @@ def literal_token(w, *, import_read=False, wings=None):
         trust="trusted",
     )
     principal = h.db.authenticate_token(token)
-    assert principal.role != "owner" and not principal.policy.sees_all_wings
+    assert principal.role == "owner" and not principal.policy.sees_all_wings
     assert principal.policy.refusal("mempalace_list_drawers") is None
     assert h.gateway.handoff.recall.can_read(principal, visible)
     assert not h.gateway.handoff.recall.can_read(principal, hidden)

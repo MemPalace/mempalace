@@ -29,7 +29,7 @@ def person():
         client="web",
         auth="session",
         role="owner",
-        policy=person_policy(),
+        policy=person_policy("owner"),
         person=True,
     )
 

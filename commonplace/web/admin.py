@@ -359,7 +359,7 @@ def wakeable(conn, workspace_id, context, board, actor):
             user = select(
                 conn,
                 context,
-                "SELECT u.id FROM memberships m JOIN users u ON u.id=m.user_id "
+                "SELECT u.id, m.role FROM memberships m JOIN users u ON u.id=m.user_id "
                 "WHERE m.workspace_id=? AND u.id=? AND u.disabled_at IS NULL",
                 (workspace_id, actor[5:]),
             ).fetchone()
@@ -367,7 +367,7 @@ def wakeable(conn, workspace_id, context, board, actor):
                 continue
             from commonplace.sessions import person_policy
 
-            policy = person_policy()
+            policy = person_policy(user["role"])
         else:
             continue
         if policy.has_scope("memory:read") and policy.can_read_wing(board["wing"]):

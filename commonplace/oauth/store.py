@@ -362,7 +362,7 @@ class OAuthAuthenticator:
             # A narrowed refresh must also narrow what its access token can do.
             policy_data = json.loads(policy.to_json())
             policy_data["scopes"] = [s for s in policy.scopes if s in token["scope"].split()]
-            policy = Policy.from_json(json.dumps(policy_data))
+            policy = Policy.from_json(json.dumps(policy_data)).for_role(row["role"])
             return Principal(
                 user_id=row["user_id"],
                 user_email=row["user_email"],

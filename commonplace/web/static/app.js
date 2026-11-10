@@ -57,7 +57,7 @@ let providersPromise;
 const root = document.querySelector("#root");
 const state = {
   me: null, boards: [], needs: {}, cards: [], children: [], open: [], card: null, route: "#/", base: "#/",
-  selected: null, backlog: false, drafts: new Map(), pending: new Set(), seq: 0, panelRequest: 0, refreshRequest: 0,
+  selected: null, backlog: false, drafts: new Map(), pending: new Set(), seq: 0, eventEpoch: "", panelRequest: 0, refreshRequest: 0,
   screen: 0, renderPending: null, error: "", pollError: false, loading: false,
   chat: [], linked: [], chatBoard: null, chatCursor: 0, spaceTab: "chat", chatTasks: new Map(),
   chatHasMore: false, chatLoading: false, chatObserver: null, chatVisible: new Set(), chatTaskRequests: new Map(),
@@ -1734,9 +1734,10 @@ async function poll() {
   if (polling || !state.me) { schedule(); return; }
   polling = true;
   try {
-    const feed = await api(`/api/events?after=${state.seq}`);
+    const feed = await api(`/api/events?after=${state.seq}&epoch=${encodeURIComponent(state.eventEpoch || "")}`);
     if (!state.me) return;
-    if (feed.events.length && await refresh({ background: true, events: feed.events }) === false) throw new Error("Refresh failed");
+    if (feed.reset && await refresh({ background: false }) === false) throw new Error("Refresh failed");
+    if (!feed.reset && feed.events.length && await refresh({ background: true, events: feed.events }) === false) throw new Error("Refresh failed");
     if (state.base === "#/settings" && state.phonePushPending) {
       const epoch = state.screen;
       const phonePush = await api("/api/phone-push");
@@ -1746,7 +1747,7 @@ async function poll() {
         if (section) section.outerHTML = phonePushView(phonePush);
       }
     }
-    state.seq = feed.seq;
+    state.seq = feed.seq; state.eventEpoch = feed.epoch || "";
     retryDelay = 2000; state.pollError = false; state.pollFails = 0;
   } catch { state.pollError = true; state.pollFails += 1; retryDelay = Math.min(30000, retryDelay * 2); }
   finally {

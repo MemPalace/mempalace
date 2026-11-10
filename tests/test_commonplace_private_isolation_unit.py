@@ -52,7 +52,16 @@ def account(tmp_path):
     ensure_schema(db)
     store = ThreadStore(str(tmp_path / "threads.sqlite3"))
     principal = Principal(
-        owner, "owner@example.test", ws, "", "web", "web", "session", "owner", person_policy(), True
+        owner,
+        "owner@example.test",
+        ws,
+        "",
+        "web",
+        "web",
+        "session",
+        "owner",
+        person_policy("owner"),
+        True,
     )
     private = continuity_read.PrivateReader(db, lambda _: store)
     ctx = SimpleNamespace(
@@ -144,7 +153,7 @@ def test_member_cannot_read_another_filers_private_threads(account, identity):
             name="synthetic-capture",
             client="claude-code",
             actor=a.owner.user_id,
-            policy=person_policy(),
+            policy=person_policy("owner"),
         )
         with a.db._lock:
             a.db._conn.execute("UPDATE connections SET revoked_at='then' WHERE id=?", (connection,))

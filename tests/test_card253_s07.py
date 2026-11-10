@@ -8,7 +8,12 @@ import pytest
 
 from commonplace.handoff.models import ThreadMessage
 from mempalace import mcp_server as _mcp
-from tests._commonplace_helpers import functional_worker_transport, hub_fixture  # noqa: F401
+from tests._commonplace_helpers import (  # noqa: F401
+    assert_member_drawer_access,
+    functional_worker_transport,
+    hub_fixture,
+    shared_readers,
+)
 
 _GET_KG = _mcp._get_kg
 
@@ -21,7 +26,7 @@ TOOLS = [
 
 
 @pytest.fixture
-def world(hub, monkeypatch, tmp_path, request):
+def world(hub, monkeypatch, tmp_path, request, shared_readers):  # noqa: F811
     from mempalace import mcp_server as mcp
 
     # The shared hub replaces _get_kg with one graph. Exercise the production
@@ -55,7 +60,8 @@ def world(hub, monkeypatch, tmp_path, request):
     monkeypatch.setenv("COMMONPLACE_RATE_LIMITS", "off")
     monkeypatch.setenv("COMMONPLACE_RULES", "off")
     member = hub.db.create_user("member@example.test")
-    hub.db.add_member(hub.workspace, member, "member", actor=hub.admin)
+    hub.db.add_member(hub.workspace, member, "owner", actor=hub.admin)
+    # Private-read fixture holders must be owners; filer boundaries remain independent.
     store = hub.gateway.handoff.store_for(hub.workspace)
     readable = store.store(
         hub.workspace,
@@ -87,7 +93,7 @@ def world(hub, monkeypatch, tmp_path, request):
         trust="trusted",
     )
     principal = hub.db.authenticate_token(tokens["A"])
-    assert principal.role != "owner" and principal.policy.has_scope("threads:read")
+    assert principal.role == "owner" and principal.policy.has_scope("threads:read")
     assert principal.policy.trust == "trusted" and principal.policy.has_scope("kg:read")
     assert principal.policy.sees_all_wings
     assert hub.gateway.handoff.recall.can_read(principal, readable.id)
@@ -103,6 +109,7 @@ def world(hub, monkeypatch, tmp_path, request):
         readable=readable,
         hidden=hidden,
         tokens=tokens,
+        member_tokens=shared_readers,
         patch=monkeypatch,
     )
     hub.gateway.handoff.close()
@@ -954,9 +961,9 @@ def test_card253_s07_r6_blank_wings(kgworld, kind, tool, args, protocol):
     principal = (
         sessions.person_principal(w.h.db, w.h.admin, w.h.workspace)
         if kind == "owner"
-        else w.h.db.authenticate_token(w.tokens["A"])
+        else w.h.db.authenticate_token(w.member_tokens["wildcard"])
     )
-    assert principal.policy.sees_all_wings
+    assert principal.policy.sees_all_wings == (kind == "owner")
     assert (principal.role == "owner") == (kind == "owner")
     assert w.h.gateway.call_memory_tool(principal, TOOLS[0], {"entity": "fixed_entity"})["facts"]
 
@@ -977,7 +984,12 @@ def test_card253_s07_r6_blank_wings(kgworld, kind, tool, args, protocol):
         else _tool_response(700, {"error": "wings must be a list of names"})
     )
     present = request()
-    assert present == expected, "blank wing replaced develop's validation error with Denied"
+    if kind == "wildcard":
+        assert present == _tool_response(
+            700, {"error": "this connection can't read wing '  '", "denied": True}, is_error=True
+        ), "member blank-wing denial envelope changed"
+    else:
+        assert present == expected, "blank wing replaced the validation error"
     remove_hidden(w)
     assert request() == present, "hidden facts changed blank-wing validation"
 
@@ -997,15 +1009,15 @@ def test_card253_s07_r6_blank_wings(kgworld, kind, tool, args, protocol):
 )
 def test_card253_s07_r7_canonical_empty_wings(kgworld, kind, args):
     from commonplace import sessions
-    from commonplace.gateway import _tool_result
+    from commonplace.gateway import _tool_response, _tool_result
 
     w = kgworld
     principal = (
         sessions.person_principal(w.h.db, w.h.admin, w.h.workspace)
         if kind == "owner"
-        else w.h.db.authenticate_token(w.tokens["A"])
+        else w.h.db.authenticate_token(w.member_tokens["wildcard"])
     )
-    assert principal.policy.sees_all_wings
+    assert principal.policy.sees_all_wings == (kind == "owner")
     assert (principal.role == "owner") == (kind == "owner")
     assert w.h.gateway.call_memory_tool(principal, TOOLS[0], {"entity": "fixed_entity"})["facts"]
 
@@ -1021,7 +1033,14 @@ def test_card253_s07_r7_canonical_empty_wings(kgworld, kind, args):
         )
 
     present = request()
-    if args["entity"] is None:
+    if kind == "wildcard":
+        wing = next(wing for wing in args["wings"] if wing != "wing_fixture")
+        assert present == _tool_response(
+            701,
+            {"error": f"this connection can't read wing {wing!r}", "denied": True},
+            is_error=True,
+        ), "member canonical-empty wing denial envelope changed"
+    elif args["entity"] is None:
         assert present == {
             "jsonrpc": "2.0",
             "id": 701,
@@ -1086,3 +1105,16 @@ def test_card253_s07_r7_canonical_empty_hidden_fact(kgworld, kind):
     )
     remove_hidden(w)
     assert request() == present, "canonical-empty H-only fact changed the public response"
+
+
+@pytest.mark.parametrize("kind", ["wildcard", "literal"])
+def test_member_shared_reader_contract(hub, shared_readers, kind):  # noqa: F811
+    principal = hub.db.authenticate_token(shared_readers[kind])
+    assert principal.role == "member" and not principal.person
+    assert not principal.policy.sees_all_wings
+    assert not principal.policy.has_scope("private:read")
+    assert principal.policy.can_read_wing("wing_fixture")
+    assert principal.policy.can_read_wing("shared")
+    assert not principal.policy.can_read_wing("private_notes")
+    assert not principal.policy.can_read_wing("private_chats")
+    assert_member_drawer_access(hub, shared_readers[kind])

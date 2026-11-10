@@ -231,7 +231,10 @@ def filter_room_keys(rule, result, can_read):
 
 def scrub_provenance(node, access):
     out = node
-    for key in provenance_refs.PROVENANCE_FIELDS | provenance_refs.DERIVED_FIELDS:
+    fields = provenance_refs.PROVENANCE_FIELDS | provenance_refs.DERIVED_FIELDS
+    if node.get("result_type") == "asset":
+        fields |= {"path", "title"}  # Media search also displays source_path under these aliases.
+    for key in fields:
         value = node.get(key)
         if value is None:
             continue
@@ -343,8 +346,28 @@ def _proved_thread(value, access):
     )
 
 
+def _without_search_acquisition_counts(principal, rule, result):
+    if rule == "search" and isinstance(result, dict) and not principal.policy.sees_all_wings:
+        # Candidate acquisition precedes drawer authorization. Neither its
+        # counts nor its truncation flags describe this reader's visible set.
+        result = {
+            key: value
+            for key, value in result.items()
+            if key
+            not in {
+                "total_before_filter",
+                "filtered_by_max_distance",
+                "date_filter_pool_truncated",
+                "candidates_truncated",
+                "distinct_results_truncated",
+            }
+        }
+    return result
+
+
 def gate(gateway, principal, rule, result, *, access=None):
     """Scrub mirror words, caching access decisions only within this response."""
+    result = _without_search_acquisition_counts(principal, rule, result)
     access = access or reader(gateway, principal)
     can_read = access
     import_allowed = access.import_allowed

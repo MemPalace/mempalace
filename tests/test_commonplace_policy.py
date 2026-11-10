@@ -135,6 +135,17 @@ def test_private_wings_need_private_scopes():
 def test_cross_wing_tools_need_every_wing():
     some = _p(profile="full", scopes=["memory:read"], read_wings=["shared"])
     assert some.refusal("mempalace_status") == "needs read access to every wing"
+    literal = _p(profile="full", scopes=["memory:read", "kg:read"], read_wings=["shared"])
+    for name in (
+        "mempalace_kg_list_wings",
+        "mempalace_traverse",
+        "mempalace_find_tunnels",
+        "mempalace_graph_stats",
+        "mempalace_list_tunnels",
+        "mempalace_list_hallways",
+        "mempalace_follow_tunnels",
+    ):
+        assert literal.refusal(name) == "needs read access to every wing", name
     reader = _p(
         profile="full",
         scopes=["memory:read", "memory:write", "private:read"],

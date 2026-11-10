@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Iterable, Optional
 
 from mempalace.config import WORKSTATION_WINGS, normalize_wing_name, wing_aliases
@@ -128,6 +128,23 @@ TOOL_RULES = {
     "mempalace_artifact_get": ("events:read", "all_wings"),
     "mempalace_patch_submit": ("events:write", "all_wings"),
 }
+
+# These reads have gateway projections that authorize inputs before counts,
+# ranking and pagination. Wildcard readers without private access may use
+# those projections; unprojected whole-palace tools still require every wing.
+PROJECTED_WING_READS = frozenset(
+    {
+        "mempalace_status",
+        "mempalace_kg_stats",
+        "mempalace_kg_list_wings",
+        "mempalace_traverse",
+        "mempalace_find_tunnels",
+        "mempalace_graph_stats",
+        "mempalace_list_tunnels",
+        "mempalace_list_hallways",
+        "mempalace_follow_tunnels",
+    }
+)
 
 # Never served through the gateway: mine and sync read paths on the server's
 # disk, hook_settings writes the server's config, reconnect drops every handle.
@@ -322,6 +339,14 @@ class Policy:
         except Exception:
             return DENY_ALL
 
+    def for_role(self, role: Optional[str]) -> "Policy":
+        """Loaded authority cannot outlive current workspace ownership."""
+        if role == "owner":
+            return self
+        return replace(
+            self, scopes=tuple(s for s in self.scopes if s not in {"private:read", "admin"})
+        )
+
     # ── scopes and trust ──
     def has_scope(self, scope: str) -> bool:
         if scope not in self.scopes:
@@ -430,7 +455,9 @@ class Policy:
             return "untrusted connections can't change existing memories"
         if rule == "all_wings":
             needs_write = TOOL_CAPABILITIES[name][0] != "read"
-            if not self.sees_all_wings:
+            if not self.sees_all_wings and not (
+                name in PROJECTED_WING_READS and "*" in self.read_wings
+            ):
                 return "needs read access to every wing"
             if needs_write and scope.startswith("memory:") and not self.writes_all_wings:
                 return "needs write access to every wing"

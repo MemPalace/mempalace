@@ -467,6 +467,8 @@ class ControlDB:
             raise ControlError(f"{user['email']} is not a member of {ws['name']}")
         if "admin" in policy.scopes and role != "owner":
             raise ControlError("only an owner's connection can hold the admin scope")
+        if "private:read" in policy.scopes and role != "owner":
+            raise ControlError("only an owner's connection can hold the private:read scope")
         name = name.strip()
         client = client.strip()
         if not _CONNECTION_NAME.fullmatch(name):
@@ -731,7 +733,7 @@ class ControlDB:
             client=row["client"],
             auth=row["auth"],
             role="member" if row["runner_kind"] is not None else row["role"],
-            policy=Policy.from_json(row["policy"]),
+            policy=Policy.from_json(row["policy"]).for_role(row["role"]),
             parent_connection_id=row["parent_id"],
             parent_agent=(
                 f"conn:{self.connection(row['parent_id'], row['workspace_id'])['name']}"

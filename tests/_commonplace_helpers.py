@@ -176,3 +176,49 @@ def hub_fixture(tmp_path, monkeypatch, config, kg):
         yield h
     finally:
         h.close()
+
+
+@pytest.fixture
+def shared_readers(hub):
+    """Real member holders for wildcard shared-only and literal-wing reads."""
+    user = hub.db.create_user("shared-reader@example.test")
+    hub.db.add_member(hub.workspace, user, "member", actor=hub.admin)
+    tokens = {}
+    for kind, wings in (("wildcard", ["*"]), ("literal", ["wing_fixture", "shared", "threads"])):
+        tokens[kind] = hub.token(
+            "shared-" + kind,
+            user=user,
+            profile="full",
+            scopes=["memory:read", "threads:read", "kg:read"],
+            read_wings=wings,
+            trust="trusted",
+        )
+    return tokens
+
+
+def assert_member_drawer_access(hub, token):
+    """Exercise shared recall and private refusal with the actual holder."""
+    owner = hub.owner_token("drawer-control")
+
+    def call(credential, name, args):
+        return hub.rpc(credential, "tools/call", {"name": name, "arguments": args})["result"]
+
+    for wing, text in (
+        ("shared", "SHARED_HOLDER_CONTROL"),
+        ("private_notes", "PRIVATE_HOLDER_CONTROL"),
+    ):
+        saved = call(
+            owner, "mempalace_add_drawer", {"wing": wing, "room": "contract", "content": text}
+        )
+        assert not saved.get("isError"), saved
+        drawer = json.loads(saved["content"][0]["text"])["drawer_id"]
+        owner_read = call(owner, "mempalace_get_drawer", {"drawer_id": drawer})
+        assert text in json.dumps(owner_read)
+        member_read = call(token, "mempalace_get_drawer", {"drawer_id": drawer})
+        if wing == "shared":
+            assert not member_read.get("isError") and text in json.dumps(member_read)
+        else:
+            assert text not in json.dumps(member_read)
+            assert json.loads(member_read["content"][0]["text"]) == {
+                "error": f"Drawer not found: {drawer}"
+            }

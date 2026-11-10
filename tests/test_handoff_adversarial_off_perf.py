@@ -445,6 +445,16 @@ ADDED_SINCE_BASELINE = {
 # that reads every wing but not private ones may now see them; and KG tools
 # added since the baseline.
 WING_SCOPED_SINCE_BASELINE = {
+    # These reads now project the caller's readable wings.
+    "mempalace_find_tunnels",
+    "mempalace_follow_tunnels",
+    "mempalace_graph_stats",
+    "mempalace_kg_list_wings",
+    "mempalace_kg_stats",
+    "mempalace_list_hallways",
+    "mempalace_list_tunnels",
+    "mempalace_status",
+    "mempalace_traverse",
     "mempalace_kg_query",
     "mempalace_kg_timeline",
     "mempalace_kg_invalidate",

@@ -11,7 +11,12 @@ import pytest
 
 from commonplace.gateway import _tool_result
 from commonplace.handoff.models import ThreadMessage
-from tests._commonplace_helpers import functional_worker_transport, hub_fixture  # noqa: F401
+from tests._commonplace_helpers import (  # noqa: F401
+    assert_member_drawer_access,
+    functional_worker_transport,
+    hub_fixture,
+    shared_readers,
+)
 
 TOOLS = [
     "mempalace_traverse",
@@ -58,7 +63,8 @@ def world(hub, monkeypatch, tmp_path, request):
     monkeypatch.setenv("COMMONPLACE_RATE_LIMITS", "off")
     monkeypatch.setenv("COMMONPLACE_RULES", "off")
     member = hub.db.create_user("member@example.test")
-    hub.db.add_member(hub.workspace, member, "member", actor=hub.admin)
+    hub.db.add_member(hub.workspace, member, "owner", actor=hub.admin)
+    # Private-read fixture holders must be owners; filer boundaries remain independent.
     store = hub.gateway.handoff.store_for(hub.workspace)
     readable = store.store(
         hub.workspace,
@@ -89,7 +95,7 @@ def world(hub, monkeypatch, tmp_path, request):
             trust="trusted",
         )
         principal = hub.db.authenticate_token(tokens[kind])
-        assert principal.role != "owner" and principal.policy.trust == "trusted"
+        assert principal.role == "owner" and principal.policy.trust == "trusted"
         assert all(
             principal.policy.has_scope(scope)
             for scope in ("memory:read", "private:read", "threads:read")
@@ -369,7 +375,7 @@ def test_card253_s05_literal_guard(world):
         trust="trusted",
     )
     principal = w.h.db.authenticate_token(w.tokens["A"])
-    assert principal.role != "owner" and not principal.policy.sees_all_wings
+    assert principal.role == "owner" and not principal.policy.sees_all_wings
     for tool, args in (
         ("mempalace_graph_stats", {}),
         ("mempalace_find_tunnels", {}),
@@ -703,3 +709,16 @@ def test_card253_s05_r3_compact_zero_guard(world, functional_worker_transport, f
 @pytest.mark.parametrize("value", [True, False])
 def test_card253_s05_r3_chroma_bool_guard(world, functional_worker_transport, field, value):
     test_card253_s05_r3_native_loci(world, functional_worker_transport, field, value)
+
+
+@pytest.mark.parametrize("kind", ["wildcard", "literal"])
+def test_member_shared_reader_contract(hub, shared_readers, kind):
+    principal = hub.db.authenticate_token(shared_readers[kind])
+    assert principal.role == "member" and not principal.person
+    assert not principal.policy.sees_all_wings
+    assert not principal.policy.has_scope("private:read")
+    assert principal.policy.can_read_wing("wing_fixture")
+    assert principal.policy.can_read_wing("shared")
+    assert not principal.policy.can_read_wing("private_notes")
+    assert not principal.policy.can_read_wing("private_chats")
+    assert_member_drawer_access(hub, shared_readers[kind])

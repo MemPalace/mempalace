@@ -267,10 +267,11 @@ def test_extraction_by_non_reader_uploader_does_not_wedge_cursor(case, monkeypat
             )
         ],
         actor=c.w.me["user"],
-        wing="private_threads",
+        wing="shared",
     )
     member = sessions.person_principal(c.w.client.db, c.user, c.w.me["workspace"])
     owner = sessions.person_principal(c.w.client.db, c.w.me["user"], c.w.me["workspace"])
+    assert member.role == "member" and member.policy.can_read_wing(stored.wing)
     filed = []
     monkeypatch.setattr(ctx.service, "save_fact", lambda p, a: filed.append(a))
     before = store.fact_cursor(stored.id, VERSION)

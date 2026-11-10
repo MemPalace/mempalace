@@ -563,7 +563,8 @@ def test_closet_statistics_exclude_drawers_even_in_the_same_wing(tmp_path, monke
 def test_cli_compatible_wing_union_never_prints_private_drawer(monkeypatch, config, kg, backend):
     from _mcp_server_helpers import _patch_mcp_server
 
-    from commonplace.gateway import Mediator
+    from commonplace.gateway import Mediator, _tool_response, _tool_result
+    from commonplace.policy import Policy
     from mempalace import mcp_server
     from mempalace.backends import embedding_wrapper
 
@@ -606,16 +607,47 @@ def test_cli_compatible_wing_union_never_prints_private_drawer(monkeypatch, conf
         return mcp_server.tool_search(**args)
 
     mediator.workers = SimpleNamespace(call_tool=call_tool)
+    mediator.gateway = SimpleNamespace()
     principal = SimpleNamespace(
         workspace_id="fixture-workspace",
-        policy=SimpleNamespace(can_read_wing=lambda wing: wing == "public"),
+        policy=Policy.build(
+            profile="full", scopes=["memory:read", "private:read"], read_wings=["*"]
+        ),
     )
-    result = mediator._fan_out_search(
-        principal,
-        "mempalace_search",
-        {"query": "ZXQ739251", "cli_compatible": True, "include_facts": False},
-    )
+    args = {
+        "query": "ZXQ739251",
+        "wings": ["public"],
+        "cli_compatible": True,
+        "include_facts": False,
+    }
+    result = mediator._fan_out_search(principal, "mempalace_search", args)
     assert "PUBLIC_NEEDLE" in result["cli_output"] and "PRIVATE_SECRET" not in result["cli_output"]
+    member = SimpleNamespace(
+        workspace_id="fixture-workspace",
+        policy=Policy.build(profile="full", scopes=["memory:read"], read_wings=["public"]),
+    )
+    protected_room = "thr_0123456789abcdef"
+    col.add(
+        ids=["protected-public-needle"],
+        documents=["ZXQ739251 PRIVATE_SECRET"],
+        embeddings=[[0.0, 0.0]],
+        metadatas=[{"wing": "public", "room": protected_room}],
+    )
+    acquired = mediator._fan_out_search(member, "mempalace_search", args)
+    assert any("PUBLIC_NEEDLE" in row["text"] for row in acquired["results"])
+    assert any(
+        "PRIVATE_SECRET" in row["text"]
+        and row["wing"] == "public"
+        and row["room"] == protected_room
+        for row in acquired["results"]
+    ), "Protected public-room drawer never reached the gate"
+    response, _ = mediator._gate_response(
+        member, "mempalace_search", "search", 1, _tool_response(1, acquired), cli_args=args
+    )
+    gated = _tool_result(response)
+    assert "PUBLIC_NEEDLE" in gated["cli_output"]
+    assert "PRIVATE_SECRET" not in gated["cli_output"], "Protected public-room drawer leaked"
+    assert gated["results"] == []
 
 
 def test_moderately_common_pool_preranks_rowids_before_loading_text():

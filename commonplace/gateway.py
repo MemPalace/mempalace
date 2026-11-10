@@ -71,6 +71,54 @@ def _with_search_facts(result, facts):
     return out
 
 
+def _scoped_cli_search_error(args):
+    """Retain the CLI argument contract when acquiring structured drawer hits."""
+    from mempalace.query_sanitizer import sanitize_query
+
+    if args.get("include_media") or args.get("query_task", "search") != "search":
+        return "cli_compatible cannot be combined with media/code task search"
+    if args.get("source_file") is not None:
+        return "cli-compatible search does not support source_file"
+    unsupported = [
+        key for key in ("min_similarity", "max_distance", "context") if args.get(key) is not None
+    ]
+    if unsupported:
+        return "cli-compatible search does not support " + ", ".join(unsupported)
+    query = args.get("query")
+    if isinstance(query, str):
+        sanitized = sanitize_query(query)
+        if sanitized["clean_query"] != query or sanitized["was_sanitized"]:
+            return "cli-compatible search requires an unchanged query"
+    return None
+
+
+def _render_scoped_cli_search(result, args):
+    """Render only structured hits and facts that passed the final drawer gate."""
+    from mempalace.searcher import render_cli_search
+
+    out = {
+        "query": result.get("query", args.get("query", "")),
+        "cli_output": render_cli_search(
+            result.get("query", args.get("query", "")),
+            result.get("results", []),
+            wing=args.get("wing"),
+            room=args.get("room"),
+            since=args.get("since"),
+            before=args.get("before"),
+            metric=result.get("distance_metric", "cosine"),
+            facts=result.get("facts", []),
+            vector_disabled=bool(result.get("vector_disabled")),
+            flat=True,
+        ),
+        "results": [],
+    }
+    if "wings_searched" in result:
+        out["wings_searched"] = result["wings_searched"]
+    if result.get("facts"):
+        out["facts"] = result["facts"]
+    return out
+
+
 def _rpc_error(req_id, code: int, message: str, data: Optional[dict] = None) -> dict:
     error = {"code": code, "message": message}
     if data is not None:
@@ -581,7 +629,18 @@ class Mediator:
             committed_result = _tool_result(response)
         else:
             response, committed_result = self._gate_response(
-                principal, name, rule, req_id, response
+                principal,
+                name,
+                rule,
+                req_id,
+                response,
+                cli_args=(
+                    import_filters
+                    if name == "mempalace_search"
+                    and import_filters.get("cli_compatible")
+                    and not principal.policy.sees_all_wings
+                    else None
+                ),
             )
 
         if classify_tool(name) != "read":
@@ -597,7 +656,7 @@ class Mediator:
             )
         return response
 
-    def _gate_response(self, principal, name, rule, req_id, response):
+    def _gate_response(self, principal, name, rule, req_id, response, *, cli_args=None):
         """Apply the final read boundary while retaining the committed result for audit."""
         from .handoff.mirror_access import gate
 
@@ -605,6 +664,8 @@ class Mediator:
         if isinstance(response, dict) and "result" in response:
             result = committed_result = _tool_result(response)
             cleaned = gate(self.gateway, principal, rule, result)
+            if cli_args is not None and isinstance(cleaned, dict) and not cleaned.get("error"):
+                cleaned = _render_scoped_cli_search(cleaned, cli_args)
             if name == "mempalace_list_drawers":
                 from .handoff.drawer_pages import finish_page
 
@@ -727,11 +788,13 @@ class Mediator:
         ):
             return self._before_import_listing(principal, name, args)
         if name == "mempalace_list_drawers":
+            # The existing projection filters physical identities before paging,
+            # so wildcard shared readers do not need private read authority.
             if not policy.sees_all_wings:
                 wing = args.get("wing") or _only_literal_wing(policy)
-                if not wing:
+                if not wing and "*" not in policy.read_wings:
                     raise Denied(f"pass a wing: this connection reads {_wings_text(policy)}")
-                if not policy.can_read_wing(wing):
+                if wing and not policy.can_read_wing(wing):
                     raise Denied(f"this connection can't read wing {wing!r}")
                 args["wing"] = wing
             from .handoff.drawer_pages import finish_page, project
@@ -743,10 +806,10 @@ class Mediator:
             wing = args.get("wing")
             if not wing:
                 wing = _only_literal_wing(policy)
-                if not wing:
+                if not wing and "*" not in policy.read_wings:
                     raise Denied(f"pass a wing: this connection reads {_wings_text(policy)}")
                 args["wing"] = wing
-            if not policy.can_read_wing(wing):
+            if wing and not policy.can_read_wing(wing):
                 raise Denied(f"this connection can't read wing {wing!r}")
         if name == "mempalace_list_rooms":
             from .handoff.overview import summary
@@ -850,6 +913,10 @@ class Mediator:
             return {"respond": {"query": args.get("query", ""), "results": [], "facts": []}}
         if wing and not policy.sees_all_wings and not policy.can_read_wing(wing):
             raise Denied(f"this connection can't read wing {wing!r}")
+        if cli and not policy.sees_all_wings:
+            error = _scoped_cli_search_error(args)
+            if error:
+                return {"respond": {"error": error}}
         fact_result = (
             self._search_facts(principal, args)
             if args.get("include_facts", True)
@@ -863,6 +930,8 @@ class Mediator:
                 canonical_wing(wing) == canonical_wing(w) for w in requested
             ):
                 return {"respond": {"query": args.get("query", ""), "results": [], "facts": []}}
+            if cli and not policy.sees_all_wings:
+                args["cli_compatible"] = False
             return fact_result
         return {
             "respond": _with_search_facts(
@@ -1004,7 +1073,12 @@ class Mediator:
         policy = principal.policy
         for key in ("source_wing", "target_wing"):
             wing = args.get(key)
-            if not wing or not policy.can_write_wing(wing):
+            if (
+                not wing
+                or not policy.can_write_wing(wing)
+                or not policy.sees_all_wings
+                and not policy.can_read_wing(wing)
+            ):
                 raise Denied(f"this connection can't link wing {wing!r}")
         for prefix in ("source", "target"):
             self._check_thread_room(
@@ -1310,11 +1384,19 @@ class Mediator:
             # A retry into a wing the caller can't read must not show whose
             # chat the first copy came from.
             result = _tool_result(response)
-            if isinstance(result, dict) and "source_kept" in result:
-                result = {k: v for k, v in result.items() if k != "source_kept"}
+            if isinstance(result, dict):
+                result = {k: v for k, v in result.items() if k not in {"source_kept", "reason"}}
                 return _replace_result(response, result)
             return response
-        if rule not in ("wing_list", "read_wing", "search", "drawer_read", "diary_read", "kg_read"):
+        if rule not in (
+            "wing_list",
+            "read_wing",
+            "search",
+            "drawer_read",
+            "diary_read",
+            "kg_read",
+            "tunnel_write",
+        ):
             return response
         result = _tool_result(response)
         if result is None:
@@ -1414,7 +1496,10 @@ class Mediator:
             raise Denied(f"pass a wing: this connection reads {len(wings)} wings")
         if not wings:
             return {"query": args.get("query", ""), "results": [], "wings_searched": []}
-        result = self.workers.call_tool(principal, name, {**args, "wings": wings})
+        worker_args = {**args, "wings": wings}
+        if args.get("cli_compatible") and not principal.policy.sees_all_wings:
+            worker_args["cli_compatible"] = False
+        result = self.workers.call_tool(principal, name, worker_args)
         if not isinstance(result, dict):
             raise WorkerUnavailable()
         if result.get("error"):

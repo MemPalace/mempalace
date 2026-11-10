@@ -764,7 +764,20 @@ def _write_drawer(
     try:
         existing = col.get(ids=idempotency_probe_ids, include=["metadatas"])
         if _get_result_ids(existing):
-            outcome = {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
+            # Fresh-write fields depend only on this request and current chunk
+            # configuration. The gateway can hide replay status for unreadable
+            # wings without exposing the existing row's storage details.
+            chunks = max(1, (len(content) + chunk_size - 1) // chunk_size)
+            outcome = {
+                "success": True,
+                "reason": "already_exists",
+                "drawer_id": drawer_id,
+                "wing": wing,
+                "room": room,
+                "chunks": chunks,
+            }
+            if chunks > 1:
+                outcome["chunk_ids"] = [f"{drawer_id}_chunk_{i:06d}" for i in range(chunks)]
             stored = next(iter(existing.get("metadatas") or []), None) or {}
             if stored.get("source_thread"):
                 # The first write's source is kept; say which, so a caller

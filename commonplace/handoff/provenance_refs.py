@@ -9,6 +9,7 @@ PROVENANCE_FIELDS = {
     "source_thread",
     "source_url",
     "source_file",
+    "source_path",
     "source_drawer_id",
     "source_closet",
 }

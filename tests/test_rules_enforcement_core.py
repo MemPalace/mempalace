@@ -533,7 +533,7 @@ def test_rules_seq_strip_mcp_and_rest(hub, env, monkeypatch):
 
     def save(ctx, args):
         assert "rules_seq" not in args and args["text"] == "Remember exactly"
-        return "stored", None
+        return "stored", None, ""
 
     def fact(ctx, args):
         assert "rules_seq" not in args and args["subject"] == "Person"

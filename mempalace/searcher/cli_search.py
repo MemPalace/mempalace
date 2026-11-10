@@ -44,44 +44,10 @@ def _print_search_results_bm25_only(
         **({"wings": wings} if wings is not None else {}),
     )
     hits = result.get("results", [])
-    from ..fact_render import format_facts
-
-    print(format_facts(facts), end="")
-
     print(
-        "\n  NOTICE: vector search disabled — HNSW index has diverged from SQLite.\n"
-        "          Showing BM25-only results. Run `mempalace repair` to restore "
-        "vector search.\n"
+        render_cli_search(query, hits, wing=wing, room=room, facts=facts, vector_disabled=True),
+        end="",
     )
-    print(f"{'=' * 60}")
-    print(f'  Results for: "{query}"')
-    if wing:
-        print(f"  Wing: {wing}")
-    if room:
-        print(f"  Room: {room}")
-    print(f"{'=' * 60}\n")
-
-    if not hits:
-        print(f'  No results found for: "{query}"')
-        return
-
-    for i, hit in enumerate(hits, 1):
-        bm25 = hit.get("bm25_score", 0.0)
-        wing_name = hit.get("wing", "?")
-        room_name = hit.get("room", "?")
-        source = Path(hit.get("source_file", "?")).name
-
-        print(f"  [{i}] {wing_name} / {room_name}")
-        print(f"      Source: {source}")
-        _print_also_in(hit)
-        print(f"      Match:  bm25={bm25}  (vector disabled)")
-        print()
-        for line in (hit.get("text", "") or "").strip().split("\n"):
-            print(f"      {line}")
-        print()
-        print(f"  {'-' * 56}")
-
-    print()
 
 
 def _cli_hit_source(hit: dict):
@@ -100,14 +66,14 @@ def _cli_hit_ref(hit: dict) -> dict:
     }
 
 
-def _print_also_in(hit: dict) -> None:
+def _cli_also_in(hit: dict) -> str:
     """Name the other files holding this exact passage (folded copies)."""
     copies = hit.get("also_in") or []
     if not copies:
-        return
+        return ""
     names = ", ".join(c.get("source_file") or "?" for c in copies[:5])
     more = f" and {len(copies) - 5} more" if len(copies) > 5 else ""
-    print(f"      Also in: {names}{more}")
+    return f"      Also in: {names}{more}"
 
 
 def _cli_ranked_hits(
@@ -249,13 +215,92 @@ def _cli_fact_matches(query, palace_path, wing, n_results, wings=None):
         return []
 
 
-def _print_cli_match(hit, metric):
+def _cli_match(hit, metric, vector_disabled):
     bm25 = hit.get("bm25_score", 0.0)
-    if hit["distance"] is None:
-        print(f"      Match:  bm25={bm25}  (lexical candidate)")
-    else:
+    if vector_disabled:
+        return f"      Match:  bm25={bm25}  (vector disabled)"
+    if hit.get("distance") is None:
+        return f"      Match:  bm25={bm25}  (lexical candidate)"
+    # Structured hits already advertise similarity rounded from the original
+    # distance; recomputing from their rounded distance can change the display.
+    vec_sim = hit.get("similarity")
+    if vec_sim is None:
         vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
-        print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
+    return f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}"
+
+
+def render_cli_search(
+    query,
+    hits,
+    *,
+    wing=None,
+    room=None,
+    since=None,
+    before=None,
+    metric="cosine",
+    facts=(),
+    vector_disabled=False,
+    flat=False,
+):
+    """Pure canonical CLI formatting over header inputs and authorized hits.
+
+    Local CLI hits carry metadata; the gateway explicitly selects flat rows,
+    whose metadata may contain unrelated import authorization information.
+    Authorization must finish before calling this formatter.
+    """
+    from io import StringIO
+
+    from ..fact_render import format_facts
+
+    output = StringIO()
+
+    def emit(*args):
+        print(*args, file=output)
+
+    output.write(format_facts(facts))
+    if vector_disabled:
+        emit(
+            "\n  NOTICE: vector search disabled — HNSW index has diverged from SQLite.\n"
+            "          Showing BM25-only results. Run `mempalace repair` to restore "
+            "vector search.\n"
+        )
+    elif not hits:
+        emit(f'\n  No results found for: "{query}"')
+        return output.getvalue()
+
+    emit(("" if vector_disabled else "\n") + "=" * 60)
+    emit(f'  Results for: "{query}"')
+    if wing:
+        emit(f"  Wing: {wing}")
+    if room:
+        emit(f"  Room: {room}")
+    if since and not vector_disabled:
+        emit(f"  Since: {since}")
+    if before and not vector_disabled:
+        emit(f"  Before: {before}")
+    emit("=" * 60 + "\n")
+    if not hits:
+        emit(f'  No results found for: "{query}"')
+        return output.getvalue()
+
+    for i, hit in enumerate(hits, 1):
+        meta = hit if flat else hit.get("metadata", hit)
+        source = meta.get("source_file", "?")
+        if (flat or "metadata" not in hit) and not vector_disabled:
+            source = hit.get("source_path", source)
+        emit(f"  [{i}] {meta.get('wing', '?')} / {meta.get('room', '?')}")
+        emit(f"      Source: {Path(source if source is not None else '?').name}")
+        copies = _cli_also_in(hit)
+        if copies:
+            emit(copies)
+        emit(_cli_match(hit, metric, vector_disabled))
+        emit()
+        for line in (hit.get("text") or "").strip().split("\n"):
+            emit(f"      {line}")
+        emit()
+        emit(f"  {'-' * 56}")
+    emit()
+    return output.getvalue()
 
 
 def search(
@@ -332,8 +377,6 @@ def search(
         print(f"\n  {e}")
         raise SearchError(str(e)) from e
     date_window_active = since_dt is not None or before_dt is not None
-    from ..fact_render import format_facts
-
     if facts is None:
         facts = _cli_fact_matches(
             query,
@@ -414,38 +457,16 @@ def search(
             break
         fetch = min(fetch * 4, _MAX_FOLD_POOL)
     hits = hits[:n_results]
-    print(format_facts(facts), end="")
-    if not hits:
-        print(f'\n  No results found for: "{query}"')
-        return None
-
-    print(f"\n{'=' * 60}")
-    print(f'  Results for: "{query}"')
-    if wing:
-        print(f"  Wing: {wing}")
-    if room:
-        print(f"  Room: {room}")
-    if since:
-        print(f"  Since: {since}")
-    if before:
-        print(f"  Before: {before}")
-    print(f"{'=' * 60}\n")
-
-    for i, hit in enumerate(hits, 1):
-        meta = hit["metadata"]
-        source = Path(meta.get("source_file", "?")).name
-        wing_name = meta.get("wing", "?")
-        room_name = meta.get("room", "?")
-
-        print(f"  [{i}] {wing_name} / {room_name}")
-        print(f"      Source: {source}")
-        _print_also_in(hit)
-        _print_cli_match(hit, metric)
-        print()
-        # Print the verbatim text, indented
-        for line in hit["text"].strip().split("\n"):
-            print(f"      {line}")
-        print()
-        print(f"  {'-' * 56}")
-
-    print()
+    print(
+        render_cli_search(
+            query,
+            hits,
+            wing=wing,
+            room=room,
+            since=since,
+            before=before,
+            metric=metric,
+            facts=facts,
+        ),
+        end="",
+    )

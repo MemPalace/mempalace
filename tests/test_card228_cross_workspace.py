@@ -20,6 +20,8 @@ from tests.test_imported_history_search import (
     functional_worker_transport,  # noqa: F401
     mirror_record,
     private_mirror,
+    refused,
+    shared_read_control,
     world,  # noqa: F401
 )
 
@@ -95,7 +97,8 @@ def two_workspaces(world, monkeypatch):  # noqa: F811
     ids = private_mirror(y, text)
     record = mirror_record(y, ids, text, owner)
     assert record.get("drawer_id"), record
-    record["source_file"] = f"handoff:{record['room']}#v2:0-0:conversation:0"
+    record["source_file"] = record["metadata"]["source_file"]
+    assert record["source_file"].startswith(f"handoff:{record['room']}#")
     db = y.client.db
     other = db.create_user("workspace-owner@example.test")
     xid = db.create_workspace("separate", other)
@@ -108,6 +111,20 @@ def two_workspaces(world, monkeypatch):  # noqa: F811
         user_ref=y.me["user"],
         actor=other,
         name="synthetic-x-member",
+        client="generic",
+        policy=Policy.build(
+            profile="full",
+            trust="trusted",
+            scopes=[s for s in SCOPES if not s.startswith("private:")],
+            read_wings=["*"],
+            write_wings=["*"],
+        ),
+    )
+    _, xowner = db.create_token(
+        workspace_ref=xid,
+        user_ref=other,
+        actor=other,
+        name="synthetic-x-owner",
         client="generic",
         policy=Policy.build(
             profile="full", trust="trusted", scopes=SCOPES, read_wings=["*"], write_wings=["*"]
@@ -123,7 +140,6 @@ def two_workspaces(world, monkeypatch):  # noqa: F811
         predicate="port",
         object="old",
         wing="shared",
-        source_thread=record["room"],
         valid_from="2026-01-01",
     )
     fx = call(
@@ -136,12 +152,25 @@ def two_workspaces(world, monkeypatch):  # noqa: F811
         wing="shared",
     )
     assert fy.get("success") and fx.get("success"), (fy, fx)
+    assert any(
+        f.get("object") == "visible"
+        for f in call(x, actor, "kg_query", entity="WorkspaceFact").get("facts", [])
+    )
+    shared_read_control(x, actor, owner=xowner)
     roots = [Path(y.gateway.supervisor.workspace_dir(z.me["workspace"])) for z in (x, y)]
     assert roots[0] != roots[1] and all(
         (p / "palace" / "knowledge_graph.sqlite3").exists() for p in roots
     )
     return SimpleNamespace(
-        x=x, y=y, actor=actor, owner=owner, record=record, room=record["room"], fy=fy, roots=roots
+        x=x,
+        y=y,
+        actor=actor,
+        owner=owner,
+        xowner=xowner,
+        record=record,
+        room=record["room"],
+        fy=fy,
+        roots=roots,
     )
 
 
@@ -176,6 +205,26 @@ def test_cw_a02_supersede_in_x_leaves_y_fact_open(two_workspaces):
     assert any(f["object"] == "old" and f["current"] for f in yfacts(c))
 
 
+@pytest.mark.parametrize("tool", ["kg_invalidate", "kg_supersede"])
+def test_cw_a01_a02_y_thread_citation_stays_in_y(two_workspaces, tool):
+    c = two_workspaces
+    cited = call(
+        c.y,
+        c.owner,
+        "kg_save",
+        subject="WorkspaceFact",
+        predicate="port",
+        object="old",
+        wing="shared",
+        source_thread=c.room,
+        valid_from="2026-01-01",
+    )
+    assert cited.get("success") and c.room in json.dumps(yfacts(c))
+    mutation(c, tool)
+    assert any(f["object"] == "old" and f["current"] for f in yfacts(c))
+    assert c.room in json.dumps(yfacts(c))
+
+
 @pytest.mark.parametrize("mode", ["same_value", "single_valued"])
 def test_cw_a03_kg_save_in_x_does_not_merge_y_fact(two_workspaces, mode):
     c = two_workspaces
@@ -202,7 +251,7 @@ def test_cw_a05_delete_by_source_in_x_leaves_y_drawers(two_workspaces):
         content="different synthetic words",
         source_file=source,
     )
-    call(c.x, c.actor, "delete_by_source", source_file=source, dry_run=False)
+    refused(c.x, c.actor, "mempalace_delete_by_source", source_file=source, dry_run=False)
     assert "zqworkspace" in call(c.y, c.owner, "get_drawer", drawer_id=c.record["drawer_id"]).get(
         "content", ""
     )
@@ -263,6 +312,7 @@ def cite(c, tool="kg_save", **fields):
 def test_cw_b01_x_cannot_cite_y_thread(two_workspaces, tool):
     c = two_workspaces
     cite(c, tool, source_thread=c.room)
+    assert c.room not in json.dumps(xfacts(c)), "Foreign thread citation leaked"
     assert any(f.get("object") == "visible" for f in xfacts(c).get("facts", []))  # RED
 
 
@@ -318,7 +368,7 @@ def test_cw_bg01_x_cites_own_x_thread_and_drawer(two_workspaces):
         c.x,
         c.actor,
         "add_drawer",
-        wing="private_threads",
+        wing="shared",
         room=own.id,
         content="own X verbatim words",
     )
@@ -340,3 +390,26 @@ def test_cw_bg03_external_ids_unchanged(two_workspaces, kind):
     ]
     cite(c, source_thread=source)
     assert source in json.dumps(xfacts(c))
+
+
+def test_cw_a05_owner_delete_by_source_in_x_leaves_y_drawers(two_workspaces):
+    c = two_workspaces
+    source = c.record["source_file"]
+    own = call(
+        c.x,
+        c.xowner,
+        "add_drawer",
+        wing="shared",
+        room="notes",
+        content="different synthetic words",
+        source_file=source,
+    )
+    assert own.get("success"), own
+    result = call(c.x, c.xowner, "delete_by_source", source_file=source, dry_run=False)
+    assert result.get("deleted", 0) > 0, result
+    assert "different synthetic words" not in call(
+        c.x, c.xowner, "get_drawer", drawer_id=own["drawer_id"]
+    ).get("content", "")
+    assert "zqworkspace" in call(c.y, c.owner, "get_drawer", drawer_id=c.record["drawer_id"]).get(
+        "content", ""
+    ), "X deletion reached Y's drawer"

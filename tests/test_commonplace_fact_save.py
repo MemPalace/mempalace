@@ -169,7 +169,8 @@ def test_a_retry_into_an_unreadable_wing_hides_the_kept_source(hub):
     again, text = hub.call(
         bot, "mempalace_add_drawer", wing="inbox", room="r", content="same words"
     )
-    assert again["reason"] == "already_exists" and "source_kept" not in again
+    assert again["success"] is True
+    assert "reason" not in again and "source_kept" not in again
     assert "owner-chat" not in text
     mine, _ = hub.call(owner, "mempalace_add_drawer", wing="inbox", room="r", content="same words")
     assert mine["source_kept"]["thread"] == "owner-chat"

@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 from urllib.parse import quote
 
 import pytest
@@ -118,6 +119,44 @@ def imported(w, text, token=None, source="claude-code"):
     return post(w, "/api/import", payload(text, source), token)
 
 
+@pytest.mark.parametrize("wing", [None, "private_chats"])
+def test_import_reader_cli_preserves_imported_location(world, wing):
+    w = world
+    text = words("clirowlocation")
+    status, connection = post(
+        w,
+        "/api/connections",
+        {
+            "name": "synthetic-import-reader",
+            "client": "generic",
+            "import": True,
+            "import_read": True,
+        },
+    )
+    assert status == 201
+    token = connection["token"]
+    principal = w.gateway.authenticate("Bearer " + token)
+    assert principal.policy.has_scope("memory:import:read")
+    assert not principal.policy.has_scope("private:read")
+    status, _ = imported(w, text, token)
+    assert status == 200
+    args = {"query": text.split()[0], **({"wing": wing} if wing else {})}
+    status, reply = rpc(w, token, "mempalace_search", args)
+    assert status == 200
+    structured = tool_value(reply)
+    row = next(r for r in structured["results"] if r["drawer_id"].startswith("imported:"))
+    assert row["wing"] == "private_chats" and row["room"].startswith("thr_")
+    assert args["query"] in row["text"]
+    status, reply = rpc(w, token, "mempalace_search", {**args, "cli_compatible": True})
+    assert status == 200
+    result = tool_value(reply)
+    output = result["cli_output"]
+    for line in row["text"].strip().split("\n"):
+        assert f"      {line}" in output, "Imported text changed in CLI output"
+    assert f"private_chats / {row['room']}" in output, "Allowed imported-row location is missing"
+    assert result["results"] == []
+
+
 def search(w, text):
     status, _, raw = w.client.request(
         "/api/memory/search?q=" + quote(text.split()[0]), cookie=w.cookie
@@ -133,6 +172,7 @@ def grant(w):
 
 def operator(w, scopes=None, user=None, policy=None):
     w.token_serial = getattr(w, "token_serial", 0) + 1
+    owner = w.client.db.role(w.me["workspace"], user or w.me["user"]) == "owner"
     return w.client.db.create_token(
         workspace_ref=w.me["workspace"],
         user_ref=user or w.me["user"],
@@ -141,7 +181,7 @@ def operator(w, scopes=None, user=None, policy=None):
         policy=policy
         or Policy.build(
             profile="standard",
-            scopes=scopes or ["memory:read", "threads:read", "private:read"],
+            scopes=scopes or ["memory:read", "threads:read"] + (["private:read"] if owner else []),
             read_wings=["*"],
             trust="standard",
         ),
@@ -339,11 +379,12 @@ def test_imported_search_r09_member_cannot_find_owner_grant_import(world):
     assert status == 201
     status, result = imported(w, text, connection["token"])
     assert status == 200
-    ids = mirror(w, result, private=True)
+    ids = shared_mirror(w, mirror(w, result, private=True), text)
     cookie = w.client.signin(w.mailbox, "second@example.test")
     user = w.client.me(cookie)["user"]
     w.client.db.add_member(w.me["workspace"], user, "member", actor=w.me["user"])
     _, token = operator(w, user=user)
+    shared_read_control(w, token)
     status, reply = rpc(w, token, "memory_search", {"query": text.split()[0]})
     assert status == 200
     assert not quoted(text, reply)  # RED: match the full imported words, not a header
@@ -466,6 +507,7 @@ def control(w, text, token=None):
 
 
 def writer(w, user=None):
+    owner = w.client.db.role(w.me["workspace"], user or w.me["user"]) == "owner"
     return operator(
         w,
         user=user,
@@ -474,7 +516,8 @@ def writer(w, user=None):
             trust="standard",
             read_wings=["*"],
             write_wings=["*"],
-            scopes=["memory:read", "memory:write", "private:read", "private:write", "threads:read"],
+            scopes=["memory:read", "memory:write", "threads:read"]
+            + (["private:read", "private:write"] if owner else []),
         ),
     )[1]
 
@@ -510,6 +553,85 @@ def private_mirror(w, text):
     ids = mirror(w, result, private=True)
     control(w, text)
     return ids
+
+
+def shared_read_control(w, token, wing="shared", owner=None):
+    """Prove the real actor can read ordinary content in the tested wing."""
+    content = "Public fixture independently readable control"
+    status, reply = rpc(
+        w,
+        owner or writer(w),
+        "mempalace_add_drawer",
+        {"wing": wing, "room": "read-control", "content": content},
+    )
+    assert status == 200 and tool_value(reply).get("success"), reply
+    drawer_id = tool_value(reply)["drawer_id"]
+    status, reply = rpc(w, token, "mempalace_get_drawer", {"drawer_id": drawer_id})
+    assert status == 200 and tool_value(reply).get("content") == content, reply
+    return drawer_id
+
+
+def shared_mirror(w, ids, text):
+    """Put a legacy mirror copy in a readable wing, retaining its protected room."""
+    owner = writer(w)
+    record = mirror_record(w, ids, text, owner)
+    assert text in record.get("content", ""), record
+    status, reply = rpc(
+        w,
+        owner,
+        "mempalace_add_drawer",
+        {
+            "wing": "shared",
+            "room": record["room"],
+            "content": record["content"],
+            "source_file": f"handoff:{record['room']}#v2:0-0:conversation:0",
+        },
+    )
+    assert status == 200 and tool_value(reply).get("success"), reply
+    return [tool_value(reply)["drawer_id"]]
+
+
+def refused(w, token, name, **args):
+    """Unprojected whole-palace tools must not reach a worker for a member."""
+    principal = w.gateway.authenticate("Bearer " + token)
+    assert principal.role == "member" and not principal.policy.has_scope("private:read")
+    with patch.object(
+        w.gateway.mediator.workers, "post", wraps=w.gateway.mediator.workers.post
+    ) as worker:
+        status, reply = rpc(w, token, name, args)
+    assert worker.call_count == 0, f"Authority leak: member dispatched {name} to a worker"
+    assert status == 200 and reply.get("error") == {
+        "code": -32601,
+        "message": "Unknown tool: " + name,
+    }, reply
+    return reply
+
+
+def other_filer_copy(w):
+    """Seed a legacy private mirror filed by someone other than the token owner."""
+    from commonplace.handoff.models import ThreadMessage
+    from mempalace import mcp_server
+
+    user = member(w)
+    text = "zqotherfiler exact hidden copy of synthetic original words"
+    stored = w.gateway.handoff.store_for(w.me["workspace"]).store(
+        w.me["workspace"],
+        f"import-private:{user}:hidden-copy",
+        [ThreadMessage(0, "user", "message", text, text)],
+        actor=user,
+        wing="private_threads",
+    )
+    drawer_id = "drawer_private_threads_" + stored.id + "_legacy"
+    collection = mcp_server._get_collection(create=True)
+    collection.add(
+        ids=[drawer_id],
+        documents=[text],
+        metadatas=[{"wing": "private_threads", "room": stored.id}],
+    )
+    assert collection.get(ids=[drawer_id], include=["documents"])["documents"] == [text]
+    status, reply = rpc(w, writer(w), "mempalace_get_drawer", {"drawer_id": drawer_id})
+    assert status == 200 and text not in json.dumps(reply), reply
+    return text
 
 
 def test_imported_search_r10_duplicate_words_without_thread_read(world):
@@ -549,9 +671,19 @@ def test_imported_search_r11_member_duplicate_words(world):
     text = words("memberduplicate")
     private_mirror(w, text)
     _, token = operator(w, user=member(w))
-    status, reply = rpc(w, token, "mempalace_check_duplicate", {"content": text, "threshold": 0.0})
+    shared_read_control(w, token)
+    refused(w, token, "mempalace_check_duplicate", content=text, threshold=0.0)
+
+
+def test_imported_search_r11_owner_duplicate_excludes_other_filer(world):
+    w = world
+    text = other_filer_copy(w)
+    owner = writer(w)
+    public_duplicate_control(w, owner)
+    status, reply = rpc(w, owner, "mempalace_check_duplicate", {"content": text})
     assert status == 200
-    assert not quoted(text, reply)  # RED
+    assert not quoted(text, reply), "Other filer's duplicate words leaked to the owner"
+    assert tool_value(reply).get("is_duplicate") is False, "Hidden copy leaked into duplicate flag"
 
 
 def public_rooms(w, token):
@@ -643,25 +775,44 @@ def test_imported_search_r13_checkpoint_does_not_skip_hidden_copy(world):
     document = record.get("content")
     assert isinstance(document, str) and text in document
     token = writer(w, member(w))
-    public_duplicate_control(w, token, checkpoint=True)
-    status, reply = rpc(
+    shared_read_control(w, token)
+    status, before = rpc(w, owner, "mempalace_list_drawers", {"wing": "shared", "room": "saved"})
+    assert status == 200
+    refused(
         w,
         token,
         "mempalace_checkpoint",
-        {
-            "items": [{"wing": "shared", "room": "saved", "content": document}],
-        },
+        items=[{"wing": "shared", "room": "saved", "content": document}],
+    )
+    status, after = rpc(w, owner, "mempalace_list_drawers", {"wing": "shared", "room": "saved"})
+    assert status == 200 and tool_value(after) == tool_value(before), (
+        "Refused checkpoint wrote data"
+    )
+
+
+def test_imported_search_r13_owner_checkpoint_does_not_skip_other_filer_copy(world):
+    w = world
+    document = other_filer_copy(w)
+    owner = writer(w)
+    public_duplicate_control(w, owner, checkpoint=True)
+    status, reply = rpc(
+        w,
+        owner,
+        "mempalace_checkpoint",
+        {"items": [{"wing": "shared", "room": "saved", "content": document}]},
     )
     assert status == 200
     value = tool_value(reply)
     assert "added" in value and "duplicates" in value, reply
-    assert value.get("added") and not value.get("duplicates")  # RED
+    assert value.get("added") and not value.get("duplicates"), (
+        "Hidden copy leaked into deduplication"
+    )
 
 
 def test_imported_search_r14_member_cannot_link_owner_thread_room(world):
     w = world
     text = words("linkwrite")
-    ids = private_mirror(w, text)
+    ids = shared_mirror(w, private_mirror(w, text), text)
     owner = writer(w)
     public_rooms(w, owner)
     status, reply = rpc(w, owner, "mempalace_get_drawer", {"drawer_id": ids[0]})
@@ -670,7 +821,7 @@ def test_imported_search_r14_member_cannot_link_owner_thread_room(world):
     args = {
         "source_wing": "shared",
         "source_room": "source",
-        "target_wing": "private_threads",
+        "target_wing": "shared",
         "target_room": room,
     }
     # Owner can link the room; the member uses a distinct public source.
@@ -681,6 +832,7 @@ def test_imported_search_r14_member_cannot_link_owner_thread_room(world):
     # Use the other public source so the refused write has a distinct id.
     args["source_room"] = "destination"
     token = writer(w, member(w))
+    shared_read_control(w, token)
     status, reply = rpc(w, token, "mempalace_create_tunnel", args)
     assert status == 200
     refused = tool_value(reply)
@@ -698,7 +850,7 @@ def test_imported_search_r14_member_cannot_link_owner_thread_room(world):
 def test_imported_search_r15_member_cannot_find_owner_derived_fact(world):
     w = world
     text = words("derivedfact")
-    ids = private_mirror(w, text)
+    ids = shared_mirror(w, private_mirror(w, text), text)
     scopes = [
         "memory:read",
         "memory:write",
@@ -729,8 +881,8 @@ def test_imported_search_r15_member_cannot_find_owner_derived_fact(world):
             "subject": "SyntheticProject",
             "predicate": "deploy_port",
             "object": value,
-            "theme": "private_threads",
-            "sensitivity": "private",
+            "theme": "shared",
+            "sensitivity": "internal",
             "source": {"thread": record["room"], "seq_start": 1, "seq_end": 1},
         },
     )
@@ -743,11 +895,12 @@ def test_imported_search_r15_member_cannot_find_owner_derived_fact(world):
         user=member(w),
         policy=Policy.build(
             profile="full",
-            scopes=["memory:read", "private:read", "threads:read", "kg:read"],
+            scopes=["memory:read", "threads:read", "kg:read"],
             read_wings=["*"],
             trust="standard",
         ),
     )
+    shared_read_control(w, token)
     status, reply = rpc(w, token, "mempalace_search", {"query": "SyntheticProject"})
     assert status == 200
     assert not quoted(value, reply)  # RED
@@ -761,7 +914,7 @@ def test_imported_search_r16_cli_search_excludes_mirror_copies(world, wing, scop
     w = world
     body = "zqimportprivateclibody"
     text = words("climirror") + " " + body
-    private_mirror(w, text)  # Owner's structured-search control on both revisions.
+    ids = private_mirror(w, text)
     owner = writer(w)
     public = "zqimportpubliccli visible shared note"
     status, reply = rpc(
@@ -780,25 +933,30 @@ def test_imported_search_r16_cli_search_excludes_mirror_copies(world, wing, scop
         user=member(w),
         policy=Policy.build(
             profile="full",
-            scopes=["memory:read", "private:read", "threads:read"],
+            scopes=["memory:read", "threads:read"],
             read_wings=["*"] if scope == "see_all" else ["shared", "private_threads"],
             trust="standard",
         ),
     )
-    status, reply = rpc(
-        w, token, "mempalace_search", {"query": "zqimportpubliccli", "cli_compatible": True}
-    )
-    assert status == 200
-    assert "visible shared note" in "\n".join(strings(reply))
-    replies = []
-    for args in (
-        {"query": text.split()[0], "cli_compatible": True},
-        {"query": text.split()[0], "wing": wing, "cli_compatible": True},
-    ):
-        status, reply = rpc(w, token, "mempalace_search", args)
+    # The member reads shared content. The existing owner's token can also
+    # read the private copy, so CLI exclusion cannot pass only through the
+    # member's lack of private:read.
+    assert text in mirror_record(w, ids, text, owner).get("content", "")
+    for actor in (token, owner):
+        status, reply = rpc(
+            w, actor, "mempalace_search", {"query": "zqimportpubliccli", "cli_compatible": True}
+        )
         assert status == 200
-        replies.append(reply)
-    assert all(body not in "\n".join(strings(reply)) for reply in replies)  # RED
+        assert "visible shared note" in "\n".join(strings(reply))
+        for args in (
+            {"query": text.split()[0], "cli_compatible": True},
+            {"query": text.split()[0], "wing": wing, "cli_compatible": True},
+        ):
+            status, reply = rpc(w, actor, "mempalace_search", args)
+            assert status == 200
+            assert body not in "\n".join(strings(reply)), (
+                "Private mirror words leaked into CLI search"
+            )
 
 
 def test_imported_search_r17_superseded_reference_requires_kept_target(world):
@@ -862,11 +1020,12 @@ def test_imported_search_r17_superseded_reference_requires_kept_target(world):
         user=member(w),
         policy=Policy.build(
             profile="full",
-            scopes=["memory:read", "private:read", "threads:read", "kg:read"],
+            scopes=["memory:read", "threads:read", "kg:read"],
             read_wings=["*"],
             trust="standard",
         ),
     )
+    shared_read_control(w, token)
     # The successor is outside this payload's temporal selection on BOTH revisions.
     status, reply = rpc(
         w, token, "mempalace_kg_query", {"entity": "SyntheticReference", "as_of": "2026-01-15"}

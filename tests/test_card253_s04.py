@@ -44,7 +44,8 @@ def world(hub, monkeypatch, tmp_path, request):
     monkeypatch.setenv("COMMONPLACE_RATE_LIMITS", "off")
     monkeypatch.setenv("COMMONPLACE_RULES", "off")
     member = hub.db.create_user("member@example.test")
-    hub.db.add_member(hub.workspace, member, "member", actor=hub.admin)
+    hub.db.add_member(hub.workspace, member, "owner", actor=hub.admin)
+    # Private-read fixture holders must be owners; filer boundaries remain independent.
     store = hub.gateway.handoff.store_for(hub.workspace)
     readable = store.store(
         hub.workspace,
@@ -75,7 +76,7 @@ def world(hub, monkeypatch, tmp_path, request):
             trust="trusted",
         )
         principal = hub.db.authenticate_token(tokens[kind])
-        assert principal.role != "owner" and principal.policy.has_scope("threads:read")
+        assert principal.role == "owner" and principal.policy.has_scope("threads:read")
         assert principal.policy.sees_all_wings is (kind == "A")
         assert hub.gateway.handoff.recall.can_read(principal, readable.id)
         assert not hub.gateway.handoff.recall.can_read(principal, hidden.id)

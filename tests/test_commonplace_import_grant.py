@@ -640,7 +640,7 @@ def test_filer_only_read_same_workspace_pure():
         client="web",
         auth="session",
         role="owner",
-        policy=person_policy(),
+        policy=person_policy("owner"),
         person=True,
     )
     member = replace(
@@ -696,7 +696,7 @@ def test_handoff_cannot_squat_private_import_namespace():
         client="web",
         auth="session",
         role="owner",
-        policy=person_policy(),
+        policy=person_policy("owner"),
         person=True,
     )
     service = HandoffService(

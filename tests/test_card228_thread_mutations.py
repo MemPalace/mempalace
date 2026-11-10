@@ -17,7 +17,10 @@ from tests.test_imported_history_search import (
     operator,
     private_mirror,
     public_rooms,
+    refused,
     rpc,
+    shared_mirror,
+    shared_read_control,
     tool_value,
     world,  # noqa: F401
 )
@@ -35,13 +38,14 @@ SCOPES = [
 
 
 def token(w, user=None, scoped=False):
+    owner = w.client.db.role(w.me["workspace"], user or w.me["user"]) == "owner"
     return operator(
         w,
         user=user,
         policy=Policy.build(
             profile="full",
             trust="trusted",
-            scopes=SCOPES,
+            scopes=[s for s in SCOPES if owner or not s.startswith("private:")],
             read_wings=["shared", "private_threads"] if scoped else ["*"],
             write_wings=["*"],
         ),
@@ -54,7 +58,7 @@ def call(w, actor, name, **args):
     return tool_value(reply)
 
 
-def store_thread(w, actor=None, source=None, wing="private_threads"):
+def store_thread(w, actor=None, source=None, wing="shared"):
     actor = actor or w.me["user"]
     store = w.gateway.handoff.store_for(w.me["workspace"])
     return store.store(
@@ -75,8 +79,11 @@ def case(world, config, kg, tmp_path, monkeypatch):  # noqa: F811
     w.gateway.supervisor.get(w.me["workspace"])
     user = member(w)
     actor = token(w, user)
+    principal = w.gateway.authenticate("Bearer " + actor)
+    assert principal.role == "member" and not principal.policy.has_scope("private:read")
+    shared_read_control(w, actor)
     text = "zqmutationfixture synthetic verbatim words"
-    ids = private_mirror(w, text)
+    ids = shared_mirror(w, private_mirror(w, text), text)
     record = mirror_record(w, ids, text, owner)
     assert record.get("room") and record.get("drawer_id"), record
     from mempalace import mcp_server
@@ -102,13 +109,115 @@ def case(world, config, kg, tmp_path, monkeypatch):  # noqa: F811
     )
 
 
-def save(c, obj="old", actor=None, wing="private_threads", **kwargs):
+@pytest.mark.parametrize("wing", [None, "shared"])
+@pytest.mark.parametrize("cli", [False, True], ids=["structured", "cli"])
+def test_search_hides_ordinary_copy_protected_source(case, wing, cli):
+    args = {"query": "qqprovenance", **({"wing": wing} if wing else {})}
+    added = call(
+        case.w,
+        case.owner,
+        "add_drawer",
+        wing="shared",
+        room="ordinary-copy",
+        content="qqprovenance ordinary copy words",
+        source_file=f"handoff:{case.room}#v2:0-0:conversation:0",
+    )
+    assert added.get("success")
+    owner = call(case.w, case.owner, "search", cli_compatible=cli, **args)
+    assert case.room in json.dumps(owner) and "handoff:" in json.dumps(owner)
+    result = call(case.w, case.actor, "search", cli_compatible=cli, **args)
+    encoded = json.dumps(result)
+    assert "qqprovenance ordinary copy words" in encoded
+    assert case.room not in encoded, "Protected thread id leaked through ordinary-copy provenance"
+    assert "handoff:" not in encoded, "Protected source leaked through ordinary-copy provenance"
+
+
+@pytest.mark.parametrize("wing", [None, "shared"])
+@pytest.mark.parametrize("cli", [False, True], ids=["structured", "cli"])
+def test_search_hides_candidate_counts(case, wing, cli):
+    args = {
+        "query": "zqmutationfixture synthetic verbatim words",
+        "limit": 1,
+        **({"wing": wing} if wing else {}),
+    }
+    owner = call(case.w, case.owner, "search", **args)
+    assert owner.get("total_before_filter", 0) > 0 and owner.get("results")
+    result = call(case.w, case.actor, "search", cli_compatible=cli, **args)
+    assert result.get("results") == []
+    assert "total_before_filter" not in result, "Hidden-candidate count leaked"
+    if cli:
+        assert set(result) <= {"cli_output", "query", "wings_searched", "results", "facts"}, (
+            "Restricted CLI exposed structured-only fields"
+        )
+
+
+@pytest.mark.parametrize("wing", [None, "shared"])
+@pytest.mark.parametrize("query", ["Public fixture", "qqnomatchzz"], ids=["hit", "empty"])
+def test_shared_cli_output_matches_owner(case, wing, query):
+    args = {"query": query, "cli_compatible": True, **({"wing": wing} if wing else {})}
+    args["room"] = "read-control" if query == "Public fixture" else "absent-control-room"
+    owner = call(case.w, case.owner, "search", **args)
+    result = call(case.w, case.actor, "search", **args)
+    if query == "Public fixture":
+        assert "Public fixture independently readable control" in owner["cli_output"]
+        assert "Match:" in owner["cli_output"] and "=" * 60 in owner["cli_output"]
+    else:
+        assert f'No results found for: "{query}"' in owner["cli_output"]
+    assert result["cli_output"] == owner["cli_output"], "Restricted CLI formatting changed"
+    assert set(result) <= {"cli_output", "query", "wings_searched", "results", "facts"}, (
+        "Restricted CLI exposed structured-only fields"
+    )
+    assert result.get("results") == [], "Restricted CLI exposed hit objects"
+
+
+@pytest.mark.parametrize("wing", [None, "shared"])
+@pytest.mark.parametrize("query", ["zqmutationfixture", "synthetic", "verbatim", "words"])
+def test_cli_search_hides_protected_shared_copy(case, wing, query):
+    args = {"cli_compatible": True, **({"wing": wing} if wing else {})}
+    visible = call(case.w, case.actor, "search", query="Public fixture", **args)
+    assert "Public fixture independently readable control" in visible.get("cli_output", "")
+    structured = call(case.w, case.actor, "search", query=query, **({"wing": wing} if wing else {}))
+    assert case.room not in json.dumps(structured)
+    result = call(case.w, case.actor, "search", query=query, **args)
+    output = result.get("cli_output", "")
+    assert "zqmutationfixture synthetic verbatim words" not in output, (
+        "Protected-room body leaked into CLI output"
+    )
+    assert case.room not in output, "Protected thread room leaked into CLI output"
+    assert "handoff:" not in output, "Protected mirror source leaked into CLI output"
+
+
+@pytest.mark.parametrize("wing", [None, "shared"])
+def test_cli_search_owner_keeps_existing_renderer(case, wing, monkeypatch):
+    seen = []
+    original = case.w.gateway.mediator.workers.post
+
+    def post(principal, request):
+        params = request.get("params", {})
+        if params.get("name") == "mempalace_search":
+            seen.append(params["arguments"].get("cli_compatible"))
+        return original(principal, request)
+
+    monkeypatch.setattr(case.w.gateway.mediator.workers, "post", post)
+    result = call(
+        case.w,
+        case.owner,
+        "search",
+        query="zqmutationfixture",
+        cli_compatible=True,
+        **({"wing": wing} if wing else {}),
+    )
+    assert "zqmutationfixture synthetic verbatim words" in result.get("cli_output", "")
+    assert seen and all(seen), "Every-wing principal no longer uses the worker CLI renderer"
+
+
+def save(c, obj="old", actor=None, wing="shared", **kwargs):
     args = dict(
         subject="SyntheticProject",
         predicate="deploy_port",
         object=obj,
         wing=wing,
-        sensitivity="private",
+        sensitivity="internal",
         valid_from="2026-01-01",
     )
     args.update(kwargs)
@@ -117,7 +226,7 @@ def save(c, obj="old", actor=None, wing="private_threads", **kwargs):
     return result
 
 
-def hidden(c, obj="old", wing="private_threads"):
+def hidden(c, obj="old", wing="shared"):
     return save(c, obj, wing=wing, source_thread=c.room)
 
 
@@ -130,7 +239,7 @@ def current(c, obj="old"):
 
 
 def mutate(c, name, actor=None, **kwargs):
-    args = dict(subject="SyntheticProject", predicate="deploy_port", wing="private_threads")
+    args = dict(subject="SyntheticProject", predicate="deploy_port", wing="shared")
     if name == "kg_supersede":
         args.update(old_object="old", new_object="new", at="2026-02-01")
     else:
@@ -187,7 +296,7 @@ def test_card228_r06_member_fact_save_single_valued_keeps_hidden_fact(case):
         subject="SyntheticProject",
         predicate="deploy_port",
         object="new",
-        theme="private_threads",
+        theme="shared",
         single_valued=True,
         valid_from="2026-02-01",
         source={
@@ -207,10 +316,10 @@ def test_card228_r07_member_kg_add_does_not_merge_hidden_fact(case):
 
 
 def test_card228_r08_member_cannot_delete_mirror_copies_by_source(case):
-    call(
+    refused(
         case.w,
         case.actor,
-        "delete_by_source",
+        "mempalace_delete_by_source",
         source_file=case.record["source_file"],
         dry_run=False,
     )
@@ -220,24 +329,28 @@ def test_card228_r08_member_cannot_delete_mirror_copies_by_source(case):
 
 def test_card228_r09_delete_by_source_dry_run_is_no_oracle(case):
     source = case.record["source_file"]
-    actual = call(case.w, case.actor, "delete_by_source", source_file=source)
-    absent = call(
-        case.w, case.actor, "delete_by_source", source_file="handoff:thr_ffff#v2:0-0:conversation:0"
+    actual = refused(case.w, case.actor, "mempalace_delete_by_source", source_file=source)
+    absent = refused(
+        case.w,
+        case.actor,
+        "mempalace_delete_by_source",
+        source_file="handoff:thr_ffff#v2:0-0:conversation:0",
     )
     actual.pop("source_file", None)
     absent.pop("source_file", None)
     assert actual == absent  # RED
 
 
-def tunnel(c, drawer=False):
-    public_rooms(c.w, c.owner)
+def tunnel(c, drawer=False, actor=None):
+    actor = actor or c.owner
+    public_rooms(c.w, actor)
     result = call(
         c.w,
-        c.owner,
+        actor,
         "create_tunnel",
         source_wing="shared",
         source_room="source",
-        target_wing="shared" if drawer else "private_threads",
+        target_wing="shared",
         target_room="destination" if drawer else c.room,
         **({"target_drawer_id": c.record["drawer_id"]} if drawer else {}),
     )
@@ -247,12 +360,12 @@ def tunnel(c, drawer=False):
 
 def test_card228_r10_member_cannot_delete_thread_tunnel(case):
     tid = tunnel(case)
-    result = call(case.w, case.actor, "delete_tunnel", tunnel_id=tid)
+    refused(case.w, case.actor, "mempalace_delete_tunnel", tunnel_id=tid)
     rows = call(case.w, case.owner, "list_tunnels")
-    assert result == {"deleted": tid} and any(t["id"] == tid for t in rows)  # RED
+    assert any(t["id"] == tid for t in rows)  # RED
 
 
-def hallway(c, wing="private_threads"):
+def hallway(c, wing="shared"):
     hid = "hallway-synthetic"
     hallways._save_hallways(
         [dict(id=hid, wing=wing, rooms=["source", c.room], entity_a="A", entity_b="B", label="A B")]
@@ -263,13 +376,14 @@ def hallway(c, wing="private_threads"):
 @pytest.mark.parametrize("kind", ["mirror", "shared"])
 def test_card228_r11_member_cannot_delete_thread_hallway(case, kind):
     hid = hallway(case, "private_threads" if kind == "mirror" else "shared")
-    result = call(case.w, case.actor, "delete_hallway", hallway_id=hid)
-    assert result == {"deleted": False} and hallways.list_hallways()  # RED
+    refused(case.w, case.actor, "mempalace_delete_hallway", hallway_id=hid)
+    assert any(h["id"] == hid for h in hallways.list_hallways())  # RED
 
 
 @pytest.mark.parametrize("scope", ["see_all", "scoped"])
 def test_card228_r12_taxonomy_hides_unreadable_thread_rooms(case, scope):
     actor = token(case.w, case.user, scope == "scoped")
+    shared_read_control(case.w, actor)
     reply = call(case.w, actor, "get_taxonomy")
     assert case.room not in json.dumps(reply)  # RED
 
@@ -294,8 +408,21 @@ def test_card228_r14_invalidate_interval_error_is_no_oracle(case):
 
 
 def test_card228_r15_taxonomy_drops_emptied_mirror_wing(case):
+    wing = "project_hidden"
+    control = shared_read_control(case.w, case.actor, wing=wing)
+    result = call(
+        case.w,
+        case.owner,
+        "add_drawer",
+        wing=wing,
+        room=case.room,
+        content="Hidden room in an independently readable wing",
+    )
+    assert result.get("success"), result
+    call(case.w, case.owner, "delete_drawer", drawer_id=control)
+    assert wing in call(case.w, case.owner, "get_taxonomy").get("taxonomy", {})
     result = call(case.w, case.actor, "get_taxonomy")
-    assert "private_threads" not in result.get("taxonomy", {})  # RED
+    assert wing not in result.get("taxonomy", {}), "Emptied hidden wing leaked into taxonomy"
 
 
 CITE_TOOLS = [
@@ -330,6 +457,7 @@ def cite(c, name="kg_save", **fields):
 @pytest.mark.parametrize("tool", CITE_TOOLS)
 def test_card228_r16_member_merge_cannot_attach_hidden_thread(case, tool):
     cite(case, tool, source_thread=case.room)
+    assert case.room not in json.dumps(query(case, case.actor)), "Hidden thread citation leaked"
     assert any(
         f.get("object") == "visible" for f in query(case, case.actor).get("facts", [])
     )  # RED
@@ -337,12 +465,13 @@ def test_card228_r16_member_merge_cannot_attach_hidden_thread(case, tool):
 
 def test_card228_r17_member_cannot_delete_drawer_endpoint_tunnel(case):
     tid = tunnel(case, True)
-    call(case.w, case.actor, "delete_tunnel", tunnel_id=tid)
+    refused(case.w, case.actor, "mempalace_delete_tunnel", tunnel_id=tid)
     assert any(t["id"] == tid for t in call(case.w, case.owner, "list_tunnels"))  # RED
 
 
 def test_card228_r18_list_rooms_hides_unreadable_thread_keys(case):
-    assert case.room not in json.dumps(call(case.w, case.actor, "list_rooms"))  # RED
+    assert case.room not in json.dumps(call(case.w, case.actor, "list_rooms"))
+    assert case.room not in json.dumps(call(case.w, case.actor, "list_rooms", wing="shared"))  # RED
 
 
 def test_card228_r19_scoped_member_cannot_invalidate_hidden_fact(case):
@@ -372,7 +501,7 @@ def test_card228_r22_member_cannot_cite_private_source_id(case, kind):
     store_thread(
         case.w,
         source=source,
-        wing="private_threads" if kind == "import_private" else "private_chats",
+        wing="shared" if kind == "import_private" else "private_chats",
     )
     cite(case, source_thread=source)
     assert source not in json.dumps(query(case, case.actor))  # RED
@@ -398,7 +527,7 @@ def survives(c, rid):
 
 def test_card228_r23_member_delete_by_source_keeps_roomless_rows(case):
     source, rid = roomless(case)
-    call(case.w, case.actor, "delete_by_source", source_file=source, dry_run=False)
+    refused(case.w, case.actor, "mempalace_delete_by_source", source_file=source, dry_run=False)
     assert survives(case, rid)  # RED
 
 
@@ -410,14 +539,12 @@ def test_card228_r24_member_cannot_publish_hidden_id_in_source_file(case, tool):
 
 def closet(c, room=None):
     room = room or c.room
-    cid = "closet_private_threads_" + room + "_abc123"
+    cid = "closet_shared_" + room + "_abc123"
     col = get_closets_collection(c.palace, create=True)
     col.upsert(
         ids=[cid],
         documents=["synthetic pointer"],
-        metadatas=[
-            {"wing": "private_threads", "room": room, "source_file": "/synthetic/closet.md"}
-        ],
+        metadatas=[{"wing": "shared", "room": room, "source_file": "/synthetic/closet.md"}],
     )
     return cid
 
@@ -472,7 +599,7 @@ def test_card228_r27_owner_delete_by_source_keeps_other_filers_roomless_revision
         case.w,
         case.actor,
         "add_drawer",
-        wing="private_threads",
+        wing="shared",
         room=other.id,
         content="other filer's private words",
     )["drawer_id"]
@@ -492,18 +619,15 @@ def test_card228_r27b_delete_by_source_keeps_hidden_drawer_despite_readable_toke
         case.w,
         creator,
         "add_drawer",
-        wing="private_threads",
+        wing="shared",
         room=other.id,
         content="hidden association words",
     )["drawer_id"]
     source, rid = roomless(case, source="/x/" + visible.id + ".md", drawer=drawer)
-    call(
-        case.w,
-        case.owner if role == "owner" else case.actor,
-        "delete_by_source",
-        source_file=source,
-        dry_run=False,
-    )
+    if role == "owner":
+        call(case.w, case.owner, "delete_by_source", source_file=source, dry_run=False)
+    else:
+        refused(case.w, case.actor, "mempalace_delete_by_source", source_file=source, dry_run=False)
     assert survives(case, rid)  # RED
 
 
@@ -512,7 +636,7 @@ def test_card228_r27c_delete_by_source_keeps_encoded_hidden_token_row(case):
     source, rid = roomless(
         case, source="/x/" + visible.id + "/%74%68%72%5f" + case.room[4:] + ".md"
     )
-    call(case.w, case.actor, "delete_by_source", source_file=source, dry_run=False)
+    refused(case.w, case.actor, "mempalace_delete_by_source", source_file=source, dry_run=False)
     assert survives(case, rid)  # RED
 
 
@@ -634,7 +758,7 @@ def test_card228_g07_owner_kg_add_and_fact_save_merge_own_thread_fact(case):
         subject="SyntheticProject",
         predicate="deploy_port",
         object="old",
-        theme="private_threads",
+        theme="shared",
         source={"thread": case.room},
     )
     assert added.get("triple_id") == kept["triple_id"] and not reply.get("error")
@@ -645,7 +769,7 @@ def test_card228_g08_member_mutates_fact_with_one_readable_source(case):
     own = store_thread(case.w, actor=case.user)
     # Legacy multi-source setup: neither filer gains authority to cite the other's thread.
     case.kg.add_triple(
-        "SyntheticProject", "deploy_port", "old", wing="private_threads", source_thread=own.id
+        "SyntheticProject", "deploy_port", "old", wing="shared", source_thread=own.id
     )
     assert mutate(case, "kg_invalidate").get("closed") == 1
 
@@ -802,3 +926,82 @@ def test_card228_g25_owner_private_family_is_literal(case):
     store_thread(case.w, source=source + "#sha256:2")
     save(case, wing="shared", source_thread=source)
     assert source in json.dumps(query(case))
+
+
+def other_filer_case(c):
+    """Seed a member-filed shared drawer unreadable to the existing owner."""
+    other = store_thread(c.w, actor=c.user, source=f"import-private:{c.user}:other-copy")
+    source = f"handoff:{other.id}#v2:0-0:conversation:0"
+    result = call(
+        c.w,
+        c.actor,
+        "add_drawer",
+        wing="shared",
+        room=other.id,
+        content="other filer's exact hidden words",
+        source_file=source,
+    )
+    assert result.get("success"), result
+    record = {"drawer_id": result["drawer_id"], "room": other.id, "source_file": source}
+    assert "other filer's" in call(c.w, c.actor, "get_drawer", drawer_id=record["drawer_id"]).get(
+        "content", ""
+    )
+    assert "other filer's" not in call(
+        c.w, c.owner, "get_drawer", drawer_id=record["drawer_id"]
+    ).get("content", "")
+    return SimpleNamespace(**{**vars(c), "room": other.id, "record": record})
+
+
+def test_card228_r08_owner_cannot_delete_other_filer_mirror(case):
+    c = other_filer_case(case)
+    call(c.w, c.owner, "delete_by_source", source_file=c.record["source_file"], dry_run=False)
+    assert "other filer's" in call(c.w, c.actor, "get_drawer", drawer_id=c.record["drawer_id"]).get(
+        "content", ""
+    ), "Other filer's hidden drawer was deleted"
+
+
+def test_card228_r09_owner_hidden_source_dry_run_is_no_oracle(case):
+    c = other_filer_case(case)
+    actual = call(c.w, c.owner, "delete_by_source", source_file=c.record["source_file"])
+    absent = call(
+        c.w, c.owner, "delete_by_source", source_file="handoff:thr_ffff#v2:0-0:conversation:0"
+    )
+    actual.pop("source_file", None)
+    absent.pop("source_file", None)
+    assert actual == absent, "Hidden source leaked into dry-run counts"
+
+
+def test_card228_r10_owner_cannot_delete_other_filer_thread_tunnel(case):
+    c = other_filer_case(case)
+    tid = tunnel(c, actor=c.actor)
+    call(c.w, c.owner, "delete_tunnel", tunnel_id=tid)
+    assert any(t["id"] == tid for t in call(c.w, c.actor, "list_tunnels")), (
+        "Other filer's hidden tunnel was deleted"
+    )
+
+
+@pytest.mark.parametrize("kind", ["mirror", "shared"])
+def test_card228_r11_owner_cannot_delete_other_filer_thread_hallway(case, kind):
+    c = other_filer_case(case)
+    hid = hallway(c, "private_threads" if kind == "mirror" else "shared")
+    call(c.w, c.owner, "delete_hallway", hallway_id=hid)
+    assert any(h["id"] == hid for h in hallways.list_hallways()), (
+        "Other filer's hidden hallway was deleted"
+    )
+
+
+def test_card228_r17_owner_cannot_delete_other_filer_drawer_tunnel(case):
+    c = other_filer_case(case)
+    tid = tunnel(c, drawer=True, actor=c.actor)
+    call(c.w, c.owner, "delete_tunnel", tunnel_id=tid)
+    assert any(t["id"] == tid for t in call(c.w, c.actor, "list_tunnels")), (
+        "Other filer's hidden drawer tunnel was deleted"
+    )
+
+
+def test_card228_r27c_owner_delete_keeps_encoded_other_filer_token(case):
+    c = other_filer_case(case)
+    visible = store_thread(c.w)
+    source, rid = roomless(c, source="/x/" + visible.id + "/%74%68%72%5f" + c.room[4:] + ".md")
+    call(c.w, c.owner, "delete_by_source", source_file=source, dry_run=False)
+    assert survives(c, rid), "Encoded hidden token's roomless revision was deleted"

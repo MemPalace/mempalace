@@ -20,7 +20,7 @@ from . import events
 from ._http import BadRequest, path_parts, query, read_json, require_principal, send_json
 from .extensions import LocalTool, ToolContext, ToolError, register
 from .http_util import log_failure
-from .policy import canonical_wing
+from .policy import canonical_wing, is_private_wing
 from .rules.enforce import RulesRefresh, rest_write
 
 logger = logging.getLogger(__name__)
@@ -304,6 +304,12 @@ def _save(ctx, args):
     )
     memory_id = result["drawer_id"]
     _emit(ctx, "memory.saved", memory_id, flags=flags)
+    saved_wing = result.get("wing") or theme
+    notice = (
+        "Saved privately. You cannot read this note for now."
+        if is_private_wing(saved_wing) and not ctx.principal.policy.can_read_wing(saved_wing)
+        else ""
+    )
     if task is not None:
         try:
             _link(ctx, memory_id, task, store)
@@ -311,13 +317,15 @@ def _save(ctx, args):
             # The memory is stored: say so, so the agent doesn't save it again.
             raise ToolError(
                 f"saved {memory_id}, not linked: {str(exc).removeprefix('no: ')}"
+                + (f"\n{notice}" if notice else "")
             ) from None
-    return memory_id, task
+    return memory_id, task, notice
 
 
 def memory_save(ctx, args):
-    memory_id, task = _save(ctx, args)
-    return f"saved {memory_id}" + (f" linked to #{task}" if task is not None else "")
+    memory_id, task, notice = _save(ctx, args)
+    result = f"saved {memory_id}" + (f" linked to #{task}" if task is not None else "")
+    return result + (f"\n{notice}" if notice else "")
 
 
 def _file_fact(ctx, args):
@@ -547,8 +555,8 @@ def install(gateway):
                     raise ToolError("no: memory write refused")
                 body = read_json(h)
                 with rest_write(ctx, h, "memory_save", body):
-                    memory_id, _ = _save(ctx, body)
-                send_json(h, 201, {"id": memory_id})
+                    memory_id, _, notice = _save(ctx, body)
+                send_json(h, 201, {"id": memory_id, **({"notice": notice} if notice else {})})
             elif h.command == "GET" and parts == ["search"]:
                 if principal.policy.refusal("memory_search"):
                     raise ToolError("no: memory search refused")

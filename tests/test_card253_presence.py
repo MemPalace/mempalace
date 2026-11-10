@@ -15,8 +15,10 @@ from commonplace.gateway import (
 from commonplace.handoff.models import ThreadMessage
 from commonplace.rules import checks
 from tests._commonplace_helpers import (  # noqa: F401
+    assert_member_drawer_access,
     functional_worker_transport,
     hub_fixture,
+    shared_readers,
 )
 
 TOOLS = ["mempalace_list_wings", "mempalace_get_taxonomy", "mempalace_search"]
@@ -62,7 +64,8 @@ def world(hub, monkeypatch, tmp_path, request):
     monkeypatch.setenv("COMMONPLACE_RATE_LIMITS", "off")
     monkeypatch.setenv("COMMONPLACE_RULES", "off")
     member = hub.db.create_user("member@example.test")
-    hub.db.add_member(hub.workspace, member, "member", actor=hub.admin)
+    hub.db.add_member(hub.workspace, member, "owner", actor=hub.admin)
+    # Private-read fixture holders must be owners; filer boundaries remain independent.
     store = hub.gateway.handoff.store_for(hub.workspace)
     readable = store.store(
         hub.workspace,
@@ -93,7 +96,7 @@ def world(hub, monkeypatch, tmp_path, request):
             trust="trusted",
         )
         principal = hub.db.authenticate_token(tokens[kind])
-        assert principal.role != "owner" and principal.policy.has_scope("threads:read")
+        assert principal.role == "owner" and principal.policy.has_scope("threads:read")
         assert principal.policy.sees_all_wings is (kind == "A")
         assert hub.gateway.handoff.recall.can_read(principal, readable.id)
         assert not hub.gateway.handoff.recall.can_read(principal, hidden.id)
@@ -725,3 +728,16 @@ def test_r12_ordinary_thr_prefix_room_stays_visible(world, tool):
         assert reply == {"wings": {"wing_notes": 1}}
     else:
         assert reply == {"taxonomy": {"wing_notes": {"thr_notes": 1}}}
+
+
+@pytest.mark.parametrize("kind", ["wildcard", "literal"])
+def test_member_shared_reader_contract(hub, shared_readers, kind):  # noqa: F811
+    principal = hub.db.authenticate_token(shared_readers[kind])
+    assert principal.role == "member" and not principal.person
+    assert not principal.policy.sees_all_wings
+    assert not principal.policy.has_scope("private:read")
+    assert principal.policy.can_read_wing("wing_fixture")
+    assert principal.policy.can_read_wing("shared")
+    assert not principal.policy.can_read_wing("private_notes")
+    assert not principal.policy.can_read_wing("private_chats")
+    assert_member_drawer_access(hub, shared_readers[kind])

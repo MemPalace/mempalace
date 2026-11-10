@@ -149,3 +149,60 @@ def latest_seq(db, workspace_id: str) -> int:
             "SELECT MAX(seq) AS s FROM events WHERE workspace_id = ?", (workspace_id,)
         ).fetchone()
     return int(row["s"] or 0)
+
+
+def member_page(db, gateway, principal, cursor: int, epoch: str) -> dict:
+    """Read one bounded ordinal page against one current board snapshot.
+
+    The control lock protects only SQL reads, never board-store access or a
+    Python authorization loop. Hidden rows do not affect the epoch or cursor.
+    """
+    import hashlib
+
+    from .boards.service import open_store
+
+    store = open_store(
+        gateway.workspace_dir(principal.workspace_id), db=db, workspace_id=principal.workspace_id
+    )
+    with store.connection() as conn:
+        boards = conn.execute(
+            "SELECT id,slug,wing,coordinator FROM boards WHERE archived=0"
+        ).fetchall()
+    readable = [b for b in boards if principal.policy.can_read_wing(b["wing"])]
+    identity = [
+        principal.role,
+        sorted((b["id"], b["slug"], b["coordinator"] == principal.actor) for b in readable),
+    ]
+    current_epoch = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    slugs = [b["slug"] for b in readable]
+    coordinators = [b["slug"] for b in readable if b["coordinator"] == principal.actor]
+    # JSON board labels are compared as strings, just like webhook admission.
+    placeholders = ",".join("?" for _ in slugs) or "NULL"
+    messages = ",".join("?" for _ in coordinators) or "NULL"
+    where = (
+        "workspace_id=? AND json_type(data,'$.board')='text' AND "
+        f"json_extract(data,'$.board') IN ({placeholders}) AND "
+        f"(kind!='space_message' OR json_extract(data,'$.board') IN ({messages}))"
+    )
+    params = [principal.workspace_id, *slugs, *coordinators]
+    ensure_schema(db)
+    with db._lock:
+        latest = db._conn.execute(f"SELECT count(*) FROM events WHERE {where}", params).fetchone()[
+            0
+        ]
+        reset = epoch != current_epoch or cursor > latest
+        rows = (
+            []
+            if reset
+            else db._conn.execute(
+                f"SELECT * FROM events WHERE {where} ORDER BY seq LIMIT 200 OFFSET ?",
+                [*params, cursor],
+            ).fetchall()
+        )
+    batch = [{**_row(row), "seq": cursor + index} for index, row in enumerate(rows, 1)]
+    return {
+        "events": batch,
+        "seq": latest if reset else cursor + len(batch),
+        "epoch": current_epoch,
+        "reset": reset,
+    }

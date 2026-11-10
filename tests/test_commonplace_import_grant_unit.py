@@ -131,7 +131,6 @@ def test_person_scopes_and_oauth_defaults_are_exact():
             "kg:write",
             "events:read",
             "events:write",
-            "private:read",
             "private:write",
             "threads:read",
             "handoff:write",

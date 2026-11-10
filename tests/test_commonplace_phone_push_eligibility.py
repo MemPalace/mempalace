@@ -25,7 +25,7 @@ def owner(monkeypatch):
         client="web",
         auth="session",
         role="owner",
-        policy=sessions.person_policy(),
+        policy=sessions.person_policy("owner"),
         person=True,
     )
     db = Mock()

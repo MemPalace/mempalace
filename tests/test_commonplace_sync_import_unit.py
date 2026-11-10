@@ -87,7 +87,7 @@ def unit(tmp_path, monkeypatch):
         auth="session",
         role="owner",
         person=True,
-        policy=person_policy(),
+        policy=person_policy("owner"),
     )
     routes = {}
     ctx = SimpleNamespace(control_db=db, data_dir=tmp_path, principal=principal)

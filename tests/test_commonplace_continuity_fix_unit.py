@@ -99,7 +99,7 @@ def test_fix6_legacy_multipart_listing_grows_by_own_submission_formula(env):
     )
     routes = {}
     principal = SimpleNamespace(
-        person=True, user_id=e.user, workspace_id=e.ws, policy=person_policy()
+        person=True, user_id=e.user, workspace_id=e.ws, policy=person_policy("owner")
     )
     ctx = SimpleNamespace(
         control_db=e.db,
@@ -131,7 +131,7 @@ def test_fix2_other_identity_adopts_orphan_before_original_retry(
         user_ref=e.user,
         name="first",
         client="claude-code",
-        policy=person_policy(),
+        policy=person_policy("owner"),
         actor=e.user,
     )
     other, _ = e.db.create_token(
@@ -139,7 +139,7 @@ def test_fix2_other_identity_adopts_orphan_before_original_retry(
         user_ref=e.user,
         name="second",
         client="claude-code",
-        policy=person_policy(),
+        policy=person_policy("owner"),
         actor=e.user,
     )
     core.backfill(e.db, e.store, e.ws, e.user)
@@ -235,7 +235,7 @@ def test_fix3_preupgrade_legacy_replay_keeps_count_until_new_bytes(env, marker_t
 
     routes, replies = {}, []
     principal = SimpleNamespace(
-        person=True, user_id=e.user, workspace_id=e.ws, policy=person_policy()
+        person=True, user_id=e.user, workspace_id=e.ws, policy=person_policy("owner")
     )
     ctx = SimpleNamespace(
         control_db=e.db,
@@ -303,7 +303,7 @@ def test_fix3_orphan_search_pages_past_controlled_archives(env, monkeypatch, sec
             user_ref=e.user,
             name=name,
             client="claude-code",
-            policy=person_policy(),
+            policy=person_policy("owner"),
             actor=e.user,
         )[0]
         for name in ("first", "second")

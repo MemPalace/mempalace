@@ -60,7 +60,7 @@ def case(hub, kg, monkeypatch, functional_worker_transport):  # noqa: F811
         "reader",
         user=user,
         tools=TOOLS,
-        scopes=SCOPES,
+        scopes=[s for s in SCOPES if s != "private:read"],
         read_wings=["*"],
         write_wings=["shared"],
         trust="trusted",
@@ -72,8 +72,9 @@ def case(hub, kg, monkeypatch, functional_worker_transport):  # noqa: F811
     assert member.role == "member" and not member.person
     assert owner.role == "owner" and owner.person and owner.auth == "session"
     for principal in (member, owner):
-        assert principal.policy.trust == "trusted" and principal.policy.sees_all_wings
-        assert all(principal.policy.has_scope(scope) for scope in SCOPES)
+        assert principal.policy.trust == "trusted"
+        assert principal.policy.sees_all_wings == principal.person
+        assert all(principal.policy.has_scope(scope) for scope in SCOPES if scope != "private:read")
         assert principal.policy.can_write_wing("shared")
         assert all(principal.policy.refusal(tool) is None for tool in TOOLS)
     store = h.gateway.handoff.store_for(h.workspace)
