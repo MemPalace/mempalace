@@ -1,0 +1,66 @@
+## bots
+
+- **Paths:** `commonplace/bots/`, `docs/bots.md`, `tests/_bots_helpers.py`, `tests/test_bots_api.py`, `tests/test_bots_machines.py`, `tests/test_bots_store.py`, `tests/test_bots_updates.py`, `tests/test_bots_turn.py`, `tests/test_bots_project_tools.py`, `tools/bots_overhead.py`
+- **Owns:**
+
+  - The web-app part of `docs/bots.md` also says where Projects, Needs me and Console moved (the Workspace group of the account menu) and that the Bots count is the number of questions waiting on the person.
+
+  - The web screens for bots are described in the "Using bots in the web app" part of `docs/bots.md` (roster, thread, blocks, orchestrator replies, memory sheet, refresh rhythm); the server parts of that file stay unchanged.
+
+  - Per-person chat bots: one workspace file `bots.sqlite3` (opened like `chat.sqlite3`) holding bots, append-only messages, the tool-action journal, pending confirmations, the work a bot filed, the posts it forwarded and memory notes, plus the person-only `/api/bots` read and management routes (`docs/bots.md`).
+
+  - `updates` is the one hub event listener of the bots (installed by `bots.install`): when a card a bot filed needs its owner, is ready for review or is done, or the project's orchestrator answers a post a bot forwarded, it appends one `event` message to that bot's thread. It filters with one indexed lookup before doing anything else (and does nothing in a workspace without a `bots.sqlite3`), checks the owner's fresh person principal with `webhooks.can_receive_event` and the board service, and never raises. `updates.working_bots` feeds the roster `working` state. `store.work_changed` and `store.forward_answered` are the exactly-once writes: one transaction each, applying a hub event only when its `seq` is newer than `bot_work.last_seq` (a stale or racing handler is a no-op), and taking a forwarded post only while `bot_forwards.answered_by` is empty; the listener also checks that the reply is the coordinator's first one after the post. The columns are added to an existing file when it is opened. `events.is_stored` is the shared check that an event is the one the log holds.
+
+  - `auth.person` is the single gate for `/api/bots*`: a signed-in person session, 404 for any agent token or machine credential, 401 for no credentials.
+
+  - The turn engine: `turn.py` runs one turn per bot on its own thread (process-local `limits.REGISTRY`: one per bot, 4 per person, 32 per process), streams through `chat.model_stream.stream` with the `BOT_*` limits in `limits.py`, journals every tool call in `bot_actions`, and stores the reply in one write; `routes.py` relays it as server-sent events and serves stop and confirm. `context.py` builds the fixed system prompt and the quoted, redacted context. `tools.py` holds the `Tool`/`Result`/`Turn` contract, argument validation, the built-in `remember` and `forget`, and `bots.TOOL_MODULES` lists the tool modules imported at install. `tools/bots_overhead.py` is an informational hub-overhead measurement, not a test.
+
+  - `tools_project.py` registers the project tools: `project_status`, `list_work`, `work_detail`, `create_work`, `prioritize_work`, `comment_work`, `tell_orchestrator`, `list_decisions`, `answer_decision`, `approve_work` and `create_project`. Each acts through `BoardService` as the person, gives a confirmed action's outcome a plain sentence (`Result.say`), reads queued work through the work hydrator so a start in flight shows as working, turns a service refusal into one plain sentence (chosen by the refusal's type, with a neutral fallback for anything unrecognised), keeps each result under the engine's cut by adding rows only while the serialised result fits and reporting how many were left out, and never repeats text of work the person cannot see. `answer_decision`, `approve_work` and `create_project` are `confirm` tools whose `check` refuses text that is not the person's own, an item they cannot see and an unoffered choice before any chip exists (and again at the tap), and whose label is built from the frozen arguments and the question or work the person can see.
+
+  - `blocks.HYDRATORS` fills stored block references (`work`, `decision`, `action`, `setup`, `confirm`) with the reader's own view through `BoardService`; an invisible or missing item becomes `gone`, an unknown type is returned as stored. `modelcfg.resolve` turns the chat front settings into a model or one of `needs_configuration`, `needs_turn_on`, `key_missing`.
+
+  - `machines` is the only thing bot code knows about machines: `list_machines`, `start_agent`, `start_status`, `cancel_start`, `run_command` and `register_provider`. Providers are merged and each machine names its own capabilities. The built-in provider calls the runner's own functions (registry, `card_start`, `card_start_status`, `card_start_cancel`, the start options) and adds no authority of its own.
+
+  - `tools_machines` registers the machine tools: `list_machines` (read, stores a `machines` block hydrated per reader), `start_work` and `stop_work` (confirm tools with server-built labels; a start passes `request_key = <request id>:<step>` so the runner deduplicates it), and `run_command`, which is only offered while some machine reports that it can run commands. It also makes the `work` block read `working` while an agent start for the item is in flight.
+
+- **Promises:**
+
+  - A bot and its thread belong to one person; every store method takes the user id and answers `Missing` for another person's bot, so a foreign id looks like an unknown one (404).
+
+  - Messages are append-only (triggers refuse UPDATE and DELETE) and verbatim; one reply per user message; a request id sent again with the same text returns the stored message, with other text it is a conflict. Memory removal is a tombstone.
+
+  - Defaults (one project bot per readable, non-archived project plus General) are created lazily and an archived default is never recreated. At most 50 live bots per person.
+
+  - Text bounds count the raw characters (what is stored), so padding cannot exceed them; text that cannot be stored as UTF-8 is `invalid`. A pending confirmation past its expiry can only become `expired`, whatever the requested state.
+
+  - A turn's `ack` leaves before any model work; text is relayed while the provider still sends; a dropped client never stops a turn. Every tool runs as the person, re-resolved per call, with an audit row `bot:<tool>`; written text must be a verbatim span of the person's message (`not_your_words`). `confirm` tools only create a pending action, run once by compare-and-set on `/confirm`. A request id is never run twice: replay reads the store, a request without reply and without a running turn is stored as `failed:interrupted` with its journal. Bot model requests count in the control table `bot_model_calls` (numbers only) and `chat.store.counts_today` includes them, so bots and project chat share one daily budget and the per-minute `USER_RATE`. A turn takes its unit atomically with the daily check just before sending (`chat.store.take_bot_call`) and gives it back if nothing was sent. Running turns hold a renewed lease in `bot_leases`, so a turn in another hub process is never marked interrupted; a late reply is logged (`code=late_reply`), not stored twice. Streamed text is redacted over the whole reply so far and only its settled part is sent; the step cap is its own code `steps`; a confirm whose `ref` cannot be read creates nothing (`unreadable`). `context.Context.messages` fits every request to `BOT_MAX_INPUT_CHARS` with the transport's own size formula (new message, system prompt, tool schemas and tool rounds first; then memory newest first, whole notes only; the snapshot; history newest first); a message that cannot fit is `too_long` before any request; tool results are cut to 4,000 characters. `Tool.check` (optional) runs before a pending action, chip or write is made, and again on `/confirm` against the original message. On `/confirm`, `check` runs before the compare-and-set, so a fixable refusal leaves the action open; `register()` refuses a confirm tool with free-text arguments and no `check`; a successful `Result.say` is the confirmed action's event text; a tool call to a tool not offered is refused `invalid` and the turn continues.
+
+  - A person is offered exactly the machines the runner would let them start on (today workspace owners; a member gets an empty list and a plain reason). Revoked and switched-off machines are never listed, an unattested one is listed as `unbound` and cannot start, and `verified` is always false. No credential, token or host name appears in any value `machines` returns.
+
+  - Filed work, comments, forwarded messages, decision replies and project names are the person's own words: a title, body, text, reply or name that is not a verbatim part of the current message is refused (`not_your_words`) and nothing is written; without arguments the whole message is used. `create_work` records `bot_work`; `tell_orchestrator` posts as the person inside `chat.front.skipping()` and records `bot_forwards`, so the post gets no front receipt, model answer, runner relay or fallback card. A confirmed answer or approval runs with the item's frozen `version`; a changed item is refused with a plain sentence.
+
+- **How it fails:**
+
+  - Out-of-bound input is 400 `invalid`, the bot limit and conflicts are 409, a busy store is 429; error bodies carry fixed text, never conversation text.
+
+  - A memory id outside the integer range is an unknown id (404); a `board` that is not a project slug string is 400.
+
+  - Before the stream starts: 400 `invalid`, 404, 409 `busy` (this bot already has a running turn) or `conflict` (request id with other text), 429 `busy` (person or process cap). After the user message is stored, every outcome is a stream event and a stored bot message with a fixed sentence per code; provider text never reaches the person. A model that is not usable gives a stored `setup` block and no request.
+
+  - A refused machine request raises `machines.Refused` with the runner's stable code and a plain sentence; `run_command` raises `machines.Unsupported` until a provider reports the capability.
+
+- **Tests:**
+
+  - `tests/test_bots_store.py` covers bounds, append-only triggers, idempotent sends and conflicts, one reply, paging, unread, the action journal, pending compare-and-set, forwards and work lookups, memory tombstones, per-user isolation and reopening the store.
+
+  - `tests/test_bots_updates.py` covers each update (needs you, ready, done, an orchestrator reply, verbatim and marked), exactly-once on redelivery and on a repeated transition, only the filing or forwarding bot, no message for another person or for someone who lost access, no store write for a card no bot filed, a failing store never breaking the card write, roster state and unread, redacted titles, log hygiene and the schema upgrade of an existing file.
+
+  - `tests/test_bots_turn.py` covers a turn over real HTTP with a scripted model and one loopback fake provider: `ack` before model work, a delta while the provider holds back, tool round trips as the person, `not_your_words`, confirm once / decline / expiry / foreign person, replay of finished and running requests, interrupted turns, stop, a dropped client, setup without a model, the shared daily and per-minute budget, the step cap, the turn deadline, caps, a member's refusal, and no conversation text in the control database, audit rows or logs.
+
+  - `tests/test_bots_project_tools.py` covers each project tool with an owner and a member, the your-words rule and span arguments, a bot that cannot reach another project or hidden work, a decision answered end to end, confirm tools running only on the tap with the frozen version, `chat.front.skipping()` (no receipt, model job, relay or fallback card, synchronous listeners, nesting), and no conversation text in audit rows or logs.
+
+  - `tests/test_bots_machines.py` covers who sees which machines (owner, member, revoked, unattested, another workspace), one runner job per request key, refusals with the runner's code, cancelling queued and launched starts, `run_command` being unsupported, merged providers and that no credential leaks, plus the tools: a start waits for a tap and runs once, labels are server-built, refusals are plain sentences, stopping a queued start works and a launched one is reported, the machines block hydrates per reader, and `run_command` is not offered without a capable provider.
+
+  - `tests/test_bots_api.py` covers defaults per readable project, create/rename/archive and the 50-bot bound, thread paging, block hydration and status words, waiting decisions, read marks, memory, redacted display, and 404 for another person, another workspace and agent tokens.
+
+  - Regression tests in both bots test files cover padded text bounds, unstorable text, huge memory ids, non-string boards, non-object bodies, expiry on cancel and refused cross-origin writes.

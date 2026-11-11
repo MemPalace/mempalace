@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_module_promises_do_not_allow_missing_runner_for_normal_admission():
-    modules = (ROOT / "MODULES.md").read_text()
+    modules = "\n".join(path.read_text() for path in sorted((ROOT / "docs/modules").glob("*.md")))
     assert "An absent runner connection or optional jobs/config table supplies" not in modules
     assert "Admission defaults retain strict runner input and shared accounting." in modules
 

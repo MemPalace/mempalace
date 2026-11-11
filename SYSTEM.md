@@ -1,7 +1,8 @@
 # System
 
 Decisions, numbers, stores and accepted residuals that hold across modules.
-`MODULES.md` says which module owns each path; this file says what the whole
+`MODULES.md` (the blocks are in `docs/modules/`) says which module owns each
+path; this file, with the sections in `docs/system/`, says what the whole
 system promises. A change that alters a decision, a number, a store or a
 residual updates this file in the same change; `docs-check` enforces that
 (see "Keeping this file current").
@@ -1525,10 +1526,20 @@ every wake attempt failed. See `docs/chat.md`.
   not extend a shared paragraph or collect unrelated additions at one section end.
   Keep each topic on its own lines, separated by blank lines. Independent
   insertion positions merge cleanly; edits at the same position can still conflict.
-  In `MODULES.md`, add a NEW indented sub-bullet to each touched module block
-  instead of extending its **Promises** or **Tests** line.
+  In the module's file in `docs/modules/`, add a NEW indented sub-bullet to each
+  touched module block instead of extending its **Promises** or **Tests** line.
 
-- `commonplace orch docs-check --base <ref> --head <ref>` exits non-zero on a changed path no `MODULES.md` block owns, a touched module whose block did not change, no change to this file (a whitespace-only edit is no change), an empty or missing block, a bad ref or any error.
+- Parallel changes must not edit the same file. Module blocks live one per file
+  in `docs/modules/<module>.md`; `MODULES.md` holds only the format. A new
+  decision, number, store or residual can be added as its own file
+  `docs/system/<slug>.md`, starting with a `### <title>` heading and written like
+  a section of this file; it counts as the change to `SYSTEM.md` that `docs-check`
+  asks for, and its place in this file is given by the heading (name the section
+  it belongs to in its first sentence). Prefer a new `docs/system/` file over an
+  insertion into `## Decisions` here. `commonplace orch docs-check --print system`
+  and `--print modules` show the assembled documents.
+
+- `commonplace orch docs-check --base <ref> --head <ref>` exits non-zero on a changed path no `MODULES.md` block owns, a touched module whose block did not change, no change to this file or `docs/system/` (a whitespace-only edit is no change), an empty or missing block, a bad ref or any error.
 
 - The test suite runs it against the merge base with the development branch and fails closed when the base is missing.
 

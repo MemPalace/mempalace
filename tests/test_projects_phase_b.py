@@ -403,6 +403,8 @@ def test_g7_private_hygiene():
         for p in (
             "MODULES.md",
             "SYSTEM.md",
+            *sorted(str(f) for f in Path("docs/modules").glob("*.md")),
+            *sorted(str(f) for f in Path("docs/system").glob("*.md")),
             "commonplace/boards/service.py",
             "commonplace/orch/runner_bridge.py",
             "commonplace/projects/__init__.py",
