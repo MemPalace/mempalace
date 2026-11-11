@@ -215,13 +215,13 @@ def plan_commands(
     return commands
 
 
-def resolve_executable(repo_root: Path | str, name: str) -> str | None:
-    """Find a JS tool in the repo's node_modules/.bin first, then on PATH."""
+def resolve_executable(repo_root: Path | str, name: str, path: str | None = None) -> str | None:
+    """Find a JS tool in the repo's node_modules/.bin first, then on ``path`` (default PATH)."""
     if name in JS_TOOLS:
         local = Path(repo_root) / "node_modules" / ".bin" / name
         if local.is_file():
             return str(local)
-    return shutil.which(name)
+    return shutil.which(name, path=path)
 
 
 # ── running ────────────────────────────────────────────────────────────
@@ -309,7 +309,7 @@ def _execute(
     else:
         if not command.argv:
             raise ValueError(f"{command.name}: planned command has neither argv nor shell")
-        exe = resolve_executable(cwd, command.argv[0])
+        exe = resolve_executable(cwd, command.argv[0], None if env is None else env.get("PATH"))
         if exe is None:
             return "missing", "", []
         argv = [exe, *command.argv[1:]]
@@ -355,6 +355,18 @@ def _run_one(
     start = clock()
     status, output, locations = _execute(command, cwd, hard_timeout_seconds, env)
     return CommandResult(command, status, clock() - start, output, locations)
+
+
+def run_command(
+    command: PlannedCommand,
+    cwd: Path | str,
+    hard_timeout_seconds: float,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    env: dict[str, str] | None = None,
+) -> CommandResult:
+    """Run one planned command with its own hard timeout; ``clock`` is read twice."""
+    return _run_one(command, Path(cwd), hard_timeout_seconds, clock, env)
 
 
 def _print_result(stream: TextIO, result: CommandResult, hard_timeout_seconds: float) -> None:

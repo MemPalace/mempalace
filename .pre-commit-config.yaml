@@ -1,4 +1,9 @@
-default_install_hook_types: [pre-commit, pre-push]
+# Only the commit stage runs through pre-commit. The pre-push stage is the quick
+# check in commonplace/guards/prepush.py (lint, format, docs-check and mapped fast
+# tests inside a time budget). Install both hooks with
+#   python -m commonplace.guards.hooks install
+# not `pre-commit install`, whose hook breaks in linked worktrees.
+default_install_hook_types: [pre-commit]
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -13,22 +18,8 @@ repos:
         stages: [pre-commit]
       - id: ruff-format
         stages: [pre-commit]
-      - id: ruff
-        name: ruff check (pre-push)
-        stages: [pre-push]
-      - id: ruff-format
-        name: ruff format --check (pre-push)
-        args: [--check]
-        stages: [pre-push]
   - repo: local
     hooks:
-      - id: cargo-fmt
-        name: cargo fmt --check (pre-push)
-        entry: cargo fmt --all --check
-        language: system
-        types: [rust]
-        pass_filenames: false
-        stages: [pre-push]
       - id: docs-check
         name: docs-check (manual; the test suite runs it too)
         entry: python3 -m commonplace orch docs-check --base origin/develop --head HEAD

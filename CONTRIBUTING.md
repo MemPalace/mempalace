@@ -16,17 +16,36 @@ uv sync --extra dev
 # Or with pip in your own venv:
 # pip install -e ".[dev]"
 
-# Install commit and push hooks (one-time, per clone)
-pre-commit install
+# Install the commit and push hooks (one-time per clone; the worktrees share them)
+python -m commonplace.guards.hooks install
 ```
 
-Run `pre-commit install` after setup, including in existing clones, to install
-both hooks. Linked Git worktrees share the clone's hooks. The configuration pins
-Ruff to the same version as the merge checks. Commits fix Python lint and formatting;
-pushes check changed Python files with `ruff check` and `ruff format --check`
-without editing them. When Rust files change, pushes also run
-`cargo fmt --all --check` for the workspace; install Rust with the `rustfmt`
-component for that check. Push hooks run no type checks or tests.
+Run the install after setup, including in existing clones. Do not use
+`pre-commit install`: the hook it writes hard-codes the interpreter of the
+worktree that ran it and needs `pre-commit` on PATH, so in a fresh linked
+worktree every commit fails with "`pre-commit` not found".
+
+The hooks installed here are two small scripts in the clone's shared hooks
+directory. Each run uses the environment of the worktree it runs in
+(`COMMONPLACE_PYTHON`, then the worktree's `.venv`, then an activated
+`VIRTUAL_ENV`, then `python3`). A new worktree needs its own `uv sync --extra dev`;
+if it has none, the hook stops and prints that command. `python -m
+commonplace.guards.hooks status` shows what a worktree would use.
+
+- **Commit** (through pre-commit, pinned to the same Ruff as the merge checks):
+  fixes Python lint and formatting in the staged files.
+- **Push** is a **quick check**, not the full test suite and not CI. It looks at the
+  files the push changes and runs, within a time budget: `ruff check` and
+  `ruff format --check` on them (plus `cargo fmt --check` for changed Rust files),
+  `docs-check` against the base branch, and the fast tests whose names match the
+  changed modules (`commonplace/guards/stacks.py` selects `tests/test_guards_stacks.py`
+  and `tests/test_stacks*.py`; no marked-slow tests). Nothing is edited.
+  A failed check blocks the push. The budget is 60 seconds for everything; set it
+  with `COMMONPLACE_PREPUSH_BUDGET=120` or `--budget`. When it runs out, the
+  step that was running is stopped, later steps are not started, and the run
+  lists exactly what was skipped or cut off: that does not block the push, and it
+  is never printed as a pass. Run the same check by hand against the base with
+  `python -m commonplace.guards.prepush --manual --base origin/develop`.
 
 ## Running Tests
 

@@ -43,6 +43,21 @@ entry was written.
   the existing gateway 401 challenge. No authority extends to other workspaces’ personal data.
   The installed route inventory mirrors both authenticated Admin GET prefixes.
 
+- **Pre-push quick check:** `git push` runs `commonplace.guards.prepush` on the
+  files the push changes (git's pre-push input, diffed against the remote tip or
+  the development branch): ruff check and format on changed Python, other
+  detected stacks, `docs-check` against the base, and the fast tests whose
+  names match the changed modules. Default budget 60 s (`--budget` or
+  `COMMONPLACE_PREPUSH_BUDGET`) covers all steps together: a step that is
+  still running when it ends is stopped, later steps are not started, and the
+  run lists them as skipped or cut off. A failed check blocks the push (exit 1);
+  an incomplete run does not, and never prints a pass. Every run states that it
+  is a quick check, not the full suite or CI. The hooks are one pair of shell
+  scripts in the clone's shared hooks directory, written by
+  `python -m commonplace.guards.hooks install`; each run picks the environment
+  of the worktree it runs in (`COMMONPLACE_PYTHON`, `.venv`, `VIRTUAL_ENV`,
+  `python3`) and, when none has the tools, exits with the setup command.
+
 - **Admin read and lifecycle bounds:** New projections use an existing SQLite
   `mode=ro` connection, connection-local `query_only`, at most 250 ms busy/connect
   wait and a 2 second monotonic request budget with progress interruption. They
