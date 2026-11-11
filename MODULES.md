@@ -2028,6 +2028,31 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/agent_schedules_view.mjs` (run by `tests/test_agent_schedules.py`) covers row rendering and escaping in the app section.
 
+## topology
+
+- **Paths:** `commonplace/topology/`, `docs/topology.md`, `tests/test_topology_store.py`
+- **Owns:**
+
+  - The topology store behind the Compute map: nodes, links and site routes as structured `(subject, predicate, object)` facts in the workspace's `topology` wing, in the workspace file `topology.sqlite3` (`topology_facts`, `topology_observations`, `topology_conflicts`). `docs/topology.md` is the contract: node kinds, link methods, routes, provenance, expiry, conflicts, the secret filter and the Python read and write signatures.
+
+  - `model.py` is the allow-list: every field and its shape, the observer, lifetimes, subjects and the secret filter. `store.py` holds `TopologyStore` (one workspace's file, opened like `bots.sqlite3`; `open_topology` caches one per workspace on the gateway) and writes and reads: `upsert` (and the node, link and route forms), `retract`, `resolve_conflict`, `get_node`, `get_link`, `get_route`, `read_graph`, `list_conflicts`, `history`.
+- **Promises:**
+
+  - Every fact keeps who observed it, when, from what verbatim evidence, and when it expires. A stale value leaves `values` and is still readable with `stale: true`; nothing is deleted.
+
+  - Two observers disagreeing leaves the current value and files the other as a conflict record; only the same observer, an expired value, an owner decision or an authoritative `replace` write changes the current value, and the old one stays in history.
+
+  - Keys, tokens, passwords and private key material are refused on write, in fields, evidence and observer ids. The refusal names the field and the kind of secret, never the value, and stores nothing.
+
+  - The schema is additive and each write is one transaction. The store does not authorize: callers check the `topology` wing with the existing wing grants. A store is one workspace's file, so reads never cross workspaces; the control database holds no topology text.
+- **How it fails:**
+
+  - A value outside the allow-list, a broken route chain or secret-looking text raises `TopologyError` (`SecretRefused` for secrets) before anything is stored. A workspace without `topology.sqlite3` reads as an empty map, and reading does not create the file.
+- **Tests:**
+
+  - `tests/test_topology_store.py` covers upsert and read back with provenance and expiry, refreshes, allow-list refusals, stale facts and route hops, conflicts and their resolutions, the authoritative write, retraction, secret refusals, workspace isolation, an old workspace without the file, reopening, a moved workspace directory, a crash inside a write and the wing grant.
+
+
 ## bots
 
 - **Paths:** `commonplace/bots/`, `docs/bots.md`, `tests/_bots_helpers.py`, `tests/test_bots_api.py`, `tests/test_bots_store.py`, `tests/test_bots_updates.py`
