@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Live sync's first backfill has its own configurable, bounded server allowance above the steady untrusted write limit (per connection and per space, durable, never re-armed by a restart or a new stream); steady limits are configurable too ([guide](docs/live-sync.md#server-side-limits)).
+
 - Add separate, unticked reader consent for connection-route imported history.
   Import remains write-only; existing tokens retain their scopes. Consented
   reads are bounded to the exact filer's imports and exclude capture tails.

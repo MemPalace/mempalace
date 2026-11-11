@@ -79,9 +79,9 @@ export function consoleView({ role, agents, selected, items, output, tools, erro
   </section>`;
 }
 
-export function createConsole({ mount, api, e, setTimer = setTimeout, clearTimer = clearTimeout, hidden = () => document.hidden }) {
+export function createConsole({ mount, api, e, setTimer = setTimeout, clearTimer = clearTimeout, hidden = () => document.hidden, onSelect = () => {} }) {
   let state, timer = null, active = false, generation = 0, visit = 0;
-  let cursor = "", ticks = 0, delay = 2000, loaded = false, newActivity = false;
+  let cursor = "", ticks = 0, delay = 2000, loaded = false, newActivity = false, wanted = null;
   const pending = new Set();
   const current = (token) => active && token === generation;
   const atBottom = (node) => !node || node.scrollHeight - node.scrollTop - node.clientHeight <= 24;
@@ -149,7 +149,8 @@ export function createConsole({ mount, api, e, setTimer = setTimeout, clearTimer
     state.agents = result.agents;
     loaded = true;
     const selected = state.agents.find((row) => row.id === state.selected);
-    if (!selected) select(state.agents[0]?.id || null);
+    // A requested agent the viewer cannot see is simply absent from this list: the first one opens instead.
+    if (!selected) select(state.agents.find((row) => row.id === wanted)?.id || state.agents[0]?.id || null);
     else {
       state.tools = !selected.own ? "private" : selected.recording ? "on" : "off";
       if (!selected.own) {
@@ -227,8 +228,16 @@ export function createConsole({ mount, api, e, setTimer = setTimeout, clearTimer
   }
 
   return {
-    show() {
-      if (active) { render(); return; }
+    show(agent = null) {
+      if (active) {
+        if (agent && agent !== state.selected && state.agents.some((row) => row.id === agent)) {
+          select(agent);
+          return restart();
+        }
+        render();
+        return;
+      }
+      wanted = agent;
       active = true;
       visit++;
       state = { role: "member", agents: [], selected: null, items: [], output: [], tools: "off", error: "", loading: true };
@@ -248,6 +257,7 @@ export function createConsole({ mount, api, e, setTimer = setTimeout, clearTimer
         const id = element?.dataset.id;
         if (id !== state.selected && state.agents.some((row) => row.id === id)) {
           select(id);
+          onSelect(id);
           void restart();
         }
         return true;

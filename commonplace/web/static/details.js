@@ -1,6 +1,11 @@
 import { api as request, escape as e, actor } from "./api.js";
+import { loadCardLinks, placeCardLinks } from "./cardlinks.js";
+import { attachCardRuns, cardRunsSlot } from "./cardruns.js";
+import { blockersSection } from "./blockers.js";
+import { waitingSection } from "./waiting.js";
 
 const statuses = ["backlog", "todo", "doing", "review", "done"];
+const priorities = ["urgent", "high", "normal", "low"];
 const enc = encodeURIComponent;
 const exact = (value) => e(value).replaceAll("\r", "&#13;");
 const label = (value) => value ? value[0].toUpperCase() + value.slice(1) : "—";
@@ -114,13 +119,17 @@ export function renderDetails(card, { board = { slug: card.board }, me, messages
   const stripBox = strip ? `<div class="chat-about from-chat" data-row="${e(strip.row || "")}"><span class="fc-text">${strip.kind === "board" ? `You picked ${e(id)} on the board. The chat is one click away.` : `Opened from ${e(name)} chat: ${e(strip.source || "")}.`}</span><button class="btn sm" data-back-chat data-action="back-to-chat">Back to chat</button></div>` : "";
   const tag = context.blocked ? "Blocked" : context.needsMe ? "Needs me" : card.review_kind === "completion" ? `Reviewer: ${author(card.ask_to)}` : "";
   const linked = (card.linked || []).map((link) => `<li><a href="#/memory?id=${enc(link.drawer_id)}"${link.invalidated ? ' class="gone"' : ""}>${e(link.title || "Memory")}</a></li>`).join("");
-  return `<section class="workbench-details" aria-label="Card details" data-card="${e(card.number)}" data-version="${e(card.version)}"><div class="ctx-head"><div class="ctx-tabs" role="tablist" aria-label="Context">${["details", "memory"].map((key) => `<button role="tab" id="tab-${key}" aria-selected="${tab === key}" aria-controls="ctx-panel" tabindex="${tab === key ? 0 : -1}" data-details-tab="${key}">${label(key)}</button>`).join("")}</div><button class="btn ghost sm hide" data-action="close-panel" aria-keyshortcuts="]">Hide</button></div>${stripBox}<div class="ctx-panel-wrap" id="ctx-panel" role="tabpanel" aria-labelledby="tab-${tab}">${tab === "memory" ? `<div class="ctx-body"><h2>Memory for ${e(id)}</h2><ul>${linked || "<li>No linked memories</li>"}</ul><a class="btn" href="#/memory?q=${enc(card.ask || card.title)}">Search memory</a></div>` : `<div class="ctx-body"><header class="detail-h"><div class="row"><span class="cid">${e(id)}</span>${tag ? `<span class="tag ${context.blocked ? "block" : "wait"}">${e(tag)}</span>` : ""}</div><div class="title-row"><h2 tabindex="-1" data-details-title>${e(card.title)}</h2><button class="btn ghost sm" data-action="edit-card">Edit <kbd>E</kbd></button><button class="btn ghost sm" data-action="handoff">Hand off</button></div></header><dl class="fields"><dt>Status</dt><dd><select id="card-status" aria-label="Card status"${context.proposal ? " disabled" : ""}>${statuses.map((status) => `<option value="${status}"${status === card.status ? " selected" : ""}>${label(status)}</option>`).join("")}</select><button class="btn sm" data-action="panel-move"${context.proposal ? " disabled" : ""}>Move</button></dd><dt>${card.need === "working" ? "Working on it" : "Who"}</dt><dd>${e(card.assignee ? author(card.assignee) : card.status === "todo" ? "Available for an agent" : "—")}</dd>${card.ask_to ? `<dt>${card.review_kind === "completion" ? "Reviewer" : "Waiting on"}</dt><dd>${e(author(card.ask_to))}</dd>` : ""}${card.return_to?.startsWith("conn:") && card.status === "review" ? `<dt>Built by</dt><dd>${e(author(card.return_to))}</dd>` : ""}${card.labels?.length ? `<dt>Labels</dt><dd>${card.labels.map((item) => e(item)).join(" · ")}</dd>` : ""}</dl>${contextBox}${originBox}<section data-details-description><div class="sec-h"><h3>Description</h3><button class="btn ghost sm" data-action="edit-card" aria-label="Edit ${e(id)}">Edit</button></div><p class="body-text">${exact(card.body)}</p></section><section><div class="sec-h"><h3>Activity</h3></div><ol class="activity">${activityHTML(card, author, stamp)}</ol></section></div><div class="ctx-foot"><form class="reply" data-form="comment"><label class="sr" for="details-comment">Comment on ${e(id)}</label><textarea id="details-comment" name="text" rows="1" data-draft="comment-${e(card.number)}" placeholder="Comment or @mention…" required></textarea><button class="btn">Send</button></form></div>`}</div></section>`;
+  return `<section class="workbench-details" aria-label="Card details" data-card="${e(card.number)}" data-version="${e(card.version)}"><div class="ctx-head"><div class="ctx-tabs" role="tablist" aria-label="Context">${["details", "memory"].map((key) => `<button role="tab" id="tab-${key}" aria-selected="${tab === key}" aria-controls="ctx-panel" tabindex="${tab === key ? 0 : -1}" data-details-tab="${key}">${label(key)}</button>`).join("")}</div><button class="btn ghost sm hide" data-action="close-panel" aria-keyshortcuts="]">Hide</button></div>${stripBox}<div class="ctx-panel-wrap" id="ctx-panel" role="tabpanel" aria-labelledby="tab-${tab}">${tab === "memory" ? `<div class="ctx-body"><h2>Memory for ${e(id)}</h2><ul>${linked || "<li>No linked memories</li>"}</ul><a class="btn" href="#/memory?q=${enc(card.ask || card.title)}">Search memory</a></div>` : `<div class="ctx-body"><header class="detail-h"><div class="row"><span class="cid">${e(id)}</span>${tag ? `<span class="tag ${context.blocked ? "block" : "wait"}">${e(tag)}</span>` : ""}</div><div class="title-row"><h2 tabindex="-1" data-details-title>${e(card.title)}</h2><button class="btn ghost sm" data-action="edit-card">Edit <kbd>E</kbd></button><button class="btn ghost sm" data-action="handoff">Hand off</button></div></header><dl class="fields"><dt>Status</dt><dd><select id="card-status" aria-label="Card status"${context.proposal ? " disabled" : ""}>${statuses.map((status) => `<option value="${status}"${status === card.status ? " selected" : ""}>${label(status)}</option>`).join("")}</select><button class="btn sm" data-action="panel-move"${context.proposal ? " disabled" : ""}>Move</button></dd><dt>Priority</dt><dd>${card.can_prioritize ? `<select id="card-priority" aria-label="Card priority">${priorities.map((item) => `<option value="${item}"${item === (card.priority || "normal") ? " selected" : ""}>${label(item)}</option>`).join("")}</select><button class="btn sm" data-action="panel-priority">Set</button>` : e(label(card.priority || "normal"))}</dd><dt>${card.need === "working" ? "Working on it" : "Who"}</dt><dd>${e(card.assignee ? author(card.assignee) : card.status === "todo" ? "Available for an agent" : "—")}</dd>${card.ask_to ? `<dt>${card.review_kind === "completion" ? "Reviewer" : "Waiting on"}</dt><dd>${e(author(card.ask_to))}</dd>` : ""}${card.return_to?.startsWith("conn:") && card.status === "review" ? `<dt>Built by</dt><dd>${e(author(card.return_to))}</dd>` : ""}${card.labels?.length ? `<dt>Labels</dt><dd>${card.labels.map((item) => e(item)).join(" · ")}</dd>` : ""}</dl>${waitingSection(card)}${blockersSection(card)}${cardRunsSlot(card)}${contextBox}${originBox}<section data-details-description><div class="sec-h"><h3>Description</h3><button class="btn ghost sm" data-action="edit-card" aria-label="Edit ${e(id)}">Edit</button></div><p class="body-text">${exact(card.body)}</p></section><section><div class="sec-h"><h3>Activity</h3></div><ol class="activity">${activityHTML(card, author, stamp)}</ol></section></div><div class="ctx-foot"><form class="reply" data-form="comment"><label class="sr" for="details-comment">Comment on ${e(id)}</label><textarea id="details-comment" name="text" rows="1" data-draft="comment-${e(card.number)}" placeholder="Comment or @mention…" required></textarea><button class="btn">Send</button></form></div>`}</div></section>`;
 }
 
 // The shell keeps ownership of card mutations, drafts, sheet modality and chat focus return.
 export function createDetails({ mount, api = request, onMemory = () => {} }) {
-  let current, options, revision = 0;
-  const draw = () => { mount.innerHTML = renderDetails(current, options); };
+  let current, options, revision = 0, links = null;
+  const draw = () => {
+    mount.innerHTML = renderDetails(current, options);
+    if (options.tab === "details") placeCardLinks(mount, links);
+    void attachCardRuns(mount, current, { api });
+  };
   function selectTab(tab, focus = false) {
     if (!current || !["details", "memory"].includes(tab)) return;
     // Keep an unfinished comment when switching away and back.
@@ -151,9 +160,15 @@ export function createDetails({ mount, api = request, onMemory = () => {} }) {
       const token = ++revision;
       // A refresh of the same card keeps the user's focus; only a new card moves it to the heading.
       const changed = current?.number !== card.number || current?.board !== card.board;
+      if (changed) links = null;
       current = card;
       options = { ...settings, tab: "details" };
       draw();
+      loadCardLinks(card, api).then((found) => {
+        if (token !== revision) return;
+        links = found;
+        if (options.tab === "details") placeCardLinks(mount, links);
+      }).catch(() => {});
       if (changed) mount.querySelector("[data-details-title]")?.focus();
       if (card.message_id != null && !originMessage(card, settings.messages)) {
         try {

@@ -7,8 +7,10 @@ import gc
 import importlib.util
 import logging
 import os
+import re
 import threading
 import time
+from dataclasses import dataclass
 
 from commonplace import plans
 from commonplace.http_util import query, read_json, require_principal, send_json
@@ -16,7 +18,70 @@ from commonplace.http_util import query, read_json, require_principal, send_json
 PCM_BYTES_PER_SECOND = 16000 * 2
 MAX_PCM_BYTES = 60 * PCM_BYTES_PER_SECOND
 LANGUAGES = ("en", "nl")
+# The existing models, kept as the defaults so current installs change nothing.
+# English runs Moonshine (only "base" is wired up); every other language runs
+# faster-whisper, whose model may be a size name, a Hugging Face repo id or the
+# absolute path of a local CTranslate2 directory.
+DEFAULT_MODELS = {"en": "base", "nl": "small"}
+MOONSHINE_MODELS = ("base",)
+_MODEL_ID = re.compile(r"^/?[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
 logger = logging.getLogger(__name__)
+
+
+class VoiceConfigError(ValueError):
+    """Voice settings are missing or invalid. Raised instead of falling back."""
+
+
+@dataclass(frozen=True)
+class VoiceConfig:
+    enabled: bool
+    models: dict
+
+
+def _model_setting(language, environ):
+    name = f"COMMONPLACE_VOICE_MODEL_{language.upper()}"
+    if name not in environ:
+        return DEFAULT_MODELS[language]
+    model = environ[name].strip()
+    if not model:
+        raise VoiceConfigError(f"{name} is empty; set a model or unset it to use the default")
+    if language == "en":
+        if model not in MOONSHINE_MODELS:
+            raise VoiceConfigError(
+                f"{name}={model!r} is not supported; English uses one of {', '.join(MOONSHINE_MODELS)}"
+            )
+        return model
+    parts = model.lstrip("/").split("/")
+    relative_ok = model.startswith("/") or len(parts) <= 2
+    if (
+        len(model) > 200
+        or not _MODEL_ID.match(model)
+        or not relative_ok
+        or any(part in (".", "..") for part in parts)
+    ):
+        raise VoiceConfigError(
+            f"{name} must be a faster-whisper model size, a Hugging Face repo id "
+            "(owner/name) or an absolute path to a local model directory"
+        )
+    if model.startswith("/") and not os.path.isdir(model):
+        raise VoiceConfigError(f"{name}={model!r} is not a directory on this server")
+    return model
+
+
+def load_config(environ=None):
+    """Read the instance-level voice settings.
+
+    COMMONPLACE_VOICE is ``on`` (default) or ``off``. COMMONPLACE_VOICE_MODEL_EN and
+    COMMONPLACE_VOICE_MODEL_NL pick each language's model. Anything invalid raises
+    VoiceConfigError, so a typo never silently selects another model.
+    """
+    environ = os.environ if environ is None else environ
+    switch = environ.get("COMMONPLACE_VOICE", "on")
+    if switch not in ("on", "off"):
+        raise VoiceConfigError(f"COMMONPLACE_VOICE must be 'on' or 'off', not {switch!r}")
+    if switch == "off":
+        return VoiceConfig(False, dict(DEFAULT_MODELS))
+    return VoiceConfig(True, {lang: _model_setting(lang, environ) for lang in LANGUAGES})
 
 
 def available():
@@ -38,7 +103,9 @@ def _trim():
         pass
 
 
-def _load_model(language, threads):
+def _load_model(language, threads, model_name):
+    if not model_name:
+        raise VoiceConfigError(f"No voice model is configured for {language!r}")
     import numpy as np
 
     if language == "en":
@@ -51,7 +118,7 @@ def _load_model(language, threads):
         options = ort.SessionOptions()
         options.intra_op_num_threads = threads
         options.inter_op_num_threads = 1
-        paths = model._load_weights_from_hf_hub("base", "float")
+        paths = model._load_weights_from_hf_hub(model_name, "float")
         model.encoder, model.decoder = [
             ort.InferenceSession(path, sess_options=options, providers=["CPUExecutionProvider"])
             for path in paths
@@ -71,7 +138,7 @@ def _load_model(language, threads):
     else:
         from faster_whisper import WhisperModel
 
-        model = WhisperModel("small", device="cpu", compute_type="int8", cpu_threads=threads)
+        model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=threads)
         # faster-whisper's debug logging can include decoded segments. Give
         # this model a private, silent logger, including under root DEBUG.
         model.logger = logging.Logger("commonplace.voice.model", level=logging.CRITICAL + 1)
@@ -98,8 +165,11 @@ class VoiceEngine:
     The short-idle environment override is also useful for deployment smoke tests.
     """
 
-    def __init__(self, loader=_load_model, clock=time.monotonic, idle_seconds=None, trim=_trim):
+    def __init__(
+        self, loader=_load_model, clock=time.monotonic, idle_seconds=None, trim=_trim, models=None
+    ):
         self.loader, self.clock, self.trim = loader, clock, trim
+        self.models = dict(DEFAULT_MODELS if models is None else models)
         self.idle_seconds = (
             float(os.environ.get("COMMONPLACE_VOICE_IDLE_SECONDS", "600"))
             if idle_seconds is None
@@ -144,7 +214,9 @@ class VoiceEngine:
                 self._timer.cancel()
             try:
                 if language not in self._models:
-                    self._models[language] = self.loader(language, self.threads)
+                    self._models[language] = self.loader(
+                        language, self.threads, self.models.get(language)
+                    )
                 return self._models[language](pcm).strip()
             finally:
                 if language in self._models:
@@ -168,11 +240,17 @@ _engine = None
 _engine_lock = threading.Lock()
 
 
-def engine():
+def engine(config=None):
     global _engine
+    models = (config or load_config()).models
     with _engine_lock:
+        # A new configuration replaces the engine, so settings never go stale.
+        # close() takes the old engine's lock, so it waits for a running transcription.
+        if _engine is not None and _engine.models != models:
+            _engine.close()
+            _engine = None
         if _engine is None:
-            _engine = VoiceEngine()
+            _engine = VoiceEngine(models=models)
         return _engine
 
 
@@ -184,14 +262,23 @@ def enabled(db, workspace):
     return bool(row and row[0])
 
 
+def _refusal(config, voice_engine):
+    """Why voice cannot run on this instance right now, or None."""
+    if not config.enabled:
+        return "Voice is switched off on this instance"
+    return None if voice_engine.available() else "Voice is unavailable"
+
+
 def install(gateway):
     with gateway.db._lock:
         gateway.db._conn.execute("""CREATE TABLE IF NOT EXISTS workspace_voice (
             workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id),
             voice_enabled INTEGER NOT NULL DEFAULT 0 CHECK (voice_enabled IN (0, 1))
         )""")
+    # A bad setting stops startup with a clear message instead of picking a model.
+    gateway.voice_config = config = load_config()
     # Tests may substitute a fake without importing the optional extra.
-    gateway.voice_engine = engine()
+    gateway.voice_engine = engine(config)
 
     def person(h):
         principal = require_principal(gateway, h)
@@ -200,8 +287,8 @@ def install(gateway):
             return None
         return principal
 
-    def status():
-        return gateway.voice_engine.available()
+    def refusal():
+        return _refusal(config, gateway.voice_engine)
 
     def get(h):
         principal = person(h)
@@ -210,7 +297,7 @@ def install(gateway):
                 h,
                 200,
                 {
-                    "available": status(),
+                    "available": refusal() is None,
                     "enabled": enabled(gateway.db, principal.workspace_id),
                     "languages": list(LANGUAGES),
                     "owner": principal.role == "owner",
@@ -231,8 +318,8 @@ def install(gateway):
         if set(body) != {"enabled"} or type(body["enabled"]) is not bool:
             send_json(h, 400, {"error": "enabled must be a boolean"})
             return
-        if not status():
-            send_json(h, 503, {"error": "Voice is unavailable"})
+        if reason := refusal():
+            send_json(h, 503, {"error": reason})
             return
         with gateway.db._lock:
             gateway.db._conn.execute(
@@ -258,8 +345,8 @@ def install(gateway):
         if not enabled(gateway.db, principal.workspace_id):
             send_json(h, 403, {"error": "Voice is off"})
             return
-        if not status():
-            send_json(h, 503, {"error": "Voice is unavailable"})
+        if reason := refusal():
+            send_json(h, 503, {"error": reason})
             return
         language = query(h).get("lang")
         if language not in LANGUAGES:
@@ -290,6 +377,12 @@ def install(gateway):
             return
         try:
             text = gateway.voice_engine.transcribe(language, pcm)
+        except VoiceConfigError as exc:
+            plans.refund_transcription(gateway.db, principal.user_id, seconds, day)
+            # Setting names only, never user content: the operator needs this.
+            logger.error("voice model setting is unusable: %s", exc)
+            send_json(h, 503, {"error": "Voice is not configured correctly on this server."})
+            return
         except Exception as exc:
             plans.refund_transcription(gateway.db, principal.user_id, seconds, day)
             # Exception messages and args may contain user content.

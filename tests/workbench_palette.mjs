@@ -6,7 +6,9 @@ const staticURL = new URL('../commonplace/web/static/', import.meta.url);
 assert.ok(existsSync(new URL('palette.js', staticURL)), 'Palette module missing');
 const dataURL = (source) => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
 const apiURL = dataURL(readFileSync(new URL('api.js', staticURL), 'utf8'));
-const boardURL = dataURL(readFileSync(new URL('board.js', staticURL), 'utf8').replace("'./api.js'", JSON.stringify(apiURL)));
+// A data: module cannot resolve "./x.js": board's other sibling imports load from their files.
+const siblings = (source) => source.replace(/(from\s*)(['"])\.\/([\w-]+\.js)\2/g, (_all, from, _quote, name) => from + JSON.stringify(new URL(name, staticURL).href));
+const boardURL = dataURL(siblings(readFileSync(new URL('board.js', staticURL), 'utf8').replace("'./api.js'", JSON.stringify(apiURL))));
 const source = readFileSync(new URL('palette.js', staticURL), 'utf8');
 const ui = await import(dataURL(source.replace("'./api.js'", JSON.stringify(apiURL)).replace("'./board.js'", JSON.stringify(boardURL))));
 for (const name of ['paletteItems', 'createPalette']) assert.equal(typeof ui[name], 'function', `${name} missing`);

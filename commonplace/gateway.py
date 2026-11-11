@@ -27,6 +27,7 @@ import os
 import re
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import monotonic, sleep
 from typing import Callable, Optional
@@ -37,7 +38,7 @@ from mempalace.config import normalize_wing_name
 from mempalace.knowledge_graph import strictest
 from mempalace.tool_capabilities import classify_tool
 
-from . import events, extensions, plans, privacy, ratelimit, sessions, urls
+from . import backfill_allowance, events, extensions, plans, privacy, ratelimit, sessions, urls
 from .auth import PersonalTokenAuthenticator, bearer_from_header
 from .control_db import ControlDB, ControlError, Principal
 from .http_util import log_failure
@@ -1863,6 +1864,9 @@ class Gateway:
         self.prefix_routes: list = []
         self.rate_limits = os.environ.get("COMMONPLACE_RATE_LIMITS", "").lower() != "off"
         self.limiter = ratelimit.TokenBuckets()
+        self.write_limit, self.backfill = ratelimit.limits_from_env()
+        self.wall_clock = time.time
+        backfill_allowance.ensure_schema(db)
         self.storage_meter = plans.StorageMeter()
         allowed = os.environ.get("COMMONPLACE_ALLOWED_HOSTS")
         self.allowed_hosts = (
@@ -2142,6 +2146,7 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         forwarded = ",".join(self.headers.get_all("X-Forwarded-For", []))
         ip = ratelimit.client_ip(self.client_address[0], forwarded)
         policies = []
+        topup = False
         if (
             path.startswith("/app/auth/")
             and path != "/app/auth/providers"
@@ -2161,18 +2166,53 @@ class _GatewayHandler(BaseHTTPRequestHandler):
                 (ratelimit.UNTRUSTED if untrusted else ratelimit.AUTHENTICATED, identity)
             )
             if untrusted and _write_request(self.command, path, request):
-                policies.append((ratelimit.WRITES, identity))
+                policies.append((self.server.gateway.write_limit, identity))
+                topup = (
+                    not principal.person
+                    and self.command == "POST"
+                    and path in ("/api/capture", "/api/import")
+                )
         # Short links replace the anonymous policy with their own budget.
         if self.command == "GET" and path.startswith("/s/"):
             policies.append((ratelimit.SHORT_LINKS, ip))
         elif principal is None:
             policies.append((ratelimit.ANONYMOUS, ip))
-        retry = self.server.gateway.limiter.check(policies)
+        gateway = self.server.gateway
+        retry = gateway.limiter.check(policies)
         if not retry:
             return False
+        if topup:
+            # A per-minute refusal wins: waiting that out, not the hourly limit, is what helps.
+            wait = self._backfill_allowance(principal, policies)
+            if wait == 0:
+                return False
+            retry = wait if wait > 0 else retry
         self.close_connection = True
         self._send_json(429, {"error": "slow down"}, {"Retry-After": str(retry)})
         return True
+
+    def _backfill_allowance(self, principal, policies):
+        """Spend one first-backfill write when only the steady write limit refused.
+
+        Returns 0 on admission, the Retry-After of another budget that refused,
+        or -1 when the allowance is spent. Every other budget (per-minute
+        included) is still charged, and refunded if the allowance is spent.
+        """
+        gateway = self.server.gateway
+        others = [(limit, ident) for limit, ident in policies if limit is not gateway.write_limit]
+        wait = gateway.limiter.check(others)
+        if wait:
+            return wait
+        if backfill_allowance.admit(
+            gateway.db,
+            workspace_id=principal.workspace_id,
+            connection_id=principal.connection_id,
+            now=gateway.wall_clock(),
+            limits=gateway.backfill,
+        ):
+            return 0
+        gateway.limiter.refund(others)
+        return -1
 
     def _dispatch(self):
         self._response_started = False

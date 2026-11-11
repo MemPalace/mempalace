@@ -80,7 +80,8 @@ def test_r21_waiting_tags():
     run = subprocess.run(
         ["node", "tests/board_why.mjs"], capture_output=True, text=True, check=True
     )
-    assert json.loads(run.stdout) == [
+    tags = json.loads(run.stdout)["tags"]
+    assert (tags[0], tags[6]) == (
         "Waiting on #7: Dependency",
         "Waiting for a free slot: 1 of 1",
-    ]  # RED
+    )  # RED

@@ -19,6 +19,7 @@ import { deriveChatState, seenStore, clearSeen } from "./chatstate.js";
 import { renderRail, renderPhoneBar, renderPhoneTabs } from "./rail.js";
 import { boardView as renderBoard, bindBoard, cardId, chatTag, loadChatTimes, roveTo } from "./board.js";
 import { createDetails } from "./details.js";
+import { addBlockers, parseBlockerNumbers, removeBlocker } from "./blockers.js";
 import { resolveRoute } from "./routes.js";
 import { createNeeds } from "./needs.js";
 import { createMemory } from "./memory.js";
@@ -377,7 +378,7 @@ function navigation() {
   if (!boardNav) return;
   const board = currentBoard();
   // Rules, Console, Settings, Decide and Projects are their own pages: they keep their heading on a phone.
-  const view = state.base === "#/needs" || state.base === "#/" ? "needs" : state.base.startsWith("#/memory") ? "memory" : state.base.startsWith("#/space/") ? "space"
+  const view = state.base === "#/needs" || state.base === "#/" ? "needs" : state.base.startsWith("#/memory") ? "memory" : state.base.startsWith("#/console") ? "console" : state.base.startsWith("#/space/") ? "space"
     : /^#\/board\/[^/?]+\/chat$|^#\/chat\//.test(state.base) ? "chat" : /^#\/board\/[^/?]+$/.test(state.base) ? "board" : "page";
   const needsByBoard = {};
   for (const card of needsCards()) needsByBoard[card.board] = (needsByBoard[card.board] || 0) + 1;
@@ -500,7 +501,7 @@ function boardView() {
   const cards = boardCards(), from = state.fromChat && cards.find((card) => card.number === state.fromChat.number);
   const made = from && chatTag(from, messages).split(" · ")[1];
   const fromBar = from ? `<div class="m-frombar"><span role="status">Showing <b>${e(cardId(board, from.number))}</b>${made ? `, made in chat at ${e(made)}` : ", from chat"}</span><a class="btn" href="#/board/${enc(board.slug)}/chat" data-action="from-chat-back">Back to chat</a></div>` : "";
-  content.innerHTML = fromBar + renderBoard({ board, cards, me: state.me.actor, filter: state.boardFilter || "all", selected: state.selected, messages, adding: state.addingCard, sheet: phone(), doneAll, people: Object.entries(state.me.people || {}).map(([ref, name]) => ({ ref, name })), column });
+  content.innerHTML = fromBar + renderBoard({ board, cards, me: state.me.actor, filter: state.boardFilter || "all", selected: state.selected, messages, adding: state.addingCard, sheet: phone(), doneAll, canPrioritize: state.me.can_admin === true, people: Object.entries(state.me.people || {}).map(([ref, name]) => ({ ref, name })), column });
   if (backlog) content.querySelector(".backlog").open = true;
   // Each card carries its actions button (m9); the menu returns focus to it by id.
   content.querySelectorAll(".workbench-board .card[data-card] .card-top").forEach((top) => {
@@ -671,7 +672,7 @@ async function cardPanel(number, epoch) {
     const shown = detailsUI.show(card, { board, me: state.me.actor, messages: state.chatBoard === card.board ? state.chat : [], strip: chatOrigin ? { kind: "chat", row: chatOrigin.id, source: chatOrigin.dataset.src } : state.base.startsWith("#/board/") && state.workbenchChat?.dock.isOpen() ? { kind: "board" } : null });
     if (tab !== "details") detailsUI.selectTab(tab);
     panel.querySelector('form[data-form="comment"]')?.setAttribute("aria-busy", String(state.pending.has(`card-${number}`)));
-    panel.querySelectorAll('[data-action="edit-card"], [data-action="panel-move"], [data-action="handoff"]').forEach((button) => { button.disabled = state.pending.has(`card-${number}`); });
+    panel.querySelectorAll('[data-action="edit-card"], [data-action="panel-move"], [data-action="panel-priority"], [data-action="handoff"]').forEach((button) => { button.disabled = state.pending.has(`card-${number}`); });
     // Keep the existing versioned ask actions and call tree reachable on card routes.
     // Only an ask waiting on this person needs these versioned answer controls; Activity already lists the rest (m10).
     const asks = card.ask != null && card.ask_to === state.me.actor ? `<ol class="log">${conversation({ ...card, events: (card.events || []).filter((ev) => ev.options || ev.kind === "decide") })}</ol>` : "";
@@ -982,8 +983,12 @@ function adminScreen() {
   navigation();
 }
 function consoleScreen() {
-  consoleUI ??= createConsole({ mount: () => root.querySelector("#content"), api, e });
-  consoleUI.show();
+  consoleUI ??= createConsole({
+    mount: () => root.querySelector("#content"), api, e,
+    // Picking another agent keeps the choice in the address, so a reload or a shared link lands on it.
+    onSelect: (id) => { const hash = `#/console?agent=${encodeURIComponent(id)}`; history.replaceState(history.state, "", hash); state.route = state.base = hash; },
+  });
+  consoleUI.show(new URLSearchParams(state.base.split("?")[1] || "").get("agent"));
   title("Console");
 }
 async function refresh({ background = false, events = [] } = {}) {
@@ -1048,7 +1053,7 @@ async function refresh({ background = false, events = [] } = {}) {
       await memoryView(epoch, background);
     } else if (/^#\/chat(?:\/|$)/.test(state.base)) {
       boardView();
-    } else if (state.base === "#/console") {
+    } else if (/^#\/console(?:\?|$)/.test(state.base)) {
       if (!background) consoleScreen();
     } else if (state.base === "#/settings") {
       if (!background || events.some((event) => event.kind.startsWith("webhook."))) await settingsView(epoch);
@@ -1295,14 +1300,14 @@ async function route() {
   if (direct) { state.base = resolveRoute("#/", { boards: state.boards, last }); state.rebase = Number(hash.slice(7)); }
   const start = decideStart(hash);
   if (!/^#\/card\/[1-9]\d*$/.test(hash)) {
-    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board\/[^/?]+(?:\/chat)?|space\/[^/?]+)|start|needs|boards|rules|memory(?:\?.*)?|chat(?:\/[^/?]+)?|console|settings|admin)$/.test(hash) ? hash : "#/");
+    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board\/[^/?]+(?:\/chat)?|space\/[^/?]+)|start|needs|boards|rules|memory(?:\?.*)?|chat(?:\/[^/?]+)?|console(?:\?agent=[^&#]+)?|settings|admin)$/.test(hash) ? hash : "#/");
     state.card = null;
   } else if (state.base === "#/admin") {
     state.base = resolveRoute("#/", { boards: state.boards, last });
   }
   if (state.base !== previousBase) state.workbenchChat?.dispose();
   if (previousBase === "#/admin") adminUI?.stop();
-  if (previousBase === "#/console" && state.base !== "#/console") consoleUI?.stop();
+  if (previousBase.startsWith("#/console") && !state.base.startsWith("#/console")) consoleUI?.stop();
   if (previousBase === "#/decide" && state.base !== "#/decide") {
     queueFlush(true); queueStop(); state.queue = null; state.queueFocus = "";
   }
@@ -1488,6 +1493,9 @@ root.addEventListener("click", async (event) => {
     else if (action === "panel-move") {
       const status = root.querySelector("#card-status").value;
       if (status === "review") reviewForm(); else await move(state.card.number, status);
+    } else if (action === "panel-priority") {
+      const priority = root.querySelector("#card-priority").value;
+      if (priority !== (state.card.priority || "normal")) await mutate(`card-${state.card.number}`, () => api(`/api/cards/${state.card.number}`, { method: "PATCH", body: { version: state.card.version, priority } }));
     } else if (action === "approve-proposal" || action === "reject-proposal") await approveProposal(state.card.number, state.card.version, action === "approve-proposal");
     else if (action === "children-toggle") {
       const card = findCard(number);
@@ -1533,6 +1541,7 @@ root.addEventListener("click", async (event) => {
     } else if (action === "new-card") newCardForm();
     else if (action === "edit-card") newCardForm(state.card);
     else if (action === "handoff") handoffForm(state.card);
+    else if (action === "unblock") await mutate(`card-${state.card.number}`, () => api(`/api/cards/${state.card.number}`, { method: "PATCH", body: { blocked_by: removeBlocker(state.card, Number(b.dataset.blocker)), version: state.card.version } }));
     else if (action === "new-board") openOnboarding();
     else if (action === "logout") {
       state.needsUI?.stop(); state.needsUI = null;
@@ -1560,6 +1569,8 @@ root.addEventListener("submit", async (event) => {
   }
   const payload = data(form), kind = form.dataset.form;
   if (kind === "reply" && !payload.reply?.trim()) { showError("Enter a reply."); return; }
+  const blockerNumbers = kind === "blockers" ? parseBlockerNumbers(payload.blockers) : null;
+  if (kind === "blockers" && !blockerNumbers) { showError("Enter the card number that blocks this card."); return; }
   if (kind === "handoff" && (!payload.note?.trim() || !payload.to?.trim())) { showError("Enter a recipient and a note."); return; }
   if (kind === "handoff" && form.dataset.connectionsOnly === "true" && !/^conn:\S+$/.test(payload.to)) {
     showError("Choose an agent using conn: followed by its name.");
@@ -1590,6 +1601,10 @@ root.addEventListener("submit", async (event) => {
     else if (kind === "new-card") await mutate("new-card", async () => {
       const card = await api(`/api/boards/${enc(form.dataset.board)}/cards`, { method: "POST", body: payload });
       location.hash = `#/card/${card.number}`;
+    });
+    else if (kind === "blockers") await mutate(`card-${state.card.number}`, async () => {
+      await api(`/api/cards/${state.card.number}`, { method: "PATCH", body: { blocked_by: addBlockers(state.card, blockerNumbers), version: state.card.version } });
+      form.reset();
     });
     else if (kind === "edit-card") await mutate(`card-${state.card.number}`, () => api(`/api/cards/${state.card.number}`, { method: "PATCH", body: { ...payload, version: state.card.version } }));
     else if (kind === "review") await move(state.card.number, "review", { ...payload, options: payload.options.split("\n").map((v) => v.trim()).filter(Boolean) });

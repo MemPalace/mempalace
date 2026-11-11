@@ -53,6 +53,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
+from commonplace.boards.priority import name as priority_name
 from commonplace.boards.store import BoardStore
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import log_failure
@@ -457,23 +458,39 @@ def _board(ctx, board):
 
 def _snapshot(ctx, st, board, role):
     """Pre-transaction control snapshot: live config with [runner], role, machine and
-    the caller's requester authority (lock order: control reads before runner.sqlite3)."""
+    the caller's requester authority (lock order: control reads before runner.sqlite3).
+    Without ``[runner]`` only the board's own trusted project seat passes, for its seat
+    role; the version it returns may then be ``None``."""
     principal = ctx.principal
     if getattr(principal, "runner", None) is not None:
         raise DurableError("not_allowed", 403, "requester not allowed")
     _check_role(role)
     with st.connection() as conn:
         version = orch_store.accepted_in(conn, board)
-    if version is None:
-        raise DurableError("not_configured", 409, "board has no orchestrator config")
-    try:
-        config = version.config()
-    except ValueError:
-        raise DurableError("config_invalid", 409, "live config does not parse") from None
-    if not config.has_runner:
-        raise DurableError("not_configured", 409, "board has no orchestrator config")
+    config = None
+    if version is not None:
+        try:
+            config = version.config()
+        except ValueError:
+            raise DurableError("config_invalid", 409, "live config does not parse") from None
+    seat = None if principal.person else _seat(ctx)
+    if config is None or not config.has_runner:
+        # No machine grants authority here: only the board's own trusted seat coordinates.
+        if seat is None or seat[:2] != (board, role):
+            raise DurableError("not_configured", 409, "board has no orchestrator config")
+        if not seat[2]:
+            raise DurableError(
+                "not_allowed",
+                403,
+                "this seat is not trusted yet; a workspace owner approves its start "
+                "permissions in Project settings",
+            )
+        return version
     if role not in config.roles:
         raise DurableError("unknown_role", 404, "role not found")
+    if seat is not None and seat[0] != board:
+        # A project seat coordinates its own board, whatever a machine grants it.
+        raise DurableError("not_allowed", 403, "requester not allowed")
     machine = registry.get_machine(ctx.db, principal.workspace_id, config.runner.machine)
     if machine is None or machine["revoked_at"]:
         raise DurableError("not_allowed", 403, "requester not allowed")
@@ -482,8 +499,25 @@ def _snapshot(ctx, st, board, role):
     return version
 
 
+def _seat(ctx):
+    """``(board, role, trusted)`` of the project seat this live PAT holds, else ``None``."""
+    from commonplace.projects import seats
+
+    principal = ctx.principal
+    cid = getattr(principal, "connection_id", None)
+    live = ctx.db.authenticate_connection(cid) if cid else None
+    if live is None or live.auth != "pat" or live.workspace_id != principal.workspace_id:
+        return None
+    held = seats.held_by(ctx.db, principal.workspace_id, live.connection_id)
+    return None if held is None else (*held, live.policy.trust == "trusted")
+
+
 def _same_version(conn, board, version):
     current = orch_store.accepted_in(conn, board)
+    if version is None:  # a seat's lease on a board without a config
+        if current is not None:
+            raise DurableError("config_changed", 409, "live config changed; retry")
+        return
     if current is None or (current.version, current.sha256) != (version.version, version.sha256):
         raise DurableError("config_changed", 409, "live config changed; retry")
 
@@ -1161,16 +1195,16 @@ def unstarted_todo(ctx, st, board_row) -> list[dict]:
     """Cards in ``todo`` with no start for their current todo occurrence: no job in
     ``queued|leased|starting|uncertain`` and no ``started`` job whose ``started_at`` is
     strictly after the card's latest firing event (todo entry or plan approval).
-    ``cancelled`` and ``failed`` jobs never hide a card.
+    ``cancelled`` and ``failed`` jobs never hide a card. Listed by priority, then number.
 
     Both stores stamp whole seconds, so a start and a firing event in the same second
     cannot be ordered; such a tie stays listed (a possible false positive, never a
     hidden unstarted card)."""
     with BoardStore(ctx.workspace_dir()).connection() as conn:
         cards = conn.execute(
-            "SELECT t.id, t.title, (SELECT e.created_at FROM task_events e WHERE e.task_id=t.id "
-            f"AND {FIRING_EVENT} ORDER BY e.id DESC LIMIT 1) AS boundary "
-            "FROM tasks t WHERE t.board_id=? AND t.status='todo' ORDER BY t.id",
+            "SELECT t.id, t.title, t.priority, (SELECT e.created_at FROM task_events e "
+            f"WHERE e.task_id=t.id AND {FIRING_EVENT} ORDER BY e.id DESC LIMIT 1) AS boundary "
+            "FROM tasks t WHERE t.board_id=? AND t.status='todo' ORDER BY t.priority, t.id",
             (board_row["id"],),
         ).fetchall()
     if not cards:
@@ -1198,7 +1232,14 @@ def unstarted_todo(ctx, st, board_row) -> list[dict]:
             ):
                 hidden = True
         if not hidden:
-            listed.append({"card": row["id"], "title": row["title"], "todo_since": row["boundary"]})
+            listed.append(
+                {
+                    "card": row["id"],
+                    "title": row["title"],
+                    "priority": priority_name(row["priority"]),
+                    "todo_since": row["boundary"],
+                }
+            )
     return listed
 
 
@@ -1224,6 +1265,75 @@ def _derived(step, job_state):
     if target != step["state"] and target in TRANSITIONS[step["state"]]:
         return {**step, "state": target}
     return step
+
+
+THREAD_JOB_STATES = ("started", "waiting", "in_doubt", "needs_person")
+
+
+def _thread_jobs(ctx, st, board_row, role, steps, now) -> list[dict]:
+    """Builders started outside the runner (kind ``thread``), derived read-only from
+    two facts that must both hold: the journal recorded the start of an unvoided,
+    unfinished thread step for a card (``started`` or ``waiting``; it stays listed
+    when a later epoch marks the step ``in_doubt``), and that card is in ``doing``
+    on this board under a live claim. Newest first, at most ``MAX_LIST``."""
+    found = [
+        row
+        for row in steps
+        if row["kind"] == "thread"
+        and row["card"] is not None
+        and row["voided_at"] is None
+        and row["state"] in THREAD_JOB_STATES
+    ]
+    if not found:
+        return []
+    # Filter by the card's claim before capping, so stale open steps never crowd out
+    # a live builder.
+    numbers = sorted({row["card"] for row in found})
+    doing = {}
+    with BoardStore(ctx.workspace_dir()).connection() as conn:
+        for start in range(0, len(numbers), 500):
+            chunk = numbers[start : start + 500]
+            for row in conn.execute(
+                "SELECT id, assignee, claim_until FROM tasks WHERE board_id=? AND status='doing' "
+                "AND assignee IS NOT NULL AND assignee!='' AND claim_expired_at IS NULL "
+                "AND (claim_until IS NULL OR claim_until>?) AND id IN ("
+                + ",".join("?" * len(chunk))
+                + ")",
+                (board_row["id"], now, *chunk),
+            ):
+                doing[row["id"]] = row
+    found = [row for row in found if row["card"] in doing][-MAX_LIST:]
+    if not found:
+        return []
+    marks = ",".join("?" * len(found))
+    with st.connection() as conn:
+        started = dict(
+            conn.execute(
+                "SELECT step_key, MIN(at) FROM orch_journal WHERE board=? AND role=? "
+                "AND event='record' AND state IN ('started','waiting') "
+                f"AND step_key IN ({marks}) GROUP BY step_key",
+                (board_row["slug"], role, *(row["step_key"] for row in found)),
+            ).fetchall()
+        )
+    return [
+        {
+            "id": None,
+            "task_number": row["card"],
+            "state": row["state"],
+            "outcome_code": row["code"],
+            "thread_id": None,
+            "started_at": started[row["step_key"]],
+            "updated_at": row["updated_at"],
+            "step_key": row["step_key"],
+            "source": "journal",
+            "assignee": doing[row["card"]]["assignee"],
+            "claim_until": doing[row["card"]]["claim_until"],
+            "detail": row["detail"],
+            "evidence": json.loads(row["evidence"]) if row["evidence"] else None,
+        }
+        for row in reversed(found)
+        if row["step_key"] in started
+    ]
 
 
 def _checkpoint(ctx, st, board_row, role, now, cards):
@@ -1282,6 +1392,10 @@ def _checkpoint(ctx, st, board_row, role, now, cards):
                 inbox_note = {"inbox": note}
     except Exception as exc:
         log_failure(logger, "checkpoint inbox unavailable", exc)
+    job_rows = [
+        *({**dict(row), "source": "runner"} for row in job_rows),
+        *_thread_jobs(ctx, st, board_row, role, steps, now),
+    ]
     return {
         **inbox_note,
         "board": board,

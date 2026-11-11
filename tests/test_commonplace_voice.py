@@ -4,6 +4,7 @@ import http.client
 import importlib
 import json
 import logging
+import re
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -455,15 +456,15 @@ def test_engine_lazy_verbatim_threads_idle_per_language(monkeypatch):
     monkeypatch.setenv("COMMONPLACE_VOICE_THREADS", "2")
     now, loaded = [100.0], []
 
-    def loader(lang, threads):
-        loaded.append((lang, threads))
+    def loader(lang, threads, model):
+        loaded.append((lang, threads, model))
         return lambda pcm: " \n Café  “yes”\n日本語 <script> \t"
 
     engine = voice.VoiceEngine(loader, lambda: now[0])
     try:
         assert loaded == []
         assert engine.transcribe("en", b"\0\0") == "Café  “yes”\n日本語 <script>"
-        assert loaded == [("en", 2)]
+        assert loaded == [("en", 2, "base")]
         now[0] += 100
         engine.transcribe("en", b"\0\0")
         engine.transcribe("nl", b"\0\0")
@@ -473,7 +474,7 @@ def test_engine_lazy_verbatim_threads_idle_per_language(monkeypatch):
         engine.unload_idle()
         assert list(engine._models) == ["nl"]
         engine.transcribe("en", b"\0\0")
-        assert loaded == [("en", 2), ("nl", 2), ("en", 2)]
+        assert loaded == [("en", 2, "base"), ("nl", 2, "small"), ("en", 2, "base")]
         now[0] += 600
         engine.unload_idle()
         assert not engine._models and engine._timer is None
@@ -485,7 +486,7 @@ def test_engine_serializes_loading_and_transcription():
     entered, release = threading.Event(), threading.Event()
     loaded, calls = [], []
 
-    def loader(lang, threads):
+    def loader(lang, threads, model):
         loaded.append(lang)
 
         def transcribe(pcm):
@@ -537,7 +538,9 @@ def test_engine_trims_only_after_unloading_models():
         assert not engine._models
         trimmed.append(now[0])
 
-    engine = voice.VoiceEngine(lambda lang, threads: lambda pcm: "yes", lambda: now[0], trim=trim)
+    engine = voice.VoiceEngine(
+        lambda lang, threads, model: lambda pcm: "yes", lambda: now[0], trim=trim
+    )
     try:
         engine.unload_idle()
         engine.close()
@@ -645,13 +648,223 @@ def test_real_loaders_use_fixed_local_models_and_no_global_ort_patch(monkeypatch
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=Whisper))
     pcm = b"\0\x80\0\x40"
     caplog.set_level(logging.DEBUG)
-    assert voice._load_model("en", 3)(pcm) == " yes  "
+    assert voice._load_model("en", 3, "base")(pcm) == " yes  "
     assert ort.InferenceSession is Session
     assert options[0].intra_op_num_threads == 3 and options[0].inter_op_num_threads == 1
     assert len(sessions_created) == 2
     assert all(kw["providers"] == ["CPUExecutionProvider"] for _, kw in sessions_created)
-    assert voice._load_model("nl", 3)(pcm) == " Ik  zei nee. "
+    assert voice._load_model("nl", 3, "small")(pcm) == " Ik  zei nee. "
     assert whisper_options == [
         (("small",), {"device": "cpu", "compute_type": "int8", "cpu_threads": 3})
     ]
     assert "PRIVATE_TRANSCRIPT" not in caplog.text
+
+
+NL_MODEL = "COMMONPLACE_VOICE_MODEL_NL"
+
+
+def test_defaults_keep_the_existing_models():
+    config = voice.load_config({})
+    assert config == voice.VoiceConfig(True, {"en": "base", "nl": "small"})
+
+
+def test_dutch_model_setting_reaches_the_whisper_loader(monkeypatch):
+    import sys
+
+    created = []
+
+    class Whisper:
+        def __init__(self, *args, **kwargs):
+            created.append(args)
+
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=Whisper))
+    config = voice.load_config({NL_MODEL: "example-org/whisper-nl-ct2"})
+    voice._load_model("nl", 1, config.models["nl"])
+    assert created == [("example-org/whisper-nl-ct2",)]
+    assert config.models == {"en": "base", "nl": "example-org/whisper-nl-ct2"}
+
+
+def test_engine_passes_configured_model_to_loader():
+    seen = []
+
+    def loader(lang, threads, model):
+        seen.append((lang, model))
+        return lambda pcm: "ja"
+
+    engine = voice.VoiceEngine(loader, models={"en": "base", "nl": "org/nl-model"})
+    try:
+        assert engine.transcribe("nl", b"\0\0") == "ja"
+    finally:
+        engine.close()
+    assert seen == [("nl", "org/nl-model")]
+
+
+@pytest.mark.parametrize(
+    "env,fragment",
+    [
+        ({"COMMONPLACE_VOICE": "yes"}, "COMMONPLACE_VOICE must be 'on' or 'off'"),
+        ({"COMMONPLACE_VOICE": ""}, "COMMONPLACE_VOICE must be 'on' or 'off'"),
+        ({NL_MODEL: ""}, f"{NL_MODEL} is empty"),
+        ({NL_MODEL: "   "}, f"{NL_MODEL} is empty"),
+        ({NL_MODEL: "bad model;rm"}, f"{NL_MODEL} must be"),
+        ({NL_MODEL: "../escape"}, f"{NL_MODEL} must be"),
+        ({NL_MODEL: "org/../x"}, f"{NL_MODEL} must be"),
+        ({NL_MODEL: "./nl"}, f"{NL_MODEL} must be"),
+        ({NL_MODEL: "models/nl/ct2"}, f"{NL_MODEL} must be"),
+        ({NL_MODEL: "https://example.invalid/model"}, f"{NL_MODEL} must be"),
+        ({NL_MODEL: "x" * 201}, f"{NL_MODEL} must be"),
+        ({NL_MODEL: "/does/not/exist-voice-model"}, "not a directory on this server"),
+        (
+            {"COMMONPLACE_VOICE_MODEL_EN": "huge"},
+            "COMMONPLACE_VOICE_MODEL_EN='huge' is not supported",
+        ),
+        ({"COMMONPLACE_VOICE_MODEL_EN": ""}, "COMMONPLACE_VOICE_MODEL_EN is empty"),
+    ],
+)
+def test_invalid_voice_settings_fail_clearly(env, fragment):
+    with pytest.raises(voice.VoiceConfigError, match=re.escape(fragment)):
+        voice.load_config(env)
+
+
+def test_local_model_directory_is_accepted(tmp_path):
+    model_dir = tmp_path / "nl-model"
+    model_dir.mkdir()
+    assert voice.load_config({NL_MODEL: str(model_dir)}).models["nl"] == str(model_dir)
+
+
+def test_models_are_not_validated_while_voice_is_off():
+    config = voice.load_config({"COMMONPLACE_VOICE": "off", NL_MODEL: ""})
+    assert config.enabled is False
+
+
+def test_missing_model_at_load_time_is_an_error_not_a_default():
+    for model in (None, ""):
+        with pytest.raises(voice.VoiceConfigError, match="No voice model is configured"):
+            voice._load_model("nl", 1, model)
+
+
+def test_install_refuses_to_start_with_invalid_settings(app, monkeypatch):
+    hub, _ = app
+    monkeypatch.setenv(NL_MODEL, "")
+    with pytest.raises(voice.VoiceConfigError, match=NL_MODEL):
+        voice.install(hub.gateway)
+
+
+def test_instance_switch_off_disables_cloud_voice(app, monkeypatch, caplog):
+    hub, _ = app
+    enable(app)
+    monkeypatch.setenv("COMMONPLACE_VOICE", "off")
+    voice.install(hub.gateway)
+    hub.gateway.voice_engine = FakeEngine()
+    status, body = call(app)
+    assert status == 200 and body["available"] is False
+    assert call(app, "PATCH", body={"enabled": True}) == (
+        503,
+        {"error": "Voice is switched off on this instance"},
+    )
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0" * 100) == (
+        503,
+        {"error": "Voice is switched off on this instance"},
+    )
+    assert hub.gateway.voice_engine.calls == []
+
+
+def test_unusable_model_setting_at_request_time_is_a_clear_503_and_refunds(limited_voice, caplog):
+    app, user = limited_voice
+    hub, _ = app
+
+    def broken(language, pcm):
+        raise voice.VoiceConfigError("COMMONPLACE_VOICE_MODEL_NL is empty")
+
+    hub.gateway.voice_engine.transcribe = broken
+    pcm = b"\0\0" * 16000
+    status, body = call(app, "POST", "/api/voice/transcribe?lang=nl", pcm)
+    assert (status, body) == (503, {"error": "Voice is not configured correctly on this server."})
+    assert "COMMONPLACE_VOICE_MODEL_NL is empty" in caplog.text
+    assert plans.transcription_used(hub.db, user) == 0
+
+
+def test_voice_calls_no_external_provider(app, monkeypatch):
+    import socket
+
+    real_getaddrinfo, real_connect = socket.getaddrinfo, socket.socket.connect
+
+    def local_only(host):
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            raise AssertionError(f"voice tests must not reach outside hosts: {host}")
+
+    def getaddrinfo(host, *args, **kwargs):
+        local_only(host)
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    def connect(self, address):
+        if isinstance(address, tuple):
+            local_only(address[0])
+        return real_connect(self, address)
+
+    enable(app)
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    # The fake engine stands in for the provider: no model download, no network.
+    assert call(app, "POST", "/api/voice/transcribe?lang=nl", b"\0\0" * 100)[0] == 200
+
+
+@pytest.fixture
+def real_free_cap(app, monkeypatch):
+    """The shipped free plan (10 minutes a day), not a shrunken test value."""
+    monkeypatch.setenv("COMMONPLACE_PLANS", "on")
+    assert plans.PLANS["free"].transcription_seconds == 600
+    return fresh_voice_user(app[0], "cap@example.com")
+
+
+def test_free_cap_allows_exactly_the_cap_then_refuses(real_free_cap):
+    app, user = real_free_cap
+    hub, _ = app
+    minute = b"\0\0" * 16000 * 60
+    for _ in range(10):
+        assert call(app, "POST", "/api/voice/transcribe?lang=nl", minute)[0] == 200
+    assert plans.transcription_used(hub.db, user) == 600
+    status, body = call(app, "POST", "/api/voice/transcribe?lang=nl", b"\0\0")
+    assert status == 429 and body["limit"] == "transcription"
+    assert plans.transcription_used(hub.db, user) == 600
+    assert len(hub.gateway.voice_engine.calls) == 10
+
+
+def test_free_cap_refuses_a_clip_that_would_cross_the_cap(real_free_cap):
+    app, user = real_free_cap
+    hub, _ = app
+    for _ in range(9):
+        assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0" * 16000 * 60)[0] == 200
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0" * 16000 * 59)[0] == 200
+    assert plans.transcription_used(hub.db, user) == 599
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0" * 16001)[0] == 429
+    assert plans.transcription_used(hub.db, user) == 599
+    assert call(app, "POST", "/api/voice/transcribe?lang=en", b"\0\0" * 16000)[0] == 200
+
+
+def test_paid_plan_is_not_capped(real_free_cap):
+    app, user = real_free_cap
+    hub, _ = app
+    plans.set_plan(hub.db, user, "paid", actor=hub.admin)
+    for _ in range(11):
+        assert call(app, "POST", "/api/voice/transcribe?lang=nl", b"\0\0" * 16000 * 60)[0] == 200
+    assert plans.transcription_used(hub.db, user) == 0
+
+
+def test_workspace_switch_off_blocks_before_the_cap_is_touched(real_free_cap):
+    app, user = real_free_cap
+    hub, _ = app
+    assert call(app, "PATCH", body={"enabled": False})[0] == 200
+    assert call(app, "POST", "/api/voice/transcribe?lang=nl", b"\0\0" * 16000)[0] == 403
+    assert plans.transcription_used(hub.db, user) == 0
+
+
+def test_engine_is_rebuilt_when_the_configuration_changes(monkeypatch):
+    monkeypatch.setattr(voice, "_engine", None)
+    first = voice.engine(voice.load_config({}))
+    try:
+        assert voice.engine(voice.load_config({})) is first
+        second = voice.engine(voice.load_config({NL_MODEL: "org/nl-model"}))
+        assert second is not first and second.models["nl"] == "org/nl-model"
+    finally:
+        voice._engine and voice._engine.close()

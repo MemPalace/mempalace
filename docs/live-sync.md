@@ -103,6 +103,27 @@ shows `Backfill: active, X of 5000 attempts` or
 Free's server cadence still applies. Additional backfill exposure is bounded by
 about 5,000 × (512 KiB + one record); retries also consume attempts.
 
+### Server-side limits
+
+Untrusted capture and import connections have a steady write limit of 120 writes per
+hour (`COMMONPLACE_WRITE_LIMIT`, `COMMONPLACE_WRITE_LIMIT_SECONDS`). A refused write returns
+`429` with `Retry-After`, and the client backs off that token. The per-minute request
+limit of the connection always applies.
+
+When only that steady write limit refuses a `POST /api/capture` or `/api/import`, the
+server spends a bounded first-backfill allowance instead, so a first open of a space
+can catch up. It is counted durably, not by stream, so restarts, new thread ids and
+offset 0 do not re-arm it:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `COMMONPLACE_BACKFILL_PER_CONNECTION` | 5000 | Extra writes per connection, once, never renewed |
+| `COMMONPLACE_BACKFILL_WINDOW_SECONDS` | 86400 | The connection's allowance closes this long after first use |
+| `COMMONPLACE_BACKFILL_PER_SPACE` | 20000 | Extra writes across all connections of a workspace |
+| `COMMONPLACE_BACKFILL_SPACE_PERIOD_SECONDS` | 2592000 | The workspace cap renews only after this period |
+
+Set a count to `0` to switch the allowance off. Invalid values stop the gateway at startup.
+
 The sync event feed contains settings and timing signals, without transcript or
 memory content. Paid and unrestricted instances long-poll for up to 25 seconds;
 Free polls at its next window. Workspace members can see sync toggles and request

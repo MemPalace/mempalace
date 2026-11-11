@@ -478,6 +478,7 @@ export async function mountProject(host, { slug, api, e, settings = false, curre
     const root = host.querySelector(".workbench-project");
     if (globalThis.matchMedia?.("(max-width: 699px)").matches) { root.setAttribute("role", "dialog"); root.setAttribute("aria-modal", "true"); }
     mountAgentLimit(host.querySelector("[data-project-limit]"), {project, api, e, current: active, onSaved: markSaved});
+    import("./orchstatus.js").then(m => m.mountOrchStatus(host.querySelector("[data-project-trust]"), {project, api, e, current: active})).catch(error => console.error("Coordinator status unavailable", error));
     const check = host.querySelector("[data-project-check]");
     if (check) check.onclick = async () => {
       if (check.disabled || !active()) return;

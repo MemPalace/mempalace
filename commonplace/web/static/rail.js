@@ -11,6 +11,7 @@ const paths = {
   chat: '<path d="M2.5 3.5h11v7H7.2L4.3 13v-2.5H2.5z"/>',
   settings: '<path d="M2 4.5h7M12.5 4.5H14M2 11.5h1.5M6.5 11.5H14"/><circle cx="10.8" cy="4.5" r="1.6"/><circle cx="5" cy="11.5" r="1.6"/>',
   keys: '<rect x="1.5" y="4" width="13" height="8" rx="1.5"/><path d="M4 7h.1M6.5 7h.1M9 7h.1M11.5 7h.1M5 9.5h6"/>',
+  console:'<rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="m4.5 6.5 2 1.8-2 1.8M8.5 10.5h3"/>',
   chevron: '<path d="m4.5 6 3.5 3.5L11.5 6"/>',
 };
 const icon = (name) => `<svg class="i" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name]}</svg>`;
@@ -32,10 +33,11 @@ export function renderRail({ workspace = 'Commonplace', user = '', boards = [], 
     <button class="cmdk" id="cmdk" data-action="palette" aria-keyshortcuts="Control+K Meta+K">${icon('search')}<span>Search or do…</span><kbd>⌘/Ctrl K</kbd></button>
     <a class="nav" href="#/needs" data-nav="needs"${current(view === 'needs')}>${icon('needs')}Needs me ${badge(needs, 'items')}</a>
     <a class="nav" href="#/memory" data-nav="memory"${current(view === 'memory')}>${icon('memory')}Memory</a>
+    <a class="nav" href="#/console" data-nav="console"${current(view === 'console')}>${icon('console')}Console</a>
     <div class="rail-h"><span id="ph">Projects</span><button class="iconbtn" id="new-project" data-action="new-board" aria-label="New project">+</button></div>
     <div role="list" aria-labelledby="ph">${boards.map((b) => `<div role="listitem"><a class="proj" href="${boardHref(b)}"${current(['board', 'chat', 'settings', 'space'].includes(view) && b.slug === board?.slug)}><span class="sw" aria-hidden="true"></span><span class="pn"><b>${e(b.name || b.slug)}</b><small>${projectSubline(b)}</small></span>${badge(needsByBoard[b.slug], 'need you')}</a></div>`).join('')}</div>
     <div class="rail-foot"><button class="nav" id="shortcuts-link" data-action="shortcuts">${icon('keys')}Shortcuts <kbd>?</kbd></button>
-    <details class="user-menu"><summary class="me"><span class="mark" aria-hidden="true">${e(Array.from(user)[0] || '?')}</span>${e(user || 'Account')}${badge(rulesWaiting, 'rules waiting')}</summary><div class="user-links"><a href="#/rules">Rules${badge(rulesWaiting, 'waiting')}</a><a href="#/console">Console</a><a href="#/settings">Workspace settings</a>${can_admin === true ? '<a href="#/admin">Admin</a>' : ''}<button data-action="logout">Sign out</button></div></details></div>
+    <details class="user-menu"><summary class="me"><span class="mark" aria-hidden="true">${e(Array.from(user)[0] || '?')}</span>${e(user || 'Account')}${badge(rulesWaiting, 'rules waiting')}</summary><div class="user-links"><a href="#/rules">Rules${badge(rulesWaiting, 'waiting')}</a><a href="#/settings">Workspace settings</a>${can_admin === true ? '<a href="#/admin">Admin</a>' : ''}<button data-action="logout">Sign out</button></div></details></div>
   </nav>`;
 }
 

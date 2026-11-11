@@ -250,3 +250,19 @@ kbd { font: 500 11px/16px var(--mono); color: var(--text-2); background: var(--s
 /* The short "Memory" title never yields its width to the promise (N5, 700-1099 px). */
 .shell[data-view="memory"] .head h1#title { flex: 0 0 auto; }
 @media (max-width: 699px) { .shell .head .head-sub { flex-basis: 100%; order: 5; } }
+
+/* ---------- Card panel: Runs (cardruns.js) ---------- */
+.card-runs:not([hidden]) { display: flex; flex-direction: column; gap: 8px; }
+.card-runs .run-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+.card-runs .run-list > li { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r); }
+.card-runs .run-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; color: var(--text-2); font-size: 13px; }
+.card-runs .run-state { color: var(--text); font-weight: 600; }
+.card-runs [data-state="uncertain"] { border-color: var(--wait-line); background: var(--wait-bg); }
+.card-runs [data-state="failed"] .run-state { color: var(--block); }
+.card-runs .run-reason, .card-runs .run-thread, .card-runs .run-resolve p { font-size: 12.5px; line-height: 19px; color: var(--text-2); overflow-wrap: anywhere; }
+.card-runs .run-resolve { width: 100%; display: flex; flex-direction: column; gap: 6px; }
+.card-runs .run-resolve-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.card-runs .run-resolve input { flex: 1 1 140px; min-width: 0; }
+.card-runs .run-empty { font-size: 13px; color: var(--text-2); }
+.card-runs .run-note { font-size: 12.5px; color: var(--text-2); }
+.card-runs .run-note:empty { display: none; }

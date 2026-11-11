@@ -16,7 +16,7 @@ from commonplace.control_db import ControlError
 from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
 
-from . import task_types
+from . import priority as priorities, task_types
 from .digest import digest
 from .display import (
     _waiting_on_person as _display_waiting,
@@ -984,7 +984,29 @@ class BoardService:
             blockers=active_blockers(conn, row["id"]),
             released=released and not stuck,
             usage=usage,
+            claim_expired=bool(
+                row["status"] == "doing" and row["claim_until"] and row["claim_until"] <= now()
+            ),
+            plan_review=_plan_waiting(row),
+            agents=self._agent_connected(row["board_wing"]),
         )
+
+    def _agent_connected(self, wing):
+        """Whether any live agent connection can write ``wing``; None when unreadable."""
+        cache = getattr(self, "_projection_cache", None)
+        cache = cache if cache is not None else {}
+        key = ("agent", wing)
+        if key not in cache:
+            try:
+                cache[key] = any(
+                    (q := self._live_connection(c["id"])) is not None
+                    and q.policy.can_write_wing(wing)
+                    for c in self.ctx.db.connections(self.principal.workspace_id)
+                    if not c["revoked_at"]
+                )
+            except (ControlError, ValueError, TypeError):
+                return None
+        return cache[key]
 
     def _usage(self, boards, runner, row):
         from commonplace.projects import orchestration as orch
@@ -1012,11 +1034,12 @@ class BoardService:
         )
 
     def _refuse_waiting(self, conn, row):
+        from commonplace.boards import why
         from commonplace.boards.store import CardRefused
 
         if self._orchestration_on is True:
             reason = self._waiting(conn, row)
-            if reason is not None and reason["code"] != "project_limit":
+            if reason is not None and reason["code"] in why.REFUSING:
                 raise CardRefused(reason["code"], reason["text"])
 
     def orchestrator_inbox(self, board):
@@ -1783,20 +1806,25 @@ class BoardService:
                         from commonplace.boards import why
 
                         summary = dict.fromkeys(why.CODES, 0)
-                        for found in conn.execute(
+                        waiting_ids = conn.execute(
                             "SELECT id FROM tasks WHERE board_id=? AND status!='done' "
                             + ("AND parent_number IS NULL" if top_level else ""),
                             (board["id"],),
-                        ).fetchall():
-                            reason = self._waiting(
-                                conn,
-                                task_row(conn, found["id"]),
-                                usage=waiting_usage,
-                                runner=runner,
-                            )
-                            if reason:
-                                summary[reason["code"]] += 1
+                        ).fetchall()
+                        with self._projection():
+                            for found in waiting_ids:
+                                reason = self._waiting(
+                                    conn,
+                                    task_row(conn, found["id"]),
+                                    usage=waiting_usage,
+                                    runner=runner,
+                                )
+                                if reason:
+                                    summary[reason["code"]] += 1
                         result[-1]["waiting"] = summary
+                        result[-1]["waiting_notes"] = why.notes(
+                            summary, used=waiting_usage.used, cap=waiting_usage.cap
+                        )
             return result
 
     def space_metadata(self, slug):
@@ -2148,7 +2176,7 @@ class BoardService:
                 for row in conn.execute(
                     "SELECT id FROM tasks WHERE board_id=? "
                     + ("AND parent_number IS NULL " if top_level else "")
-                    + "ORDER BY position,id",
+                    + "ORDER BY priority,position,id",
                     (b["id"],),
                 ):
                     task = task_row(conn, row["id"])
@@ -2432,9 +2460,15 @@ class BoardService:
         claim=False,
         task_type=task_types.UNSET,
         type_holder=None,
+        priority=priorities.UNSET,
     ):
         p = self.principal
         label = "" if task_type is task_types.UNSET else task_types.owner_value(p, task_type)
+        rank = (
+            priorities.DEFAULT_RANK
+            if priority is priorities.UNSET
+            else priorities.rank(priorities.owner_value(p, priority))
+        )
         if message_id is not None:
             if (
                 isinstance(message_id, bool)
@@ -2564,7 +2598,7 @@ class BoardService:
         number = cur.lastrowid
         conn.execute(
             "UPDATE tasks SET claim_until=?,heartbeat_at=?,agent_parent=?,proposal_status=?,"
-            "proposed_to=?,review_kind=?,task_type=? WHERE id=?",
+            "proposed_to=?,review_kind=?,task_type=?,priority=? WHERE id=?",
             (
                 until,
                 at if until else None,
@@ -2573,6 +2607,7 @@ class BoardService:
                 p.parent_agent if proposal else None,
                 "decision" if ask is not None else None,
                 label,
+                rank,
                 number,
             ),
         )
@@ -2608,9 +2643,12 @@ class BoardService:
         claim=False,
         blocked_by=_UNSET,
         task_type=task_types.UNSET,
+        priority=priorities.UNSET,
     ):
         if task_type is not task_types.UNSET:
             task_types.owner_value(self.principal, task_type)
+        if priority is not priorities.UNSET:
+            priorities.owner_value(self.principal, priority)
         type_holder = (
             self._type_holder(
                 self._actor(assignee) if assignee is not None else self.principal.actor
@@ -2637,6 +2675,7 @@ class BoardService:
                 claim=claim,
                 task_type=task_type,
                 type_holder=type_holder,
+                priority=priority,
             )
             if blocked_by is not _UNSET:
                 from commonplace.boards.store import CardRefused, set_blockers
@@ -2894,7 +2933,7 @@ class BoardService:
                         if self._orchestration_on is True
                         else ""
                     )
-                    + "ORDER BY assignee IS NULL,position,id",
+                    + "ORDER BY assignee IS NULL,priority,position,id",
                     (
                         b["id"],
                         self.principal.actor,
@@ -3307,6 +3346,22 @@ class BoardService:
             actor = self._update_acquisition_actor(prospective, args)
         return actor, self._type_holder(actor)
 
+    def _priority_rank(self, args):
+        """The owner's requested rank, or None when the update does not set one."""
+        if "priority" not in args:
+            return None
+        return priorities.rank(priorities.owner_value(self.principal, args["priority"]))
+
+    @staticmethod
+    def _priority_change(row, rank):
+        return {} if rank is None or rank == row["priority"] else {"priority": rank}
+
+    @staticmethod
+    def _priority_note(ask, updates):
+        if "priority" in updates and ask["text"] is None:
+            return {**ask, "text": "Priority set to " + priorities.name(updates["priority"])}
+        return ask
+
     def task_update(self, task, *, version=None, **args):
         type_updates = {
             key: task_types.owner_value(self.principal, value)
@@ -3314,8 +3369,10 @@ class BoardService:
             if key == "task_type"
         }
         prospective_actor, type_holder = self._update_type_holder(task, args)
+        priority_update = self._priority_rank(args)
         permitted = {
             "task_type",
+            "priority",
             "title",
             "body",
             "labels",
@@ -3401,7 +3458,7 @@ class BoardService:
                 raise ToolError("no: card is waiting on a person")
             if "lesson" in args and args.get("status", row["status"]) != "done":
                 raise ToolError("no: a lesson requires status done")
-            updates = dict(type_updates)
+            updates = {**type_updates, **self._priority_change(row, priority_update)}
             self._update_waiting(conn, row, args)
             if "labels" in args:
                 labels = args["labels"]
@@ -3532,6 +3589,7 @@ class BoardService:
                 if updates.get("ask") is not None
                 else {"text": review_edit_text}
             )
+            ask = self._priority_note(ask, updates)
             self._record_review_withdrawal(conn, row, status, reason)
             self._log(
                 conn,

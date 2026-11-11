@@ -21,6 +21,7 @@ CONFLICTS = {
     "request_key reused with different arguments",
     "start outcome is uncertain; a workspace owner must resolve it",
     "start is already finished",
+    "start is not uncertain",
 }
 
 

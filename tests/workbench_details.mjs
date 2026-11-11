@@ -64,6 +64,17 @@ const cases = {
     assert.ok(html.includes('Original &lt;description&gt;\n  unchanged'));
     assert.ok(!html.includes('<context>'));
   },
+  priority() {
+    // The owner gets a picker with the current value selected; everyone else reads the name.
+    const owner = renderDetails({ ...card, priority: 'high', can_prioritize: true }, opts);
+    assert.ok(owner.includes('id="card-priority"')); assert.ok(owner.includes('data-action="panel-priority"'));
+    assert.ok(owner.includes('<option value="high" selected>High</option>'));
+    for (const name of ['urgent', 'normal', 'low']) assert.ok(owner.includes(`<option value="${name}">`), name);
+    const reader = renderDetails({ ...card, priority: 'urgent', can_prioritize: false }, opts);
+    assert.ok(!reader.includes('id="card-priority"')); assert.ok(reader.includes('<dt>Priority</dt><dd>Urgent</dd>'));
+    // A card from an older server reads as normal.
+    assert.ok(renderDetails({ ...card }, opts).includes('<dt>Priority</dt><dd>Normal</dd>'));
+  },
   tabs() {
     assert.ok(html.includes('role="tablist" aria-label="Context"'));
     assert.ok(html.includes('id="tab-details" aria-selected="true"'));
@@ -121,7 +132,7 @@ const cases = {
     // A slow old origin must never replace a newly selected card.
     let resolve;
     const mount = { innerHTML: '', addEventListener() {}, removeEventListener() {}, querySelector: () => null };
-    const component = createDetails({ mount, api: () => new Promise((done) => { resolve = done; }) });
+    const component = createDetails({ mount, api: (path) => path.startsWith('/api/chat/') ? new Promise((done) => { resolve = done; }) : Promise.reject(new Error('links are not under test')) });
     const pending = component.show(card, opts);
     await component.show({ ...card, number: 22, message_id: null, title: 'New selection' }, opts);
     resolve({ board: 'atlas', messages: [{ id: 17, text: 'Stale source' }] });

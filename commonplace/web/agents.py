@@ -32,6 +32,43 @@ def _read_wings(gateway, principal, data):
     return list(dict.fromkeys(canonical_wing(wing) for wing in wings))
 
 
+def _revoke_oauth(gateway, h, principal, ref):
+    """Revoke an OAuth-connected client for its workspace's owner.
+
+    The connection can only be read, rotated or edited through its own sign-in, but
+    cutting it off is the owner's call. Returns False for anything that is not an
+    OAuth connection of this workspace, so the caller's normal path answers it.
+    """
+    from commonplace.oauth import store
+
+    try:
+        row = gateway.db.connection(ref, principal.workspace_id)
+    except ControlError:
+        return False
+    if row["auth"] != "oauth":
+        return False
+    try:
+        store.revoke_connection(
+            gateway.db, row["id"], actor_id=principal.user_id, workspace_id=principal.workspace_id
+        )
+    except ControlError:
+        send_json(h, 403, {"error": "Sign in as a workspace owner to manage agents"})
+        return True
+    send_json(h, 200, {"ok": True})
+    return True
+
+
+def _revoke_pat(gateway, h, principal, row):
+    from commonplace.control_db import RunnerLinkedError
+
+    try:
+        gateway.db.revoke(row["id"], actor=principal.user_id, workspace_ref=principal.workspace_id)
+    except RunnerLinkedError as exc:
+        send_json(h, 409, {"error": str(exc)})
+        return
+    send_json(h, 200, {"ok": True})
+
+
 def connection_view(row):
     view = {
         key: row[key]
@@ -164,6 +201,12 @@ def install(gateway):
             row = gateway.db.connection(cid, principal.workspace_id)
             reveal(h, 201, row, token)
             return
+        if (
+            h.command == "DELETE"
+            and len(parts) == 1
+            and _revoke_oauth(gateway, h, principal, parts[0])
+        ):
+            return
         if not (
             (h.command == "POST" and len(parts) == 2 and parts[1] == "rotate")
             or (h.command == "DELETE" and len(parts) == 1)
@@ -180,14 +223,7 @@ def install(gateway):
             send_json(h, 409, {"error": "Manage this connection in its sign-in client"})
             return
         if h.command == "DELETE":
-            try:
-                gateway.db.revoke(
-                    row["id"], actor=principal.user_id, workspace_ref=principal.workspace_id
-                )
-            except RunnerLinkedError as exc:
-                send_json(h, 409, {"error": str(exc)})
-                return
-            send_json(h, 200, {"ok": True})
+            _revoke_pat(gateway, h, principal, row)
             return
         try:
             data = read_json(h)

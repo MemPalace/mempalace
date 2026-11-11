@@ -134,7 +134,7 @@ connections reserve new cards for their creator by default, including trusted
 connections that still write to an inbox. Those restricted-origin protections,
 explicit reservations, person decisions and child approvals still apply.
 
-The claim. Without `task`: the caller's reserved `todo` card with the lowest position, else the unassigned one with the lowest position. It never falls back to backlog, so the ready-work queue keeps its priority. With `task`: that card, if it is in `todo` and free or reserved for the caller. An unrestricted connection with policy trust `trusted` and write access to the board may also claim a `backlog` card explicitly by number. The claim moves it to `doing`, assigns the caller, and starts the normal claim expiry. `task_update task=#n status=doing` gives the same explicit backlog pickup and lease. The audit differs: `task_take_next` records `claim` / `card.claimed`; the status update records `move` / `card.moved`.
+The claim. Without `task`: the caller's reserved `todo` card with the highest priority (then the lowest position), else the unassigned one in the same order. It never falls back to backlog, so the ready-work queue keeps its priority. With `task`: that card, if it is in `todo` and free or reserved for the caller. An unrestricted connection with policy trust `trusted` and write access to the board may also claim a `backlog` card explicitly by number. The claim moves it to `doing`, assigns the caller, and starts the normal claim expiry. `task_update task=#n status=doing` gives the same explicit backlog pickup and lease. The audit differs: `task_take_next` records `claim` / `card.claimed`; the status update records `move` / `card.moved`.
 
 Agents cannot claim backlog cards filed by restricted connections, or cards with an open ask or a person in `assignee` or `ask_to`. A person in `return_to` also protects a backlog card. Outside backlog, an answered decision's return marker does not block normal moves or annotations after the person releases the card. Automatic selection skips pending person decisions. Other agents' reservations remain protected. An agent may also promote or claim its own available backlog, including an older inbox submission. Pending/rejected child proposals always require approval first. Expired claims retain the assignee and lane.
 
@@ -148,6 +148,10 @@ The `decision` line appears only on a card that came back from `review`. Empty c
 
 Claims and expiries use `BEGIN IMMEDIATE`, so concurrent agents never take the same ready card. Expiry records an event without releasing it; only a holder heartbeat or write renews it.
 
+### Priority
+
+Every card carries `priority`: `urgent`, `high`, `normal` (the default) or `low`. The owner sets it from the card in the app or with `task_add` / `task_update`; connections cannot, and cards report `can_prioritize` for the caller. `task_list` (todo, backlog or any status), the board and `task_take_next` order by priority first, then board position, so an orchestrator reading the list top-down sees the most urgent work first. Each `task_list` / `task_show` line carries `priority:<name>`, and the orchestrator checkpoint's `unstarted` todo cards are listed in the same order with their `priority`.
+
 ### task_update
 
 Only the holder of a `doing` card, or a person, may change it. Anyone else gets `no: #142 is held by conn:codex:example until 14:30Z`.
@@ -157,7 +161,8 @@ Only the holder of a `doing` card, or a person, may change it. Anyone else gets 
 - Completed-card exception for trusted, unrestricted board writers: an update containing only `lesson`, `pr` and/or `link` may annotate a `done` card without reopening it. Optional `status=done` is accepted. Removing links and other edits stay frozen. These annotations emit the normal link history and `card.updated` event, preserving completion time and status.
 - `status: "done"` closes the card. On a board with `done_needs_review`, an agent's `done` moves the card to `review` instead, with a substantive completion question, the card context, and options to accept or return the work.
 - `lesson` (with `status: "done"`, or on an already completed card) files the text as a new drawer through the normal memory write path and links it. It lands in the token's write wing.
-- `before` / `after` take a task ID; the server picks a position between the neighbours.
+- `before` / `after` take a task ID; the server picks a position between the neighbours. Position orders cards of equal priority.
+- `priority` (`urgent` \| `high` \| `normal` \| `low`) is set by a signed-in workspace owner only; any other caller gets `no: only a signed-in workspace owner can set a priority`. `task_add` takes it too. Every card has one: without it a new card is `normal`, as are cards that predate the field. Setting the current value changes nothing.
 - `link` / `unlink` take a drawer ID.
 - `callstack` takes the PR's call tree as printed by `python -m commonplace.callstack --base origin/develop` (or `null` to clear; `--card N --hub URL` uploads it directly). The web card shows its head commit, so a stale tree is visible. The server checks its shape and caps it at 64 KB; `task_show` returns it and the web card shows it next to the review. The agent that asked for review may still update this one field while the card waits on a person.
 - Any update by the holder renews the claim.
@@ -641,13 +646,32 @@ the card version and append an edit history row. Existing card ownership,
 visibility and optimistic-version rules still apply.
 
 Enabled card views include `waiting` (null or one reason). Precedence is
-`blocked_by`, `waits_on_person`, `not_released`, then `project_limit` for a new
-agent. Reasons include `text`; blockers include same-board numbers and titles,
-and a project limit includes `used` and `cap`. Board lists include a `waiting`
-count by code. A blocked-card wait alone does not appear in `needs_me`.
+`blocked_by`, `waits_on_person`, `claim_expired` (a `doing` card whose claim
+passed; the assignee is kept and its next update renews it), `plan_review` (the
+`plan` label asks for review), `not_released`, `no_agent` (a `todo` card while no
+live agent connection can write the board's wing), then `project_limit` for a new
+agent, and last `checks_pending` (a `doing` or `review` card whose checks are
+pending). Every reason carries a plain-sentence `text` from one function
+(`boards.why`), so the app and the API cannot disagree; blockers include
+same-board numbers and titles, and a project limit includes `used` and `cap`.
+Only `blocked_by`, `waits_on_person`, `plan_review` and `not_released` refuse an
+explicit claim or start; the others only explain. Board lists include a `waiting`
+count by code and `waiting_notes`, a list of `{code, count, text}` sentences that
+say why cards wait and why few agents are working (for example `Agent limit
+reached (1 of 1 working): 2 cards wait for a free slot.`). The app shows the card
+sentence as a tag on the board and under "Why this card waits" in the details, and
+the notes in a strip above the board. A blocked-card wait alone does not appear in `needs_me`.
 Explicit claims use the same waiting text for blocker and project-cap refusals;
 existing-agent admission exemptions still apply. Board tags show the blocker
 title or occupied-slot count instead of advertising a waiting card as available.
+In the app, a card's details show a **Blocked by** section: each blocker with its
+title and whether it is still waiting or Done, a Clear button per blocker, and an
+Add blocker box that takes a card number (`12` or `#12`). Both send the ordinary
+card `PATCH` with the full `blocked_by` list and the card `version`. A refused link
+(itself, a loop, a card that is not on this board or that the caller cannot read)
+comes back as a `400` whose `error` is a plain sentence and whose `code` is
+`self`, `cycle`, `other_board`, `invalid_blockers` or `blocker_graph_too_large`;
+a card the caller cannot read gets the same `other_board` answer as a missing number.
 With orchestration off these fields and the `blocked_by` schema properties are absent,
 and `blocked_by` is refused. `not_released` applies only to Todo/Backlog cards.
 

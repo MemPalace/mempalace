@@ -775,6 +775,12 @@ document's earlier-thread pointers are also newest first.
 The card view at `/app/cards/142` shows handoff state for `#142`, with the
 old thread and the successor reference or URL.
 
+The web app's card panel links to it ("Transcript and handoffs") only when the
+signed-in person can read at least one of the card's handoffs, the same test the
+page applies, so neither the link nor the page reveals a thread that person
+cannot read. When the card's assignee is an agent that person's Console lists,
+"Agent activity" opens `#/console?agent=<id>`.
+
 ## Limits and open questions
 
 - A single `thread_get` reads at most 200 messages. Continue with another

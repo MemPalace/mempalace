@@ -1,4 +1,5 @@
 import { escape as e, actor, elapsed } from './api.js';
+import { whyStrip, waitingText } from './waiting.js';
 
 const columns = ['todo', 'doing', 'review', 'done'];
 const ITEM = '.card[data-card]';
@@ -16,12 +17,7 @@ function author(ref, board) {
 }
 export function cardTags(card, { me, board = {}, messages = [] } = {}) {
   const tags = [];
-  if (card.waiting) {
-    const w = card.waiting;
-    if (w.code === 'blocked_by') tags.push('Waiting on ' + w.blockers.map((b) => `#${b.number}: ${b.title}`).join(', '));
-    else if (w.code === 'project_limit') tags.push(`Waiting for a free slot: ${w.used} of ${w.cap}`);
-    else tags.push(w.text);
-  }
+  if (card.waiting) tags.push(waitingText(card));
   if (isBlocked(card, me)) tags.push('Blocked');
   else if (card.need === 'you' || (card.status === 'review' && card.ask && card.ask_to === me && card.review_kind !== 'completion')) tags.push('Needs me');
   if (card.message_id) tags.push(chatTag(card, messages));
@@ -46,6 +42,10 @@ export function filterCards(cards, filter, me) {
   return cards.filter((c) => filter === 'mine' ? c.assignee === me : filter === 'agents' ? String(c.assignee).startsWith('conn:') : filter === 'blocked' ? isBlocked(c, me) : true);
 }
 // Status tags are chips; the rest (who, source, open for agents) reads as quiet meta text.
+const PRIORITIES = ['urgent', 'high', 'normal', 'low'];
+// A card shows its priority only when it is not the default; the list order already carries the rest.
+const prioTag = (card) => card.priority && card.priority !== 'normal' && PRIORITIES.includes(card.priority) ? `<span class="tag prio ${card.priority === 'urgent' ? 'block' : 'meta'}" data-priority="${card.priority}">${heading(card.priority)}</span>` : '';
+const prioRank = (card) => { const i = PRIORITIES.indexOf(card.priority); return i < 0 ? PRIORITIES.indexOf('normal') : i; };
 const tagKind = (t) => t === 'Blocked' ? 'block' : t === 'Needs me' ? 'you' : t.startsWith('From chat') ? 'new' : t === 'Available for an agent' ? 'meta open' : 'meta';
 const icon = (d) => `<svg class="i" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${d}"/></svg>`;
 const PLUS = 'M8 3v10M3 8h10', CHECK = 'm3.5 8.5 3 3 6-7';
@@ -59,7 +59,7 @@ function doneView(card, options, stop) {
 function cardView(card, options, stop) {
   const id = cardId(options.board, card.number), tags = cardTags(card, options);
   const blocked = isBlocked(card, options.me), selected = options.selected === card.number;
-  return `<article class="card${blocked ? ' is-blocked' : ''}${tags.includes('Needs me') ? ' is-you' : ''}${selected ? ' is-selected' : ''}" data-card="${card.number}" data-key="${card.number}" draggable="true" tabindex="${stop ? 0 : -1}" aria-label="${e(id + ' ' + card.title)}"${selected ? ' aria-current="true"' : ''}><div class="card-top"><span class="cid">${e(id)}</span>${(card.labels || []).map((l) => `<span class="tag lbl">${e(l)}</span>`).join('')}</div><h3><a href="#/card/${card.number}" tabindex="-1">${e(card.title)}</a></h3><div class="card-meta">${tags.map((t) => `<span class="tag ${tagKind(t)}">${e(t)}</span>`).join('')}${card.assignee && card.need !== 'working' ? `<span class="who">${e(author(card.assignee, options.board))}</span>` : ''}</div>${blocked ? `<p class="card-note">Waiting on ${e(author(card.ask_to, options.board))}: ${e(card.ask)}</p>` : ''}</article>`;
+  return `<article class="card${blocked ? ' is-blocked' : ''}${tags.includes('Needs me') ? ' is-you' : ''}${selected ? ' is-selected' : ''}" data-card="${card.number}" data-key="${card.number}" draggable="true" tabindex="${stop ? 0 : -1}" aria-label="${e(id + ' ' + card.title)}"${selected ? ' aria-current="true"' : ''}><div class="card-top"><span class="cid">${e(id)}</span>${(card.labels || []).map((l) => `<span class="tag lbl">${e(l)}</span>`).join('')}</div><h3><a href="#/card/${card.number}" tabindex="-1">${e(card.title)}</a></h3><div class="card-meta">${prioTag(card)}${tags.map((t) => `<span class="tag ${tagKind(t)}">${e(t)}</span>`).join('')}${card.assignee && card.need !== 'working' ? `<span class="who">${e(author(card.assignee, options.board))}</span>` : ''}</div>${blocked ? `<p class="card-note">Waiting on ${e(author(card.ask_to, options.board))}: ${e(card.ask)}</p>` : ''}</article>`;
 }
 // Component styles (design 03, 04, 05, r2-04-board-1024) stay with this renderer.
 const styles = `
@@ -69,6 +69,9 @@ const styles = `
 .workbench-board .seg button { border: 0; background: none; min-height: 30px; padding: 0 10px; color: var(--text-2); font-size: 13px; font-weight: 500; }
 .workbench-board .seg button + button { border-left: 1px solid var(--line); }
 .workbench-board .seg button[aria-pressed="true"] { background: var(--text); color: var(--surface); }
+.workbench-board .why-strip { margin: 12px 14px 0; padding: 8px 12px; border-radius: var(--r); background: var(--wait-bg); color: var(--wait); font-size: 12.5px; line-height: 17px; }
+.workbench-board .why-strip h2 { margin: 0 0 2px; font-size: 12.5px; font-weight: 650; }
+.workbench-board .why-strip ul { margin: 0; padding-left: 18px; }
 .workbench-board .col-jump { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 14px 0; }
 .workbench-board .col-jump button { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 12px; border-radius: 20px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--text-2); font-size: 13px; font-weight: 600; }
 .workbench-board .col-jump button .n { font-weight: 600; }
@@ -186,12 +189,12 @@ export function roveTo(card) {
   reveal(card);
   card.closest('.cards')?.querySelectorAll(ITEM).forEach((item) => { item.tabIndex = item === card ? 0 : -1; });
 }
-export function boardView({ board, cards = [], me, filter = 'all', selected, messages = [], adding = false, people = [], column = 'todo', sheet = true, doneAll = false }) {
-  const options = { board, me, selected, messages }, visible = filterCards(cards, filter, me);
+export function boardView({ board, cards = [], me, filter = 'all', selected, messages = [], adding = false, people = [], canPrioritize = false, column = 'todo', sheet = true, doneAll = false }) {
+  const options = { board, me, selected, messages }, visible = filterCards(cards, filter, me).map((c, i) => [c, i]).sort(([a, i], [b, j]) => prioRank(a) - prioRank(b) || i - j).map(([c]) => c);
   const backlog = visible.filter((c) => c.status === 'backlog'), count = (s) => visible.filter((c) => c.status === s).length;
-  const form = adding ? addCardForm({ people, sheet }) : '';
+  const form = adding ? addCardForm({ people, sheet, canPrioritize }) : '';
   const steps = !cards.length ? `<section class="empty-strip" aria-label="Get started"><ol class="steps"><li class="is-next"><span class="num" aria-hidden="true">1</span><div><h2>Add your first card</h2><p>A card is one piece of work. Write it like a to-do.</p><button class="btn primary" data-action="new-card">${icon(PLUS)}Add card</button></div></li><li><span class="num" aria-hidden="true">2</span><div><h2>Connect an agent</h2><p>An agent is an AI helper that works on cards. The first one becomes the orchestrator.</p><button class="btn" data-action="connect-agent">Connect an agent</button></div></li><li><span class="num" aria-hidden="true">3</span><div><h2>Ask for something</h2><p>Write in chat. The orchestrator turns requests into cards.</p><button class="btn" data-action="open-chat">Write in chat <kbd>/</kbd></button></div></li></ol></section>` : '';
-  return `<div class="workbench-board">${steps}<div class="board-tools"><div class="seg" role="group" aria-label="Filter cards">${['all','mine','agents','blocked'].map((f) => `<button data-board-filter="${f}" aria-pressed="${filter === f}">${heading(f)}${f === 'blocked' ? ` ${cards.filter((c) => isBlocked(c, me)).length}` : ''}</button>`).join('')}</div></div><nav class="col-jump" aria-label="Jump to a column">${columns.map((s) => `<button type="button" data-board-column="${s}" aria-controls="col-${s}" aria-pressed="${column === s}">${heading(s)} <span class="n">${count(s)}</span></button>`).join('')}</nav><div class="board" role="region" aria-label="Board">${columns.map((s) => {
+  return `<div class="workbench-board">${steps}${whyStrip(board)}<div class="board-tools"><div class="seg" role="group" aria-label="Filter cards">${['all','mine','agents','blocked'].map((f) => `<button data-board-filter="${f}" aria-pressed="${filter === f}">${heading(f)}${f === 'blocked' ? ` ${cards.filter((c) => isBlocked(c, me)).length}` : ''}</button>`).join('')}</div></div><nav class="col-jump" aria-label="Jump to a column">${columns.map((s) => `<button type="button" data-board-column="${s}" aria-controls="col-${s}" aria-pressed="${column === s}">${heading(s)} <span class="n">${count(s)}</span></button>`).join('')}</nav><div class="board" role="region" aria-label="Board">${columns.map((s) => {
     // The selected card is never one of the hidden Done cards: its column opens instead.
     const list = visible.filter((c) => c.status === s), done = s === 'done', all = done && (doneAll || list.findIndex((c) => c.number === selected) >= DONE_SHOWN), more = done && !all ? list.length - DONE_SHOWN : 0;
     const body = list.length ? list.map((c) => (done ? doneView : cardView)(c, options, c.number === stopIn(list, selected))).join('') : s === 'todo' ? `<button type="button" class="add-ghost" data-action="new-card">${icon(PLUS)}Add card</button>` : '<p class="empty-col">Nothing yet</p>';
@@ -199,11 +202,11 @@ export function boardView({ board, cards = [], me, filter = 'all', selected, mes
   }).join('')}</div>${backlog.length ? `<details class="backlog"><summary>Backlog (${backlog.length})</summary><div class="cards">${backlog.map((c) => cardView(c, options, c.number === stopIn(backlog, selected))).join('')}</div></details>` : ''}${sheet ? form : ''}</div>`;
 }
 // The composer opens at the top of Todo (05); on a phone it is a full-screen modal sheet (m4).
-export function addCardForm({ people = [], sheet = true } = {}) {
-  return `<form data-board-add class="composer"${sheet ? ' role="dialog" aria-modal="true" aria-labelledby="add-card-h"' : ' aria-labelledby="add-card-h"'}><h2 id="add-card-h"${sheet ? '' : ' class="sr"'}>Add card</h2><label><span class="sr">Title</span><input class="ttl" name="title" required maxlength="500" placeholder="Card title"></label><label class="vis">Details <small>(optional)</small><textarea name="body"></textarea></label><div class="composer-row"><label class="vis">Who<select name="assignee"><option value="">Any agent</option>${people.map((p) => `<option value="${e(p.ref)}">${e(p.name)}</option>`).join('')}</select></label><label class="vis">Label<input name="label"></label></div><div class="composer-foot"><button class="btn primary" type="submit">Add card</button><button type="button" class="btn ghost" data-action="cancel-card">Cancel</button></div><p class="composer-hint">Enter adds · Esc cancels</p><p role="status" data-add-status></p></form>`;
+export function addCardForm({ people = [], sheet = true, canPrioritize = false } = {}) {
+  return `<form data-board-add class="composer"${sheet ? ' role="dialog" aria-modal="true" aria-labelledby="add-card-h"' : ' aria-labelledby="add-card-h"'}><h2 id="add-card-h"${sheet ? '' : ' class="sr"'}>Add card</h2><label><span class="sr">Title</span><input class="ttl" name="title" required maxlength="500" placeholder="Card title"></label><label class="vis">Details <small>(optional)</small><textarea name="body"></textarea></label><div class="composer-row"><label class="vis">Who<select name="assignee"><option value="">Any agent</option>${people.map((p) => `<option value="${e(p.ref)}">${e(p.name)}</option>`).join('')}</select></label><label class="vis">Label<input name="label"></label>${canPrioritize ? `<label class="vis">Priority<select name="priority">${PRIORITIES.map((p) => `<option value="${p}"${p === 'normal' ? ' selected' : ''}>${heading(p)}</option>`).join('')}</select></label>` : ''}</div><div class="composer-foot"><button class="btn primary" type="submit">Add card</button><button type="button" class="btn ghost" data-action="cancel-card">Cancel</button></div><p class="composer-hint">Enter adds · Esc cancels</p><p role="status" data-add-status></p></form>`;
 }
 export async function submitCard({ api, board, values }) {
-  return api(`/api/boards/${encodeURIComponent(board.slug)}/cards`, { method:'POST', body:{ title:values.title, body:values.body || '', assignee:values.assignee || null, labels:values.label ? [values.label] : [] } });
+  return api(`/api/boards/${encodeURIComponent(board.slug)}/cards`, { method:'POST', body:{ title:values.title, body:values.body || '', assignee:values.assignee || null, labels:values.label ? [values.label] : [], ...(values.priority ? { priority:values.priority } : {}) } });
 }
 export function bindBoard(root, { api, board, onAdded = () => {}, onFilter = () => {}, onSelect = () => {}, onOpen = () => {}, onCancel = () => {} }) {
   const click = (event) => { const more = event.target.closest('[data-board-more]'); if (more) { const col = more.closest('.col'); col?.setAttribute('data-all', ''); more.remove(); const next = col?.querySelectorAll(ITEM)[DONE_SHOWN]; if (next) { roveTo(next); next.focus(); } return; } const button = event.target.closest('[data-board-filter]'); if (button) onFilter(button.dataset.boardFilter); const jump = event.target.closest('[data-board-column]'); if (jump) { root.querySelectorAll('[data-status]').forEach((el) => { el.dataset.active = String(el.dataset.status === jump.dataset.boardColumn); }); root.querySelectorAll('[data-board-column]').forEach((el) => el.setAttribute('aria-pressed', String(el === jump))); root.querySelector(`#col-${jump.dataset.boardColumn}`)?.scrollIntoView({ block:'nearest', inline:'nearest' }); } };

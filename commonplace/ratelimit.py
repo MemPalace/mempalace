@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -22,6 +23,54 @@ AUTHENTICATED = Limit("authenticated", 600, 60)
 UNTRUSTED = Limit("untrusted", 60, 60)
 WRITES = Limit("untrusted-writes", 120, 3600)
 SHORT_LINKS = Limit("short-links", 120, 60)
+
+
+@dataclass
+class Backfill:
+    """Bounded extra write allowance for a connection's first backfill.
+
+    It tops up the steady untrusted write limit and is counted durably, so a
+    restart or a client that "starts over" cannot re-arm it. ``per_connection``
+    is spent once, within ``window_seconds`` of first use. ``per_space`` is a
+    cap across all connections of a workspace that renews every
+    ``space_period_seconds``. Zero disables the allowance.
+    """
+
+    per_connection: int = 5000
+    per_space: int = 20000
+    window_seconds: int = 24 * 3600
+    space_period_seconds: int = 30 * 24 * 3600
+
+
+def _integer(env, name, default, minimum):
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = minimum - 1
+    if value < minimum:
+        raise ValueError(f"{name} must be an integer of at least {minimum}")
+    return value
+
+
+def limits_from_env(env=None) -> tuple[Limit, Backfill]:
+    """Steady untrusted write limit and first-backfill allowance, from configuration."""
+    env = os.environ if env is None else env
+    write = Limit(
+        WRITES.name,
+        _integer(env, "COMMONPLACE_WRITE_LIMIT", WRITES.capacity, 1),
+        _integer(env, "COMMONPLACE_WRITE_LIMIT_SECONDS", WRITES.seconds, 1),
+    )
+    default = Backfill()
+    backfill = Backfill(
+        _integer(env, "COMMONPLACE_BACKFILL_PER_CONNECTION", default.per_connection, 0),
+        _integer(env, "COMMONPLACE_BACKFILL_PER_SPACE", default.per_space, 0),
+        _integer(env, "COMMONPLACE_BACKFILL_WINDOW_SECONDS", default.window_seconds, 1),
+        _integer(env, "COMMONPLACE_BACKFILL_SPACE_PERIOD_SECONDS", default.space_period_seconds, 1),
+    )
+    return write, backfill
 
 
 def client_ip(peer: str, forwarded: str = "") -> str:
@@ -88,3 +137,12 @@ class TokenBuckets:
                 return max(1, math.ceil(retry))
             self._buckets.update(pending)
             return 0
+
+    def refund(self, policies: list[tuple[Limit, str]]) -> None:
+        """Give back one token for each policy a rejected request was charged."""
+        with self._lock:
+            for limit, identity in policies:
+                key = (limit.name, identity)
+                if key in self._buckets:
+                    tokens, updated, expires = self._buckets[key]
+                    self._buckets[key] = (min(limit.capacity, tokens + 1), updated, expires)

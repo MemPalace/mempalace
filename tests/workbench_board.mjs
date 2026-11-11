@@ -77,6 +77,22 @@ case 'chat-time': {
   assert.deepEqual(await b.loadChatTimes({board, cards:[{...card,message_id:10}], api:async () => { throw new Error('gone'); }}),[]);
   break;
 }
+case 'priority': {
+  // Higher priority sorts first inside a column; equal priority keeps the server's order; normal shows no chip.
+  const mk = (number, priority) => ({...card, number, title:`C${number}`, status:'todo', ask:null, ask_to:null, priority});
+  const html = render([mk(1,'low'), mk(2,'normal'), mk(3,'urgent'), mk(4,'high'), mk(5,'high'), mk(6,undefined)]);
+  const order = [...html.matchAll(/<article class="card[^"]*" data-card="(\d+)"/g)].map((m) => Number(m[1]));
+  assert.deepEqual(order, [3,4,5,2,6,1]);
+  assert.ok(html.includes('data-priority="urgent"')); assert.ok(html.includes('data-priority="high"')); assert.ok(html.includes('data-priority="low"'));
+  assert.ok(!html.includes('data-priority="normal"'));
+  // Only the owner sees the picker, and an unset choice is not sent.
+  assert.ok(!render([card]).includes('name="priority"'));
+  const owner = render([], {adding:true, sheet:false, canPrioritize:true});
+  assert.ok(owner.includes('<select name="priority">')); assert.ok(owner.includes('<option value="normal" selected>Normal</option>'));
+  const sent = []; const api = async (url, init) => { sent.push(init.body); return {number:9}; };
+  await b.submitCard({api, board, values:{title:'T', priority:'high'}}); await b.submitCard({api, board, values:{title:'T'}});
+  assert.equal(sent[0].priority, 'high'); assert.ok(!('priority' in sent[1])); break;
+}
 case 'drag': assert.match(render([card]),/<article [^>]*draggable="true"/); break;
 default: assert.fail('Unknown case');
 }

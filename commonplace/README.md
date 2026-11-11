@@ -56,6 +56,22 @@ there is no replay cache or idempotency key. Limit errors return HTTP 429 with
 `limit: "transcription"` and the daily reset time. Accounts without a plan have no limits and every feature.
 Unset, empty or `off` keeps plans off: self-hosted installations have no limits or plan UI.
 
+## Voice transcription (server-side)
+
+Dictation runs on the server with the optional `voice` extra; audio and transcripts stay in request
+memory. It is off per workspace until an owner turns it on. Instance-level settings (environment):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `COMMONPLACE_VOICE` | `on` | `off` switches cloud voice off for the whole instance (HTTP 503, hidden in the UI). |
+| `COMMONPLACE_VOICE_MODEL_EN` | `base` | English Moonshine model. Only `base` is wired up. |
+| `COMMONPLACE_VOICE_MODEL_NL` | `small` | Dutch faster-whisper model: a size name, a Hugging Face repo id (`owner/name`) or the absolute path of a local model directory. |
+
+Unset settings keep the defaults above. A set but empty or invalid value stops the server at startup
+with a message naming the setting; there is no silent fallback to another model. A non-local repo id is
+downloaded by faster-whisper from the Hugging Face hub on first use; use a local directory to avoid that.
+The free-tier daily cap (see Hosted plans) applies to every clip regardless of model.
+
 ## Context handoff
 
 Optional handoff saves a full thread in Memory and starts a fresh agent with a pointer to it. It is installed with the gateway and off by default. Thread tools appear once a workspace enables handoff or has stored threads. Pages use the hub's web sign-in; events use its signed webhooks with the `handoff` preset. See [setup and API](../docs/handoff.md).

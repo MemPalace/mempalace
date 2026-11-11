@@ -175,6 +175,7 @@ def make_surface(tmp_path, monkeypatch):
         gateway = Gateway(db, supervisor)
         clock = SimpleNamespace(now=0.0)
         gateway.limiter = ratelimit.TokenBuckets(clock=lambda: clock.now)
+        gateway.wall_clock = lambda: clock.now
         # These tests exercise the gateway, not the memory worker's behavior.
         gateway.mediator.handle = lambda principal, data: {"jsonrpc": "2.0", "id": 1, "result": {}}
         server = gateway.build_server("127.0.0.1", 0)
@@ -945,3 +946,210 @@ def test_rules_control_routes_require_a_person_owner(surface, method, path, body
     assert hardened(response) == 403
     assert surface.db.rule_checks(surface.workspace) == {}
     assert surface.db.rule_stores(surface.workspace) is None
+
+
+# ── first-backfill allowance vs the steady untrusted write limit ──
+
+CAPTURE_BODY = json.dumps({"source": "claude-code", "thread_id": "x"})
+CAPTURE_HEADERS = {"Content-Type": "application/json"}
+# A first backfill of a realistic space: ~300 sessions, a few appended chunks each.
+REALISTIC_BACKFILL_WRITES = 600
+CLIENT_PACE_SECONDS = 2  # sync_protocol.LIVE_TICK_SECONDS
+
+
+def _capture(surface, auth, path="/api/capture", body=CAPTURE_BODY):
+    return request(surface, "POST", path, headers={**auth, **CAPTURE_HEADERS}, body=body)
+
+
+def _run_writes(surface, auth, count, *, pace=CLIENT_PACE_SECONDS, path="/api/capture"):
+    """Send `count` capture writes at the client's pace; return (admitted, throttled)."""
+    admitted = throttled = 0
+    for _ in range(count):
+        surface.clock.now += pace
+        if _capture(surface, auth, path)[0] == 429:
+            throttled += 1
+        else:
+            admitted += 1
+    return admitted, throttled
+
+
+def _drain_steady(surface, cid):
+    """Spend the whole steady hourly write budget of a connection, as a client would."""
+    policy = (surface.gateway.write_limit, "connection:" + cid)
+    while surface.gateway.limiter.check([policy]) == 0:
+        pass
+
+
+def _used(surface, scope, scope_id):
+    row = surface.db._conn.execute(
+        "SELECT used FROM backfill_allowance WHERE scope=? AND scope_id=?", (scope, scope_id)
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def test_first_backfill_of_realistic_size_is_not_throttled_by_the_steady_limit(surface):
+    _cid, _value, auth = token(surface, untrusted=True)
+    admitted, throttled = _run_writes(surface, auth, REALISTIC_BACKFILL_WRITES)
+    print(f"backfill of {REALISTIC_BACKFILL_WRITES}: admitted={admitted} throttled={throttled}")
+    assert throttled == 0 and admitted == REALISTIC_BACKFILL_WRITES
+
+
+def test_throttled_client_sees_slow_down_with_retry_after_once_allowance_is_off(surface):
+    surface.gateway.backfill.per_connection = 0
+    cid, _value, auth = token(surface, untrusted=True)
+    _drain_steady(surface, cid)
+    status, headers, body = _capture(surface, auth)
+    assert status == 429 and json.loads(body) == {"error": "slow down"}
+    assert headers["Retry-After"] == "30"
+
+
+def test_steady_write_limit_is_unchanged_once_backfill_is_used_up(surface):
+    surface.gateway.backfill.per_connection = 30
+    cid, _value, auth = token(surface, untrusted=True)
+    _drain_steady(surface, cid)
+    assert _run_writes(surface, auth, 30, pace=0.5) == (30, 0)  # the backfill allowance
+    status, headers, _body = _capture(surface, auth)
+    assert status == 429 and int(headers["Retry-After"]) <= 30
+    # Steady refill is exactly as before: one write per 30 seconds.
+    surface.clock.now += 30
+    assert _capture(surface, auth)[0] != 429
+    assert _capture(surface, auth)[0] == 429
+    assert _used(surface, "connection", cid) == 30
+
+
+def test_backfill_allowance_is_only_for_capture_and_import_writes(surface):
+    cid, _value, auth = token(surface, untrusted=True)
+    headers = {**auth, **CAPTURE_HEADERS}
+    _drain_steady(surface, cid)
+    assert _capture(surface, auth)[0] != 429
+    assert _capture(surface, auth, "/api/import")[0] != 429
+    for method, path in [("POST", "/api/memory"), ("PATCH", "/api/cards/1"), ("POST", "/mcp")]:
+        body = json.dumps({"method": "tools/call", "params": {"name": "memory_save"}})
+        response = request(surface, method, path, headers=headers, body=body)
+        assert response[0] == 429, (method, path)
+    assert _used(surface, "connection", cid) == 2
+
+
+def test_trusted_connection_keeps_its_own_limit(surface):
+    cid, _value, auth = token(surface)
+    assert _run_writes(surface, auth, 100, pace=0) == (100, 0)
+    assert not any(key[0] == ratelimit.WRITES.name for key in surface.gateway.limiter._buckets)
+    assert _used(surface, "connection", cid) == 0
+
+
+def test_backfill_allowance_is_bounded_per_connection_and_cannot_be_rearmed(surface):
+    surface.gateway.backfill.per_connection = 30
+    cid, _value, auth = token(surface, untrusted=True)
+    _drain_steady(surface, cid)
+    assert _run_writes(surface, auth, 30, pace=0.5) == (30, 0)
+    assert _capture(surface, auth)[0] == 429
+    # Waiting does not re-arm it: the steady bucket refills, the allowance does not.
+    surface.clock.now += 30 * 3600
+    _drain_steady(surface, cid)
+    assert _capture(surface, auth)[0] == 429
+    assert _used(surface, "connection", cid) == 30
+    # "Starting over" with a new thread id at offset 0 changes nothing: the
+    # allowance is keyed by connection and space, never by stream.
+    body = json.dumps({"source": "claude-code", "thread_id": "brand-new", "offset": 0})
+    assert _capture(surface, auth, body=body)[0] == 429
+
+
+def test_backfill_allowance_expires_with_its_window(surface):
+    surface.gateway.backfill.per_connection = 1000
+    surface.gateway.backfill.window_seconds = 600
+    cid, _value, auth = token(surface, untrusted=True)
+    _drain_steady(surface, cid)
+    assert _run_writes(surface, auth, 10, pace=0.5) == (10, 0)
+    surface.clock.now += 600
+    _drain_steady(surface, cid)
+    assert _capture(surface, auth)[0] == 429  # plenty left by count, but the window is over
+    assert _used(surface, "connection", cid) == 10
+
+
+def test_backfill_allowance_is_bounded_per_space_across_new_connections(surface):
+    surface.gateway.backfill.per_connection = 100
+    surface.gateway.backfill.per_space = 150
+    for index in range(4):
+        cid, _value, auth = token(surface, f"device-{index}", untrusted=True)
+        _drain_steady(surface, cid)
+        _run_writes(surface, auth, 100, pace=0.5)
+        assert _capture(surface, auth)[0] in (200, 400, 401, 403, 404, 409, 429)
+    # Four fresh connections cannot mint more than the space allowance.
+    assert _used(surface, "workspace", surface.workspace) == 150
+    assert _capture(surface, auth)[0] == 429
+
+
+def test_backfill_space_allowance_renews_only_after_its_period(surface):
+    backfill = surface.gateway.backfill
+    backfill.per_connection, backfill.per_space = 100, 40
+    backfill.space_period_seconds = 1000
+    for name, expected in (("a", 40), ("b", 40)):
+        cid, _value, auth = token(surface, name, untrusted=True)
+        _drain_steady(surface, cid)
+        _run_writes(surface, auth, 60, pace=0.5)
+        assert _used(surface, "workspace", surface.workspace) == expected
+    surface.clock.now += 1000
+    cid, _value, auth = token(surface, "c", untrusted=True)
+    _drain_steady(surface, cid)
+    _run_writes(surface, auth, 10, pace=0.5)
+    assert _used(surface, "workspace", surface.workspace) == 10
+
+
+def test_backfill_still_obeys_the_per_minute_limit(surface):
+    _cid, _value, auth = token(surface, untrusted=True)
+    admitted, throttled = _run_writes(surface, auth, 200, pace=0)
+    # 200 requests inside one instant: the 60/min bucket still bounds the burst.
+    assert (admitted, throttled) == (60, 140)
+
+
+def test_per_minute_refusal_during_backfill_reports_its_own_retry_after(surface):
+    cid, _value, auth = token(surface, untrusted=True)
+    _drain_steady(surface, cid)
+    assert _run_writes(surface, auth, 60, pace=0) == (60, 0)
+    status, headers, _body = _capture(surface, auth)
+    assert status == 429 and headers["Retry-After"] == "1"  # not the hourly 30
+    assert _used(surface, "connection", cid) == 60
+
+
+def test_rejected_backfill_request_does_not_charge_other_budgets(surface):
+    surface.gateway.backfill.per_connection = 0
+    cid, _value, auth = token(surface, untrusted=True)
+    _drain_steady(surface, cid)
+    key = (ratelimit.UNTRUSTED.name, "connection:" + cid)
+    assert surface.gateway.limiter.check([(ratelimit.UNTRUSTED, "connection:" + cid)]) == 0
+    before = surface.gateway.limiter._buckets[key][0]
+    assert _capture(surface, auth)[0] == 429
+    assert surface.gateway.limiter._buckets[key][0] == before
+
+
+@pytest.mark.parametrize(
+    "env,message",
+    [
+        ({"COMMONPLACE_WRITE_LIMIT": "0"}, "COMMONPLACE_WRITE_LIMIT"),
+        ({"COMMONPLACE_WRITE_LIMIT_SECONDS": "x"}, "COMMONPLACE_WRITE_LIMIT_SECONDS"),
+        ({"COMMONPLACE_BACKFILL_PER_CONNECTION": "-1"}, "COMMONPLACE_BACKFILL_PER_CONNECTION"),
+        ({"COMMONPLACE_BACKFILL_WINDOW_SECONDS": "0"}, "COMMONPLACE_BACKFILL_WINDOW_SECONDS"),
+    ],
+)
+def test_invalid_limit_configuration_is_rejected(env, message):
+    with pytest.raises(ValueError, match=message):
+        ratelimit.limits_from_env(env)
+
+
+def test_limits_default_and_come_from_environment(monkeypatch, make_surface):
+    write, backfill = ratelimit.limits_from_env({})
+    assert write == ratelimit.WRITES == ratelimit.Limit("untrusted-writes", 120, 3600)
+    assert (backfill.per_connection, backfill.per_space) == (5000, 20000)
+    assert backfill.window_seconds == 24 * 3600 and backfill.space_period_seconds == 30 * 24 * 3600
+    for name, value in {
+        "COMMONPLACE_WRITE_LIMIT": "10",
+        "COMMONPLACE_WRITE_LIMIT_SECONDS": "60",
+        "COMMONPLACE_BACKFILL_PER_CONNECTION": "7",
+        "COMMONPLACE_BACKFILL_PER_SPACE": "9",
+        "COMMONPLACE_BACKFILL_WINDOW_SECONDS": "11",
+        "COMMONPLACE_BACKFILL_SPACE_PERIOD_SECONDS": "13",
+    }.items():
+        monkeypatch.setenv(name, value)
+    surface = make_surface()
+    assert surface.gateway.write_limit == ratelimit.Limit("untrusted-writes", 10, 60)
+    assert surface.gateway.backfill == ratelimit.Backfill(7, 9, 11, 13)

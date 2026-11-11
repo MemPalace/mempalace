@@ -18,8 +18,15 @@ function readAccess(c, wings) {
   return `<details data-agent-access><summary>Read access</summary>${wings.map((wing) => `<label><input type="checkbox" value="${e(wing)}" ${(c.read_wings || []).some((grant) => grant === "*" || grant === wing) ? "checked" : ""}>${e(wing)}</label>`).join("")}<button type="button" data-action="agent-wings" data-agent-mutation data-agent-id="${e(c.id)}">Save read access</button></details>`;
 }
 
+const oauthNote = "Connected through sign-in (OAuth). It cannot be rotated here: revoke it and the client signs in again.";
+
+function oauthControls(c) {
+  if (c.auth !== "oauth" || c.revoked_at) return "";
+  return `<small data-agent-oauth>${e(oauthNote)}</small><button type="button" data-action="agent-revoke" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Revoke</button>`;
+}
+
 function agentRows(rows, wings = []) {
-  return rows.map((c) => `<div class="setting-row"><span>${e(c.name)}<br><small>${e(c.client)} · ${c.revoked_at ? "Revoked" : c.expires_at && Date.parse(c.expires_at) <= Date.now() ? "Expired" : c.last_used_at ? usedText(c.last_used_at) : "Unused"}</small></span>${active(c) ? `${readAccess(c, wings)}${c.import_read ? `<small>Imported history: allowed. ${e(readerDetail)}</small>` : ""}<button type="button" data-action="agent-rotate" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Rotate</button><button type="button" data-action="agent-revoke" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Revoke</button>` : ""}</div>`).join("") || '<p class="message">No agents connected</p>';
+  return rows.map((c) => `<div class="setting-row"><span>${e(c.name)}<br><small>${e(c.client)} · ${c.revoked_at ? "Revoked" : c.expires_at && Date.parse(c.expires_at) <= Date.now() ? "Expired" : c.last_used_at ? usedText(c.last_used_at) : "Unused"}</small></span>${oauthControls(c)}${active(c) ? `${readAccess(c, wings)}${c.import_read ? `<small>Imported history: allowed. ${e(readerDetail)}</small>` : ""}<button type="button" data-action="agent-rotate" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Rotate</button><button type="button" data-action="agent-revoke" data-agent-mutation data-agent-id="${e(c.id)}" data-agent-name="${e(c.name)}">Revoke</button>` : ""}</div>`).join("") || '<p class="message">No agents connected</p>';
 }
 
 export function agentsView(payload) {

@@ -14,7 +14,10 @@ function slice(start, end) {
 }
 const url = (source) => `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`;
 const apiUrl = url(await read('api.js'));
-const module = async (name) => import(url((await read(`${name}.js`)).replace(/(['"])\.\/api\.js\1/g, JSON.stringify(apiUrl))));
+const linksUrl = url(await read('cardlinks.js'));
+// A data: module cannot resolve "./x.js": every other sibling import loads from its file.
+const siblings = (source) => source.replace(/(from\s*)(['"])\.\/([\w-]+\.js)\2/g, (_all, from, _quote, name) => from + JSON.stringify(new URL(`../commonplace/web/static/${name}`, import.meta.url).href));
+const module = async (name) => import(url(siblings((await read(`${name}.js`)).replace(/(['"])\.\/api\.js\1/g, JSON.stringify(apiUrl)).replace(/(['"])\.\/cardlinks\.js\1/g, JSON.stringify(linksUrl)))));
 const e = (v) => String(v ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
 const board = { slug: 'alpha', name: 'Alpha' };
 const state = { me: { actor: 'user:one', people: { 'user:one': 'One' } }, boards: [board], needs: {}, base: '#/board/alpha', route: '#/board/alpha',

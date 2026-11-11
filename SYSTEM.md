@@ -340,6 +340,10 @@ visibility for slim, standard and full profiles remain unchanged.
 
   - Connect alone never grants this trust.
 
+  - A trusted project seat may hold the orchestrator lease of its own board and seat role while the board has no `[runner]` config; no config or requester edit is needed. Its direct starts are unchanged. Demotion, switch-off or revocation ends that authority at the next lease call.
+
+  - A project seat never claims another board's lease, also when that board's runner machine lists it as a requester.
+
 - **Lock order.**
 
   - Control snapshots precede waits.
@@ -449,6 +453,10 @@ playbooks and the original wider orchestration acceptance remain separate work.
   - `orch_owner` is a signed-in person with role owner, or the local CLI (data-dir access).
 
   - Agent tokens with an owner role are refused.
+
+- **The app shows who coordinates.**
+
+  - Project settings > Orchestrator reads the read-only checkpoint for role `main` and says in words who holds the lease, when it runs out and how much work is open, in doubt or unstarted. A signed-in owner can End lease (a confirm first); it calls the same `force-release` as the CLI and MCP, so members, agent tokens and other workspaces are refused. Ending a lease changes no step: unfinished work stays listed and becomes in doubt when the next coordinator claims.
 
 - **Channels.**
 
@@ -583,6 +591,8 @@ playbooks and the original wider orchestration acceptance remain separate work.
 
 - `orch_resume` returns a checkpoint (open steps, `in_doubt`, `needs_person`, holds, next, jobs, misses) plus the unstarted `todo` cards of each configured board: no active job and no job started strictly after the card's latest firing event (a start in the same second as the event does not count).
 
+- Checkpoint `jobs` covers runner jobs (`source=runner`) and builders started outside the runner (`source=journal`). A journal entry is listed only while two facts hold: the lease holder recorded the start of an unvoided, unfinished `thread` step for a card (`started` or `waiting`; it stays listed when a later epoch marks the step `in_doubt`), and that card is in `doing` on the same board under a live claim. Each entry carries the card, step key, assignee, claim end and the step's evidence. Nothing is stored and no card or step is changed; the hub does not verify that the thread exists.
+
 ### Thread-search ranking
 
 - For a verified thread index, search finds the scoped BM25 cutoff using the FTS rank iterator, then includes every hit at or above that cutoff before ordering by BM25, thread ID and chunk index.
@@ -618,8 +628,14 @@ playbooks and the original wider orchestration acceptance remain separate work.
   edges (maximum 16 per card, no self/cycles, DFS bounded to 200 nodes).
   Only Done unblocks. SQL selection skips unresolved blockers and the runner
   checks them before starting. Views use the pure `boards.why` predicate in
-  blocker/person/release/cap order; explicit claims share its waiting text.
+  blocker/person/release/cap order (the full list is in docs/boards/API.md);
+  explicit claims share its waiting text.
   Dependency waiting alone does not enter `needs_me`.
+
+- Blocker links are edited in the app through the ordinary card `PATCH` with the full `blocked_by` list and the card version, so ownership, visibility and optimistic-version rules are unchanged. Refusals (`self`, `cycle`, `other_board`, `invalid_blockers`, `blocker_graph_too_large`) carry a plain sentence; a card the caller cannot read is answered exactly like a missing number.
+
+- `boards.why` is the single source of waiting sentences. Besides blockers, person, release and capacity it explains an expired claim, a plan awaiting review, no connected agent and pending checks; only `blocked_by`, `waits_on_person`, `plan_review` and `not_released` refuse a claim or start. Board lists add `waiting_notes` built from the same counts.
+
 - `boards.sqlite3` adds `task_blockers` and `card_splits`. Keyed children use
   `split:<parent>:<key>` labels; key checks and inserts share the board write
   transaction. Inbox reads include open unsplit roots, excluding children and
@@ -704,7 +720,7 @@ playbooks and the original wider orchestration acceptance remain separate work.
 | Question | Default |
 |---|---|
 | Who approves a config | The owner only. |
-| Who may hold an orchestrator lease | A principal that passes `requester_ok` for the configured machine (a listed trusted PAT or the person owner). |
+| Who may hold an orchestrator lease | A principal that passes `requester_ok` for the configured machine (a listed trusted PAT or the person owner); a project seat only on its own board. Without `[runner]`: only the board's own trusted project seat, for its seat role. |
 | Lease TTL | 1800 s (G). |
 | Wait budgets | Guesses until measured (see Numbers). |
 | CLI acts as owner | Yes, through data-dir access. |
@@ -1266,6 +1282,19 @@ playbooks and the original wider orchestration acceptance remain separate work.
 ### Compatibility fixture coverage boundary
 
 - The overlaid board definitions share schemas between baseline and current servers; the strict fixture protects visibility, HTTP and audit compatibility, while focused card tests cover opt-in schema fields.
+
+### Refused Done moves and handoffs
+
+When the service refuses `PATCH /api/cards/<n>` with `status: "done"` or
+`POST /api/cards/<n>/handoff` with 403, the answer is
+`{error, next_step, code}`: `error` is a plain reason, `next_step` says what to do
+next (for example release the restricted-origin card first, or move a todo card to
+Doing before Done), and `code` is `done_refused` or `handoff_refused`. Refusals the
+service does not know get its own text plus a generic reload-and-ask step. Only the
+wording is added here: who may move or hand off a card, and every status code
+(404 not found, 409 version clash, 400 invalid input), stay as the service decides.
+The owner web client joins `error` and `next_step`, and shows a readable message
+for a 403 that carries no JSON body.
 
 ### Canonical Space REST foundation
 

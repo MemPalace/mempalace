@@ -1,6 +1,7 @@
 export class ApiError extends Error {
   constructor(status, payload) {
-    super(payload?.error || `Request failed (${status})`);
+    const reason = payload?.error || (status === 403 ? "You are not allowed to do that here. Reload the page; if it is still refused, ask the workspace owner." : `Request failed (${status})`);
+    super(payload?.next_step ? `${reason} ${payload.next_step}` : reason);
     this.status = status;
     this.payload = payload;
   }
@@ -37,7 +38,13 @@ export async function api(path, options = {}) {
     headers: { "Accept": "application/json", ...((options.body || ["POST", "PATCH", "DELETE"].includes(options.method?.toUpperCase())) ? { "Content-Type": "application/json" } : {}), ...options.headers },
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
-  const payload = response.status === 204 ? null : await response.json();
+  let payload = null;
+  if (response.status !== 204) {
+    try { payload = await response.json(); } catch (error) {
+      // A refusal without a JSON body (a proxy or a bare status line) still gets a readable message.
+      if (response.ok) throw error;
+    }
+  }
   if (!response.ok) {
     if (response.status === 401) document.dispatchEvent(new Event("session-expired"));
     throw new ApiError(response.status, payload);

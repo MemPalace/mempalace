@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 
 from .. import urls
-from ..control_db import Principal
+from ..control_db import ControlError, Principal
 from ..policy import Policy
 from .http import OAuthError
 
@@ -148,6 +148,36 @@ def _revoke(conn, connection_id):
         "UPDATE oauth_tokens SET revoked_at = COALESCE(revoked_at, ?) WHERE connection_id = ?",
         (now(), connection_id),
     )
+
+
+def revoke_connection(db, connection_id: str, *, actor_id: str, workspace_id: str) -> None:
+    """An owner cuts off one OAuth-connected client: the connection, its unredeemed
+    codes and every access and refresh token, in one transaction.
+
+    Nothing the client wrote is touched; the connection row stays as history.
+    """
+    with db._lock, db._tx() as conn:
+        row = conn.execute(
+            "SELECT id, workspace_id FROM connections "
+            "WHERE id = ? AND workspace_id = ? AND auth = 'oauth'",
+            (connection_id, workspace_id),
+        ).fetchone()
+        if row is None:
+            raise ControlError("no such OAuth connection")
+        db.require_owner(workspace_id, actor_id)
+        _revoke(conn, connection_id)
+        conn.execute(
+            "UPDATE oauth_codes SET used_at = COALESCE(used_at, ?) WHERE connection_id = ?",
+            (now(), connection_id),
+        )
+        db.audit(
+            action="token.revoke",
+            decision="ok",
+            workspace_id=workspace_id,
+            user_id=actor_id,
+            connection_id=connection_id,
+            auth="oauth",
+        )
 
 
 def _issue(conn, grant) -> dict:

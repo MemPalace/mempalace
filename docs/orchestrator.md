@@ -225,7 +225,10 @@ commit is still found.
   held, after release or expiry, or when the owner forces it. The token is
   returned once. TTL 1800 s, renewed by fenced writes and `orch_heartbeat`;
   waits are sliced to at most 10 minutes with heartbeats. Expiry only fences.
-  A lost token means waiting for expiry or an owner force.
+  A lost token means waiting for expiry or an owner force. A board without
+  `[runner]` has one possible holder: its own project seat, once an owner
+  trusted it in Project settings, for its seat role (`main`). A project seat
+  never claims another board's lease.
 - **Journal.** `intent → started → waiting → done | failed | in_doubt`;
   `in_doubt` moves on to `done`, `failed` or `needs_person`. A job maps to its
   step as: queued, leased or starting → `waiting`; started → `done`;
@@ -258,9 +261,22 @@ commit is still found.
   checkpoint: open steps, `in_doubt`, `needs_person`, holds, next, jobs, misses,
   and the unstarted `todo` cards of each configured board (a `todo` card with no
   active job and no job started after it last entered `todo`; a start in the
-  same second as that entry cannot be ordered, so the card is listed). Cards are
+  same second as that entry cannot be ordered, so the card is listed; they come
+  most urgent `priority` first). Cards are
   classified read-only as `held`, `expired` or `not_held_by_caller`; only the
   caller's own held cards get a heartbeat.
+- **Builders started outside the runner.** A lead that starts a builder itself
+  (for example a T3 thread) journals it: `orch_journal_intent` with kind
+  `thread` and the card, then `orch_journal_record` with state `started` once
+  the builder runs (a `holder_attested` note can name the thread). The
+  checkpoint's `jobs` then lists that builder with `source: "journal"`, the
+  card, step key, assignee, claim end, detail and evidence, for as long as the
+  step is unfinished and unvoided and the card is in `doing` on this board
+  under a live claim. It stays listed when a new lease epoch marks the step
+  `in_doubt`. An intent without a recorded start, a card that left `doing` or
+  whose claim expired, and steps of another board or role are not listed.
+  Runner jobs carry `source: "runner"`. The list is derived on every read;
+  the hub does not check that the thread exists.
 
 ## Restore
 

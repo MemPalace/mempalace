@@ -90,6 +90,12 @@ the connection keeps its identity and permissions.
 Use **Revoke** to stop the connection. Its token stops working immediately.
 Create a new connection if you need to connect that agent again.
 
+A client that signed in through OAuth is listed too, marked "Connected through
+sign-in (OAuth)". It has **Revoke** but no Rotate: it has no token to copy, and
+revoking it makes the client sign in again. Revoke stops its access and refresh
+tokens and any sign-in code it has not used yet, immediately. Only a workspace
+owner can do this. Memory and cards the client wrote stay.
+
 If a token is lost or exposed, rotate it. If a connection is expired, rotate it
 and reconnect. If copying fails, select and copy the displayed value manually
 before dismissing it.
