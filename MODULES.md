@@ -725,7 +725,7 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
-  - The pinned handoff baseline in `tests/test_handoff_adversarial_off_perf.py` overlays only leaf or board modules the current board code imports (now including `commonplace/decide_grant.py`); the pinned gateway, policy and handoff sources stay at the baseline commit.
+  - The pinned handoff baseline in `tests/test_handoff_adversarial_off_perf.py` overlays only leaf or board modules the current board code imports (now including `commonplace/decide_grant.py` and `mempalace/deadline.py`); the pinned gateway, policy and handoff sources stay at the baseline commit.
 
   - Browser tests that need Playwright skip at module level when it is missing, so collecting `tests/` never errors; `CP_BROWSER_E2E=1` turns a missing Playwright into a failure (`tests/test_cards_decide_scope_browser.py`, as in `tests/workbench_e2e`).
 

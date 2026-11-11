@@ -704,7 +704,8 @@ playbooks and the original wider orchestration acceptance remain separate work.
   Playwright fail instead.
 
 - Compatibility baseline: the pinned handoff "off" baseline test supplies
-  `commonplace/decide_grant.py` (a leaf module the current board code imports);
+  `commonplace/decide_grant.py` and `mempalace/deadline.py` (leaf modules the current
+  board and rules code import);
   its gateway, policy and handoff comparison stays pinned.
 
 ### Explicit imported-history reader consent
