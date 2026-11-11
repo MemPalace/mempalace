@@ -603,6 +603,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:**
 
+  - `tests/test_run_ledger.py`: run ledger acceptance through the public HTTP routes and the runner CLI.
+
   - `tests/test_rules_index.py` pins the compact rules index (completeness, size bound), keyed `rules_get` with unknown keys, partial reads not counting as served, and unchanged defaults; `tests/spaces_surfaces.json` carries the new `rules_get` and `session_start` arguments.
 
   - Model-role regressions: the one-per-role Needs me item and its clearing and owner-only scope, the start refusal naming the role, the API and UI refusal of an unknown model id, and the Needs me row and settings focus.
@@ -1184,11 +1186,15 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/cli.py`, `commonplace/client.py`, `commonplace/client_hooks.py`, `commonplace/client_install.py`, `commonplace/review_rules.py`, `commonplace/bridge.py`, `commonplace/onboarding.py`, `commonplace/seed.py`, `commonplace/README.md`, `commonplace/SETUP.md`, `commonplace/agent-skill/`
 - **Owns:**
 
+  - The `runner report` argument parser; the command itself lives in `commonplace/runner/report.py`.
+
   - `commonplace waitlist list|admit` (instance admin, `--by` as for `plan set`) and the `COMMONPLACE_MAX_ACCOUNTS` setup note in `SETUP.md`.
 
   - The `commonplace` command line, the credential-scoped client, native hooks and installers, the stdio bridge and the agent skill.
 
 - **Promises:**
+
+  - `runner report` sends only the values it was given for one started run; it never opens the data directory.
 
   - `commonplace token add` refuses `cards:decide`; answering Needs-me questions needs the owner's browser consent.
 
@@ -1217,11 +1223,15 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - `runner report` exits 4 on an invalid config or report, 3 on a revoked credential and 5 when the hub refuses or is unavailable.
+
   - Local data-directory access remains operator authority; authenticated progress never inherits it.
 
   - The CLI runs with data-dir access, so anyone with the service's OS user can use it (residual in `SYSTEM.md`).
 
 - **Tests:**
+
+  - `tests/test_run_ledger.py` runs `runner report` against a hub.
 
   - `tests/test_search_index_progress.py` covers local status, run and explicit capture enrolment.
 
@@ -1350,6 +1360,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/runner/`, `docs/runner.md`
 - **Owns:**
 
+  - The run ledger: `run_ledger` in `runner.sqlite3` (`ledger.py`), the machine usage route `POST /api/runner/usage` (`ledger_api.py`) and the `runner report` client command (`report.py`).
+
   - The runner guide links the owner Admin contact/grant projection and documents the Admin runner block that enrolls, attests and edits machines through the owner routes.
 
 
@@ -1359,6 +1371,8 @@ Format (read by `commonplace orch docs-check`):
   - `commonplace/runner/start_context.py`: the card context of a start. `assemble` is the one function that turns a card into launch text; its `SECTIONS` list is the priority order and the place to add a section. A card that points at a goal gets its own goal as an always-present line beside the title and the goals above it (nearest first) as the section after decisions.
 
 - **Promises:**
+
+  - Every start has one ledger row, written in the job's own transaction and following its state; tokens, cost, log pointer and the run's end are only what the run's own enabled machine reported, and an unreported value stays NULL. The end status is set once; jobs from before the ledger are given a row when the store opens.
 
   - A machine's worker policy reads and writes exactly its granted wings (first is the default write wing); starts on any other board wing are refused with a message naming the board wing and the granted wings, and the worker cannot write to an ungranted wing through any tool.
 
@@ -1387,6 +1401,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - A usage report for a run that has not started, or a second, different end status, answers 409; a job of another machine or any caller but an enabled machine answers 404; an invalid report answers 400 and changes nothing.
+
   - Absent optional runner stores remain absent for Admin; existing unreadable sources produce safe errors rather than fabricated usage.
 
 
@@ -1401,6 +1417,8 @@ Format (read by `commonplace orch docs-check`):
   - Resolving a start that is no longer `uncertain` answers 409, not 403, so a settled start reads differently from a refused caller; `tests/test_card_runs_contract.py` pins it with the member and other-workspace refusals.
 
 - **Tests:**
+
+  - `tests/test_run_ledger.py` covers the ledger row per start and its states, partial and final reports, refusals by caller and by body, the backfill of older jobs and the `runner report` command.
 
   - tests/test_admin_runtime_api.py covers machine timestamps, unverified binding, expired lease omission and absent/corrupt runner sources; existing runner owner tests retain authority contracts.
 
@@ -1970,6 +1988,10 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/web/`, `commonplace/console/`
 - **Owns:**
 
+  - The ledger lines of the card panel's Runs list in `cardruns.js`: end status, tokens, cost and log pointer of a started run.
+
+  - The Admin runner block (`adminrunners.js`): owner-only machine list, enroll, attest and wings edit over `/api/runners`, with one-time token display kept outside the Admin sections' redraws.
+
   - The Needs me Set up row for a missing model role, and the project settings model picker with its stored id, add-a-model form and role focus.
 
   - The instance-admin sign-up waitlist routes (`GET`/`POST /api/admin/instance/waitlist`, mounted from `commonplace/capacity.py`) and the plain `waitlist` sign-in message in `signin.js`.
@@ -1991,6 +2013,8 @@ Format (read by `commonplace orch docs-check`):
   - Settings mounts the owner-only Scheduled prompts section (`agent-schedules.js`) next to Agents; members see nothing there.
 
 - **Promises:**
+
+  - The Runs list shows a run's reported tokens, cost, end and log pointer; an unreported value reads "not reported", never zero, and a log pointer is a link only when it is an http(s) address.
 
   - Settings → Agents offers an unticked `cards:decide` consent on create, shows the grant on PAT and OAuth rows with **Stop answering**, and offers **Allow answering Needs-me** only on rows the server marks `decide_grantable` (the viewing owner's own eligible, unexpired PATs; never agents, runners, seats, board coordinators or other members' connections; the grant route refuses coordinators too); the consent copy comes from `decide_consent` in `GET /api/connections`; `PATCH /api/connections/<id>` with `{"decide": bool}` grants (PAT only) or withdraws (PAT or OAuth).
 
@@ -2065,6 +2089,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **How it fails:**
 
+  - A hub that sends no ledger with a start shows the Runs list as before, without ledger lines.
+
   - Runtime suberrors preserve completed sibling facts; needs-me and stuck settle independently. Deployment/health and backup receipts have independent subpanels. Missing optional data stays absent and corrupt sources return safe errors.
 
 
@@ -2074,6 +2100,8 @@ Format (read by `commonplace orch docs-check`):
   - Rendering errors surface in the browser; the server state is unaffected.
 
 - **Tests:**
+
+  - `tests/test_card_runs_ui.py` (ledger case) covers reported and unreported usage, end words, cost formatting and log pointer escaping.
 
   - tests/test_admin_runtime_api.py, tests/test_admin_runtime_controls.py, tests/test_admin_runtime_ui.py and tests/admin_runtime_ui.mjs cover fixed-time accounting, authority, wildcard subscription eligibility, no-write/lock sentinels, partial failures and GET-only pagination.
 

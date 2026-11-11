@@ -14,7 +14,7 @@ from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
 from mempalace.sqlite_crypto import connect, row_factory
 
-from . import registry
+from . import ledger, registry
 
 QUEUE_LIMIT = 8
 STARTED_HOLD_SECONDS = 3600
@@ -99,6 +99,7 @@ class JobStore:
         with self.connection() as conn:
             conn.executescript(SCHEMA)
             _migrate(conn)
+            ledger.ensure(conn)
 
     @contextmanager
     def connection(self):
@@ -197,7 +198,9 @@ def _update(conn, row, values, *, token=False):
     ).rowcount
     if changed != 1:
         raise Conflict("start changed")
-    return dict(_row(conn, row["id"]))
+    updated = dict(_row(conn, row["id"]))
+    ledger.sync(conn, updated)
+    return updated
 
 
 def sweep(store, db, ws):
@@ -407,7 +410,9 @@ def create_in(
             + " WHERE id=?",
             (*(config.get(key) for key in CONFIG_COLUMNS), job),
         )
-    return 201, dict(_row(conn, job))
+    row = dict(_row(conn, job))
+    ledger.sync(conn, row, agent=machine["worker_connection_id"])
+    return 201, row
 
 
 def lease(store, machine):
@@ -670,9 +675,11 @@ def status(store, task, principal):
         rows = conn.execute(
             "SELECT * FROM runner_jobs WHERE task_number=? ORDER BY created_at,rowid", (task,)
         ).fetchall()
+        runs = ledger.views(conn, [row["id"] for row in rows])
     return [
         dict(
             job=row["id"],
+            run=runs.get(row["id"]),
             machine_label=machines[row["machine_id"]]["label"]
             if row["machine_id"] in machines
             else None,

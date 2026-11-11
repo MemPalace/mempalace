@@ -52,6 +52,38 @@ const cases = {
     assert.equal(outcomeWords('weird_code'), 'Reason code: weird_code');
     assert.equal(outcomeWords(null), '');
   },
+  ledger() {
+    const { runLedgerHTML, runStateWords, tokenWords, costWords } = runs;
+    const started = (run) => job({ state: 'started', thread_id: 'thread-9', run });
+    const blank = { status: 'started', started_at: '2026-11-11T10:00:00Z', ended_at: null, log_ref: null, input_tokens: null, output_tokens: null, cost_micros: null, currency: null, reported_at: null };
+    // Nothing reported: said so, never shown as zero.
+    const unknown = cardRunsHTML([started(blank)]);
+    assert.ok(unknown.includes('Tokens not reported · Cost not reported'));
+    assert.ok(unknown.includes('>Started<') && !unknown.includes('run-log') && !unknown.includes('run-ended'));
+    // Reported values, the end status in the tag and a link for an http(s) log pointer.
+    const full = cardRunsHTML([started({ ...blank, status: 'completed', ended_at: '2026-11-11T10:30:00Z', log_ref: 'https://logs.example.test/run/1', input_tokens: 1234567, output_tokens: 890, cost_micros: 1250000, currency: 'USD', reported_at: '2026-11-11T10:30:00Z' })]);
+    for (const text of ['>Finished<', 'Tokens: 1,234,567 in · 890 out', 'Cost: 1.25 USD', '<a href="https://logs.example.test/run/1" target="_blank" rel="noopener noreferrer">', 'class="run-ended"', 'datetime="2026-11-11T10:30:00Z"']) {
+      assert.ok(full.includes(text), `missing: ${text}`);
+    }
+    assert.ok(!full.includes('>Started<'));
+    assert.equal(runStateWords(started({ ...blank, status: 'errored' })), 'Ended with an error');
+    assert.equal(runStateWords(started({ ...blank, status: 'stopped' })), 'Stopped');
+    assert.equal(runStateWords(job({ state: 'queued', run: { ...blank, status: 'queued' } })), '');
+    // One side of the tokens known; zero is a reported value.
+    assert.equal(tokenWords({ input_tokens: 0, output_tokens: null }), 'Tokens: 0 in · out not reported');
+    assert.equal(tokenWords({ input_tokens: null, output_tokens: 5 }), 'Tokens: in not reported · 5 out');
+    assert.equal(costWords({ cost_micros: 0, currency: 'EUR' }), 'Cost: 0.00 EUR');
+    assert.equal(costWords({ cost_micros: 1234567, currency: 'EUR' }), 'Cost: 1.234567 EUR');
+    assert.equal(costWords({ cost_micros: 2000000000, currency: 'USD' }), 'Cost: 2,000.00 USD');
+    assert.equal(costWords({ cost_micros: 5, currency: null }), 'Cost not reported');
+    assert.equal(costWords({ cost_micros: -1, currency: 'USD' }), 'Cost not reported');
+    // A log pointer that is not a web address is text, never a link; markup is escaped.
+    const opaque = cardRunsHTML([started({ ...blank, log_ref: 'javascript:alert(1)' }), started({ ...blank, log_ref: '<b>x</b>' })]);
+    assert.ok(!opaque.includes('<a ') && opaque.includes('<code>javascript:alert(1)</code>') && opaque.includes('&lt;b&gt;x&lt;/b&gt;'));
+    // No ledger lines before the run started, or when the hub sent no ledger at all.
+    assert.equal(runLedgerHTML(job({ run: { ...blank, status: 'queued' } })), '');
+    assert.equal(runLedgerHTML(job({ state: 'started' })), '');
+  },
   empty() {
     const html = cardRunsHTML([]);
     assert.ok(html.includes('No agent has been started on this card.'));

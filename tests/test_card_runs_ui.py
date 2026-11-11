@@ -9,6 +9,7 @@ STATIC = Path(__file__).resolve().parents[1] / "commonplace" / "web" / "static"
 HARNESS = Path(__file__).with_name("cardruns.mjs")
 CASES = [
     "words",
+    "ledger",
     "empty",
     "escape",
     "mount",

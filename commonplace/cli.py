@@ -982,6 +982,11 @@ def cmd_runner(args) -> int:
 
         return chat_agent.run(args.config, args.once)
 
+    if args.action == "report":
+        from .runner import report
+
+        return report.run(args)
+
     from .runner.agent import check, run
 
     if args.action == "check":
@@ -1003,6 +1008,15 @@ def build_parser() -> argparse.ArgumentParser:
         if action in ("run", "chat"):
             s.add_argument("--once", action="store_true")
         s.set_defaults(func=cmd_runner)
+    s = runner.add_parser("report", help="report a started run's status, log and usage")
+    s.add_argument("--config", required=True)
+    s.add_argument("--job", required=True, help="job id of the started run")
+    s.add_argument("--status", choices=("completed", "errored", "stopped"))
+    s.add_argument("--log-ref")
+    for flag in ("--input-tokens", "--output-tokens", "--cost-micros"):
+        s.add_argument(flag, type=int)
+    s.add_argument("--currency")
+    s.set_defaults(func=cmd_runner)
 
     s = sub.add_parser("init", help="create the control database and the first admin")
     s.add_argument("--admin-email", required=True)

@@ -58,6 +58,37 @@ An ambiguous launch becomes `uncertain`, never automatically queued again. Start
 
 `card_start_cancel` on `uncertain` returns 409 for everyone, including the owner: `start outcome is uncertain; a workspace owner must resolve it`. Cancelling a `starting` job only records the request; it does not stop a remote thread or free the slot. Resolve spans the control and workspace databases: the control audit commits before the runner resolution, so a crash between commits can leave an audit entry without the resolution. A completed resolution retains `resolved_by` and `resolved_at`.
 
+## Run ledger
+
+Every start is one run and has one ledger row in the workspace's `runner.sqlite3` (`run_ledger`), written in the same transaction as the start itself. The row carries the card, board, project, topic, machine, worker connection, requester and (for a config-driven start) the pinned model. Its status follows the start (`queued`, `leased`, `starting`, `started`, `failed`, `uncertain`, `cancelled`) until the machine reports how the run ended. Starts made before the ledger existed get their row when the store is next opened; their usage stays unknown.
+
+The hub never measures or estimates usage. Only the run's own enabled machine can report it, for a run in `started`:
+
+```
+POST /api/runner/usage
+{"job_id": "<job>", "status": "completed", "log_ref": "<url or id>",
+ "input_tokens": 5000, "output_tokens": 800, "cost_micros": 420000, "currency": "USD"}
+```
+
+- Every field except `job_id` is optional, and at least one is needed. A field left out keeps its stored value; a value nobody reported stays `null` and the app says "not reported".
+- `input_tokens` and `output_tokens` are the run's totals so far (whole numbers, 0 to 10^15) and replace the stored totals.
+- `cost_micros` is the cost in millionths of the currency unit and always comes with `currency`, three capital letters. The hub holds no prices: the cost is whatever the agent or its provider told the machine.
+- `log_ref` (up to 512 printable characters) points at the run's log: a web address or an id such as a thread id. The hub stores the pointer, never the log.
+- `status` is the run's end: `completed`, `errored` or `stopped`. It is set once, with `ended_at` as the time the hub received it. The same status again is accepted; another one answers 409 `run already ended`. Totals may still be corrected after the end.
+- A run that has not started answers 409 `run has not started`. A job of another machine answers 404, as does any caller that is not an enabled machine. An invalid report answers 400 and changes nothing.
+
+On the machine, whatever starts or watches the agent reports with the runner's own config and machine credential:
+
+```
+python -m commonplace runner report --config F --job <job> \
+  [--status completed|errored|stopped] [--log-ref R] \
+  [--input-tokens N] [--output-tokens N] [--cost-micros N --currency CUR]
+```
+
+It exits 0 when recorded, 4 for an invalid config or report, 3 for a revoked credential and 5 when the hub refuses or cannot be reached. The runner itself does not watch threads (D3), so nothing is reported unless this command or the route is called.
+
+`card_start_status(task)` and `GET /api/card-starts?task=<n>` return the ledger of each start under `run` (`status`, `started_at`, `ended_at`, `log_ref`, `input_tokens`, `output_tokens`, `cost_micros`, `currency`, `reported_at`, `model_provider`, `model`), with the same visibility as the start: the owner sees all, a requester its own. The card panel's Runs list shows it next to each started run. A reported end does not change the start job, capacity or the card.
+
 ## Start from the card panel
 
 The Runs section of a card has a **Start agent**

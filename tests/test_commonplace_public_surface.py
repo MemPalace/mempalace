@@ -54,7 +54,10 @@ EXACT = {
     ("POST", "/api/runners"): "authenticated",
     ("POST", "/api/card-starts"): "authenticated",
     ("GET", "/api/card-starts"): "authenticated",
+    ("POST", "/api/runner/usage"): "authenticated",
     ("GET", "/api/card-starts/options"): "authenticated",
+    ("GET", "/api/agent-schedules"): "authenticated",
+    ("POST", "/api/agent-schedules"): "authenticated",
     **{
         (method, path): "authenticated"
         for method in ("GET", "POST", "PATCH", "DELETE")
@@ -102,6 +105,8 @@ PREFIX = {
     ("GET", "/api/orch/"): "authenticated",
     ("POST", "/api/orch/"): "authenticated",
     ("POST", "/api/runner/chat/"): "authenticated",
+    ("GET", "/api/agent-schedules/"): "authenticated",
+    ("POST", "/api/agent-schedules/"): "authenticated",
     ("POST", "/api/card-starts/"): "authenticated",
     **{
         (method, path): "authenticated"

@@ -259,7 +259,8 @@ kbd { font: 500 11px/16px var(--mono); color: var(--text-2); background: var(--s
 .card-runs .run-state { color: var(--text); font-weight: 600; }
 .card-runs [data-state="uncertain"] { border-color: var(--wait-line); background: var(--wait-bg); }
 .card-runs [data-state="failed"] .run-state { color: var(--block); }
-.card-runs .run-reason, .card-runs .run-thread, .card-runs .run-resolve p { font-size: 12.5px; line-height: 19px; color: var(--text-2); overflow-wrap: anywhere; }
+.card-runs .run-usage { font-variant-numeric: tabular-nums; }
+.card-runs .run-reason, .card-runs .run-thread, .card-runs .run-ended, .card-runs .run-usage, .card-runs .run-log, .card-runs .run-resolve p { font-size: 12.5px; line-height: 19px; color: var(--text-2); overflow-wrap: anywhere; }
 .card-runs .run-resolve { width: 100%; display: flex; flex-direction: column; gap: 6px; }
 .card-runs .run-resolve-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .card-runs .run-resolve input { flex: 1 1 140px; min-width: 0; }

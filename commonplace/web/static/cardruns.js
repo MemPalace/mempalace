@@ -105,6 +105,50 @@ const ago = (at) => {
   return value === "now" ? "just now" : value === "—" ? "" : `${value} ago`;
 };
 
+// The ledger part of one run in the card panel's Runs list: how the run ended, its tokens, its cost
+// and where its log is. `job.run` comes with each row of GET /api/card-starts. Every number is what the
+// machine reported; a value nobody reported is shown as "not reported", never as zero or a guess.
+
+export const RUN_WORDS = {
+  completed: "Finished",
+  errored: "Ended with an error",
+  stopped: "Stopped",
+};
+
+// The words for a run that reported its end; "" while it has not (the start state is shown instead).
+export const runStateWords = (job) => (job?.state === "started" && RUN_WORDS[job.run?.status]) || "";
+
+const known = (value) => Number.isSafeInteger(value) && value >= 0;
+const count = (value) => value.toLocaleString("en-US");
+
+export function tokenWords(run) {
+  const input = known(run?.input_tokens), output = known(run?.output_tokens);
+  if (!input && !output) return "Tokens not reported";
+  return `Tokens: ${input ? `${count(run.input_tokens)} in` : "in not reported"} · ${output ? `${count(run.output_tokens)} out` : "out not reported"}`;
+}
+
+// Cost is stored in millionths of the currency unit, so no float ever rounds it.
+export function costWords(run) {
+  if (!known(run?.cost_micros) || !/^[A-Z]{3}$/.test(run.currency || "")) return "Cost not reported";
+  const whole = Math.floor(run.cost_micros / 1e6);
+  const fraction = String(run.cost_micros % 1e6).padStart(6, "0").replace(/0{1,4}$/, "");
+  return `Cost: ${count(whole)}.${fraction} ${run.currency}`;
+}
+
+function logHTML(ref) {
+  if (typeof ref !== "string" || !ref) return "";
+  const link = /^https?:\/\/[^\s]+$/i.test(ref);
+  return `<p class="run-log">Log: ${link ? `<a href="${e(ref)}" target="_blank" rel="noopener noreferrer">${e(ref)}</a>` : `<code>${e(ref)}</code>`}</p>`;
+}
+
+export function runLedgerHTML(job) {
+  const run = job?.run;
+  if (!run || job.state !== "started") return "";
+  const since = run.ended_at ? elapsed(run.ended_at) : "";
+  const ended = run.ended_at ? `<p class="run-ended">Ended <time datetime="${e(run.ended_at)}" title="${e(run.ended_at)}">${e(since === "now" ? "just now" : since === "—" ? run.ended_at : `${since} ago`)}</time></p>` : "";
+  return `${ended}<p class="run-usage">${e(tokenWords(run))} · ${e(costWords(run))}</p>${logHTML(run.log_ref)}`;
+}
+
 function runHTML(job) {
   const reason = outcomeWords(job.outcome_code);
   const machine = job.machine_label ? ` · ${e(job.machine_label)}` : "";
@@ -113,7 +157,7 @@ function runHTML(job) {
   const resolve = job.state === "uncertain"
     ? `<form class="run-resolve" data-run-resolve="${e(job.job)}"><p>If it did start, paste the thread id of the agent that is running it.</p><div class="run-resolve-row"><label class="sr" for="run-thread-${e(job.job)}">Thread id</label><input id="run-thread-${e(job.job)}" name="thread" autocomplete="off" spellcheck="false" maxlength="256" placeholder="Thread id"><button class="btn sm" type="submit" value="started">It started</button><button class="btn sm" type="submit" value="failed" formnovalidate>It failed</button></div></form>`
     : "";
-  return `<li data-run="${e(job.job)}" data-state="${e(job.state)}"><p class="run-line"><span class="tag run-state">${e(STATE_WORDS[job.state] || job.state)}</span>${machine}${when}</p>${reason ? `<p class="run-reason">${e(reason)}</p>` : ""}${job.thread_id ? `<p class="run-thread">Thread <code>${e(job.thread_id)}</code></p>` : ""}${cancel}${resolve}</li>`;
+  return `<li data-run="${e(job.job)}" data-state="${e(job.state)}"><p class="run-line"><span class="tag run-state">${e(runStateWords(job) || STATE_WORDS[job.state] || job.state)}</span>${machine}${when}</p>${reason ? `<p class="run-reason">${e(reason)}</p>` : ""}${job.thread_id ? `<p class="run-thread">Thread <code>${e(job.thread_id)}</code></p>` : ""}${runLedgerHTML(job)}${cancel}${resolve}</li>`;
 }
 
 // The inner HTML of the section for a loaded list; `note` is the last refusal or confirmation.

@@ -263,6 +263,14 @@ configs. No deployment, replacement importer or memory-coverage completion is cl
 - A runner machine's worker PAT reads and writes every wing in the machine grant and no other; its first wing is the default write wing. `startable()` accepts a card whose board wing is granted and otherwise refuses with `outside_worker_wing`, naming the board wing and the granted wings. Machines enrolled before this keep a first-wing-only worker policy until their wings are saved once (same wings do not reset the binding).
 - The Admin page's runner block lists, enrolls, attests and edits wings through the existing owner-only `/api/runners` routes. Enrollment tokens are shown once in a panel and never stored, logged or redrawn.
 
+### Run ledger
+
+- A run is one runner start. Its ledger row (`run_ledger` in `runner.sqlite3`) is written in the start's own transaction and follows its state; the table is additive and older starts get a row when the store opens.
+
+- The hub never measures, prices or estimates usage. Tokens, cost (millionths of a currency unit plus the currency), the log pointer and the run's end are only what the run's own enabled machine reported through `POST /api/runner/usage`; an unreported value stays NULL and reads "not reported".
+
+- A reported end changes neither the start job nor machine capacity nor the card (D3 stays open).
+
 ### Mirror and search-index test waits
 
 - Tests that wait for background mirror or search-index work drain on the actual completion condition (no sweep active, no mirror job pending) through one shared test helper, with a 120 s stuck-job limit, rather than one fixed `wait_for_mirrors` budget that returns silently when it runs out.
@@ -990,7 +998,7 @@ A routine (name, card template, schedule, owner) creates one card per due time. 
 |---|---|---|---|
 | `control.sqlite3` | hub | users, workspaces, memberships, connections, model settings, audit, sign-up waitlist (`signup_waitlist`, additive) | yes |
 | `boards.sqlite3` | workspace | boards, cards, `task_events` (append-only) | yes |
-| `runner.sqlite3` | workspace | runner jobs; orchestrator configs, cursors, leases, steps, journal, restore flag | yes |
+| `runner.sqlite3` | workspace | runner jobs and their run ledger; orchestrator configs, cursors, leases, steps, journal, restore flag | yes |
 | palace and other workspace SQLite files | workspace | verbatim memory, indexes, threads | yes |
 
 - Backups copy every SQLite file in the data directory (`commonplace/backup.py`).
