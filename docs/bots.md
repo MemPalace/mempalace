@@ -102,7 +102,17 @@ the role `event`, and the roster follows (`unread` counts it, `state` changes).
 This part describes what the screens do; the server side is in [Routes](#routes),
 [Blocks](#blocks) and [Privacy and storage](#privacy-and-storage).
 
-Open **Bots** in the left rail (or the first tab on a phone). Every bot you can talk to is listed:
+**Bots** is where you land after signing in (until a first project exists, the first-run screen
+comes first). It is the first entry in the left rail and the first tab on a phone; **Memory** is
+the only other primary entry. The number next to Bots counts the questions waiting on you.
+
+**Where the rest went.** Projects, Needs me and Console sit under **Workspace** in the account
+menu (your name at the bottom of the rail, the menu button at the top left on a phone), next to
+Rules, Workspace settings and, for owners, Admin. Nothing was removed: every project, task,
+chat, Needs me and Console link keeps working, and the project chat dock still opens on a
+project screen.
+
+Every bot you can talk to is listed:
 one per project, a General bot, and any you made yourself. The list is in the order the server
 gives it, most recently used first.
 

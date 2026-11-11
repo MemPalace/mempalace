@@ -48,9 +48,10 @@ if (which === 'shell') {
   run(slice('function navigation()', 'function showError') + '\nnavigation();');
   const html = nodes['#board-nav'].outerHTML;
   assert.equal(typeof html, 'string');
-  assert.match(html, /2 agents working/);
-  assert.doesNotMatch(html, /9 need you/);
-  assert.equal((nodes['#phone-tabs'].innerHTML.match(/<a /g) || []).length, 3);
+  // The rail lists Bots and Memory only: no project rows, no per-project counts.
+  assert.doesNotMatch(html, /agents working|9 need you|class="proj"/);
+  assert.deepEqual([...html.slice(0, html.indexOf('rail-foot')).matchAll(/<a [^>]*href="([^"]*)"/g)].map((m) => m[1]), ['#/bots', '#/memory']);
+  assert.equal((nodes['#phone-tabs'].innerHTML.match(/<a /g) || []).length, 2);
   state.base = '#/needs'; state.selected = 12;
   context.needsCards = () => [{number: 12, board: 'alpha'}];
   run('navigation();');
@@ -83,9 +84,9 @@ if (which === 'shell') {
   await run('cardPanel(5, 0)'); assert.equal(stopped, 0);
 } else if (which === 'routes') {
   const routes = await module('routes'); assert.equal(typeof routes.resolveRoute, 'function');
-  Object.assign(context, routes, { clearAgentSecret() {}, decideStart: () => undefined, speech: {stop() {}}, chatUI: {stop() {}}, consoleUI: {stop() {}}, detailsUI: null, boardDispose: null, markOpenCard() {}, refresh: async () => {}, history: { state: null, replaceState(_s,_t,hash) { context.location.hash = hash; } }, api: async () => ({boards: state.boards}), boardPreference: () => 'last', singleKeysEnabled: () => true });
+  Object.assign(context, routes, { clearAgentSecret() {}, decideStart: () => undefined, speech: {stop() {}}, chatUI: {stop() {}}, consoleUI: {stop() {}}, botsUI: null, detailsUI: null, boardDispose: null, markOpenCard() {}, refresh: async () => {}, history: { state: null, replaceState(_s,_t,hash) { context.location.hash = hash; } }, api: async () => ({boards: state.boards}), boardPreference: () => 'last', singleKeysEnabled: () => true });
   run(slice('async function route()', '// The current view'));
-  for (const [hash, expected] of [['#/', '#/board/alpha'], ['#/chat/alpha', '#/board/alpha/chat'], ['#/space/alpha', '#/space/alpha'], ['#/needs', '#/needs'], ['#/rules', '#/rules'], ['#/console', '#/console'], ['#/settings', '#/settings'], ['#/decide', '#/decide']]) {
+  for (const [hash, expected] of [['#/', '#/bots'], ['#/bots', '#/bots'], ['#/board/alpha', '#/board/alpha'], ['#/chat/alpha', '#/board/alpha/chat'], ['#/space/alpha', '#/space/alpha'], ['#/needs', '#/needs'], ['#/rules', '#/rules'], ['#/console', '#/console'], ['#/settings', '#/settings'], ['#/decide', '#/decide']]) {
     context.decideStart = () => hash === '#/decide' ? null : undefined;
     Object.assign(context, {createSession: () => ({}), askedRead: () => ({}), queueArmSlow() {}, queueStop() {}, queueFlush() {}});
     context.location.hash = hash; await run('route()'); assert.equal(state.base, expected);
@@ -207,7 +208,7 @@ if (which === 'shell') {
   assert.match(rules[0], />2</);
 } else if (which === 'bare-chat') {
   const routes = await module('routes');
-  Object.assign(context, routes, { clearAgentSecret() {}, decideStart: () => undefined, speech: {stop() {}}, chatUI: {stop() {}}, consoleUI: {stop() {}}, detailsUI: null, boardDispose: null, markOpenCard() {}, refresh: async () => {}, history: { state: null, replaceState(_s,_t,hash) { context.location.hash = hash; } }, api: async () => ({boards: state.boards}), boardPreference: () => 'last', singleKeysEnabled: () => true });
+  Object.assign(context, routes, { clearAgentSecret() {}, decideStart: () => undefined, speech: {stop() {}}, chatUI: {stop() {}}, consoleUI: {stop() {}}, botsUI: null, detailsUI: null, boardDispose: null, markOpenCard() {}, refresh: async () => {}, history: { state: null, replaceState(_s,_t,hash) { context.location.hash = hash; } }, api: async () => ({boards: state.boards}), boardPreference: () => 'last', singleKeysEnabled: () => true });
   run(slice('async function route()', '// The current view'));
   // Bare #/chat opens the default project's chat; no slug is read from the path.
   context.location.hash = '#/chat'; await run('route()');

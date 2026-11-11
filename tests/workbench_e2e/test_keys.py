@@ -423,7 +423,7 @@ def _(ui, seed):
 @case("m10.dialog")
 def _(ui, seed):
     p = ui.open("#/board/atlas", PHONE)
-    p.click("#m-chat-tab")
+    p.click("#chat-toggle")
     settle(p, 500)
     initial = composer(p)
     kept = trapped(p, "#chat")
@@ -431,8 +431,8 @@ def _(ui, seed):
     settle(p, 200)
     after = modal_snapshot(p)
     ok(
-        initial and kept and after["focus"] == "m-chat-tab" and after["inert"] == 0,
-        "m10 chat sheet: composer focus (workbench plan), trap, Esc to the tab",
+        initial and kept and after["focus"] == "chat-toggle" and after["inert"] == 0,
+        "m10 chat sheet: composer focus (workbench plan), trap, Esc back to the Chat button",
         {"composer": initial, "trapped": kept, **after},
     )
 
@@ -886,7 +886,7 @@ def _(ui, seed):
 
 def _phone_show(ui, seed, cid, column):
     p = ui.open("#/board/atlas", PHONE)
-    p.click("#m-chat-tab")
+    p.click("#chat-toggle")
     settle(p, 600)
     p.click(row(seed, cid))
     settle(p, 600)
@@ -924,12 +924,12 @@ def _(ui, seed):
 @case("m10.back-to-board")
 def _(ui, seed):
     p = ui.open("#/board/atlas", PHONE)
-    p.click("#m-chat-tab")
+    p.click("#chat-toggle")
     settle(p, 500)
     tap(p, "#m-chat-back, #chat-close")
     settle(p, 300)
     focus = p.evaluate("() => document.activeElement.id")
-    ok(focus == "m-chat-tab", "m10 Back to board → focus on the Chat tab", {"focus": focus})
+    ok(focus == "chat-toggle", "m10 Back to board → focus on the Chat button", {"focus": focus})
 
 
 # ---- Round 3 -----------------------------------------------------------------------------
@@ -1138,24 +1138,6 @@ def _(ui, seed):
     )
 
 
-@case("m2.chat-tab-back-to-needs")
-def _(ui, seed):
-    p = ui.open("#/needs", PHONE)
-    p.click("#m-chat-tab")
-    settle(p, 500)
-    n1 = p.evaluate(HERE_JS)
-    tap(p, "#chat .chat-about [data-close-chat]")
-    settle(p, 400)
-    n2 = p.evaluate(HERE_JS)
-    ok(
-        "Back to Needs me" in n1["back"]
-        and n2["hash"] == "#/needs"
-        and n2["focus"] == "m-chat-tab",
-        "phone Needs me Chat tab → Back to Needs me → focus on the tab",
-        {"n1": n1, "n2": n2},
-    )
-
-
 def _phone_settings(p):
     p.click("#m-settings")
     p.wait_for_selector("[data-project-back]", timeout=5000)
@@ -1350,7 +1332,7 @@ def _(ui, seed):
 
 def _tab_text(p):
     return p.evaluate(
-        "() => { const t = document.getElementById('m-chat-tab'); "
+        "() => { const t = document.getElementById('chat-toggle'); "
         "return (t.getAttribute('aria-label') || t.textContent).replace(/\\s+/g, ' ').trim(); }"
     )
 
@@ -1358,29 +1340,6 @@ def _tab_text(p):
 SHEET_INFO_JS = """() => ({ head: (document.getElementById('chat-h') || {}).textContent || '',
   label: (document.querySelector('#chat label[for="chat-text"]') || {}).textContent || '',
   back: (document.querySelector('#chat .chat-about:not([hidden]) [data-close-chat]') || {}).textContent || '' })"""
-
-
-@case("m2.tab-names-atlas")
-def _(ui, seed):
-    p = ui.open("#/needs", PHONE)
-    settle(p, 600)
-    ta = _tab_text(p)
-    p.click("#m-chat-tab")
-    settle(p, 500)
-    sa = p.evaluate(SHEET_INFO_JS)
-    tap(p, "#chat .chat-about [data-close-chat]")
-    settle(p, 400)
-    ra = p.evaluate("() => ({ hash: location.hash, focus: document.activeElement.id })")
-    ok(
-        ta == "Atlas chat 1 new reply"
-        and sa["head"] == "Atlas chat"
-        and sa["label"] == "Message to Atlas chat"
-        and sa["back"] == "Back to Needs me"
-        and ra["hash"] == "#/needs"
-        and ra["focus"] == "m-chat-tab",
-        "m2: the tab reads 'Atlas chat 1 new reply' → Atlas chat → back to Needs me",
-        {"tab": ta, "sheet": sa, "back": ra},
-    )
 
 
 def _harbor_last(p):
@@ -1391,31 +1350,10 @@ def _harbor_last(p):
         settle(p, 300)
 
 
-@case("m2b.tab-names-harbor")
-def _(ui, seed):
-    p = ui.open("#/needs", PHONE)
-    _harbor_last(p)
-    th = _tab_text(p)
-    p.click("#m-chat-tab")
-    settle(p, 500)
-    sh = p.evaluate(SHEET_INFO_JS)
-    tap(p, "#chat .chat-about [data-close-chat]")
-    settle(p, 400)
-    rh = p.evaluate("() => ({ hash: location.hash, focus: document.activeElement.id })")
-    ok(
-        th.startswith("Harbor chat")
-        and sh["head"] == "Harbor chat"
-        and sh["label"] == "Message to Harbor chat"
-        and rh["focus"] == "m-chat-tab",
-        "m2b: Harbor item last opened → Harbor chat",
-        {"tab": th, "sheet": sh, "back": rh},
-    )
-
-
 @case("m12b.restart-path")
 def _(ui, seed):
     p = ui.open("#/board/ledger", PHONE)
-    p.click("#m-chat-tab")
+    p.click("#chat-toggle")
     settle(p, 600)
     first = _restart_actions(p)
     p.locator("#chat .chat-recovery a", has_text="restart").first.click()
@@ -1453,16 +1391,6 @@ def _(ui, seed):
         "m2 Settings → Back to Needs me → focus on Settings",
         {"sheet": d, "after": r},
     )
-
-
-@case("m2.unread-status-line")
-def _(ui, seed):
-    p = ui.open("#/needs", PHONE)
-    settle(p, 800)
-    live = p.evaluate(
-        "() => (document.querySelector('.m-tabs [role=\"status\"]') || {}).textContent || ''"
-    )
-    ok(live == "1 new reply in Atlas chat", "the phone unread count is announced", {"status": live})
 
 
 # ---- Round 5 -----------------------------------------------------------------------------
@@ -1543,7 +1471,7 @@ def _esc_settings(p):
 @case("m13.esc.error")
 def _(ui, seed):
     p = ui.open("#/board/ledger", PHONE)
-    p.click("#m-chat-tab")
+    p.click("#chat-toggle")
     settle(p, 600)
     p.locator("#chat .chat-recovery a", has_text="restart").first.click()
     p.wait_for_selector("[data-project-back]", timeout=5000)

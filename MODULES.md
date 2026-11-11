@@ -243,9 +243,9 @@ Format (read by `commonplace orch docs-check`):
 - **Owns:**
 
   - The project connection guide describes persistent conflict reasons and retry choices after consent dialogs close.
-
   - Memory sync documentation states the restricted-search refill bound, suppressed candidate counters and the restricted CLI-compatible route.
   - The project and orchestrator guides state that a role without a model raises one owner Needs me item and that Agent models are picked from the workspace's model list.
+  - `docs/design/RULES.md` places the Rules entry in the account menu rather than the sidebar and phone tabs.
 
   - The OAuth contract records the displayed callback origin, numeric-host tightening and required pre-deploy registration inventory.
 
@@ -603,6 +603,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `tests/`
 - **Owns:**
+
+  - The navigation tests follow the bots-first rail: `tests/workbench_shell_wiring.mjs`, `tests/workbench_chat_wiring.mjs`, `tests/commonplace_home_render.mjs`, `tests/commonplace_board_defaults_render.mjs`, `tests/card_log_links.mjs`, `tests/admin_ui.mjs` and the phone scenarios of `tests/workbench_e2e/test_keys.py` no longer expect project rows, a Needs me or Console rail entry or a Chat tab (the phone Chat button is the dock toggle in the header).
 
   - `tests/test_commonplace_agent_log.py` and `tests/test_commonplace_agent_log_sync.py` cover agent-log capture, provenance, idempotent retry and a non-reader of the private chat; the protected-reference producer matrix includes the agent-log source.
 
@@ -2024,6 +2026,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/bots/`, `docs/bots.md`, `tests/_bots_helpers.py`, `tests/test_bots_api.py`, `tests/test_bots_store.py`, `tests/test_bots_updates.py`
 - **Owns:**
 
+  - The web-app part of `docs/bots.md` also says where Projects, Needs me and Console moved (the Workspace group of the account menu) and that the Bots count is the number of questions waiting on the person.
+
   - The web screens for bots are described in the "Using bots in the web app" part of `docs/bots.md` (roster, thread, blocks, orchestrator replies, memory sheet, refresh rhythm); the server parts of that file stay unchanged.
 
   - Per-person chat bots: one workspace file `bots.sqlite3` (opened like `chat.sqlite3`) holding bots, append-only messages, the tool-action journal, pending confirmations, the work a bot filed, the posts it forwarded and memory notes, plus the person-only `/api/bots` read and management routes (`docs/bots.md`).
@@ -2068,6 +2072,8 @@ Format (read by `commonplace orch docs-check`):
 - **Owns:**
 
   - The ledger lines of the card panel's Runs list in `cardruns.js`: end status, tokens, cost and log pointer of a started run.
+
+  - Bots-first navigation (`routes.js`, `rail.js`, `app.js`): a bare visit resolves to `#/bots` for a person who has a project (the first-run screen stays for one who has none); the rail and the phone tabs list Bots and Memory only, with the Bots count taken from the roster (`waitingTotal` in `bots.js`); Projects, Needs me and Console sit in a "Workspace" group of the account menu (desktop rail and phone top bar), beside Rules, Workspace settings and Admin. `boardRoute` keeps the old landing board for shared card links and the exit from Admin; every earlier deep link resolves as before.
 
   - The bots screens (`bots.js`, `botstream.js`, `bots.css`, routes `#/bots` and `#/bots/<id>`): a roster of named bots with one state dot each and one streamed thread per bot, drawn from the `/api/bots*` contract. `botstream.js` is the DOM-free SSE frame parser and the message sender; `bots.js` renders blocks (actions on one line, work chip, decision buttons and reply field through the existing decide route, confirm chip, setup block, a "Waiting on you" strip) and owns polling, the unsent-text retry and the memory/rename/archive sheet. See "Using bots in the web app" in `docs/bots.md`.
 
@@ -2203,6 +2209,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/orchstatus.mjs` (run by `tests/test_orchstatus.py`) covers the status block states, the End lease confirm, refusals and escaping; `tests/test_orch_lease_status.py` covers the checkpoint fields it reads and the owner-only force-release contract.
 
   - `api.js` joins a refusal's `error` and `next_step` and words a 403 without a JSON body; `tests/test_commonplace_owner_403_message.py` and `tests/owner_403_message.mjs` cover it.
+
+  - `tests/commonplace_bots_nav.mjs` (run by `tests/test_commonplace_bots_nav.py`) covers the landing route, every old deep link still being a screen, the Bots count and the exact rail, menu and phone-tab entries; `tests/workbench_rail.mjs` and `tests/workbench_routes.mjs` hold the rail markup and route resolution cases.
 
   - `tests/commonplace_bots_view.mjs` (run by `tests/test_commonplace_bots_view.py`) covers the stream parser cut at every byte, the sender's pre-stream refusals and events, the roster, every block type, the optimistic echo and streamed fill, Stop, retry under one request id, escaping of hostile text and the route and rail glue; `tests/bots_harness.html` with `tests/bots_shots.sh` renders the screens for desktop and phone screenshots.
 

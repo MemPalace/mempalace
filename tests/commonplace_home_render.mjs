@@ -73,9 +73,10 @@ if (which === "need_items") {
   const flush = async () => { for (let i = 0; i < 20; i++) await new Promise((resolve) => setImmediate(resolve)); };
   try {
     context.navigation();
-    const project = nodes["#board-nav"].outerHTML.match(/<a class="proj" href="#\/board\/atlas"[^>]*>[\s\S]*?<\/a>/);
-    assert.ok(project, "Atlas rail entry missing");
-    assert.match(project[0], />2<span class="sr"> need you<\/span>/, "Owner origin release must count in its project's rail badge");
+    // The rail no longer lists projects: the release shows in the Needs me count of the account menu.
+    const rail = nodes["#board-nav"].outerHTML;
+    assert.ok(!rail.includes('class="proj"'), "The rail lists no projects");
+    assert.match(rail, /href="#\/needs">Needs me<span class="count need">3<span class="sr"> items<\/span>/, "Owner origin release must count in the Needs me total");
     assert.deepEqual(home.needItems(needs).map(({ card }) => card.number), [22, 7, 1], "Release must rank after you and before plan, regardless of card number");
     context.needsView(); await flush();
     assert.equal(shows.at(-1), origin.number, "Origin approval must remain selected when opening Needs me");

@@ -244,6 +244,21 @@ test("an event with an orchestrator block carries an Orchestrator label and esca
   assert.doesNotMatch(bot, /Orchestrator/, "only event messages are labelled");
 });
 
+test("server keys that match inherited object members get the default text, never a function or a throw", () => {
+  const ctx = { open: new Set(), busy: new Set() };
+  for (const key of ["constructor", "__proto__", "toString", "hasOwnProperty"]) {
+    assert.match(ui.setupHTML({ code: key, can_configure: true }, e), /Bots need a chat model/, `setup ${key}`);
+    assert.equal(ui.setupText(key, false), ui.setupText("needs_configuration", false));
+    assert.doesNotMatch(ui.workHTML({ card: 1, title: "t", status: key }, ctx, e), /chip|function|native code/, `status ${key}`);
+    const row = ui.rosterHTML({ bots: [{ id: "a", name: "A", job: "", last: null, unread: 0, state: key }] }, e);
+    assert.doesNotMatch(row, /bot-dot|function|native code/, `dot ${key}`);
+    const note = ui.messageHTML({ id: 1, role: "bot", text: "x", state: `failed:${key}`, blocks: [] }, ctx, e);
+    assert.match(note, /The reply failed\./, `fail ${key}`);
+    assert.doesNotMatch(note, /function|native code/);
+    assert.doesNotMatch(ui.confirmHTML({ pending: "p", label: "L", state: key }, ctx, e), /function|native code| · /, `confirm ${key}`);
+  }
+});
+
 // ---------- view: controller ----------
 
 function dom() {
@@ -273,7 +288,7 @@ function dom() {
 const msg = (id, role, extra = {}) => ({ id, role, text: "", blocks: [], at: "2026-11-11T08:00:00Z", state: "ok", reply_to: null, ...extra });
 const botRow = (id, name, extra = {}) => ({ id, name, job: `${name} job`, instructions: "", kind: "custom", board: null, last: null, unread: 0, waiting: 0, state: "idle", ...extra });
 
-function harness({ bots = [botRow("b1", "Atlas")], messages = [], waiting = [], running = false, model = { ready: true, label: "local", code: "" }, canConfigure = true, send, hidden = false, phone = false } = {}) {
+function harness({ bots = [botRow("b1", "Atlas")], messages = [], waiting = [], running = false, model = { ready: true, label: "local", code: "" }, canConfigure = true, send, hidden = false, phone = false, onRoster } = {}) {
   const d = dom();
   const calls = [];
   const timers = new Map();
@@ -299,7 +314,7 @@ function harness({ bots = [botRow("b1", "Atlas")], messages = [], waiting = [], 
     mount: () => d.mount, api, e, send, makeId: (() => { let n = 0; return () => `req_auto_${++n}00000`; })(),
     setTimer: (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
     clearTimer: (id) => timers.delete(id),
-    hidden: () => state.hidden, phone: () => state.phone, go: (hash) => gone.push(hash), viewport: null,
+    hidden: () => state.hidden, phone: () => state.phone, go: (hash) => gone.push(hash), viewport: null, onRoster,
   });
   const fire = async (delay) => { for (const [id, t] of [...timers]) if (t.delay === delay) { timers.delete(id); await t.fn(); } await settle(); };
   return { d, calls, timers, state, controller, fire, gone, api };
@@ -662,10 +677,20 @@ test("copy never says card, board or ticket", async () => {
 
 // ---------- glue ----------
 
-test("the shell routes #/bots and #/bots/<id>, loads the stylesheet and adds one Bots entry to rail and tabs", async () => {
+test("each roster load reports the bots to the shell, so the rail badge needs no second poll", async () => {
+  const seen = [];
+  const h = harness({ bots: [botRow("b1", "Atlas", { waiting: 2 }), botRow("b2", "General", { kind: "general", waiting: 3 })], onRoster: (bots) => seen.push(ui.waitingTotal(bots)) });
+  await h.controller.show(null);
+  assert.deepEqual(seen, [3]);
+  h.state.bots = [botRow("b1", "Atlas", { waiting: 0 }), botRow("b2", "General", { kind: "general", waiting: 0 })];
+  await h.fire(15000);
+  assert.deepEqual(seen, [3, 0]);
+});
+
+test("the shell routes #/bots and #/bots/<id>, loads the stylesheet and lists Bots once in rail and tabs", async () => {
   const app = await read("app.js"), html = await read("index.html"), rail = await read("rail.js");
   assert.match(html, /<link rel="stylesheet" href="\/app\/bots\.css">/);
-  assert.match(app, /import \{ createBots \} from "\.\/bots\.js"/);
+  assert.match(app, /import \{ createBots, waitingTotal \} from "\.\/bots\.js"/);
   assert.ok(app.includes("bots(?:\\/[A-Za-z0-9_-]+)?"), "route regex");
   assert.match(app, /botsScreen\(\)/);
   const { renderRail, renderPhoneTabs } = await import("../commonplace/web/static/rail.js");
@@ -674,7 +699,7 @@ test("the shell routes #/bots and #/bots/<id>, loads the stylesheet and adds one
   assert.equal((renderPhoneTabs({}).match(/href="#\/bots"/g) || []).length, 1);
   assert.match(rail, /Bots/);
   const { resolveRoute } = await import("../commonplace/web/static/routes.js");
-  assert.equal(resolveRoute("#/", { boards: [{ slug: "a" }] }), "#/board/a", "the landing route is unchanged");
+  assert.equal(resolveRoute("#/", { boards: [{ slug: "a" }] }), "#/bots", "a set-up person lands on the bots");
   assert.equal(resolveRoute("#/bots/abc"), "#/bots/abc");
 });
 

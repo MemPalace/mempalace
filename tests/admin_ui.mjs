@@ -42,7 +42,7 @@ async function main() {
   const {createAdmin,boundedRequest}=await load('admin');
   globalThis.document = new EventTarget();
   if(which==='route') {
-    const {resolveRoute}=await load('routes');
+    const {resolveRoute,boardRoute}=await load('routes');
     for(const can_admin of [true,false]) {
       // Execute the production route and refresh functions; unrelated sources never settle.
       const f=fixture(createAdmin); f.setMe({...me,can_admin});
@@ -50,7 +50,7 @@ async function main() {
       const nodes={'#content':f.mount,'#card-panel':{hidden:true},'#shell-dialog':{close(){}}};
       f.mount.children=[];
       let shared=0;
-      const context={state,root:{querySelector:s=>nodes[s]||null},location:{hash:'#/admin'},history:{replaceState(){}},localStorage:{getItem:()=>null},resolveRoute,boardPreference:()=>'',decideStart:()=>undefined,clearAgentSecret(){},voice:{stop(){}},speech:{stop(){}},remember(){},markOpenCard(){},message:x=>x,showError(){},queueFlush(){},queueStop(){},boardDispose:null,consoleUI:null,detailsUI:null,adminUI:f.ui,createAdmin,api(){shared++;return new Promise(()=>{});},e:escapeHTML,title(){},navigation(){},currentBoard:()=>null,consoleScreen(){}};
+      const context={state,root:{querySelector:s=>nodes[s]||null},location:{hash:'#/admin'},history:{replaceState(){}},localStorage:{getItem:()=>null},resolveRoute,boardRoute,boardPreference:()=>'',decideStart:()=>undefined,clearAgentSecret(){},voice:{stop(){}},speech:{stop(){}},remember(){},markOpenCard(){},message:x=>x,showError(){},queueFlush(){},queueStop(){},boardDispose:null,consoleUI:null,detailsUI:null,adminUI:f.ui,createAdmin,api(){shared++;return new Promise(()=>{});},e:escapeHTML,title(){},navigation(){},currentBoard:()=>null,consoleScreen(){}};
       // adminScreen is production shell glue; use the real controller with the same mount.
       runInNewContext(appSlice('function adminScreen(', 'function consoleScreen(')+appSlice('async function refresh(', 'function decideStart(')+appSlice('async function route()', '// The current view'),context);
       context.adminUI=f.ui;
@@ -67,14 +67,14 @@ async function main() {
       f.ui.stop();
     }
   } else if(which==='card-route' || which==='route-disposal') {
-    const {resolveRoute}=await load('routes');
+    const {resolveRoute,boardRoute}=await load('routes');
     const f=fixture(createAdmin), calls=[], errors=[];
     const state={me:{...me},screen:0,route:'#/',base:'#/',boards:[],needs:{},cards:[],drafts:new Map(),pending:new Set(),chatVisible:new Set(),refreshRequest:0,panelRequest:0};
     const panel={hidden:true,innerHTML:'',querySelector:()=>null,querySelectorAll:()=>[]};
     const nodes={'#content':f.mount,'#card-panel':panel,'#shell-dialog':{close(){}}};
     f.mount.children=[];
     let stops=0, shows=0;
-    const context={state,root:{querySelector:s=>nodes[s]||null},location:{hash:'#/admin'},history:{replaceState(){}},localStorage:{getItem:()=>null},resolveRoute,boardPreference:()=>'',decideStart:()=>undefined,clearAgentSecret(){},voice:{stop(){}},speech:{stop(){}},remember(){},restore(){},capture:()=>()=>{},markOpenCard(){},message:x=>x,showError(x){if(x) errors.push(x);},queueFlush(){},queueStop(){},boardDispose:null,consoleUI:null,detailsUI:null,
+    const context={state,root:{querySelector:s=>nodes[s]||null},location:{hash:'#/admin'},history:{replaceState(){}},localStorage:{getItem:()=>null},resolveRoute,boardRoute,boardPreference:()=>'',decideStart:()=>undefined,clearAgentSecret(){},voice:{stop(){}},speech:{stop(){}},remember(){},restore(){},capture:()=>()=>{},markOpenCard(){},message:x=>x,showError(x){if(x) errors.push(x);},queueFlush(){},queueStop(){},boardDispose:null,consoleUI:null,detailsUI:null,
       adminUI:{show(){shows++;f.ui.show();},stop(){stops++;f.ui.stop();}},createAdmin,e:escapeHTML,enc:encodeURIComponent,title(){},navigation(){},currentBoard:()=>null,placeLifecycle(){},consoleScreen(){},needsView(){},boardsView(){},boardView(){},mountWorkbenchChat(){},callTree:()=>'',
       createDetails:({mount})=>({show(card){mount.innerHTML=`Card ${card.number}: ${card.title}`;},stop(){}}),
       api(path,options={}){calls.push({path,options}); if(path==='/api/boards') return Promise.resolve({boards:[]}); if(path==='/api/cards/5') return Promise.resolve({number:5,title:'Requested card',board:'demo'}); return Promise.resolve({});}};

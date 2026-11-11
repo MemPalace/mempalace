@@ -15,10 +15,12 @@ const rail = await import(dataUrl(railSource.replace("'./api.js'", JSON.stringif
 for (const name of ['renderRail', 'renderPhoneBar', 'renderPhoneTabs']) assert.equal(typeof rail[name], 'function');
 const context = { state, root, e, enc: encodeURIComponent, ...rail, currentBoard: () => board, needsCards: () => [] };
 runInNewContext(slice('function navigation()', 'function showError') + '\nnavigation();', context);
-assert.ok(nav.outerHTML.includes('href="#/board/fresh-space"'));
-assert.ok(nav.outerHTML.includes('data-action="new-board"'));
+// Projects are reached from the Workspace group of the account menu (its page has the New project button); the rail lists none.
+assert.ok(nav.outerHTML.includes('href="#/boards">Projects<'));
+assert.ok(!nav.outerHTML.includes('href="#/board/fresh-space"'));
 assert.ok(!nav.outerHTML.includes('href="#/space/fresh-space"'));
-assert.equal((phoneTabs.innerHTML.match(/<a /g) || []).length, 3);
+assert.ok(phoneBar.innerHTML.includes('href="#/boards">Projects<'));
+assert.equal((phoneTabs.innerHTML.match(/<a /g) || []).length, 2);
 runInNewContext(slice('function reviewForm()', 'function handoffForm(') + '\nreviewForm();', context);
 assert.equal(panel.hidden, false);
 assert.ok(panel.innerHTML.includes('name="question" minlength="24" required'));

@@ -169,12 +169,10 @@ test("picking another agent reports it for the address bar; the automatic choice
   f.controller.stop();
 });
 
-test("the rail lists Console, the account menu no longer does", () => {
-  const html = rail.renderRail({ user: "Maya", board: { slug: "atlas" }, boards: [{ slug: "atlas" }], view: "console" });
-  const nav = html.match(/<a class="nav" href="#\/console"[^>]*>/);
-  assert.ok(nav, "rail link missing");
-  assert.match(nav[0], /aria-current="page"/);
+test("Console sits in the Workspace group of the account menu, not among the rail's primary entries", () => {
+  const html = rail.renderRail({ user: "Maya", view: "console" });
   assert.equal((html.match(/href="#\/console"/g) || []).length, 1);
-  assert.doesNotMatch(html.match(/<div class="user-links">[\s\S]*?<\/div>/)[0], /Console/);
+  assert.doesNotMatch(html.slice(0, html.indexOf('class="rail-foot"')), /console/i);
+  assert.match(html.match(/<div class="menu-group"[\s\S]*?<\/div>/)[0], /href="#\/console">Console</);
   assert.doesNotMatch(rail.renderRail({ view: "memory" }), /href="#\/console"[^>]*aria-current/);
 });

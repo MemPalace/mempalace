@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 STATIC = ROOT / "commonplace" / "web" / "static"
 
 
-@pytest.mark.parametrize("case", ["phone", "counts", "current", "menu", "escaping"])
+@pytest.mark.parametrize(
+    "case", ["nav", "ids", "phone", "counts", "current", "menu", "nostyle", "rules", "escaping"]
+)
 def test_rail_render(case):
     assert (STATIC / "rail.js").is_file(), "Rail module missing"
     result = subprocess.run(

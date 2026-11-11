@@ -3,7 +3,6 @@
    Colours and radii come from the workbench tokens; nothing new is introduced. */
 .shell[data-view="bots"] .head { display: none; }
 .shell[data-view="bots"] #content { padding: 0; gap: 0; overflow: hidden; }
-.m-tabs { grid-template-columns: repeat(4, 1fr); }
 
 .bots { flex: 1; min-height: 0; min-width: 0; position: relative; display: grid; grid-template-columns: 320px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); background: var(--pane); font-family: var(--font); }
 .bots button, .bots input, .bots textarea { font: inherit; color: inherit; }
@@ -142,8 +141,7 @@
   /* One screen at a time; the page is exactly as tall as the visible viewport, so the composer rides above the keyboard. */
   body .shell[data-view="bots"] { display: flex; flex-direction: column; height: var(--bots-vh, 100dvh); overflow: hidden; }
   .shell[data-view="bots"] .center { flex: 1; min-height: 0; overflow: hidden; }
-  .shell[data-view="bots"] .m-top { display: none; }
-  .shell[data-view="bots"]:has(.bots[data-pane="thread"]) .m-tabs { display: none; }
+  .shell[data-view="bots"]:has(.bots[data-pane="thread"]) :is(.m-top, .m-tabs) { display: none; }
   .bots { grid-template-columns: minmax(0, 1fr); }
   .bots[data-pane="roster"] .bots-thread, .bots[data-pane="thread"] .bots-roster { display: none; }
   .bots-back { display: inline-flex; }

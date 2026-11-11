@@ -7,34 +7,69 @@ const apiURL = `data:text/javascript;base64,${Buffer.from(apiSource).toString('b
 const rail = await import(`data:text/javascript;base64,${Buffer.from(source.replace("'./api.js'", JSON.stringify(apiURL))).toString('base64')}`);
 for (const fn of ['renderRail', 'renderPhoneBar', 'renderPhoneTabs', 'projectSubline']) assert.equal(typeof rail[fn], 'function', `${fn} missing`);
 const board = { slug: 'atlas', name: 'Atlas', agents_working: 2, counts: { doing: 3, review: 10 } };
-const options = { workspace: 'Northwind', user: 'Maya', board, boards: [board], needs: 3, needsByBoard: { atlas: 2 } };
+const options = { workspace: 'Northwind', user: 'Maya', needs: 3, botsWaiting: 2 };
 const links = (html) => [...html.matchAll(/<a\b[^>]*>[\s\S]*?<\/a>/g)].map(m => m[0]);
+const hrefs = (html) => links(html).map(a => /href="([^"]*)"/.exec(a)[1]);
+const renderAll = () => rail.renderRail({ ...options, can_admin: true }) + rail.renderPhoneBar({ ...options, can_admin: true }) + rail.renderPhoneTabs(options);
+const text = (html) => html.replace(/<span class="sr">[^<]*<\/span>/g, '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 switch (process.argv[2]) {
+  case 'nav': {
+    // Primary navigation: exactly Bots and Memory. Everything else lives in the account menu.
+    const html = rail.renderRail({ ...options, can_admin: true });
+    const primary = html.slice(0, html.indexOf('<div class="rail-foot">'));
+    assert.deepEqual(hrefs(primary), ['#/bots', '#/memory']);
+    assert.deepEqual(links(primary).map(text), ['Bots 2', 'Memory']);
+    for (const gone of ['#/needs', '#/console', '#/boards', '#/board/', 'rail-h', 'new-project', 'new-board', 'class="proj"']) assert.ok(!primary.includes(gone), gone);
+    // The Workspace group: Projects, Needs me, Console, in that order, then the existing entries.
+    const menu = html.match(/<div class="user-links">([\s\S]*?)<\/div><\/details>/)[1];
+    const group = menu.match(/<div class="menu-group"[^>]*>([\s\S]*?)<\/div>/)[1];
+    assert.match(menu, /<div class="menu-group" role="group" aria-label="Workspace">/);
+    assert.match(group, /Workspace</);
+    assert.deepEqual(hrefs(group), ['#/boards', '#/needs', '#/console']);
+    assert.deepEqual(links(group).map(text), ['Projects', 'Needs me 3', 'Console']);
+    assert.deepEqual(hrefs(menu), ['#/boards', '#/needs', '#/console', '#/rules', '#/settings', '#/admin']);
+    assert.ok(!/\bBoards?\b/.test(text(html)), 'the new navigation says Projects, not Boards');
+    break;
+  }
+  case 'ids': {
+    // The rail and the phone top bar are both in the page: no id may appear twice, and no label points at an id.
+    const all = renderAll();
+    const ids = [...all.matchAll(/\sid="([^"]*)"/g)].map(m => m[1]);
+    assert.equal(new Set(ids).size, ids.length, `duplicate ids: ${ids}`);
+    assert.ok(!all.includes('aria-labelledby'), 'the Workspace group is named by aria-label');
+    assert.equal((all.match(/role="group" aria-label="Workspace"/g) || []).length, 2);
+    break;
+  }
   case 'phone': {
-    const html = rail.renderPhoneTabs({ ...options, unread: 1 });
-    assert.equal(links(html).length, 4);
-    assert.match(links(html)[0], /href="#\/bots"/);
-    assert.ok(!html.includes('Memory'));
-    assert.match(html, /aria-label="Chat 1 new reply"/);
-    assert.match(html, /href="#\/board\/atlas\/chat"/);
-    assert.match(html, /role="status">1 new reply in Atlas chat/);
-    const needs = rail.renderPhoneTabs({ ...options, view: 'needs', unread: 2 });
-    assert.match(needs, /aria-label="Atlas chat 2 new replies"/);
-    const harbor = rail.renderPhoneTabs({ board: { slug: 'harbor', name: 'Harbor' }, view: 'needs' });
-    assert.match(harbor, /aria-label="Harbor chat"/);
-    assert.ok(!harbor.includes('newb'));
-    const bar = rail.renderPhoneBar(options);
-    assert.match(bar, /Project: Atlas. Switch project/);
-    assert.match(bar, /aria-label="Settings"/);
+    const html = rail.renderPhoneTabs({ ...options, view: 'bots' });
+    assert.deepEqual(hrefs(html), ['#/bots', '#/memory']);
+    assert.deepEqual(links(html).map(text), ['Bots 2', 'Memory']);
+    for (const gone of ['Board', 'Chat', 'Needs me', 'm-chat-tab', '#/needs', 'newb']) assert.ok(!html.includes(gone), gone);
+    // The same Workspace group is reachable from the phone top bar's menu.
+    const bar = rail.renderPhoneBar({ ...options, can_admin: true });
+    assert.match(bar, /<details class="m-menu"><summary[^>]*aria-label="Menu"/);
+    const group = bar.match(/<div class="menu-group"[^>]*>([\s\S]*?)<\/div>/)[1];
+    assert.deepEqual(hrefs(group), ['#/boards', '#/needs', '#/console']);
+    assert.deepEqual(hrefs(bar), ['#/boards', '#/needs', '#/console', '#/rules', '#/settings', '#/admin']);
     assert.match(bar, /data-action="palette"/);
-    assert.ok(!rail.renderPhoneBar().includes('m-settings'));
+    assert.match(bar, /data-action="logout"/);
+    assert.ok(!bar.includes('switch-project') && !bar.includes('m-settings'), 'no project switcher outside project screens');
+    const project = rail.renderPhoneBar({ ...options, board });
+    assert.match(project, /Project: Atlas. Switch project/);
+    assert.match(project, /aria-label="Settings"/);
+    assert.ok(!rail.renderPhoneBar({ can_admin: false }).includes('#/admin'));
     break;
   }
   case 'counts': {
     const html = rail.renderRail(options);
+    assert.match(html, /Bots <span class="count need">2<span class="sr"> waiting on you<\/span>/);
     assert.match(html, />3<span class="sr"> items<\/span>/);
-    assert.match(html, />2<span class="sr"> need you<\/span>/);
-    assert.ok(!html.includes('>10</span>'));
+    for (const none of [undefined, 0, -1, 1.5, '3', NaN]) {
+      const empty = rail.renderRail({ ...options, botsWaiting: none });
+      assert.doesNotMatch(empty.match(/<a class="nav" href="#\/bots"[\s\S]*?<\/a>/)[0], /class="count/, String(none));
+      assert.doesNotMatch(rail.renderPhoneTabs({ botsWaiting: none }), /class="count/, String(none));
+    }
+    assert.match(rail.renderPhoneTabs({ botsWaiting: 4 }), /Bots <span class="count need">4</);
     assert.equal(rail.projectSubline(board), '2 agents working');
     assert.equal(rail.projectSubline({ agents_working: 1 }), '1 agent working');
     assert.equal(rail.projectSubline({ counts: { doing: 4 } }), '4 doing');
@@ -43,35 +78,38 @@ switch (process.argv[2]) {
     break;
   }
   case 'current': {
-    for (const view of ['board', 'chat', 'settings', 'space', 'needs', 'memory']) {
-      const html = rail.renderRail({ ...options, view });
-      const active = links(html).filter(a => a.includes('aria-current="page"'));
-      assert.equal(active.length, 1);
-      assert.ok(active[0].includes(view === 'needs' ? '#/needs' : view === 'memory' ? '#/memory' : '#/board/atlas'));
+    for (const view of ['bots', 'memory']) {
+      for (const html of [rail.renderRail({ ...options, view }), rail.renderPhoneTabs({ ...options, view })]) {
+        const active = links(html).filter(a => a.includes('aria-current="page"'));
+        assert.equal(active.length, 1, view);
+        assert.ok(active[0].includes(`#/${view}`));
+      }
     }
-    for (const view of ['board', 'chat', 'needs']) {
-      const active = links(rail.renderPhoneTabs({ ...options, view })).filter(a => a.includes('aria-current="page"'));
-      assert.equal(active.length, 1);
-      assert.ok(active[0].includes(view === 'needs' ? '#/needs' : view === 'chat' ? '#/board/atlas/chat' : '#/board/atlas"'));
+    for (const view of ['board', 'chat', 'settings', 'space', 'needs', 'console', 'page']) {
+      assert.equal(links(rail.renderRail({ ...options, view })).filter(a => a.includes('aria-current="page"')).length, 0, view);
+      assert.equal(links(rail.renderPhoneTabs({ ...options, view })).filter(a => a.includes('aria-current="page"')).length, 0, view);
     }
     break;
   }
   case 'menu': {
     const html = rail.renderRail(options);
-    for (const route of ['rules', 'console', 'settings']) assert.ok(html.includes(`href="#/${route}"`));
-    for (const action of ['logout', 'palette', 'shortcuts', 'new-board', 'switch-workspace']) assert.ok(html.includes(`data-action="${action}"`));
+    for (const route of ['rules', 'console', 'settings', 'needs', 'boards']) assert.ok(html.includes(`href="#/${route}"`));
+    for (const action of ['logout', 'palette', 'shortcuts', 'switch-workspace']) assert.ok(html.includes(`data-action="${action}"`));
     assert.match(html, /<details class="user-menu"><summary/);
     assert.match(html, /Workspace settings/);
     assert.match(html, /Control\+K Meta\+K/);
     assert.match(html, /Shortcuts <kbd>\?<\/kbd>/);
     assert.match(css, /\.m-tabs \{ display: grid;/);
+    // Admin keeps its permission rule: only an exact true shows it.
+    assert.equal((rail.renderRail({ can_admin: true }).match(/href="#\/admin"/g) || []).length, 1);
+    for (const can_admin of [false, undefined, 'true']) assert.doesNotMatch(rail.renderRail({ can_admin }), /href="#\/admin"/);
     break;
   }
   case 'nostyle': {
     // Rail styles live in the shared stylesheet; re-rendering the rail must not add a copy.
     assert.doesNotMatch(rail.renderRail(options), /<style>/);
     assert.doesNotMatch(rail.renderPhoneBar(options) + rail.renderPhoneTabs(options), /<style>/);
-    for (const rule of ['.cmdk {', '.proj {', '.m-top {', '.m-tabs {', '.rail .user-links a {']) assert.ok(css.includes(rule), rule);
+    for (const rule of ['.cmdk {', '.m-top {', '.m-tabs {', '.rail .user-links a {']) assert.ok(css.includes(rule), rule);
     break;
   }
   case 'rules': {
@@ -88,13 +126,11 @@ switch (process.argv[2]) {
   case 'escaping': {
     const bad = '<img src=x onerror="bad()">';
     const b = { slug: 'a/"<>', name: bad };
-    for (const html of [rail.renderRail({ workspace: bad, user: bad, boards: [b] }), rail.renderPhoneBar({ board: b }), rail.renderPhoneTabs({ board: b, view: 'needs', unread: -1 })]) {
+    for (const html of [rail.renderRail({ workspace: bad, user: bad }), rail.renderPhoneBar({ board: b }), rail.renderPhoneTabs({ view: bad, botsWaiting: 1 })]) {
       assert.ok(!html.includes('<img'));
-      assert.ok(html.includes('&lt;'));
-      assert.ok(!html.includes('class="badge newb"'));
     }
-    assert.match(rail.renderPhoneTabs({ board: b }), /a%2F%22%3C%3E/);
-    assert.match(rail.renderPhoneTabs(), /href="#\/start"/);
+    assert.ok(rail.renderRail({ workspace: bad, user: bad }).includes('&lt;'));
+    assert.ok(rail.renderPhoneBar({ board: b }).includes('&lt;'));
     break;
   }
   default: assert.fail('Unknown case');

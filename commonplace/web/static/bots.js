@@ -36,6 +36,8 @@ const SETUP = Object.freeze({
   needs_turn_on: ["This project's chat model is not turned on yet.", "Turn it on in the project's settings, then send again.", "Ask the workspace owner to turn it on for this project."],
   key_missing: ["The chat model has no key yet.", "Add it in Workspace settings.", "Ask the workspace owner to add it."],
 });
+// Server-supplied keys only ever match the table's own entries ("constructor" is not a status).
+const own = (table, key, fallback) => typeof key === "string" && Object.hasOwn(table, key) ? table[key] : fallback;
 const MAX_TEXT = 8000;
 const PAGE = 50;
 const enc = encodeURIComponent;
@@ -54,7 +56,7 @@ const chevron = '<svg class="i" viewBox="0 0 16 16" fill="none" stroke="currentC
 const back = '<svg class="i" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg>';
 
 export function setupText(code, canConfigure) {
-  const [what, owner, member] = SETUP[code] || SETUP.needs_configuration;
+  const [what, owner, member] = own(SETUP, code, SETUP.needs_configuration);
   return `${what} ${canConfigure ? owner : member}`;
 }
 
@@ -65,7 +67,7 @@ export function rosterHTML({ bots, current = null, loaded = true }, e) {
   return bots.map((bot) => {
     const line = bot.last?.text ? `${bot.last.role === "user" ? "You: " : ""}${oneLine(bot.last.text)}` : oneLine(bot.job);
     const unread = Number.isSafeInteger(bot.unread) && bot.unread > 0 ? `<span class="bot-unread">${bot.unread}<span class="sr"> unread</span></span>` : "";
-    const dot = DOT[bot.state] ? `<span class="bot-dot ${e(bot.state)}" role="img" aria-label="${DOT[bot.state]}"></span>` : "";
+    const dot = own(DOT, bot.state) ? `<span class="bot-dot ${e(bot.state)}" role="img" aria-label="${DOT[bot.state]}"></span>` : "";
     return `<li><a class="bot-row" href="#/bots/${enc(bot.id)}" data-bot="${e(bot.id)}"${bot.id === current ? ' aria-current="page"' : ""}>
       <span class="bot-av" aria-hidden="true">${e(initial(bot.name))}</span>
       <span class="bot-main"><span class="bot-top"><b class="bot-name">${e(bot.name)}</b>${bot.last?.at ? `<time class="bot-at" datetime="${e(bot.last.at)}">${e(elapsed(bot.last.at))}</time>` : ""}</span><span class="bot-line">${marked(line, e)}</span></span>
@@ -88,7 +90,7 @@ export function workHTML(b, ctx, e) {
   const key = `work:${n}:${ctx.mid ?? ""}`;
   const open = ctx.open?.has(key) === true;
   const links = (Array.isArray(b.links) ? b.links : []).map((l) => ({ label: l?.label, href: link(l?.url) })).filter((l) => l.href);
-  return `<div class="bb work" data-status="${e(b.status)}"><button type="button" class="bb-head" data-bots-action="toggle" data-key="${e(key)}" aria-expanded="${open}">${STATUS[b.status] ? `<span class="chip ${e(b.status)}">${STATUS[b.status]}</span>` : ""}<span class="bb-title">${marked(b.title ?? "", e)}</span>${chevron}</button>${open ? `<div class="bb-body">${b.note ? `<p class="bb-note">${marked(b.note, e)}</p>` : ""}${links.length ? `<ul class="bb-links">${links.map((l) => `<li><a href="${e(l.href)}" target="_blank" rel="noopener noreferrer">${e(l.label || l.href)}</a></li>`).join("")}</ul>` : ""}${n ? `<a class="bb-open" href="#/card/${n}">Open</a>` : ""}</div>` : ""}</div>`;
+  return `<div class="bb work" data-status="${e(b.status)}"><button type="button" class="bb-head" data-bots-action="toggle" data-key="${e(key)}" aria-expanded="${open}">${own(STATUS, b.status) ? `<span class="chip ${e(b.status)}">${own(STATUS, b.status)}</span>` : ""}<span class="bb-title">${marked(b.title ?? "", e)}</span>${chevron}</button>${open ? `<div class="bb-body">${b.note ? `<p class="bb-note">${marked(b.note, e)}</p>` : ""}${links.length ? `<ul class="bb-links">${links.map((l) => `<li><a href="${e(l.href)}" target="_blank" rel="noopener noreferrer">${e(l.label || l.href)}</a></li>`).join("")}</ul>` : ""}${n ? `<a class="bb-open" href="#/card/${n}">Open</a>` : ""}</div>` : ""}</div>`;
 }
 
 export function decisionHTML(b, ctx, e) {
@@ -107,7 +109,7 @@ export function confirmHTML(b, ctx, e) {
     const off = ctx.busy?.has(`p:${b.pending}`) ? " disabled" : "";
     return `<div class="bb confirm" data-state="open"><p class="bb-label">${label}</p><div class="bb-btns"><button type="button" class="bb-opt go" data-bots-action="confirm" data-pending="${e(b.pending)}" data-accept="1"${off}>Confirm</button><button type="button" class="bb-opt" data-bots-action="confirm" data-pending="${e(b.pending)}" data-accept="0"${off}>Cancel</button></div></div>`;
   }
-  const word = { done: "Done", cancelled: "Cancelled", expired: "Expired" }[b.state];
+  const word = own({ done: "Done", cancelled: "Cancelled", expired: "Expired" }, b.state);
   return `<p class="bb-settled">${label}${word ? ` · ${word}` : ""}</p>`;
 }
 
@@ -150,7 +152,7 @@ function noteHTML(m, e) {
   if (m.state === "stopped") return `<p class="bm-note">${e(BOTS_COPY.stopped)}</p>`;
   const code = /^failed:(.+)$/.exec(m.state || "")?.[1];
   if (!code || (code === "needs_configuration" && (m.blocks || []).some((b) => b?.type === "setup"))) return "";
-  return `<p class="bm-note">${e(FAILS[code] || "The reply failed.")}</p>`;
+  return `<p class="bm-note">${e(own(FAILS, code, "The reply failed."))}</p>`;
 }
 
 export function messageHTML(m, ctx, e) {
@@ -230,6 +232,14 @@ const newRequestId = () => {
   const id = globalThis.crypto?.randomUUID?.().replaceAll("-", "");
   return id || `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
 };
+/** Questions waiting on the person across all their bots. The General bot's count already covers every
+ * readable project, so project bots are not added on top of it (each question would count twice). */
+export function waitingTotal(bots) {
+  const n = (bot) => Number.isSafeInteger(bot?.waiting) && bot.waiting > 0 ? bot.waiting : 0;
+  const list = Array.isArray(bots) ? bots : [];
+  const general = list.find((bot) => bot?.kind === "general");
+  return general ? n(general) : list.reduce((sum, bot) => sum + n(bot), 0);
+}
 const lastId = (messages) => messages.reduce((top, m) => Math.max(top, Number(m.id) || 0), 0);
 const merge = (rows, added) => [...new Map([...rows, ...added].map((m) => [m.id, m])).values()].sort((a, b) => a.id - b.id);
 const waitingIds = (list) => list.map((b) => b.card).sort().join(",");
@@ -245,6 +255,7 @@ export function createBots({
   send = sendMessage, fetchImpl,
   viewport = globalThis.visualViewport,
   makeId = newRequestId,
+  onRoster = () => {},
 }) {
   const s = {
     bots: [], model: null, canConfigure: false, loaded: false, error: "",
@@ -366,6 +377,7 @@ export function createBots({
       s.bots = result.bots || []; s.model = result.model || null; s.canConfigure = result.can_configure === true;
       s.loaded = true; s.error = "";
       if (s.botId && !s.bot) s.bot = s.bots.find((b) => b.id === s.botId) || null;
+      onRoster(s.bots);
     } catch (error) {
       if (!alive(token)) return;
       s.loaded = true; s.error = error.message || BOTS_COPY.offline;

@@ -34,7 +34,7 @@ const api = async (path, options) => {
   if (path.endsWith('/status')) return {orchestrator: {visible: false, last_seen: 'private'}};
   return {me: {user: 'maya'}, board: selectedBoard.slug, messages: rows, replies, cursor: messageCursor, reply_cursor: replyCursor};
 };
-const context = {state, root, e, enc: encodeURIComponent, api, adminUI: null, ...chatstate,
+const context = {state, root, e, enc: encodeURIComponent, api, adminUI: null, botsUI: null, ...chatstate,
   seenStore: (user, slug) => chatstate.seenStore(user, slug, storageAPI), clearSeen: (user) => chatstate.clearSeen(user, storageAPI),
   currentBoard: () => selectedBoard, singleKeysEnabled: () => true, chatUI: null,
   createChat: (options) => {chatOptions = options; creates++; return pane;},
@@ -120,7 +120,8 @@ if (which === 'board_header') {
     state.base = which === 'needs_project' ? '#/needs' : '#/memory?q=exact'; selectedBoard = harbor;
     run('mountWorkbenchChat()'); await flush();
     assert.equal(dock.settings.label, 'Harbor chat'); assert.equal(dock.settings.board, harbor);
-    assert.equal(context.phoneOptions.board, harbor);
+    // The phone tabs are Bots and Memory only: the project and its unread count no longer reach them.
+    assert.equal(context.phoneOptions.board, undefined); assert.equal(context.phoneOptions.view, which === 'memory_project' ? 'memory' : '');
   } else if (which === 'deep_route') {
     state.base = state.route = '#/board/atlas/chat'; run('mountWorkbenchChat()'); await flush();
     assert.equal(dock.isOpen(), true); assert.equal(pane.shown[0], 'atlas');
@@ -173,7 +174,7 @@ if (which === 'board_header') {
     dock.opened = true; rows=[message(21)]; messageCursor=21;
     await chatOptions.api('/api/chat/atlas?after=20'); chatOptions.onState({unread:1});
     assert.equal(JSON.parse(storage.get('cmmn.chat.seen.maya.atlas')).message, 21);
-    assert.equal(service.unread, 0); assert.equal(context.phoneOptions.unread, 0);
+    assert.equal(service.unread, 0); assert.equal('unread' in context.phoneOptions, false);
     dock.opened=false; chatOptions.onState({unread:10});
     assert.equal(JSON.parse(storage.get('cmmn.chat.seen.maya.atlas')).message, 21);
   } else if (which === 'details') {
