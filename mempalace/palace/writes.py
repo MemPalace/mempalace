@@ -165,7 +165,7 @@ def _backup_changed_conversation_drawers(
     # snapshot. Never promote those *unpublished* rows to immutable history
     # on the next attempt: check each filed generation's completion first.
     candidates = []
-    generation_counts = {}
+    generation_rows = {}
     backup_rows = []
     offset = 0
     while True:
@@ -194,18 +194,34 @@ def _backup_changed_conversation_drawers(
             if not isinstance(old_text, str):
                 raise RuntimeError("old conversation text unavailable; refusing an unsafe re-mine")
             key = (old_meta.get("source_mtime"), old_meta.get("filed_at"))
-            generation = generation_counts.setdefault(key, [0, 0])
-            generation[0] += 1
-            declared = old_meta.get("chunk_total")
-            if declared is not None:
-                if not _is_plain_number(declared) or declared < 0:
-                    generation[1] = float("inf")
-                else:
-                    generation[1] = max(generation[1], declared)
+            generation_rows.setdefault(key, []).append(
+                (old_meta.get("chunk_total"), old_meta.get("chunk_index"))
+            )
             candidates.append((original_id, old_text, old_meta, key))
         if len(ids) < 1000:
             break
         offset += len(ids)
+
+    # A count alone cannot prove a generation was complete: a torn write can
+    # have duplicate/missing chunk indices or conflicting chunk_total stamps.
+    # Do not promote any such rows into public immutable history on retry.
+    # Entirely unstamped legacy groups retain the previous archive behavior.
+    complete_generations = set()
+    for key, markers in generation_rows.items():
+        totals = [total for total, _ in markers]
+        if all(total is None for total in totals):
+            complete_generations.add(key)
+            continue
+        expected = totals[0]
+        if (
+            type(expected) is int
+            and expected > 0
+            and len(markers) == expected
+            and all(type(total) is int and total == expected for total in totals)
+            and all(type(index) is int and 0 <= index < expected for _, index in markers)
+            and len({index for _, index in markers}) == expected
+        ):
+            complete_generations.add(key)
 
     # History visibility is checked as an entire source/mode generation.
     # If just one chunk changes, archiving only that chunk creates a torn
@@ -226,10 +242,9 @@ def _backup_changed_conversation_drawers(
         key: make_convo_history_generation_token(rows) for key, rows in grouped_text.items()
     }
     for original_id, old_text, old_meta, key in candidates:
-        seen, expected = generation_counts[key]
-        if seen < expected:
-            # An interrupted positional upsert or unfinished metadata
-            # finalize must not become a published historical version.
+        if key not in complete_generations:
+            # An interrupted positional upsert, missing chunk, or unfinished
+            # metadata finalize cannot become published historical content.
             continue
         if key not in changed_generations:
             continue

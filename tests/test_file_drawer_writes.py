@@ -598,3 +598,66 @@ def test_convo_shared_chunk_history_is_generation_scoped_and_idempotent(monkeypa
     assert {
         label: sum(meta["filed_at"] == label for _, _, meta in history) for label in ("A", "B")
     } == {"A": 2, "B": 2}
+
+
+@pytest.mark.parametrize(
+    ("indices", "totals"),
+    [
+        ([0, 0], [2, 2]),  # duplicate index hides a missing chunk
+        ([0, 2], [2, 2]),  # out-of-range index hides a missing chunk
+        ([0, 1], [2, 1]),  # conflicting finalization markers
+        ([0, 1], [None, 2]),  # partially stamped generation
+    ],
+)
+def test_convo_torn_generation_is_never_archived_with_duplicate_or_missing_indices(
+    monkeypatch, indices, totals
+):
+    """A row count matching chunk_total alone is not proof of a committed B."""
+    import mempalace.palace as palace
+
+    source = "/transcripts/torn-previous-pass.jsonl"
+    base = {
+        "source_file": source,
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": palace.NORMALIZE_VERSION,
+        "convo_chunker_version": palace.CONVO_CHUNKER_VERSION,
+        "source_mtime": 2.0,
+        "filed_at": "failed-B",
+    }
+    torn = [
+        (
+            f"drawer_{number}",
+            f"unpublished B {number}",
+            {**base, "chunk_index": indices[number], "chunk_total": totals[number]},
+        )
+        for number in range(2)
+    ]
+
+    class SavedCollection:
+        def get(self, ids=None, where=None, **_kwargs):
+            rows = torn if where is not None else []
+            return {
+                "ids": [item_id for item_id, _, _ in rows],
+                "documents": [text for _, text, _ in rows],
+                "metadatas": [meta for _, _, meta in rows],
+            }
+
+    archived = []
+    monkeypatch.setattr(palace, "_stored_vectors", lambda *_args: {})
+    monkeypatch.setattr(palace, "assert_no_collisions", lambda *_args: None)
+    monkeypatch.setattr(
+        palace,
+        "_upsert",
+        lambda _col, rows, embeddings=None: archived.extend(rows),
+    )
+
+    replacement = [
+        (item_id, f"committed C {number}", meta)
+        for number, (item_id, _, meta) in enumerate(torn)
+    ]
+    palace._backup_changed_conversation_drawers(
+        SavedCollection(), source, "exchange", replacement
+    )
+
+    assert not archived, "a malformed, unpublished generation was promoted to history"
