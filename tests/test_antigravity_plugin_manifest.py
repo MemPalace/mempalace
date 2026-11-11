@@ -1,37 +1,45 @@
-"""Schema tests for the .antigravity-plugin/ directory.
+"""Schema and Marketplace readiness tests for `plugins/mempalace/`.
 
 Covers:
 
-* `plugin.json` matches the verified-minimal Antigravity schema
-  (`{"name": "..."}`, no fabricated fields).
-* `mcp_config.json` registers `mempalace-mcp` under the `mcpServers`
-  key with the verified shape from
-  https://antigravity.google/docs/mcp.
-* `hooks.json.tmpl` is valid JSON, references both hook scripts via
-  the `__PLUGIN_DIR__` placeholder, and pins per-event timeouts
-  inside the safety bounds.
-* `skills/mempalace/SKILL.md` exists as a real file (no symlinks) and
-  carries the required YAML frontmatter (`description`).
-
-These are contract tests — they fail as soon as anyone changes the
-in-repo shape in a way that drifts from Antigravity's documented
-schema. See [hooks/antigravity/INVESTIGATION.md](../hooks/antigravity/INVESTIGATION.md)
-for the source-of-truth audit driving the assertions.
+* `plugin.json` matches https://antigravity.google/schemas/v1/plugin.json
+  with all Marketplace fields and no fabricated `permissions` key.
+* `mcp_config.json` registers `mempalace-mcp` under `mcpServers`.
+* `hooks.json` is committed directly for zero-touch Marketplace / `agy plugin install`
+  bundles, uses relative `node ./scripts/...` paths (no `${PLUGIN_ROOT}` or
+  `__PLUGIN_DIR__`), and bundles LF-shebang scripts under `scripts/`.
+* `hooks/antigravity/hooks.json.tmpl` remains valid for the POSIX `install.sh` path.
+* `skills/*/SKILL.md` and `rules/mempalace-recall.md` exist as real files
+  with valid Antigravity frontmatter.
+* When `agy` CLI is installed locally, `agy plugin validate --strict` passes
+  with 0 errors and 0 warnings directly against `plugins/mempalace/`.
 """
 
 import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_DIR = REPO_ROOT / ".antigravity-plugin"
+PLUGIN_DIR = REPO_ROOT / "plugins" / "mempalace"
+LEGACY_DOT_DIR = REPO_ROOT / ".antigravity-plugin"
 
 PLUGIN_JSON = PLUGIN_DIR / "plugin.json"
+PLUGIN_LICENSE = PLUGIN_DIR / "LICENSE"
 LOGO_SVG = PLUGIN_DIR / "assets" / "logo.svg"
 MCP_CONFIG = PLUGIN_DIR / "mcp_config.json"
-HOOKS_TMPL = PLUGIN_DIR / "hooks.json.tmpl"
+HOOKS_JSON = PLUGIN_DIR / "hooks.json"
+HOOKS_TMPL = REPO_ROOT / "hooks" / "antigravity" / "hooks.json.tmpl"
+SCRIPTS_DIR = PLUGIN_DIR / "scripts"
+HOOK_SCRIPTS = (
+    SCRIPTS_DIR / "hook-common.mjs",
+    SCRIPTS_DIR / "save-hook.mjs",
+    SCRIPTS_DIR / "wake-hook.mjs",
+)
 SKILL_MD = PLUGIN_DIR / "skills" / "mempalace" / "SKILL.md"
 PLUGIN_README = PLUGIN_DIR / "README.md"
 SIDECAR_DIR = PLUGIN_DIR / "sidecars" / "palace"
@@ -56,11 +64,13 @@ SHARED_PROTOCOL_REF = (
 
 EXPECTED_HOOKS = {
     "Stop": {
+        "node_command": "node ./scripts/save-hook.mjs",
         "script_basename": "mempal_save_hook_antigravity.sh",
         "timeout_floor": 10,
         "timeout_ceiling": 60,
     },
     "PreInvocation": {
+        "node_command": "node ./scripts/wake-hook.mjs",
         "script_basename": "mempal_wake_hook_antigravity.sh",
         "timeout_floor": 1,
         "timeout_ceiling": 10,
@@ -69,15 +79,23 @@ EXPECTED_HOOKS = {
 
 
 def test_plugin_dir_exists() -> None:
-    """The in-repo plugin directory exists and is laid out as expected."""
+    """The in-repo Marketplace plugin bundle exists at plugins/mempalace/."""
     assert PLUGIN_DIR.is_dir(), f"missing: {PLUGIN_DIR}"
+    assert not LEGACY_DOT_DIR.exists(), (
+        ".antigravity-plugin/ must not exist at repo root because Antigravity "
+        "treats .antigravity-plugin as a manifest-only override whose parent "
+        "(the entire monorepo) becomes <plugin-root>."
+    )
     for required in (
         PLUGIN_JSON,
+        PLUGIN_LICENSE,
         LOGO_SVG,
         MCP_CONFIG,
+        HOOKS_JSON,
         HOOKS_TMPL,
         SKILL_MD,
         PLUGIN_README,
+        *HOOK_SCRIPTS,
         *SIDECAR_FILES,
     ):
         assert required.is_file(), f"missing: {required}"
@@ -157,6 +175,74 @@ def test_mcp_config_registers_mempalace_mcp() -> None:
     assert entry.get("command") == "mempalace-mcp", (
         f"mcpServers.mempalace.command must be 'mempalace-mcp'; got {entry.get('command')!r}"
     )
+
+
+@pytest.mark.parametrize("event", sorted(EXPECTED_HOOKS))
+def test_marketplace_hooks_json_uses_relative_node_scripts(event: str) -> None:
+    """plugins/mempalace/hooks.json follows the official build-plugins checklist:
+    named hook group, flat handler array for Stop/PreInvocation, relative
+    `node ./scripts/...` paths (no ${PLUGIN_ROOT} or __PLUGIN_DIR__).
+    """
+    raw = HOOKS_JSON.read_text(encoding="utf-8")
+    assert "${PLUGIN_ROOT}" not in raw
+    assert "__PLUGIN_DIR__" not in raw
+    data = json.loads(raw)
+    bounds = EXPECTED_HOOKS[event]
+    matching = [
+        (ns, payload[event])
+        for ns, payload in data.items()
+        if isinstance(payload, dict) and event in payload
+    ]
+    assert len(matching) == 1
+    _, entries = matching[0]
+    assert isinstance(entries, list) and len(entries) == 1
+    handler = entries[0]
+    assert handler.get("type") == "command"
+    assert handler.get("command") == bounds["node_command"]
+    timeout = handler.get("timeout")
+    assert isinstance(timeout, int) and not isinstance(timeout, bool)
+    assert bounds["timeout_floor"] <= timeout <= bounds["timeout_ceiling"]
+
+
+def test_bundled_node_scripts_have_lf_shebang() -> None:
+    """Bundled scripts under plugins/mempalace/scripts/ must use LF line endings."""
+    for script in HOOK_SCRIPTS:
+        raw = script.read_bytes()
+        assert raw.startswith(b"#!/usr/bin/env node\n"), (
+            f"{script} must start with LF '#!/usr/bin/env node\\n'"
+        )
+        assert b"\r\n" not in raw, f"{script} must use LF line endings, not CRLF"
+
+
+def test_agy_cli_strict_validation_passes_when_installed() -> None:
+    """When `agy` is installed, `agy plugin validate --strict` passes with 0 findings."""
+    agy_bin = shutil.which("agy")
+    if not agy_bin and os.name == "nt":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        candidate = Path(local_app) / "agy" / "bin" / "agy.exe"
+        if candidate.is_file():
+            agy_bin = str(candidate)
+    if not agy_bin:
+        pytest.skip("agy CLI not installed on this runner")
+
+    proc = subprocess.run(
+        [agy_bin, "plugin", "validate", "--strict", "--json", str(PLUGIN_DIR)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"agy validate --strict failed:\n{proc.stdout}\n{proc.stderr}"
+    report = json.loads(proc.stdout)
+    assert report.get("name") == "mempalace"
+    assert report.get("findings") == []
+    assert report.get("components") == {
+        "agents": 0,
+        "hooks": 2,
+        "mcpServers": 1,
+        "rules": 1,
+        "sidecars": 1,
+        "skills": 2,
+    }
 
 
 def test_hooks_template_valid_json() -> None:

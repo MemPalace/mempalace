@@ -33,10 +33,14 @@ pytestmark = pytest.mark.skipif(
 
 EXPECTED_FILES = (
     "plugin.json",
+    "LICENSE",
     "assets/logo.svg",
     "mcp_config.json",
     "README.md",
     "hooks.json",
+    "scripts/hook-common.mjs",
+    "scripts/save-hook.mjs",
+    "scripts/wake-hook.mjs",
     "skills/mempalace/SKILL.md",
     "skills/mempalace-recall/SKILL.md",
     "rules/mempalace-recall.md",
