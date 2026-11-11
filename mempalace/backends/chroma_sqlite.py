@@ -464,6 +464,8 @@ def sqlite_lexical_rows(
     tokens = [t for t in tokenize(query) if len(t) >= 3]
 
     def read(conn):
+        conn.execute("BEGIN")
+        _install_sqlite_convo_visibility(conn, collection_name)
         row_ids: list[int] = []
         recency = not tokens
         if tokens:
@@ -480,6 +482,7 @@ def sqlite_lexical_rows(
                         JOIN collections c ON s.collection = c.id
                         WHERE embedding_fulltext_search MATCH ?
                           AND c.name = ?
+                          AND _mempalace_convo_public(e.id)
                         {limit_sql}
                         """,
                         (" OR ".join(tokens), collection_name) + (() if where else (limit,)),
@@ -488,7 +491,12 @@ def sqlite_lexical_rows(
             except sqlite3.Error:
                 recency = True
         if not row_ids and recency:
-            row_ids = _newest_row_ids(conn, collection_name, limit)
+            row_ids = _newest_row_ids(
+                conn,
+                collection_name,
+                limit,
+                " AND _mempalace_convo_public(e.id)",
+            )
         return _decoded_rows(conn, row_ids, where)
 
     return _read_db(palace_path, read) or []
@@ -893,6 +901,8 @@ def _sqlite_iter_metadata(
     keys: Optional[Iterable[str]],
     require_key: Optional[str],
     equals: Optional[dict] = None,
+    *,
+    with_ids: bool = False,
 ) -> Iterator[Optional[dict]]:
     """Stream each drawer's stored metadata from an open connection, in row order.
 
@@ -945,14 +955,14 @@ def _sqlite_iter_metadata(
     for row_id, key, sval, ival, fval, bval in cursor:
         if row_id != current_id:
             if current_id is not None:
-                yield current
+                yield (current_id, current) if with_ids else current
             current_id, current = row_id, None
         if key is not None:
             if current is None:
                 current = {}
             current[key] = _cell_value(sval, ival, fval, bval)
     if current_id is not None:
-        yield current
+        yield (current_id, current) if with_ids else current
 
 
 def sqlite_iter_metadata(
@@ -1045,6 +1055,48 @@ def _sqlite_ready_metadata_segment(conn, collection_name):
     ).fetchone():
         return None
     return collection_id, segment_id
+
+
+
+def _install_sqlite_convo_visibility(conn, collection_name: str) -> None:
+    """Apply source-wide conversation completeness inside this SQLite snapshot.
+
+    The scalar predicate is evaluated by FTS/recency SQL *before* candidate
+    LIMIT, so an interrupted B batch cannot displace the last visible A hit.
+    It is only a metadata completeness check, not an atomic publish marker.
+    A pending metadata projection is never treated as an authorized snapshot.
+    """
+    from ..convo_visibility import visible_conversation_rows
+
+    if _sqlite_ready_metadata_segment(conn, collection_name) is None:
+        raise MetadataRecoveryPending("conversation visibility needs recovered metadata")
+
+    keys = (
+        "ingest_mode",
+        "source_file",
+        "extract_mode",
+        "source_mtime",
+        "filed_at",
+        "historical_version",
+        "chunk_index",
+        "chunk_total",
+    )
+    ids = []
+    metadatas = []
+    for row_id, metadata in _sqlite_iter_metadata(
+        conn,
+        collection_name,
+        keys,
+        require_key=None,
+        equals={"ingest_mode": "convos"},
+        with_ids=True,
+    ):
+        ids.append(row_id)
+        metadatas.append(decode_record(None, metadata)[1] or {})
+
+    visible = {row_id for row_id, _ in visible_conversation_rows(ids, metadatas)}
+    hidden = set(ids).difference(visible)
+    conn.create_function("_mempalace_convo_public", 1, lambda row_id: row_id not in hidden)
 
 
 @contextlib.contextmanager

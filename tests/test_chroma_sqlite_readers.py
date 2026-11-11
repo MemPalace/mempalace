@@ -619,3 +619,66 @@ EXPECTED = {
         ],
     ),
 }
+
+
+
+def test_conversation_visibility_precedes_sqlite_lexical_and_bm25_candidate_limits(palace):
+    """A torn B must neither leak nor take the sole candidate slot from A."""
+    from mempalace.searcher import _bm25_only_via_sqlite
+
+    palace_path, col = palace
+    source = "/sessions/visibility.jsonl"
+    base = {
+        "ingest_mode": "convos",
+        "source_file": source,
+        "extract_mode": "general",
+        "source_mtime": 12.5,
+    }
+    col.add(
+        ids=["visible_a_0", "visible_a_1", "torn_b_0"],
+        documents=[
+            "ultrarewrite A preserved text zero",
+            "ultrarewrite A preserved text one",
+            "ultrarewrite B unpublished text",
+        ],
+        metadatas=[
+            {
+                **base,
+                "filed_at": "A",
+                "historical_version": True,
+                "room": room,
+                "chunk_index": index,
+                "chunk_total": 2,
+            }
+            for index, room in enumerate(("ideas", "notes"))
+        ]
+        + [
+            {
+                **base,
+                "filed_at": "B",
+                "historical_version": False,
+                "room": "notes",
+                "chunk_index": 0,
+                "chunk_total": 3,
+            }
+        ],
+        embeddings=[[0.1, 0.2, 0.3]] * 3,
+    )
+
+    lexical = chroma_sqlite.sqlite_lexical_rows(
+        palace_path, _NAME, "ultrarewrite", where=None, limit=1
+    )
+    assert len(lexical) == 1
+    assert "A preserved" in lexical[0][1]
+
+    fallback = _bm25_only_via_sqlite(
+        "ultrarewrite",
+        palace_path,
+        source_file=source,
+        collection_name=_NAME,
+        n_results=1,
+        max_candidates=1,
+    )
+    assert "error" not in fallback, fallback
+    assert len(fallback["results"]) == 1, fallback
+    assert "A preserved" in fallback["results"][0]["text"]

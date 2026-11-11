@@ -166,6 +166,7 @@ def _bm25_only_via_sqlite(
 
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
         sql, params = _match_sql(equalities, row_id_expr, "mf")
+        sql += f" AND _mempalace_convo_public({row_id_expr})"
         for op, sql_bound in _window_sql_prefilters(since_dt, before_dt):
             sql += (
                 " AND EXISTS (SELECT 1 FROM embedding_metadata mf"
@@ -179,6 +180,12 @@ def _bm25_only_via_sqlite(
         conn = open_palace_reader(db_path)
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
+    try:
+        conn.execute("BEGIN")
+        _install_sqlite_convo_visibility(conn, collection_name)
+    except sqlite3.Error as e:
+        conn.close()
+        return _search_error_result(f"sqlite conversation visibility unavailable: {e}")
 
     window_active = since_dt is not None or before_dt is not None
     try:
