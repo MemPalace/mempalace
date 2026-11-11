@@ -48,7 +48,7 @@ from typing import Optional
 
 from mempalace.sqlite_crypto import connect, row_factory
 
-from . import fact_provenance, paths, provenance
+from . import deadline as read_deadline, fact_provenance, paths, provenance
 from .config import DEFAULT_SINGLE_VALUED_PREDICATES, sanitize_iso_temporal
 from .ids import make_triple_id
 from .timeutil import utc_now_iso, utc_now_z
@@ -1157,13 +1157,11 @@ class KnowledgeGraph:
         """Metadata only; never hydrate hidden fact text."""
         from time import monotonic
 
-        from commonplace.rules import checks
-
         with self._lock:
             conn = self._conn()
-            end = checks._deadline.get()
+            end = read_deadline._deadline.get()
             if end is not None:
-                checks.remaining(0)
+                read_deadline.remaining(0)
                 conn.set_progress_handler(lambda: monotonic() >= end, 1000)
             try:
                 rows = conn.execute(
@@ -1173,15 +1171,13 @@ class KnowledgeGraph:
                 ).fetchall()
                 facts = []
                 for row in rows[:500]:
-                    checks.remaining(0)
+                    read_deadline.remaining(0)
                     facts.append(self._read_descriptor(conn, row))
                 return {"facts": facts, "next": facts[-1]["id"] if len(rows) > 500 else None}
             finally:
                 conn.set_progress_handler(None, 0)
 
     def _copy_search_snapshot(self, conn, ids):
-        from commonplace.rules import checks
-
         scope = json.dumps(ids)
         queries = {
             "entities": (
@@ -1202,13 +1198,13 @@ class KnowledgeGraph:
         }
         copied = {}
         for table, (sql, params) in queries.items():
-            checks.remaining(0)
+            read_deadline.remaining(0)
             schema = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
             ).fetchone()[0]
             rows = []
             for row in conn.execute(sql, params):
-                checks.remaining(0)
+                read_deadline.remaining(0)
                 rows.append(dict(row))
             copied[table] = (schema, rows)
         return copied
@@ -1217,13 +1213,11 @@ class KnowledgeGraph:
         """Revalidate once; search works on a detached authorized snapshot."""
         from time import monotonic
 
-        from commonplace.rules import checks
-
         with self._lock:
             conn = self._conn()
-            end = checks._deadline.get()
+            end = read_deadline._deadline.get()
             if end is not None:
-                checks.remaining(0)
+                read_deadline.remaining(0)
                 conn.set_progress_handler(lambda: monotonic() >= end, 1000)
             token = None
             try:
@@ -1236,7 +1230,7 @@ class KnowledgeGraph:
                 ).fetchall()
                 ids = []
                 for row in rows:
-                    checks.remaining(0)
+                    read_deadline.remaining(0)
                     if self._read_descriptor(conn, row) == expected[row["id"]]:
                         ids.append(row["id"])
                 if search:

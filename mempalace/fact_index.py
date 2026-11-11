@@ -3,7 +3,7 @@
 import json
 import logging
 
-from . import fact_provenance
+from . import deadline as read_deadline, fact_provenance
 
 FALLBACK_SEED_MULTIPLIER = 20
 SELECTIVE_SCOPE_LIMIT = 1000
@@ -304,32 +304,30 @@ def snapshot_candidates(snapshot, *args, **kwargs):
     import sqlite3
     from time import monotonic
 
-    from commonplace.rules import checks
-
-    checks.remaining(0)
+    read_deadline.remaining(0)
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
-    end = checks._deadline.get()
+    end = read_deadline._deadline.get()
     if end is not None:
         conn.set_progress_handler(lambda: monotonic() >= end, 1000)
     try:
         for schema, _ in snapshot.values():
-            checks.remaining(0)
+            read_deadline.remaining(0)
             conn.execute(schema)
         # Install while empty, then insert in original document order. The same
         # triggers/tokenizer preserve seed ordering without global hidden terms.
         install(conn)
         for table, (_, rows) in snapshot.items():
             for row in rows:
-                checks.remaining(0)
+                read_deadline.remaining(0)
                 columns = ", ".join('"' + key.replace('"', '""') + '"' for key in row)
                 conn.execute(
                     f'INSERT INTO "{table}" ({columns}) VALUES ({", ".join("?" for _ in row)})',
                     tuple(row.values()),
                 )
-        checks.remaining(0)
+        read_deadline.remaining(0)
         result = candidates(conn, *args, **kwargs)
-        checks.remaining(0)
+        read_deadline.remaining(0)
         return result
     finally:
         conn.close()

@@ -6,7 +6,7 @@ import math
 from collections import defaultdict
 from datetime import datetime, time, timezone
 
-from .. import fact_provenance
+from .. import deadline as read_deadline, fact_provenance
 from ..fact_render import ordered_sources
 from ..i18n import get_stopwords
 from ..lexical import TOKEN_RE, tokenize
@@ -88,9 +88,7 @@ def search_facts(
 
     def check_deadline():
         if _read_ids.get() is not None:
-            from commonplace.rules import checks
-
-            checks.remaining(0)
+            read_deadline.remaining(0)
 
     if not query_is_sanitized:
         query = sanitize_query(query)["clean_query"]

@@ -496,6 +496,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - The fact readers (`knowledge_graph`, `fact_index`, `searcher/facts`) take the read deadline from the stdlib-only `mempalace/deadline.py` and never import `commonplace.rules`, so an import-following test selector does not widen every change into most of the suite; `commonplace.rules.checks` re-uses the same context variable and keeps its own clock.
+
   - Local CLI and gated gateway CLI use the same pure drawer formatter, preserving headers, match scores, folded-copy labels, body whitespace conventions, empty results and BM25 fallback output. The gateway explicitly selects flat rows even when they carry import-authorization metadata; the owner default remains unchanged.
 
   - Drawer retries retain replay status for readable owners while also returning request-derived fresh-write fields, allowing the gateway to hide replay status for unreadable wings.
@@ -708,6 +710,8 @@ Format (read by `commonplace orch docs-check`):
   - Subagent question routing, proposal/release prerequisites and recipient authority regressions.
 
   - Coordinator status regressions: `tests/orchstatus.mjs` (run by `tests/test_orchstatus.py`) and `tests/test_orch_lease_status.py` pin the status states, the End lease confirm and refusals, and that ending a live lease leaves unfinished steps listed.
+
+  - `tests/test_fact_readers_import_graph.py` runs a fresh interpreter over the fact read and search path and asserts `commonplace.rules` is never loaded, scans the three fact readers for any `commonplace` import, and pins the shared read deadline.
 
 - **Promises:**
 
@@ -1644,6 +1648,8 @@ Format (read by `commonplace orch docs-check`):
   - `commonplace.guards.pretool`, a PreToolUse command that refuses git-hook bypasses (`docs/hook-bypass-guard.md`).
 
 - **Promises:**
+
+  - `commonplace/rules/checks.py` keeps the deadline API (`deadline`, `remaining`, `_deadline`) as thin wrappers over `mempalace/deadline.py` with its own patchable clock; fact readers call the leaf directly and do not import rules.
 
   - Split completion markers are checked writes on MCP and REST.
   - Canonical create uses header freshness while legacy routes retain body compatibility.
