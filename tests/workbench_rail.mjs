@@ -12,7 +12,8 @@ const links = (html) => [...html.matchAll(/<a\b[^>]*>[\s\S]*?<\/a>/g)].map(m => 
 switch (process.argv[2]) {
   case 'phone': {
     const html = rail.renderPhoneTabs({ ...options, unread: 1 });
-    assert.equal(links(html).length, 3);
+    assert.equal(links(html).length, 4);
+    assert.match(links(html)[0], /href="#\/bots"/);
     assert.ok(!html.includes('Memory'));
     assert.match(html, /aria-label="Chat 1 new reply"/);
     assert.match(html, /href="#\/board\/atlas\/chat"/);

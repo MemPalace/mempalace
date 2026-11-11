@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bots harness</title>
+<!-- Loads the real bots.js and the app's stylesheets in index.html order. Scene comes from ?scene=
+     (roster | stream | done | sheet); the API and the stream are scripted fakes. Used by tests/bots_shots.sh. -->
+<link rel="stylesheet" href="/commonplace/web/static/app.css">
+<link rel="stylesheet" href="/commonplace/web/static/screens.css">
+<link rel="stylesheet" href="/commonplace/web/static/map.css">
+<link rel="stylesheet" href="/commonplace/web/static/mix.css">
+<link rel="stylesheet" href="/commonplace/web/static/ui.css">
+<link rel="stylesheet" href="/commonplace/web/static/decide.css">
+<link rel="stylesheet" href="/commonplace/web/static/rules.css">
+<link rel="stylesheet" href="/commonplace/web/static/console.css">
+<link rel="stylesheet" href="/commonplace/web/static/chat.css">
+<link rel="stylesheet" href="/commonplace/web/static/workbench.css">
+<link rel="stylesheet" href="/commonplace/web/static/chatdock.css">
+<link rel="stylesheet" href="/commonplace/web/static/bots.css">
+</head>
+<body>
+<div id="root"><div class="shell two" data-view="bots"><nav class="rail" id="board-nav"></nav><main class="center"><div id="phone-bar"></div><header class="head bar"><h1 id="title">Bots</h1></header><div id="content" tabindex="-1"></div><div id="phone-tabs"></div></main></div></div>
+<script type="module">
+import { createBots } from "/commonplace/web/static/bots.js";
+import { renderRail, renderPhoneTabs } from "/commonplace/web/static/rail.js";
+import { escape as e } from "/commonplace/web/static/api.js";
+
+const scene = new URLSearchParams(location.search).get("scene") || "roster";
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const at = (m) => new Date(Date.now() - m * 60000).toISOString().replace(/\.\d+Z$/, "Z");
+const board = { slug: "atlas", name: "Atlas", agents_working: 1 };
+const rail = renderRail({ workspace: "Northwind", user: "Maya", boards: [board], board, view: "bots", needs: 2 }).replace('<nav class="rail"', '<nav class="rail" id="board-nav"');
+document.querySelector("#board-nav").outerHTML = rail;
+document.querySelector("#phone-tabs").innerHTML = renderPhoneTabs({ board, view: "bots", needs: 2 });
+
+const bot = (id, name, job, extra = {}) => ({ id, name, job, instructions: "", kind: "project", board: null, last: null, unread: 0, waiting: 0, state: "idle", ...extra });
+const bots = [
+  bot("atlas", "Atlas", "Atlas project: login, billing and site", { state: "needs_you", unread: 2, waiting: 1, last: { role: "bot", text: "Filed “Fix login redirect” and asked you to decide on shipping.", at: at(4) } }),
+  bot("harbor", "Harbor", "Harbor mobile app", { state: "working", last: { role: "bot", text: "An agent is working on the push-token fix.", at: at(26) } }),
+  bot("billing", "Billing", "Invoices and payment questions", { state: "needs_you", unread: 1, waiting: 1, last: { role: "bot", text: "Which currency should the export use?", at: at(95) } }),
+  bot("general", "General", "Anything that is not a project", { kind: "general", last: { role: "user", text: "What did we decide about the offsite?", at: at(60 * 20) } }),
+  bot("notes", "Notes", "Keeps my reading list", { kind: "custom" }),
+];
+const msg = (id, role, extra = {}) => ({ id, role, text: "", blocks: [], at: at(30 - id), state: "ok", reply_to: null, ...extra });
+const decision = { type: "decision", card: 60, question: "Ship the login fix today?", context: "The fix is ready for review. Shipping today skips Friday's freeze check.", options: ["Ship today", "Wait until Monday"], version: 3, open: true, answer: null };
+const history = [
+  msg(1, "user", { text: "Please fix the login redirect on the site and ask Dana whether we can ship it today." }),
+  msg(2, "bot", { reply_to: 1, text: "On it. I filed the work and passed your question on to the orchestrator.", blocks: [
+    { type: "action", tool: "create_work", label: "Filed “Fix login redirect”", ok: true },
+    { type: "action", tool: "tell_orchestrator", label: "Told the orchestrator (connected)", ok: true },
+    { type: "work", card: 57, title: "Fix login redirect", status: "working", note: "An agent is working on this on the build server. Last update: tests pass locally, opening a pull request next.", links: [{ label: "Pull request #412", url: "https://example.com/pull/412" }], version: 2 },
+    decision,
+  ] }),
+  msg(3, "user", { text: "Also start the footer links task." }),
+  msg(4, "bot", { reply_to: 3, text: "That one needs your tap before I start an agent.", blocks: [
+    { type: "work", card: 61, title: "Update footer links", status: "queued", note: "", links: [], version: 1 },
+    { type: "confirm", pending: "p1", label: "Start work on “Update footer links” on the build server", state: "open" },
+  ] }),
+  msg(5, "event", { text: "", blocks: [{ type: "work", card: 52, title: "Rotate the staging keys", status: "ready", note: "Ready for your review.", links: [], version: 1 }] }),
+  msg(6, "event", { text: "", blocks: [{ type: "work", card: 49, title: "Migrate the invoice table", status: "blocked", note: "Waiting on the database owner.", links: [], version: 1 }, { type: "work", card: 40, gone: true }] }),
+];
+const earlier = [
+  msg(1, "user", { text: "How many items are open on the billing side?" }),
+  msg(2, "bot", { reply_to: 1, text: "Three open items. One is waiting on a review; the other two are queued.", blocks: [{ type: "action", tool: "project_status", label: "Checked project status", ok: true }] }),
+];
+const sheetMemory = [{ id: 1, text: "Prefers short answers, in Dutch when it is about invoices.", at: at(300) }, { id: 2, text: "The offsite is in May; ignore [redacted:token].", at: at(200) }];
+
+const state = { messages: scene === "stream" ? earlier : scene === "roster" ? [] : history, waiting: scene === "done" || scene === "sheet" ? [decision] : [] };
+const api = async (path, options = {}) => {
+  await sleep(10);
+  const method = options.method || "GET";
+  if (path === "/api/bots") return { bots, model: { ready: true, label: "local", code: "" }, can_configure: true };
+  if (/\/memory$/.test(path)) return { memories: sheetMemory };
+  const page = /^\/api\/bots\/([^/?]+)\/messages/.exec(path);
+  if (method === "GET" && page) return { bot: bots.find((b) => b.id === page[1]), messages: path.includes("after=") ? [] : state.messages, waiting: state.waiting, running: false };
+  return { ok: true };
+};
+
+const send = async ({ text, onEvent }) => {
+  onEvent("ack", { message: msg(3, "user", { text }) });
+  await sleep(60);
+  for (const piece of ["Sure. Billing has three open items, ", "one of them waiting on a review. ", "I am checking the invoice export now"]) { onEvent("delta", { text: piece }); await sleep(30); }
+  onEvent("action", { step: 0, tool: "project_status", label: "Checked project status", state: "ok" });
+  onEvent("action", { step: 1, tool: "create_work", label: "Filing “Invoice export”", state: "running" });
+  await new Promise(() => {}); // the turn is still going when the picture is taken
+};
+
+const phone = matchMedia("(max-width:699px)").matches;
+const ui = createBots({ mount: () => document.querySelector("#content"), api, e, send, go: () => {}, hidden: () => false, phone: () => phone });
+const id = scene === "roster" ? null : scene === "stream" ? "billing" : "atlas";
+await ui.show(id);
+await sleep(80);
+if (scene === "stream") {
+  const box = document.querySelector('textarea[name="text"]');
+  box.value = "Give me a status on the billing project and file work for the invoice export.";
+  document.querySelector('form[data-bots-form="send"]').dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  await sleep(400);
+}
+if (scene === "done") {
+  document.querySelector('[data-bots-action="toggle"]')?.click();
+  const box = document.querySelector('textarea[name="text"]');
+  box.value = "Thanks, and one more thing:";
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+}
+if (scene === "sheet") {
+  document.querySelector('[data-bots-action="sheet"]').click();
+  await sleep(100);
+}
+document.title = "ready";
+</script>
+</body>
+</html>

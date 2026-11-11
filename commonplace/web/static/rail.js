@@ -9,6 +9,7 @@ const paths = {
   memory: '<path d="M3.5 2.5h6.5L12.5 5v8.5h-9zM5.8 7h4.4M5.8 9.5h4.4M5.8 12h2.4"/>',
   board: '<rect x="2" y="2.5" width="3.4" height="11" rx=".6"/><rect x="6.3" y="2.5" width="3.4" height="7.5" rx=".6"/><rect x="10.6" y="2.5" width="3.4" height="9" rx=".6"/>',
   chat: '<path d="M2.5 3.5h11v7H7.2L4.3 13v-2.5H2.5z"/>',
+  bots: '<rect x="2.5" y="5" width="11" height="8" rx="2"/><path d="M8 5V2.8M5.8 9h.1M10.2 9h.1"/>',
   settings: '<path d="M2 4.5h7M12.5 4.5H14M2 11.5h1.5M6.5 11.5H14"/><circle cx="10.8" cy="4.5" r="1.6"/><circle cx="5" cy="11.5" r="1.6"/>',
   keys: '<rect x="1.5" y="4" width="13" height="8" rx="1.5"/><path d="M4 7h.1M6.5 7h.1M9 7h.1M11.5 7h.1M5 9.5h6"/>',
   console:'<rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="m4.5 6.5 2 1.8-2 1.8M8.5 10.5h3"/>',
@@ -31,6 +32,7 @@ export function renderRail({ workspace = 'Commonplace', user = '', boards = [], 
   return `<nav class="rail" aria-label="Workspace">
     <button class="ws" data-action="switch-workspace" aria-label="Workspace: ${e(workspace)}. Switch workspace"><span class="mark" aria-hidden="true">${e(Array.from(workspace)[0] || 'C')}</span>${e(workspace)}${icon('chevron')}</button>
     <button class="cmdk" id="cmdk" data-action="palette" aria-keyshortcuts="Control+K Meta+K">${icon('search')}<span>Search or do…</span><kbd>⌘/Ctrl K</kbd></button>
+    <a class="nav" href="#/bots" data-nav="bots"${current(view === 'bots')}>${icon('bots')}Bots</a>
     <a class="nav" href="#/needs" data-nav="needs"${current(view === 'needs')}>${icon('needs')}Needs me ${badge(needs, 'items')}</a>
     <a class="nav" href="#/memory" data-nav="memory"${current(view === 'memory')}>${icon('memory')}Memory</a>
     <a class="nav" href="#/console" data-nav="console"${current(view === 'console')}>${icon('console')}Console</a>
@@ -51,5 +53,5 @@ export function renderPhoneTabs({ board = null, view = 'board', needs = 0, unrea
   const name = board?.name || board?.slug || 'Project';
   const chatLabel = view === 'needs' ? `${name} chat` : 'Chat';
   const newLabel = n ? `${n} new repl${n === 1 ? 'y' : 'ies'}` : '';
-  return `<nav class="m-tabs" aria-label="Main"><a href="${boardHref(board)}" data-nav="boards"${current(view === 'board')}>${icon('board')}Board</a><a href="${board?.slug ? `${boardHref(board)}/chat` : '#/start'}" id="m-chat-tab" data-nav="chat" aria-haspopup="dialog" aria-label="${e(chatLabel)}${n ? ` ${newLabel}` : ''}"${current(view === 'chat')}>${icon('chat')}${e(chatLabel)}${n ? `<span class="badge newb">${n} new<span class="sr"> repl${n === 1 ? 'y' : 'ies'}</span></span>` : ''}</a><a href="#/needs" data-nav="needs"${current(view === 'needs')}>${icon('needs')}Needs me${badge(needs, 'items')}</a><span class="sr" role="status">${n ? `${newLabel} in ${e(name)} chat` : ''}</span></nav>`;
+  return `<nav class="m-tabs" aria-label="Main"><a href="#/bots" data-nav="bots"${current(view === 'bots')}>${icon('bots')}Bots</a><a href="${boardHref(board)}" data-nav="boards"${current(view === 'board')}>${icon('board')}Board</a><a href="${board?.slug ? `${boardHref(board)}/chat` : '#/start'}" id="m-chat-tab" data-nav="chat" aria-haspopup="dialog" aria-label="${e(chatLabel)}${n ? ` ${newLabel}` : ''}"${current(view === 'chat')}>${icon('chat')}${e(chatLabel)}${n ? `<span class="badge newb">${n} new<span class="sr"> repl${n === 1 ? 'y' : 'ies'}</span></span>` : ''}</a><a href="#/needs" data-nav="needs"${current(view === 'needs')}>${icon('needs')}Needs me${badge(needs, 'items')}</a><span class="sr" role="status">${n ? `${newLabel} in ${e(name)} chat` : ''}</span></nav>`;
 }
