@@ -584,9 +584,7 @@ def test_convo_shared_chunk_history_is_generation_scoped_and_idempotent(monkeypa
 
     for current, replacement in ((a1, b1), (b1, a2), (a2, b2)):
         collection.current = current
-        palace._backup_changed_conversation_drawers(
-            collection, source, "exchange", replacement
-        )
+        palace._backup_changed_conversation_drawers(collection, source, "exchange", replacement)
 
     assert len(collection.history) == 4, (
         "shared text must have one immutable backup in each distinct generation"
@@ -598,6 +596,5 @@ def test_convo_shared_chunk_history_is_generation_scoped_and_idempotent(monkeypa
     )
     assert len(visible) == 4, "A/B historical chunks must be complete source snapshots"
     assert {
-        label: sum(meta["filed_at"] == label for _, _, meta in history)
-        for label in ("A", "B")
+        label: sum(meta["filed_at"] == label for _, _, meta in history) for label in ("A", "B")
     } == {"A": 2, "B": 2}

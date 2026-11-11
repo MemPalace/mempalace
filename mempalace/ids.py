@@ -113,9 +113,7 @@ def make_convo_history_generation_token(rows: list[tuple[str, str]]) -> str:
     return digest.hexdigest()[:_HASH_TRUNC_DRAWER]
 
 
-def make_convo_history_id(
-    physical_id: str, content: str, generation_token: str = ""
-) -> str:
+def make_convo_history_id(physical_id: str, content: str, generation_token: str = "") -> str:
     """Stable historical ID, optionally scoped to a complete source generation."""
     parts = (physical_id, content)
     if generation_token:
