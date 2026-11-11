@@ -1149,6 +1149,16 @@ class BoardService:
     def _own_card(self, row):
         return owns_card(row, self.principal.actor)
 
+    def _can_cancel_reservation(self, row):
+        p = self.principal
+        return (
+            not p.person
+            and row["status"] == "todo"
+            and row["created_by"] == p.actor
+            and row["assignee"] == p.actor
+            and not _waiting_on_person(row)
+        )
+
     def _plan_gate(self, conn, board_id):
         """The orchestrator plan gate of a board with an accepted live config, else None."""
         from commonplace.orch import plan_check
@@ -1438,7 +1448,16 @@ class BoardService:
     def _claimable_origin(self, row):
         return self._available_origin(row)
 
-    def _write(self, board, *, submission=False, row=None, claiming=False, content_edit=False):
+    def _write(
+        self,
+        board,
+        *,
+        submission=False,
+        row=None,
+        claiming=False,
+        content_edit=False,
+        cancelling=False,
+    ):
         p = self.principal
         if not p.policy.has_scope("memory:write") or not p.policy.can_read_wing(board["wing"]):
             raise ToolError("no: this connection cannot change this board")
@@ -1448,7 +1467,11 @@ class BoardService:
                 if claiming or self._own_card(row)
                 else self._available_origin(row)
             )
-            if not available and not content_edit:
+            if (
+                not available
+                and not content_edit
+                and not (cancelling and self._can_cancel_reservation(row))
+            ):
                 raise ToolError(
                     "no: restricted-origin work needs parent or workspace owner release"
                 )
@@ -3175,7 +3198,11 @@ class BoardService:
                 ("doing", "backlog"),
             }:
                 return
-            if old == "todo" and status == "backlog" and row["assignee"] is None:
+            if (
+                old == "todo"
+                and status == "backlog"
+                and (row["assignee"] is None or self._can_cancel_reservation(row))
+            ):
                 return
         raise ToolError("no: this move requires a person or a handoff")
 
@@ -3437,7 +3464,12 @@ class BoardService:
             inactive_annotation = (
                 set(args) == {"status_line"} and row["status"] == "backlog" and self._own_card(row)
             )
-            self._write(board, row=row, content_edit=content_edit or inactive_annotation)
+            self._write(
+                board,
+                row=row,
+                content_edit=content_edit or inactive_annotation,
+                cancelling=set(args) == {"status"} and args["status"] == "backlog",
+            )
             self._version(conn, row, version)
             if (
                 set(args) - permitted
