@@ -986,6 +986,8 @@ A routine (name, card template, schedule, owner) creates one card per due time. 
 - No scope is persisted and no existing user text is rewritten. Rollback is
   a code revert; the per-request revocation window remains unchanged.
 
+- **Deck settings:** the Workspace section Deck adds to Settings is plain links to existing routes; Admin appears only when `/api/me` says `can_admin` is true, the same rule the account menu uses.
+
 - **Deck look (opt-in):** a second look and navigation for the web app, chosen per browser (`localStorage` `cmmn.ui`; nothing is stored on the server and no request carries it). It changes markup and CSS only: the same routes, APIs, permissions and CSP apply, the font it adds is a same-origin file, and with the switch off the app draws exactly as before. `#/today` and `#/compute` are reserved for Deck screens and resolve to the home screen until a screen registers for them.
 
 - **Bots web screens (S5):** `#/bots` and `#/bots/<id>` (`web/static/bots.js`, `botstream.js`, `bots.css`) talk only to the `/api/bots*` contract and the existing `POST /api/cards/<n>/decide`; they hold no conversation text beyond the open page, store nothing in the browser except an unsent draft in memory, and never send a model or mode choice. Every server string is escaped before it is drawn. A turn is streamed with `fetch` and a stream reader; a connection lost after the `ack` event is not a failure, the page polls `GET /api/bots/<id>/messages?after=` until `running` is false. The roster is polled every 15 s and an open thread every 5 s (1.5 s while a turn runs), both paused while the tab is hidden. A failed send keeps the text and retries under the same `request_id`. Work stays "work", "task" and "question" in the screen's wording.

@@ -619,6 +619,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_run_ledger.py`: run ledger acceptance through the public HTTP routes and the runner CLI.
 
+  - `tests/commonplace_deck.mjs` also covers the Workspace section that Deck adds to Settings (Deck only, Admin for admins only).
+
   - `tests/test_commonplace_deck.py` (`commonplace_deck.mjs`): the Deck switch, bar, phone tabs, screen registry, Look section and shell wiring.
 
   - `tests/bots_harness.html` and `tests/bots_shots.sh` are the screenshot harness for the bots screens: the real `bots.js` and stylesheets with a scripted fake API and stream, captured through headless Chromium.
@@ -2143,6 +2145,8 @@ Format (read by `commonplace orch docs-check`):
   - The ledger lines of the card panel's Runs list in `cardruns.js`: end status, tokens, cost and log pointer of a started run.
 
   - Bots-first navigation (`routes.js`, `rail.js`, `app.js`): a bare visit resolves to `#/bots` for a person who has a project (the first-run screen stays for one who has none); the rail and the phone tabs list Bots and Memory only, with the Bots count taken from the roster (`waitingTotal` in `bots.js`); Projects, Needs me and Console sit in a "Workspace" group of the account menu (desktop rail and phone top bar), beside Rules, Workspace settings and Admin. `boardRoute` keeps the old landing board for shared card links and the exit from Admin; every earlier deep link resolves as before.
+
+  - Deck settings (`deck.css`, `toolsHTML` in `deck.js`): in the Deck look Settings is one column of cards, the shell dialog and the shared `.opt` / `.blockbtn` buttons take the Deck tokens, and on a phone, which has no account menu, Settings opens with a Workspace section linking Needs me, Projects, Memory, Console, Rules and (for admins) Admin.
 
   - The opt-in Deck look (`deck.js`, `deck.css`, `fonts/inter-latin.woff2`): one per-browser switch (`localStorage` key `cmmn.ui`, the Look section in Settings, or `?ui=deck` / `?ui=classic` once). On, the shell draws the Deck top bar and phone tabs instead of the rail, with the workspace tools in the account menu, and `deck.css` re-tokens every screen; every rule in it is scoped to `:root[data-ui="deck"]`, so the file is inert while the switch is off. Deck-only screens register in `SCREENS` and are reached through `state.deck` in the shell.
 

@@ -139,6 +139,25 @@ test("the Look switch is added to Settings once and flips the look", () => {
   assert.equal("ui" in d.documentElement.dataset, false);
 });
 
+test("Settings carries the workspace tools in the Deck look only, with Admin for admins", () => {
+  const make = (on, me) => {
+    const s = storage(on ? { [deck.UI_KEY]: "deck" } : {});
+    const parts = [];
+    const box = { querySelector: (q) => (parts.some(([, m]) => m.includes(`id="${q.slice(1)}"`)) ? {} : null), insertAdjacentHTML: (where, markup) => parts.push([where, markup]) };
+    const ui = deck.createDeck({ root: {}, context: () => ({ me, needs: { count: 3 } }), title() {}, screens: {}, storage: s, doc: doc() });
+    ui.settings({ querySelector: (q) => (q === ".settings" ? box : null) });
+    ui.settings({ querySelector: (q) => (q === ".settings" ? box : null) });
+    return parts;
+  };
+  assert.deepEqual(make(false, { can_admin: true }).map(([where]) => where), ["beforeend"], "classic look: the Look switch only");
+  const on = make(true, { can_admin: true });
+  assert.deepEqual(on.map(([where]) => where), ["afterbegin", "beforeend"]);
+  assert.deepEqual([...on[0][1].matchAll(/href="(#\/[a-z]+)"/g)].map((m) => m[1]), ["#/needs", "#/boards", "#/memory", "#/console", "#/rules", "#/admin"]);
+  assert.match(on[0][1], /Needs me<span class="count need">3/);
+  for (const can_admin of [false, undefined, "true"]) assert.doesNotMatch(make(true, { can_admin })[0][1], /#\/admin/);
+  assert.doesNotMatch(deck.toolsHTML(), /<style|style="/);
+});
+
 test("the shell is wired through state.deck and the stylesheet is inert without the switch", () => {
   const app = read("app.js"), index = read("index.html"), css = read("deck.css");
   assert.match(app, /import \{ applyDeck, createDeck \} from "\.\/deck\.js";/);
@@ -159,7 +178,8 @@ test("the shell is wired through state.deck and the stylesheet is inert without 
     if (line.startsWith("@font-face") || line.startsWith("@media")) continue;
     const head = line.split("{")[0];
     if (/^--|^color-scheme/.test(head) || !head.trim()) continue;
-    for (const selector of head.split(",")) assert.match(selector.trim(), /^:root\[data-ui="deck"\]/, line);
+    // Commas inside :is(...) or :not(...) belong to one selector.
+    for (const selector of head.split(/,(?![^()]*\))/)) assert.match(selector.trim(), /^:root\[data-ui="deck"\]/, line);
   }
   assert.match(css, /url\("fonts\/inter-latin\.woff2"\)/);
   assert.doesNotMatch(css, /https?:\/\//);

@@ -117,3 +117,36 @@
   :root[data-ui="deck"] .sheet { background: var(--surface); }
   :root[data-ui="deck"] .sheet-body { border-radius: 0; }
 }
+
+/* ---------- Page heading, dialogs and the shared buttons of the older screens ---------- */
+:root[data-ui="deck"] .shell .head { padding: 20px var(--deck-gutter) 8px; border: 0; }
+:root[data-ui="deck"] .shell .head h1 { font-size: 24px; line-height: 30px; font-weight: 600; letter-spacing: -0.01em; }
+:root[data-ui="deck"] #shell-dialog { border: 0; border-radius: 20px; background: var(--well); color: var(--text); box-shadow: 0 24px 60px rgba(0, 0, 0, .7); }
+:root[data-ui="deck"] #shell-dialog::backdrop { background: rgba(0, 0, 0, .7); }
+:root[data-ui="deck"] .opt, :root[data-ui="deck"] .blockbtn { border-radius: 18px; box-shadow: none; }
+:root[data-ui="deck"] .opt { background: var(--well); color: var(--text); font-weight: 500; }
+:root[data-ui="deck"] .opt:hover { background: var(--accent-weak); box-shadow: none; }
+:root[data-ui="deck"] .opt.go, :root[data-ui="deck"] .blockbtn, :root[data-ui="deck"] .blockbtn:hover { background: var(--text); color: var(--bg); font-weight: 600; }
+:root[data-ui="deck"] .message { border-radius: 16px; }
+
+/* ---------- Settings: one column of cards ---------- */
+:root[data-ui="deck"] .shell #content:has(> .settings) { padding: 8px var(--deck-gutter) 28px; }
+:root[data-ui="deck"] .settings { gap: 14px; }
+:root[data-ui="deck"] .settings-section { padding: 20px 22px; border-radius: 20px; background: var(--surface); box-shadow: none; }
+:root[data-ui="deck"] .settings-section h2 { margin-bottom: 10px; color: var(--text-2); font-size: 14px; line-height: 20px; font-weight: 500; letter-spacing: 0; }
+:root[data-ui="deck"] .settings-section > p { color: var(--text-2); }
+:root[data-ui="deck"] .setting-row { min-height: 56px; border-bottom-color: var(--line); }
+:root[data-ui="deck"] .setting-row button { min-height: 32px; padding: 0 14px; border-radius: 16px; background: var(--well); color: var(--text); box-shadow: none; font-weight: 500; }
+:root[data-ui="deck"] .setting-row button:hover { background: var(--accent-weak); box-shadow: none; }
+:root[data-ui="deck"] .setting-row button[aria-pressed="true"] { background: var(--text); color: var(--bg); box-shadow: none; }
+:root[data-ui="deck"] .settings :is(input:not([type=checkbox], [type=radio]), select, textarea) { min-height: 36px; padding: 0 12px; border: 0; border-radius: 12px; background: var(--well); color: var(--text); }
+:root[data-ui="deck"] .deck-tools { display: none; }
+:root[data-ui="deck"] .deck-tools a { display: flex; align-items: center; justify-content: space-between; min-height: 48px; color: var(--text); text-decoration: none; font-weight: 500; }
+:root[data-ui="deck"] .deck-tools a + a { border-top: 1px solid var(--line); }
+@media (max-width: 699px) {
+  :root[data-ui="deck"] .shell .head { padding: 14px 16px 4px; }
+  :root[data-ui="deck"] .shell #content:has(> .settings) { padding: 8px 16px 20px; }
+  :root[data-ui="deck"] .settings-section { padding: 18px; }
+  /* A phone has no account menu, so Settings carries the workspace tools. */
+  :root[data-ui="deck"] .deck-tools { display: block; }
+}

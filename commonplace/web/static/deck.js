@@ -85,6 +85,12 @@ export function lookHTML(on) {
   return `<section class="settings-section" id="look"><h2>Look</h2><p>Deck puts what waits on you first and moves the workspace tools into the account menu. The choice is saved in this browser.</p><button class="opt" data-deck-action="toggle" aria-pressed="${on ? 'true' : 'false'}">${on ? 'Go back to the classic look' : 'Try the Deck look'}</button></section>`;
 }
 
+/** The workspace tools as one Settings section. The phone layout shows it, because a phone has no account menu. */
+export function toolsHTML({ needs = 0, rulesWaiting = 0, can_admin = false } = {}) {
+  const row = (href, label, n = 0) => `<a href="${href}">${label}${badge(n, 'waiting')}</a>`;
+  return `<section class="settings-section deck-tools" id="deck-tools"><h2>Workspace</h2>${row('#/needs', 'Needs me', needs)}${row('#/boards', 'Projects')}${row('#/memory', 'Memory')}${row('#/console', 'Console')}${row('#/rules', 'Rules', rulesWaiting)}${can_admin === true ? row('#/admin', 'Admin') : ''}</section>`;
+}
+
 /** The shell's handle on Deck. Everything it needs comes in, so it runs without a browser.
  *  context() returns what a screen may read: { me, boards, needs, go(hash) }. */
 export function createDeck({ root, api, context, title, screen = () => 0, reload = () => {}, screens = SCREENS, storage = store(), doc = globalThis.document } = {}) {
@@ -104,7 +110,12 @@ export function createDeck({ root, api, context, title, screen = () => 0, reload
   }
   function settings(content) {
     const box = content?.querySelector?.('.settings');
-    if (box && !box.querySelector('#look')) box.insertAdjacentHTML('beforeend', lookHTML(deckOn(storage)));
+    if (!box) return;
+    if (deckOn(storage) && !box.querySelector('#deck-tools')) {
+      const { me, needs } = context() || {};
+      box.insertAdjacentHTML('afterbegin', toolsHTML({ needs: needs?.count, can_admin: me?.can_admin }));
+    }
+    if (!box.querySelector('#look')) box.insertAdjacentHTML('beforeend', lookHTML(deckOn(storage)));
   }
   function toggle() {
     setDeck(!deckOn(storage), storage);
