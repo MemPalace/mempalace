@@ -135,6 +135,8 @@ def test_chat_sources_generic_and_actionless():
         "chat_front_jobs",
         "chat_handoffs",
         "chat_replies",
+        "chat_live_posts",
+        "chat_live_reads",
         "bot_model_calls",  # bot model requests counted in the shared budget (numbers only)
     }
     sql = re.compile(

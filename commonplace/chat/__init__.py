@@ -3,7 +3,7 @@
 import os
 import time
 
-from commonplace.chat import front, handoff, routes, settings, store, worker
+from commonplace.chat import front, handoff, live, routes, settings, store, worker
 
 
 def install(gateway):
@@ -13,6 +13,7 @@ def install(gateway):
     settings.ensure_schema(db)
     store.ensure_schema(db)
     handoff.ensure_schema(db)
+    live.ensure_schema(db)
     now = time.time()
     store.recover(db, now)
     handoff.recover(db, gateway, now)

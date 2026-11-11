@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from commonplace import control_db, events, redact, sessions, webhooks
 from commonplace.boards.service import BoardService
-from commonplace.chat import handoff, settings, store
+from commonplace.chat import handoff, live, settings, store
 from commonplace.chat.types import ACK_WAIT_S, RECEIPT_COPY, OrchestratorView
 from commonplace.console import authority
 from commonplace.extensions import ToolContext
@@ -112,6 +112,7 @@ def on_event(gateway, event: dict) -> None:
         db = gateway.db
         if not events.is_stored(db, event):
             return
+        live.record_post(db, event)
         actor = event.get("actor", "")
         if not actor.startswith("user:"):
             return

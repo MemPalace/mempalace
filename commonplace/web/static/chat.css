@@ -36,8 +36,10 @@
 .chat-quote { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
 .chat-quote button { margin-left: auto; min-width: 28px; min-height: 28px; }
 .chat-source { margin: 0; background: var(--accent-weak); }
-.chat-recovery { margin: 0 16px 8px; background: var(--pane); border: 1px solid var(--line); border-radius: var(--r); }
-.chat-recovery[role=alert], .chat-unsent { background: var(--block-bg); color: var(--block); }
+.chat-recovery, .chat-live { margin: 0 16px 8px; background: var(--pane); border: 1px solid var(--line); border-radius: var(--r); }
+.chat-recovery[role=alert], .chat-live[role=alert], .chat-unsent { background: var(--block-bg); color: var(--block); }
+.chat-live { padding: 8px 10px; font-size: 12.5px; line-height: 18px; overflow-wrap: anywhere; }
+.chat-live p { margin: 4px 0 0; color: var(--text); }
 .chat-unsent { margin: 0 16px 8px; border-left: 3px solid var(--block); }
 .chat-unsent p:first-child { white-space: pre-wrap; }
 .chat-unsent div { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }

@@ -2,7 +2,7 @@
 
 from commonplace import redact
 from commonplace.boards.service import BoardService
-from commonplace.chat import front, model, search, settings, status, store
+from commonplace.chat import front, live, model, search, settings, status, store
 from commonplace.chat.types import LINKED_CARDS_MAX, ChatDenied
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import path_parts, query, read_json, require_principal, send_json
@@ -90,6 +90,7 @@ def install(gateway) -> None:
                 payload.pop("coordinator", None)
                 view = front.orchestrator(gateway, principal, parts[0])
                 payload["orchestrator"] = view.public() if view is not None else None
+                payload["live"] = live.snapshot(gateway, principal, parts[0], view)
                 payload["messages"] = [
                     {**message, "text": redact.redact(message["text"])[0]}
                     for message in payload["messages"]

@@ -1,6 +1,7 @@
 import { actor, api as request } from "./api.js";
 import { cardId } from "./board.js";
 import { deriveChatState, seenStore, clearSeen } from "./chatstate.js";
+import { liveHTML, liveLine, livePending } from "./chatlive.js";
 
 export const CHAT_COPY = Object.freeze({
   title: "Chat", loading: "Loading chat…", unavailable: "Chat is unavailable. Try again.",
@@ -292,6 +293,8 @@ export function createChat({ mount, api, e, me, board, coordinator, onCard = () 
       if (state.derived?.state === "no_answer") text = `Connected, not answering since ${clock(request?.at) || "earlier"}`;
       else if (state.derived?.state === "waiting" || !hasOrchestrator) text = "No orchestrator yet";
       else text = "Orchestrator connected";
+      // The server's delivery state of the newest message says more than "connected".
+      if (state.derived?.state !== "no_answer") text = liveLine(state.page.live) || text;
     }
     if (text !== headerShown) { headerShown = text; headerSink?.(text); }
   }
@@ -302,7 +305,7 @@ export function createChat({ mount, api, e, me, board, coordinator, onCard = () 
     const bottom = !old || old.scrollHeight - top - old.clientHeight < 60;
     const page = { ...state.page, project: project(), cards: state.cards, at: state.at, seen: state.baseline, todayIds: state.todayIds };
     if (!host.querySelector(".chat-view")) {
-      host.innerHTML = `<aside class="chat-view chatpane" aria-labelledby="chat-h"><header class="chat-header"><h2 id="chat-h">${e(project().name || state.slug || "Project")} chat</h2><button class="btn ghost sm" type="button" data-close-chat>Close chat</button><label>Project<select data-chat-project></select></label><a data-chat-board>Board</a><div class="chat-status" data-chat-status></div></header><div data-chat-source></div><p data-chat-error role="alert" hidden></p><div class="chat-history"><button type="button" data-chat-earlier>Show earlier</button></div><ol class="chat-stream" role="log" aria-label="Messages" tabindex="0">${chatHTML(page, state.me, e)}</ol><div data-chat-recovery></div><div data-chat-unsent></div><form class="chat-compose"><div data-chat-quote></div><label class="sr" for="chat-text">Message to ${e(project().name || state.slug || "project")} chat</label><div class="chat-box"><textarea id="chat-text" name="text" rows="2" placeholder="${e(CHAT_COPY.placeholder)}" required></textarea><button class="btn primary sm" type="submit" aria-label="Send" aria-describedby="chat-wait"><svg class="i" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 8 13.5 3l-3 10.5-2.3-4.3z"/><path d="M8.2 9.2 13.5 3"/></svg></button></div><p class="chat-wait" id="chat-wait" data-chat-wait role="status" hidden>${e(CHAT_COPY.waiting)}</p><p class="chat-hint chat-keys"><span>Enter to send · Shift+Enter new line</span><span><kbd>Esc</kbd> closes the chat</span></p></form></aside>`;
+      host.innerHTML = `<aside class="chat-view chatpane" aria-labelledby="chat-h"><header class="chat-header"><h2 id="chat-h">${e(project().name || state.slug || "Project")} chat</h2><button class="btn ghost sm" type="button" data-close-chat>Close chat</button><label>Project<select data-chat-project></select></label><a data-chat-board>Board</a><div class="chat-status" data-chat-status></div></header><div data-chat-source></div><p data-chat-error role="alert" hidden></p><div class="chat-history"><button type="button" data-chat-earlier>Show earlier</button></div><ol class="chat-stream" role="log" aria-label="Messages" tabindex="0">${chatHTML(page, state.me, e)}</ol><div data-chat-live></div><div data-chat-recovery></div><div data-chat-unsent></div><form class="chat-compose"><div data-chat-quote></div><label class="sr" for="chat-text">Message to ${e(project().name || state.slug || "project")} chat</label><div class="chat-box"><textarea id="chat-text" name="text" rows="2" placeholder="${e(CHAT_COPY.placeholder)}" required></textarea><button class="btn primary sm" type="submit" aria-label="Send" aria-describedby="chat-wait"><svg class="i" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2.5 8 13.5 3l-3 10.5-2.3-4.3z"/><path d="M8.2 9.2 13.5 3"/></svg></button></div><p class="chat-wait" id="chat-wait" data-chat-wait role="status" hidden>${e(CHAT_COPY.waiting)}</p><p class="chat-hint chat-keys"><span>Enter to send · Shift+Enter new line</span><span><kbd>Esc</kbd> closes the chat</span></p></form></aside>`;
       const form = host.querySelector(".chat-compose");
       if (form) {
         form.onsubmit = send;
@@ -356,7 +359,12 @@ export function createChat({ mount, api, e, me, board, coordinator, onCard = () 
     const acts = recovery === "no_answer"
       ? `<a class="btn sm primary" href="#/board/${encodeURIComponent(state.slug)}/settings">Show how to restart the agent</a><button class="btn sm" type="button" data-chat-ask-again>Ask again</button>`
       : '<p>Connect an agent in Settings. Your message is delivered when it connects.</p>';
-    put("[data-chat-recovery]", request && ["waiting", "working", "no_answer"].includes(recovery) ? `<div class="chat-recovery" role="${recovery === "no_answer" ? "alert" : "status"}"><b>${recovery === "waiting" ? "Waiting for an agent" : recovery === "working" ? "Working on it…" : "No answer yet."}</b>${recoveryText ? `<p>${e(recoveryText)}</p>` : ""}${recovery !== "working" ? `<div class="chat-acts">${acts}<button class="btn sm" type="button" data-chat-make-card ${state.making ? "disabled" : ""}>Make it a card now (adds it to Todo)</button></div>` : ""}</div>` : "");
+    // With a live delivery state from the server, the timed "Working on it…" guess is not shown,
+    // and "Waiting for an agent" only while the server also finds no agent.
+    const live = state.page.live?.message_id ? state.page.live : null;
+    const recovering = !!request && (live ? recovery === "no_answer" || (recovery === "waiting" && live.state === "no_agent") : ["waiting", "working", "no_answer"].includes(recovery));
+    put("[data-chat-live]", recovering ? "" : liveHTML(live, state.me, e));
+    put("[data-chat-recovery]", recovering ? `<div class="chat-recovery" role="${recovery === "no_answer" ? "alert" : "status"}"><b>${recovery === "waiting" ? "Waiting for an agent" : recovery === "working" ? "Working on it…" : "No answer yet."}</b>${recoveryText ? `<p>${e(recoveryText)}</p>` : ""}${recovery !== "working" ? `<div class="chat-acts">${acts}<button class="btn sm" type="button" data-chat-make-card ${state.making ? "disabled" : ""}>Make it a card now (adds it to Todo)</button></div>` : ""}</div>` : "");
     headerLine();
     const form = host.querySelector(".chat-compose");
     // While an earlier message is unsent, the composer keeps its text but does not send.
@@ -428,7 +436,7 @@ export function createChat({ mount, api, e, me, board, coordinator, onCard = () 
         if (!state.loaded) restore();
         lastProject = state.slug;
       }
-      state.loaded = true; state.error = ""; delay = 2000;
+      state.loaded = true; state.error = ""; delay = livePending(state.page.live) ? 1000 : 2000;
     } catch { if (!current(token)) return; state.error = CHAT_COPY.unavailable; delay = Math.min(delay * 2, 30000); }
     render(); schedule(token);
   }
