@@ -158,7 +158,7 @@ def _backup_changed_conversation_drawers(
     publication: uncommitted new chunks still require a separate visibility
     gate before concurrent Hub reads can be enabled.
     """
-    from ..ids import make_convo_history_id
+    from ..ids import make_convo_history_generation_token, make_convo_history_id
 
     desired = {drawer_id: document for drawer_id, document, _ in drawers}
     # A failed positional replacement can leave B rows next to the old A
@@ -215,6 +215,16 @@ def _backup_changed_conversation_drawers(
     changed_generations = {
         key for original_id, old_text, _, key in candidates if desired.get(original_id) != old_text
     }
+    # Content-scoped tokens allow two historical versions to reuse one text
+    # chunk without collapsing their full snapshot into a single physical row.
+    # The token ignores source mtime so A -> B -> A remains idempotent.
+    grouped_text = {}
+    for original_id, old_text, _, key in candidates:
+        if key in changed_generations:
+            grouped_text.setdefault(key, []).append((original_id, old_text))
+    generation_tokens = {
+        key: make_convo_history_generation_token(rows) for key, rows in grouped_text.items()
+    }
     for original_id, old_text, old_meta, key in candidates:
         seen, expected = generation_counts[key]
         if seen < expected:
@@ -223,7 +233,7 @@ def _backup_changed_conversation_drawers(
             continue
         if key not in changed_generations:
             continue
-        history_id = make_convo_history_id(original_id, old_text)
+        history_id = make_convo_history_id(original_id, old_text, generation_tokens[key])
         historical = {
             **old_meta,
             "source_file": source_file,

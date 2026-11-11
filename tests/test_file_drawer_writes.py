@@ -526,3 +526,78 @@ def test_convo_history_backup_preserves_whole_generation_on_partial_change(monke
     archived.clear()
     palace._backup_changed_conversation_drawers(SavedCollection(), source, "exchange", old)
     assert not archived, "a no-op re-mine must not archive an unchanged generation"
+
+
+def test_convo_shared_chunk_history_is_generation_scoped_and_idempotent(monkeypatch):
+    """A and B share text but both entire snapshots must remain readable."""
+    import mempalace.palace as palace
+    from mempalace.convo_visibility import visible_conversation_rows
+
+    source = "/transcripts/alternating.jsonl"
+    common = {
+        "source_file": source,
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": palace.NORMALIZE_VERSION,
+        "convo_chunker_version": palace.CONVO_CHUNKER_VERSION,
+        "chunk_total": 2,
+    }
+
+    def version(label, changed, mtime):
+        meta = {**common, "filed_at": label, "source_mtime": mtime}
+        return [
+            ("drawer_shared", "same first chunk", {**meta, "chunk_index": 0}),
+            ("drawer_changed", changed, {**meta, "chunk_index": 1}),
+        ]
+
+    a1 = version("A", "only A", 1.0)
+    b1 = version("B", "only B", 2.0)
+    a2 = version("A2", "only A", 3.0)
+    b2 = version("B2", "only B", 4.0)
+
+    class SavedCollection:
+        def __init__(self):
+            self.current = a1
+            self.history = {}
+
+        def get(self, ids=None, where=None, **_kwargs):
+            rows = (
+                self.current + list(self.history.values())
+                if where is not None
+                else [self.history[item] for item in ids if item in self.history]
+            )
+            return {
+                "ids": [row[0] for row in rows],
+                "documents": [row[1] for row in rows],
+                "metadatas": [row[2] for row in rows],
+            }
+
+    collection = SavedCollection()
+
+    def save_history(_collection, rows, embeddings=None):
+        for row in rows:
+            collection.history[row[0]] = row
+
+    monkeypatch.setattr(palace, "_stored_vectors", lambda *_args: {})
+    monkeypatch.setattr(palace, "assert_no_collisions", lambda *_args: None)
+    monkeypatch.setattr(palace, "_upsert", save_history)
+
+    for current, replacement in ((a1, b1), (b1, a2), (a2, b2)):
+        collection.current = current
+        palace._backup_changed_conversation_drawers(
+            collection, source, "exchange", replacement
+        )
+
+    assert len(collection.history) == 4, (
+        "shared text must have one immutable backup in each distinct generation"
+    )
+    history = list(collection.history.values())
+    visible = visible_conversation_rows(
+        [row_id for row_id, _, _ in history],
+        [metadata for _, _, metadata in history],
+    )
+    assert len(visible) == 4, "A/B historical chunks must be complete source snapshots"
+    assert {
+        label: sum(meta["filed_at"] == label for _, _, meta in history)
+        for label in ("A", "B")
+    } == {"A": 2, "B": 2}
