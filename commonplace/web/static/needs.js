@@ -481,6 +481,8 @@ export function createNeeds({ mount, detailMount, api = request, onAction, onAsk
     if (event.key.toLowerCase() === "r") { event.preventDefault(); event.stopPropagation?.(); ask(); }
     else if (event.key.toLowerCase() === "z" && holdState(currentHold(), now()).canStop) { event.preventDefault(); event.stopPropagation?.(); void stopHold(currentHold().id); }
     else if (["j", "k"].includes(event.key.toLowerCase())) {
+      // An open form holds the panel and the keyboard until it is cancelled or saved.
+      if (detailMount?.querySelector("form.form-tile")) return;
       const rows = items(), index = rows.findIndex((card) => card.number === selected);
       const next = rows[Math.max(0, Math.min(rows.length - 1, index + (event.key.toLowerCase() === "j" ? 1 : -1)))];
       if (next) { event.preventDefault(); event.stopPropagation?.(); paused = false; void select(next.number); }
@@ -491,6 +493,8 @@ export function createNeeds({ mount, detailMount, api = request, onAction, onAsk
     rememberNote(); filter = value;
     const rows = items();
     if (!rows.some((card) => card.number === selected)) {
+      // The selection leaves with the filter, so a form held for it no longer belongs on screen.
+      paused = false;
       if (rows.length) return select(rows[0].number);
       revision++; selected = null; current = null; confirming = false;
     }
@@ -528,7 +532,16 @@ export function createNeeds({ mount, detailMount, api = request, onAction, onAsk
     },
     select, setFilter, approve, approvePlan, confirm, decline, answer, stopHold, ask, refreshHolds,
     setChatOpen(open) { rememberNote(); chatOpen = Boolean(open); drawDetail(); },
-    pause(on) { if (paused === Boolean(on)) return; paused = Boolean(on); if (!paused) drawDetail(); },
+    pause(on) {
+      if (paused === Boolean(on)) return;
+      paused = Boolean(on);
+      if (paused) return;
+      // A closed panel stays closed: the next pick reads the card, and a read must not reopen it.
+      if (detailMount?.hidden) { drawDetail(); return; }
+      // A read that failed while the form held the panel would leave a bare placeholder: read the selection again.
+      if (current == null && selected != null) void select(selected);
+      else { drawDetail(); focus("[data-needs-title]"); }
+    },
     paused: () => paused,
     stop() {
       stopped = true; github = null; revision++; unschedule(timer);

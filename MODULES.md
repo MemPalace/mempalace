@@ -583,6 +583,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Legacy report-source tests quiesce hold, chat and phone workers and verify removal of a pre-existing invalid reset trigger before raw status writes.
 
+  - Real-browser refresh cases (`workbench_e2e/test_refresh_forms.py`) hold an open hand-off form or comment across background refreshes, including a read in flight and a changed Needs me queue, and check that Cancel closes the form, that J and K leave an open form alone, and that closing the panel after a failed read keeps it closed.
+
   - `tests/test_projects_seat_lease.py` creates a seat through the Project settings routes and has it take, hold, renew and release its lease over MCP.
 
   - Overview witnesses separate old-head behavioral regressions from the original-base fail-closed contract, with exact facet-call sequences and both lazy SQLite error classes.
@@ -1792,6 +1794,8 @@ Format (read by `commonplace orch docs-check`):
 
   - A current refresh failure clears that responsibility, so later background reads still preserve busy Rules forms.
 
+  - A background refresh never replaces an edit, hand-off or ask form open in the card panel, including one opened while the refresh's card read was in flight. On Needs me (including a hash the router does not recognise, which draws it too) the item's detail waits (paused) while a hand-off form is open; Cancel, a saved hand-off, choosing another item or a filter that drops the item gives the panel back and focuses the item heading, and a read that failed meanwhile is repeated. J and K do not move the selection while a form is open, wherever focus is. Closing the panel does not read a card, so the close itself does not reopen it; a later change to the Needs me payload re-selects the item and opens the panel again, as before. When a filter leaves no items, focus goes to the filter button. On a card route the panel redraws from a fresh card read.
+
   - The latest refresh carries a pending foreground render for its screen, so background events cannot leave Settings or Console on Loading; completed Settings views keep their usual background-update policy.
 
   - The person-owner task-type API rejects non-object JSON with 400 and replaces a connection’s sorted allowlist atomically; GET never creates a boards store.
@@ -1830,6 +1834,8 @@ Format (read by `commonplace orch docs-check`):
 
 
   - The `tests/test_workbench_` files, the `tests/test_console_` files and the `tests/test_commonplace_console_` files.
+
+  - `tests/workbench_e2e/test_refresh_forms.py` drives a real browser: an open hand-off form (also one opened mid-refresh) and a comment in progress survive a background refresh, the panel updates once the form is cancelled, and on Needs me a queue change leaves an open hand-off form alone and Cancel closes it.
 
   - `tests/orchstatus.mjs` (run by `tests/test_orchstatus.py`) covers the status block states, the End lease confirm, refusals and escaping; `tests/test_orch_lease_status.py` covers the checkpoint fields it reads and the owner-only force-release contract.
 
