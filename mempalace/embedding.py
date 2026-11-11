@@ -113,6 +113,17 @@ def embedding_section():
         yield
 
 
+@contextlib.contextmanager
+def suspend_embedding_section_hook():
+    """Keep the caller's request lease while publishing a compound write."""
+    hook = getattr(_embedding_section_hook_local, "hook", None)
+    set_embedding_section_hook(None)
+    try:
+        yield
+    finally:
+        set_embedding_section_hook(hook)
+
+
 _PROVIDER_MAP = {
     "cpu": ["CPUExecutionProvider"],
     "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
