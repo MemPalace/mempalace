@@ -64,6 +64,7 @@ def _run_node_hook(
         "MEMPALACE_HOOKS_AUTO_SAVE",
         "MEMPAL_SAVE_INTERVAL",
         "MEMPALACE_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
     ):
         env.pop(k, None)
     if extra_env:
