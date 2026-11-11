@@ -6,8 +6,13 @@ only for them); other boards are never scanned. The sweep reads committed
 failed after its commit is still found.
 
 Firing rule (``durable.FIRING_EVENT``): ``to_status='todo' AND (from_status IS NULL OR
-from_status!='todo')``, or the plan-approval row ``kind='edit' AND choice='approve plan'
-AND to_status='todo'``.
+from_status!='todo')``, the plan-approval row ``kind='edit' AND choice='approve plan'
+AND to_status='todo'``, or an origin release ``kind='decide' AND choice='release
+origin'`` (a released card that already waited in todo has no new todo transition).
+
+A firing event whose start cannot even be planned (``prepare`` refuses, or the config
+lacks the role the start needs) is a coded miss that advances the cursor, like any other
+refusal; only infrastructure errors leave the cursor.
 
 Cursor protocol (board events live in ``boards.sqlite3``, the cursor in
 ``runner.sqlite3``, so no transaction spans both):
@@ -39,7 +44,9 @@ start, renewal, result and status read), never inside its transaction.
 
 Locks: the sweep opens the orchestrator store with ``Store.existing`` (no schema script,
 no ``orch_state`` insert, no marker conversion), so up to ``fenced_start`` its only
-``runner.sqlite3`` write is the arming ``UPDATE`` of a NULL cursor. The store is created
+``runner.sqlite3`` write is the arming ``UPDATE`` of a NULL cursor. After a board's sweep,
+``orch_sweep_health`` records a failure streak (cleared by the next clean sweep, no write
+while healthy); the second failure in a row alerts once (``failing``, Needs me, event). The store is created
 by the accept that configures a board; a pending restore marker is converted by the next
 explicit store open (surface, CLI, lease call or start), and until then the sweep skips
 the workspace as it does under the restore flag.
@@ -61,7 +68,7 @@ from commonplace.runner import jobs, registry
 from commonplace.runner.predicate import requester_ok
 from commonplace.sessions import person_principal
 
-from . import durable, runner_bridge, store as orch_store
+from . import durable, runner_bridge, schema, store as orch_store
 
 logger = logging.getLogger(__name__)
 BATCH = 50
@@ -178,17 +185,33 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
         for event in events:
             principal, ref, refusal = _actor(gateway, ws, event, machine)
             _barrier("sweep_after_requester", conn)
-            plan = runner_bridge.prepare(
-                gateway,
-                ws,
-                board_row=board_row,
-                card_row=cards[event["task_id"]],
-                version=version,
-                principal=principal,
-                requested_by=ref or "unknown",
-                person=False,
-                split_start=on,
-            )
+            try:
+                plan = runner_bridge.prepare(
+                    gateway,
+                    ws,
+                    board_row=board_row,
+                    card_row=cards[event["task_id"]],
+                    version=version,
+                    principal=principal,
+                    requested_by=ref or "unknown",
+                    person=False,
+                    split_start=on,
+                )
+            except (runner_bridge.StartRefused, schema.ConfigError) as exc:
+                # A start that cannot even be planned is a coded miss for this event,
+                # not an infrastructure error: leaving the cursor would block the board.
+                code = exc.code if isinstance(exc, runner_bridge.StartRefused) else "config_invalid"
+                trigger = runner_bridge.TriggerRef(event["id"], cursor, gen, ref)
+                if not runner_bridge.trigger_miss(
+                    js, board, event["task_id"], trigger, code, now=now
+                ):
+                    results.append({"event": event["id"], "dropped": True})
+                    break
+                cursor = event["id"]
+                results.append(
+                    {"event": event["id"], "card": event["task_id"], "job": None, "miss": code}
+                )
+                continue
             _barrier("sweep_before_start", conn)
             outcome = runner_bridge.fenced_start(
                 js,
@@ -239,17 +262,25 @@ def _reconcile(js, st, board, now):
             n = len(split.attempts(conn, row["id"])) + 1
             event = {"stamp_user": row["stamp_user"], "stamp_connection": row["stamp_connection"]}
             principal, ref, refusal = _actor(gateway, ws, event, machine)
-            plan = runner_bridge.prepare(
-                gateway,
-                ws,
-                board_row=b,
-                card_row=cards[row["id"]],
-                version=version,
-                principal=principal,
-                requested_by=ref or "unknown",
-                person=False,
-                split_start=True,
-            )
+            try:
+                plan = runner_bridge.prepare(
+                    gateway,
+                    ws,
+                    board_row=b,
+                    card_row=cards[row["id"]],
+                    version=version,
+                    principal=principal,
+                    requested_by=ref or "unknown",
+                    person=False,
+                    split_start=True,
+                )
+            except (runner_bridge.StartRefused, schema.ConfigError) as exc:
+                # Counted like any refused attempt: three of them end reconciliation.
+                code = exc.code if isinstance(exc, runner_bridge.StartRefused) else "config_invalid"
+                trigger = runner_bridge.TriggerRef(0, pair[0], pair[1], ref, retry=n)
+                if runner_bridge.trigger_miss(js, board, row["id"], trigger, code, now=now):
+                    results.append({"card": row["id"], "retry": n, "job": None, "miss": code})
+                continue
             outcome = runner_bridge.fenced_start(
                 js,
                 plan,
@@ -304,4 +335,115 @@ def run(js, *, now=None) -> dict:
         except Exception as exc:
             log_failure(logger, "orchestrator trigger sweep of a board failed", exc)
             report[board] = None
+            _record_failure(js, st, board, exc, now or jobs._now())
+        else:
+            _record_success(st, board)
     return report
+
+
+# --------------------------------------------------------------- sweep health
+
+HEALTH_DDL = (
+    "CREATE TABLE IF NOT EXISTS orch_sweep_health (board TEXT PRIMARY KEY, "
+    "failures INTEGER NOT NULL, first_at TEXT NOT NULL, last_at TEXT NOT NULL, "
+    "error TEXT NOT NULL, alerted INTEGER NOT NULL DEFAULT 0)"
+)
+ALERT_AFTER = 2  # consecutive failed sweeps of one board before the owner is alerted
+
+
+def _health_table(conn) -> bool:
+    return bool(
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='orch_sweep_health'"
+        ).fetchone()
+    )
+
+
+def _record_success(st, board: str) -> None:
+    """A clean sweep ends the board's failure streak (no write while healthy)."""
+    try:
+        with st.connection() as conn:
+            if (
+                not _health_table(conn)
+                or not conn.execute(
+                    "SELECT 1 FROM orch_sweep_health WHERE board=?", (board,)
+                ).fetchone()
+            ):
+                return
+        with st.transaction() as conn:
+            conn.execute("DELETE FROM orch_sweep_health WHERE board=?", (board,))
+    except Exception as exc:
+        log_failure(logger, "orchestrator sweep health could not be cleared", exc)
+
+
+def _record_failure(js, st, board: str, exc: Exception, now: str) -> None:
+    """Count consecutive failed sweeps of a board. The second one in a row emits one
+    ``orch.trigger.failing`` event (app and webhooks) and the owner's Needs me lists the
+    board until a sweep succeeds: a sweep that fails on every poll is never just a log line.
+    Only the exception's type is stored, never its text."""
+    error = type(exc).__name__
+    try:
+        with st.transaction() as conn:
+            conn.execute(HEALTH_DDL)
+            conn.execute(
+                "INSERT INTO orch_sweep_health(board,failures,first_at,last_at,error) "
+                "VALUES (?,1,?,?,?) ON CONFLICT(board) DO UPDATE SET "
+                "failures=failures+1,last_at=excluded.last_at,error=excluded.error",
+                (board, now, now, error),
+            )
+            row = conn.execute("SELECT * FROM orch_sweep_health WHERE board=?", (board,)).fetchone()
+            alert = row["failures"] >= ALERT_AFTER and not row["alerted"]
+            if alert:
+                conn.execute("UPDATE orch_sweep_health SET alerted=1 WHERE board=?", (board,))
+            failures, since = row["failures"], row["first_at"]
+    except Exception as health_exc:
+        log_failure(logger, "orchestrator sweep health could not be recorded", health_exc)
+        return
+    if alert:
+        from commonplace import events
+
+        try:
+            events.emit(
+                js.gateway.db,
+                js.workspace_id,
+                "orch.trigger.failing",
+                subject=f"board:{board}",
+                actor="system",
+                data={"board": board, "failures": failures, "since": since, "error": error},
+            )
+        except Exception as emit_exc:
+            log_failure(logger, "orchestrator sweep alert could not be emitted", emit_exc)
+
+
+def failing(gateway, workspace_id: str) -> list[dict]:
+    """Boards whose trigger sweep keeps failing: ``[{board, failures, since, error,
+    message}]`` for the owner's Needs me. Empty when the store or table does not exist."""
+    directory = gateway.workspace_dir(workspace_id)
+    from pathlib import Path
+
+    if not (Path(directory) / "runner.sqlite3").exists():
+        return []
+    try:
+        st = orch_store.open_existing(gateway, workspace_id)
+        with st.connection() as conn:
+            if not _health_table(conn):
+                return []
+            rows = conn.execute(
+                "SELECT * FROM orch_sweep_health WHERE failures>=? ORDER BY board",
+                (ALERT_AFTER,),
+            ).fetchall()
+    except Exception as exc:
+        log_failure(logger, "orchestrator sweep health unavailable", exc)
+        return []
+    return [
+        {
+            "board": row["board"],
+            "failures": row["failures"],
+            "since": row["first_at"],
+            "error": row["error"],
+            "message": f"The orchestrator cannot start work on {row['board']}: its trigger "
+            f"sweep failed {row['failures']} times in a row since {row['first_at']} "
+            f"({row['error']}). New and released cards will not start until it is fixed.",
+        }
+        for row in rows
+    ]

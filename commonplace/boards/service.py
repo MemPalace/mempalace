@@ -3845,7 +3845,24 @@ class BoardService:
             return result
         if self.principal.role == "owner":
             groups["coordinator_waiting"] = self._coordinator_waiting()
+            groups["orchestrator_failing"] = self._orchestrator_failing()
         return groups
+
+    def _orchestrator_failing(self):
+        if not self.principal.person:
+            return []
+        from commonplace.orch import triggers
+
+        return [
+            item
+            for item in triggers.failing(self.ctx.gateway, self.principal.workspace_id)
+            if self._visible_board_slug(item["board"])
+        ]
+
+    def _visible_board_slug(self, slug):
+        with self.store.connection() as conn:
+            row = conn.execute("SELECT wing FROM boards WHERE slug=?", (slug,)).fetchone()
+        return row is not None and self.principal.policy.can_read_wing(row["wing"])
 
     def seed_card(
         self,

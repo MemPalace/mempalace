@@ -1148,9 +1148,12 @@ def _card_classes(ctx, board_row, principal, now, *, heartbeat):
     return {key: value[:MAX_LIST] for key, value in classes.items()}
 
 
+# An origin release is a firing event too: a restricted-origin card that waited in todo
+# for release has no new todo transition, so without it a released card never starts.
 FIRING_EVENT = (
     "((to_status='todo' AND (from_status IS NULL OR from_status!='todo')) "
-    "OR (kind='edit' AND choice='approve plan' AND to_status='todo'))"
+    "OR (kind='edit' AND choice='approve plan' AND to_status='todo') "
+    "OR (kind='decide' AND choice='release origin'))"
 )
 
 

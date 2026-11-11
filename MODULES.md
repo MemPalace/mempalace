@@ -247,6 +247,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `docs/admin.md` is the authoritative current Admin API and partial-rollout contract, linked from the existing board API and agent connection guide.
 
+  - `docs/projects.md` names the split-start role: `main`, or the `[runner]` role when the config has no `main` role.
+
 
   - Live-sync instructions describe transcript-only reinstall, explicit destination and retained disabled memory history.
   - Public Space endpoint and error documentation alongside legacy board routes.
@@ -1129,6 +1131,8 @@ Format (read by `commonplace orch docs-check`):
 
   - With workspace orchestration enabled, claims hold runner admission through board commit and person assignments or handoffs cannot reserve a busy agent.
 
+  - The owner's `needs_me` lists boards whose orchestrator trigger sweep keeps failing (`orchestrator_failing`), limited to boards whose wing the owner can read.
+
   - Subagent and restricted-agent submissions remain inactive until deliberate origin release. An appointed independent coordinator needs current memory read/write, board-wing read/write and visible space_read, space_post, task_approve and needs_me; decide is not required. Ancestors remain eligible, while creators and their descendants cannot obtain new release authority. Missing, foreign or cyclic ancestry and unverifiable connection-creator stamps fail closed on every agent release path, including stored markers.
   - The appointed independent coordinator may release origin while holding the card, preserving status, holder, every lease timestamp, provenance and pending review. Its marker is revalidated against current appointment, liveness, lineage and grants. This grants no self-review, rejection or escalation rights; origin release requires an affirmative decision and a nonempty reason of at most 500 characters.
   - Signed-in workspace owners recover origin only when the configured record is absent/non-live, or verified independent but missing a required release grant. A live creator, descendant or unsafe lineage requires coordinator configuration and blocks owner release, even with missing grants. An unverifiable creator stamp plus any live configured record also blocks release: clear the coordinator first. Clearing affects the entire board and routes its other unreleased cards to owner recovery as well. Owner-role connection tokens gain no person fallback.
@@ -1212,7 +1216,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## orch
 
-- **Paths:** `commonplace/orch/`, `docs/orchestrator.md`, `tests/_orch_helpers.py`, `tests/test_orch_acceptance.py`, `tests/test_orch_schema.py`, `tests/test_orch_areas.py`, `tests/test_orch_store.py`, `tests/test_orch_durable.py`, `tests/test_orch_runner.py`, `tests/test_orch_surfaces.py`, `tests/test_orch_checks.py`, `tests/test_orch_plan_gate.py`, `tests/test_docs_obligations.py`
+- **Paths:** `commonplace/orch/`, `docs/orchestrator.md`, `tests/_orch_helpers.py`, `tests/test_orch_acceptance.py`, `tests/test_orch_schema.py`, `tests/test_orch_areas.py`, `tests/test_orch_store.py`, `tests/test_orch_durable.py`, `tests/test_orch_runner.py`, `tests/test_orch_surfaces.py`, `tests/test_orch_checks.py`, `tests/test_orch_plan_gate.py`, `tests/test_orch_trigger_stall.py`, `tests/test_docs_obligations.py`
 - **Owns:**
 
   - Inert area declarations and topology validation, their render/diff representation and test-only accepted-area fixtures.
@@ -1225,6 +1229,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Owner-assigned runner work uses the existing configured person-start fence; agent-authored todo reservations still produce an assigned-card trigger miss for a different worker.
   - Enabled root triggers pin main-role launches; reconciliation uses existing miss history and an in-lock eligibility recheck for at most three attempts.
+
+  - A split start uses the config's `main` role, or the `[runner]` role when no role is named `main`. A trigger start that cannot be planned (`StartRefused`, `ConfigError`) is a coded miss that advances the cursor, so one card never blocks the board; an origin release is a firing event.
 
   - Empty disabled sweeps avoid config resolution, checkpoint inbox context is best effort, and failed inbox snapshots keep committed leases launchable using pinned instructions.
 
@@ -1247,6 +1253,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Refusals become coded misses shown on resume; an unproven external effect becomes `needs_person`; infrastructure errors leave the trigger cursor in place for the next sweep.
 
+  - Two failed sweeps of a board in a row emit one `orch.trigger.failing` event and list the board in the owner's `needs_me` (`orchestrator_failing`) until a sweep succeeds; `orch_sweep_health` stores only the exception type.
+
   - Void cannot stop launched threads or prove completion; existing active/recent-start and per-switch capacity guards still apply, and a pending todo trigger may run on a later sweep.
 
 
@@ -1257,6 +1265,8 @@ Format (read by `commonplace orch docs-check`):
   - The `tests/test_orch_` files listed in Paths and `tests/test_docs_obligations.py`; R22 in `tests/test_orch_checks.py` covers misplaced labels, missing files, accepted label forms and repository-root resolution.
 
   - R1, R1b, R1d, R1e, R8b, R10a and R11e map to `tests/test_orch_acceptance.py`.
+
+  - `tests/test_orch_trigger_stall.py` covers a split start without a `main` role (including the live v3 config shape), unplannable starts as misses, a released todo card starting, and the failing-sweep owner alert.
 
 
 ## projects

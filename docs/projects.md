@@ -175,7 +175,8 @@ Finish with `card_split_done(task=N, state="split"|"kept")`, or
 The first marker wins and is recorded in card history.
 
 On a runner-configured board, enabled orchestration changes root todo triggers
-to role `main`, with an inbox snapshot and instructions in the launch message.
+to role `main` (or to the `[runner]` role when the config has no role named
+`main`), with an inbox snapshot and instructions in the launch message.
 Split children never trigger that start. The existing event deduplication,
 one-active-start rule and 24-hour non-person start restriction still apply.
 Every runner sweep reconciles unsplit roots older than 10 minutes without an

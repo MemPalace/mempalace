@@ -255,7 +255,13 @@ def prepare(
     workers = orch.workers(gateway.db, workspace_id) if on else frozenset()
     config = version.config()
     if split_start and on and config.runner is not None:
-        config = replace(config, runner=replace(config.runner, role="main"))
+        # The split start runs the board's orchestrator role. Configs may name it freely
+        # (``main`` by convention); without a ``main`` role keep the runner's own role, so
+        # a differently named orchestrator never turns every trigger sweep into an error.
+        split_role = "main" if "main" in config.roles else config.runner.role
+        config = replace(config, runner=replace(config.runner, role=split_role))
+    if config.runner is not None and config.runner.role not in config.roles:
+        raise StartRefused("unknown_role", "the config has no role for this start")
     role = config.runner_role
     if config.runner is None or role is None:
         raise StartRefused("not_configured", "the board has no orchestrator runner config")
@@ -497,6 +503,40 @@ def _advance(conn, plan, trigger) -> None:
         "UPDATE orch_cursor SET cursor=? WHERE board=? AND gen=? AND cursor=?",
         (trigger.event, plan.board, trigger.gen, trigger.cursor),
     )
+
+
+def trigger_miss(store, board: str, card: int, trigger: TriggerRef, code: str, *, now=None):
+    """Record a coded miss for a trigger start that could not be planned (``prepare``
+    refused) under the same in-lock ``(cursor, gen)`` re-check, and advance the cursor
+    past its event; a split retry (``trigger.retry``) records its miss under ``-retry``
+    and leaves the cursor. Returns False when the pair moved (nothing written).
+
+    One unplannable card must cost one visible miss, never a stuck cursor that blocks
+    every later card on the board."""
+    now = now or jobs._now()
+    with store.transaction() as conn:
+        if orch_store.cursor_in(conn, board) != (trigger.cursor, trigger.gen):
+            return False
+        ensure_schema(conn)
+        conn.execute(
+            "INSERT INTO orch_misses(board,event_id,card,code,actor,gen,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                board,
+                -trigger.retry if trigger.retry else trigger.event,
+                card,
+                code,
+                trigger.actor,
+                trigger.gen,
+                now,
+            ),
+        )
+        if not trigger.retry:
+            conn.execute(
+                "UPDATE orch_cursor SET cursor=? WHERE board=? AND gen=? AND cursor=?",
+                (trigger.event, board, trigger.gen, trigger.cursor),
+            )
+    return True
 
 
 def fenced_start(
@@ -776,7 +816,7 @@ def launch_fields(conn, row) -> dict:
             else config.runner.role
         )
         text = schema.role_instructions(config, role)
-        if role == "main" and "launch_role" in row.keys() and row["launch_role"]:
+        if "launch_role" in row.keys() and row["launch_role"]:  # only split starts set it
             text += f"\n\nRead orchestrator_inbox(board={row['board_slug']}) now. Use stable split:<parent>:<key> labels for missing children, then card_split_done. Poll the inbox on every wake and every 10 minutes while running."
             from pathlib import Path
 
