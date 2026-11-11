@@ -1373,11 +1373,63 @@ def tool_list_drawers(
         known = _palace_known_wings() if wing else frozenset()
         where = build_where_filter(wing, room, known=known) or None
 
-        def make_page(ids, metadatas):
+        def scoped_visible_ids(metadatas, load_source_rows):
+            """Validate filtered conversation rows against their full source snapshots.
+
+            A general-mode generation may span multiple rooms. Checking just
+            the rows selected by wing/room would wrongly hide a complete
+            generation. Fetch source-wide metadata in bounded batches, still
+            under the same SQLite snapshot when that reader is available.
+            """
+            from ..convo_visibility import visible_conversation_rows
+
+            sources = sorted(
+                {
+                    meta["source_file"]
+                    for meta in metadatas
+                    if isinstance(meta, dict)
+                    and meta.get("ingest_mode") == "convos"
+                    and meta.get("extract_mode") in ("exchange", "general")
+                    and "chunk_total" in meta
+                    and isinstance(meta.get("source_file"), str)
+                    and meta["source_file"]
+                }
+            )
+            source_ids, source_metadata = [], []
+            for start in range(0, len(sources), 200):
+                source_where = {"source_file": {"$in": sources[start : start + 200]}}
+                found = load_source_rows(source_where)
+                if found is None or len(found[0]) != len(found[1]):
+                    raise RuntimeError("cannot verify source-wide conversation visibility")
+                source_ids.extend(found[0])
+                source_metadata.extend(found[1])
+            return {
+                row_id
+                for row_id, _ in visible_conversation_rows(source_ids, source_metadata)
+            }
+
+        def make_page(ids, metadatas, checked_ids=None):
             from ..convo_visibility import visible_conversation_rows
 
             candidates = [(i, m) for i, m in zip(ids, metadatas) if not is_bookkeeping(m, i)]
-            kept = visible_conversation_rows([i for i, _ in candidates], [m for _, m in candidates])
+            if checked_ids is None:
+                kept = visible_conversation_rows(
+                    [i for i, _ in candidates], [m for _, m in candidates]
+                )
+            else:
+                # The filtered SQL/SDK query sees only some rooms of a source.
+                # Reject any stamped conversation row not validated by the
+                # full source snapshot, before logical collapse or pagination.
+                kept = [
+                    (row_id, meta)
+                    for row_id, meta in candidates
+                    if not (
+                        (meta or {}).get("ingest_mode") == "convos"
+                        and (meta or {}).get("extract_mode") in ("exchange", "general")
+                        and "chunk_total" in (meta or {})
+                    )
+                    or row_id in checked_ids
+                ]
             drawers = _collapse_drawer_rows([i for i, _ in kept], [], [m for _, m in kept])
             if since_dt is not None or before_dt is not None:
                 drawers = [
@@ -1407,7 +1459,18 @@ def tool_list_drawers(
                         _config.palace_path, _config.collection_name, where=where, _connection=conn
                     )
                     if listed is not None:
-                        result = make_page(*listed)
+                        checked = None
+                        if where:
+                            checked = scoped_visible_ids(
+                                listed[1],
+                                lambda source_where: sqlite_list_id_metadata(
+                                    _config.palace_path,
+                                    _config.collection_name,
+                                    where=source_where,
+                                    _connection=conn,
+                                ),
+                            )
+                        result = make_page(*listed, checked_ids=checked)
                         if _fill_drawer_previews_from_sqlite(result["drawers"], connection=conn):
                             return result
 
@@ -1415,7 +1478,15 @@ def tool_list_drawers(
         if not col:
             return _collection_error_or_no_palace()
         ids, _documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
-        result = make_page(ids, metadatas)
+
+        def fetch_source_rows(source_where):
+            source_ids, _, source_metadata = _fetch_drawer_rows(
+                col, where=source_where, include=["metadatas"]
+            )
+            return source_ids, source_metadata
+
+        checked = scoped_visible_ids(metadatas, fetch_source_rows) if where else None
+        result = make_page(ids, metadatas, checked_ids=checked)
         _fill_drawer_previews(col, result["drawers"])
         return result
     except Exception as e:

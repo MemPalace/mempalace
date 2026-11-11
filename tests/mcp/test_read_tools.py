@@ -593,6 +593,40 @@ with mine_palace_lock(sys.argv[1]):
         assert result["drawers"][0]["drawer_id"] == "keep"
         assert "keep me" in result["drawers"][0]["content_preview"]
 
+    def test_list_drawers_room_filter_validates_complete_source_across_rooms(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """A complete general-mode generation spans rooms; a torn one stays hidden."""
+        common = {
+            "wing": "mempalace",
+            "source_file": "/sessions/multi-room.jsonl",
+            "ingest_mode": "convos",
+            "extract_mode": "general",
+            "source_mtime": 7.0,
+            "filed_at": "2026-11-11T00:00:00Z",
+            "chunk_total": 2,
+        }
+        collection.add(
+            ids=["multi_room_0", "multi_room_1"],
+            documents=["first room content", "second room content"],
+            metadatas=[
+                {**common, "room": "first", "chunk_index": 0},
+                {**common, "room": "second", "chunk_index": 1},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        complete = mcp_server.tool_list_drawers(wing="mempalace", room="first", limit=20)
+        assert "error" not in complete, complete
+        assert complete["total"] == 1, complete
+        assert [row["drawer_id"] for row in complete["drawers"]] == ["multi_room_0"]
+
+        collection.delete(ids=["multi_room_1"])
+        interrupted = mcp_server.tool_list_drawers(wing="mempalace", room="first", limit=20)
+        assert "error" not in interrupted, interrupted
+        assert interrupted["total"] == 0, interrupted
+
     def test_list_drawers_scan_filters_in_sql_and_skips_documents(
         self, monkeypatch, config, palace_path, collection, kg
     ):

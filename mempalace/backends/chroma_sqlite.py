@@ -1097,7 +1097,7 @@ def sqlite_list_id_metadata(
     render one page of previews. Callers hydrate the page they display via
     :func:`sqlite_documents_for_ids`.
 
-    ``where`` supports equality or ``$in`` on ``wing``/``room`` and ``$and``
+    ``where`` supports equality or ``$in`` on ``wing``/``room``/``source_file`` and ``$and``
     of those, matching ``tool_list_drawers``; it is applied in SQL. Returns
     ``None`` when sqlite cannot be trusted so the caller can fall back to
     ``col.get`` paging.
@@ -1105,7 +1105,7 @@ def sqlite_list_id_metadata(
     if _db_file(palace_path) is None:
         return None
     pairs = _where_pairs(where)
-    if pairs is None or any(key not in ("wing", "room") for key, _ in pairs):
+    if pairs is None or any(key not in ("wing", "room", "source_file") for key, _ in pairs):
         return None
     filters = dict(pairs)
     reader = (
