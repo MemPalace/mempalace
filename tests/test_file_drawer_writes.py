@@ -512,14 +512,16 @@ def test_convo_history_backup_preserves_whole_generation_on_partial_change(monke
 
     assert {doc for _, doc, _ in archived} == {"unchanged original", "changed original"}
     assert all(meta["historical_version"] is True for _, _, meta in archived)
-    assert len(
-        visible_conversation_rows(
-            [drawer_id for drawer_id, _, _ in archived],
-            [meta for _, _, meta in archived],
+    assert (
+        len(
+            visible_conversation_rows(
+                [drawer_id for drawer_id, _, _ in archived],
+                [meta for _, _, meta in archived],
+            )
         )
-    ) == 2, "the historical source snapshot must be complete"
+        == 2
+    ), "the historical source snapshot must be complete"
 
     archived.clear()
     palace._backup_changed_conversation_drawers(SavedCollection(), source, "exchange", old)
     assert not archived, "a no-op re-mine must not archive an unchanged generation"
-

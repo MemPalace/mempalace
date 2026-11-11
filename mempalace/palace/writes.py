@@ -213,9 +213,7 @@ def _backup_changed_conversation_drawers(
     # Snapshot every old chunk of any changed complete generation, while
     # keeping no-op re-mines free of unnecessary historical copies.
     changed_generations = {
-        key
-        for original_id, old_text, _, key in candidates
-        if desired.get(original_id) != old_text
+        key for original_id, old_text, _, key in candidates if desired.get(original_id) != old_text
     }
     for original_id, old_text, old_meta, key in candidates:
         seen, expected = generation_counts[key]
