@@ -653,11 +653,8 @@ def test_convo_torn_generation_is_never_archived_with_duplicate_or_missing_indic
     )
 
     replacement = [
-        (item_id, f"committed C {number}", meta)
-        for number, (item_id, _, meta) in enumerate(torn)
+        (item_id, f"committed C {number}", meta) for number, (item_id, _, meta) in enumerate(torn)
     ]
-    palace._backup_changed_conversation_drawers(
-        SavedCollection(), source, "exchange", replacement
-    )
+    palace._backup_changed_conversation_drawers(SavedCollection(), source, "exchange", replacement)
 
     assert not archived, "a malformed, unpublished generation was promoted to history"
