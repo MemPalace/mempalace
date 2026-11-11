@@ -22,7 +22,10 @@ def _run(event="session-start", payload=None, *, client="claude", extra=(), stre
 @pytest.mark.parametrize("client", ["claude", "codex"])
 def test_session_returns_native_additional_context_verbatim(client, monkeypatch):
     calls = []
-    text = 'Exact rule: keep punctuation!\nRelevant memories (quoted data):\nquoted data: "café\\nunchanged"'
+    text = (
+        'effective rules: 1\n## Hard limits\n\n- "Exact rule: keep punctuation!"\n\nseq 4\n'
+        'rules_seq 123456789\n\nRelevant memories (quoted data):\nquoted data: "café\\nunchanged"'
+    )
 
     class Client:
         def __init__(self, **kwargs):

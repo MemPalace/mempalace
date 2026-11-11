@@ -257,6 +257,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `docs/projects.md` names the split-start role: `main`, or the `[runner]` role when the config has no `main` role.
 
+  - `docs/design/RULES.md` describes the reviewer rules block and its verdict line, the session hook's missing-rules notice, and a table that maps each rule enforcement point to the tests that fail when it is skipped.
+
 
   - Live-sync instructions describe transcript-only reinstall, explicit destination and retained disabled memory history.
   - Public Space endpoint and error documentation alongside legacy board routes.
@@ -608,6 +610,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/cardruns.mjs` (run by `tests/test_card_runs_ui.py`) covers the card panel's Runs section including the Start agent control: the words of every refusal, the configured and free forms, what a refresh keeps and when no control shows.
 
   - `tests/test_projects_seat_lease.py` creates a seat through the Project settings routes and has it take, hold, renew and release its lease over MCP.
+
+  - `tests/test_rules_enforcement_points.py` checks the four rule enforcement points; hook tests that compare the startup context now feed it a complete rules section, and the import-reader hook check expects the missing-rules notice for a memory-only context.
 
   - `tests/test_guards_prepush.py` and `tests/test_guards_hooks.py` build throwaway git repos and linked worktrees with stand-in tools; they run no host tool and need no network.
 
@@ -1133,7 +1137,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## cli-and-client
 
-- **Paths:** `commonplace/cli.py`, `commonplace/client.py`, `commonplace/client_hooks.py`, `commonplace/client_install.py`, `commonplace/bridge.py`, `commonplace/onboarding.py`, `commonplace/seed.py`, `commonplace/README.md`, `commonplace/SETUP.md`, `commonplace/agent-skill/`
+- **Paths:** `commonplace/cli.py`, `commonplace/client.py`, `commonplace/client_hooks.py`, `commonplace/client_install.py`, `commonplace/review_rules.py`, `commonplace/bridge.py`, `commonplace/onboarding.py`, `commonplace/seed.py`, `commonplace/README.md`, `commonplace/SETUP.md`, `commonplace/agent-skill/`
 - **Owns:**
 
   - `commonplace waitlist list|admit` (instance admin, `--by` as for `plan set`) and the `COMMONPLACE_MAX_ACCOUNTS` setup note in `SETUP.md`.
@@ -1163,6 +1167,10 @@ Format (read by `commonplace orch docs-check`):
 
   - The native startup hook gives the hub `client_hooks.HUB_TIMEOUT_S` (0.4 s) and then fails open to the follow-up notice.
 
+  - The native startup hook adds a missing-rules notice unless its context opens with a complete effective rule set.
+
+  - `commonplace review-rules` prints the effective rules as a reviewer prompt block that is never empty, and `--verify` accepts a verdict only when its last `Rules checked:` line names the current complete set.
+
 - **How it fails:**
 
   - Local data-directory access remains operator authority; authenticated progress never inherits it.
@@ -1174,6 +1182,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_search_index_progress.py` covers local status, run and explicit capture enrolment.
 
   - `tests/test_commonplace_cli.py`, `tests/test_commonplace_client.py`, `tests/test_commonplace_client_hooks.py`, `tests/test_commonplace_client_install.py`, `tests/test_commonplace_onboarding.py`.
+
+  - `tests/test_rules_enforcement_points.py` covers the hook's missing-rules notice and the `review-rules` block, verdict check and exit statuses.
 
 
 ## boards
@@ -1497,6 +1507,8 @@ Format (read by `commonplace orch docs-check`):
   - Route-aware checked REST harness and Space freshness contract tests.
 
   - `tests/test_commonplace_rules.py`, `tests/test_commonplace_rules_enforce.py`, `tests/test_commonplace_privacy.py`, the `tests/test_guards_` files.
+
+  - `tests/test_rules_enforcement_points.py` holds one skip-detecting check per enforcement point (injection, session hook, write sequence check, reviewers); `docs/design/RULES.md` maps each point to its tests.
 
   - `tests/test_guards_prepush.py` covers test selection, the budget (cut-off lint, cut-off tests, skipped steps), docs-check and the per-worktree tool path; `tests/test_guards_hooks.py` installs the hooks into a clone and pushes and commits from fresh linked worktrees.
 

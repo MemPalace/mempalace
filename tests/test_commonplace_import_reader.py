@@ -421,8 +421,10 @@ def test_r04_continuity(live, monkeypatch, request):
         == 0
     )
     wire = json.loads(output.getvalue())
+    # This context holds memory only, so the hook adds its missing-rules notice.
     assert (
-        wire["hookSpecificOutput"]["additionalContext"] == client_hooks.GUIDANCE + "\n\n" + context
+        wire["hookSpecificOutput"]["additionalContext"]
+        == client_hooks.GUIDANCE + "\n" + client_hooks.RULES_MISSING + "\n\n" + context
     )
     exact = "  zqnativefile café\r\nExact file words.\t"
     identity = sync_protocol.memory_thread_id(

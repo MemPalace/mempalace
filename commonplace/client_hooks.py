@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,16 @@ FOLLOWUP = (
     "Automatically call session_start now; if unavailable, call "
     "rules_get(effective=true, format=md) and memory_search for the current topic."
 )
+# session_start opens with the server's rules reply. Anything but a complete
+# set (unreadable, lost store, over the size cap, or no rules section at all)
+# gets this notice, so a session never starts as if no rules applied.
+RULES_MISSING = (
+    "The startup hook did not get the complete workspace rules. Workspace rules may apply: "
+    "before you plan or write, call rules_get(effective=true, format=md), "
+    "and tell the owner if it keeps failing."
+)
+_RULES_HEAD = re.compile(r"effective rules: ([0-9]+)\n")
+_RULES_MARKER = re.compile(r"^rules_seq (?:off|[0-9]+)$", re.MULTILINE)
 LOCAL_WARNING = (
     "A managed instruction or memory file has local-only changes. "
     "Save requested memory through Commonplace memory_save and new rules through rules_publish "
@@ -46,6 +57,14 @@ def _input(stream):
     return value
 
 
+def _rules_complete(context):
+    head, marker = _RULES_HEAD.match(context), _RULES_MARKER.search(context)
+    if head is None or marker is None:
+        return False
+    # A count above zero without any rule line is an empty set, not a complete one.
+    return int(head[1]) == 0 or "\n- " in context[: marker.start()]
+
+
 def _session(args, payload):
     query = payload.get("prompt")
     if not isinstance(query, str) or not query.strip() or len(query) > 1000:
@@ -58,6 +77,8 @@ def _session(args, payload):
         or len(context.encode("utf-8")) > MAX_CONTEXT_BYTES
     ):
         raise ValueError
+    if not _rules_complete(context):
+        return GUIDANCE + "\n" + RULES_MISSING + "\n\n" + context
     return GUIDANCE + "\n\n" + context
 
 

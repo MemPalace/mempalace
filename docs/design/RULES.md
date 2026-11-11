@@ -302,6 +302,13 @@ guidance. Hooks warn about managed local-only instruction/memory edits without
 uploading them. [Onboarding](../agent-onboarding.md) covers exact imports,
 recovery and owner approval of imported proposals.
 
+The hook presents its context as complete only when it opens with a complete
+effective rule set (`effective rules: N` through a `rules_seq` number or `off`).
+For an unreadable or lost store, an over-cap set or a reply without a rules
+section it adds a notice ahead of the context: workspace rules may apply, and
+the agent must call `rules_get(effective=true, format=md)` before it plans or
+writes. A session never starts as if no rules applied.
+
 ### Write sequence checks
 
 Owners opt individual connections or the workspace into `warn` or `enforce`.
@@ -370,9 +377,43 @@ checklist: verify that inventory and preserve the documented exemptions.
 
 ### Reviewer checks
 
-Review blocks and review attestations are delivered separately. An orchestrator
-must fetch its own complete effective rules before posting attestations when
-write checks are enforced.
+A reviewer often has no connection of its own, so the party that builds its
+prompt fetches the rules for it. `commonplace review-rules [--url URL]
+[--token-env NAME]` reads `rules_get effective=true format=md` with the given
+token and prints a block for the reviewer's prompt: the instruction to check
+the change against every rule, the rules as quoted data, and one closing line
+the reviewer must repeat at the end of its verdict, `Rules checked: rules_seq N`
+(`Rules checked: seq N` while checking is off). The rules are those of the
+token's connection, so review a change with the token of the connection that
+made it. Reading the block counts as that connection's full read.
+
+The block is never empty. With no rules it says that none apply. An over-cap
+set prints the rules that fit, says the set is incomplete and asks for
+`Rules checked: incomplete`. A lost store, an unreadable reply, a missing token
+or an unreachable hub prints that the rules could not be loaded, that the
+change must not be reported as checked against them, and asks for
+`Rules checked: no`; only fixed wording is printed, never the failure text.
+Exit status is 0 for a complete set and 2 otherwise.
+
+`commonplace review-rules --verify VERDICT_FILE` reads the rules again and
+checks the last `Rules checked:` line of the verdict against the current
+version: exit 0 when it matches a complete set, 1 when the verdict names no
+or another version (review again with the current block), 2 when the rules
+are incomplete or unavailable. The line proves which rule set the reviewer
+was given, not that it applied each rule.
+
+An orchestrator records the verdict with `orch_gate_record`, a checked write:
+under `enforce` it must pass the same `rules_seq`, and a rule change after the
+review refuses the record until the rules are read again.
+
+### Enforcement points and their tests
+
+| Point | Where | Fails when the point is skipped |
+|---|---|---|
+| Rules injected at connect | `gateway.Mediator._initialize_context`, `rules/service.py` `instructions_for` | `tests/test_commonplace_rules_inject.py`, `tests/test_commonplace_session_initialize.py`; a failed read keeps the explicit follow-up: `tests/test_rules_enforcement_points.py` |
+| Session-start hook | `client_install.py` (install), `client_hooks.py` (fetch), `session.py` (`session_start`) | `tests/test_commonplace_client_install.py`, `tests/test_commonplace_client_hooks.py`, `tests/test_commonplace_agent_defaults.py`, `tests/test_commonplace_session.py`; incomplete rules get a notice: `tests/test_rules_enforcement_points.py` |
+| Write sequence check | `gateway.Mediator._tools_call`, `rules/enforce.py` `check` and `rest_write` | `tests/test_commonplace_rules_enforce.py` (every checked MCP tool and REST shape, the served requirement, the inventory) |
+| Rules for reviewers | `review_rules.py` | `tests/test_rules_enforcement_points.py` |
 
 ## Out of scope
 
