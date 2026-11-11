@@ -599,6 +599,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_projects_seat_lease.py` creates a seat through the Project settings routes and has it take, hold, renew and release its lease over MCP.
 
+  - `tests/test_statechart_card_rules.py` walks the shortest breaking path of each card-lifecycle statechart rule (R1, R3, R4, R5, R6, R6b, R7) and asserts the rule holds.
+
   - Overview witnesses separate old-head behavioral regressions from the original-base fail-closed contract, with exact facet-call sequences and both lazy SQLite error classes.
 
   - Assertion-only review witnesses pin public facet compatibility, real-wrapper projected retry, refusal envelopes and negative-cache invalidation.
