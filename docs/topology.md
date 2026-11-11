@@ -188,6 +188,127 @@ A route's `hops` is a list of `{"link", "from", "to", "method", "known", "stale"
 
 `read_graph` returns `{"wing", "nodes", "links", "routes", "conflicts"}`. A conflict is `{"conflict_id", "subject", "predicate", "state", "created_at", "resolved_by", "resolved_at", "current", "contender"}`, where both values have the field shape above. `history` returns every value a subject held, newest first, each with `predicate`, `state` and `superseded_by`.
 
+## Live status
+
+Live status of machines and of the two ends of every link, derived from signals that runners already send. There is no probing daemon: nothing in this section opens a connection to a machine.
+
+Code: `commonplace/topology/status.py`. Tests: `tests/test_topology_status.py`.
+
+### The read
+
+The one read the read tools (`topology_get`) and the canvas call:
+
+```python
+from commonplace.topology import status
+
+status.read_status(gateway, workspace_id, *, graph=None, now=None, config=None) -> dict
+```
+
+`graph` is a `store.read_graph` result the caller already holds (so the map and its status describe the same moment); when `None` the function reads the workspace's graph itself. `now` is an optional timezone-aware `datetime` (tests pass a fake clock). `config` is a `status.StatusConfig`; `None` means `StatusConfig.from_env()`. The caller authorizes (`policy.can_read_wing(TOPOLOGY_WING)`) before calling; the read opens no workspace other than `workspace_id` and creates no topology file.
+
+The pure core, which tests and other callers can use with their own signals, takes no gateway:
+
+```python
+status.derive(graph, signals, *, now, config) -> dict      # signals: dict[machine_id, MachineSignals]
+status.machine_status(signals, *, now, config) -> dict     # one MachineSignals -> one status record
+status.collect_signals(gateway, workspace_id, *, now) -> dict[str, MachineSignals]   # the only reader of the hub's tables
+```
+
+The result:
+
+```python
+{
+    "as_of": "2026-01-01T10:00:00Z",
+    "config": {"green_within_s": 180, "red_after_s": 900, "path_fresh_s": 900, "path_unknown_after_s": 3600},
+    "machines": {"mach_…": STATUS},      # every enrolled runner machine, with or without a node
+    "nodes":    {"web1": STATUS},        # every node of the graph
+    "links":    {"laptop>web1:tailscale": {**STATUS, "ends": {"from": STATUS, "to": STATUS}}},
+}
+```
+
+A `STATUS` record:
+
+```python
+{"status": "up" | "degraded" | "down" | "unknown",
+ "color": "green" | "orange" | "red" | "grey",     # grey is unknown, never green
+ "reason": "<code>",
+ "last_signal_at": "2026-01-01T09:59:12Z" | None,  # machines and nodes; for a link end: the path report
+ "last_signal_source": "<signal name>" | None,
+ "age_s": 48 | None}
+```
+
+A link's record is a `STATUS` plus `ends`; each end is a `STATUS` plus `basis` (`node` when the end's own node decided it, `path` when the path report did). `last_signal_at` and `age_s` of a link end are those of the record that decided it.
+
+The status words are the ones a link's `status` fact already uses, so a link's reported status and its derived status compare directly.
+
+### Rules
+
+One rule set, applied in this order. Times are ages at `now`; a signal dated in the future counts as age 0.
+
+**Machine** (an enrolled runner machine; a node is its machine when its `runner_id` names it):
+
+| Condition | Status | Reason |
+| --- | --- | --- |
+| machine revoked | down | `revoked` |
+| machine disabled | down | `disabled` |
+| no signal ever | unknown | `never_reported` |
+| newest signal older than `red_after_s` | down | `no_heartbeat` |
+| newest signal older than `green_within_s` | degraded | `late_heartbeat` |
+| a start is leased or starting | degraded | `start_in_progress` |
+| otherwise | up | `heartbeat` |
+
+The newest signal is the latest of the signals below. A machine that never produced one is unknown, not green, and a card start never makes an unknown machine green.
+
+**Link path.** A runner (or an agent) may report a path with `upsert_link(..., {"status": ...})`; that is the optional path report. The report's age is `now - observed_at` of the link's newest `status` observation, stale or not:
+
+| Report | Age | Path status | Reason |
+| --- | --- | --- | --- |
+| none | | unknown | `no_report` |
+| any | up to `path_fresh_s` | as reported | `reported` |
+| `up` | up to `path_unknown_after_s` | degraded | `late_report` |
+| `down` or `degraded` | up to `path_unknown_after_s` | as reported | `late_report` |
+| any | older | unknown | `report_stale` |
+
+A path that is `down` while another link between the same two nodes (any direction, any other method) is `up` is `degraded` with reason `alternate_path_up`: the target is still reachable, one path is failing.
+
+**Link end.** An end shows the worse of its node's status and the path's status, ignoring `unknown`; when both are unknown the end is unknown, with the reason of the one that saw a signal (a stale report) when there is one. Worse means `down` over `degraded` over `up`. A node that is not a runner machine has no signals of its own, so its end shows the path report alone.
+
+**Link.** The link's own status is the worse of its two ends by the same rule.
+
+### Signals that exist today
+
+Each signal is read from state the hub already keeps; none is new.
+
+| Signal | Source | What it proves |
+| --- | --- | --- |
+| `machine_connection` | `connections.last_used_at` of the machine's connection (`runner_machines.machine_connection_id`), touched by the hub on every authenticated runner request, at most once a minute | the runner reached the hub |
+| `worker_connection` | `connections.last_used_at` of the machine's worker connection (`runner_machines.worker_connection_id`) | an agent started on the machine is working |
+| `chat_poll` | `chat_runners_seen.seen_at` | the runner's chat relay polled |
+| `start_success` | newest `runner_jobs.updated_at` in state `started` for the machine | the machine launched a card start |
+| `start_in_progress` | any `runner_jobs` row of the machine in state `leased` or `starting` | a start is underway (orange) |
+
+`runner_machines.enabled` and `revoked_at` give the disabled and revoked rows of the rule table.
+
+### What does not exist, and the gap
+
+- **No per-path reachability signal from runners.** Nothing on the hub carries a runner's view of a direct, jump host, Tailscale or relay path. The only path signal is the optional `status` fact of a link written through the store; until runners write it, every link's path is `unknown` / `no_report` and a link end shows its node alone. The Compute stack (not on develop) may add such a report; it must write the same `status` fact so this code needs no change.
+- **No heartbeat for a non-runner node** (router, cloud, website, container): they stay `unknown` unless a path report names them.
+- **No failed-start signal in the rules.** A failed or uncertain start does not change a machine's status; a machine that fails starts but keeps polling is `up`.
+- **The thresholds are per hub, not per machine.** A machine configured with `poll_seconds` near 300 needs `green_within_s` of at least twice that.
+
+### Configuration
+
+Thresholds are configuration, not constants. `StatusConfig` holds them; build it with `StatusConfig(green_within_s=…)`, `StatusConfig.from_mapping({...})` or `StatusConfig.from_env()`.
+
+| Field | Environment variable | Default | Meaning |
+| --- | --- | --- | --- |
+| `green_within_s` | `COMMONPLACE_TOPOLOGY_GREEN_S` | 180 | a signal this young is green |
+| `red_after_s` | `COMMONPLACE_TOPOLOGY_RED_S` | 900 | no signal for longer is red |
+| `path_fresh_s` | `COMMONPLACE_TOPOLOGY_PATH_FRESH_S` | 900 | a path report this young is trusted as reported |
+| `path_unknown_after_s` | `COMMONPLACE_TOPOLOGY_PATH_STALE_S` | 3600 | a path report older than this is unknown |
+
+Each is a whole number of seconds; `green_within_s` must be below `red_after_s` and `path_fresh_s` below `path_unknown_after_s`, or the config is refused with a `TopologyError`.
+
 ## Existing workspaces
 
 The store is additive: one new file per workspace with three tables, created by the first write. No existing file or table changes. A workspace from before this feature has no `topology.sqlite3`; it reads as an empty map (`nodes`, `links`, `routes` and `conflicts` all empty), `get_*` return `None`, and reading does not create the file.
