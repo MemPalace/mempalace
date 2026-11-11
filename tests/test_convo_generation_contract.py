@@ -305,7 +305,7 @@ def test_interrupted_b_generation_is_not_archived_when_retry_writes_c(tmp_path, 
 
 
 def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, monkeypatch):
-    """Future generation gate: an interrupted mine must not expose mixed rows."""
+    """Metadata listing must hide incomplete B while COW history still shows A."""
     source_dir = tmp_path / "sessions"
     source_dir.mkdir()
     session = source_dir / "session.txt"
@@ -369,9 +369,7 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
     assert initial_snapshot.issubset(set(public)), (
         "interrupted generation hid part of the previously published A snapshot"
     )
-    if any("B question" in text for text in public):
-        pytest.xfail(
-            "MCP listing leaks an incomplete replacement after the first "
-            "new batch; requires committed-generation filtering before limits"
-        )
+    assert not any("B question" in text for text in public), (
+        "public listing leaked uncommitted B chunks before its completion"
+    )
     assert all("A question" in text for text in public)

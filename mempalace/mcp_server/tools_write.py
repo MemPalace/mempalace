@@ -1374,7 +1374,12 @@ def tool_list_drawers(
         where = build_where_filter(wing, room, known=known) or None
 
         def make_page(ids, metadatas):
-            kept = [(i, m) for i, m in zip(ids, metadatas) if not is_bookkeeping(m, i)]
+            from ..convo_visibility import visible_conversation_rows
+
+            candidates = [(i, m) for i, m in zip(ids, metadatas) if not is_bookkeeping(m, i)]
+            kept = visible_conversation_rows(
+                [i for i, _ in candidates], [m for _, m in candidates]
+            )
             drawers = _collapse_drawer_rows([i for i, _ in kept], [], [m for _, m in kept])
             if since_dt is not None or before_dt is not None:
                 drawers = [
