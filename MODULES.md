@@ -444,7 +444,9 @@ Format (read by `commonplace orch docs-check`):
 
 - **Tests:**
 
-  - `tests/test_claude_plugin_hook_config.py`, `tests/test_claude_plugin_hook_wrappers.py`, `tests/test_antigravity_plugin_manifest.py`, `tests/test_claude_marketplace_skills.py`, `tests/test_hooks_cli.py`.
+  - `tests/test_claude_plugin_hook_config.py`, `tests/test_claude_plugin_hook_wrappers.py`, `tests/test_antigravity_plugin_manifest.py`, `tests/test_claude_marketplace_skills.py`, `tests/test_hooks_cli.py`, `tests/test_untangle_skill.py`.
+
+  - `skills/untangle-codebase/` is a generic, repo-independent debt-cleanup skill (SKILL.md plus a read-only `scripts/measure.py`); `.claude-plugin/skills/untangle-codebase/` is its byte-identical bundle copy, and `tests/test_untangle_skill.py` keeps it well-formed (front matter, required sections, no local paths).
 
   - `.dsh-plugin/test/autosave.test.mjs` holds a hook run open until the test releases it (`until` in `.dsh-plugin/test/host.mjs`) to check that unloading joins a running hook and that queued runs collapse, and checks what must not have happened after one event-loop turn (`loopTurn`) or after `unload()`, not after a timer. Positive checks wait for the hook spawn, warning or transcript content. The `unload()` negatives only see runs that go through `schedule()`, because `unload()` drains exactly those.
 
@@ -622,6 +624,8 @@ Format (read by `commonplace orch docs-check`):
   - Real-browser refresh cases (`workbench_e2e/test_refresh_forms.py`) hold an open hand-off form or comment across background refreshes, including a read in flight and a changed Needs me queue, and check that Cancel closes the form, that J and K leave an open form alone, and that closing the panel after a failed read keeps it closed.
 
   - `tests/cardruns.mjs` (run by `tests/test_card_runs_ui.py`) covers the card panel's Runs section including the Start agent control: the words of every refusal, the configured and free forms, what a refresh keeps and when no control shows.
+
+  - Skill-bundle contracts: the Claude marketplace copy of every skill matches the canonical one file for file (helpers included), and `tests/test_untangle_skill.py` checks the generic untangle skill's front matter, required sections and absence of local paths, and runs its read-only measuring helper on a synthetic tree.
 
   - `tests/test_routines.py` pins routine creation per due time on a fake clock, restart recovery and owner-only access.
 
