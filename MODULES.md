@@ -587,6 +587,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:**
 
+  - `tests/test_commonplace_capacity.py` covers the unlimited default, under/at the cap, concurrent sign-ups on one and on separate connections, waitlist admit, invited and disabled accounts, and the email, provider, REST and CLI paths.
+
   - The encrypted-store budget regression proves a budgeted thread write and its refusal through SQLCipher, whose `page_size` is text.
 
   - Import-reader CLI regressions retain allowed row locations and verbatim text; union fixtures acquire a protected-room hit in the readable wing before testing the drawer gate. Source-path controls pin control/format-character refusal alongside ordinary-path preservation.
@@ -1089,7 +1091,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## sessions-and-sign-in
 
-- **Paths:** `commonplace/sessions.py`, `commonplace/session.py`, `commonplace/email_auth.py`, `commonplace/mailer.py`, `commonplace/oauth/`, `commonplace/social/`
+- **Paths:** `commonplace/sessions.py`, `commonplace/session.py`, `commonplace/email_auth.py`, `commonplace/mailer.py`, `commonplace/capacity.py`, `commonplace/oauth/`, `commonplace/social/`
 - **Owns:**
 
   - Authenticated consent displays the validated code destination origin and permits only that origin in form-action; login and generic pages remain self-only. IPv6 redirects fail closed because Chromium ignores IPv6 CSP host-sources.
@@ -1116,21 +1118,25 @@ Format (read by `commonplace orch docs-check`):
 
   - **Browser GitHub connection:** GitHub login reserves subject ownership, and connect-marked callbacks dispatch before login flow lookup without provisioning or replacing sessions.
 
+  - **Account cap and waitlist:** `COMMONPLACE_MAX_ACCOUNTS` unset means unlimited and changes nothing. When set, only the creation of a new account through sign-up is gated: the count (non-disabled users) and the insert share one `BEGIN IMMEDIATE` transaction, so concurrent sign-ups cannot overshoot it, also across processes. A full server records the verified email in `signup_waitlist` and tells the person plainly (`signin=waitlist` for providers, a 200 text page for email). Existing accounts, invited members and people an instance admin admitted are never refused; admitting may exceed the cap. Admins list and admit through `GET`/`POST /api/admin/instance/waitlist` or `commonplace waitlist list|admit`.
+
   - **Connection lifecycle proof:** Connect-marked POST callbacks are refused before login dispatch; a normal login remains independent of an outstanding connect flow.
 
 - **How it fails:**
 
-  - Mail outages block new sign-ins but not existing sessions; a misconfigured provider fails closed.
+  - Mail outages block new sign-ins but not existing sessions; a misconfigured provider fails closed. An invalid `COMMONPLACE_MAX_ACCOUNTS` logs one warning and leaves accounts unlimited.
 
 - **Tests:**
 
-  - `tests/test_commonplace_email_auth.py`, `tests/test_commonplace_oauth.py`, `tests/test_commonplace_agents_oauth_revoke.py`, `tests/test_commonplace_social.py`, `tests/test_commonplace_session.py`.
+  - `tests/test_commonplace_email_auth.py`, `tests/test_commonplace_oauth.py`, `tests/test_commonplace_agents_oauth_revoke.py`, `tests/test_commonplace_social.py`, `tests/test_commonplace_session.py`, `tests/test_commonplace_capacity.py`.
 
 
 ## cli-and-client
 
 - **Paths:** `commonplace/cli.py`, `commonplace/client.py`, `commonplace/client_hooks.py`, `commonplace/client_install.py`, `commonplace/bridge.py`, `commonplace/onboarding.py`, `commonplace/seed.py`, `commonplace/README.md`, `commonplace/SETUP.md`, `commonplace/agent-skill/`
 - **Owns:**
+
+  - `commonplace waitlist list|admit` (instance admin, `--by` as for `plan set`) and the `COMMONPLACE_MAX_ACCOUNTS` setup note in `SETUP.md`.
 
   - The `commonplace` command line, the credential-scoped client, native hooks and installers, the stdio bridge and the agent skill.
 
@@ -1861,6 +1867,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `commonplace/web/`, `commonplace/console/`
 - **Owns:**
+
+  - The instance-admin sign-up waitlist routes (`GET`/`POST /api/admin/instance/waitlist`, mounted from `commonplace/capacity.py`) and the plain `waitlist` sign-in message in `signin.js`.
 
   - The Admin runner block (`adminrunners.js`): owner-only machine list, enroll, attest, wings edit and two-step revoke over `/api/runners`, with one-time token display (and a token-free setup note) kept outside the Admin sections' redraws; revoking a machine clears its token panel.
 

@@ -7,6 +7,7 @@ const messages = {
   email: "That account has no verified email.",
   account: "No account for that email.",
   disabled: "This account can't sign in.",
+  waitlist: "This server is full right now. You're on the waitlist; please try again later.",
   paused: "This sign-in option is paused until tomorrow. Use another option with the same email.",
 };
 function pausedMessage(provider) {

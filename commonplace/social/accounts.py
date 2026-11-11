@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from .. import plans, sessions
+from .. import capacity, plans, sessions
 from ..boards.service import BoardService
 from ..control_db import ControlError
 from ..extensions import ToolContext
@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS github_account_owners (
 
 
 def ensure_schema(db) -> None:
+    capacity.ensure_schema(db)
     with db._lock:
         db._conn.executescript(SCHEMA)
         with db._tx() as conn:
@@ -101,6 +102,16 @@ def complete_signin(gateway, provider: str, profile: Profile, *, signup: bool) -
 
 
 def _resolve(db, provider: str, profile: Profile, *, signup: bool) -> tuple[str, str | None]:
+    uid, workspace = _resolve_tx(db, provider, profile, signup=signup)
+    if uid is None:
+        # Raised after the transaction committed, so the waitlist entry is kept.
+        raise SignInError("waitlist")
+    return uid, workspace
+
+
+def _resolve_tx(
+    db, provider: str, profile: Profile, *, signup: bool
+) -> tuple[str | None, str | None]:
     with db._lock, db._tx() as conn:
         known = db._conn.execute(
             "SELECT u.* FROM user_identities i JOIN users u ON u.id = i.user_id "
@@ -140,6 +151,8 @@ def _resolve(db, provider: str, profile: Profile, *, signup: bool) -> tuple[str,
         else:
             if not signup:
                 raise SignInError("account")
+            if not capacity.admit_new_account(conn, profile.emails, profile.name, provider):
+                return None, None
             try:
                 uid = db.create_user(profile.emails[0], profile.name)
                 workspace_id = db.create_workspace(
@@ -147,6 +160,7 @@ def _resolve(db, provider: str, profile: Profile, *, signup: bool) -> tuple[str,
                 )
                 plans.assign_signup_plan(db, uid, workspace_id, via=provider, conn=conn)
                 created_workspace = workspace_id
+                capacity.mark_joined(conn, profile.emails)
             except ControlError:
                 raise SignInError("failed") from None
             db.audit(action="user.create", decision="ok", user_id=uid, reason=provider)

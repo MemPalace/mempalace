@@ -91,6 +91,38 @@ def cmd_plan_set(args) -> int:
         db.close()
 
 
+def cmd_waitlist_list(args) -> int:
+    from . import capacity
+
+    db = _db(args)
+    try:
+        capacity.ensure_schema(db)
+        state = capacity.status(db)
+        limit = state["max_accounts"]
+        print(f"accounts  {state['accounts']} of {limit if limit is not None else 'unlimited'}")
+        for entry in capacity.waitlist(db):
+            print(f"{entry['status']:<9} {entry['email']}  {entry['created_at']}")
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_waitlist_admit(args) -> int:
+    from . import capacity
+
+    db = _db(args)
+    try:
+        capacity.ensure_schema(db)
+        actor = db.user(_actor(db, args))
+        if not actor["is_admin"]:
+            raise ControlError("admin access required")
+        for email in capacity.admit(db, actor=actor["id"], email=args.email, next_n=args.next or 0):
+            print(f"admitted  {email}")
+        return 0
+    finally:
+        db.close()
+
+
 def cmd_plan_show(args) -> int:
     from .workers import WorkerSupervisor
 
@@ -993,6 +1025,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = plan.add_parser("show")
     s.add_argument("user")
     s.set_defaults(func=cmd_plan_show)
+
+    waitlist = sub.add_parser("waitlist").add_subparsers(dest="action", required=True)
+    waitlist.add_parser("list").set_defaults(func=cmd_waitlist_list)
+    s = waitlist.add_parser("admit")
+    s.add_argument("email", nargs="?")
+    s.add_argument("--next", type=int, help="admit the oldest N waiting people")
+    s.add_argument("--by")
+    s.set_defaults(func=cmd_waitlist_admit)
 
     ws = sub.add_parser("workspace").add_subparsers(dest="action", required=True)
     s = ws.add_parser("add")

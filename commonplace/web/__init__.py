@@ -233,9 +233,11 @@ def install(gateway):
             },
         )
 
+    from .. import capacity
     from . import admin, agents, task_types
 
     admin.install(gateway)
+    capacity.install(gateway)
     agents.install(gateway)
     task_types.install(gateway)
 

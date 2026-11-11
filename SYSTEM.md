@@ -936,7 +936,7 @@ playbooks and the original wider orchestration acceptance remain separate work.
 
 | Store | Scope | Holds | Backed up |
 |---|---|---|---|
-| `control.sqlite3` | hub | users, workspaces, memberships, connections, model settings, audit | yes |
+| `control.sqlite3` | hub | users, workspaces, memberships, connections, model settings, audit, sign-up waitlist (`signup_waitlist`, additive) | yes |
 | `boards.sqlite3` | workspace | boards, cards, `task_events` (append-only) | yes |
 | `runner.sqlite3` | workspace | runner jobs; orchestrator configs, cursors, leases, steps, journal, restore flag | yes |
 | palace and other workspace SQLite files | workspace | verbatim memory, indexes, threads | yes |

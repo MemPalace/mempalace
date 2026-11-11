@@ -9,7 +9,7 @@ import threading
 from datetime import timedelta
 from queue import Empty, Full, Queue
 
-from . import mailer, ratelimit, sessions, urls
+from . import capacity, mailer, ratelimit, sessions, urls
 from .oauth.http import OAuthError, body, query, redirect, send, send_json
 from .social import _next, accounts
 from .social.providers import Profile, SignInError
@@ -312,13 +312,21 @@ class EmailAuth:
                 status=303,
                 headers=sessions.signin_headers(session, self.gateway.secure_cookies),
             )
-        except (OAuthError, SignInError):
+        except SignInError as exc:
+            if exc.code == "waitlist":
+                send(h, 200, capacity.MESSAGE.encode(), media="text/plain; charset=utf-8")
+            else:
+                send(
+                    h, 400, b"Sign in link is invalid or expired", media="text/plain; charset=utf-8"
+                )
+        except OAuthError:
             send(h, 400, b"Sign in link is invalid or expired", media="text/plain; charset=utf-8")
 
 
 def install(gateway):
     if hasattr(gateway, "email_auth"):
         return
+    capacity.ensure_schema(gateway.db)
     gateway.email_auth = EmailAuth(gateway)
     gateway.add_route("POST", "/app/auth/email", gateway.email_auth.request)
     gateway.add_route("GET", "/app/auth/email/verify", gateway.email_auth.confirmation)
