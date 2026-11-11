@@ -105,7 +105,7 @@ class ChatDenied(Exception):
 
 class ModelError(Exception):
     def __init__(self, code: str):
-        if code not in ("timeout", "http_error", "bad_response"):
+        if code not in ("timeout", "http_error", "bad_response", "stopped"):
             raise ValueError("Invalid model error code")
         self.code = code
         super().__init__(code)

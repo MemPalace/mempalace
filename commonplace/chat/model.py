@@ -7,7 +7,8 @@ import os
 import socket
 import threading
 import time
-from urllib.parse import urlsplit
+from typing import NamedTuple
+from urllib.parse import SplitResult, urlsplit
 
 from commonplace.chat import settings as front_settings
 from commonplace.chat.types import (
@@ -91,6 +92,155 @@ def _connect_socket(address, remaining, sockets, source_address=None, *, local=F
     raise last_error or OSError("No model addresses")
 
 
+class Endpoint(NamedTuple):
+    anthropic: bool
+    origin: SplitResult
+    headers: dict
+    path: str
+
+
+def resolve_endpoint(settings: FrontSettings, key: str | None) -> Endpoint:
+    """Validate the origin and key host for one call; no I/O."""
+    anthropic = settings.provider == "anthropic"
+    if not anthropic and settings.provider != "openai_compatible":
+        raise ValueError("model provider unavailable")
+    origin = urlsplit(ANTHROPIC_ORIGIN if anthropic else settings.base_url or "")
+    if origin.scheme not in ("http", "https") or not origin.hostname:
+        raise ValueError("invalid model origin")
+    if key is not None and not anthropic:
+        hosts = {host.strip().lower() for host in os.environ.get(KEY_HOSTS_ENV, "").split(",")}
+        if origin.hostname.lower() not in hosts:
+            raise ChatDenied("model key host not allowed")
+    headers = {"Content-Type": "application/json"}
+    if anthropic:
+        headers.update({"anthropic-version": ANTHROPIC_VERSION})
+        if key is not None:
+            headers["x-api-key"] = key
+    elif key is not None:
+        headers["Authorization"] = f"Bearer {key}"
+    path = origin.path.rstrip("/") + ("/v1/messages" if anthropic else "/v1/chat/completions")
+    return Endpoint(anthropic, origin, headers, path)
+
+
+class Call:
+    """One deadline-bound request: checked sockets, bounded headers, error codes.
+
+    Use as a context manager. The deadline shuts the sockets so a blocked read ends at
+    once; `stop()` does the same on request. Socket-level failures leave the block as
+    `ModelError` with only the codes `timeout`, `http_error` and `stopped`.
+    """
+
+    def __init__(self, settings: FrontSettings, endpoint: Endpoint, timeout: float):
+        self.endpoint = endpoint
+        self.deadline = time.monotonic() + timeout
+        self.expired = threading.Event()
+        self.stopped = threading.Event()
+        self.closed = threading.Event()
+        self.sockets = []
+        self.response = None
+        self.sock = None
+        local = front_settings.is_local(settings)
+
+        class DeadlineHTTPSConnection(http.client.HTTPSConnection):
+            def connect(conn):
+                http.client.HTTPConnection.connect(conn)
+                conn.sock.settimeout(self.remaining())
+                conn.sock = conn._context.wrap_socket(
+                    conn.sock, server_hostname=conn.host, do_handshake_on_connect=False
+                )
+                conn.sock.do_handshake()
+
+        origin = endpoint.origin
+        cls = DeadlineHTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
+        self.conn = cls(origin.hostname, origin.port, timeout=self.remaining())
+        self.conn._create_connection = lambda address, timeout=None, source_address=None: (
+            _connect_socket(address, self.remaining, self.sockets, source_address, local=local)
+        )
+        self.timer = threading.Timer(self.remaining(), self._expire)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def remaining(self):
+        seconds = self.deadline - time.monotonic()
+        if seconds <= 0:
+            raise ModelError("timeout")
+        return seconds
+
+    def _shutdown(self):
+        _shutdown_sockets([self.conn.sock, *self.sockets])
+
+    def _expire(self):
+        self.expired.set()
+        self._shutdown()
+
+    def stop(self):
+        self.stopped.set()
+        self._shutdown()
+
+    def watch(self, cancel: threading.Event):
+        """Stop the call as soon as `cancel` is set, until the call is closed."""
+
+        def run():
+            while not self.closed.is_set():
+                if cancel.wait(0.05):
+                    self.stop()
+                    return
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def open(self, payload: bytes, on_sent=None):
+        """Connect, send the request and return the 200 response."""
+        conn = self.conn
+        conn.connect()
+        sock = conn.sock
+        if sock not in self.sockets:
+            self.sockets.append(sock)
+        sock.settimeout(self.remaining())
+        conn.request("POST", self.endpoint.path, payload, self.endpoint.headers)
+        if on_sent is not None:
+            on_sent()
+        sock.settimeout(self.remaining())
+        conn.response_class = _bounded_response(self.remaining)
+        self.response = conn.getresponse()
+        self.remaining()
+        if self.response.status != 200:
+            raise ModelError("http_error")
+        # Keep the socket reference: HTTP/1.0 responses detach it from conn.
+        self.sock = sock
+        return self.response
+
+    def read(self, size: int) -> bytes:
+        self.sock.settimeout(self.remaining())
+        chunk = self.response.read1(size)
+        self.remaining()
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.closed.set()
+        self.timer.cancel()
+        if self.response is not None:
+            self.response.close()
+        self.conn.close()
+        if exc_type is None:
+            return False
+        if self.stopped.is_set() and issubclass(
+            exc_type, (OSError, ValueError, http.client.HTTPException)
+        ):
+            raise ModelError("stopped") from None
+        if issubclass(exc_type, TimeoutError):
+            raise ModelError("timeout") from None
+        if issubclass(exc_type, ValueError):
+            if self.expired.is_set():
+                raise ModelError("timeout") from None
+            return False
+        if issubclass(exc_type, (OSError, http.client.HTTPException)):
+            raise ModelError("timeout" if self.expired.is_set() else "http_error") from None
+        return False
+
+
 def complete(
     settings: FrontSettings,
     key: str | None,
@@ -103,110 +253,29 @@ def complete(
 ) -> str:
     if len(system) + sum(len(turn["content"]) for turn in turns) > MAX_INPUT_CHARS:
         raise ValueError("model input too long")
-    anthropic = settings.provider == "anthropic"
-    if not anthropic and settings.provider != "openai_compatible":
-        raise ValueError("model provider unavailable")
-    origin = urlsplit(ANTHROPIC_ORIGIN if anthropic else settings.base_url or "")
-    if origin.scheme not in ("http", "https") or not origin.hostname:
-        raise ValueError("invalid model origin")
-    if key is not None and not anthropic:
-        hosts = {host.strip().lower() for host in os.environ.get(KEY_HOSTS_ENV, "").split(",")}
-        if origin.hostname.lower() not in hosts:
-            raise ChatDenied("model key host not allowed")
-    headers = {"Content-Type": "application/json"}
+    endpoint = resolve_endpoint(settings, key)
+    anthropic = endpoint.anthropic
     body = {
         "model": settings.model,
         "max_tokens": min(max_tokens, MAX_OUTPUT_TOKENS),
         "temperature": 0,
     }
     if anthropic:
-        headers.update({"anthropic-version": ANTHROPIC_VERSION})
-        if key is not None:
-            headers["x-api-key"] = key
         body.update(system=system, messages=turns)
     else:
-        if key is not None:
-            headers["Authorization"] = f"Bearer {key}"
         body.update(stream=False, messages=[{"role": "system", "content": system}, *turns])
     payload = json.dumps(body).encode()
-    deadline = time.monotonic() + timeout
-
-    def remaining():
-        seconds = deadline - time.monotonic()
-        if seconds <= 0:
-            raise ModelError("timeout")
-        return seconds
-
-    class DeadlineHTTPSConnection(http.client.HTTPSConnection):
-        def connect(self):
-            http.client.HTTPConnection.connect(self)
-            self.sock.settimeout(remaining())
-            self.sock = self._context.wrap_socket(
-                self.sock, server_hostname=self.host, do_handshake_on_connect=False
-            )
-            self.sock.do_handshake()
-
-    cls = DeadlineHTTPSConnection if origin.scheme == "https" else http.client.HTTPConnection
-    conn = cls(origin.hostname, origin.port, timeout=remaining())
-    response = None
-    expired = threading.Event()
-    sockets = []
-
-    def expire():
-        expired.set()
-        _shutdown_sockets([conn.sock, *sockets])
-
-    def connect_socket(address, timeout=None, source_address=None):
-        return _connect_socket(
-            address, remaining, sockets, source_address, local=front_settings.is_local(settings)
-        )
-
-    conn._create_connection = connect_socket
-    timer = threading.Timer(remaining(), expire)
-    timer.daemon = True
-    timer.start()
-    try:
-        conn.connect()
-        sock = conn.sock
-        if sock not in sockets:
-            sockets.append(sock)
-        sock.settimeout(remaining())
-        path = origin.path.rstrip("/") + ("/v1/messages" if anthropic else "/v1/chat/completions")
-        conn.request("POST", path, payload, headers)
-        if on_sent is not None:
-            on_sent()
-        sock.settimeout(remaining())
-
-        conn.response_class = _bounded_response(remaining)
-        response = conn.getresponse()
-        remaining()
-        if response.status != 200:
-            raise ModelError("http_error")
+    with Call(settings, endpoint, timeout) as call:
+        response = call.open(payload, on_sent)
         chunks = bytearray()
         while not response.isclosed():
-            # Keep the socket reference: HTTP/1.0 responses detach it from conn.
-            sock.settimeout(remaining())
-            chunk = response.read1(min(8192, MAX_RESPONSE_BYTES + 1 - len(chunks)))
-            remaining()
+            chunk = call.read(min(8192, MAX_RESPONSE_BYTES + 1 - len(chunks)))
             if not chunk:
                 break
             chunks.extend(chunk)
             if len(chunks) > MAX_RESPONSE_BYTES:
                 raise ModelError("bad_response")
         return _answer(chunks, anthropic)
-    except TimeoutError:
-        raise ModelError("timeout") from None
-    except ValueError:
-        if expired.is_set():
-            raise ModelError("timeout") from None
-        raise
-    except (OSError, http.client.HTTPException):
-        raise ModelError("timeout" if expired.is_set() else "http_error") from None
-    finally:
-        timer.cancel()
-        if response is not None:
-            response.close()
-        conn.close()
 
 
 def _answer(chunks, anthropic):
