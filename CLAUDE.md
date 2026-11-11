@@ -27,12 +27,25 @@ These are non-negotiable. Every PR, every feature, every refactor must honor the
 - **Performance budgets** — Hooks under 500ms. Startup injection under 100ms. Memory should feel instant.
 - **Privacy by architecture** — The system physically cannot send your data because it never leaves your machine. No telemetry, no phone-home, no external service dependencies for core operations.
 - **Background everything** — Filing, indexing, timestamps, and pipeline work happen via hooks in the background. Nothing interrupts the user's conversation. Zero tokens spent on bookkeeping in the chat window.
+- **Agentic first** (owner, 11 Nov 2026) — Every setup flow (Compute runner installer, orchestrator/project setup, any other setup) is one click plus ONE accept prompt. After that, agents do everything on that machine with no further approval prompts on the machine itself (no per-command OS, UAC or local confirm dialogs). Approvals appear only in the browser (app.cmmn.dev) or the cmmn app.
 
 ## Contributing
 
 We welcome bug fixes, performance improvements, new language support, better entity disambiguation, documentation, and test coverage.
 
 We do not accept summarization of user content, cloud storage/sync features, telemetry or analytics, features requiring API keys for core memory, or shortcuts that bypass verbatim storage.
+
+## Merging pull requests (batch lane)
+
+- A pull request into `develop` is merge-ready on its exact head when it has a gate PASS and a quick PR check subset PASS (affected or narrow tests plus smoke, about 2 minutes; never the full suite). Only a PASS result counts. SKIP, ERROR and TIMEOUT are not a pass.
+- The builder that owns the PR merges it: `gh pr merge <n> -R <owner>/<repo> --squash --match-head-commit <full sha>`.
+- No full-suite check per PR. The full suite runs per batch on `develop`, about every 5 merges or 60 minutes. If a batch is red, bisect it, open a revert or fix PR, and hold merges while `develop` is red.
+- The coordinator never merges. `develop` to `main` needs the owner's go.
+
+## Host and test limits
+
+- At most 12 concurrent Claude agents/turns on the shared host across all orchestrators and their delegated children. Queue the rest; start no new child above the cap.
+- No raw pytest on the shared host: run tests only through the project's test runners so the slot cap holds; full batches prefer a dedicated runner.
 
 ## Setup
 

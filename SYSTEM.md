@@ -12,6 +12,8 @@ entry was written.
 
 ## Decisions
 
+- **Batch merge lane:** `CLAUDE.md` ("Merging pull requests") is the agent rule. A PR into `develop` merges on a gate PASS plus a quick PR check subset PASS on its exact head, squash with `--match-head-commit`, by its builder. The full suite runs per develop batch, not per PR; a red batch holds merges until a revert or fix lands. The coordinator never merges; `develop` to `main` needs the owner.
+
 - **OAuth consent navigation:** Only a consent form bound to a validated client and
   exact registered redirect adds that redirect's parsed origin to CSP `form-action
   'self'` and shows that same escaped origin as the code destination. Login forms and generic HTML pages remain self-only, including failed
