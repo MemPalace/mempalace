@@ -637,6 +637,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_projects_seat_lease.py` creates a seat through the Project settings routes and has it take, hold, renew and release its lease over MCP.
 
+  - `tests/test_commonplace_goals.py` covers the goals tree, its owner-only writes, the additive schema and the card-context chain budget.
+
   - `tests/projectpanel.mjs` (run by `tests/test_project_panel_ui.py`) covers the panel draw: escaped text, dropped unsafe links, nothing for a project without a panel, cached redraws and failed reads.
 
   - `tests/test_rules_enforcement_points.py` checks the four rule enforcement points; hook tests that compare the startup context now feed it a complete rules section, and the import-reader hook check expects the missing-rules notice for a memory-only context.
@@ -1241,12 +1243,16 @@ Format (read by `commonplace orch docs-check`):
 
   - Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
 
+  - A small workspace goals tree (`boards/goals.py`, owner REST in `web/goals.py`, MCP `goal_list`, `goal_set`, `card_goal`) and the goal a card points at. `task_show` and `task_take_next` add the card's goal chain as `goals` only when a goal is set; `goals.chain_block` is the one place that builds it.
+
   - Task-type refusals (`boards/task_types.py`): a pickup the holder’s grants do not allow names the refused type and points the owner to Settings > Agents.
   - The card's completion reviewer (`boards/reviewer.py`): only a signed-in workspace owner chooses, changes or clears it, it must be a current member, and a reviewer who left counts as none. With none the owner reviews as before. With one, every move to Done by anyone else opens a completion review addressed to that member, and only that member may answer it; the reviewer sees it in needs-me, and changing the reviewer re-addresses an open review.
 
   - Routines (`routines.py`, `/api/routines`): an owner-defined name, card template, schedule and owner that create one card per due time through `BoardService.task_add`, with a history of runs linking to the cards. Due times come from the shared `schedule_time.py`.
 
 - **Promises:**
+
+  - Goals are owner-written plain single-line text (title 100, detail 400 characters, at most 200 goals, 6 levels). A card's goal context never exceeds `goals.BUDGET` (1200) characters: higher goals are dropped from the top level down and counted in `omitted`; the card's own goal always stays. Goal tables are created idempotently, so older boards databases keep working and a missing table reads as no goal.
 
   - Owner-granted `cards:decide`: a live owner's top-level PAT or OAuth connection holding the scope answers only asks addressed to that owner, is refused for seats and board coordinators, needs `memory:write`, read access to the board's wing and the owner's person-level write access to it (not the app's own write wings), cannot escalate, and writes one `card.decide.delegated` audit row inside the board transaction (a failed write fails the answer; a later rollback appends `card.decide.rolled_back`; an audit row without an answer is possible after a kill between the two commits, or when the cancel write fails). Without the scope, refusals are unchanged.
 
@@ -1326,6 +1332,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_cards_waiting_reasons.py` with `tests/board_why.mjs` covers each waiting reason (pure, card view, board summary) and its app rendering.
 
+  - `tests/test_commonplace_goals.py` covers owner-only goal writes, validation, cycles and depth, the additive schema on an old database, the chain in card context, the fixed character budget and cards without a goal staying unchanged.
+
   - `tests/test_routines.py` uses a fake clock: one card per due time, restart recovery without duplicates, bounded catch-up and history, pause/resume/delete, owner-only refusals and limits.
 
   - `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`, `tests/test_commonplace_webhooks.py`.
@@ -1346,7 +1354,7 @@ Format (read by `commonplace orch docs-check`):
   - Machine enrollment and grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
   - Machine enrollment, binding epoch migrations and immutable job epoch snapshots, grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
 
-  - `commonplace/runner/start_context.py`: the card context of a start. `assemble` is the one function that turns a card into launch text; its `SECTIONS` list is the priority order and the place to add a section.
+  - `commonplace/runner/start_context.py`: the card context of a start. `assemble` is the one function that turns a card into launch text; its `SECTIONS` list is the priority order and the place to add a section. A card that points at a goal gets its own goal as an always-present line beside the title and the goals above it (nearest first) as the section after decisions.
 
 - **Promises:**
 
@@ -1975,6 +1983,8 @@ Format (read by `commonplace orch docs-check`):
   - The card panel's Runs section (`cardruns.js`) lists the card's start jobs with Cancel and the owner's Resolve choice, and offers the owner a Start agent control fed by the options route, with plain words for each refusal.
 
   - The cookie-authenticated web app and the live console, including the owner orchestration switch, project seat-consent controls and default agent-limit display.
+
+  - Owner REST for the workspace goals tree (`web/goals.py`: GET/POST `/api/goals`, POST `/api/goals/card`), a thin layer over `BoardService`.
 
   - Settings mounts the owner-only Scheduled prompts section (`agent-schedules.js`) next to Agents; members see nothing there.
 

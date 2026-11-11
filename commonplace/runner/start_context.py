@@ -8,7 +8,8 @@ launch message by the runner.
 
 ``assemble`` is the one place that turns a card into that text:
 
-- The title, the body and the card's fields are always present.
+- The title, the body and the card's fields are always present, and so is the card's
+  own goal when it points at one. The goals above it follow as a section, nearest first.
 - Then each builder in ``SECTIONS`` adds one section, in priority order: asks, decisions
   and handoff notes; comments; blockers and related cards; linked evidence; the text of
   linked memories. A section lists its items most important first.
@@ -25,7 +26,7 @@ larger than the budget by themselves exceed it. The launch message limit of the 
 is a second, hard bound: when even the title and body do not fit there, the body is cut
 whole and the marker says so.
 
-To add context (for example a goals chain), put the data on the card dict in ``load``
+To add context, put the data on the card dict in ``load``
 and insert a builder in ``SECTIONS`` at its priority; ``assemble`` does the budgeting
 and the cut markers.
 """
@@ -136,6 +137,31 @@ def decisions(card) -> Optional[Section]:
     )
 
 
+def goal_head(card) -> tuple:
+    """The card's own goal, the last link of its chain; never cut, like the title."""
+    block = card.get("goals")
+    if not block or not block.get("chain"):
+        return ()
+    own = block["chain"][-1]
+    line = f"Goal of this card: {quote(own['title'])}"
+    return (line + (f" - {quote(own['detail'])}" if own["detail"] else ""),)
+
+
+def goals(card) -> Optional[Section]:
+    """The goals above the card's own, nearest first, so a tight budget keeps the
+    closest ones; the owner-set tree is bounded already, see ``boards.goals``."""
+    block = card.get("goals")
+    if not block or len(block.get("chain") or []) < 2:
+        return None
+    items = [
+        f"- {quote(g['title'])}" + (f" - {quote(g['detail'])}" if g["detail"] else "")
+        for g in reversed(block["chain"][:-1])
+    ]
+    if block.get("omitted"):
+        items.append(f"- ({block['omitted']} higher goals are not shown)")
+    return Section("Goals above it (nearest first):", tuple(items), "goals", "goal_list")
+
+
 def comments(card) -> Optional[Section]:
     return Section(
         "Comments (newest first):",
@@ -202,6 +228,7 @@ def linked_text(card) -> Optional[Section]:
 # Priority order. A builder takes the card dict of ``load`` and returns a Section or None.
 SECTIONS: list[Callable[[dict], Optional[Section]]] = [
     decisions,
+    goals,
     comments,
     blockers,
     evidence,
@@ -244,6 +271,7 @@ def assemble(
         _fields(card),
         f"Title: {quote(card['title'])}",
         f"Body: {quote(card.get('body') or '')}",
+        *goal_head(card),
     ]
     tail = TAIL.format(n=number)
     built = [build(card) for build in (SECTIONS if sections is None else sections)]

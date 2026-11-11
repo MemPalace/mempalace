@@ -16,7 +16,7 @@ from commonplace.control_db import ControlError
 from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
 
-from . import lifecycle, priority as priorities, reviewer as reviewers, task_types
+from . import goals, lifecycle, priority as priorities, reviewer as reviewers, task_types
 from .digest import digest
 from .display import (
     _waiting_on_person as _display_waiting,
@@ -2435,6 +2435,40 @@ class BoardService(lifecycle.LifecycleMixin):
             ]
             result["linked"] = linked
             result["callstack"] = json.loads(row["callstack"]) if row["callstack"] else None
+            self._with_goals(conn, row, result)
+            return result
+
+    def _with_goals(self, conn, row, result):
+        """Agent card context: the goal chain, only for a card that points at a goal."""
+        block = goals.chain_block(conn, row["id"])
+        if block is not None:
+            result["goals"] = block
+
+    def goal_list(self):
+        with self.transaction() as conn:
+            return goals.tree(conn)
+
+    def goal_set(self, goal=None, title=None, detail=None, parent=None, archived=None):
+        goals.require_owner(self.principal)
+        with self.transaction() as conn:
+            return goals.put(
+                conn,
+                self.principal.actor,
+                now(),
+                goal=goal,
+                title=title,
+                detail=detail,
+                parent=parent,
+                archived=archived,
+            )
+
+    def card_goal(self, task, goal=None):
+        goals.require_owner(self.principal)
+        with self.transaction() as conn:
+            row, _board = self._get(conn, task)
+            goals.point(conn, self.principal.actor, now(), row["id"], goal)
+            result = {"number": row["id"], "board": row["board"]}
+            self._with_goals(conn, row, result)
             return result
 
     def _parent_card(self, conn, board, parent, *, delegating=False):
@@ -3174,6 +3208,7 @@ class BoardService(lifecycle.LifecycleMixin):
                 # Clear the delivery marker in this same versioned mutation.
                 conn.execute("UPDATE tasks SET return_to=NULL WHERE id=?", (row["id"],))
                 result["return_to"] = None
+            self._with_goals(conn, row, result)
             return result
 
     def _position(self, conn, row, updates, before=None, after=None):

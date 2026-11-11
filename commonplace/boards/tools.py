@@ -108,6 +108,8 @@ def show(c):
     ):
         if c[key] not in (None, ""):
             rows.append(f"{label}: {quoted(c[key])}")
+    if c.get("goals"):
+        rows.append(c["goals"]["text"])
     if c.get("callstack"):
         rows += tree(c["callstack"])
     for event in c["events"][-10:]:
@@ -166,6 +168,21 @@ def _run(ctx, name, args):
         return json.dumps(result, ensure_ascii=False)
     if name == "board_add":
         return f"added board {result['slug']}"
+    if name == "goal_list":
+        return (
+            "\n".join(
+                f"{'  ' * g['depth']}{g['id']}{' (archived)' if g['archived'] else ''} "
+                f"{quoted(g['title'])}" + (f": {quoted(g['detail'])}" if g["detail"] else "")
+                for g in result
+            )
+            or "no goals"
+        )
+    if name == "goal_set":
+        return f"goal {result['id']} {quoted(result['title'])}"
+    if name == "card_goal":
+        return f"#{result['number']} " + (
+            result["goals"]["text"] if result.get("goals") else "has no goal"
+        )
     if name == "task_list":
         return "\n".join(line(c) for c in result) or "no cards"
     if name == "task_show":
@@ -184,6 +201,8 @@ def _run(ctx, name, args):
         )
         reply += parent_line(result)
         reply += f"\nbody: {quoted(result['body'])}"
+        if result.get("goals"):
+            reply += "\n" + result["goals"]["text"]
         if "decision" in result:
             d = result["decision"]
             reply += f"\ndecision by {d['actor']}: {d['choice'] or ''}  {quoted(d['reply'])}"
@@ -284,6 +303,9 @@ def add(
                 "ask": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
                 "decide": "Answer a review as its owner, an owner's connection holding cards:decide (asks addressed to that owner only) or the addressed live coordinator. Never answer your own ask. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
                 "needs_me": "Read the visible decision queue and origin releases. Eligible coordinators receive origin work without decide authority; signed-in owners receive release or configuration recovery only when needed. Ask authority remains separate.",
+                "goal_list": "Read the workspace goals tree. Cards that point at a goal show its chain in task_show and task_take_next.",
+                "goal_set": "Create a goal (title, optional detail and parent goal number) or change one by number; parent 0 makes it top-level, archived hides it from new cards. Signed-in workspace owner only.",
+                "card_goal": "Point a card at a goal, or clear it with goal omitted. Signed-in workspace owner only.",
             }[name],
             input_schema=input_schema,
             input_schema_for=(
@@ -337,6 +359,26 @@ def _orchestration_available(principal, gateway):
 def register_tools():
     add("board_list", {})
     add("board_own_wing", {"board": STRING}, ("board",), owner=True, trusted=True, write=True)
+    add("goal_list", {})
+    add(
+        "goal_set",
+        {
+            "goal": {"type": "integer", "minimum": 1},
+            "title": STRING,
+            "detail": STRING,
+            "parent": {"type": "integer", "minimum": 0},
+            "archived": {"type": "boolean"},
+        },
+        owner=True,
+        write=True,
+    )
+    add(
+        "card_goal",
+        {"task": TASK, "goal": {"type": ["integer", "null"], "minimum": 1}},
+        ("task",),
+        owner=True,
+        write=True,
+    )
     add(
         "space_read",
         {

@@ -234,12 +234,13 @@ def install(gateway):
         )
 
     from .. import capacity
-    from . import admin, agents, task_types
+    from . import admin, agents, goals, task_types
 
     admin.install(gateway)
     capacity.install(gateway)
     agents.install(gateway)
     task_types.install(gateway)
+    goals.install(gateway)
 
     gateway.add_route("GET", "/app/login", login)
     gateway.add_route("POST", "/app/logout", logout)

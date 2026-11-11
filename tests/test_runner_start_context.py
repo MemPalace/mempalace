@@ -11,6 +11,7 @@ import json
 import pytest
 
 from commonplace import memory_tools
+from commonplace.boards import goals
 from commonplace.boards.service import BoardService
 from commonplace.runner import agent, start_context
 from commonplace.runner.agent import SPAWN_MESSAGE
@@ -184,6 +185,28 @@ def test_blockers_and_related_cards_are_named(hub):
     assert f'- blocked by #{first} "Agree on the file format" (todo)' in context
 
 
+def test_started_card_carries_its_goal_chain(hub):
+    w = world(hub)
+    number = w.card(title="Small card")
+    plain = start_context.assemble(start_context.load(w.ctx(w.a), number))
+    assert "oal" not in plain.split("Body:")[0] and "Goals above" not in plain
+    with w.boards.store.transaction() as conn:
+        top = goals.put(conn, "user:example", "2030-01-01", title="Ship the ferry app")["id"]
+        mid = goals.put(conn, "user:example", "2030-01-01", title="Timetables", parent=top)["id"]
+        leaf = goals.put(
+            conn, "user:example", "2030-01-01", title="Import works", detail="Weekly", parent=mid
+        )["id"]
+        goals.point(conn, "user:example", "2030-01-01", number, leaf)
+    context = start_context.assemble(start_context.load(w.ctx(w.a), number))
+    lines = context.splitlines()
+    assert lines[4] == 'Goal of this card: "Import works" - "Weekly"'
+    assert lines[lines.index("Goals above it (nearest first):") + 1 :][:2] == [
+        '- "Timetables"',
+        '- "Ship the ferry app"',
+    ]
+    assert "[cut" not in context
+
+
 # ------------------------------------------------------------- pure assembly
 
 
@@ -259,6 +282,38 @@ def test_higher_priority_sections_are_filled_first():
     assert "read them with memory_get(id=<memory id>)]" in context
 
 
+def _goal_card(count, **fields):
+    chain = [{"id": i, "title": f"G{i} " + "t" * 90, "detail": "d" * 300} for i in range(count)]
+    return _card(goals={"chain": chain, "omitted": 0}, **fields)
+
+
+def test_goal_section_is_cut_from_the_top_and_the_own_goal_stays():
+    card = _goal_card(4)
+    own = start_context.goal_head(card)[0]
+    assert own.startswith('Goal of this card: "G3 ')
+    # room for the heading, one ancestor and a marker, not for all three
+    context = start_context.assemble(card, budget_tokens=330)
+    assert start_context.tokens(context) <= 330
+    assert own in context
+    assert '"G2 ' in context and '"G1 ' not in context and '"G0 ' not in context
+    assert (
+        "[cut: 2 of 3 goals left out to fit the start budget; read them with goal_list]" in context
+    )
+
+
+def test_goal_chain_that_was_cut_on_the_card_says_so():
+    card = _goal_card(3)
+    card["goals"]["omitted"] = 2
+    context = start_context.assemble(card)
+    assert "- (2 higher goals are not shown)" in context
+
+
+def test_a_card_without_goals_gets_no_goal_text():
+    context = start_context.assemble(_card())
+    assert "oal" not in context
+    assert start_context.assemble(_card(goals=None)) == context
+
+
 def test_title_and_body_survive_a_budget_smaller_than_the_body():
     body = 'Line with ünïcode and "quotes".\n' * 200
     card = _card(body=body, events=[_comment("small")])
@@ -282,18 +337,18 @@ def test_launch_limit_cuts_the_body_whole_and_says_so():
 def test_added_section_gets_the_same_budget_and_marker():
     """The extension point: a builder inserted in the order is budgeted like the rest."""
 
-    def goals(card):
+    def notes(card):
         return start_context.Section(
-            "Goals:", tuple(card["goals"]), "goals", "task_show(task=<goal>)"
+            "Notes:", tuple(card["notes"]), "notes", "task_show(task=<note>)"
         )
 
-    card = _card(goals=["- " + "g" * 400, "- " + "h" * 400], events=[_comment("small")])
-    order = [goals, *start_context.SECTIONS]
+    card = _card(notes=["- " + "g" * 400, "- " + "h" * 400], events=[_comment("small")])
+    order = [notes, *start_context.SECTIONS]
     context = start_context.assemble(card, sections=order)
-    assert context.index("Goals:") < context.index("Comments (newest first):")
+    assert context.index("Notes:") < context.index("Comments (newest first):")
     tight = start_context.assemble(card, sections=order, budget_tokens=250)
     assert start_context.tokens(tight) <= 250
-    assert "[cut: 1 of 2 goals left out to fit the start budget; " in tight
+    assert "[cut: 1 of 2 notes left out to fit the start budget; " in tight
 
 
 def test_budget_setting(monkeypatch):
