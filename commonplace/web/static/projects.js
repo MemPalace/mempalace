@@ -320,9 +320,16 @@ const reconnectCopy = (project, e) => project.main.source === "coordinator"
   ? { title: "Replace the orchestrator?", body: `<p>Connect replaces ${e(project.main.name)} as this project's orchestrator.</p>`, action: "Connect" }
   : { title: "Reconnect this agent?", body: "<p>Its current token will stop working.</p>", action: "Reconnect" };
 
+// Plain text for the persistent status, including when a conflict dialog is dismissed.
+function connectConflict(payload = {}) {
+  if (payload?.error === "shared_wing") return `${PROJECT_COPY.connectError} This project uses shared memory. Try connecting again and choose “${PROJECT_COPY.ownWing}” or “${PROJECT_COPY.allowShared}”.`;
+  if (payload?.error === "replaces current orchestrator") return `${PROJECT_COPY.connectError} The project already has an orchestrator. Try connecting again and confirm its replacement.`;
+  return `${PROJECT_COPY.connectError} ${payload?.message || payload?.error || "Please try again."}`;
+}
+
 // Shared by the settings Connect button and the empty-board dialog.
 // `onWing(path)` makes the project's own memory section; `ask(copy)` resolves to true or false.
-async function requestConnect({ api, path, project, e, active, ask, onWing }) {
+async function requestConnect({ api, path, project, e, active, ask, onWing, onStatus }) {
   const body = {};
   if (project.main.connected) {
     if (!await ask(reconnectCopy(project, e))) return null;
@@ -333,9 +340,11 @@ async function requestConnect({ api, path, project, e, active, ask, onWing }) {
     try { return await api(`${path}/orchestrator/connect`, { method: "POST", body }); }
     catch (error) {
       if (!active()) return null;
+      if (error.status === 409) onStatus(connectConflict(error.payload));
       if (error.status === 409 && error.payload?.error === "shared_wing") {
         const choice = await chooseSharedWing(error.payload, e);
         if (choice === "cancel" || !active()) return null;
+        onStatus("");
         if (choice === "shared") body.allow_shared = true;
         else {
           const owned = await onWing(error.payload.fix.path);
@@ -345,6 +354,7 @@ async function requestConnect({ api, path, project, e, active, ask, onWing }) {
       } else if (error.status === 409 && error.payload?.error === "replaces current orchestrator" && !body.replace) {
         const copy = { title: "Replace the orchestrator?", body: `<p>${wingChanged ? PROJECT_COPY.ownWingDone + " " : ""}Connect replaces the current orchestrator.</p>`, action: "Connect" };
         if (!await ask(copy)) return null;
+        onStatus("");
         body.replace = true;
       } else throw error;
     }
@@ -382,6 +392,7 @@ export function openConnectDialog({ slug, api, e, opener, current = () => true, 
       project = project || await loading;
       const result = await requestConnect({
         api, path, project, e, active,
+        onStatus: (text) => { status.textContent = text; },
         ask: (copy) => askConfirm(copy, e, { opener: create }),
         onWing: async (wingPath) => {
           changingWing = true;
@@ -396,7 +407,7 @@ export function openConnectDialog({ slug, api, e, opener, current = () => true, 
       const app = dialog.querySelector("[data-project-app]")?.value || "claude-code";
       showConnectResult(result, e, { api, path, project, current: active, onUpdate: (latest) => { project = latest; onUpdate(latest); }, into: modal, app, copySetup: true });
     } catch (error) {
-      if (active()) status.textContent = changingWing ? ownWingError(error.payload) : PROJECT_COPY.connectError;
+      if (active()) status.textContent = changingWing ? ownWingError(error.payload) : error.status === 409 ? connectConflict(error.payload) : PROJECT_COPY.connectError;
     } finally {
       busy = false;
       if (create.isConnected) create.disabled = false;
@@ -468,6 +479,7 @@ export async function mountProject(host, { slug, api, e, settings = false, curre
     try {
       let result = await requestConnect({
         api, path, project, e, active,
+        onStatus: (text) => { status.textContent = text; },
         ask: (copy) => askConfirm(copy, e, { opener: button, fallback }),
         onWing: async (wingPath) => {
           changingWing = true;
@@ -486,7 +498,7 @@ export async function mountProject(host, { slug, api, e, settings = false, curre
       project = await api(path);
       if (active()) renderMain();
     } catch (error) {
-      if (active()) status.textContent = changingWing ? ownWingError(error.payload) : PROJECT_COPY.connectError;
+      if (active()) status.textContent = changingWing ? ownWingError(error.payload) : error.status === 409 ? connectConflict(error.payload) : PROJECT_COPY.connectError;
     } finally {
       connecting = false; button.disabled = false;
       const next = host.querySelector("[data-project-connect]");

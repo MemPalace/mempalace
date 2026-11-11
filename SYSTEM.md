@@ -325,6 +325,11 @@ optional `reviewer` argument to `task_add` and `task_update`.
 
 ### Project seat wake recommendations
 
+- Project Connect writes every HTTP 409 conflict to its persistent status. Shared-memory
+  and replacement conflicts retain their explanation and next step after dialog dismissal;
+  shared-memory consent and own-section conversion still require the existing explicit choices.
+  Other conflicts include the server's reason in the Orchestrator section of project settings.
+
 - Connect recommends a board-scoped webhook for `space_message` and `card.moved`, so messages and worker completion moves can wake the orchestrator.
 
 - Setup is advisory: Connect and reconnect neither register nor modify subscriptions.
