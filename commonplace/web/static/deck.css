@@ -1,0 +1,119 @@
+/* Deck: the opt-in look (deck.js sets data-ui="deck" on the root element; without it this file is inert).
+   True black, elevation by lightness alone, no card borders. One hue, amber, and it means one thing:
+   this waits on you. The primary action is the inverted pill (white fill, black label).
+   Contrast on #000 / #111 / #1E1E1E: text 21:1, text-2 10:1, text-3 6.9:1 (5.6:1 on #1E1E1E). */
+@font-face { font-family: "Inter"; src: url("fonts/inter-latin.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+
+:root[data-ui="deck"] {
+  color-scheme: dark;
+  --bg: #000000;
+  --pane: #000000;
+  --surface: #111111;
+  --well: #1E1E1E;
+  --line: #1C1C1C;
+  --line-strong: #4A4A4A;
+  --text: #FFFFFF;
+  --text-2: #B4B4B4;
+  --text-3: #949494;
+  --accent: #FFFFFF;
+  --accent-hover: #E6E6E6;
+  --accent-weak: #2A2A2A;
+  --wait: #F2B33D; --wait-bg: #2B2414; --wait-line: #5C4A1B;
+  --block: #F0708A; --block-bg: #2C1A20; --block-line: #6B3040;
+  --ok: #45C07C; --ok-bg: #172A1D;
+  --agent: #B4B4B4; --agent-bg: #222222;
+  --r: 12px;
+  --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --deck-gutter: max(24px, calc((100% - 1200px) / 2));
+}
+:root[data-ui="deck"] body { font-variant-numeric: tabular-nums; }
+:root[data-ui="deck"] a { text-underline-offset: 3px; }
+:root[data-ui="deck"] ::selection { background: var(--text); color: var(--bg); }
+
+/* ---------- Controls ---------- */
+:root[data-ui="deck"] .btn { min-height: 36px; padding: 0 16px; border: 0; border-radius: 18px; background: var(--well); }
+:root[data-ui="deck"] .btn.primary, :root[data-ui="deck"] .skip { background: var(--text); color: var(--bg); }
+:root[data-ui="deck"] .btn.primary kbd { color: var(--bg); border-color: currentColor; }
+:root[data-ui="deck"] .btn.ghost { background: none; }
+:root[data-ui="deck"] .btn.danger { background: var(--block-bg); }
+:root[data-ui="deck"] .iconbtn.bordered { border-color: transparent; background: var(--well); }
+:root[data-ui="deck"] .mark { border-radius: 9px; background: var(--well); color: var(--text); }
+:root[data-ui="deck"] kbd { background: var(--well); border-color: var(--line-strong); }
+:root[data-ui="deck"] .count.need { background: var(--wait); color: var(--bg); box-shadow: none; }
+
+/* ---------- Shell: bar over one column ---------- */
+:root[data-ui="deck"] .shell, :root[data-ui="deck"] .shell.two { grid-template-columns: minmax(0, 1fr); grid-template-rows: 56px minmax(0, 1fr); }
+:root[data-ui="deck"] .shell > .rail { grid-column: 1 / -1; }
+:root[data-ui="deck"] .center, :root[data-ui="deck"] .context { grid-row: 2; }
+@media (min-width: 1100px) {
+  :root[data-ui="deck"] .shell:not(.two), :root[data-ui="deck"] .shell.two.chat-open, :root[data-ui="deck"] .shell.ctx-pushed { grid-template-columns: minmax(0, 1fr) 396px; }
+}
+@media (min-width: 700px) and (max-width: 1099px) {
+  :root[data-ui="deck"] .shell, :root[data-ui="deck"] .shell.two, :root[data-ui="deck"] .shell.two.chat-open, :root[data-ui="deck"] .shell.ctx-pushed { grid-template-columns: minmax(0, 1fr); }
+}
+:root[data-ui="deck"] .context { border-left: 0; }
+:root[data-ui="deck"] .rail[data-deck="bar"] { flex-direction: row; align-items: center; gap: 8px; padding: 0 var(--deck-gutter); border: 0; overflow: visible; }
+:root[data-ui="deck"] .deck-brand { display: flex; align-items: center; gap: 10px; margin-right: 20px; color: var(--text); text-decoration: none; font-size: 15px; font-weight: 600; }
+:root[data-ui="deck"] .deck-mark { width: 22px; height: 22px; flex: none; color: var(--text); }
+:root[data-ui="deck"] .deck-tick { stroke: var(--bg); }
+:root[data-ui="deck"] .deck-links { display: flex; align-items: center; gap: 4px; margin-right: auto; }
+:root[data-ui="deck"] .rail .deck-links .nav { width: auto; min-height: 36px; padding: 0 10px; gap: 6px; color: var(--text-2); font-weight: 500; }
+:root[data-ui="deck"] .rail .deck-links .nav[aria-current] { background: none; box-shadow: none; color: var(--text); font-weight: 600; }
+:root[data-ui="deck"] .rail .deck-links .nav[aria-current]::before { content: none; }
+:root[data-ui="deck"] .deck-links .count { margin-left: 0; }
+:root[data-ui="deck"] .rail[data-deck="bar"] .ws { width: auto; padding: 0 10px; color: var(--text-2); font-weight: 500; }
+:root[data-ui="deck"] .rail[data-deck="bar"] .user-menu { position: relative; }
+:root[data-ui="deck"] .rail[data-deck="bar"] .me { min-height: 36px; padding: 0 2px; list-style: none; }
+:root[data-ui="deck"] .rail[data-deck="bar"] .me::-webkit-details-marker { display: none; }
+:root[data-ui="deck"] .rail[data-deck="bar"] .user-links { position: absolute; top: 44px; right: 0; z-index: 20; min-width: 208px; padding: 8px; border-radius: 16px; background: var(--well); box-shadow: 0 16px 40px rgba(0, 0, 0, .6); }
+:root[data-ui="deck"] .rail[data-deck="bar"] .user-links a, :root[data-ui="deck"] .rail[data-deck="bar"] .user-links button { min-height: 36px; padding: 0 10px; border-radius: 10px; text-decoration: none; font-weight: 500; }
+:root[data-ui="deck"] .rail[data-deck="bar"] .user-links a:hover, :root[data-ui="deck"] .rail[data-deck="bar"] .user-links button:hover { background: var(--accent-weak); }
+
+/* ---------- Phone: title bar and four tabs ---------- */
+:root[data-ui="deck"] .m-top { border: 0; }
+:root[data-ui="deck"] .m-top .deck-brand { margin: 0 0 0 4px; font-size: 17px; }
+:root[data-ui="deck"] .m-tabs { border-top-color: var(--line); }
+:root[data-ui="deck"] .m-tabs[data-count="2"] { grid-template-columns: repeat(2, 1fr); }
+:root[data-ui="deck"] .m-tabs[data-count="3"] { grid-template-columns: repeat(3, 1fr); }
+:root[data-ui="deck"] .m-tabs a { color: var(--text-3); font-weight: 500; }
+:root[data-ui="deck"] .m-tabs a[aria-current] { color: var(--text); }
+:root[data-ui="deck"] .m-tabs a[aria-current]::before { content: none; }
+
+/* ---------- Bots ---------- */
+:root[data-ui="deck"] .bots-roster { border-right: 0; }
+:root[data-ui="deck"] .bots-bar, :root[data-ui="deck"] .bots-head, :root[data-ui="deck"] .bots-compose { border: 0; }
+:root[data-ui="deck"] .bots-new { border: 0; border-radius: 22px; background: var(--text); color: var(--bg); }
+:root[data-ui="deck"] .bot-row { margin: 0 8px 2px; border: 0; border-radius: 16px; }
+:root[data-ui="deck"] .bot-row[aria-current] { box-shadow: none; }
+:root[data-ui="deck"] .bot-av { border-radius: 12px; color: var(--text); }
+:root[data-ui="deck"] .bot-unread, :root[data-ui="deck"] .bot-dot.needs_you { background: var(--wait); }
+:root[data-ui="deck"] .bot-unread { color: var(--bg); }
+:root[data-ui="deck"] .bot-dot.working { background: var(--text); }
+:root[data-ui="deck"] .bm-bubble { border: 0; border-radius: 20px; padding: 10px 16px; }
+:root[data-ui="deck"] .bm.me .bm-bubble { border-bottom-right-radius: 6px; background: var(--accent-weak); }
+:root[data-ui="deck"] .bm.bot .bm-bubble { padding-left: 0; background: none; }
+:root[data-ui="deck"] .bm.event .bm-bubble { padding-left: 0; }
+:root[data-ui="deck"] .bm-text { font-size: 15px; line-height: 22px; }
+:root[data-ui="deck"] .bb { border: 0; border-radius: 16px; }
+:root[data-ui="deck"] .bb-body { border-top-color: var(--line); }
+:root[data-ui="deck"] .bb.decision, :root[data-ui="deck"] .bb.confirm, :root[data-ui="deck"] .bb.setup { padding: 16px; gap: 10px; }
+:root[data-ui="deck"] .bb.confirm { border-left: 0; }
+:root[data-ui="deck"] .bb.confirm .bb-label, :root[data-ui="deck"] .bb-q { font-size: 16px; line-height: 22px; font-weight: 600; }
+:root[data-ui="deck"] .bb-opt { border: 0; border-radius: 22px; padding: 0 18px; background: var(--well); }
+:root[data-ui="deck"] .bb-opt.go { background: var(--text); color: var(--bg); }
+:root[data-ui="deck"] .chip { background: var(--well); }
+:root[data-ui="deck"] .chip.needs_you, :root[data-ui="deck"] .chip.ready { background: var(--wait-bg); color: var(--wait); box-shadow: none; }
+:root[data-ui="deck"] .chip.working { background: var(--accent-weak); color: var(--text); }
+:root[data-ui="deck"] .wait { border: 0; }
+:root[data-ui="deck"] .bots-box { padding: 6px 6px 6px 14px; border: 0; border-radius: 26px; background: var(--well); }
+:root[data-ui="deck"] .bots-box:focus-within { box-shadow: 0 0 0 2px var(--line-strong); }
+:root[data-ui="deck"] .bots .bots-send { border: 0; border-radius: 22px; color: var(--bg); }
+:root[data-ui="deck"] .bots .bots-send.stop { background: var(--accent-weak); color: var(--text); }
+:root[data-ui="deck"] .sheet { background: rgba(0, 0, 0, .7); }
+:root[data-ui="deck"] .sheet-body { border: 0; border-radius: 20px; padding: 22px; }
+:root[data-ui="deck"] .bb-reply input, :root[data-ui="deck"] .memory-add input, :root[data-ui="deck"] .sheet-body input, :root[data-ui="deck"] .sheet-body textarea { border-color: transparent; background: var(--well); }
+
+@media (max-width: 699px) {
+  :root[data-ui="deck"] .sheet { background: var(--surface); }
+  :root[data-ui="deck"] .sheet-body { border-radius: 0; }
+}

@@ -31,6 +31,7 @@ import { createMemory } from "./memory.js";
 import { createPalette } from "./palette.js";
 import { mountOnboarding } from "./onboarding.js";
 import { createCardMenu } from "./cardmenu.js";
+import { applyDeck, createDeck } from "./deck.js";
 // Shell layout rules. The CSP (style-src 'self') refuses inline style elements, so they live in a constructed sheet.
 const shellStyles = `
     .shell #content { flex:1; min-height:0; overflow:auto; }
@@ -60,6 +61,7 @@ if (signinParams.has("signin") || signinParams.has("next")) {
   history.replaceState(history.state, "", `${location.pathname}${search ? `?${search}` : ""}${location.hash}`);
 }
 let providersPromise;
+applyDeck();
 
 const root = document.querySelector("#root");
 const state = {
@@ -72,6 +74,12 @@ const state = {
   phonePushPending: false, underChat: null, fromChat: null, detailsSheet: false, rebase: null,
   queue: null, pollFails: 0, queueFocus: "", queueShownAt: 0, queueField: false, queueDirty: false,
 };
+// The opt-in Deck look: its bar, its own screens and the Look switch in Settings (deck.js).
+state.deck = createDeck({
+  root, api, title: (text) => title(text), screen: () => state.screen,
+  context: () => ({ me: state.me, boards: state.boards, needs: state.needs, go: (hash) => { location.hash = hash; } }),
+  reload: () => { if (state.me) void route(); },
+});
 let adminUI = null;
 let consoleUI = null, botsUI = null, chatUI = null, detailsUI = null, boardDispose = null;
 const statuses = ["backlog", "todo", "doing", "review", "done"];
@@ -387,9 +395,11 @@ function navigation() {
     : /^#\/board\/[^/?]+\/chat$|^#\/chat\//.test(state.base) ? "chat" : /^#\/board\/[^/?]+$/.test(state.base) ? "board" : "page";
   // The rail lists Bots and Memory; the phone bar keeps naming the project on every screen but the bots.
   const needs = state.needs.count || 0;
-  boardNav.outerHTML = renderRail({ can_admin: state.me.can_admin === true, workspace: state.me.workspace_name || "Commonplace", user: state.me.people?.[state.me.actor] || state.me.email, view, needs, rulesWaiting: state.rulesWaiting, botsWaiting: state.botsWaiting }).replace('<nav class="rail"', '<nav class="rail" id="board-nav"');
-  root.querySelector("#phone-bar").innerHTML = renderPhoneBar({ board: view === "bots" ? null : board, needs, rulesWaiting: state.rulesWaiting, can_admin: state.me.can_admin === true });
-  root.querySelector("#phone-tabs").innerHTML = renderPhoneTabs({ view, botsWaiting: state.botsWaiting });
+  const rail = { can_admin: state.me.can_admin === true, workspace: state.me.workspace_name || "Commonplace", user: state.me.people?.[state.me.actor] || state.me.email, view, needs, rulesWaiting: state.rulesWaiting, botsWaiting: state.botsWaiting };
+  // The Deck look draws its own bar, phone title and tabs; each is "" while that look is off.
+  boardNav.outerHTML = (state.deck?.bar(rail) || renderRail(rail)).replace('<nav class="rail"', '<nav class="rail" id="board-nav"');
+  root.querySelector("#phone-bar").innerHTML = state.deck?.top() || renderPhoneBar({ board: view === "bots" ? null : board, needs, rulesWaiting: state.rulesWaiting, can_admin: state.me.can_admin === true });
+  root.querySelector("#phone-tabs").innerHTML = state.deck?.tabs(rail) || renderPhoneTabs({ view, botsWaiting: state.botsWaiting });
   root.querySelector(".shell")?.setAttribute("data-screen", state.base === "#/decide" ? "decide" : "");
   // The phone top bar already names the project, so the board hides its own title there (m1).
   root.querySelector(".shell")?.setAttribute("data-view", view);
@@ -832,6 +842,7 @@ async function settingsView(epoch) {
   content.innerHTML = `<div class="settings">${plan.status === "fulfilled" ? planView(plan.value) : failed("Plan", plan)}${orchestration.status === "fulfilled" ? '<section class="settings-section"><h2>Agent orchestration</h2><div data-workspace-orchestration></div></section>' : failed("Agent orchestration", orchestration)}${voice.settings()}${chatSettings.status === "fulfilled" ? `<section class="settings-section"><h2>Chat</h2><p>${e(chatSettings.value.front.enabled && chatSettings.value.front.provider !== "none" ? `Answers by ${chatSettings.value.front.provider}/${chatSettings.value.front.model}` : chatSettings.value.front.enabled ? "Basic replies (no model)" : "Front replies off")}</p><p>Model answers today: ${e(chatSettings.value.usage.used_today)} · Yours: ${e(chatSettings.value.usage.user_used_today)}</p>${chatSettings.value.usage.last_error ? `<p role="status">Last model error: ${e(chatSettings.value.usage.last_error)}</p>` : ""}</section>` : failed("Chat", chatSettings)}${connections.status === "fulfilled" ? agentsView(connections.value) : `<section class="settings-section"><h2>Agents</h2>${failed("Agents", connections)}</section>`}<section class="settings-section" id="agent-schedules"><h2>Scheduled prompts</h2><div data-agent-schedules></div></section>${phonePush.status === "fulfilled" ? phonePushView(phonePush.value) : `<section class="settings-section" id="phone-push"><h2>Phone notifications</h2>${failed("Phone notifications", phonePush)}</section>`}<section class="settings-section"><h2>Webhooks</h2><div id="hook-secret"></div>${hooks.status === "fulfilled" ? (hooks.value.webhooks || []).map((h) => `<div class="setting-row"><span>${e(h.url)}<br><small>${e(h.id)}</small></span><button data-action="deliveries" data-hook="${e(h.id)}">Deliveries</button><button data-action="test-hook" data-hook="${e(h.id)}">Test</button><button data-action="remove-hook" data-hook="${e(h.id)}">Remove</button></div>`).join("") || message("No webhooks") : failed("Webhooks", hooks)}<form class="webhook-form" data-form="webhook"><input name="url" type="url" data-draft="webhook-url" aria-label="Webhook URL" required><input name="board" data-draft="webhook-board" aria-label="Board" placeholder="Board"><input name="waiting_on" data-draft="webhook-waiting" aria-label="Waiting on" placeholder="Waiting on"><select name="events" aria-label="Events" data-draft="webhook-events"><option value="*">All events</option><option value="review_needed">Review needed</option><option value="card_changed">Card changed</option><option value="waiting_on_me">Waiting on me</option></select><button class="blockbtn">Add</button></form><div id="deliveries"></div></section><section class="settings-section"><button class="opt" data-action="logout">Sign out</button></section></div>`;
   if (orchestration.status === "fulfilled") mountWorkspaceOrchestration(content.querySelector("[data-workspace-orchestration]"), {api, e, enabled: orchestration.value.enabled, current: () => epoch === state.screen});
   mountAgentSchedules(content.querySelector("[data-agent-schedules]"), {api, e, current: () => epoch === state.screen});
+  state.deck?.settings(content);
   restore(saved);
 }
 
@@ -1108,6 +1119,8 @@ async function refresh({ background = false, events = [] } = {}) {
       if (!background) consoleScreen();
     } else if (state.base === "#/settings") {
       if (!background || events.some((event) => event.kind.startsWith("webhook."))) await settingsView(epoch);
+    } else if (state.deck?.owns(state.base)) {
+      await state.deck.show(state.base, { background, epoch });
     } else if (state.base === "#/decide") {
       if (state.queue) queueApply(state.queue.ready ? { type: "sync", cards: decideQueue(state.needs) } : { type: "load", cards: decideQueue(state.needs) });
       queueNoteOffline();
@@ -1329,6 +1342,8 @@ async function route() {
   if (!state.me) return;
   remember();
   let hash = location.hash || "#/";
+  // The Deck look has its own home; the classic one resolves "#/" to a project below.
+  if (hash === "#/" && state.deck?.on()) { hash = state.deck.home(); history.replaceState(history.state, "", hash); }
   // A shared card link (first screen of the visit) needs a screen behind the card.
   const direct = state.screen === 0 && /^#\/card\/[1-9]\d*$/.test(hash);
   if (hash === "#/" || hash === "#/chat" || direct) {
@@ -1351,7 +1366,9 @@ async function route() {
   if (direct) { state.base = boardRoute({ boards: state.boards, last }); state.rebase = Number(hash.slice(7)); }
   const start = decideStart(hash);
   if (!/^#\/card\/[1-9]\d*$/.test(hash)) {
-    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board\/[^/?]+(?:\/chat)?|space\/[^/?]+)|start|needs|boards|rules|memory(?:\?.*)?|bots(?:\/[A-Za-z0-9_-]+)?|chat(?:\/[^/?]+)?|console(?:\?agent=[^&#]+)?|settings|admin)$/.test(hash) ? hash : "#/");
+    state.base = start !== undefined ? "#/decide" : (/^#\/((?:board\/[^/?]+(?:\/chat)?|space\/[^/?]+)|start|needs|boards|rules|memory(?:\?.*)?|bots(?:\/[A-Za-z0-9_-]+)?|chat(?:\/[^/?]+)?|console(?:\?agent=[^&#]+)?|settings|admin|today|compute)$/.test(hash) ? hash : "#/");
+    // Today and Compute exist in the Deck look only; without it they are an unknown address.
+    if (/^#\/(?:today|compute)$/.test(state.base) && !state.deck?.owns(state.base)) state.base = "#/";
     state.card = null;
   } else if (state.base === "#/admin") {
     state.base = boardRoute({ boards: state.boards, last });
@@ -1360,6 +1377,7 @@ async function route() {
   if (previousBase === "#/admin") adminUI?.stop();
   if (previousBase.startsWith("#/console") && !state.base.startsWith("#/console")) consoleUI?.stop();
   if (previousBase.startsWith("#/bots") && !state.base.startsWith("#/bots")) botsUI?.stop();
+  if (state.base !== previousBase) state.deck?.leave();
   if (previousBase === "#/decide" && state.base !== "#/decide") {
     queueFlush(true); queueStop(); state.queue = null; state.queueFocus = "";
   }
