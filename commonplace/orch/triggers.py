@@ -14,6 +14,11 @@ A firing event whose start cannot even be planned (``prepare`` refuses, or the c
 lacks the role the start needs) is a coded miss that advances the cursor, like any other
 refusal; only infrastructure errors leave the cursor.
 
+A start refused for a transient reason (``start_retry.TRANSIENT``) is also queued in
+``orch_start_retries`` by ``fenced_start``; after the board's new events the sweep starts
+the due ones again (``_retry_starts``, boards without workspace orchestration), bounded
+and backed off, each refusal a miss. A permanent refusal is never retried.
+
 Cursor protocol (board events live in ``boards.sqlite3``, the cursor in
 ``runner.sqlite3``, so no transaction spans both):
 
@@ -60,15 +65,17 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
 
 from commonplace.boards.store import BoardStore, task_row
 from commonplace.control_db import ControlError
+from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
 from commonplace.runner import jobs, registry
 from commonplace.runner.predicate import requester_ok
 from commonplace.sessions import person_principal
 
-from . import durable, runner_bridge, schema, store as orch_store
+from . import durable, runner_bridge, schema, start_retry, store as orch_store
 
 logger = logging.getLogger(__name__)
 BATCH = 50
@@ -178,10 +185,13 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
             board_row = dict(board_row)
             events = boards.execute(_EVENTS, (cursor, board_row["id"], BATCH)).fetchall()
             cards = {row["task_id"]: dict(task_row(boards, row["task_id"])) for row in events}
-        if not events and not on:
+        at = now or jobs._now()
+        retries = [] if on else start_retry.due(conn, board, at)
+        if not events and not on and not retries:
             return results
         version = orch_store.resolve_in(conn, board)
         machine = registry.get_machine(gateway.db, ws, version.config().runner.machine)
+        stopped = False
         for event in events:
             principal, ref, refusal = _actor(gateway, ws, event, machine)
             _barrier("sweep_after_requester", conn)
@@ -206,6 +216,7 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
                     js, board, event["task_id"], trigger, code, now=now
                 ):
                     results.append({"event": event["id"], "dropped": True})
+                    stopped = True
                     break
                 cursor = event["id"]
                 results.append(
@@ -223,6 +234,7 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
             )
             if outcome.dropped:
                 results.append({"event": event["id"], "dropped": True})
+                stopped = True
                 break
             cursor = event["id"]  # re-recorded from the advance
             results.append(
@@ -233,8 +245,70 @@ def _sweep_board(js, st, board: str, now) -> list[dict]:
                     "miss": outcome.refusal.code if outcome.refusal else None,
                 }
             )
+        if retries and not stopped:
+            results.extend(
+                _retry_starts(js, board_row, version, machine, retries, (cursor, gen), now)
+            )
     if on:
         results.extend(_reconcile(js, st, board, now or jobs._now()))
+    return results
+
+
+def _retry_starts(js, board_row, version, machine, retries, pair, now) -> list[dict]:
+    """Start again the cards whose first start was refused for a transient reason
+    (``start_retry``). The actor is rebuilt from the event, as for the first start."""
+    gateway, ws = js.gateway, js.workspace_id
+    board = board_row["slug"]
+    results = []
+    for row in retries:
+        retry = row["attempts"] + 1
+        trigger = runner_bridge.TriggerRef(row["event_id"], pair[0], pair[1], None, redo=retry)
+        with BoardStore(gateway.workspace_dir(ws)).connection() as boards:
+            event = boards.execute(
+                "SELECT id, task_id, kind, stamp_user, stamp_connection, created_at "
+                "FROM task_events WHERE id=?",
+                (row["event_id"],),
+            ).fetchone()
+            try:
+                card = dict(task_row(boards, row["card"]))
+            except ToolError:
+                card = None
+        principal, ref, refusal = _actor(gateway, ws, event, machine)
+        trigger = replace(trigger, actor=ref)
+        try:
+            if card is None:
+                raise runner_bridge.StartRefused("card_not_found", status=404)
+            plan = runner_bridge.prepare(
+                gateway,
+                ws,
+                board_row=board_row,
+                card_row=card,
+                version=version,
+                principal=principal,
+                requested_by=ref or "unknown",
+                person=False,
+            )
+        except (runner_bridge.StartRefused, schema.ConfigError) as exc:
+            code = exc.code if isinstance(exc, runner_bridge.StartRefused) else "config_invalid"
+            if runner_bridge.trigger_miss(js, board, row["card"], trigger, code, now=now):
+                results.append(
+                    {"event": row["event_id"], "card": row["card"], "retry": retry, "miss": code}
+                )
+            continue
+        outcome = runner_bridge.fenced_start(
+            js, plan, path="trigger", trigger=trigger, actor_refusal=refusal, now=now
+        )
+        if outcome.dropped:
+            continue
+        results.append(
+            {
+                "event": row["event_id"],
+                "card": row["card"],
+                "retry": retry,
+                "job": outcome.job["id"] if outcome.job else None,
+                "miss": outcome.refusal.code if outcome.refusal else None,
+            }
+        )
     return results
 
 

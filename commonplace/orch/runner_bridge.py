@@ -40,7 +40,7 @@ from commonplace.projects import limits as project_limits, models
 from commonplace.runner import jobs, registry
 from commonplace.runner.predicate import Refused, grant_values, requester_ok, startable
 
-from . import durable, schema, store as orch_store
+from . import durable, schema, start_retry, store as orch_store
 
 logger = logging.getLogger(__name__)
 
@@ -129,7 +129,8 @@ class TriggerRef:
     cursor: int
     gen: int
     actor: str | None = None
-    retry: int = 0
+    retry: int = 0  # split reconciliation attempt (``orch_misses`` rows with a negative event)
+    redo: int = 0  # transient-refusal retry number of the event (``start_retry``)
 
 
 @dataclass
@@ -531,7 +532,12 @@ def trigger_miss(store, board: str, card: int, trigger: TriggerRef, code: str, *
                 now,
             ),
         )
-        if not trigger.retry:
+        if trigger.redo:
+            start_retry.settle(
+                conn, board=board, card=card, event=trigger.event, code=code, now=now,
+                retry=trigger.redo,
+            )  # fmt: skip
+        elif not trigger.retry:
             conn.execute(
                 "UPDATE orch_cursor SET cursor=? WHERE board=? AND gen=? AND cursor=?",
                 (trigger.event, board, trigger.gen, trigger.cursor),
@@ -583,11 +589,14 @@ def fenced_start(
         if plan.orchestration_on
         else store.transaction() as conn
     ):
-        if trigger is not None and not trigger.retry:
+        if trigger is not None and not trigger.retry and not trigger.redo:
             # First statement in the lock: the pair the sweep recorded must still hold.
             if orch_store.cursor_in(conn, plan.board) != (trigger.cursor, trigger.gen):
                 return Outcome(dropped=True)
         ensure_schema(conn)
+        if trigger is not None and trigger.redo:
+            if not start_retry.claimable(conn, plan.board, trigger.event, trigger.redo):
+                return Outcome(dropped=True)
         if trigger is not None and plan.orchestration_on:
             from commonplace.projects import split
 
@@ -644,8 +653,19 @@ def fenced_start(
                         now,
                     ),
                 )
-            if not trigger.retry:
+            if not trigger.retry and not trigger.redo:
                 _advance(conn, plan, trigger)
+            if not trigger.retry and not plan.orchestration_on:
+                start_retry.settle(
+                    conn,
+                    board=plan.board,
+                    card=plan.card,
+                    event=trigger.event,
+                    code=refusal.code if refusal else None,
+                    now=now,
+                    retry=trigger.redo,
+                    job=outcome.job,
+                )
     if refusal is not None and trigger is None:
         raise refusal
     return outcome
