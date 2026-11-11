@@ -1648,3 +1648,86 @@ def test_hook_mine_exit_watchdog_preserves_nonzero_exit_code_on_atexit_hang(tmp_
         f"Expected a failure status, got {proc.returncode}; stderr={proc.stderr!r}"
     )
     assert not pid_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for #2300: per-chunk room classification & noise routing
+# ---------------------------------------------------------------------------
+
+
+def test_mine_convos_classifies_each_exchange_chunk_independently(tmp_path, capsys):
+    """#2300: exchange mode must score each chunk rather than collapsing the
+    entire transcript (including chunks past char 3000) into the first chunk's room,
+    and terminal dumps must land in 'logs' without dropping verbatim content."""
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+
+    # Make chunk 0 pad well past the old 3000-char file prefix so later chunks
+    # would never even have been inspected by per-file content[:3000] scoring.
+    tech_padding = "We refactored the python function and database server query. " * 55
+    transcript = convo_dir / "multi_topic.txt"
+    transcript.write_text(
+        f"> Can we debug this python function and database server error?\n{tech_padding}\n\n"
+        "> How should we structure the service architecture and module interface?\n"
+        "Let's design a clean component layer and schema pattern for the service.\n\n"
+        "> What is the sprint roadmap and milestone deadline for the backlog?\n"
+        "Our priority plan sets the spec scope and requirements for next week.\n\n"
+        "> Why did we switch storage engines in git?\n"
+        "We decided and chose to migrate after weighing the trade-off and alternatives.\n\n"
+        "> Can you share the README documentation and tutorial guide for the API?\n"
+        "Yes, I updated the docs walkthrough and changelog docstring examples.\n\n"
+        "> What did the terminal print during deploy?\n"
+        "\x1b[32mDeploying Metadata...\x1b[0m\n"
+        "\x1b[36mDeploy ID: 0Af8c00000\x1b[0m\n"
+        "-rw-r--r--  1 dev staff  4096 Nov 11 10:00 app.py\n"
+        "drwxr-xr-x  5 dev staff   160 Nov 11 10:00 tests\n",
+        encoding="utf-8",
+    )
+
+    palace_path = str(tmp_path / "palace")
+
+    # Dry-run reports per-chunk room breakdown without mutating disk.
+    mine_convos(str(convo_dir), palace_path, wing="proj", dry_run=True)
+    dry_out = capsys.readouterr().out
+    assert "[DRY RUN] multi_topic.txt ->" in dry_out
+    for expected_room in (
+        "technical",
+        "architecture",
+        "planning",
+        "decisions",
+        "documentation",
+        "logs",
+    ):
+        assert f"{expected_room}:" in dry_out
+
+    # Real mine files every chunk verbatim under its own classified room.
+    mine_convos(str(convo_dir), palace_path, wing="proj")
+    capsys.readouterr()
+
+    col = palace.get_collection(palace_path)
+    stored = col.get(
+        where={"source_file": str(transcript.resolve())},
+        include=["documents", "metadatas"],
+    )
+    drawers = sorted(
+        [
+            (meta["chunk_index"], meta["room"], doc)
+            for doc, meta in zip(stored["documents"], stored["metadatas"])
+            if meta.get("room") != "_registry"
+        ],
+        key=lambda row: row[0],
+    )
+    rooms_in_order = [room for _, room, _ in drawers]
+    assert rooms_in_order[0] == "technical"
+    assert rooms_in_order[-5:] == [
+        "architecture",
+        "planning",
+        "decisions",
+        "documentation",
+        "logs",
+    ]
+    # Verbatim terminal text is preserved inside the 'logs' drawer, never dropped.
+    assert any(
+        room == "logs" and "Deploying Metadata..." in doc and "drwxr-xr-x" in doc
+        for _, room, doc in drawers
+    )

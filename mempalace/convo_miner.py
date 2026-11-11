@@ -11,9 +11,10 @@ Same palace as project mining. Different ingest strategy.
 import json
 import logging
 import os
+import re
 import stat
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -418,6 +419,74 @@ def _chunk_by_paragraph(content: str, chunk_size: int, min_chunk_size: int) -> l
 # =============================================================================
 
 TOPIC_KEYWORDS = {
+    "architecture": [
+        "architecture",
+        "design",
+        "pattern",
+        "structure",
+        "schema",
+        "interface",
+        "module",
+        "component",
+        "service",
+        "layer",
+    ],
+    "planning": [
+        "plan",
+        "planning",
+        "roadmap",
+        "milestone",
+        "deadline",
+        "priority",
+        "sprint",
+        "backlog",
+        "scope",
+        "requirement",
+        "requirements",
+        "spec",
+    ],
+    "decisions": [
+        "decide",
+        "decided",
+        "decision",
+        "chose",
+        "picked",
+        "switched",
+        "migrated",
+        "replaced",
+        "trade-off",
+        "tradeoff",
+        "alternative",
+        "alternatives",
+        "option",
+        "options",
+        "approach",
+    ],
+    "problems": [
+        "problem",
+        "problems",
+        "issue",
+        "broken",
+        "failed",
+        "failure",
+        "crash",
+        "crashed",
+        "stuck",
+        "workaround",
+        "fix",
+        "solved",
+        "resolved",
+    ],
+    "documentation": [
+        "documentation",
+        "docs",
+        "readme",
+        "tutorial",
+        "guide",
+        "changelog",
+        "docstring",
+        "walkthrough",
+    ],
     "technical": [
         "code",
         "python",
@@ -433,67 +502,83 @@ TOPIC_KEYWORDS = {
         "debug",
         "refactor",
     ],
-    "architecture": [
-        "architecture",
-        "design",
-        "pattern",
-        "structure",
-        "schema",
-        "interface",
-        "module",
-        "component",
-        "service",
-        "layer",
-    ],
-    "planning": [
-        "plan",
-        "roadmap",
-        "milestone",
-        "deadline",
-        "priority",
-        "sprint",
-        "backlog",
-        "scope",
-        "requirement",
-        "spec",
-    ],
-    "decisions": [
-        "decided",
-        "chose",
-        "picked",
-        "switched",
-        "migrated",
-        "replaced",
-        "trade-off",
-        "alternative",
-        "option",
-        "approach",
-    ],
-    "problems": [
-        "problem",
-        "issue",
-        "broken",
-        "failed",
-        "crash",
-        "stuck",
-        "workaround",
-        "fix",
-        "solved",
-        "resolved",
-    ],
 }
+
+# Ubiquitous coding-session tokens appear as background vocabulary in almost
+# every engineering exchange. Down-weight them so specific topic rooms win
+# unless an exchange is genuinely generic implementation work, and require at
+# least two weak hits (or one strong hit) before assigning ``technical``.
+_WEAK_TECHNICAL_KEYWORDS = frozenset({"code", "test", "api", "deploy", "git"})
+_WEAK_TECHNICAL_WEIGHT = 0.25
+_TECHNICAL_MIN_SCORE = 0.5
+_SPECIFIC_ROOM_THRESHOLD = 2
+_ROOM_SAMPLE_CHARS = 6000
+
+_WORD_TOKEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_LS_LONG_LINE_RE = re.compile(r"(?m)^\s*[cbdlps-][rwxstST-]{9}[+@.]?\s+\d+\s+")
+_DEPLOY_PROGRESS_RE = re.compile(
+    r"(?im)(?:^\s*(?:deploy\s+id\b|deploying\s+\w+|deployment\s+status\b)"
+    r"|[█▓▒░=#>-]{5,}\s*\d{1,3}%)"
+)
+
+
+def _is_terminal_noise(sample: str) -> bool:
+    """Return True when a chunk is dominated by raw terminal or deploy log output."""
+    if len(_ANSI_CSI_RE.findall(sample)) >= 2:
+        return True
+    if len(_LS_LONG_LINE_RE.findall(sample)) >= 2:
+        return True
+    return len(_DEPLOY_PROGRESS_RE.findall(sample)) >= 2
+
+
+def _keyword_matches(kw: str, tokens: set[str], sample_lower: str) -> bool:
+    """Match a keyword on word boundaries rather than raw substrings."""
+    if " " not in kw:
+        return kw in tokens
+    return bool(re.search(rf"\b{re.escape(kw)}\b", sample_lower))
 
 
 def detect_convo_room(content: str) -> str:
-    """Score conversation content against topic keywords."""
-    content_lower = content[:3000].lower()
-    scores = {}
+    """Classify a conversation chunk into a topic room.
+
+    Routes raw terminal/deploy log dumps to ``logs``, prefers specific rooms
+    (``architecture``, ``planning``, ``decisions``, ``problems``,
+    ``documentation``) over down-weighted generic coding tokens, and falls back
+    to ``technical`` or ``general`` when no specific room dominates.
+    """
+    if not content:
+        return "general"
+    sample = content[:_ROOM_SAMPLE_CHARS]
+    if _is_terminal_noise(sample):
+        return "logs"
+
+    sample_lower = sample.lower()
+    tokens = set(_WORD_TOKEN_RE.findall(sample_lower))
+
+    specific_scores: dict[str, int] = {}
     for room, keywords in TOPIC_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in content_lower)
+        if room == "technical":
+            continue
+        score = sum(1 for kw in keywords if _keyword_matches(kw, tokens, sample_lower))
         if score > 0:
-            scores[room] = score
-    if scores:
-        return max(scores, key=scores.get)
+            specific_scores[room] = score
+
+    tech_keywords = TOPIC_KEYWORDS.get("technical", ())
+    tech_score = sum(
+        _WEAK_TECHNICAL_WEIGHT if kw in _WEAK_TECHNICAL_KEYWORDS else 1.0
+        for kw in tech_keywords
+        if _keyword_matches(kw, tokens, sample_lower)
+    )
+
+    if specific_scores:
+        best_room = max(specific_scores, key=specific_scores.get)
+        best_specific = specific_scores[best_room]
+        if best_specific >= _SPECIFIC_ROOM_THRESHOLD or best_specific >= tech_score:
+            return best_room
+
+    if tech_score >= _TECHNICAL_MIN_SCORE:
+        return "technical"
     return "general"
 
 
@@ -676,8 +761,13 @@ def _file_chunks_locked(
                 source_mtime = None
         drawers = []
         for chunk in chunks:
-            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
+                chunk_room = chunk.get("memory_type", room) or "general"
+                room_counts_delta[chunk_room] += 1
+            elif room is not None:
+                chunk_room = room
+            else:
+                chunk_room = chunk.get("room") or detect_convo_room(chunk["content"])
                 room_counts_delta[chunk_room] += 1
             meta = {
                 "wing": wing,
@@ -919,7 +1009,7 @@ def _print_room_counts(room_counts) -> None:
     if room_counts:
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"    {room:20} {count} files")
+            print(f"    {room:20} {count} drawers")
 
 
 def _yield_and_reopen(palace_path: str, collection, dry_run: bool):
@@ -1093,32 +1183,26 @@ def _mine_convos_impl(
                     )
                 continue
 
-            # Detect room from content (general mode uses memory_type instead)
+            # Classify each chunk into its own room rather than scoring only the
+            # file's opening characters and collapsing the whole transcript.
+            room = None
             if extract_mode != "general":
-                room = detect_convo_room(content)
-            else:
-                room = None  # set per-chunk below
+                for chunk in chunks:
+                    chunk.setdefault("room", detect_convo_room(chunk["content"]))
 
             if dry_run:
-                if extract_mode == "general":
-                    from collections import Counter
-
-                    type_counts = Counter(c.get("memory_type", "general") for c in chunks)
-                    types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                    print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
-                    for t, n in type_counts.items():
-                        room_counts[t] += n
-                else:
-                    print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
-                    room_counts[room] += 1
+                room_key = "memory_type" if extract_mode == "general" else "room"
+                label = "memories" if extract_mode == "general" else "drawers"
+                type_counts = Counter(c.get(room_key, "general") for c in chunks)
+                types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
+                print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} {label} ({types_str})")
+                for t, n in type_counts.items():
+                    room_counts[t] += n
                 total_drawers += len(chunks)
                 files_mined += 1
                 if limit > 0 and files_mined >= limit:
                     break
                 continue
-
-            if extract_mode != "general":
-                room_counts[room] += 1
 
             # Lock + file fresh chunks + drop stale ones. Lock serializes
             # concurrent agents; the prune removes pre-v2 drawers so the schema

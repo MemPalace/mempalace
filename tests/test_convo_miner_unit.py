@@ -432,6 +432,89 @@ class TestDetectConvoRoom:
         content = "Hello, how are you doing today? The weather is nice."
         assert detect_convo_room(content) == "general"
 
+    def test_empty_content_returns_general(self):
+        assert detect_convo_room("") == "general"
+
+    def test_word_boundaries_prevent_substring_false_positives(self):
+        # Substrings like ca[pit]al/c[api]tal, di[git], ex[plan]ation, la[test], en[code]
+        # must not trigger 'api', 'git', 'plan', 'test', or 'code'.
+        assert detect_convo_room("Can you explain the capital city digit?") == "general"
+        assert detect_convo_room("Let's check the latest contest on the planet.") == "general"
+        assert detect_convo_room("We can encode unicode characters cleanly.") == "general"
+
+    def test_single_weak_coding_token_falls_back_to_general(self):
+        assert detect_convo_room("What is the dress code for dinner tonight?") == "general"
+        assert detect_convo_room("Let's test the waters tomorrow morning.") == "general"
+
+    def test_multiple_weak_coding_tokens_route_to_technical(self):
+        assert detect_convo_room("Push the code to git and run the api test.") == "technical"
+
+    def test_specific_rooms_win_over_background_coding_tokens(self):
+        assert (
+            detect_convo_room(
+                "How should we design the module architecture for our Python API code in git?"
+            )
+            == "architecture"
+        )
+        assert (
+            detect_convo_room("What is our sprint roadmap to test and deploy the server?")
+            == "planning"
+        )
+        assert (
+            detect_convo_room(
+                "We decided to switch our git code and chose a new API deploy approach."
+            )
+            == "decisions"
+        )
+        assert (
+            detect_convo_room("The server deploy failed and left the build broken in git code.")
+            == "problems"
+        )
+        assert (
+            detect_convo_room(
+                "Let's write the README documentation and tutorial guide for the Python API."
+            )
+            == "documentation"
+        )
+
+    def test_single_specific_keyword_beats_weak_technical_tokens(self):
+        assert detect_convo_room("Should we update the roadmap for this API git deploy?") == (
+            "planning"
+        )
+
+    def test_terminal_ansi_ls_and_deploy_noise_route_to_logs(self):
+        ansi_dump = "\x1b[32mPASS\x1b[0m src/api.py\n\x1b[31mFAIL\x1b[0m tests/test_code.py"
+        assert detect_convo_room(ansi_dump) == "logs"
+
+        ls_dump = (
+            "total 48\n"
+            "-rw-r--r--  1 dev staff  4096 Nov 11 10:00 code.py\n"
+            "drwxr-xr-x  5 dev staff   160 Nov 11 10:00 tests\n"
+        )
+        assert detect_convo_room(ls_dump) == "logs"
+
+        deploy_dump = "Deploy ID: 0Af8c000001\nDeploying Metadata...\n[==========          ] 50%\n"
+        assert detect_convo_room(deploy_dump) == "logs"
+
+    def test_multiword_custom_keyword_uses_word_boundaries(self, monkeypatch):
+        import mempalace.convo_miner as cm
+
+        custom = dict(cm.TOPIC_KEYWORDS, release_ops=["canary rollout"])
+        monkeypatch.setitem(cm.__dict__, "TOPIC_KEYWORDS", custom)
+        assert detect_convo_room("Let's start the canary rollout now.") == "release_ops"
+
+    def test_detect_convo_room_always_returns_valid_room_slug(self):
+        from hypothesis import given, strategies as st
+
+        from mempalace.config import sanitize_name
+
+        @given(st.text(min_size=0, max_size=500))
+        def _check(text: str):
+            room = detect_convo_room(text)
+            assert sanitize_name(room, "room") == room
+
+        _check()
+
 
 class TestScanConvos:
     def test_scan_finds_txt_and_md(self, tmp_path):
