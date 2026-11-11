@@ -621,7 +621,6 @@ EXPECTED = {
 }
 
 
-
 def test_conversation_visibility_precedes_sqlite_lexical_and_bm25_candidate_limits(palace):
     """A torn B must neither leak nor take the sole candidate slot from A."""
     from mempalace.searcher import _bm25_only_via_sqlite

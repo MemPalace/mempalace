@@ -1057,7 +1057,6 @@ def _sqlite_ready_metadata_segment(conn, collection_name):
     return collection_id, segment_id
 
 
-
 def _install_sqlite_convo_visibility(conn, collection_name: str) -> None:
     """Apply source-wide conversation completeness inside this SQLite snapshot.
 
