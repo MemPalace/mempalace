@@ -1,0 +1,135 @@
+/* Deck bots: one canvas for tiles, one centred column for a conversation.
+   At a 1200px canvas: 3 × (1172 / 3) + 2 × 14 = 1200. */
+:root[data-ui="deck"] .bots { grid-template-columns: minmax(0, 1fr); background: var(--bg); }
+:root[data-ui="deck"] .bots[data-pane="roster"] .bots-thread,
+:root[data-ui="deck"] .bots[data-pane="thread"] .bots-roster { display: none; }
+:root[data-ui="deck"] .bots-roster { border: 0; padding: 24px var(--deck-gutter) 28px; gap: 20px; }
+:root[data-ui="deck"] .bots-bar { min-height: 40px; padding: 0; border: 0; justify-content: flex-start; gap: 16px; flex-wrap: wrap; }
+:root[data-ui="deck"] .bots-bar h1 { font-size: 24px; line-height: 30px; font-weight: 600; letter-spacing: -.01em; }
+:root[data-ui="deck"] .deck-bots-intro[hidden] { display: block !important; margin: 0; color: var(--text-2); font-size: 14px; }
+:root[data-ui="deck"] .bots-roster > [data-region="model"]:empty { display: none; }
+:root[data-ui="deck"] .bots-new { margin-left: auto; min-width: 104px; min-height: 40px; padding: 0 18px; border: 0; border-radius: 999px; background: var(--text); color: var(--bg); font-weight: 500; }
+:root[data-ui="deck"] .bots-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-content: start; gap: 14px; }
+:root[data-ui="deck"] .bots-list > li { min-width: 0; }
+:root[data-ui="deck"] .bot-row { display: grid; grid-template-columns: 40px minmax(0, 1fr); grid-template-rows: 40px minmax(44px, 1fr) 18px; gap: 14px 12px; min-height: 196px; height: 100%; margin: 0; padding: 20px 22px; border: 0; border-radius: 20px; background: var(--surface); }
+:root[data-ui="deck"] .bot-row:hover { background: var(--well); }
+:root[data-ui="deck"] .bot-row[aria-current] { box-shadow: none; }
+:root[data-ui="deck"] .bot-av { width: 40px; height: 40px; border-radius: 12px; background: var(--well); color: var(--text); font-weight: 600; }
+:root[data-ui="deck"] .bot-row > .bot-av { grid-column: 1; grid-row: 1; }
+:root[data-ui="deck"] .bot-main,
+:root[data-ui="deck"] .bot-top,
+:root[data-ui="deck"] .bot-side { display: contents; }
+:root[data-ui="deck"] .bot-name { grid-column: 2; grid-row: 1; align-self: start; font-size: 16px; line-height: 22px; font-weight: 600; }
+:root[data-ui="deck"] .deck-bot-job[hidden] { display: block !important; grid-column: 2; grid-row: 1; align-self: end; font-size: 13px; line-height: 18px; color: var(--text-3); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+:root[data-ui="deck"] .bot-line { grid-column: 1 / -1; grid-row: 2; align-self: start; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; white-space: normal; font-size: 15px; line-height: 22px; color: var(--text-2); overflow-wrap: anywhere; }
+:root[data-ui="deck"] .bot-at { display: block; grid-column: 2; grid-row: 3; justify-self: end; align-self: center; font-size: 13px; }
+:root[data-ui="deck"] .deck-bot-state[hidden] { display: block !important; grid-column: 1 / -1; grid-row: 3; justify-self: start; align-self: center; max-width: calc(100% - 52px); font-size: 13px; line-height: 18px; color: var(--text-2); }
+:root[data-ui="deck"] .deck-bot-state[data-state="needs_you"] { color: var(--wait); }
+:root[data-ui="deck"] .bot-unread,
+:root[data-ui="deck"] .bot-dot { display: none; }
+
+/* The header keeps the same region and event delegation as the classic name button. */
+:root[data-ui="deck"] .bots-head { min-height: 56px; padding: 4px var(--deck-gutter) 12px; border: 0; }
+:root[data-ui="deck"] .deck-bots-strip { display: flex; align-items: center; gap: 6px; min-width: 0; width: 100%; }
+:root[data-ui="deck"] .deck-bot-chips { display: flex; align-items: center; gap: 6px; min-width: 0; overflow-x: auto; }
+:root[data-ui="deck"] .deck-bot-chip { display: flex; flex: none; align-items: center; gap: 8px; min-height: 40px; padding: 0 14px 0 6px; border-radius: 14px; color: var(--text-2); text-decoration: none; font-weight: 500; }
+:root[data-ui="deck"] .deck-bot-chip[aria-current] { background: var(--surface); color: var(--text); }
+:root[data-ui="deck"] .deck-bot-chip .bot-av { width: 28px; height: 28px; border-radius: 9px; font-size: 12px; }
+:root[data-ui="deck"] .deck-bot-wait { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--wait); }
+:root[data-ui="deck"] .deck-bot-settings { display: grid; place-items: center; flex: none; width: 44px; min-height: 44px; padding: 0; border: 0; border-radius: 999px; background: none; color: var(--text-3); }
+:root[data-ui="deck"] .deck-bot-settings-name { display: none; }
+:root[data-ui="deck"] .deck-project-link { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-height: 44px; margin-left: auto; padding-left: 14px; color: var(--text-2); text-decoration: none; white-space: nowrap; }
+:root[data-ui="deck"] .deck-project-link .i { transform: rotate(-90deg); }
+:root[data-ui="deck"] .deck-project-short { display: none; }
+:root[data-ui="deck"] .deck-bot-chip:hover,
+:root[data-ui="deck"] .deck-bot-settings:hover { background: var(--well); }
+:root[data-ui="deck"] .deck-project-link:hover { color: var(--text); }
+
+:root[data-ui="deck"] .bots-stream { padding: 4px max(16px, calc((100% - 760px) / 2)) 10px; gap: 16px; }
+:root[data-ui="deck"] .bm { width: 100%; max-width: 100%; gap: 12px; }
+:root[data-ui="deck"] .bm.me { width: auto; max-width: min(560px, 88%); }
+:root[data-ui="deck"] .bm-bubble { max-width: 640px; padding: 0; border: 0; border-radius: 0; background: none; }
+:root[data-ui="deck"] .bm.me .bm-bubble { padding: 12px 18px; border-radius: 22px 22px 6px 22px; background: var(--accent-weak); }
+:root[data-ui="deck"] .bm-text { font-size: 16px; line-height: 24px; }
+:root[data-ui="deck"] .acts { font-size: 13px; line-height: 20px; }
+:root[data-ui="deck"] .bb { width: min(600px, 100%); border: 0; border-radius: 20px; background: var(--surface); }
+:root[data-ui="deck"] .bb.work { border-radius: 16px; }
+:root[data-ui="deck"] .bb-head { min-height: 52px; padding: 10px 16px; gap: 12px; }
+:root[data-ui="deck"] .bb-title { font-weight: 600; }
+:root[data-ui="deck"] .bots .chip { padding: 2px 10px; font-size: 12px; line-height: 20px; font-weight: 500; white-space: nowrap; }
+:root[data-ui="deck"] .bots .chip.blocked { background: var(--block-bg); }
+:root[data-ui="deck"] .bb-body { padding: 0 16px 14px; border: 0; color: var(--text-2); }
+:root[data-ui="deck"] .bb.decision,
+:root[data-ui="deck"] .bb.confirm,
+:root[data-ui="deck"] .bb.setup { padding: 18px 22px; gap: 8px; }
+:root[data-ui="deck"] .bb.decision[data-state="open"]::before,
+:root[data-ui="deck"] .bb.confirm[data-state="open"]::before { content: "Waiting on you"; color: var(--wait); font-size: 13px; font-weight: 500; }
+:root[data-ui="deck"] .bb.confirm .bb-label,
+:root[data-ui="deck"] .bb-q { font-size: 17px; line-height: 24px; font-weight: 600; }
+:root[data-ui="deck"] .bb-ctx { font-size: 15px; line-height: 22px; }
+:root[data-ui="deck"] .bb-opt { min-height: 44px; padding: 0 18px; border: 0; border-radius: 999px; background: var(--accent-weak); font-weight: 500; }
+:root[data-ui="deck"] .bb-opt.go,
+:root[data-ui="deck"] .bb.decision .bb-btns .bb-opt:first-child { background: var(--text); color: var(--bg); }
+:root[data-ui="deck"] .bb-btns { gap: 8px; margin-top: 8px; }
+:root[data-ui="deck"] .bb-reply input { border: 0; background: var(--well); }
+:root[data-ui="deck"] .bb.setup { color: var(--text-2); }
+:root[data-ui="deck"] .bots-thread > [data-region="waiting"],
+:root[data-ui="deck"] .bots-thread > [data-region="notice"] { width: min(760px, calc(100% - 32px)); margin-inline: auto; }
+:root[data-ui="deck"] .wait { border: 0; border-radius: 20px; background: var(--surface); }
+:root[data-ui="deck"] .bots .wait-toggle { padding-inline: 18px; color: var(--wait); }
+:root[data-ui="deck"] .wait-list { padding-inline: 0; }
+:root[data-ui="deck"] .wait-list .bb { width: 100%; }
+:root[data-ui="deck"] .bots-compose { padding: 10px max(16px, calc((100% - 760px) / 2)) max(20px, env(safe-area-inset-bottom)); border: 0; background: var(--bg); }
+:root[data-ui="deck"] .bots-box { padding: 6px 6px 6px 18px; border: 0; border-radius: 28px; background: var(--well); }
+:root[data-ui="deck"] .bots-box textarea { font-size: 16px; line-height: 24px; padding-left: 0; }
+:root[data-ui="deck"] .bots-box:focus-within { box-shadow: 0 0 0 2px var(--line-strong); }
+:root[data-ui="deck"] .bots .bots-send { border: 0; border-radius: 999px; background: var(--text); color: var(--bg); }
+:root[data-ui="deck"] .bots .bots-send.stop { background: var(--accent-weak); color: var(--text); }
+
+:root[data-ui="deck"] .deck-project { width: min(900px, 100%); gap: 14px; padding: 22px; background: var(--bg); }
+:root[data-ui="deck"] .deck-project > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+:root[data-ui="deck"] .deck-project h2 { font-size: 24px; line-height: 30px; font-weight: 600; }
+:root[data-ui="deck"] .deck-project header p { margin: 6px 0 0; color: var(--text-2); }
+:root[data-ui="deck"] .deck-project-group { padding: 18px 22px; border-radius: 20px; background: var(--surface); }
+:root[data-ui="deck"] .deck-project-group h3 { margin: 0 0 8px; font-size: 14px; font-weight: 500; }
+:root[data-ui="deck"] .deck-project-group ul { list-style: none; margin: 0; padding: 0; }
+:root[data-ui="deck"] .deck-project-group li { display: flex; align-items: center; gap: 12px; min-height: 60px; padding-block: 8px; }
+:root[data-ui="deck"] .deck-project-group li > div { min-width: 0; }
+:root[data-ui="deck"] .deck-project-group b { font-weight: 500; overflow-wrap: anywhere; }
+:root[data-ui="deck"] .deck-project-group p { margin: 2px 0 0; font-size: 13px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+:root[data-ui="deck"] .deck-project-group .chip { min-width: 84px; text-align: center; }
+:root[data-ui="deck"] .bots a:focus-visible,
+:root[data-ui="deck"] .bots button:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+
+@media (min-width: 700px) and (max-width: 1023px) {
+  :root[data-ui="deck"] .bots-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 699px) {
+  :root[data-ui="deck"] .bots-roster { padding: 18px 16px 20px; gap: 16px; }
+  :root[data-ui="deck"] .bots-list { grid-template-columns: minmax(0, 1fr); }
+  :root[data-ui="deck"] .bots-bar { gap: 4px 12px; }
+  :root[data-ui="deck"] .deck-bots-intro { flex-basis: 100%; order: 3; }
+  :root[data-ui="deck"] .bots-new { min-height: 44px; }
+  :root[data-ui="deck"] .bot-row { min-height: 0; grid-template-rows: 40px auto 18px; gap: 10px 12px; }
+  :root[data-ui="deck"] .bots-head { min-height: 60px; padding: 8px; }
+  :root[data-ui="deck"] .deck-bot-chips { display: none; }
+  :root[data-ui="deck"] .deck-bot-settings { flex: 1; min-width: 0; width: auto; justify-content: start; text-align: left; color: var(--text); font-size: 16px; font-weight: 500; }
+  :root[data-ui="deck"] .deck-bot-settings-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  :root[data-ui="deck"] .deck-bot-settings .i { display: none; }
+  :root[data-ui="deck"] .deck-project-long { display: none; }
+  :root[data-ui="deck"] .deck-project-short { display: inline; }
+  :root[data-ui="deck"] .deck-project-link { padding: 0 6px; }
+  :root[data-ui="deck"] .bots-back { display: inline-flex; flex: none; justify-content: center; min-width: 44px; margin: 0; padding: 0 8px; color: var(--text-2); }
+  :root[data-ui="deck"] .bots-stream { padding-top: 4px; }
+  :root[data-ui="deck"] .bb.decision,
+  :root[data-ui="deck"] .bb.confirm,
+  :root[data-ui="deck"] .bb.setup { padding: 18px; }
+  :root[data-ui="deck"] .bb-head { flex-wrap: wrap; gap: 6px 12px; }
+  :root[data-ui="deck"] .bb-head .bb-title { flex: 1; }
+  :root[data-ui="deck"] .bb-btns .bb-opt { flex: 1; }
+  :root[data-ui="deck"] .bots-compose { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+  :root[data-ui="deck"] .deck-project { padding: 16px; }
+  :root[data-ui="deck"] .deck-project-group { padding: 18px; }
+  :root[data-ui="deck"] .deck-project-group li { align-items: flex-start; flex-direction: column; gap: 6px; padding-block: 12px; }
+  :root[data-ui="deck"] .deck-project-group .chip { min-width: 0; }
+}

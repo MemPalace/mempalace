@@ -70,8 +70,8 @@ export function rosterHTML({ bots, current = null, loaded = true }, e) {
     const dot = own(DOT, bot.state) ? `<span class="bot-dot ${e(bot.state)}" role="img" aria-label="${DOT[bot.state]}"></span>` : "";
     return `<li><a class="bot-row" href="#/bots/${enc(bot.id)}" data-bot="${e(bot.id)}"${bot.id === current ? ' aria-current="page"' : ""}>
       <span class="bot-av" aria-hidden="true">${e(initial(bot.name))}</span>
-      <span class="bot-main"><span class="bot-top"><b class="bot-name">${e(bot.name)}</b>${bot.last?.at ? `<time class="bot-at" datetime="${e(bot.last.at)}">${e(elapsed(bot.last.at))}</time>` : ""}</span><span class="bot-line">${marked(line, e)}</span></span>
-      <span class="bot-side">${unread}${dot}</span></a></li>`;
+      <span class="bot-main"><span class="bot-top"><b class="bot-name">${e(bot.name)}</b><span class="deck-bot-job" hidden>${e(oneLine(bot.job))}</span>${bot.last?.at ? `<time class="bot-at" datetime="${e(bot.last.at)}">${e(elapsed(bot.last.at))}</time>` : ""}</span><span class="bot-line">${marked(line, e)}</span></span>
+      <span class="bot-side">${unread}${dot}<span class="deck-bot-state" data-state="${e(bot.state)}" hidden>${own({ needs_you: "Waiting on you", working: "Working" }, bot.state, "Idle")}</span></span></a></li>`;
   }).join("");
 }
 
@@ -177,6 +177,45 @@ export function headHTML(bot, e) {
   return `<a class="bots-back" href="#/bots">${back}<span>${e(BOTS_COPY.title)}</span></a><button type="button" class="bots-name" data-bots-action="sheet" aria-haspopup="dialog"><span class="bot-av" aria-hidden="true">${e(initial(bot.name))}</span><span class="bots-title"><b>${e(bot.name)}</b>${bot.job ? `<small>${e(oneLine(bot.job))}</small>` : ""}</span></button>`;
 }
 
+export function stripHTML(bots, bot, e) {
+  // Keep the selected bot available even if the roster request has not finished yet.
+  const list = bots.some((b) => b.id === bot.id) ? bots : [bot, ...bots];
+  return `<nav class="deck-bots-strip" aria-label="Bots"><a class="bots-back" href="#/bots" aria-label="Back to bots">${back}</a><div class="deck-bot-chips">${list.map((b) => `<a class="deck-bot-chip" href="#/bots/${enc(b.id)}"${b.id === bot.id ? ' aria-current="page"' : ""}><span class="bot-av" aria-hidden="true">${e(initial(b.name))}</span><span>${e(b.name)}</span>${b.state === "needs_you" ? '<span class="deck-bot-wait" role="img" aria-label="Waiting on you"></span>' : ""}</a>`).join("")}</div><button type="button" class="deck-bot-settings" data-bots-action="sheet" aria-label="${e(bot.name)} settings and memory" title="Bot settings and memory"><span class="deck-bot-settings-name">${e(bot.name)}</span>${chevron}</button>${bot.board ? `<a class="deck-project-link" href="#/bots/${enc(bot.id)}" data-bots-action="project"><span class="deck-project-long">What ${e(bot.name)} is doing</span><span class="deck-project-short">Project</span>${chevron}</a>` : ""}</nav>`;
+}
+
+/** Mirror bots.blocks.work_status over the person's existing project read projection. */
+export function projectWork(item) {
+  let status, note = "";
+  if (item.status === "done") status = "done";
+  else if (item.status === "review") {
+    if (item.review_kind !== "decision") status = "ready";
+    else if (item.need === "you") status = "needs_you";
+    else { status = "blocked"; note = "Waiting for an answer"; }
+  } else if (item.waiting) {
+    status = "blocked";
+    note = item.waiting.text || "";
+    if (item.waiting.code === "claim_expired") note = note.replace("hand the card off", "hand the task off");
+  }
+  else status = item.status === "doing" ? "working" : "queued";
+  return { ...item, status, note: oneLine(note || item.status_line) };
+}
+
+export function projectHTML(sheet, bot, e, now = new Date()) {
+  const week = new Date(now);
+  week.setHours(0, 0, 0, 0);
+  week.setDate(week.getDate() - (week.getDay() + 6) % 7);
+  const groups = new Map([["Needs you", []], ["Working", []], ["Blocked", []], ["Queued", []], ["Done this week", []]]);
+  for (const raw of sheet.items || []) {
+    const item = projectWork(raw);
+    if (item.status === "done") {
+      const at = Date.parse(item.done_at);
+      if (at >= week.getTime() && at <= now.getTime()) groups.get("Done this week").push(item);
+    } else groups.get(own({ needs_you: "Needs you", ready: "Needs you", working: "Working", blocked: "Blocked" }, item.status, "Queued")).push(item);
+  }
+  const rows = [...groups].filter(([, items]) => items.length).map(([label, items]) => `<section class="deck-project-group"><h3>${label}</h3><ul>${items.map((item) => `<li><span class="chip ${item.status}">${STATUS[item.status]}</span><div><b>${marked(item.title ?? "", e)}</b>${item.note ? `<p>${marked(item.note, e)}</p>` : ""}</div></li>`).join("")}</ul></section>`).join("");
+  return `<div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-h"><div class="sheet-body deck-project"><header><div><h2 id="sheet-h">What ${e(bot.name)} is doing</h2>${bot.job ? `<p>${e(bot.job)}</p>` : ""}</div><button type="button" class="bb-opt" data-bots-action="close" data-focus>Close</button></header>${sheet.loading ? `<p class="bots-note">${e(BOTS_COPY.loading)}</p>` : sheet.error ? '<p class="bots-note" role="alert">This project’s work is unavailable. Close and try again.</p>' : rows || '<p class="bots-note">No open work or work finished this week.</p>'}</div></div>`;
+}
+
 export function composerHTML(bot, e) {
   return `<div class="bots-box"><textarea name="text" rows="1" maxlength="${MAX_TEXT}" aria-label="Message to ${e(bot.name)}" placeholder="Message ${e(bot.name)}" enterkeyhint="send"></textarea><span data-region="send"></span></div>`;
 }
@@ -188,6 +227,7 @@ export function sendButtonHTML({ busy, canStop }) {
 }
 
 export function sheetHTML(sheet, bot, e) {
+  if (sheet.kind === "project") return projectHTML(sheet, bot, e);
   if (sheet.kind === "new") {
     return `<div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-h"><form class="sheet-body" data-bots-form="create"><h2 id="sheet-h">New bot</h2>
       <label>Name<input name="name" maxlength="60" required autocomplete="off" data-focus></label>
@@ -214,7 +254,7 @@ export function sheetHTML(sheet, bot, e) {
 
 const shellHTML = `<div class="bots" data-pane="roster">
   <section class="bots-roster" aria-labelledby="bots-h">
-    <header class="bots-bar"><h1 id="bots-h">${BOTS_COPY.title}</h1><button type="button" class="bots-new" data-bots-action="new">${BOTS_COPY.newBot}</button></header>
+    <header class="bots-bar"><h1 id="bots-h">${BOTS_COPY.title}</h1><p class="deck-bots-intro" hidden>One thread per bot. Tap one to talk.</p><button type="button" class="bots-new" data-bots-action="new">${BOTS_COPY.newBot}</button></header>
     <div data-region="model"></div>
     <ul class="bots-list" data-region="roster"></ul>
   </section>
@@ -275,6 +315,7 @@ export function createBots({
   const busy = () => Boolean(s.turn) || s.running;
   const ctx = () => ({ open: s.open, busy: s.busy });
   const runningRequestId = () => s.turn?.requestId || (s.running ? [...s.messages].reverse().find((m) => m.role === "user")?.request_id : "") || "";
+  const deck = () => globalThis.document?.documentElement?.dataset?.ui === "deck";
 
   // --- painting ---
   function paintRoster() {
@@ -282,6 +323,7 @@ export function createBots({
     if (node) node.innerHTML = rosterHTML({ bots: s.bots, current: s.botId, loaded: s.loaded }, e);
     const model = region("model");
     if (model) model.innerHTML = modelNoteHTML({ model: s.model, canConfigure: s.canConfigure, error: s.error }, e);
+    if (deck()) paintHead();
   }
   function paintMessages({ force = false } = {}) {
     const node = region("messages");
@@ -321,17 +363,37 @@ export function createBots({
   }
   function paintThread() {
     host()?.querySelector(".bots")?.setAttribute?.("data-pane", s.botId ? "thread" : "roster");
-    const head = region("head"), composer = region("composer");
-    if (head) head.innerHTML = s.bot ? headHTML(s.bot, e) : "";
+    const composer = region("composer");
+    paintHead();
     if (composer) {
       composer.innerHTML = s.bot ? composerHTML(s.bot, e) : "";
       const box = composer.querySelector?.('textarea[name="text"]');
       if (box && s.drafts.get(s.botId)) { box.value = s.drafts.get(s.botId); fit(box); }
+      takeDraft();
     }
     paintMessages({ force: true });
     paintWaiting();
     paintNotice();
     paintSend();
+  }
+  function paintHead() {
+    const head = region("head");
+    if (head) head.innerHTML = s.bot ? deck() ? stripHTML(s.bots, s.bot, e) : headHTML(s.bot, e) : "";
+  }
+  function takeDraft() {
+    const box = composerBox();
+    if (!s.bot || !s.ready || !box || s.notice?.gone) return;
+    try {
+      const storage = globalThis.sessionStorage, raw = storage?.getItem("cmmn.deck.draft");
+      if (raw === null || raw === undefined) return;
+      let draft;
+      try { draft = JSON.parse(raw); } catch { storage.removeItem("cmmn.deck.draft"); return; }
+      if (!draft || typeof draft.bot !== "string" || typeof draft.text !== "string") { storage.removeItem("cmmn.deck.draft"); return; }
+      if (draft.bot !== s.botId) return;
+      setComposer(draft.text);
+      box.focus?.();
+      storage.removeItem("cmmn.deck.draft");
+    } catch { /* Storage can be disabled; the composer still works. */ }
   }
   function fit(box) {
     if (!box?.style) return;
@@ -572,6 +634,18 @@ export function createBots({
 
   // --- sheets ---
   async function openSheet(kind) {
+    if (kind === "project") {
+      if (!deck() || !s.bot?.board) return;
+      const sheet = s.sheet = { kind, loading: true, items: [], error: "", painted: false };
+      const token = generation, id = s.botId;
+      paintSheet();
+      try {
+        const result = await api(`/api/boards/${enc(s.bot.board)}/cards`);
+        if (alive(token) && s.botId === id && s.sheet === sheet) sheet.items = [...(result.cards || []), ...(result.children || [])];
+      } catch { if (alive(token) && s.sheet === sheet) sheet.error = "unavailable"; }
+      if (alive(token) && s.sheet === sheet) { sheet.loading = false; sheet.painted = false; paintSheet(); }
+      return;
+    }
     s.sheet = { kind, busy: false, error: "", confirmArchive: false, memories: kind === "bot" ? null : undefined, painted: false };
     paintSheet();
     if (kind !== "bot") return;
@@ -581,7 +655,7 @@ export function createBots({
       if (s.sheet === sheet) { sheet.memories = result.memories || []; paintSheet(); }
     } catch (error) { if (s.sheet === sheet) { sheet.memories = []; sheet.error = error.message; paintSheet(); } }
   }
-  function closeSheet() { s.sheet = null; paintSheet(); region("head")?.querySelector?.(".bots-name")?.focus?.(); }
+  function closeSheet() { const project = s.sheet?.kind === "project"; s.sheet = null; paintSheet(); region("head")?.querySelector?.(deck() ? project ? ".deck-project-link" : ".deck-bot-settings" : ".bots-name")?.focus?.(); }
   async function sheetCall(sheet, work) {
     sheet.busy = true; sheet.error = ""; paintSheet();
     try { return await work(); }
@@ -645,6 +719,7 @@ export function createBots({
     switch (d.botsAction) {
       case "new": void openSheet("new"); break;
       case "sheet": void openSheet("bot"); break;
+      case "project": void openSheet("project"); break;
       case "close": closeSheet(); break;
       case "retry": { const token = generation; s.error = ""; void loadRoster(token); if (s.botId) void loadThread(token, s.botId); break; }
       case "toggle": if (s.open.has(d.key)) s.open.delete(d.key); else s.open.add(d.key); paintMessages(); break;
@@ -726,7 +801,7 @@ export function createBots({
       const el = host();
       if (!el) return undefined;
       // The shell asks again after unrelated route changes (a work item opened beside the thread): keep what is on screen.
-      if (wasActive && id === previous && el.querySelector(".bots")?.isConnected === true) return undefined;
+      if (wasActive && id === previous && el.querySelector(".bots")?.isConnected === true) { takeDraft(); return undefined; }
       const token = ++generation;
       active = true;
       if (id !== previous) {

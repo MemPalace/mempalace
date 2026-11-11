@@ -79,36 +79,9 @@
 :root[data-ui="deck"] .m-tabs a[aria-current] { color: var(--text); }
 :root[data-ui="deck"] .m-tabs a[aria-current]::before { content: none; }
 
-/* ---------- Bots ---------- */
-:root[data-ui="deck"] .bots-roster { border-right: 0; }
-:root[data-ui="deck"] .bots-bar, :root[data-ui="deck"] .bots-head, :root[data-ui="deck"] .bots-compose { border: 0; }
-:root[data-ui="deck"] .bots-new { border: 0; border-radius: 22px; background: var(--text); color: var(--bg); }
-:root[data-ui="deck"] .bot-row { margin: 0 8px 2px; border: 0; border-radius: 16px; }
-:root[data-ui="deck"] .bot-row[aria-current] { box-shadow: none; }
-:root[data-ui="deck"] .bot-av { border-radius: 12px; color: var(--text); }
-:root[data-ui="deck"] .bot-unread, :root[data-ui="deck"] .bot-dot.needs_you { background: var(--wait); }
-:root[data-ui="deck"] .bot-unread { color: var(--bg); }
-:root[data-ui="deck"] .bot-dot.working { background: var(--text); }
-:root[data-ui="deck"] .bm-bubble { border: 0; border-radius: 20px; padding: 10px 16px; }
-:root[data-ui="deck"] .bm.me .bm-bubble { border-bottom-right-radius: 6px; background: var(--accent-weak); }
-:root[data-ui="deck"] .bm.bot .bm-bubble { padding-left: 0; background: none; }
-:root[data-ui="deck"] .bm.event .bm-bubble { padding-left: 0; }
-:root[data-ui="deck"] .bm-text { font-size: 15px; line-height: 22px; }
-:root[data-ui="deck"] .bb { border: 0; border-radius: 16px; }
-:root[data-ui="deck"] .bb-body { border-top-color: var(--line); }
-:root[data-ui="deck"] .bb.decision, :root[data-ui="deck"] .bb.confirm, :root[data-ui="deck"] .bb.setup { padding: 16px; gap: 10px; }
-:root[data-ui="deck"] .bb.confirm { border-left: 0; }
-:root[data-ui="deck"] .bb.confirm .bb-label, :root[data-ui="deck"] .bb-q { font-size: 16px; line-height: 22px; font-weight: 600; }
-:root[data-ui="deck"] .bb-opt { border: 0; border-radius: 22px; padding: 0 18px; background: var(--well); }
-:root[data-ui="deck"] .bb-opt.go { background: var(--text); color: var(--bg); }
 :root[data-ui="deck"] .chip { background: var(--well); }
 :root[data-ui="deck"] .chip.needs_you, :root[data-ui="deck"] .chip.ready { background: var(--wait-bg); color: var(--wait); box-shadow: none; }
 :root[data-ui="deck"] .chip.working { background: var(--accent-weak); color: var(--text); }
-:root[data-ui="deck"] .wait { border: 0; }
-:root[data-ui="deck"] .bots-box { padding: 6px 6px 6px 14px; border: 0; border-radius: 26px; background: var(--well); }
-:root[data-ui="deck"] .bots-box:focus-within { box-shadow: 0 0 0 2px var(--line-strong); }
-:root[data-ui="deck"] .bots .bots-send { border: 0; border-radius: 22px; color: var(--bg); }
-:root[data-ui="deck"] .bots .bots-send.stop { background: var(--accent-weak); color: var(--text); }
 :root[data-ui="deck"] .sheet { background: rgba(0, 0, 0, .7); }
 :root[data-ui="deck"] .sheet-body { border: 0; border-radius: 20px; padding: 22px; }
 :root[data-ui="deck"] .bb-reply input, :root[data-ui="deck"] .memory-add input, :root[data-ui="deck"] .sheet-body input, :root[data-ui="deck"] .sheet-body textarea { border-color: transparent; background: var(--well); }
