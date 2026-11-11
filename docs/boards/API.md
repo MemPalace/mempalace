@@ -232,6 +232,30 @@ Ends the caller's hold and gives the card to someone else. `note` is required, s
 
 `options` (people only) requires two to six distinct choices. A substantive question and context are required; free-text replies remain available in addition to the options.
 
+### Structured decision blocks
+
+`ask` also accepts structured options: each entry of `options` is a label, or an object
+`{"label", "detail"?, "preview"?}`. `detail` is a short explanation (up to 280 characters);
+`preview` is plain text (up to 1200 characters and 24 lines: a mockup, a snippet, sample copy)
+that the app shows side by side in a fixed-width font. A structured list needs two to six
+distinct labels; unknown keys, empty or non-text values and control characters are refused.
+
+```json
+{"question": "Which header should the app use?",
+ "context": "Both variants pass the layout checks.",
+ "options": [
+   {"label": "Compact header", "detail": "One row; search moves into the menu.",
+    "preview": "[logo]  Boards  Memory   (o)"},
+   {"label": "Tall header", "preview": "[logo]\nBoards  Memory  [ search ]"},
+   "Keep the current header"]}
+```
+
+The labels are stored in `ask_options` as for a plain ask, so routing, events and `decide` do
+not change: the person answers with one label, and a choice that was not offered is refused.
+The card adds `ask_blocks`, one `{label, detail?, preview?}` per offered label (an empty list
+for a plain ask); it is cleared with the ask. `task_show` prints each option's detail and
+preview under the ask line. `task_handoff` and `task_update` take plain labels only.
+
 ```
 ok #145 → user:avery  review
 ```

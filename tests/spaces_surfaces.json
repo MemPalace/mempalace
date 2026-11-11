@@ -3,7 +3,7 @@
     "mcp": {
       "tools": [
         {
-          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
+          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason. An option is a label, or {label, detail, preview} to show a short explanation and a plain-text preview side by side; the answer is always one of the labels.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -15,8 +15,34 @@
               },
               "options": {
                 "items": {
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "detail": {
+                          "maxLength": 280,
+                          "type": "string"
+                        },
+                        "label": {
+                          "maxLength": 120,
+                          "type": "string"
+                        },
+                        "preview": {
+                          "maxLength": 1200,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "label"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
+                "maxItems": 6,
                 "type": "array"
               },
               "person_reason": {
@@ -1960,7 +1986,7 @@
     "mcp": {
       "tools": [
         {
-          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
+          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason. An option is a label, or {label, detail, preview} to show a short explanation and a plain-text preview side by side; the answer is always one of the labels.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -1972,8 +1998,34 @@
               },
               "options": {
                 "items": {
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "detail": {
+                          "maxLength": 280,
+                          "type": "string"
+                        },
+                        "label": {
+                          "maxLength": 120,
+                          "type": "string"
+                        },
+                        "preview": {
+                          "maxLength": 1200,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "label"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
+                "maxItems": 6,
                 "type": "array"
               },
               "person_reason": {
@@ -2907,7 +2959,7 @@
     "mcp": {
       "tools": [
         {
-          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
+          "description": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason. An option is a label, or {label, detail, preview} to show a short explanation and a plain-text preview side by side; the answer is always one of the labels.",
           "inputSchema": {
             "additionalProperties": false,
             "properties": {
@@ -2919,8 +2971,34 @@
               },
               "options": {
                 "items": {
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "detail": {
+                          "maxLength": 280,
+                          "type": "string"
+                        },
+                        "label": {
+                          "maxLength": 120,
+                          "type": "string"
+                        },
+                        "preview": {
+                          "maxLength": 1200,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "label"
+                      ],
+                      "type": "object"
+                    }
+                  ]
                 },
+                "maxItems": 6,
                 "type": "array"
               },
               "person_reason": {

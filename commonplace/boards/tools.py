@@ -14,6 +14,7 @@ from commonplace.extensions import (
 )
 from commonplace.http_util import log_failure
 
+from . import decision_blocks
 from .display import card_url, people
 from .priority import PRIORITIES
 from .service import APPROVALS_TRUNCATED, BoardService, _trusted_agent, approvals_text
@@ -97,6 +98,7 @@ def show(c):
         rows.append(f"space message: {c['message_id']}")
     if c["ask"]:
         rows.append(f"asks {c['ask_to']}: {quoted(c['ask'])}  options: {quoted(c['ask_options'])}")
+        rows.extend(decision_blocks.lines(c))
     for key, label in (
         ("repo", "repo"),
         ("branch", "branch"),
@@ -300,7 +302,7 @@ def add(
                 "Trusted agents may move available backlog cards of unrestricted origin to todo or doing and add lessons, PR links or memory links to done cards. "
                 "callstack takes the JSON from python -m commonplace.callstack.",
                 "task_handoff": "Hand off work with a note, or ask a person and end the turn.",
-                "ask": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason.",
+                "ask": "Ask and end the turn. Agent questions go to the authorized live board coordinator by default; otherwise the owner. Supply person_reason only when a person is required, explaining why. The coordinator may escalate with a reason. An option is a label, or {label, detail, preview} to show a short explanation and a plain-text preview side by side; the answer is always one of the labels.",
                 "decide": "Answer a review as its owner, an owner's connection holding cards:decide (asks addressed to that owner only) or the addressed live coordinator. Never answer your own ask. A coordinator may escalate to the owner with then=escalate and a reason in reply. Pass the version you read to reject decisions on an edited card.",
                 "needs_me": "Read the visible decision queue and origin releases. Eligible coordinators receive origin work without decide authority; signed-in owners receive release or configuration recovery only when needed. Ask authority remains separate.",
                 "goal_list": "Read the workspace goals tree. Cards that point at a goal show its chain in task_show and task_take_next.",
@@ -532,7 +534,7 @@ def register_tools():
         "ask",
         {
             "question": STRING,
-            "options": ARRAY,
+            "options": decision_blocks.OPTIONS_SCHEMA,
             "context": STRING,
             "board": STRING,
             "task": TASK,

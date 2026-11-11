@@ -1,0 +1,7 @@
+/* Structured decision blocks: options side by side, stacked when the panel is narrow. */
+.dblocks { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 8px; align-items: stretch; }
+.dblock { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 8px; border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
+.dblock-preview { flex: 1; margin: 0; padding: 8px; max-height: 240px; overflow: auto; border-radius: 4px; background: var(--bg); color: var(--text); font: 12px/18px var(--mono); white-space: pre; }
+.dblock-preview:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.dblock .btn { justify-content: center; min-height: 44px; white-space: normal; overflow-wrap: anywhere; text-align: center; }
+.dblock-detail { margin: 0; color: var(--text-2); font-size: 13px; line-height: 19px; white-space: pre-wrap; overflow-wrap: anywhere; }

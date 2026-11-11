@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_context TEXT,
     ask           TEXT,                             -- set while status = 'review': the question for the recipient
     ask_options   TEXT,                             -- JSON array of short choices, or NULL for free text
+    ask_blocks    TEXT,                             -- JSON array of {label, detail?, preview?} for a structured ask, else NULL
     ask_to        TEXT,                             -- recipient actor ref (authorized coordinator or person; legacy default: owner)
     return_to     TEXT,                             -- actor ref the card goes back to after the decision
     flags         TEXT,                             -- JSON array from the §9 injection check, e.g. ["curl_pipe"]

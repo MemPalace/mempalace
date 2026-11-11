@@ -12,6 +12,7 @@ from commonplace.admission import GATE
 from commonplace.extensions import ToolError
 from mempalace.sqlite_crypto import connect, row_factory
 
+from . import decision_blocks
 from .display import need_for, plan_waiting
 from .goals import GOALS_SCHEMA
 from .priority import DEFAULT_RANK, PRIORITIES, name as priority_name
@@ -42,6 +43,7 @@ TASK_COLUMNS = {
     "review_kind": "TEXT",
     "review_context": "TEXT",
     "reviewer": "TEXT",
+    "ask_blocks": "TEXT",
     "priority": f"INTEGER NOT NULL DEFAULT {DEFAULT_RANK} CHECK (priority BETWEEN 0 AND {len(PRIORITIES) - 1})",
 }
 
@@ -233,8 +235,10 @@ def card(conn, row, principal=None, *, release=None, approver=None) -> dict:
         **{
             key: row[key] if key in row.keys() else None
             for key in TASK_COLUMNS
-            if key not in ("labels", "parent_number", "pr_repo", "task_type", "priority")
+            if key
+            not in ("labels", "parent_number", "pr_repo", "task_type", "priority", "ask_blocks")
         },
+        "ask_blocks": decision_blocks.public(row),
         "priority": priority_name(row["priority"] if "priority" in row.keys() else None),
         "labels": json.loads(row["labels"] or "[]"),
         "links": len(BoardStore.links(conn, row["id"], principal)),

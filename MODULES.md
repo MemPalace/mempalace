@@ -271,6 +271,8 @@ Format (read by `commonplace orch docs-check`):
   - Live-sync instructions describe transcript-only reinstall, explicit destination and retained disabled memory history.
   - Public Space endpoint and error documentation alongside legacy board routes.
 
+  - `docs/boards/API.md` describes structured decision blocks: the `{label, detail, preview}` option shape, its bounds, and the `ask_blocks` card field; `docs/boards/schema.sql` lists the column.
+
   - Contributor and agent instructions, the mission and design notes, user and operator documentation, release history, the licence and the security policy.
 
   - `CONTRIBUTING.md` documents the hook install, the pre-push quick check and its budget, and the per-worktree environment.
@@ -674,6 +676,8 @@ Format (read by `commonplace orch docs-check`):
   - Card339 regressions exercise MCP and HTTP routing, owner fallback, person queue visibility, withdrawal history and authorization refusals. The pinned Space tool contract records the optional person_reason parameter and matching ask/review descriptions without changing tool names or profile visibility.
 
   - `tests/test_commonplace_subagent_asks.py` covers released-card questions and coordinator routing, answers, escalation and recovery.
+
+  - `tests/test_commonplace_decision_blocks.py` and its Node harness `tests/commonplace_decision_blocks.mjs` cover structured asks from the MCP call through `needs_me` and the decide route to the Needs me blocks, with refusal controls for options that were not offered and for malformed blocks.
 
   - Shared fixtures and harnesses and every test file not listed in another block.
   - Shared fixtures and harnesses and every test file not listed in another block, including binding-epoch migration, direct fences, lock-entry instrumentation and bounded reset races.
@@ -1324,12 +1328,16 @@ Format (read by `commonplace orch docs-check`):
 
   - All agent asks and review questions default to the authorized live board coordinator. Explicit person_reason is audited and routes to the owner; completion reviews and person handoffs retain their route. Missing or unavailable coordinators fall back to the owner without rewriting asks. Only a currently authorized coordinator may withdraw its own agent-directed decision to todo/doing; recipient, requester and current board appointment are checked. Person decisions and other requesters remain protected, and agents cannot answer their own asks. Withdrawal preserves history.
 
+  - `ask` accepts structured decision blocks (`boards/decision_blocks.py`): each option is a label or `{label, detail, preview}`, with 2 to 6 distinct labels, detail up to 280 characters and a plain-text preview up to 1200 characters and 24 lines. Labels stay in `ask_options`, so routing, events and `decide` are unchanged; the card adds `ask_blocks` (empty for a plain ask), which is cleared whenever the offered options change.
+
 - **How it fails:**
 
   - Hidden metadata is absent; hidden repo collisions are forbidden; unsupported shapes execute no domain method.
   - Report routing defers one event durably before advancing the global cursor; authorization retries indefinitely with fixed inspection code and persisted count/since, independent of HTTP attempts. Control persistence failures retain unacknowledged work.
 
   - A swallowed emission loses a notification but not the change (the trigger sweep reads `task_events`); webhook delivery retries and records failures.
+
+  - A structured option with an unknown key, non-text or control characters, a missing or duplicate label, or text over its bound is refused with a `no:` message and nothing is stored; a decision naming a label that was not offered is refused and the ask stays open.
 
   - Non-closure ProgrammingError follows the same recovery path as every other unexpected dispatcher-pass exception: it is contained and logged without its private message, then waits on the stop event for 5 s, doubling after consecutive errors up to 300 s, before continuing.
 
@@ -1351,6 +1359,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`, `tests/test_commonplace_webhooks.py`.
 
   - `tests/test_commonplace_subagent_asks.py` and `tests/test_commonplace_agent_asks.py` check generic question routing, owner fallback, explicit person reasons, recipient authority and withdrawal guards through MCP and HTTP.
+
+  - `tests/test_commonplace_decision_blocks.py` checks structured asks end to end: blocks reach the person's `needs_me`, the chosen label returns to the asker, options that were not offered and malformed or oversized blocks are refused, plain asks are unchanged, and a later ask never inherits earlier blocks.
 
   - `tests/test_card_lifecycle.py` holds archive/restore (hide, never delete), carry-on follow-ups and the Pocket, with owner, member, connection and anonymous authorization over the service and REST.
 
@@ -2085,6 +2095,8 @@ Format (read by `commonplace orch docs-check`):
   - **Connection recovery:** Callbacks reopen the selected Needs item; GitHub-only status failures preserve card actions, and connections in another workspace show an explicit disconnect control.
 
   - Needs me renders origin/configuration as approvals, requires a release reason and posts directly; coordinator configuration navigates to existing settings without mutating a card. Proposal Decline and plan Reject controls follow reject permission independently of approve permission and use the existing rejection handler.
+
+  - Needs me shows a structured ask (`ask_blocks`, `web/static/decision-blocks.js`) as side-by-side option blocks under the question: optional plain-text preview, the answer button, optional detail. The button answers with the option's label exactly like a plain option; plain asks keep their footer buttons, and blocks that do not match the offered labels are not drawn.
   - Shell needItems includes approvals when counting each project and retaining selected details on refresh; release ranks between person decisions and plan review.
 
 - **How it fails:**
@@ -2114,6 +2126,8 @@ Format (read by `commonplace orch docs-check`):
   - The `tests/test_workbench_` files, the `tests/test_console_` files and the `tests/test_commonplace_console_` files.
 
   - `tests/workbench_e2e/test_refresh_forms.py` drives a real browser: an open hand-off form (also one opened mid-refresh) and a comment in progress survive a background refresh, the panel updates once the form is cancelled, and on Needs me a queue change leaves an open hand-off form alone and Cancel closes it.
+
+  - `tests/commonplace_decision_blocks.mjs` (run by `tests/test_commonplace_decision_blocks.py`) checks that a structured ask renders one block per option in the Needs me body, escapes option text, answers with the option's label through the decide route, and falls back to plain buttons for plain or mismatched blocks.
 
   - `tests/orchstatus.mjs` (run by `tests/test_orchstatus.py`) covers the status block states, the End lease confirm, refusals and escaping; `tests/test_orch_lease_status.py` covers the checkpoint fields it reads and the owner-only force-release contract.
 
