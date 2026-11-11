@@ -2,8 +2,9 @@
 
 Run with Playwright installed (for example ``uv run --with playwright==1.64.1``) and a
 Chromium cache; set PLAYWRIGHT_BROWSERS_PATH when HOME is isolated. Without Playwright
-this file errors at import: a missing browser is never a silent skip. Set
-DECIDE_SCOPE_SHOTS to a directory to keep screenshots.
+the module is skipped, so ordinary collection of tests/ is unaffected; with
+CP_BROWSER_E2E=1 (a browser evidence run) a missing Playwright fails instead, as in
+tests/workbench_e2e. Set DECIDE_SCOPE_SHOTS to a directory to keep screenshots.
 """
 
 import asyncio
@@ -12,12 +13,21 @@ import os
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from playwright.async_api import async_playwright, expect
+import pytest
 
 from commonplace import sessions
 from tests._commonplace_helpers import hub_fixture as hub_fixture
 from tests.test_cards_decide_scope import api
 from tests.test_commonplace_oauth import Client
+
+if os.environ.get("CP_BROWSER_E2E") == "1":
+    from playwright import async_api as playwright_api  # an evidence run never skips
+else:
+    playwright_api = pytest.importorskip(
+        "playwright.async_api", reason="browser test needs the playwright package"
+    )
+async_playwright = playwright_api.async_playwright
+expect = playwright_api.expect
 
 SCOPE = "memory:read memory:write cards:decide"
 DECIDE = "cards:decide"

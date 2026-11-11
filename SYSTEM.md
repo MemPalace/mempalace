@@ -664,6 +664,10 @@ playbooks and the original wider orchestration acceptance remain separate work.
   granted scopes the connection still holds after policy and role intersection,
   so a withdrawn `cards:decide` never reappears in a refresh.
 
+- Test collection: the consent and Agents browser test skips without Playwright
+  (collecting `tests/` must never error); `CP_BROWSER_E2E=1` makes a missing
+  Playwright fail instead.
+
 ### Explicit imported-history reader consent
 
   - Imported view proofs share the response access checker with normalized citation and private-source authorization; thread-bound mutation and source-delete checks remain enforced.

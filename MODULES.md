@@ -678,6 +678,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Browser tests that need Playwright skip at module level when it is missing, so collecting `tests/` never errors; `CP_BROWSER_E2E=1` turns a missing Playwright into a failure (`tests/test_cards_decide_scope_browser.py`, as in `tests/workbench_e2e`).
+
   - `tests/spaces_surfaces.json` pins the `decide` description naming owner connections holding `cards:decide`.
 
   - Restricted event regressions cover omitted webhook numbers, keyed opaque ids, authority changes, readable-set resets, cursor recovery and saved-but-unlinked notices. Restricted recovery checks retain exact event identity and internal deduplication without exposing public sequence fields. Authority lookup failures pin one redacted diagnostic and no enqueue. Shared fixtures also retain real member wildcard and literal-wing holders alongside owner-only private readers.
@@ -1126,7 +1128,7 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_commonplace_gateway.py`, `tests/test_commonplace_control_db.py`, `tests/test_commonplace_policy.py`, `tests/test_hub_` files.
 
   - `tests/test_restricted_search_fill.py` covers bounded refill and response privacy, with a synthetic latency fixture.
-  - `tests/test_cards_decide_scope.py` covers granting, refusal, other people's asks, revocation and audit; `tests/test_cards_decide_scope_browser.py` covers the consent and Agents UI (needs Playwright).
+  - `tests/test_cards_decide_scope.py` covers granting, refusal, other people's asks, revocation and audit; `tests/test_cards_decide_scope_browser.py` covers the consent and Agents UI (needs Playwright; skipped without it, except that `CP_BROWSER_E2E=1` makes a missing Playwright fail).
 
 
 ## sessions-and-sign-in
