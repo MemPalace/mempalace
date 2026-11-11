@@ -11,6 +11,7 @@ from commonplace.boards._http import (
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.rules.enforce import RulesRefresh, rest_write
 
+from .start_options import start_options
 from .tools import dispatch
 
 NOT_FOUND = {"machine not found", "start not found", "card not found"}
@@ -36,6 +37,12 @@ def register(gateway):
             if parts == ["card-starts"] and handler.command == "GET":
                 result = dispatch(ctx, "card_start_status", query(handler))
                 send_json(handler, 200, result)
+                return
+            if parts == ["card-starts", "options"] and handler.command == "GET":
+                task = query(handler).get("task")
+                if not task:
+                    raise HTTPError(400, "task is required")
+                send_json(handler, 200, start_options(ctx, task))
                 return
             if parts == ["card-starts"] and handler.command == "POST":
                 name = "card_start"
@@ -67,8 +74,11 @@ def register(gateway):
             if not isinstance(status, int) or isinstance(status, bool):
                 # Orchestrator refusals carry their own status; others map by text.
                 status = 404 if message in NOT_FOUND else 409 if message in CONFLICTS else 403
-            send_json(handler, status, {"error": str(exc)})
+            # A refused config-driven start also carries its stable code for surfaces.
+            code = getattr(exc, "code", None)
+            send_json(handler, status, {"error": str(exc), **({"code": code} if code else {})})
 
     gateway.add_route("POST", "/api/card-starts", route)
     gateway.add_route("GET", "/api/card-starts", route)
+    gateway.add_route("GET", "/api/card-starts/options", route)
     gateway.add_prefix_route("POST", "/api/card-starts/", route)

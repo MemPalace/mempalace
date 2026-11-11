@@ -45,6 +45,23 @@ An ambiguous launch becomes `uncertain`, never automatically queued again. Start
 
 `card_start_cancel` on `uncertain` returns 409 for everyone, including the owner: `start outcome is uncertain; a workspace owner must resolve it`. Cancelling a `starting` job only records the request; it does not stop a remote thread or free the slot. Resolve spans the control and workspace databases: the control audit commits before the runner resolution, so a crash between commits can leave an audit entry without the resolution. A completed resolution retains `resolved_by` and `resolved_at`.
 
+## Start from the card panel
+
+The Runs section of a card has a **Start agent**
+button for a signed-in owner. What it offers comes from `GET /api/card-starts/options?task=<n>`
+(owner only, read-only; anyone else gets 403 and sees no button):
+
+- On a board with an accepted `[runner]` config: one button. The start uses the config's machine,
+  project and topic.
+- On a board without one: a machine select, and the projects and topics that machine allows. A
+  machine that is revoked, not attested, not usable by the owner, or whose wings do not cover the
+  card is not offered.
+- When nothing can be started the answer carries a `refusal` code (`no_machine`,
+  `machine_unavailable`, `origin_not_released`, `not_writable`, ...) and the panel says what to do
+  next. A card that is not Todo, is assigned, blocked, waiting on a person or has an open proposal
+  gets no button and no message. Refusals of the start itself (an active start, the 24-hour rule,
+  the hourly limit, the agent cap) show in words too, using the `code` of the response.
+
 ## Boards with an orchestrator config
 
 A board whose owner accepted a live orchestrator config with a `[runner]`
@@ -53,7 +70,10 @@ runner. Boards without one behave exactly as described above.
 
 - **Requests.** `card_start` (MCP and `POST /api/card-starts`) is accepted only
   from the person owner; a coordinator PAT gets `no: use orch_card_start` and
-  uses the orchestrator lease instead. Cancelling a job that belongs to an
+  uses the orchestrator lease instead. The owner may send the card alone
+  (`{"task": <n>}`): machine, project and topic then come from the config, and
+  values that are sent must still equal it (`config_mismatch`). A refused start
+  answers `{"error", "code"}` where the refusal has a stable code. Cancelling a job that belongs to an
   orchestrator step through `card_start_cancel` is person-owner only.
   Separately, an owner or the local CLI can void the step: this atomically
   cancels a queued or leased job and permanently retires the old step key.

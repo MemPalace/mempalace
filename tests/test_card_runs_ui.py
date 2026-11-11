@@ -19,6 +19,13 @@ CASES = [
     "resolve",
     "stale",
     "panel",
+    "startwords",
+    "startview",
+    "startconfigured",
+    "startfree",
+    "startrefused",
+    "startnotoffered",
+    "startpicks",
 ]
 
 
@@ -40,4 +47,4 @@ def test_details_mount_is_one_small_insertion():
 
 def test_runs_styles_exist():
     css = (STATIC / "workbench.css").read_text()
-    assert ".card-runs" in css and ".run-resolve" in css
+    assert ".card-runs" in css and ".run-resolve" in css and ".run-start" in css

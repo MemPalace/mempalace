@@ -266,3 +266,8 @@ kbd { font: 500 11px/16px var(--mono); color: var(--text-2); background: var(--s
 .card-runs .run-empty { font-size: 13px; color: var(--text-2); }
 .card-runs .run-note { font-size: 12.5px; color: var(--text-2); }
 .card-runs .run-note:empty { display: none; }
+.card-runs .run-start { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 8px 10px; border: 1px dashed var(--line); border-radius: var(--r); }
+.card-runs .run-start p, .card-runs .run-start-why { font-size: 12.5px; line-height: 19px; color: var(--text-2); margin: 0; }
+.card-runs .run-start-row { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
+.card-runs .run-start-field { display: flex; flex-direction: column; gap: 2px; flex: 1 1 120px; min-width: 0; font-size: 12px; color: var(--text-2); }
+.card-runs .run-start-field select { min-width: 0; }

@@ -544,6 +544,8 @@ playbooks and the original wider orchestration acceptance remain separate work.
 
 - Cancelling a job that belongs to a step is person-owner only.
 
+- The person owner may send `card_start` the card alone on a configured board: machine, project and topic come from the config, and values that are sent must still equal it. `GET /api/card-starts/options` (person owner only, read-only) tells the card panel what it may offer and why nothing can be started; it creates no job.
+
 - The cap counts distinct cards: queued, leased, starting or uncertain jobs; jobs started within `STARTED_HOLD_SECONDS`; and `doing` cards with any connection assignee.
 
 - The limit is `min(config.max_agents, project_limits.max_agents)` when both are set.

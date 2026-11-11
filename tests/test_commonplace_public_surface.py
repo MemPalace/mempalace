@@ -54,6 +54,7 @@ EXACT = {
     ("POST", "/api/runners"): "authenticated",
     ("POST", "/api/card-starts"): "authenticated",
     ("GET", "/api/card-starts"): "authenticated",
+    ("GET", "/api/card-starts/options"): "authenticated",
     **{
         (method, path): "authenticated"
         for method in ("GET", "POST", "PATCH", "DELETE")
