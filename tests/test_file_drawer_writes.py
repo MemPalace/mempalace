@@ -466,3 +466,60 @@ def test_history_backup_reuses_available_original_embeddings(monkeypatch):
     assert archived[0][2]["historical_version"] is True
     assert reused_vectors == [[0.1, 0.2]]
     assert observed[1][0] == []
+
+def test_convo_history_backup_preserves_whole_generation_on_partial_change(monkeypatch):
+    """One changed chunk must not make an incomplete, invisible A history."""
+    import mempalace.palace as palace
+    from mempalace.convo_visibility import visible_conversation_rows
+
+    source = "/transcripts/partial-edit.jsonl"
+    metadata = {
+        "source_file": source,
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": palace.NORMALIZE_VERSION,
+        "convo_chunker_version": palace.CONVO_CHUNKER_VERSION,
+        "source_mtime": 1.0,
+        "filed_at": "2026-11-11",
+        "chunk_total": 2,
+    }
+    old = [
+        ("drawer_0", "unchanged original", {**metadata, "chunk_index": 0}),
+        ("drawer_1", "changed original", {**metadata, "chunk_index": 1}),
+    ]
+
+    class SavedCollection:
+        def get(self, ids=None, where=None, **_kwargs):
+            if where is not None:
+                return {
+                    "ids": [row[0] for row in old],
+                    "documents": [row[1] for row in old],
+                    "metadatas": [row[2] for row in old],
+                }
+            return {"ids": [], "documents": [], "metadatas": []}
+
+    archived = []
+    monkeypatch.setattr(palace, "_stored_vectors", lambda *_args: {})
+    monkeypatch.setattr(palace, "assert_no_collisions", lambda *_args: None)
+    monkeypatch.setattr(
+        palace,
+        "_upsert",
+        lambda _col, rows, embeddings=None: archived.extend(rows),
+    )
+
+    incoming = [old[0], ("drawer_1", "new replacement", old[1][2])]
+    palace._backup_changed_conversation_drawers(SavedCollection(), source, "exchange", incoming)
+
+    assert {doc for _, doc, _ in archived} == {"unchanged original", "changed original"}
+    assert all(meta["historical_version"] is True for _, _, meta in archived)
+    assert len(
+        visible_conversation_rows(
+            [drawer_id for drawer_id, _, _ in archived],
+            [meta for _, _, meta in archived],
+        )
+    ) == 2, "the historical source snapshot must be complete"
+
+    archived.clear()
+    palace._backup_changed_conversation_drawers(SavedCollection(), source, "exchange", old)
+    assert not archived, "a no-op re-mine must not archive an unchanged generation"
+

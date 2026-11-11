@@ -207,13 +207,23 @@ def _backup_changed_conversation_drawers(
             break
         offset += len(ids)
 
+    # History visibility is checked as an entire source/mode generation.
+    # If just one chunk changes, archiving only that chunk creates a torn
+    # historical batch (chunk_total still names *all* the old chunks).
+    # Snapshot every old chunk of any changed complete generation, while
+    # keeping no-op re-mines free of unnecessary historical copies.
+    changed_generations = {
+        key
+        for original_id, old_text, _, key in candidates
+        if desired.get(original_id) != old_text
+    }
     for original_id, old_text, old_meta, key in candidates:
         seen, expected = generation_counts[key]
         if seen < expected:
             # An interrupted positional upsert or unfinished metadata
             # finalize must not become a published historical version.
             continue
-        if desired.get(original_id) == old_text:
+        if key not in changed_generations:
             continue
         history_id = make_convo_history_id(original_id, old_text)
         historical = {
