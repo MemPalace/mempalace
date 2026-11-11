@@ -382,11 +382,10 @@ def test_agent_tokens_get_404_everywhere_and_anonymous_is_asked_to_sign_in(bots_
     assert len(hub.store().roster(hub.hub.admin)) == 1
 
 
-def test_routes_this_slice_does_not_own_are_not_served(bots_hub):
+def test_unknown_bot_routes_are_not_served(bots_hub):
     hub = bots_hub
     bot_id = hub.bots(hub.owner)["bots"][0]["id"]
-    for tail in ("messages", "stop", "confirm"):
-        assert hub.post(hub.owner, f"/api/bots/{bot_id}/{tail}", {"text": "x"})[0] == 404
+    assert hub.post(hub.owner, f"/api/bots/{bot_id}/elsewhere", {"text": "x"})[0] == 404
     assert hub.get(hub.owner, f"/api/bots/{bot_id}")[0] == 404
 
 

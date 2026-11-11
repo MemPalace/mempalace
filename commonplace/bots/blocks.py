@@ -92,7 +92,28 @@ def setup(reader, stored) -> dict:
     return {**stored, "can_configure": reader.principal.role == "owner"}
 
 
-HYDRATORS = {"work": work, "decision": decision, "action": action, "setup": setup}
+def confirm(reader, stored) -> dict:
+    """The server-built label and the state; an open one past its expiry reads ``expired``."""
+    from commonplace.bots import store
+
+    pending = store.open_bots(reader.gateway, reader.principal.workspace_id).pending_for(
+        reader.principal.user_id, stored.get("pending")
+    )
+    if pending is None:
+        return {**stored, "gone": True}
+    state = pending["state"]
+    if state == "open" and pending["expires_at"] <= store.stamp():
+        state = "expired"
+    return {**stored, "label": _clean(pending["label"]), "state": state}
+
+
+HYDRATORS = {
+    "work": work,
+    "decision": decision,
+    "action": action,
+    "setup": setup,
+    "confirm": confirm,
+}
 
 
 def hydrate(reader, blocks) -> list[dict]:
@@ -101,3 +122,16 @@ def hydrate(reader, blocks) -> list[dict]:
         HYDRATORS.get(block.get("type"), lambda _reader, stored: stored)(reader, block)
         for block in blocks
     ]
+
+
+def message_view(reader, message) -> dict:
+    """A stored message as the API shows it: redacted text, hydrated blocks."""
+    return {
+        "id": message["id"],
+        "role": message["role"],
+        "text": redact.redact(message["text"])[0],
+        "blocks": hydrate(reader, message["blocks"]),
+        "at": message["at"],
+        "state": message["state"],
+        "reply_to": message["reply_to"],
+    }

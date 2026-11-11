@@ -4,6 +4,10 @@
     POST   /api/bots                       {name, job?, instructions?, board?} -> 201 {bot}
     PATCH  /api/bots/<id>                  {name?, job?, instructions?, archived?} -> {bot}
     GET    /api/bots/<id>/messages         ?after=&before=&limit= -> {bot, messages, waiting, running}
+    POST   /api/bots/<id>/messages         {text, request_id} -> text/event-stream
+                                           (?stream=0 -> {message, reply} when the turn ends)
+    POST   /api/bots/<id>/stop             {request_id} -> {ok}
+    POST   /api/bots/<id>/confirm          {pending, accept} -> {message}
     POST   /api/bots/<id>/read             {upto} -> {ok}
     GET    /api/bots/<id>/memory           {memories}
     POST   /api/bots/<id>/memory           {text} -> {memory}
@@ -13,14 +17,20 @@ A bot id that is unknown or belongs to someone else is 404. ``HANDLERS`` maps (m
 tail) to a handler, so a later route (sending a message) is one more entry.
 """
 
+import json
+import queue
+import time
+
 from commonplace import redact
 from commonplace.boards.service import BoardService
-from commonplace.bots import auth, blocks, modelcfg, store, updates
+from commonplace.bots import auth, blocks, limits, modelcfg, store, turn, updates
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import path_parts, query, read_json, send_json
 
 PREFIX = "/api/bots/"
 PREVIEW_CHARS = 200
+PING_S = 10  # SSE heartbeat
+WRITE_TIMEOUT_S = 10  # one blocked socket write ends the relay, never the turn
 
 
 def _error(h, status, code, text):
@@ -58,12 +68,23 @@ def _view(bot, asks, working=()) -> dict:
     }
 
 
+def _running(principal, bot_id) -> bool:
+    return limits.REGISTRY.running(principal.workspace_id, bot_id) is not None
+
+
+def _working(gateway, principal, bots) -> set[str]:
+    """Bots with a turn running, or whose filed work is in progress."""
+    return updates.working_bots(gateway, principal, bots) | limits.REGISTRY.running_bots(
+        principal.workspace_id, principal.user_id
+    )
+
+
 def _bot(gateway, principal, bot_id) -> dict:
     bots = _bots(gateway, principal)
     return _view(
         bots.roster(principal.user_id, bot_id)[0],
         _asks(gateway, principal),
-        updates.working_bots(gateway, principal, bots),
+        _working(gateway, principal, bots),
     )
 
 
@@ -81,7 +102,7 @@ def _listing(gateway, h, principal):
     bots = _bots(gateway, principal)
     bots.ensure_defaults(principal.user_id, [(b["slug"], b["name"]) for b in boards])
     asks = _asks(gateway, principal)
-    working = updates.working_bots(gateway, principal, bots)
+    working = _working(gateway, principal, bots)
     send_json(
         h,
         200,
@@ -144,6 +165,7 @@ def _messages(gateway, h, principal, bot_id, rest):
     except ValueError:
         raise store.Invalid("invalid cursor") from None
     bots = _bots(gateway, principal)
+    turn.recover(gateway, principal.workspace_id, principal.user_id, bot_id)
     page = bots.messages(bot_id, principal.user_id, **cursors)
     reader = blocks.Reader(gateway, principal)
     asks = _asks(gateway, principal)
@@ -153,25 +175,15 @@ def _messages(gateway, h, principal, bot_id, rest):
         for ask in asks
         if bot["board"] in (None, ask["board"])
     ]
+    running = _running(principal, bot_id)
     send_json(
         h,
         200,
         {
-            "bot": _view(bot, asks, updates.working_bots(gateway, principal, bots)),
-            "messages": [
-                {
-                    "id": m["id"],
-                    "role": m["role"],
-                    "text": redact.redact(m["text"])[0],
-                    "blocks": blocks.hydrate(reader, m["blocks"]),
-                    "at": m["at"],
-                    "state": m["state"],
-                    "reply_to": m["reply_to"],
-                }
-                for m in page
-            ],
+            "bot": _view(bot, asks, _working(gateway, principal, bots)),
+            "messages": [blocks.message_view(reader, m) for m in page],
             "waiting": blocks.hydrate(reader, waiting),
-            "running": False,
+            "running": running,
         },
     )
 
@@ -212,10 +224,154 @@ def _memory_remove(gateway, h, principal, bot_id, rest):
     send_json(h, 200, {"ok": True})
 
 
+# Talking to a bot
+
+
+def _frame(event, data) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
+
+
+def _relay(h, frames) -> None:
+    """Write an SSE response from ``frames`` (a list, or a turn queue ending in None).
+
+    A broken pipe or a write blocked for ``WRITE_TIMEOUT_S`` ends only this relay.
+    """
+    h.send_response(200)
+    h.send_header("Content-Type", "text/event-stream; charset=utf-8")
+    h.send_header("Cache-Control", "no-store")
+    h.send_header("X-Accel-Buffering", "no")
+    h.end_headers()
+    try:
+        h.connection.settimeout(WRITE_TIMEOUT_S)
+        h.wfile.flush()
+        items = iter(frames) if isinstance(frames, list) else None
+        while True:
+            if items is not None:
+                item = next(items, None)
+            else:
+                try:
+                    item = frames.get(timeout=PING_S)
+                except queue.Empty:
+                    h.wfile.write(b": ping\n\n")
+                    h.wfile.flush()
+                    continue
+            if item is None:
+                return
+            h.wfile.write(_frame(*item))
+            h.wfile.flush()
+    except (OSError, ValueError):
+        return  # the client went away; the turn goes on and its reply is stored
+
+
+def _final(events) -> dict:
+    return next(data["message"] for event, data in events if event in ("done", "error"))
+
+
+def _send(gateway, h, principal, bot_id, rest):
+    started = time.monotonic()
+    stream = query(h).get("stream", "1") != "0"
+    body = _body(h, {"text", "request_id"})
+    if body is None:
+        return
+    text, request_id = body.get("text"), body.get("request_id")
+    if not isinstance(text, str) or len(text) > store.TEXT_MAX or not text.strip():
+        raise store.Invalid("text")
+    if not isinstance(request_id, str) or store.REQUEST_ID.fullmatch(request_id) is None:
+        raise store.Invalid("request_id")
+    bots = _bots(gateway, principal)
+    bot = bots.get(bot_id, principal.user_id)
+    seen = bots.message_for_request(bot_id, principal.user_id, request_id)
+    if seen is not None:
+        if seen["text"] != text:
+            raise store.Conflict()
+        _replay(gateway, h, principal, bot_id, seen, stream)
+        return
+    run = turn.TurnRun(gateway, principal, bot, request_id, started)
+    try:
+        limits.REGISTRY.admit(run)
+    except limits.Busy as busy:
+        _error(h, busy.status, "busy", "Busy, try again")
+        return
+    try:
+        # A same-id request may have finished between the first look and admission.
+        seen = bots.message_for_request(bot_id, principal.user_id, request_id)
+        if seen is None:
+            bots.lease_start(bot_id, principal.user_id, request_id)
+            message = bots.add_user_message(bot_id, principal.user_id, text, request_id)
+    except BaseException:
+        bots.lease_end(bot_id, request_id)
+        limits.REGISTRY.release(run)
+        raise
+    if seen is not None:
+        limits.REGISTRY.release(run)
+        if seen["text"] != text:
+            raise store.Conflict()
+        _replay(gateway, h, principal, bot_id, seen, stream)
+        return
+    run.start(message)
+    if stream:
+        _relay(h, run.queue)
+        return
+    run.finished.wait()
+    if run.reply is None:  # the reply could not be stored; the stream would say the same
+        text = turn.SENTENCES["model_error"]
+        send_json(h, 500, {"error": text, "code": "model_error", "message": run.view(message)})
+        return
+    send_json(h, 200, {"message": run.view(message), "reply": run.view(run.reply)})
+
+
+def _replay(gateway, h, principal, bot_id, message, stream):
+    events = turn.replay(gateway, principal, bot_id, message)
+    if stream:
+        _relay(h, events)
+        return
+    running = limits.REGISTRY.running(principal.workspace_id, bot_id)
+    if events[-1][0] == "running" and running is not None:
+        running.finished.wait()
+        events = turn.replay(gateway, principal, bot_id, message)
+    if events[-1][0] == "running":
+        _error(h, 409, "busy", "Still running")
+        return
+    send_json(h, 200, {"message": events[0][1]["message"], "reply": _final(events)})
+
+
+def _stop(gateway, h, principal, bot_id, rest):
+    body = _body(h, {"request_id"})
+    if body is None:
+        return
+    _bots(gateway, principal).get(bot_id, principal.user_id)
+    running = limits.REGISTRY.running(principal.workspace_id, bot_id)
+    stopping = running is not None and running.request_id == body.get("request_id")
+    if stopping:
+        running.cancel.set()
+    send_json(h, 200, {"ok": stopping})
+
+
+def _confirm(gateway, h, principal, bot_id, rest):
+    body = _body(h, {"pending", "accept"})
+    if body is None:
+        return
+    if not isinstance(body.get("pending"), str) or type(body.get("accept")) is not bool:
+        raise store.Invalid("pending")
+    try:
+        message = turn.confirm(gateway, principal, bot_id, body["pending"], body["accept"])
+    except turn.Refused as refused:
+        if refused.code == "expired":
+            _error(h, 409, "expired", "This request expired. Ask again.")
+        else:
+            _error(h, 409, "conflict", "This was already answered.")
+        return
+    reader = blocks.Reader(gateway, principal)
+    send_json(h, 200, {"message": blocks.message_view(reader, message)})
+
+
 # (method, first segment after the id) -> handler(gateway, h, principal, bot_id, rest)
 HANDLERS = {
     ("PATCH", None): _patch,
     ("GET", "messages"): _messages,
+    ("POST", "messages"): _send,
+    ("POST", "stop"): _stop,
+    ("POST", "confirm"): _confirm,
     ("POST", "read"): _read,
     ("GET", "memory"): _memory_list,
     ("POST", "memory"): _memory_add,

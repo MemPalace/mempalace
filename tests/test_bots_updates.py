@@ -40,6 +40,8 @@ class Scene:
         user = user or self.admin
         bot = bot or self.bot
         message = self.store.add_user_message(bot, user, "file this", f"req-{bot[:6]}-{number}")
+        reply = self.store.add_bot_message(bot, user, message["id"], "Filed.")  # turns reply
+        self.store.mark_read(bot, user, reply["id"])
         self.store.work_add(bot, user, "work", number, message["id"])
 
     def ask(self, number):
@@ -66,6 +68,8 @@ class Scene:
         message = self.store.add_user_message(
             bot or self.bot, self.admin, text, f"fw-{posted:04d}0"
         )
+        reply = self.store.add_bot_message(bot or self.bot, self.admin, message["id"], "Forwarded.")
+        self.store.mark_read(bot or self.bot, self.admin, reply["id"])
         self.store.forward_add(bot or self.bot, self.admin, "work", posted, message["id"])
         return posted
 

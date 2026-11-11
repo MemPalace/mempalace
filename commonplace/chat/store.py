@@ -23,6 +23,13 @@ CREATE TABLE IF NOT EXISTS chat_front_jobs (            -- model answers
     PRIMARY KEY (workspace_id, board, message_id)
 );
 CREATE INDEX IF NOT EXISTS chat_front_jobs_due ON chat_front_jobs(state, created_at);
+CREATE TABLE IF NOT EXISTS bot_model_calls (             -- bot model requests sent (numbers only)
+    workspace_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    day TEXT NOT NULL,                        -- UTC YYYY-MM-DD
+    n INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, user_id, day)
+);
 """
 
 
@@ -249,21 +256,65 @@ def recover(db, now: float) -> None:
             )
 
 
+def take_bot_call(db, workspace_id, user_id, daily_limit, user_daily_limit) -> str | None:
+    """Count one bot model request about to be sent, unless that would pass a daily limit.
+
+    The check and the count are one transaction, so concurrent turns cannot pass together.
+    Returns the UTC day the unit was counted on, or None when refused.
+    """
+    with db._lock, db._tx() as conn:
+        now = datetime.now(timezone.utc)
+        day = now.strftime("%Y-%m-%d")
+        used, user_used = _used_today(conn, workspace_id, user_id, now)
+        if used >= daily_limit or user_used >= user_daily_limit:
+            return None
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_model_calls (workspace_id,user_id,day,n) VALUES (?,?,?,0)",
+            (workspace_id, user_id, day),
+        )
+        conn.execute(
+            "UPDATE bot_model_calls SET n=n+1 WHERE workspace_id=? AND user_id=? AND day=?",
+            (workspace_id, user_id, day),
+        )
+        return day
+
+
+def give_back_bot_call(db, workspace_id, user_id, day) -> None:
+    """Undo :func:`take_bot_call` for a request never sent, on the day it was counted."""
+    with db._lock, db._tx() as conn:
+        conn.execute(
+            "UPDATE bot_model_calls SET n=n-1 WHERE workspace_id=? AND user_id=? AND day=? AND n>0",
+            (workspace_id, user_id, day),
+        )
+
+
+def _used_today(conn, workspace_id, user_id, now=None) -> tuple[int, int]:
+    now = datetime.now(timezone.utc) if now is None else now
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    row = conn.execute(
+        "SELECT COALESCE(SUM(called),0), COALESCE(SUM(CASE WHEN user_id=? THEN called ELSE 0 END),0) "
+        "FROM chat_front_jobs WHERE workspace_id=? AND julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?)",
+        (user_id, workspace_id, start.isoformat(), (start + timedelta(days=1)).isoformat()),
+    ).fetchone()
+    bots = conn.execute(
+        "SELECT COALESCE(SUM(n),0), COALESCE(SUM(CASE WHEN user_id=? THEN n ELSE 0 END),0) "
+        "FROM bot_model_calls WHERE workspace_id=? AND day=?",
+        (user_id, workspace_id, start.strftime("%Y-%m-%d")),
+    ).fetchone()
+    return row[0] + bots[0], row[1] + bots[1]
+
+
 def counts_today(db, workspace_id, user_id: str | None = None) -> dict:
-    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    """Model requests sent today by project chat and bots together (one budget)."""
     with db._lock:
-        row = db._conn.execute(
-            "SELECT COALESCE(SUM(called),0), COALESCE(SUM(CASE WHEN user_id=? THEN called ELSE 0 END),0) "
-            "FROM chat_front_jobs WHERE workspace_id=? AND julianday(created_at)>=julianday(?) AND julianday(created_at)<julianday(?)",
-            (user_id, workspace_id, start.isoformat(), (start + timedelta(days=1)).isoformat()),
-        ).fetchone()
+        used, user_used = _used_today(db._conn, workspace_id, user_id)
         error = db._conn.execute(
             "SELECT code FROM chat_front_jobs WHERE workspace_id=? AND state IN ('failed','skipped') "
             "AND code<>'' ORDER BY updated_at DESC,created_at DESC,message_id DESC LIMIT 1",
             (workspace_id,),
         ).fetchone()
     return {
-        "used_today": row[0],
-        "user_used_today": row[1],
+        "used_today": used,
+        "user_used_today": user_used,
         "last_error": error[0] if error else None,
     }

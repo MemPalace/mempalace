@@ -130,7 +130,13 @@ def test_chat_sources_generic_and_actionless():
         "task_approve",
         "ask",
     }
-    tables = {"chat_model_settings", "chat_front_jobs", "chat_handoffs", "chat_replies"}
+    tables = {
+        "chat_model_settings",
+        "chat_front_jobs",
+        "chat_handoffs",
+        "chat_replies",
+        "bot_model_calls",  # bot model requests counted in the shared budget (numbers only)
+    }
     sql = re.compile(
         r"\b(INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE(?!\s+(?:ON|OF)\b)|DELETE\s+FROM)\s+(\w+)", re.I
     )
