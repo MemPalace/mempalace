@@ -225,7 +225,11 @@ class TurnRun:
                 else:
                     steps += 1
                     turn.step = steps
-                    result, code = self._tool(turn, offered[call["name"]], call["arguments"])
+                    tool = offered.get(call["name"])
+                    if tool is None:  # not offered this turn: refused, the turn goes on
+                        result, code = tools.Result(False, say=REFUSALS["invalid"]), "invalid"
+                    else:
+                        result, code = self._tool(turn, tool, call["arguments"])
                 tail.append(
                     {
                         "role": "tool",
@@ -341,7 +345,9 @@ class TurnRun:
 
     def _hydrated(self, block) -> dict:
         try:
-            return blocks.hydrate(self._reader, [block])[0]
+            principal = sessions.person_principal(self.gateway.db, self.user_id, self.workspace_id)
+            reader = self._reader if principal is None else blocks.Reader(self.gateway, principal)
+            return blocks.hydrate(reader, [block])[0]
         except Exception as exc:
             log_failure(logger, "Bot block not hydrated", exc)
             return block
@@ -479,10 +485,15 @@ class Refused(Exception):
         self.code = code
 
 
+OUTCOME_CHARS = 500  # a tool's own outcome sentence on a confirmed action
+
+
 def confirm(gateway, principal, bot_id, pending_id, accept) -> dict:
     """Run exactly the stored action as the person (or cancel it); the stored event message.
 
-    ``open -> done`` (or ``cancelled``) is a compare-and-set, so it runs at most once.
+    The tool's ``check`` runs first, against the message that asked for the action: a refusal
+    the person can fix leaves the action open for another tap. Only an action that is actually
+    attempted is consumed, by a compare-and-set ``open -> done``, so it runs at most once.
     """
     bots = store.open_bots(gateway, principal.workspace_id)
     pending = bots.pending_get(bot_id, principal.user_id, pending_id)
@@ -494,7 +505,8 @@ def confirm(gateway, principal, bot_id, pending_id, accept) -> dict:
             raise Refused(_closed(bots, bot_id, principal.user_id, pending_id))
         block = _action(pending["tool"], pending["label"], False, "cancelled")
         return bots.add_event_message(bot_id, principal.user_id, "Cancelled.", [block])
-    if not bots.pending_resolve(bot_id, principal.user_id, pending_id, "done"):
+    if pending["state"] != "open" or pending["expires_at"] <= store.stamp():
+        bots.pending_resolve(bot_id, principal.user_id, pending_id, "expired")
         raise Refused(_closed(bots, bot_id, principal.user_id, pending_id))
     frozen = pending["args"]
     bot = bots.get(bot_id, principal.user_id)
@@ -518,26 +530,46 @@ def confirm(gateway, principal, bot_id, pending_id, accept) -> dict:
     args = dict(frozen["args"])
     if frozen.get("version") is not None:
         args["version"] = frozen["version"]
-    code = None
+
+    def refused(result, code):
+        turn.audit(pending["tool"], "deny")
+        shown = [_action(pending["tool"], pending["label"], False, code)]
+        return bots.add_event_message(bot_id, principal.user_id, result.say, shown)
+
     if tool is None:
-        result, code = tools.Result(False, say=REFUSALS["failed"]), "failed"
-    else:
+        bots.pending_resolve(bot_id, principal.user_id, pending_id, "cancelled")
+        return refused(tools.Result(False, say=REFUSALS["failed"]), "failed")
+    if tool.check is not None:
         try:
-            if tool.check is not None:
-                tool.check(turn, args)  # against the message that asked for it
-            result = tool.run(turn, args)
+            tool.check(turn, args)  # against the message that asked for it
         except tools.NotYourWords:
-            result, code = tools.Result(False, say=REFUSALS["not_your_words"]), "not_your_words"
+            # Frozen text that is not the person's words never becomes valid: close it.
+            bots.pending_resolve(bot_id, principal.user_id, pending_id, "cancelled")
+            return refused(tools.Result(False, say=REFUSALS["not_your_words"]), "not_your_words")
         except tools.Gone:
-            result, code = tools.Result(False, say=REFUSALS["gone"]), "gone"
+            return refused(tools.Result(False, say=REFUSALS["gone"]), "gone")
         except ToolError as exc:
-            result, code = tools.Result(False, say=redact.redact(str(exc))[0][:500]), "refused"
-        except Exception as exc:
-            log_failure(logger, "Bot confirmed action failed", exc)
-            result, code = tools.Result(False, say=REFUSALS["failed"]), "failed"
-        turn.audit(tool.name, "ok" if result.ok else "deny")
+            return refused(tools.Result(False, say=redact.redact(str(exc))[0][:500]), "refused")
+    if not bots.pending_resolve(bot_id, principal.user_id, pending_id, "done"):
+        raise Refused(_closed(bots, bot_id, principal.user_id, pending_id))
+    code = None
+    try:
+        result = tool.run(turn, args)
+    except tools.NotYourWords:
+        result, code = tools.Result(False, say=REFUSALS["not_your_words"]), "not_your_words"
+    except tools.Gone:
+        result, code = tools.Result(False, say=REFUSALS["gone"]), "gone"
+    except ToolError as exc:
+        result, code = tools.Result(False, say=redact.redact(str(exc))[0][:500]), "refused"
+    except Exception as exc:
+        log_failure(logger, "Bot confirmed action failed", exc)
+        result, code = tools.Result(False, say=REFUSALS["failed"]), "failed"
+    turn.audit(tool.name, "ok" if result.ok else "deny")
     shown = [_action(pending["tool"], pending["label"], result.ok, code), *result.blocks]
-    text = "Done." if result.ok else (result.say or REFUSALS["failed"])
+    if result.ok:
+        text = redact.redact(result.say)[0][:OUTCOME_CHARS] if result.say else "Done."
+    else:
+        text = result.say or REFUSALS["failed"]
     return bots.add_event_message(bot_id, principal.user_id, text, shown)
 
 

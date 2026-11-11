@@ -1017,3 +1017,122 @@ def test_the_per_process_turn_cap(bots_hub, fake, monkeypatch):
     assert (other.status, other.json()["code"]) == (429, "busy")
     gate.set()
     first.until_end()
+
+
+# Follow-ups round 2
+
+
+def test_a_tool_not_offered_this_turn_is_refused_and_the_turn_goes_on(bots_hub, fake):
+    hub = bots_hub
+    configure(hub)
+    fake.script = [[call("no_such_tool")], [("text", "Answered anyway.")]]
+    _, events = talk(hub)
+    assert names(events)[-1] == "done"
+    assert events[-1][1]["message"]["text"] == "Answered anyway."
+    fed = json.loads(fake.calls[1]["messages"][-1]["content"].split(": ", 1)[1])
+    assert (fed["ok"], fed["code"]) == (False, "invalid")
+
+
+def toggled_confirm_tool(extra_tools, runs, refuse, say=""):
+    def check(turn, args):
+        if refuse:
+            raise ToolError("That item changed; look at it again first.")
+
+    extra_tools(
+        tools.Tool(
+            name="approve_toggle",
+            description="Approve an item",
+            schema={
+                "type": "object",
+                "properties": {"ref": {"type": "integer"}},
+                "required": ["ref"],
+                "additionalProperties": False,
+            },
+            kind="confirm",
+            run=lambda turn, args: runs.append(args["ref"]) or tools.Result(True, say=say),
+            label=lambda turn, args: f"Approve item {args['ref']}",
+            check=check,
+        )
+    )
+
+
+def test_a_confirm_refused_by_check_stays_open_for_another_tap(bots_hub, fake, extra_tools):
+    hub = bots_hub
+    configure(hub)
+    runs, refuse = [], []
+    toggled_confirm_tool(extra_tools, runs, refuse)
+    card = new_card(hub)
+    fake.script = [[call("approve_toggle", ref=card["number"])], [("text", "Tap OK.")]]
+    bot, events = talk(hub, "Approve it")
+    [block] = [d for e, d in events if e == "block"]
+    refuse.append(True)  # the item changed before the tap
+    status, body, _ = confirm(hub, bot["id"], block["pending"])
+    assert status == 200 and body["message"]["blocks"][0]["ok"] is False
+    assert runs == []
+    refuse.clear()  # fixed; the same chip works
+    status, body, _ = confirm(hub, bot["id"], block["pending"])
+    assert status == 200 and body["message"]["blocks"][0]["ok"] is True
+    assert runs == [card["number"]]
+    assert confirm(hub, bot["id"], block["pending"])[0] == 409  # still exactly once
+
+
+def test_a_confirm_tool_with_text_and_no_check_is_refused_at_registration():
+    with pytest.raises(ValueError):
+        tools.register(
+            tools.Tool(
+                name="post_unchecked",
+                description="Post",
+                schema={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                    "additionalProperties": False,
+                },
+                kind="confirm",
+                run=lambda turn, args: tools.Result(True),
+                label=lambda turn, args: "Post",
+            )
+        )
+    assert "post_unchecked" not in tools.REGISTRY
+
+
+def test_a_confirmed_action_carries_the_tools_own_outcome(bots_hub, fake, extra_tools):
+    hub = bots_hub
+    configure(hub)
+    runs = []
+    toggled_confirm_tool(extra_tools, runs, [], say="Done. The new bot is in your list now.")
+    card = new_card(hub)
+    fake.script = [[call("approve_toggle", ref=card["number"])], [("text", "Tap OK.")]]
+    bot, events = talk(hub, "Approve it")
+    [block] = [d for e, d in events if e == "block"]
+    status, body, _ = confirm(hub, bot["id"], block["pending"])
+    assert status == 200
+    assert body["message"]["text"] == "Done. The new bot is in your list now."
+
+
+def test_blocks_shown_during_a_turn_use_the_persons_current_rights(bots_hub, fake, extra_tools):
+    hub = bots_hub
+    configure(hub)
+
+    def promote(turn, args):
+        with hub.db._lock:  # the owner makes this member an owner while the turn runs
+            hub.db._conn.execute(
+                "UPDATE memberships SET role='owner' WHERE workspace_id=? AND user_id=?",
+                (hub.workspace, hub.member_user),
+            )
+        return tools.Result(True, blocks=({"type": "setup", "code": "needs_turn_on"},))
+
+    extra_tools(
+        tools.Tool(
+            name="show_setup",
+            description="Show setup",
+            schema={"type": "object", "properties": {}, "additionalProperties": False},
+            kind="read",
+            run=promote,
+            label=lambda turn, args: "Looked at setup",
+        )
+    )
+    fake.script = [[call("show_setup")], [("text", "Ok.")]]
+    _, events = talk(hub, "Set up", auth=hub.member)
+    [block] = [d for e, d in events if e == "block"]
+    assert block["can_configure"] is True

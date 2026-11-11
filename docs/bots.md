@@ -154,7 +154,10 @@ block. When the item named by `ref` cannot be read, nothing is created and the c
 (`unreadable`). `POST /api/bots/<id>/confirm {pending, accept:true}` moves it from `open` to `done`
 once and runs exactly the stored action as the person; the result is an `event` message with
 the action block. `accept:false` cancels it. A second confirm is 409 `conflict`, an expired one
-409 `expired`, another person's 404. A confirm tool receives the frozen `version` among its
+409 `expired`, another person's 404. The tool's `check` runs before the action is consumed:
+when it refuses for a reason the person can fix (the item changed), the event message says so
+and the same chip can be tapped again; text that is not the person's words closes it. Only an
+attempted action is consumed, by the compare-and-set, so it still runs at most once. A confirm tool receives the frozen `version` among its
 arguments.
 
 **Writing a tool.** `commonplace/bots/tools.py` defines `Tool` (name, description, a closed
@@ -164,7 +167,11 @@ argument validation and before anything is labelled, stored or written: a confir
 writes the person's text calls `turn.words()` there, so model text is refused before a
 pending action or chip exists. `/confirm` rebuilds the turn with the message that asked for
 the action (even when newer messages exist) and calls `check` again before `run`; a routine
-tool's `check` also runs before `run`. A `project`-scope tool acts on the bot's own project; for a bot
+tool's `check` also runs before `run`. A confirm tool whose schema takes free text (a string
+without an `enum`) must have `check`, or `register()` refuses it. A successful `Result` may
+carry `say`, a plain outcome sentence that becomes the text of the confirmed action's event
+message (redacted, at most 500 characters); without it the text is "Done.". A tool call
+naming a tool that was not offered is refused with `invalid` and the turn goes on. A `project`-scope tool acts on the bot's own project; for a bot
 without one the model must name a readable project in a `project` argument, and
 `Turn.board(args)` returns it. Tool modules are listed in `bots.TOOL_MODULES` and imported at
 install; a missing module is skipped.

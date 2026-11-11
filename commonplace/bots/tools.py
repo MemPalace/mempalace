@@ -56,7 +56,7 @@ class Result:
     ok: bool
     data: Any = None
     blocks: tuple = ()
-    say: str = ""  # plain refusal sentence
+    say: str = ""  # plain refusal sentence; on success, an optional plain outcome sentence
 
 
 REGISTRY: dict[str, Tool] = {}
@@ -73,11 +73,23 @@ def register(tool: Tool) -> Tool:
         raise ValueError(f"{tool.name}: schema must be a closed object")
     if tool.scope == "project" and "project" in schema.get("properties", {}):
         raise ValueError(f"{tool.name}: `project` is supplied by the turn")
+    if tool.kind == "confirm" and tool.check is None and _free_text(schema):
+        # Free text on a chip must be checked (your words) before the chip exists.
+        raise ValueError(f"{tool.name}: a confirm tool with text arguments needs `check`")
     with _lock:
         if tool.name in REGISTRY and REGISTRY[tool.name] is not tool:
             raise ValueError(f"bot tool {tool.name} registered twice")
         REGISTRY[tool.name] = tool
     return tool
+
+
+def _free_text(schema) -> bool:
+    """True when the schema accepts a free string anywhere (an enum string is not free)."""
+    if schema.get("type") == "string":
+        return "enum" not in schema
+    return any(_free_text(item) for item in schema.get("properties", {}).values()) or (
+        schema.get("type") == "array" and _free_text(schema.get("items", {}))
+    )
 
 
 class Turn:
