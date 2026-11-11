@@ -50,6 +50,7 @@ MODULES = (
     "commonplace.chat",
     "commonplace.holds",
     "commonplace.agent_schedules",
+    "commonplace.routines",
     "commonplace.projects",
 )
 

@@ -609,6 +609,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/cardruns.mjs` (run by `tests/test_card_runs_ui.py`) covers the card panel's Runs section including the Start agent control: the words of every refusal, the configured and free forms, what a refresh keeps and when no control shows.
 
+  - `tests/test_routines.py` pins routine creation per due time on a fake clock, restart recovery and owner-only access.
+
   - `tests/test_projects_seat_lease.py` creates a seat through the Project settings routes and has it take, hold, renew and release its lease over MCP.
 
   - `tests/test_rules_enforcement_points.py` checks the four rule enforcement points; hook tests that compare the startup context now feed it a complete rules section, and the import-reader hook check expects the missing-rules notice for a memory-only context.
@@ -975,6 +977,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The extension seam lists `commonplace.agent_schedules`, installed after holds.
 
+  - The extension list also loads `commonplace.routines`, which starts its worker with the other background workers and stops it before the control database closes.
+
   - Extension installation registers email shutdown before GitHub shutdown; HTTP server teardown closes both in that order before SQLite closes.
 
   - The untrusted write limit and the first-backfill allowance are environment configuration (`COMMONPLACE_WRITE_LIMIT*`, `COMMONPLACE_BACKFILL_*`); the allowance is counted durably per connection and per workspace.
@@ -1188,7 +1192,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## boards
 
-- **Paths:** `commonplace/boards/`, `commonplace/events.py`, `commonplace/webhooks.py`, `commonplace/holds.py`, `commonplace/callstack.py`
+- **Paths:** `commonplace/boards/`, `commonplace/events.py`, `commonplace/webhooks.py`, `commonplace/holds.py`, `commonplace/routines.py`, `commonplace/callstack.py`
 - **Owns:**
 
   - Canonical Space REST response projection and typed creation refusals.
@@ -1199,9 +1203,13 @@ Format (read by `commonplace orch docs-check`):
 
   - The card's completion reviewer (`boards/reviewer.py`): only a signed-in workspace owner chooses, changes or clears it, it must be a current member, and a reviewer who left counts as none. With none the owner reviews as before. With one, every move to Done by anyone else opens a completion review addressed to that member, and only that member may answer it; the reviewer sees it in needs-me, and changing the reviewer re-addresses an open review.
 
+  - Routines (`routines.py`, `/api/routines`): an owner-defined name, card template, schedule and owner that create one card per due time through `BoardService.task_add`, with a history of runs linking to the cards. Due times come from the shared `schedule_time.py`.
+
 - **Promises:**
 
   - Owner-granted `cards:decide`: a live owner's top-level PAT or OAuth connection holding the scope answers only asks addressed to that owner, is refused for seats and board coordinators, needs `memory:write`, read access to the board's wing and the owner's person-level write access to it (not the app's own write wings), cannot escalate, and writes one `card.decide.delegated` audit row inside the board transaction (a failed write fails the answer; a later rollback appends `card.decide.rolled_back`; an audit row without an answer is possible after a kill between the two commits, or when the cancel write fails). Without the scope, refusals are unchanged.
+
+  - A routine creates at most one card per due time, also across restarts (a unique run row per due time plus a marker label on the card); the owner is a workspace owner whose authority applies at run time, runs are bounded (25 routines per workspace, 60-minute minimum interval, 3 catch-up cards after downtime, 200 history rows per routine) and five failed runs in a row pause the routine. Only signed-in workspace owners read or change routines.
 
   - Member event pages use one readable-board snapshot, an opaque access epoch and bounded SQL projection. Restricted webhook subscriptions omit public sequence fields and use opaque ids from independent server-only subscription keys, initialized on first use and durable across restarts. Neither keys nor sequence fields are exposed; raw event keys remain internal for replay deduplication without a counter or backfill. Subscription lookup exceptions log their type and stack locations while retaining fail-closed authority.
 
@@ -1276,6 +1284,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_cards_blocked_by_app.py` with `tests/blockers_ui.mjs` covers the app's blocker section, the REST add/clear round trip, todo and take-next skipping blocked cards, and plain refusals.
 
   - `tests/test_cards_waiting_reasons.py` with `tests/board_why.mjs` covers each waiting reason (pure, card view, board summary) and its app rendering.
+
+  - `tests/test_routines.py` uses a fake clock: one card per due time, restart recovery without duplicates, bounded catch-up and history, pause/resume/delete, owner-only refusals and limits.
 
   - `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`, `tests/test_commonplace_webhooks.py`.
 
