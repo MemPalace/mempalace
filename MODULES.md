@@ -254,6 +254,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The operational Admin API and opt-in backup receipts, with operator provisioning and unknown-history limits.
 
+  - `docs/chat.md` and `docs/bots.md` state that bots are the main way to talk to a project, what the project tools do for the person, the your-words rule, which actions wait for a tap, and that a post a bot forwards gets no front receipt or fallback card.
+
   - The card API reference documents the after-Done routes (archive, restore, carry on, Pocket), their person-only authorization and what archiving hides.
 
   - The Admin runtime/limits/stuck API, independent owner queue and project/runner guide links.
@@ -1856,6 +1858,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The control-database `bot_model_calls` table (bot model requests per person and day, numbers only); `store.counts_today` adds it to project chat's count so both share one budget, and `store.take_bot_call` checks and counts one bot request in a single transaction.
 
+  - `front.skipping()` is a thread-local context manager: a project-chat post made inside it on the same thread is ignored by the front agent's event handler (no receipt, model job, runner relay or fallback card). Bots wrap their forwarded posts in it.
+
   - `commonplace/chat/model.py` holds the shared connection code (`resolve_endpoint`, `Call`) behind both `complete` and the streaming client `commonplace/chat/model_stream.py`, which yields reply text, complete tool calls and one stop reason as the provider sends them.
 
 - **Promises:**
@@ -2104,7 +2108,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## bots
 
-- **Paths:** `commonplace/bots/`, `docs/bots.md`, `tests/_bots_helpers.py`, `tests/test_bots_api.py`, `tests/test_bots_machines.py`, `tests/test_bots_store.py`, `tests/test_bots_updates.py`, `tests/test_bots_turn.py`, `tools/bots_overhead.py`
+- **Paths:** `commonplace/bots/`, `docs/bots.md`, `tests/_bots_helpers.py`, `tests/test_bots_api.py`, `tests/test_bots_machines.py`, `tests/test_bots_store.py`, `tests/test_bots_updates.py`, `tests/test_bots_turn.py`, `tests/test_bots_project_tools.py`, `tools/bots_overhead.py`
 - **Owns:**
 
   - The web-app part of `docs/bots.md` also says where Projects, Needs me and Console moved (the Workspace group of the account menu) and that the Bots count is the number of questions waiting on the person.
@@ -2118,6 +2122,8 @@ Format (read by `commonplace orch docs-check`):
   - `auth.person` is the single gate for `/api/bots*`: a signed-in person session, 404 for any agent token or machine credential, 401 for no credentials.
 
   - The turn engine: `turn.py` runs one turn per bot on its own thread (process-local `limits.REGISTRY`: one per bot, 4 per person, 32 per process), streams through `chat.model_stream.stream` with the `BOT_*` limits in `limits.py`, journals every tool call in `bot_actions`, and stores the reply in one write; `routes.py` relays it as server-sent events and serves stop and confirm. `context.py` builds the fixed system prompt and the quoted, redacted context. `tools.py` holds the `Tool`/`Result`/`Turn` contract, argument validation, the built-in `remember` and `forget`, and `bots.TOOL_MODULES` lists the tool modules imported at install. `tools/bots_overhead.py` is an informational hub-overhead measurement, not a test.
+
+  - `tools_project.py` registers the project tools: `project_status`, `list_work`, `work_detail`, `create_work`, `prioritize_work`, `comment_work`, `tell_orchestrator`, `list_decisions`, `answer_decision`, `approve_work` and `create_project`. Each acts through `BoardService` as the person, gives a confirmed action's outcome a plain sentence (`Result.say`), reads queued work through the work hydrator so a start in flight shows as working, turns a service refusal into one plain sentence (chosen by the refusal's type, with a neutral fallback for anything unrecognised), keeps each result under the engine's cut by adding rows only while the serialised result fits and reporting how many were left out, and never repeats text of work the person cannot see. `answer_decision`, `approve_work` and `create_project` are `confirm` tools whose `check` refuses text that is not the person's own, an item they cannot see and an unoffered choice before any chip exists (and again at the tap), and whose label is built from the frozen arguments and the question or work the person can see.
 
   - `blocks.HYDRATORS` fills stored block references (`work`, `decision`, `action`, `setup`, `confirm`) with the reader's own view through `BoardService`; an invisible or missing item becomes `gone`, an unknown type is returned as stored. `modelcfg.resolve` turns the chat front settings into a model or one of `needs_configuration`, `needs_turn_on`, `key_missing`.
 
@@ -2139,6 +2145,8 @@ Format (read by `commonplace orch docs-check`):
 
   - A person is offered exactly the machines the runner would let them start on (today workspace owners; a member gets an empty list and a plain reason). Revoked and switched-off machines are never listed, an unattested one is listed as `unbound` and cannot start, and `verified` is always false. No credential, token or host name appears in any value `machines` returns.
 
+  - Filed work, comments, forwarded messages, decision replies and project names are the person's own words: a title, body, text, reply or name that is not a verbatim part of the current message is refused (`not_your_words`) and nothing is written; without arguments the whole message is used. `create_work` records `bot_work`; `tell_orchestrator` posts as the person inside `chat.front.skipping()` and records `bot_forwards`, so the post gets no front receipt, model answer, runner relay or fallback card. A confirmed answer or approval runs with the item's frozen `version`; a changed item is refused with a plain sentence.
+
 - **How it fails:**
 
   - Out-of-bound input is 400 `invalid`, the bot limit and conflicts are 409, a busy store is 429; error bodies carry fixed text, never conversation text.
@@ -2156,6 +2164,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_bots_updates.py` covers each update (needs you, ready, done, an orchestrator reply, verbatim and marked), exactly-once on redelivery and on a repeated transition, only the filing or forwarding bot, no message for another person or for someone who lost access, no store write for a card no bot filed, a failing store never breaking the card write, roster state and unread, redacted titles, log hygiene and the schema upgrade of an existing file.
 
   - `tests/test_bots_turn.py` covers a turn over real HTTP with a scripted model and one loopback fake provider: `ack` before model work, a delta while the provider holds back, tool round trips as the person, `not_your_words`, confirm once / decline / expiry / foreign person, replay of finished and running requests, interrupted turns, stop, a dropped client, setup without a model, the shared daily and per-minute budget, the step cap, the turn deadline, caps, a member's refusal, and no conversation text in the control database, audit rows or logs.
+
+  - `tests/test_bots_project_tools.py` covers each project tool with an owner and a member, the your-words rule and span arguments, a bot that cannot reach another project or hidden work, a decision answered end to end, confirm tools running only on the tap with the frozen version, `chat.front.skipping()` (no receipt, model job, relay or fallback card, synchronous listeners, nesting), and no conversation text in audit rows or logs.
 
   - `tests/test_bots_machines.py` covers who sees which machines (owner, member, revoked, unattested, another workspace), one runner job per request key, refusals with the runner's code, cancelling queued and launched starts, `run_command` being unsupported, merged providers and that no credential leaks, plus the tools: a start waits for a tap and runs once, labels are server-built, refusals are plain sentences, stopping a queued start works and a launched one is reported, the machines block hydrates per reader, and `run_command` is not offered without a capable provider.
 

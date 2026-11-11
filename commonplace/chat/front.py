@@ -1,7 +1,9 @@
 """Deterministic receipts and person-message event handling."""
 
+import contextlib
 import functools
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -14,6 +16,23 @@ from commonplace.extensions import ToolContext
 from commonplace.http_util import log_failure
 
 logger = logging.getLogger(__name__)
+_skip = threading.local()
+
+
+@contextlib.contextmanager
+def skipping():
+    """Posts made inside this block on this thread get no front handling.
+
+    A bot that forwards its person's words to the project chat wraps the post in it: the person
+    is already talking to the bot, so no receipt, model answer, runner relay or fallback card is
+    added. Event listeners run synchronously in the posting thread, so the counter is still set
+    when :func:`on_event` sees the post.
+    """
+    _skip.depth = getattr(_skip, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _skip.depth -= 1
 
 
 def orchestrator(gateway, principal, board: str) -> OrchestratorView | None:
@@ -85,6 +104,8 @@ def receipt(gateway, principal, board: str, *, work: bool) -> tuple[str, str, tu
 
 
 def on_event(gateway, event: dict) -> None:
+    if getattr(_skip, "depth", 0):
+        return
     try:
         if event.get("kind") != "space_message":
             return

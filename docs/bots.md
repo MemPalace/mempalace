@@ -178,7 +178,45 @@ install; a missing module is skipped.
 
 ## Project tools
 
-Filled by a later slice.
+A project's bot (or the General bot, when you name the project) can run the project for you
+in plain language. You never open a board: the bot calls the same services you would, as you,
+so it can do nothing you may not do yourself. When a service refuses, the bot says so in one
+plain sentence with what to do next.
+
+What the bot can do:
+
+- **Look.** `project_status` (counts by status, who is working, what waits and why, whether the
+  orchestrator is connected and woken), `list_work` (up to 20 tasks, filtered by status),
+  `work_detail` (one task with its latest notes and links) and `list_decisions` (the open
+  questions waiting for you).
+- **File and order work.** `create_work` files your message as a new task, `prioritize_work`
+  changes a task's priority (project owner only) or moves it before or after another task, and
+  `comment_work` adds a comment.
+- **Steer.** `tell_orchestrator` passes your words to the project's orchestrator and says
+  honestly whether it is connected and woken, or will only see them when it next checks. New
+  work goes through `create_work` only, never also forwarded. One message that does both uses
+  the span arguments: one part is filed, another is forwarded.
+- **Answer and approve, with one tap.** `answer_decision` (an offered option, or your own
+  reply), `approve_work` and `create_project` never run from the bot's own call. The bot shows
+  a confirm chip whose text the server builds from the frozen arguments; your tap runs exactly
+  that action once. An answer or approval is tied to the item's version: if it changed after
+  the chip was shown, the tap is refused and the bot asks you to look again.
+
+**Your words only.** Every text a writing tool uses (a title, body, comment, forwarded
+message, decision reply or project name) must be copied verbatim from your current message,
+or the tool refuses (`not_your_words`) and nothing is written. Without arguments the whole
+message is used (the title is its first non-blank line, cut to 200 characters). The bot
+chooses which tool, which item and which part of your message, never what gets written, so
+text it read in other people's work cannot end up in a task, the project chat or an answer.
+
+Filing work is routine: on a project whose owner configured starts for new tasks, a filed
+task starts an agent exactly as when you file it by hand. Each filed task and each forwarded
+post is remembered for the bot (`bot_work`, `bot_forwards`) so later slices can tell you when
+it needs you or is done. A post forwarded by a bot is made inside `chat.front.skipping()`, so
+project chat adds no receipt, answer or fallback card for it.
+
+A new project is created through the same service the web app uses, with its permission
+rules. The project's own bot appears in the roster on the next read.
 
 ## Machines
 

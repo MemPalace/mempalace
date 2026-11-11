@@ -6,6 +6,14 @@ a signed-in person session; agents continue to use `space_read` and `space_post`
 The view shows the conversation, linked cards, permitted orchestrator status,
 linked start jobs and the Decisions count. Private status stays private.
 
+Bots are the main way to talk to a project: you tell a bot what you want, and it
+files your words as work, passes them on to the orchestrator or answers your
+questions (see [bots](bots.md)). This chat stays as the shared channel between
+people, the orchestrator and agents; a bot forwards into it. A post a bot forwards
+for you gets no front receipt, model answer, runner relay or five-minute fallback
+card, because you are already talking to the bot; the orchestrator is woken exactly
+as for any other post.
+
 ## Basic, runner and model modes
 
 **Basic mode is the default** (`provider: "none"`). Each post gets an immediate,
