@@ -202,6 +202,17 @@ unattempted siblings explicit errors. SQLite may take bounded ordinary read lock
 Deployment/health and backup receipts are read-only operational sections. No deploy,
 backup-run, restore, runner control or new enforcement endpoint is present.
 
+## Runner machines block
+
+Below the sections, the Admin page hosts a separate **Runner machines** block for the
+workspace owner. It does not use the `/api/admin` dispatcher, which stays GET-only; it
+calls the existing owner-only `/api/runners` routes to list machines, enroll one,
+attest a binding and edit a machine's wings. Enrollment shows the machine and worker
+tokens once, in a panel the page empties on dismissal, navigation, sign-out or session
+expiry; they are never stored, logged or redrawn. The block redraws independently of
+the Admin sections, so refreshing them cannot clear a form or the token panel. See the
+[runner guide](runner.md#owner-screen) for the fields and what a wings change resets.
+
 ## Instance deployment, health and backup receipts
 
 The operational sections require a signed-in person who owns the active workspace

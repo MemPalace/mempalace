@@ -27,8 +27,8 @@ export async function boundedRequest(api, path, { timers = globalThis, signal } 
   }
 }
 
-export function createAdmin({ mount, api, e, current, timers = globalThis }) {
-  let host = null, workspace = null, epoch = 0, live = false, instanceBlocked = false;
+export function createAdmin({ mount, api, e, current, runners = null, timers = globalThis }) {
+  let host = null, body = null, workspace = null, epoch = 0, live = false, instanceBlocked = false;
   const sections = new Map(), requests = new Map(), generations = new Map();
   const owner = () => current()?.can_admin === true;
   const eligible = () => live && owner() && current()?.workspace === workspace;
@@ -114,7 +114,7 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
 
   function render() {
     if (!host || !live) return;
-    host.innerHTML = `<div class="admin settings"><p class="admin-workspace">${e(current().workspace_name || '')}</p><a href="#/settings">Manage agents and workspace settings</a>${Object.entries(SECTIONS).map(([key, title]) => {
+    (body || host).innerHTML = `<div class="admin settings"><p class="admin-workspace">${e(current().workspace_name || '')}</p><a href="#/settings">Manage agents and workspace settings</a>${Object.entries(SECTIONS).map(([key, title]) => {
       if (!sections.has(key)) return '';
       if (key === 'deploy') return `<section class="settings-section" data-admin-section="deploy"><h2>${e(title)}</h2>${panel('deploy')}${panel('health')}</section>`;
       return `<section class="settings-section" data-admin-section="${key}" aria-busy="${requests.has(key)}"><h2>${e(title)}</h2>${key === 'stuck' ? '<h3>Needs-me</h3>' + panel('needs') + '<h3>Stuck facts</h3>' : ''}${panel(key)}</section>`;
@@ -128,8 +128,9 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
     host?.removeEventListener('click', click);
     globalThis.document?.removeEventListener('session-expired', stop);
     globalThis.document?.removeEventListener('signout', stop);
+    runners?.stop();
     if (host) host.innerHTML = '';
-    workspace = null;
+    body = null; workspace = null;
   }
 
   function refreshSection(key, { more = false, list = null, cursor: requestedCursor } = {}) {
@@ -229,6 +230,12 @@ export function createAdmin({ mount, api, e, current, timers = globalThis }) {
     if (!host) return;
     if (!owner()) { host.innerHTML = '<p role="status">a signed-in workspace owner is required</p>'; return; }
     workspace = current().workspace; live = true; instanceBlocked = false;
+    // The runner block sits beside the refreshing sections so its form and one-time tokens survive their redraws.
+    if (runners) {
+      host.innerHTML = '<div data-admin-body></div><div data-admin-runners></div>';
+      body = host.querySelector('[data-admin-body]');
+      runners.show(host.querySelector('[data-admin-runners]'));
+    }
     for (const key of ['users', 'connections', 'runtime', 'limits', 'stuck', 'needs']) sections.set(key, { data: null, error: '', restricted: false });
     for (const key of ['deploy','health','backups','backup-online','backup-offline']) sections.set(key, { data:null, error:instanceOwner() ? '' : 'Instance administrator access required', restricted:!instanceOwner() });
     host.addEventListener('click', click);

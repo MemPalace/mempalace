@@ -110,6 +110,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 1px
 .agent-secret h3 { font-size: 16px; overflow-wrap: anywhere; }
 .agent-secret pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
 .agent-secret button, .agents-settings .setting-row button { min-height: 44px; }
+.runner-block form > :is(h3, h4, p, fieldset) { flex-basis: 100%; margin: 0; }
+.runner-block fieldset { border: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.runner-block fieldset label { flex-direction: row; align-items: center; gap: 8px; }
+.runner-block fieldset input { width: 18px; height: 18px; min-height: 0; }
+.runner-machine { padding: 16px 0; border-top: 1px solid var(--line); }
 @media (max-width: 640px) {
   .agent-secret { grid-template-columns: minmax(0, 1fr); }
   .agent-form > label, .agent-form > button { flex-basis: 100%; }

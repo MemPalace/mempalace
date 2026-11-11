@@ -1,6 +1,6 @@
 # Optional machine runner
 
-The owner [Admin overview](admin.md) shows recorded machine and worker contact separately, unverified attestation, and machine grants. It sends no runner probe or control request.
+The owner [Admin overview](admin.md) shows recorded machine and worker contact separately, unverified attestation, and machine grants. Its overview sends no runner probe or control request; the separate [runner block](#owner-screen) manages machines through the owner routes below.
 
 The runner lets a signed-in workspace owner or a granted coordinator request an agent start for a card the machine's worker could claim. It is inert by default: no machine means no change; an `unbound` machine refuses every start, including the owner's, and leases return 204. No config or service activation ships enabled. D1–D3 below remain open.
 
@@ -8,11 +8,24 @@ The runner lets a signed-in workspace owner or a granted coordinator request an 
 
 Only a signed-in person owner can enroll, attest, change grants, rotate credentials or revoke a machine through `/api/runners`. Enrollment returns separate machine and worker tokens once. Attestation records an owner statement as `owner_attested`, always with `verified:false`: **attested, not verified**. Topic or wing changes, worker rotation and revocation reset the binding to `unbound`; queued and leased jobs are cancelled on the next sweep. Each reset increments a binding epoch once; reattestation cannot revive jobs carrying the old epoch. Changing an already-attested provider returns 409 `provider_change_requires_reset`: explicitly reset by changing topics/wings, review the grant, then confirm the new provider. Same-provider confirmation and project-only edits preserve the epoch. Stop old hub processes before upgrading and restarting; mixed-version reset writers cannot uphold the epoch fence.
 
-Coordinators are CLI-created trusted PATs explicitly listed in the machine's `requesters`; OAuth and ordinary standard or untrusted connections do not qualify. A start checks both the requester's card access and whether the worker could claim the unassigned, released `todo` card in its write wing. It does not assign or claim the card.
+Coordinators are CLI-created trusted PATs explicitly listed in the machine's `requesters`; OAuth and ordinary standard or untrusted connections do not qualify. A start checks both the requester's card access and whether the worker could claim the unassigned, released `todo` card on a board whose wing is in the machine's grant. It does not assign or claim the card.
 
-The worker PAT bounds tools and wing access. Its tools are `task_show`, `task_take_next`, `task_update`, `task_comment`, `task_heartbeat`, `task_handoff` and `ask`; it cannot coordinate starts or perform owner actions. The fixed `SPAWN_MESSAGE` tells the agent to claim only the requested card, stop if refused, and touch no other card. Card scope from the spawn message is guidance only. A worker can claim any startable todo card in its write wing. Also, a card manually assigned to the worker by an owner remains editable outside its write wing under the existing assigned-card rule. The runner never assigns cards.
+The worker PAT bounds tools and wing access: it reads and writes exactly the wings in its machine grant (the first is its default write wing) and nothing else, through any tool. A start on a board outside the grant is refused with `no: card is not startable: outside_worker_wing: board wing '<wing>' is not in the machine's granted wings '<a>', '<b>'`. Its tools are `task_show`, `task_take_next`, `task_update`, `task_comment`, `task_heartbeat`, `task_handoff` and `ask`; it cannot coordinate starts or perform owner actions. The fixed `SPAWN_MESSAGE` tells the agent to claim only the requested card, stop if refused, and touch no other card. Card scope from the spawn message is guidance only. A worker can claim any startable todo card on a granted wing's boards. Also, a card manually assigned to the worker by an owner remains editable outside its granted wings under the existing assigned-card rule. The runner never assigns cards.
+
+A machine enrolled before multi-wing grants keeps a worker PAT limited to its first wing until the owner saves its wings once (the screen's "Save wings", or `PATCH` with the same wings): that rewrites the worker policy without resetting the binding.
 
 The T3 grant supplied through `t3_grant_env` is outside the worker PAT ceiling. It reaches whatever T3 permits; local runtime ceilings constrain an honest runner only. The default runtime ceiling is `approval-required`; a higher local ceiling needs `runtime_ack == "<label>:<mode>"`, and requests must also fit the hub grant.
+
+## Owner screen
+
+A workspace owner manages machines in the **Runner machines** block at the bottom of the Admin page (`#/admin`), using only the owner routes above; nobody else sees it.
+
+- **List.** `GET /api/runners` shows each machine's label, state, binding, projects, topics and wings. Credentials are never listed.
+- **Add runner.** Label, projects, topics, wings (picked from the readable, non-private wings), maximum runtime mode and maximum in flight go to `POST /api/runners`. The machine and worker tokens appear once in a panel with copy buttons and a warning that they are not shown again. The page keeps them only in that panel: nothing goes to storage or logs, they are not part of any list redraw, and **Done** (or leaving the page, signing out or an expired session) removes them.
+- **Attest.** Per machine: topics, provider instance id and the worker connection id (prefilled) go to `POST /api/runners/<id>/attest`. The result is still your statement, not verified.
+- **Edit wings.** Per machine: `PATCH /api/runners/<id>` with the chosen wings. Changing wings (or topics) resets the machine to `unbound`, cancels its queued and leased starts and requires a new attestation; saving the same wings only refreshes the worker's access.
+
+Requesters and model choices are managed elsewhere ([projects](projects.md)).
 
 ## Local checks and checkout
 
@@ -262,7 +275,7 @@ config and 5 for a hub failure in `--once` mode.
 1. [ ] D1 decision recorded.
 2. [ ] D2 capture artifact path recorded; the parser contract **and the `root` workspace strategy** re-checked against it (OD-B).
 3. [ ] T3 provider instance and topic mapping set up by the owner; T3 grant scoping known, or its absence accepted.
-4. [ ] Only then: a real `POST /api/runners` enrollment and `attest` in the owner's own session.
+4. [ ] Only then: a real enrollment (`POST /api/runners`, or the Admin runner block) and `attest` in the owner's own session.
 5. [ ] Runner config written by the owner (0600), with `shared_checkout_ack` for each project only after the owner accepts that agents work in that project's checkout (or points the project at a dedicated clone, OD-B); `runner check` exit 0. Any service install or activation is a separate approval.
 
 ### Optional workspace admission

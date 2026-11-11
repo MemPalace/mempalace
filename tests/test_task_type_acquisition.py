@@ -87,7 +87,7 @@ def test_legacy_runner_exact_reason(hub, legacy, allowed):
     with owner.store.connection() as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (cards[1]["number"],)).fetchone()
         board = conn.execute("SELECT * FROM boards WHERE slug='work'").fetchone()
-    # Runner worker's single write wing is part of existing admission authority.
+    # The worker's write wings come from its machine grant, part of existing admission authority.
     token = hub.token(
         "runner-worker",
         profile="full",
@@ -102,7 +102,11 @@ def test_legacy_runner_exact_reason(hub, legacy, allowed):
             conn.execute(
                 "INSERT INTO connection_task_types VALUES (?, 'code')", (worker.connection_id,)
             )
-    machine = {"workspace_id": hub.workspace, "worker_connection_id": worker.connection_id}
+    machine = {
+        "workspace_id": hub.workspace,
+        "worker_connection_id": worker.connection_id,
+        "wings": ["shared"],
+    }
     if allowed:
         predicate.startable(hub.gateway, machine, row, board)
     else:

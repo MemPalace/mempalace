@@ -168,10 +168,12 @@ def _grant(db, owner, grant, *, initial=False):
 
 
 def _worker_policy(wings):
+    """Read and write exactly the granted wings; the first is the default write wing."""
     return Policy.build(
         tools=WORKER_TOOLS,
         scopes=("memory:read", "memory:write"),
         read_wings=wings,
+        write_wings=wings,
         write_wing=wings[0],
         trust="standard",
     )

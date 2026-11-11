@@ -11,6 +11,7 @@ import { signinView, signinMessage } from "./signin.js";
 import { childProgress } from "./children.js";
 import { agentsView, createAgent, agentAction, changeAgentClient, clearAgentSecret } from "./agents.js";
 import { createAdmin, boundedRequest } from "./admin.js";
+import { createRunnerBlock } from "./adminrunners.js";
 import { createConsole } from "./console.js";
 import { createChat } from "./chat.js";
 import { createDock } from "./chatdock.js";
@@ -975,7 +976,7 @@ function clearWorkbenchChat() {
   if (typeof Event === "function") document.dispatchEvent?.(new Event("signout"));
 }
 function adminScreen() {
-  adminUI ??= createAdmin({ mount: () => root.querySelector("#content"), api, e, current: () => state.me });
+  adminUI ??= createAdmin({ mount: () => root.querySelector("#content"), api, e, current: () => state.me, runners: createRunnerBlock({ api, e }) });
   adminUI.show();
   title("Workspace administration");
   navigation();

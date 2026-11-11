@@ -205,6 +205,11 @@ configs. No deployment, replacement importer or memory-coverage completion is cl
 
 - Repeated sweep failures are visible: the second consecutive failure of a board alerts the owner once (`orch.trigger.failing`, `needs_me.orchestrator_failing`) until a sweep succeeds.
 
+### Runner wings and the owner runner block
+
+- A runner machine's worker PAT reads and writes every wing in the machine grant and no other; its first wing is the default write wing. `startable()` accepts a card whose board wing is granted and otherwise refuses with `outside_worker_wing`, naming the board wing and the granted wings. Machines enrolled before this keep a first-wing-only worker policy until their wings are saved once (same wings do not reset the binding).
+- The Admin page's runner block lists, enrolls, attests and edits wings through the existing owner-only `/api/runners` routes. Enrollment tokens are shown once in a panel and never stored, logged or redrawn.
+
 ### Mirror and search-index test waits
 
 - Tests that wait for background mirror or search-index work drain on the actual completion condition (no sweep active, no mirror job pending) through one shared test helper, with a 120 s stuck-job limit, rather than one fixed `wait_for_mirrors` budget that returns silently when it runs out.

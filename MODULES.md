@@ -247,6 +247,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `docs/admin.md` is the authoritative current Admin API and partial-rollout contract, linked from the existing board API and agent connection guide.
 
+  - `docs/admin.md` also describes the owner runner block, which manages machines through `/api/runners`, not the GET-only Admin dispatcher.
+
   - `docs/projects.md` names the split-start role: `main`, or the `[runner]` role when the config has no `main` role.
 
 
@@ -579,6 +581,8 @@ Format (read by `commonplace orch docs-check`):
 
 
   - Synthetic Admin HTTP inventories and served-asset Node contracts, with assertion-only pinned-base RED evidence and identical selected head GREEN nodes.
+
+  - Runner block checks run the served `adminrunners.js` against a fake DOM: enroll, attest and wings edit call the owner routes with exact bodies, and enrollment tokens never reach storage, logs, list redraws or a dismissed panel.
 
 
   - Synthetic legacy safety-stop cases and explicitly classified transcript-only fixture updates.
@@ -1171,13 +1175,15 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/runner/`, `docs/runner.md`
 - **Owns:**
 
-  - The runner guide links the owner Admin contact/grant projection without adding runner management actions.
+  - The runner guide links the owner Admin contact/grant projection and documents the Admin runner block that enrolls, attests and edits machines through the owner routes.
 
 
   - Machine enrollment and grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
   - Machine enrollment, binding epoch migrations and immutable job epoch snapshots, grants, runner jobs in `runner.sqlite3`, the requester and machine routes, the local launch client and chat answers.
 
 - **Promises:**
+
+  - A machine's worker policy reads and writes exactly its granted wings (first is the default write wing); starts on any other board wing are refused with a message naming the board wing and the granted wings, and the worker cannot write to an ungranted wing through any tool.
 
   - Admin keeps machine and worker contact separate and always reports owner attestation as unverified; expired job inspection never sweeps or renews leases.
 
@@ -1213,6 +1219,8 @@ Format (read by `commonplace orch docs-check`):
 
 
   - The `tests/test_runner_` files, `tests/test_orch_runner.py`, `tests/test_orch_acceptance.py`.
+
+  - `tests/test_runner_wings.py` covers multi-wing starts, the ungranted-wing refusal, worker write bounds after enrollment and PATCH, and owner-only listing.
   - The `tests/test_runner_` files (including binding migration, reset races, direct fences and lock-order instrumentation), `tests/test_orch_runner.py`, `tests/test_orch_acceptance.py`.
 
 
@@ -1669,6 +1677,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/web/`, `commonplace/console/`
 - **Owns:**
 
+  - The Admin runner block (`adminrunners.js`): owner-only machine list, enroll, attest and wings edit over `/api/runners`, with one-time token display kept outside the Admin sections' redraws.
+
   - Runtime switch/orchestrator/machine read projectors, effective limits, stuck facts and separate legacy needs-me rendering in the existing Admin lifecycle.
 
 
@@ -1691,6 +1701,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Settings and its prerequisite reads use ten-second per-request deadlines through JSON decoding; each failed section is named with Retry while successful sections retain saved values.
   - The navigation-only instance flag falls back to false on read faults without breaking /api/me; receipt parent refreshes invalidate older mode generations.
+
+  - The runner block never stores, logs or redraws enrollment tokens: they live only in a dismissible panel that sign-out, session expiry and leaving Admin also clear.
 
   - Admin validates runtime metadata, probes optional columns, filters inactive grants and preserves paginated rows with source-specific retry errors.
 

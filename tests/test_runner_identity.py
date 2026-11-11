@@ -122,7 +122,7 @@ def test_w3_linked_connections_require_runner_management(signup_hub, identity_ow
 
 def test_w4_worker_cannot_claim_outside_its_write_wing(signup_hub, identity_owner):  # noqa: F811
     hub, owner = signup_hub, identity_owner
-    machine = enroll(hub, owner, wings=["shared", "team"])
+    machine = enroll(hub, owner, wings=["shared"])
     created = card(hub, owner, board="team")
     number = created["number"]
     before = _show(hub, owner, number)
@@ -130,7 +130,10 @@ def test_w4_worker_cannot_claim_outside_its_write_wing(signup_hub, identity_owne
     for arguments in ({"task": number}, {"board": "team"}):
         ok, text = _take(hub, machine["worker_token"], **arguments)
         assert not ok, text
-        assert "cannot change this board" in text
+        # Reads and writes share one grant now, so an ungranted board is simply hidden.
+        assert any(
+            m in text for m in ("card not found", "board not found", "cannot change this board")
+        )
         after = _show(hub, owner, number)
         for key in ("status", "assignee", "claim_until", "version"):
             assert after[key] == before[key]
