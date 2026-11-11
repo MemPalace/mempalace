@@ -1403,10 +1403,7 @@ def tool_list_drawers(
                     raise RuntimeError("cannot verify source-wide conversation visibility")
                 source_ids.extend(found[0])
                 source_metadata.extend(found[1])
-            return {
-                row_id
-                for row_id, _ in visible_conversation_rows(source_ids, source_metadata)
-            }
+            return {row_id for row_id, _ in visible_conversation_rows(source_ids, source_metadata)}
 
         def make_page(ids, metadatas, checked_ids=None):
             from ..convo_visibility import visible_conversation_rows
