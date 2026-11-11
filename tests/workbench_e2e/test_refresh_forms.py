@@ -4,9 +4,16 @@ Each case drives the real app: open a card, open a form in its panel, let a back
 refresh run (another card changes, so the event feed wakes the board), and read the panel.
 """
 
-from playwright.sync_api import expect
-
 from tests.workbench_e2e.seed import request
+
+
+def expect(*args, **kwargs):
+    """Playwright's expect, imported on use: without CP_BROWSER_E2E=1 this module is collected and skipped,
+    and the dev install has no playwright package (a module-level import breaks collection of the whole suite)."""
+    from playwright.sync_api import expect as playwright_expect
+
+    return playwright_expect(*args, **kwargs)
+
 
 CARD = "A-131"
 OTHER = "A-132"
