@@ -27,7 +27,7 @@ function region() {
     },
   };
 }
-function fixture({ machines, wings = ['shared', 'team'], fail = {} } = {}) {
+function fixture({ machines, wings = ['shared', 'team'], fail = {}, wingsGate = null } = {}) {
   const regions = {}, listeners = {}, calls = [];
   const host = {
     innerHTML: '',
@@ -37,11 +37,12 @@ function fixture({ machines, wings = ['shared', 'team'], fail = {} } = {}) {
   };
   const state = { machines: machines ?? [machine()], copied: [] };
   const api = async (path, options = {}) => {
-    calls.push({ path, method: options.method || 'GET', body: options.body });
+    calls.push({ path, method: options.method || 'GET', body: options.body});
+    (calls.timeouts ??= {})[`${options.method || 'GET'} ${path}`] = options.timeoutMs;
     const key = `${options.method || 'GET'} ${path}`;
     if (fail[key]) throw Object.assign(new Error(fail[key]), { status: 409 });
     if (path === '/api/runners' && !options.method) return { machines: state.machines };
-    if (path === '/api/connections') return { wings, connections: [] };
+    if (path === '/api/connections') { await wingsGate; return { wings, connections: [] }; }
     if (path === '/api/runners' && options.method === 'POST') return { machine_id: 'mach_0123456789abcdef', machine_token: TOKENS.machine, worker_token: TOKENS.worker, binding_state: 'unbound' };
     return { ok: true };
   };
@@ -187,6 +188,30 @@ const field = (name, value, type = 'text', checked = false) => ({ name, value, t
   await f.click({ runnerAction: 'revoke', runnerId: 'mach_0123456789abcdef' });
   await f.click({ runnerAction: 'revoke-confirm', runnerId: 'mach_0123456789abcdef' });
   assert.equal(f.regions.reveal.innerHTML, '', 'revoking the machine clears its tokens from the page');
+  f.block.stop();
+}
+
+// 4e. A stuck wings read never holds the machine list: it renders at once, wing pickers wait, then fill in.
+{
+  let release; const wingsGate = new Promise(resolve => { release = resolve; });
+  const f = fixture({ wingsGate });
+  f.block.show(f.host); await flush();
+  assert.doesNotMatch(f.regions.list.innerHTML, /Loading runner machines/);
+  assert.ok(f.calls.timeouts['GET /api/runners'] > 0 && f.calls.timeouts['GET /api/connections'] > 0, 'both reads are bounded by a timeout');
+  assert.match(f.regions.list.innerHTML, /bench-1/);
+  assert.match(f.regions.list.innerHTML, /Loading wings/); assert.doesNotMatch(f.regions.list.innerHTML, /type="checkbox"/);
+  release(); await flush();
+  assert.match(f.regions.list.innerHTML, /name="wings" value="shared" checked/);
+  assert.match(f.regions['enroll-slot'].innerHTML, /name="wings" value="team"/);
+  f.block.stop();
+}
+// 4f. A failed machine read replaces the loading text instead of leaving it up.
+{
+  const f = fixture({ fail: { 'GET /api/runners': 'boom' } });
+  f.block.show(f.host); await flush();
+  assert.doesNotMatch(f.regions.list.innerHTML, /Loading runner machines/);
+  assert.match(f.regions.list.innerHTML, /could not be loaded/);
+  assert.equal(f.regions.status.textContent, 'boom'); assert.equal(f.regions.status.dataset.state, 'error');
   f.block.stop();
 }
 assert.deepEqual(leaks, [], 'nothing is written to local or session storage');

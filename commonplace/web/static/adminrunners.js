@@ -1,6 +1,8 @@
 /** Owner screen for runner machines: enroll, attest, edit wings and revoke. Tokens live only in the reveal panel. */
 const MODES = ['approval-required', 'auto-accept-edits', 'auto', 'full-access'];
 const SETUP_NOTE = 'Setup: put the machine token in the environment variable the runner config names as token_env, and the worker token in the Commonplace MCP entry of the worker\'s provider instance. Set hub_url to this site\'s address, then run "python -m commonplace runner check --config <file>" before starting the runner. See docs/runner.md.';
+// The wings read goes through the memory backend and can be slow; the machine list must never wait on it.
+const LIST_TIMEOUT_MS = 15000, WINGS_TIMEOUT_MS = 30000;
 const RESET_NOTE = 'Changing wings or topics resets this machine to unbound: queued and leased starts are cancelled and the machine must be attested again. Saving the same wings only refreshes the worker\'s access.';
 
 export const parseList = text => [...new Set(String(text || '').split(',').map(part => part.trim()).filter(Boolean))];
@@ -38,7 +40,7 @@ export function attestBody(values) {
 }
 
 export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.clipboard.writeText(text) }) {
-  let host = null, epoch = 0, machines = [], wings = [], wingsError = false, busy = false, confirming = null, revealed = null;
+  let host = null, epoch = 0, machines = [], wings = [], wingsError = false, wingsPending = true, busy = false, confirming = null, revealed = null;
   const region = name => host?.querySelector(`[data-runner-${name}]`);
   const status = (text, bad = false) => {
     const node = region('status');
@@ -46,6 +48,7 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
   };
   const wingBoxes = (selected, name = 'wings') => {
     const all = [...new Set([...wings, ...selected])].sort();
+    if (wingsPending) return '<p>Loading wings…</p>';
     return all.length ? `<fieldset><legend>Wings</legend>${all.map(w => `<label><input type="checkbox" name="${name}" value="${e(w)}"${selected.includes(w) ? ' checked' : ''}>${e(w)}</label>`).join('')}</fieldset>` : `<p>${wingsError ? 'Wings could not be loaded. Reload to try again.' : 'No readable wings yet.'}</p>`;
   };
   const enrollForm = () => `<form class="agent-form" data-runner-form="enroll"><h3>Add runner</h3>
@@ -93,13 +96,23 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
 
   async function load(resetForm = false) {
     const mine = epoch;
-    const [list, conns] = await Promise.allSettled([api('/api/runners'), api('/api/connections')]);
-    if (mine !== epoch) return;
-    if (list.status === 'rejected') { status(list.reason?.message || 'Runner machines unavailable. Reload to try again.', true); return; }
-    machines = list.value.machines || [];
-    wingsError = conns.status === 'rejected';
-    wings = wingsError ? [] : conns.value.wings || [];
-    renderList(resetForm);
+    const wingsRead = api('/api/connections', { timeoutMs: WINGS_TIMEOUT_MS }).then(result => ({ wings: result.wings || [], failed: false }), () => ({ wings: [], failed: true }));
+    try {
+      const list = await api('/api/runners', { timeoutMs: LIST_TIMEOUT_MS });
+      if (mine !== epoch) return;
+      machines = list.machines || [];
+      renderList(resetForm);
+      const read = await wingsRead;
+      if (mine !== epoch) return;
+      const changed = wingsPending || wingsError !== read.failed || wings.join('\n') !== read.wings.join('\n');
+      wings = read.wings; wingsError = read.failed; wingsPending = false;
+      if (changed) renderList(true);
+    } catch (error) {
+      if (mine !== epoch) return;
+      const node = region('list');
+      if (node) node.innerHTML = '<p>Runner machines could not be loaded. Reload to try again.</p>';
+      status(error?.message || 'Runner machines unavailable. Reload to try again.', true);
+    }
   }
 
   async function submit(kind, id, values) {
@@ -179,7 +192,7 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
   }
 
   function stop() {
-    epoch++; busy = false; machines = []; wings = []; confirming = null; revealed = null;
+    epoch++; busy = false; machines = []; wings = []; wingsError = false; wingsPending = true; confirming = null; revealed = null;
     if (host) {
       host.removeEventListener('submit', onSubmit);
       host.removeEventListener('click', onClick);
