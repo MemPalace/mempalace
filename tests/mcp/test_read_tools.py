@@ -621,11 +621,19 @@ with mine_palace_lock(sys.argv[1]):
         assert "error" not in complete, complete
         assert complete["total"] == 1, complete
         assert [row["drawer_id"] for row in complete["drawers"]] == ["multi_room_0"]
+        assert mcp_server.tool_get_drawer("multi_room_0")["content"] == "first room content"
+        assert mcp_server.tool_get_drawers(["multi_room_0"])["results"][0]["content"] == (
+            "first room content"
+        )
 
         collection.delete(ids=["multi_room_1"])
         interrupted = mcp_server.tool_list_drawers(wing="mempalace", room="first", limit=20)
         assert "error" not in interrupted, interrupted
         assert interrupted["total"] == 0, interrupted
+        assert "error" in mcp_server.tool_get_drawer("multi_room_0")
+        bulk = mcp_server.tool_get_drawers(["multi_room_0"])
+        assert bulk["errors"] == 1
+        assert "error" in bulk["results"][0]
 
     def test_list_drawers_scan_filters_in_sql_and_skips_documents(
         self, monkeypatch, config, palace_path, collection, kg

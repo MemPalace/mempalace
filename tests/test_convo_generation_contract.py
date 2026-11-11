@@ -363,6 +363,23 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
         _mine(source_dir, palace_path)
     assert replacement_batches == 2
 
+    raw = get_collection(palace_path).get(
+        where={"source_file": str(session)}, include=["documents", "metadatas"]
+    )
+    unpublished = [
+        row_id
+        for row_id, doc, meta in zip(raw["ids"], raw["documents"], raw["metadatas"])
+        if "B question" in doc and (meta or {}).get("historical_version") is not True
+    ]
+    assert unpublished, "failure did not persist an uncommitted B row"
+    for row_id in unpublished:
+        assert "error" in mcp_server.tool_get_drawer(row_id), (
+            "public single get leaked uncommitted B"
+        )
+    bulk = mcp_server.tool_get_drawers(unpublished)
+    assert bulk["errors"] == len(unpublished), "public bulk get leaked uncommitted B"
+    assert all("error" in item for item in bulk["results"])
+
     # Raw Chroma rows are allowed to contain unpublished staging records.
     # The user-visible contract is the MCP listing, not the storage internals.
     public = public_session_previews()

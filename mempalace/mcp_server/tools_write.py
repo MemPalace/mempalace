@@ -264,6 +264,73 @@ def _bulk_drawer_records(col, drawer_ids):
     return found
 
 
+def _public_conversation_record_visible(record, *, col=None, source_cache=None):
+    """Fail closed for torn conversation generations on public get APIs.
+
+    Metadata-only completeness, not an atomic commit protocol: each source
+    must also have a staged physical generation and durable publication marker
+    before this can guarantee concurrent-reader snapshot isolation.
+    """
+    from ..convo_visibility import visible_conversation_rows
+
+    watched = [
+        (row_id, meta or {})
+        for row_id, meta in zip(record["ids"], record["metadatas"])
+        if (meta or {}).get("ingest_mode") == "convos"
+        and (meta or {}).get("extract_mode") in ("exchange", "general")
+        and "chunk_total" in (meta or {})
+    ]
+    if not watched:
+        return True
+
+    cache = source_cache if source_cache is not None else {}
+    for row_id, meta in watched:
+        source = meta.get("source_file")
+        if not isinstance(source, str) or not source:
+            return False
+        if source not in cache:
+            listed = None
+            if _is_chroma_backend() and _config.palace_path:
+                from ..backends.chroma_sqlite import sqlite_list_id_metadata
+
+                listed = sqlite_list_id_metadata(
+                    _config.palace_path,
+                    _config.collection_name,
+                    where={"source_file": source},
+                )
+            if listed is None:
+                if col is None:
+                    col = _get_collection()
+                if col is None:
+                    raise RuntimeError("cannot verify conversation generation without a collection")
+                source_ids, _, source_meta = _fetch_drawer_rows(
+                    col, where={"source_file": source}, include=["metadatas"]
+                )
+            else:
+                source_ids, source_meta = listed
+            if len(source_ids) != len(source_meta):
+                raise RuntimeError("incomplete conversation visibility snapshot")
+            cache[source] = dict(visible_conversation_rows(source_ids, source_meta))
+
+        stored = cache[source].get(row_id)
+        if stored is None:
+            return False
+        # A row can be replaced between the direct read and the source scan.
+        # Never authorize a different version simply because it shares an ID.
+        compare_keys = (
+            "source_file",
+            "extract_mode",
+            "source_mtime",
+            "filed_at",
+            "chunk_total",
+            "chunk_index",
+            "historical_version",
+        )
+        if any((stored or {}).get(key) != meta.get(key) for key in compare_keys):
+            return False
+    return True
+
+
 def _drawer_payload(record):
     safe_meta = _response_safe_meta(record["metadata"])
 
@@ -1232,6 +1299,8 @@ def tool_get_drawer(drawer_id: str, include_source_bytes: bool = False):
     try:
         record = _sqlite_logical_drawer_record(drawer_id)
         if record is not None:
+            if not _public_conversation_record_visible(record):
+                return {"error": f"Drawer not found: {drawer_id}"}
             return finish(_drawer_payload(record))
     except Exception as e:
         return {"error": str(e)}
@@ -1242,7 +1311,7 @@ def tool_get_drawer(drawer_id: str, include_source_bytes: bool = False):
 
     try:
         record = _collection_logical_drawer_record(col, drawer_id)
-        if record is None:
+        if record is None or not _public_conversation_record_visible(record, col=col):
             return {"error": f"Drawer not found: {drawer_id}"}
         return finish(_drawer_payload(record))
     except Exception as e:
@@ -1309,6 +1378,7 @@ def tool_get_drawers(drawer_ids: list):
 
     results = []
     errors = 0
+    visibility_cache = {}
     for drawer_id in drawer_ids:
         try:
             if found is None:
@@ -1316,6 +1386,10 @@ def tool_get_drawers(drawer_ids: list):
             else:
                 record = found.get(drawer_id)
             error = None
+            if record is not None and not _public_conversation_record_visible(
+                record, col=col, source_cache=visibility_cache
+            ):
+                record = None
         except Exception as e:
             record = None
             error = str(e)
