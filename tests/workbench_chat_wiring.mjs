@@ -54,7 +54,7 @@ const context = {state, root, e, enc: encodeURIComponent, api, adminUI: null, ..
   Event: class {constructor(type) {this.type=type;}},
   setTimeout(fn, ms) {const key = {}; timers.set(key, {fn, ms}); return key;}, clearTimeout(key) {timers.delete(key);},
   title(_text, actions) {titleActions = actions;}, cardId: () => '', chatTag: () => '', cancelCard() {}, renderBoard: () => 'board', bindBoard: () => () => {}, boardDispose: null,
-  boardsView() {}, markOpenCard() {}, fillChatTimes() {}, remember: () => ({}), restore() {}, refresh() {},
+  boardsView() {}, markOpenCard() {}, fillChatTimes() {}, mountProjectPanel: async () => {}, remember: () => ({}), restore() {}, refresh() {},
 };
 const run = (s) => runInNewContext(s, context);
 // The shell's board helpers (child cards, phone width) come from app.js itself.

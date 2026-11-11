@@ -10,7 +10,7 @@ Format ``commonplace.panel/1`` (JSON, kept in the repo as ``.commonplace/panel.j
       "format": "commonplace.panel/1",
       "title": "Atlas",                                   (optional, 60 characters)
       "highlights": ["Beta ships Friday", "3 open risks"],  (at most 6 lines, 200 characters)
-      "links": [{"label": "Runbook", "url": "https://example.com/runbook"}]  (at most 6)
+      "links": [{"label": "Runbook", "url": "<absolute http or https address>"}]  (at most 6)
     }
 """
 

@@ -646,7 +646,7 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_commonplace_goals.py` covers the goals tree, its owner-only writes, the additive schema and the card-context chain budget.
 
-  - `tests/projectpanel.mjs` (run by `tests/test_project_panel_ui.py`) covers the panel draw: escaped text, dropped unsafe links, nothing for a project without a panel, cached redraws and failed reads.
+  - `tests/projectpanel.mjs` (run by `tests/test_project_panel_ui.py`) covers the panel draw: escaped text, dropped unsafe links, nothing for a project without a panel, cached redraws and failed reads, and that the rules come from one adopted sheet (no inline style element, which the app's CSP refuses).
 
   - `tests/test_rules_enforcement_points.py` checks the four rule enforcement points; hook tests that compare the startup context now feed it a complete rules section, and the import-reader hook check expects the missing-rules notice for a memory-only context.
 
@@ -1587,7 +1587,7 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_projects_seat_lease.py` drives the settings routes and the seat's own MCP calls: take, hold, renew and release with no config, plus refusals without trust, after demotion or switch-off, for another project's seat, for another role and outside the wing.
 
-  - `tests/test_projects_panel.py` covers the format limits, unsafe link schemes, a stored panel read back, refusals for read-only, add-cards-only, anonymous and other-workspace callers, and a project without a panel left unchanged.
+  - `tests/test_projects_panel.py` covers the format limits, unsafe link schemes, a stored panel read back, refusals for read-only, add-cards-only, anonymous and other-workspace callers, and a project without a panel left unchanged. `tests/test_projects_guards.py` keeps every module here, `panel.py` included, free of outside host names and local paths, in comments and docstrings too.
 
 
 ## rules-and-guards
@@ -2129,7 +2129,7 @@ Format (read by `commonplace orch docs-check`):
   - Admin requires a signed-in current-workspace owner before read-only SELECTs; explicit credential-free allowlists, display redaction, 100-row cursors, injected clocks and 2 second source/5,000 ms client deadlines preserve private state boundaries.
 
 
-  - The project panel (`projectpanel.js`): mounted on the board with one line in `app.js`, draws the stored panel as escaped text with http(s)-only links, and nothing for a project without one; covered by `tests/projectpanel.mjs` via `tests/test_project_panel_ui.py`.
+  - The project panel (`projectpanel.js`): mounted on the board with one line in `app.js`, draws the stored panel as escaped text with http(s)-only links, and nothing for a project without one; its rules are adopted as a constructed sheet (no inline style element); covered by `tests/projectpanel.mjs` via `tests/test_project_panel_ui.py`.
   - Imported-history consent: The owner form offers independent unticked import and reader checkboxes and displays reader authority beside Revoke.
   - The Connect checklist renders the supplied webhook event recommendation, including card moves and optional card creation, with escaped values.
 

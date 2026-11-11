@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+// Stand-ins for the browser's constructed-sheet API, installed before the module loads.
+const adopted = [];
+globalThis.CSSStyleSheet = class { replaceSync(text) { this.text = text; } };
+globalThis.document = { get adoptedStyleSheets() { return adopted; }, set adoptedStyleSheets(list) { adopted.splice(0, adopted.length, ...list); } };
 const load = (name) => import(new URL(`../commonplace/web/static/${name}`, import.meta.url));
 const { panelHTML, mountProjectPanel, forgetProjectPanels } = await load('projectpanel.js');
 
@@ -7,13 +11,13 @@ const PANEL = {
   links: [{ label: 'Runbook', url: 'https://example.com/runbook' }],
 };
 
-// A fake board: keeps the inserted panel, the style tag and a document, which is all the mount touches.
+// A fake board: keeps the inserted panel and counts any write to the document head, which the mount must never make.
 function fakeContent() {
   const board = {
     html: '', removed: 0,
     querySelector: (selector) => (selector === '[data-project-panel]' && board.html ? { remove: () => { board.html = ''; board.removed += 1; } } : null),
     insertAdjacentHTML: (_where, html) => { board.html = html; },
-    ownerDocument: { styles: 0, getElementById: () => (board.ownerDocument.styles ? {} : null), head: { insertAdjacentHTML: () => { board.ownerDocument.styles += 1; } } },
+    ownerDocument: { styles: 0, getElementById: () => null, head: { insertAdjacentHTML: () => { board.ownerDocument.styles += 1; } } },
   };
   return { board, content: { querySelector: (selector) => (selector === '.workbench-board' ? board : null) } };
 }
@@ -58,7 +62,10 @@ const cases = {
     await mountProjectPanel(content, { slug: 'a b', api: async (path) => { calls.push(path); return { panel: PANEL }; } });
     assert.deepEqual(calls, ['/api/projects/a%20b/panel']);
     assert.match(board.html, /Beta ships Friday/);
-    assert.equal(board.ownerDocument.styles, 1);
+    // style-src 'self' refuses an inline style element: the rules come from one adopted sheet instead.
+    assert.equal(board.ownerDocument.styles, 0);
+    assert.doesNotMatch(board.html, /<style| style="/);
+    assert.equal(adopted.filter((sheet) => sheet.text.includes('.project-panel ')).length, 1);
   },
   async mount_leaves_a_project_without_a_panel_alone() {
     forgetProjectPanels();

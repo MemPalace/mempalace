@@ -7,11 +7,17 @@ import { api as request, escape as e, safeLink } from "./api.js";
 
 const MAX_AGE_MS = 60_000;
 const cache = new Map();
-const STYLE = `.project-panel { margin: 12px 14px 0; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--surface); font-size: 13px; line-height: 18px; }
+const styles = `.project-panel { margin: 12px 14px 0; padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--surface); font-size: 13px; line-height: 18px; }
 .project-panel h2 { margin: 0 0 4px; font-size: 12.5px; font-weight: 650; }
 .project-panel ul { margin: 0; padding-left: 18px; }
 .project-panel .panel-links { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 6px; padding: 0; list-style: none; }
 .project-panel .panel-links a { overflow-wrap: anywhere; }`;
+// The app's CSP (style-src 'self') refuses inline style elements, so the rules are adopted as a sheet.
+if (globalThis.document?.adoptedStyleSheets) {
+  const sheet = new CSSStyleSheet();
+  sheet.replaceSync(styles);
+  document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+}
 
 export function panelHTML(panel) {
   if (!panel || typeof panel !== "object") return "";
@@ -35,7 +41,6 @@ export async function mountProjectPanel(content, { slug, api = request, current 
     board.querySelector("[data-project-panel]")?.remove();
     const html = panelHTML(panel);
     if (!html) return;
-    if (!board.ownerDocument.getElementById("project-panel-style")) board.ownerDocument.head.insertAdjacentHTML("beforeend", `<style id="project-panel-style">${STYLE}</style>`);
     board.insertAdjacentHTML("afterbegin", html);
   };
   const known = cache.get(slug);

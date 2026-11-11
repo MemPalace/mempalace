@@ -153,11 +153,9 @@ def test_agents_screen_offers_revoke_but_not_rotate_for_oauth_rows():
 
     script = r"""
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-const url = (text) => `data:text/javascript;base64,${Buffer.from(text).toString("base64")}`;
-const apiSource = await readFile("commonplace/web/static/api.js", "utf8");
-const source = await readFile("commonplace/web/static/agents.js", "utf8");
-const agents = await import(url(source.replace('"./api.js"', JSON.stringify(url(apiSource)))));
+import { pathToFileURL } from "node:url";
+// The real file, so every module the agents screen imports resolves by itself.
+const agents = await import(pathToFileURL("commonplace/web/static/agents.js"));
 const oauth = { id: "conn-oauth", name: "oauth:claude <x>", auth: "oauth", client: "claude-ai", read_wings: ["shared"], revoked_at: null };
 const pat = { id: "conn-pat", name: "my-agent", auth: "pat", client: "codex", read_wings: ["shared"], revoked_at: null };
 const row = (html, id) => html.split('<div class="setting-row">').find((part) => part.includes(`data-agent-id="${id}"`)) || "";

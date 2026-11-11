@@ -75,7 +75,7 @@ async function main() {
     f.mount.children=[];
     let stops=0, shows=0;
     const context={state,root:{querySelector:s=>nodes[s]||null},location:{hash:'#/admin'},history:{replaceState(){}},localStorage:{getItem:()=>null},resolveRoute,boardPreference:()=>'',decideStart:()=>undefined,clearAgentSecret(){},voice:{stop(){}},speech:{stop(){}},remember(){},restore(){},capture:()=>()=>{},markOpenCard(){},message:x=>x,showError(x){if(x) errors.push(x);},queueFlush(){},queueStop(){},boardDispose:null,consoleUI:null,detailsUI:null,
-      adminUI:{show(){shows++;f.ui.show();},stop(){stops++;f.ui.stop();}},createAdmin,e:escapeHTML,enc:encodeURIComponent,title(){},navigation(){},currentBoard:()=>null,consoleScreen(){},needsView(){},boardsView(){},boardView(){},mountWorkbenchChat(){},callTree:()=>'',
+      adminUI:{show(){shows++;f.ui.show();},stop(){stops++;f.ui.stop();}},createAdmin,e:escapeHTML,enc:encodeURIComponent,title(){},navigation(){},currentBoard:()=>null,placeLifecycle(){},consoleScreen(){},needsView(){},boardsView(){},boardView(){},mountWorkbenchChat(){},callTree:()=>'',
       createDetails:({mount})=>({show(card){mount.innerHTML=`Card ${card.number}: ${card.title}`;},stop(){}}),
       api(path,options={}){calls.push({path,options}); if(path==='/api/boards') return Promise.resolve({boards:[]}); if(path==='/api/cards/5') return Promise.resolve({number:5,title:'Requested card',board:'demo'}); return Promise.resolve({});}};
     runInNewContext(appSlice('async function cardPanel(', 'function newCardForm(')+appSlice('function adminScreen(', 'function consoleScreen(')+appSlice('async function refresh(', 'function decideStart(')+appSlice('async function route()', '// The current view'),context);

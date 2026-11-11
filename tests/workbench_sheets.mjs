@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 // Stand-ins for the browser's constructed-sheet API, installed before any module loads.
 const adopted = [];
 globalThis.CSSStyleSheet = class { replaceSync(text) { this.text = text; } };
-globalThis.document = { get adoptedStyleSheets() { return adopted; }, set adoptedStyleSheets(list) { adopted.splice(0, adopted.length, ...list); } };
+globalThis.document = { addEventListener() {}, get adoptedStyleSheets() { return adopted; }, set adoptedStyleSheets(list) { adopted.splice(0, adopted.length, ...list); } };
 const load = async (name) => {
   const file = new URL(`../commonplace/web/static/${name}`, import.meta.url);
   assert.ok(existsSync(file), `${name} missing`);

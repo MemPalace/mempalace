@@ -70,11 +70,9 @@ def test_agents_screen_renders_and_saves_existing_read_access():
 
     script = r"""
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-const url = (text) => `data:text/javascript;base64,${Buffer.from(text).toString("base64")}`;
-const apiSource = await readFile("commonplace/web/static/api.js", "utf8");
-const source = await readFile("commonplace/web/static/agents.js", "utf8");
-const agents = await import(url(source.replace('"./api.js"', JSON.stringify(url(apiSource)))));
+import { pathToFileURL } from "node:url";
+// The real file, so every module the agents screen imports resolves by itself.
+const agents = await import(pathToFileURL("commonplace/web/static/agents.js"));
 const connection = { id: "conn-one", name: "Agent <one>", auth: "pat", client: "codex", read_wings: ["project_a"] };
 const html = agents.agentsView({ connections: [connection], wings: ["project_a", "project_b"] });
 assert.ok(html.includes('data-action="agent-wings"'), "Existing agents need a read access action");

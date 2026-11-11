@@ -44,7 +44,7 @@ const context = {
   navigation() { navigationCalls++; },
   title() {}, message: (text) => text, e: (value) => String(value ?? ""), planView,
   agentsView: () => "", phonePushView: () => "", voice: { settings: () => "" },
-  mountWorkspaceOrchestration() {},
+  mountWorkspaceOrchestration() {}, mountAgentSchedules() {},
   consoleScreen() { renders++; content.innerHTML = "Console controls"; },
   showError: (error) => assert.equal(error, ""),
 };

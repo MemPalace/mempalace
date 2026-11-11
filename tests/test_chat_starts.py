@@ -78,6 +78,8 @@ def test_status_lists_start_jobs_for_linked_cards(signup_hub, owners):
         "thread_id",
         "outcome_code",
         "updated_at",
+        # The run ledger's view of this start (None until a ledger row exists).
+        "run",
     }
     assert (row["task"], row["job"], row["state"]) == (number, job["job_id"], "queued")
     assert row["machine_label"] == "example-machine"

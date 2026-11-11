@@ -58,6 +58,15 @@ EXACT = {
     ("GET", "/api/card-starts/options"): "authenticated",
     ("GET", "/api/agent-schedules"): "authenticated",
     ("POST", "/api/agent-schedules"): "authenticated",
+    ("GET", "/api/routines"): "authenticated",
+    ("POST", "/api/routines"): "authenticated",
+    ("GET", "/api/goals"): "authenticated",
+    ("POST", "/api/goals"): "authenticated",
+    ("POST", "/api/goals/card"): "authenticated",
+    ("GET", "/api/bots"): "authenticated",
+    ("POST", "/api/bots"): "authenticated",
+    ("GET", "/api/admin/instance/waitlist"): "authenticated",
+    ("POST", "/api/admin/instance/waitlist"): "authenticated",
     **{
         (method, path): "authenticated"
         for method in ("GET", "POST", "PATCH", "DELETE")
@@ -111,7 +120,7 @@ PREFIX = {
     **{
         (method, path): "authenticated"
         for method in ("GET", "POST", "PATCH", "DELETE")
-        for path in ("/api/skills/", "/api/skill-decks/")
+        for path in ("/api/skills/", "/api/skill-decks/", "/api/routines/", "/api/bots/")
     },
     ("GET", "/skills/decks/"): "public",
     **{
