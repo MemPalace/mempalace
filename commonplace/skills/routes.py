@@ -17,6 +17,22 @@ def body(h, allowed, required=()):
     return value
 
 
+def dispatch_shares(service, h, skill_id, target):
+    method = h.command
+    if not target:
+        if method == "GET":
+            return 200, service.shares(skill_id)
+        if method == "POST":
+            return 201, service.share(skill_id, **body(h, ("target",), ("target",)))
+        if method == "DELETE":
+            return 200, service.revoke(skill_id)
+    elif method == "DELETE" and target == ["workspace"]:
+        return 200, service.revoke(skill_id, "workspace")
+    elif method == "DELETE" and len(target) == 2 and target[0] == "project":
+        return 200, service.revoke(skill_id, f"project:{target[1]}")
+    raise ToolError("no: route not found")
+
+
 def dispatch(service, h, parts):
     method = h.command
     if parts == ["skills"]:
@@ -24,7 +40,7 @@ def dispatch(service, h, parts):
             return 200, service.list()
         if method == "POST":
             return 201, service.save(
-                **body(h, ("name", "markdown", "source"), ("name", "markdown"))
+                **body(h, ("name", "markdown", "source", "files", "share"), ("name", "markdown"))
             )
     if len(parts) in (2, 3) and parts[0] == "skills":
         skill_id = parts[1]
@@ -43,10 +59,14 @@ def dispatch(service, h, parts):
         if len(parts) == 2 and method == "PATCH":
             return 200, service.save(
                 **body(
-                    h, ("version", "name", "markdown", "source"), ("version", "name", "markdown")
+                    h,
+                    ("version", "name", "markdown", "source", "files"),
+                    ("version", "name", "markdown"),
                 ),
                 skill_id=skill_id,
             )
+    if len(parts) >= 3 and parts[0] == "skills" and parts[2] == "shares":
+        return dispatch_shares(service, h, parts[1], parts[3:])
     if parts == ["skill-decks"] and method == "POST":
         return 201, service.publish(
             **body(h, ("title", "guide", "skills", "confirm_public"), ("title", "guide", "skills"))

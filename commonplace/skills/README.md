@@ -8,7 +8,7 @@ Signed-in workspace owners manage skills through REST. Connected agents on any d
 | --- | --- |
 | `POST /api/skills` | Owner creates `{name, markdown, source?}`. Source accepts `url`, `commit`, `license`, and `deck` strings. URLs are provenance only and are never fetched. |
 | `PATCH /api/skills/{id}` | Owner appends `{version, name, markdown, source?}`; version must match the current version. |
-| `GET /api/skills` / `skills_list` | List latest version metadata. |
+| `GET /api/skills` / `skills_list` | List latest version metadata, including each helper file's path, size and hash. Agents see only skills shared with them. |
 | `GET /api/skills/{id}?version=1` / `skills_get` | Read exact Markdown; MCP takes `skill_id` and optional `version`. Text is JSON-quoted data. |
 | `GET /api/skills/{id}/history` | Read every version, including exact Markdown. |
 | `skills_select` | `{task, limit?}` ranks up to 200 current skills by local sentence-embedding cosine similarity. Returns quoted documents with scores and heuristic safety findings. |
@@ -20,8 +20,23 @@ Signed-in workspace owners manage skills through REST. Connected agents on any d
 | `GET /api/skill-decks/{id}/reports` | Publishing workspace owner reads reports. Reporting does not automatically remove a deck. |
 | `DELETE /api/skill-decks/{id}` | Publishing workspace owner withdraws the public snapshot and prevents further installs. Existing installed copies stay private in their destination workspaces. |
 
+### Bundles, sharing and revocation
+
+A skill is `SKILL.md` (the `markdown` field, up to 128 KiB) plus up to 20 helper files, given as `files: [{path, content}]` on create or edit. Files are exact UTF-8 text of at most 64 KiB each and 256 KiB together, at relative paths of letters, digits, `.`, `_`, `-` (up to five folders deep; no leading dot, no `..`, no `SKILL.md`, no repeats ignoring case). NUL bytes and invalid text are refused. They are stored by content hash without execute permission, hashed on read, returned as JSON-quoted data and never run, imported or fetched by the server. An edit that omits `files` keeps the previous version's files; `files: []` clears them. A safety scan covers the files too. Public decks do not carry helper files yet: publishing such a skill is refused.
+
+The owner decides who is served. Targets are `workspace` (every agent, and member, of this workspace) and `project:<board slug>` (callers whose policy reads that board's wing, which needs `memory:read` as for boards). A new skill is shared with the workspace unless `share` lists other targets (`[]` keeps it private to the owner); skills stored before sharing existed started as workspace shares. Editing a skill does not change its shares. Agents without a matching share get "not found", for every version and for history. The share is read on every request, so revocation applies to the next call.
+
+| Route | Contract |
+| --- | --- |
+| `GET /api/skills/{id}/shares` | Owner lists the current share targets. |
+| `POST /api/skills/{id}/shares` | Owner shares `{target}`; a project must exist in this workspace. Repeating is harmless. |
+| `DELETE /api/skills/{id}/shares/workspace` or `/shares/project/{slug}` | Owner revokes one target. |
+| `DELETE /api/skills/{id}/shares` | Owner revokes every share; the skill stays stored and owner-readable. |
+
+Share and revoke are audited by skill id and target. Only the signed-in workspace owner may install, edit, share or revoke; agents, members and other workspaces are refused.
+
 Public sharing is an explicit owner action. A deck exposes only its pinned documents, provenance, title, and guide; later private edits are not published automatically. Imported text is displayed literally, including HTML comments and instruction-looking text. The heuristic scan flags instruction overrides, hidden markup, network references, credentials/environment reads, shell execution, and obfuscation. It is not a security verdict. No imported text is rendered as HTML or executed. Reports go to the publisher; this is not an independent moderation service.
 
 Selection uses the locally installed Chroma MiniLM ONNX model (`all-MiniLM-L6-v2`) on CPU. Missing model files or runtime errors produce a clear refusal. Selection never downloads a model, calls an external embedding API, or falls back to lexical matching. Provision the model separately before using selection. MiniLM uses a limited token window, and selection sends only the first 8,000 characters of each name/document to the tokenizer. Ranking is a relevance aid; it makes no guarantee of exhaustive recall or multilingual quality. Verbatim storage and reads are unaffected.
 
-Repository/URL fetching, helper-file bundles, on-device filesystem sync, and a session-start skills index are separate work. This API does not install documents into an agent's instruction directories or activate them automatically.
+Repository/URL fetching, on-device filesystem sync, and a session-start skills index are separate work. This API does not install documents into an agent's instruction directories or activate them automatically.
