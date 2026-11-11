@@ -77,6 +77,8 @@ _MINED_SCAN_KEYS = (
     "general_extractor_version",
     "wing",
     "historical_version",
+    "filed_at",
+    "chunk_index",
 )
 
 
@@ -161,6 +163,72 @@ def _paged_metadata(collection):
         offset += len(batch["ids"])
 
 
+
+def _mine_group_key(meta, extract_mode):
+    """Separate conversation filings with identical mtimes but distinct filing times."""
+    mtime = meta.get("source_mtime")
+    return (mtime, meta.get("filed_at")) if extract_mode in ("exchange", "general") else mtime
+
+
+def _add_mine_group(groups, key, meta, extract_mode):
+    """Track completeness without retaining every row of a large metadata scan."""
+    entry = groups.setdefault(key, [0, 0, False, None])
+    entry[0] += 1
+    total = meta.get("chunk_total")
+    if total is None:
+        entry[2] = True
+    else:
+        entry[1] = max(entry[1], total)
+    # Non-conversation/legacy skip checks retain their former count semantics.
+    if (
+        extract_mode not in ("exchange", "general")
+        or meta.get("ingest_mode") != "convos"
+        or meta.get("extract_mode") not in ("exchange", "general")
+    ):
+        return
+    if entry[3] is None:
+        entry[3] = [0, None, set(), 0, False]
+    modern = entry[3]  # [row count, expected total, indices, unstamped, invalid]
+    modern[0] += 1
+    if total is None:
+        modern[3] += 1
+        return
+    if modern[1] is None:
+        modern[1] = total
+    if type(total) is not int or total <= 0 or total != modern[1]:
+        modern[4] = True
+        return
+    index = meta.get("chunk_index")
+    if type(index) is not int or index < 0 or index >= total or index in modern[2]:
+        modern[4] = True
+    else:
+        modern[2].add(index)
+
+
+def _mine_group_complete(entry):
+    """Reject torn stamped conversations even when row count looks complete."""
+    count, largest, untracked, modern = entry
+    if modern is None:
+        return untracked or count >= largest
+    modern_count, expected, indices, unstamped, invalid = modern
+    if modern_count != count:
+        return False
+    if unstamped == count:
+        return True  # entirely unstamped pre-marker conversation generation
+    return (
+        unstamped == 0
+        and not invalid
+        and type(expected) is int
+        and expected > 0
+        and count == expected
+        and len(indices) == expected
+    )
+
+
+def _mine_group_mtime(key, extract_mode):
+    return key[0] if extract_mode in ("exchange", "general") else key
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -214,10 +282,7 @@ def file_already_mined(
             current_mtime = os.path.getmtime(source_file)
         except OSError:
             return False
-    # A source can hold several stored groups, one per mining pass, so every
-    # matching drawer is walked and the answer is decided after the walk:
-    # get() ordering is undefined. Per stored_mtime group: [drawers seen,
-    # largest chunk_total, whether some drawer has no chunk_total].
+    # Each filing is checked across all its chunks, regardless of get order.
     groups: dict = {}
     unprovable = False
     offset = 0
@@ -249,20 +314,18 @@ def file_already_mined(
             stored_mtime = meta.get("source_mtime")
             if check_mtime and (stored_mtime is None or abs(stored_mtime - current_mtime) >= 0.001):
                 continue
-            chunk_total = meta.get("chunk_total")
-            entry = groups.setdefault(stored_mtime, [0, 0, False])
-            entry[0] += 1
-            if chunk_total is None:
-                # No completion marker (legacy rows, sentinels): trusted.
-                entry[2] = True
-            else:
-                entry[1] = max(entry[1], chunk_total)
+            _add_mine_group(groups, _mine_group_key(meta, extract_mode), meta, extract_mode)
         if not ids:
             break
         offset += len(ids)
     if unprovable:
         return False
-    return any(untracked or seen >= largest for seen, largest, untracked in groups.values())
+    # A completed filing with the same mtime must not hide a torn B retry.
+    if extract_mode in ("exchange", "general") and any(
+        entry[3] is not None and not _mine_group_complete(entry) for entry in groups.values()
+    ):
+        return False
+    return any(_mine_group_complete(entry) for entry in groups.values())
 
 
 # Above this many candidate files, one filtered get costs more round trips
@@ -315,9 +378,7 @@ def prefetch_mined_set(
     omitted, the behaviour is unchanged: a bulk sweep still benefits more
     from one full scan than from many filtered queries.
     """
-    # Per source_file: per stored_mtime group -> [count, largest chunk_total,
-    # whether some drawer has no chunk_total]. A source is only "mined" once
-    # some group is complete, and never while any of its rows is unprovable.
+    # Per source_file and filing, track completeness without a second scan.
     groups: dict[str, dict] = {}
     unprovable: set = set()
 
@@ -341,13 +402,12 @@ def prefetch_mined_set(
             return
         stored_mtime = meta.get("source_mtime")
         mtime_key = float(stored_mtime) if stored_mtime is not None else None
-        entry = groups.setdefault(src, {}).setdefault(mtime_key, [0, 0, False])
-        entry[0] += 1
-        chunk_total = meta.get("chunk_total")
-        if chunk_total is None:
-            entry[2] = True
-        else:
-            entry[1] = max(entry[1], chunk_total)
+        group_key = (
+            (mtime_key, meta.get("filed_at"))
+            if extract_mode in ("exchange", "general")
+            else mtime_key
+        )
+        _add_mine_group(groups.setdefault(src, {}), group_key, meta, extract_mode)
 
     def _scan_all():
         _scan_collection_metadata(collection, _MINED_SCAN_KEYS, _absorb, _reset)
@@ -380,9 +440,14 @@ def prefetch_mined_set(
     for src, by_mtime in groups.items():
         if src in unprovable:
             continue
-        for mtime_key, (count, largest, untracked) in by_mtime.items():
-            # Legacy / registry rows carry no completion marker: trusted.
-            if untracked or count >= largest:
+        incomplete_mtimes = {
+            _mine_group_mtime(key, extract_mode)
+            for key, entry in by_mtime.items()
+            if entry[3] is not None and not _mine_group_complete(entry)
+        }
+        for key, entry in by_mtime.items():
+            mtime_key = _mine_group_mtime(key, extract_mode)
+            if mtime_key not in incomplete_mtimes and _mine_group_complete(entry):
                 mined[src] = mtime_key
                 break
     return mined
