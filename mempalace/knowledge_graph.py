@@ -91,13 +91,64 @@ def _read_only(path: str) -> sqlite3.Connection:
     return conn
 
 
+def _import_graph_entities(source, target):
+    """Map source IDs by canonical name without following legacy lookup aliases."""
+    names = {}
+    occupied = {}
+    for row in target.execute("SELECT id, name FROM entities"):
+        names.setdefault(canonical_entity_name(row["name"]), []).append(row["id"])
+        occupied[row["id"]] = row["name"]
+    available = {r["name"] for r in source.execute("PRAGMA table_info(entities)")}
+    columns = [c for c in KnowledgeGraph._REPLICATION_TABLES["entities"] if c in available]
+    mapping = {}
+    counts = {"added": 0, "present": 0, "conflicts": []}
+    if "id" not in columns:
+        return mapping, counts
+    insert = (
+        f"INSERT INTO entities ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})"
+    )
+    for record in source.execute(f"SELECT {', '.join(columns)} FROM entities"):
+        row = dict(record)
+        canonical = canonical_entity_name(row["name"])
+        matches = names.get(canonical, [])
+        if len(matches) == 1:
+            mapping[row["id"]] = matches[0]
+            counts["present"] += 1
+            continue
+        desired = entity_id_for_name(row["name"])
+        if matches or desired in occupied:
+            counts["conflicts"].append(
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "target_names": [occupied[eid] for eid in matches]
+                    if matches
+                    else [occupied[desired]],
+                }
+            )
+            continue
+        source_id = row["id"]
+        row["id"] = desired
+        if target.execute(insert, tuple(row[c] for c in columns)).rowcount != 1:
+            raise sqlite3.IntegrityError(
+                f"knowledge graph import did not insert entity {source_id!r}"
+            )
+        mapping[source_id] = desired
+        names[canonical] = [desired]
+        occupied[desired] = row["name"]
+        counts["added"] += 1
+    return mapping, counts
+
+
 def import_graph_rows(source_path: str, target_path: str, apply: bool = False) -> dict:
     """Copy one graph file's entities and triples into another, keeping what is there.
 
-    The source is only read. An entity the target already has (same id) is left
-    as it is; so is a fact it already records with the same subject, predicate,
-    object and validity window, whenever it was recorded. A current fact whose
-    subject and predicate already hold a different current object in the target
+    The source is only read. Entities are matched by canonical name, and both
+    fact endpoints are mapped to the resolved target IDs. Ambiguous identities
+    and facts depending on them are reported and skipped. New entities use the
+    current ID recipe. A fact already recorded with the same subject, predicate,
+    object and validity window is kept as it is, whenever it was recorded.
+    A current fact whose subject and predicate already hold a different current object in the target
     is not copied but listed under ``conflicts``, so the two never both read as
     current. A reused fact id with different content or validity is kept in
     the target and listed under ``id_conflicts``. With ``apply`` false the
@@ -107,6 +158,7 @@ def import_graph_rows(source_path: str, target_path: str, apply: bool = False) -
     if paths.same_path(source_path, target_path):
         raise ValueError("the source and the target are the same knowledge graph")
     source = _read_only(source_path)
+    source.execute("BEGIN")
     target = None
     kg = None
 
@@ -129,61 +181,66 @@ def import_graph_rows(source_path: str, target_path: str, apply: bool = False) -
                 # Preview those same changes only in the in-memory copy.
                 kg._init_db()
         target = kg._conn()
-        for table, columns in KnowledgeGraph._REPLICATION_TABLES.items():
-            available = {r["name"] for r in source.execute(f"PRAGMA table_info({table})")}
-            cols = [c for c in columns if c in available]
-            numbers = {"added": 0, "present": 0}
-            if table == "triples":
-                numbers["conflicts"] = []
-                numbers["id_conflicts"] = []
-            counts[table] = numbers
-            if "id" not in cols:
+        target.execute("BEGIN IMMEDIATE")
+        entity_ids, counts["entities"] = _import_graph_entities(source, target)
+        available = {r["name"] for r in source.execute("PRAGMA table_info(triples)")}
+        cols = [c for c in KnowledgeGraph._REPLICATION_TABLES["triples"] if c in available]
+        numbers = {
+            "added": 0,
+            "present": 0,
+            "conflicts": [],
+            "id_conflicts": [],
+            "entity_conflicts": [],
+        }
+        counts["triples"] = numbers
+        if "id" not in cols:
+            if apply:
+                target.commit()
+            return counts
+        insert = f"INSERT INTO triples ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+        for record in source.execute(f"SELECT {', '.join(cols)} FROM triples"):
+            row = dict(record)
+            if row["subject"] not in entity_ids or row["object"] not in entity_ids:
+                numbers["entity_conflicts"].append(row["id"])
                 continue
-            insert = (
-                f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})"
+            row["subject"] = entity_ids[row["subject"]]
+            row["object"] = entity_ids[row["object"]]
+            fact = (row["subject"], row["predicate"], row["object"])
+            window = (row["valid_from"], row["valid_to"])
+            if found(
+                "SELECT 1 FROM triples WHERE subject = ? AND predicate = ? "
+                "AND object = ? AND valid_from IS ? AND valid_to IS ?",
+                fact + window,
+            ):
+                numbers["present"] += 1
+                continue
+            if found("SELECT 1 FROM triples WHERE id = ?", (row["id"],)):
+                numbers["id_conflicts"].append(row["id"])
+                continue
+            clash = (
+                target.execute(
+                    "SELECT object FROM triples WHERE subject = ? AND predicate = ? "
+                    "AND object != ? AND valid_to IS NULL",
+                    fact,
+                ).fetchone()
+                if row["valid_to"] is None
+                else None
             )
-            for row in source.execute(f"SELECT {', '.join(cols)} FROM {table}"):
-                if table == "triples":
-                    fact = (row["subject"], row["predicate"], row["object"])
-                    window = (row["valid_from"], row["valid_to"])
-                    if found(
-                        "SELECT 1 FROM triples WHERE subject = ? AND predicate = ? "
-                        "AND object = ? AND valid_from IS ? AND valid_to IS ?",
-                        fact + window,
-                    ):
-                        numbers["present"] += 1
-                        continue
-                    if found("SELECT 1 FROM triples WHERE id = ?", (row["id"],)):
-                        numbers["id_conflicts"].append(row["id"])
-                        continue
-                    clash = (
-                        target.execute(
-                            "SELECT object FROM triples WHERE subject = ? AND predicate = ? "
-                            "AND object != ? AND valid_to IS NULL",
-                            fact,
-                        ).fetchone()
-                        if row["valid_to"] is None
-                        else None
-                    )
-                    if clash is not None:
-                        numbers["conflicts"].append(
-                            {
-                                "subject": row["subject"],
-                                "predicate": row["predicate"],
-                                "object": row["object"],
-                                "current_object": clash[0],
-                            }
-                        )
-                        continue
-                elif found(f"SELECT 1 FROM {table} WHERE id = ?", (row["id"],)):
-                    numbers["present"] += 1
-                    continue
-                inserted = target.execute(insert, tuple(row)).rowcount
-                if inserted != 1:
-                    raise sqlite3.IntegrityError(
-                        f"knowledge graph import did not insert {table} row {row['id']!r}"
-                    )
-                numbers["added"] += inserted
+            if clash is not None:
+                numbers["conflicts"].append(
+                    {
+                        "subject": row["subject"],
+                        "predicate": row["predicate"],
+                        "object": row["object"],
+                        "current_object": clash[0],
+                    }
+                )
+                continue
+            if target.execute(insert, tuple(row[c] for c in cols)).rowcount != 1:
+                raise sqlite3.IntegrityError(
+                    f"knowledge graph import did not insert fact {row['id']!r}"
+                )
+            numbers["added"] += 1
         if apply:
             target.commit()
     finally:

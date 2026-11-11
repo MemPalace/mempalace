@@ -18,13 +18,20 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
 import chromadb
+from chromadb.api.types import validate_where_document
 from chromadb.config import Settings as _ChromaSettings
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from ..lexical import bm25_scores
-from ..stored_text import encode_filter, encode_where, prepare_stored_write, restore_rows
+from ..stored_text import (
+    document_filter_candidate,
+    encode_filter,
+    encode_where,
+    prepare_stored_write,
+    restore_rows,
+)
 from ..timeutil import filename_stamp
-from ._filters import validate_where
+from ._filters import matches_where_document, validate_where
 from ._inproc_sqlite import (
     open_reader as open_palace_reader,
     open_writer as open_palace_writer,
@@ -2424,6 +2431,69 @@ class ChromaCollection(BaseCollection):
     # Reads
     # ------------------------------------------------------------------
 
+    def _get_document_filtered(self, where_document, **kwargs):
+        """Refill one native response before logical pagination and projection."""
+        validate_where_document(where_document)
+        candidate = document_filter_candidate(where_document)
+        fields = ["ids", *kwargs["include"]]
+        offset = kwargs.pop("offset", 0) or 0
+        limit = kwargs.pop("limit", None)
+        if offset < 0 or (limit is not None and limit < 0):
+            raise ValueError("offset and limit must be nonnegative")
+        if limit == 0:
+            return {field: [] for field in fields}
+        needed = offset + limit if limit is not None else None
+        kwargs["include"] = list(dict.fromkeys([*kwargs["include"], "documents", "metadatas"]))
+        if needed is not None:
+            kwargs["limit"] = needed
+        if candidate is not None:
+            kwargs["where_document"] = candidate
+        while True:
+            raw = self._collection.get(**kwargs)
+            documents, _ = restore_rows(raw["documents"] or [], raw["metadatas"] or [])
+            matches = [
+                index
+                for index, document in enumerate(documents)
+                if matches_where_document(document or "", where_document)
+            ]
+            if needed is not None and len(matches) < needed and len(raw["ids"]) == kwargs["limit"]:
+                kwargs["limit"] *= 2
+                continue
+            matches = matches[offset:needed]
+            return {field: [raw[field][index] for index in matches] for field in fields}
+
+    def _query_document_filtered(self, where_document, **kwargs):
+        """Refill native ranking until the original-text predicate fills top-k."""
+        validate_where_document(where_document)
+        candidate = document_filter_candidate(where_document)
+        fields = ["ids", *kwargs["include"]]
+        requested = kwargs["n_results"]
+        kwargs["include"] = list(dict.fromkeys([*kwargs["include"], "documents", "metadatas"]))
+        if candidate is not None:
+            kwargs["where_document"] = candidate
+        while True:
+            raw = self._collection.query(**kwargs)
+            selections = []
+            refill = False
+            for ids, documents, metadatas in zip(raw["ids"], raw["documents"], raw["metadatas"]):
+                documents, _ = restore_rows(documents or [], metadatas or [])
+                matches = [
+                    index
+                    for index, document in enumerate(documents)
+                    if matches_where_document(document or "", where_document)
+                ]
+                selections.append(matches[:requested])
+                if len(matches) < requested and len(ids) == kwargs["n_results"]:
+                    refill = True
+            if not refill:
+                result = {field: [] for field in fields}
+                for query_index, matches in enumerate(selections):
+                    for field in fields:
+                        values = raw[field][query_index]
+                        result[field].append([values[index] for index in matches])
+                return result
+            kwargs["n_results"] *= 2
+
     def query(
         self,
         *,
@@ -2468,9 +2538,9 @@ class ChromaCollection(BaseCollection):
         if where is not None:
             kwargs["where"] = encode_where(where)
         if where_document is not None:
-            kwargs["where_document"] = where_document
-
-        raw = self._collection.query(**kwargs)
+            raw = self._query_document_filtered(where_document, **kwargs)
+        else:
+            raw = self._collection.query(**kwargs)
 
         num_queries = (
             len(query_texts)
@@ -2535,14 +2605,15 @@ class ChromaCollection(BaseCollection):
             kwargs["ids"] = ids
         if where is not None:
             kwargs["where"] = encode_where(where)
-        if where_document is not None:
-            kwargs["where_document"] = where_document
         if limit is not None:
             kwargs["limit"] = limit
         if offset is not None:
             kwargs["offset"] = offset
 
-        raw = self._collection.get(**kwargs)
+        if where_document is not None:
+            raw = self._get_document_filtered(where_document, **kwargs)
+        else:
+            raw = self._collection.get(**kwargs)
         out_ids = list(raw.get("ids") or [])
         out_docs, out_metas = restore_rows(
             list(raw.get("documents") or []), list(raw.get("metadatas") or [])

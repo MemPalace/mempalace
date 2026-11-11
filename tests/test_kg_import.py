@@ -117,3 +117,107 @@ def test_semantic_duplicate_with_a_different_id_is_still_present(tmp_path):
     assert applied["triples"]["present"] == 1
     with closing(sqlite3.connect(target)) as conn:
         assert conn.execute("SELECT id FROM triples").fetchall() == [("different-id",)]
+
+
+def _legacy_fact(path, subject, predicate, obj):
+    """Rows written with the v3.11 ID recipe, before punctuation was preserved."""
+    from mempalace.knowledge_graph import legacy_entity_id
+
+    with KnowledgeGraph(str(path)) as graph:
+        conn = graph._conn()
+        for name in (subject, obj):
+            conn.execute(
+                "INSERT INTO entities (id, name) VALUES (?, ?)", (legacy_entity_id(name), name)
+            )
+        conn.execute(
+            "INSERT INTO triples (id, subject, predicate, object, valid_from) "
+            "VALUES ('legacy-fact', ?, ?, ?, '2024-01-01')",
+            (legacy_entity_id(subject), predicate, legacy_entity_id(obj)),
+        )
+        conn.commit()
+
+
+@pytest.mark.parametrize(
+    "legacy_name, other_name", [("O'Brien", "OBrien"), ("my_project", "my project")]
+)
+@pytest.mark.parametrize("endpoint", ["subject", "object"])
+def test_legacy_import_distinguishes_names_with_the_same_stored_id(
+    tmp_path, legacy_name, other_name, endpoint
+):
+    source = tmp_path / "source.sqlite3"
+    target = tmp_path / "target.sqlite3"
+    subject, obj = (legacy_name, "Paris") if endpoint == "subject" else ("Paris", legacy_name)
+    _legacy_fact(source, subject, "knows", obj)
+    with KnowledgeGraph(str(target)) as graph:
+        graph.add_triple(other_name, "likes", "Coffee")
+    before = _files(tmp_path)
+
+    preview = import_graph_rows(str(source), str(target))
+    assert _files(tmp_path) == before
+    assert import_graph_rows(str(source), str(target), apply=True) == preview
+
+    with KnowledgeGraph(str(target)) as graph:
+        imported = graph.query_entity(legacy_name, direction="both")
+        other = graph.query_entity(other_name, direction="both")
+    assert [(f["subject"], f["predicate"], f["object"]) for f in imported] == [
+        (subject, "knows", obj)
+    ]
+    assert [(f["subject"], f["predicate"], f["object"]) for f in other] == [
+        (other_name, "likes", "Coffee")
+    ]
+    replay = import_graph_rows(str(source), str(target), apply=True)
+    assert replay["triples"]["added"] == 0
+    assert replay["triples"]["present"] == 1
+
+
+@pytest.mark.parametrize("name", ["O'Brien", "my_project"])
+@pytest.mark.parametrize("endpoint", ["subject", "object"])
+def test_legacy_import_reuses_the_existing_canonical_name_across_id_recipes(
+    tmp_path, name, endpoint
+):
+    source = tmp_path / "source.sqlite3"
+    target = tmp_path / "target.sqlite3"
+    subject, obj = (name, "Paris") if endpoint == "subject" else ("Paris", name)
+    _legacy_fact(source, subject, "knows", obj)
+    with KnowledgeGraph(str(target)) as graph:
+        entity_id = graph.add_entity(name)
+        graph.add_triple(name, "likes", "Coffee")
+    preview = import_graph_rows(str(source), str(target))
+
+    assert import_graph_rows(str(source), str(target), apply=True) == preview
+
+    with KnowledgeGraph(str(target)) as graph:
+        facts = graph.query_entity(name, direction="both")
+        assert {f["predicate"] for f in facts} == {"knows", "likes"}
+        rows = graph._conn().execute("SELECT id FROM entities WHERE name = ?", (name,)).fetchall()
+        assert [r["id"] for r in rows] == [entity_id]
+    replay = import_graph_rows(str(source), str(target), apply=True)
+    assert replay["triples"]["added"] == 0
+    assert replay["triples"]["present"] == 1
+
+
+@pytest.mark.parametrize("endpoint", ["subject", "object"])
+@pytest.mark.parametrize("apply", [False, True])
+def test_legacy_import_reports_unresolvable_entities_and_their_dependent_facts(
+    tmp_path, capsys, endpoint, apply
+):
+    from mempalace.cli import cmd_kg
+
+    source = tmp_path / "source.sqlite3"
+    target = tmp_path / "palace" / "knowledge_graph.sqlite3"
+    subject, obj = ("OBrien", "Paris") if endpoint == "subject" else ("Paris", "OBrien")
+    _legacy_fact(source, subject, "knows", obj)
+    # An existing legacy row owns the modern ID for the distinct name OBrien.
+    _legacy_fact(target, "O'Brien", "likes", "Coffee")
+    cmd_kg(
+        argparse.Namespace(
+            kg_action="import-legacy", palace=str(target.parent), source=str(source), yes=apply
+        )
+    )
+    output = capsys.readouterr().out
+    assert "1 entity conflict(s)" in output
+    assert "O'Brien" in output and "OBrien" in output
+    assert "1 fact(s) not copied because their entities could not be resolved" in output
+    assert "legacy-fact" in output
+    with KnowledgeGraph(str(target)) as graph:
+        assert [f["predicate"] for f in graph.query_entity("O'Brien")] == ["likes"]
