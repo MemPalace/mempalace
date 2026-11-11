@@ -564,6 +564,11 @@ def legacy(tmp_path_factory):
         ignore=shutil.ignore_patterns("__pycache__"),
     )
     shutil.copy2(ROOT / "commonplace" / "callstack.py", snapshot / "commonplace" / "callstack.py")
+    # Current board code imports the cards:decide grant rules: a leaf module with
+    # no commonplace imports, so the pinned gateway, policy and handoff stay as-is.
+    shutil.copy2(
+        ROOT / "commonplace" / "decide_grant.py", snapshot / "commonplace" / "decide_grant.py"
+    )
     # Current board and rules stores create files through the admission gate.
     shutil.copy2(ROOT / "commonplace" / "admission.py", snapshot / "commonplace" / "admission.py")
     # Overlaid board tools use the current registry contract; handoff remains

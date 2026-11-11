@@ -688,6 +688,10 @@ playbooks and the original wider orchestration acceptance remain separate work.
   (collecting `tests/` must never error); `CP_BROWSER_E2E=1` makes a missing
   Playwright fail instead.
 
+- Compatibility baseline: the pinned handoff "off" baseline test supplies
+  `commonplace/decide_grant.py` (a leaf module the current board code imports);
+  its gateway, policy and handoff comparison stays pinned.
+
 ### Explicit imported-history reader consent
 
   - Imported view proofs share the response access checker with normalized citation and private-source authorization; thread-bound mutation and source-delete checks remain enforced.
