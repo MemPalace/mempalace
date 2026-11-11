@@ -826,7 +826,7 @@ Format (read by `commonplace orch docs-check`):
   - Claim text assertions avoid feature imports; duplicate-key label edits preserve labels, version and audit history on refusal.
 
   - Pure-module guards check generic path/URL patterns and outbound imports without embedding deployment identifiers.
-  - Deferred refresh regressions execute the production shell and Settings renderers in both completion orders, retain plan and account controls, and guard navigation away and background updates during rendering.
+  - Deferred refresh regressions execute the production shell and Settings renderers in both completion orders, retain plan and account controls, and guard navigation away and background updates during rendering. The harness (`tests/commonplace_refresh_render.mjs`) also answers the bots roster read that `refresh()` makes for the Bots badge and checks the badge total on a completed view.
   - Coordinator settings regressions cover owner authority, current PAT eligibility, workspace isolation and missing-coordinator release notices.
   - Coordinator settings regressions cover owner authority, current PAT eligibility, workspace isolation and missing-coordinator release notices; the waiting bucket remains present for owners and absent for members.
 
