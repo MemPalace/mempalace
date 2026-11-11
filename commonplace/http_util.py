@@ -3,16 +3,47 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import traceback
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 MAX_JSON_BYTES = 1024 * 1024
 
 
+# SQLite's own fixed texts; any other exception message may quote user data.
+SQLITE_MESSAGES = frozenset(
+    {
+        "database is locked",
+        "unable to open database file",
+        "disk I/O error",
+        "database or disk is full",
+    }
+)
+
+
+def _sqlite_detail(exc) -> str:
+    """Error code/name for sqlite3 (and sqlcipher3) errors, plus allowlisted messages."""
+    if not (isinstance(exc, sqlite3.Error) or type(exc).__module__.startswith("sqlcipher3")):
+        return ""
+    parts = []
+    name, code = getattr(exc, "sqlite_errorname", None), getattr(exc, "sqlite_errorcode", None)
+    if isinstance(name, str) and name.isidentifier():
+        parts.append(name)
+    if isinstance(code, int):
+        parts.append(str(code))
+    text = exc.args[0] if len(exc.args) == 1 else None
+    if text in SQLITE_MESSAGES:
+        parts.append(repr(text))
+    return ": " + " ".join(parts) if parts else ""
+
+
 def log_failure(logger, message, exc):
-    """Keep diagnostic stack locations without exception text or local values."""
+    """Keep diagnostic stack locations without exception text or local values.
+
+    SQLite errors also carry their error name/code and, when it is one of SQLite's
+    fixed texts, the message; any other message is dropped."""
     frames = [(f.filename, f.lineno, f.name) for f in traceback.extract_tb(exc.__traceback__)]
-    logger.error("%s (%s), stack=%s", message, type(exc).__name__, frames)
+    logger.error("%s (%s%s), stack=%s", message, type(exc).__name__, _sqlite_detail(exc), frames)
 
 
 def _invalid_constant(value):

@@ -40,6 +40,7 @@ from .store import (
     expire_claims,
     now,
     owns_card,
+    pr_repository,
     require_visible,
     task_number,
     task_row,
@@ -1817,6 +1818,8 @@ class BoardService(lifecycle.LifecycleMixin):
             updates["claim_expired_at"] = None
             if updates["claim_until"] is not None:
                 updates["heartbeat_at"] = now()
+        if "pr_url" in updates:  # set here, so the next BoardStore open has nothing to backfill
+            updates["pr_repo"] = pr_repository(updates["pr_url"])
         fields = ",".join(f"{key}=?" for key in updates)
         conn.execute(f"UPDATE tasks SET {fields} WHERE id=?", (*updates.values(), row["id"]))
 

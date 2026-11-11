@@ -265,7 +265,7 @@ def migrate_workspace(db, workspace_id, directory, *, accept=False):
     if boards.exists() and bound.get("boards_store_id") is None:
         from commonplace.boards.store import BoardStore
 
-        BoardStore(directory, create=False)
+        BoardStore(directory, create=False, timeout=0.2)  # deploy loop: fail fast and log
     if rules.exists() and bound.get("rules_store_id") is None:
         with connection(rules, write=True, timeout=0.2) as conn:
             # Bound boards need no probe here; effective reconciliation catches
