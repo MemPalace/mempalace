@@ -492,6 +492,33 @@ export async function mountProject(host, { slug, api, e, settings = false, curre
       } catch { if (active()) status.textContent = "Could not check the agent. Try again."; }
       finally { check.disabled = false; }
     };
+    // Bind the models form before the optional reads below: until it has a handler the browser submits it as a GET and drops the values.
+    const form = host.querySelector("[data-project-models]");
+    if (form && project.can_configure) form.onsubmit = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const button = form.querySelector('button[type="submit"]');
+      if (button.disabled) return;
+      const status = form.querySelector("[data-project-model-status]"), body = {};
+      for (const role of ["main", "worker"]) {
+        const provider = form.querySelector(`[name="${role}_provider"]`).value.trim();
+        const model = form.querySelector(`[name="${role}_model"]`).value.trim();
+        if (!!provider !== !!model) { status.textContent = "Enter both provider and model, or leave both empty."; return; }
+        body[role] = provider ? { provider, model } : null;
+      }
+      button.disabled = true;
+      status.textContent = "";
+      try {
+        const saved = await api(`${path}/models`, { method: "PUT", body });
+        if (!active()) return;
+        project = saved;
+        status.textContent = PROJECT_COPY.saved;
+        markSaved();
+        renderMain();
+      } catch {
+        if (active()) status.textContent = PROJECT_COPY.saveError;
+      } finally { button.disabled = false; }
+    };
     await Promise.all([
       mountChatAnswers(host.querySelector("[data-project-chat]"), {project, api, e, current: active, onSaved: markSaved}),
       mountProjectAgents(host.querySelector("[data-project-agents]"), {project, api, e, current: active, onUpdate: latest => { project = latest; renderMain(); }}),
@@ -500,32 +527,6 @@ export async function mountProject(host, { slug, api, e, settings = false, curre
     if (!active()) return;
   }
   renderMain();
-  const form = host.querySelector("[data-project-models]");
-  if (form && project.can_configure) form.onsubmit = async (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const button = form.querySelector('button[type="submit"]');
-    if (button.disabled) return;
-    const status = form.querySelector("[data-project-model-status]"), body = {};
-    for (const role of ["main", "worker"]) {
-      const provider = form.elements.namedItem(`${role}_provider`).value.trim();
-      const model = form.elements.namedItem(`${role}_model`).value.trim();
-      if (!!provider !== !!model) { status.textContent = "Enter both provider and model, or leave both empty."; return; }
-      body[role] = provider ? { provider, model } : null;
-    }
-    button.disabled = true;
-    status.textContent = "";
-    try {
-      const saved = await api(`${path}/models`, { method: "PUT", body });
-      if (!active()) return;
-      project = saved;
-      status.textContent = PROJECT_COPY.saved;
-      markSaved();
-      renderMain();
-    } catch {
-      if (active()) status.textContent = PROJECT_COPY.saveError;
-    } finally { button.disabled = false; }
-  };
 }
 
 const LOCAL_URL = "http://127.0.0.1:11434";

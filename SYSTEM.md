@@ -15,7 +15,7 @@ entry was written.
 - **Workspace Admin foundation:** `/app/#/admin` is discoverable only when
   `/api/me.can_admin` is true (signed-in person and current-workspace owner).
   The additive `can_admin_instance` uses the operational predicate below. New GET-only users/connections/runtime/limits/stuck
-  inventories bind the decoded path ID to the authenticated workspace before any
+  inventories (the runtime panel's one write is the owner's machine requester edit: one owner-only add or remove per request on the stored list) bind the decoded path ID to the authenticated workspace before any
   projection source read. Members and owner connections receive the exact
   person-owner refusal; foreign workspace IDs are concealed with 404. Personal
   data remains workspace-local; no global directory or mutation action is added.

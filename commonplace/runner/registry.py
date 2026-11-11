@@ -105,7 +105,7 @@ def _strings(value, key, limit, pattern=None):
     return list(dict.fromkeys(value))
 
 
-def _grant(db, owner, grant, *, initial=False):
+def _grant(db, owner, grant, *, initial=False, held=()):
     if not isinstance(grant, dict) or set(grant) - (
         GRANT_KEYS | (set() if initial else {"enabled"})
     ):
@@ -150,7 +150,8 @@ def _grant(db, owner, grant, *, initial=False):
         refs = data["requesters"]
         if not isinstance(refs, list) or any(not isinstance(ref, str) for ref in refs):
             raise ValueError("invalid requesters")
-        for ref in refs:
+        # Entries the machine already holds stay even if they have lapsed; only additions are vetted.
+        for ref in (ref for ref in refs if ref not in held):
             p = db.authenticate_connection(ref)
             linked = db._conn.execute(
                 "SELECT 1 FROM runner_connections WHERE connection_id=?", (ref,)
@@ -179,7 +180,7 @@ def _worker_policy(wings):
     )
 
 
-def _audit(db, owner, action, machine_id, *, reset=False):
+def _audit(db, owner, action, machine_id, *, reset=False, also=()):
     db.audit(
         action=f"runner.{action}",
         decision="ok",
@@ -188,7 +189,7 @@ def _audit(db, owner, action, machine_id, *, reset=False):
         connection_id=owner.connection_id,
         auth=owner.auth,
         reason="binding_reset" if reset else "",
-        target_ids=(machine_id,),
+        target_ids=(machine_id, *also),
     )
 
 
@@ -282,22 +283,33 @@ def _active(db, owner, machine_id):
     return row
 
 
-def patch(db, owner, machine_id, grant):
+def _expect(row, version):
+    """An owner who read the machine at an older grant version must reload, not overwrite."""
+    if version is not None and row["grant_version"] != version:
+        raise Conflict("the machine changed since it was read; reload and try again")
+
+
+def patch(db, owner, machine_id, grant, *, version=None):
     _owner(owner)
     with db._lock, db._tx():
-        return patch_in(db, owner, machine_id, grant)
+        return patch_in(db, owner, machine_id, grant, version=version)
 
 
-def patch_in(db, owner, machine_id, grant, *, remove_requester=None):
-    """Patch inside the caller's control transaction; removal preserves stale peers."""
+def patch_in(
+    db, owner, machine_id, grant, *, remove_requester=None, version=None, audit=("patch", ())
+):
+    """Patch inside the caller's control transaction; removal preserves stale peers.
+
+    ``version`` is the grant version the caller read; a different stored version is a Conflict."""
     _owner(owner)
     row = (
         _active(db, owner, machine_id)
         if remove_requester is None
         else get_machine(db, owner.workspace_id, machine_id)
     )
+    _expect(row, version)
     if remove_requester is None:
-        data = _grant(db, owner, grant)
+        data = _grant(db, owner, grant, held=json.loads(row["requesters"]))
     else:
         data = {
             "requesters": [ref for ref in json.loads(row["requesters"]) if ref != remove_requester]
@@ -316,8 +328,52 @@ def patch_in(db, owner, machine_id, grant, *, remove_requester=None):
     _write(db, row["id"], data)
     if reset:
         db._conn.execute(f"UPDATE runner_machines SET {RESET} WHERE id=?", (row["id"],))
-    _audit(db, owner, "patch", row["id"], reset=reset)
+    _audit(db, owner, audit[0], row["id"], reset=reset, also=audit[1])
     return get_machine(db, owner.workspace_id, row["id"])
+
+
+def add_requester(db, owner, machine_id, ref, *, version):
+    """Add one requester to the stored list, vetting only that id.
+
+    ``version`` is the grant version the caller read (a stale one is a Conflict, so a page
+    that predates another owner's removal cannot give the requester back). Returns the
+    machine row and whether the list changed; adding a held requester changes nothing."""
+    _owner(owner)
+    with db._lock, db._tx():
+        row = _active(db, owner, machine_id)
+        _expect(row, version)
+        held = json.loads(row["requesters"])
+        if ref in held:
+            return row, False
+        row = patch_in(
+            db,
+            owner,
+            machine_id,
+            {"requesters": [*held, ref]},
+            audit=("requester_add", (ref,)),
+        )
+        return row, True
+
+
+def remove_requester(db, owner, machine_id, ref, *, version):
+    """Remove one requester from the stored list, never touching the others.
+
+    Same version rule and return value as ``add_requester``."""
+    _owner(owner)
+    with db._lock, db._tx():
+        row = _active(db, owner, machine_id)
+        _expect(row, version)
+        if ref not in json.loads(row["requesters"]):
+            return row, False
+        row = patch_in(
+            db,
+            owner,
+            machine_id,
+            {},
+            remove_requester=ref,
+            audit=("requester_remove", (ref,)),
+        )
+        return row, True
 
 
 def attest(db, owner, machine_id, binding):

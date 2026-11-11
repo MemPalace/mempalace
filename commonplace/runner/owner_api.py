@@ -41,6 +41,25 @@ def _wings(gateway, owner, data):
     return {**data, "wings": wings}
 
 
+class PreconditionRequired(Exception):
+    """A per-requester edit named no grant version."""
+
+
+def _if_match(h, *, required=True):
+    """The grant version the caller read, from If-Match; absent is fine only when not required."""
+    raw = (h.headers.get("If-Match") or "").strip()
+    if raw.startswith("W/"):
+        raw = raw[2:]
+    raw = raw.strip('"')
+    if not raw:
+        if required:
+            raise PreconditionRequired
+        return None
+    if not raw.isdigit():
+        raise ValueError("If-Match must be the machine's grant_version")
+    return int(raw)
+
+
 def register(gateway):
     def manage(h):
         owner = require_principal(gateway, h)
@@ -65,7 +84,12 @@ def register(gateway):
         if not (
             (not parts and method == "POST")
             or (len(parts) == 1 and method in ("PATCH", "DELETE"))
-            or (len(parts) == 2 and method == "POST" and parts[1] in ("attest", "rotate"))
+            or (
+                len(parts) == 2
+                and method == "POST"
+                and parts[1] in ("attest", "rotate", "requesters")
+            )
+            or (len(parts) == 3 and method == "DELETE" and parts[1] == "requesters")
         ):
             send_json(h, 404, {"error": "not found"})
             return
@@ -80,8 +104,28 @@ def register(gateway):
                 status = 201
             elif method == "PATCH":
                 result = _view(
-                    registry.patch(gateway.db, owner, parts[0], _wings(gateway, owner, data))
+                    registry.patch(
+                        gateway.db,
+                        owner,
+                        parts[0],
+                        _wings(gateway, owner, data),
+                        version=_if_match(h, required=False),
+                    )
                 )
+                status = 200
+            elif parts[1:2] == ["requesters"] and method == "DELETE":
+                row, changed = registry.remove_requester(
+                    gateway.db, owner, parts[0], parts[2], version=_if_match(h)
+                )
+                result = {**_view(row), "changed": changed}
+                status = 200
+            elif parts[1:2] == ["requesters"]:
+                if set(data) != {"requester"} or not isinstance(data["requester"], str):
+                    raise ValueError("requester must be a connection id")
+                row, changed = registry.add_requester(
+                    gateway.db, owner, parts[0], data["requester"], version=_if_match(h)
+                )
+                result = {**_view(row), "changed": changed}
                 status = 200
             elif method == "DELETE":
                 result = registry.revoke(gateway.db, owner, parts[0])
@@ -101,6 +145,12 @@ def register(gateway):
                     raise ValueError("credential must be machine or worker")
                 result = registry.rotate(gateway.db, owner, parts[0], data["credential"])
                 status = 200
+        except PreconditionRequired:
+            send_json(h, 428, {"error": "If-Match with the machine's grant_version is required"})
+            return
+        except PermissionError:
+            send_json(h, 403, {"error": "a signed-in workspace owner is required"})
+            return
         except registry.NotFound as exc:
             send_json(h, 404, {"error": str(exc)})
             return

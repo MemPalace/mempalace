@@ -326,6 +326,9 @@ def test_runtime_machines(hub, runtime):
         "max_in_flight",
         "max_starts_per_hour",
         "created_at",
+        "requesters",
+        "requesters_total",
+        "grant_version",
     }
     assert all(set(row) == expected_keys for row in found)
     assert all(r["verified"] is False for r in found)

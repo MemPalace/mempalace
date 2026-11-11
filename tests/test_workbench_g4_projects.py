@@ -19,6 +19,8 @@ CASES = [
     "on_back",
     "setup_clipboard",
     "disconnect_scope",
+    "models_submit_before_loads",
+    "models_submit_after_reads_settle",
 ]
 
 

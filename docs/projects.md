@@ -48,7 +48,7 @@ agent has used the connection within the last 24 hours.
 Owners can save provider and model labels for the main orchestrator and workers
 in project settings. These choices are stored only: saving them does not call a
 provider or start work. Applying them through the runner comes later. They do
-not change the separate workspace chat model settings.
+not change the separate workspace chat model settings. The Save models form works as soon as project settings open, even while the page's other reads (chat answers, agents) are still loading or have timed out.
 
 Model resolution uses the project's choice, then the workspace default for
 that role, then the runner's own default. Clearing a project choice restores
