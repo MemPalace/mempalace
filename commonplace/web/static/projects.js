@@ -12,6 +12,8 @@ export const PROJECT_COPY = Object.freeze({
   wingInUse: "Some agent connections would gain access to this project. Nothing was changed.",
   loadError: "Could not load project settings.", connectError: "Could not connect the agent.",
   saveError: "Could not save project models.", saved: "Project models saved.",
+  unknownModel: "That model is not in this workspace's list. Pick one from the list, or add it first.",
+  modelAdded: "Model added to the list.", addModelError: "Could not add that model.",
   copyError: "Copy failed. Select the token and copy it manually.",
 });
 
@@ -212,11 +214,31 @@ export function connectResultHTML(result, e, { app = "claude-code" } = {}) {
   return `<section class="form-tile"><h2 id="project-connect-title">Agent connection</h2><p>A token for this project's orchestrator seat is ready. No agent is attached until one uses it. The token is shown once: copy it now.</p><ol class="dsteps" data-connect-steps><li data-connect-step="setup"><b>Copy the setup for your agent app</b><span class="d">It holds the MCP address and this token as a Bearer header, in the format the app reads.</span>${appSelect(app)}<button type="button" class="btn primary" data-project-copy-setup>Copy setup</button><details><summary>Show the setup to select it</summary><pre data-project-config></pre></details></li><li data-connect-step="paste"><b>Paste it where the app lists its MCP servers</b><span class="d">Some apps call them Tools or Connectors. Save the change.</span></li><li data-connect-step="start"><b>Start or restart the agent app</b><span class="d">The project shows the agent as connected once it uses the token.</span></li><li data-connect-step="webhook"><b>Optional: wake on messages and card moves</b><span class="d">Ask the agent to call webhook_add with events ${e(JSON.stringify(events))}${board ? ` and board ${e(board)}` : ""}.</span></li></ol><label>Token<input data-project-token value="${e(result.token)}" readonly autocomplete="off" spellcheck="false"></label><button type="button" class="opt" data-project-copy>Copy token</button><label>MCP URL<input value="${e(result.mcp_url)}" readonly></label>${result.warning ? `<p role="status">${e(result.warning)}</p>` : ""}<p role="status" data-project-copy-status></p><button type="button" class="blockbtn" data-project-dismiss>Close</button></section>`;
 }
 
+const sameModel = (a, b) => a?.provider === b?.provider && a?.model === b?.model;
+// Providers and model ids hold no spaces, so a space joins them into one option value.
+const modelValue = (choice) => choice ? `${choice.provider} ${choice.model}` : "";
+const parseModel = (value) => { const at = value.indexOf(" "); return at < 1 ? null : { provider: value.slice(0, at), model: value.slice(at + 1) }; };
+
+// Each role picks from the workspace's list; the stored choice always stays an option and is shown as stored.
 export function modelsHTML(project, e) {
-  return `<form data-project-models><p>Leave both fields empty to use the runner's default for that role.</p>${["main", "worker"].map((role) => {
+  const catalog = project.model_catalog || [], disabled = project.can_configure ? "" : "disabled";
+  const roles = ["main", "worker"].map((role) => {
     const choice = project.models?.[role];
-    return `<fieldset ${project.can_configure ? "" : "disabled"}><legend>${role === "main" ? "Main orchestrator" : "Worker"}</legend><label>Provider<input name="${role}_provider" value="${e(choice?.provider)}" maxlength="128" autocomplete="off"></label><label>Model<input name="${role}_model" value="${e(choice?.model)}" maxlength="120" autocomplete="off"></label></fieldset>`;
-  }).join("")}${project.can_configure ? '<button class="blockbtn" type="submit">Save models</button>' : ""}<p role="status" data-project-model-status></p></form>`;
+    const options = choice && !catalog.some((item) => sameModel(item, choice)) ? [...catalog, choice] : catalog;
+    return `<fieldset ${disabled}><legend>${role === "main" ? "Main orchestrator" : "Worker"}</legend><label>Model<select name="${role}_model" data-model-role="${role}"><option value="">Runner default</option>${options.map((item) => `<option value="${e(modelValue(item))}"${sameModel(item, choice) ? " selected" : ""}>${e(item.provider)} · ${e(item.model)}</option>`).join("")}</select></label>${choice ? `<p class="set-note">Stored: <code data-model-stored="${role}">${e(choice.provider)}/${e(choice.model)}</code></p>` : ""}</fieldset>`;
+  }).join("");
+  const add = project.can_configure ? `<form data-project-model-add><h3>Add a model to the list</h3><label>Provider<input name="provider" maxlength="128" autocomplete="off" required></label><label>Model<input name="model" maxlength="120" autocomplete="off" required></label><button class="opt" type="submit">Add to list</button><p role="status" data-project-model-add-status></p></form>` : "";
+  return `<form data-project-models><p>Pick a model from this workspace's list, or leave a role on the runner's default.</p>${roles}${project.can_configure ? '<button class="blockbtn" type="submit">Save models</button>' : ""}<p role="status" data-project-model-status></p></form>${add}`;
+}
+
+// Options the shell passes when a button opens project settings (Needs me, board header).
+// "project-models" opens the Agent models section on that role; Back and a saved model refresh the lists.
+export function settingsOptions({ action, dataset = {}, needs = null, panel, refresh = () => {} }) {
+  return {
+    refresh,
+    ...(action === "project-models" ? { focus: "models", role: dataset.role } : {}),
+    ...(needs ? { onBack() { panel.hidden = true; refresh(); } } : {}),
+  };
 }
 
 export function showConnectResult(result, e, { api, path, project, current = () => true, onUpdate = () => {}, opener, fallback, into, app = "claude-code", copySetup = false } = {}) {
@@ -385,7 +407,7 @@ export function openConnectDialog({ slug, api, e, opener, current = () => true, 
 }
 
 // Both app.js entry points keep their handlers here.
-export async function mountProject(host, { slug, api, e, settings = false, current = () => true, notice = "", origin = globalThis.location?.hash || "", restart = origin.endsWith("/chat"), onBack }) {
+export async function mountProject(host, { slug, api, e, settings = false, current = () => true, notice = "", origin = globalThis.location?.hash || "", restart = origin.endsWith("/chat"), onBack, focus, role, refresh = () => {} }) {
   const path = `/api/projects/${encodeURIComponent(slug)}`;
   const active = () => current() && host.isConnected && !host.closest("[hidden]");
   const markSaved = () => { const saved = host.querySelector("[data-project-saved]"); if (saved) saved.textContent = `Changes save automatically · ${savedAt()}`; };
@@ -492,33 +514,15 @@ export async function mountProject(host, { slug, api, e, settings = false, curre
       } catch { if (active()) status.textContent = "Could not check the agent. Try again."; }
       finally { check.disabled = false; }
     };
-    // Bind the models form before the optional reads below: until it has a handler the browser submits it as a GET and drops the values.
-    const form = host.querySelector("[data-project-models]");
-    if (form && project.can_configure) form.onsubmit = async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const button = form.querySelector('button[type="submit"]');
-      if (button.disabled) return;
-      const status = form.querySelector("[data-project-model-status]"), body = {};
-      for (const role of ["main", "worker"]) {
-        const provider = form.querySelector(`[name="${role}_provider"]`).value.trim();
-        const model = form.querySelector(`[name="${role}_model"]`).value.trim();
-        if (!!provider !== !!model) { status.textContent = "Enter both provider and model, or leave both empty."; return; }
-        body[role] = provider ? { provider, model } : null;
-      }
-      button.disabled = true;
-      status.textContent = "";
-      try {
-        const saved = await api(`${path}/models`, { method: "PUT", body });
-        if (!active()) return;
-        project = saved;
-        status.textContent = PROJECT_COPY.saved;
-        markSaved();
-        renderMain();
-      } catch {
-        if (active()) status.textContent = PROJECT_COPY.saveError;
-      } finally { button.disabled = false; }
-    };
+    // Draw and bind the models form before the optional reads below: until it has a handler the
+    // browser submits it as a GET and drops the values. It is not redrawn when the reads settle.
+    drawModels();
+    // Needs me sends the owner here for one role: open the section and put focus on that role's picker.
+    if (focus === "models") {
+      const section = host.querySelector("[data-project-models-section]");
+      if (section) section.setAttribute("open", "");
+      host.querySelector(`[data-model-role="${role || "main"}"]`)?.focus();
+    }
     await Promise.all([
       mountChatAnswers(host.querySelector("[data-project-chat]"), {project, api, e, current: active, onSaved: markSaved}),
       mountProjectAgents(host.querySelector("[data-project-agents]"), {project, api, e, current: active, onUpdate: latest => { project = latest; renderMain(); }}),
@@ -527,6 +531,62 @@ export async function mountProject(host, { slug, api, e, settings = false, curre
     if (!active()) return;
   }
   renderMain();
+  // The models form is redrawn from `project`, so a saved or added model shows at once.
+  function drawModels(message = {}, keep = {}) {
+    const holder = host.querySelector("[data-project-models-host]");
+    if (!holder) return;
+    holder.innerHTML = modelsHTML(project, e);
+    // Picks not saved yet survive a redraw (adding a model must not undo them).
+    for (const [role, value] of Object.entries(keep)) {
+      const select = holder.querySelector(`[data-model-role="${role}"]`);
+      if (select && [...select.querySelectorAll("option")].some((option) => option.getAttribute("value") === value)) select.value = value;
+    }
+    const form = holder.querySelector("[data-project-models]");
+    const status = (selector, text) => { const node = holder.querySelector(selector); if (node && text) node.textContent = text; };
+    status("[data-project-model-status]", message.save);
+    status("[data-project-model-add-status]", message.add);
+    if (!project.can_configure) return;
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const button = form.querySelector('button[type="submit"]');
+      if (button.disabled) return;
+      const body = {};
+      for (const role of ["main", "worker"]) {
+        const value = form.querySelector(`[name="${role}_model"]`).value;
+        body[role] = value ? parseModel(value) : null;
+      }
+      button.disabled = true;
+      try {
+        const saved = await api(`${path}/models`, { method: "PUT", body });
+        if (!active()) return;
+        project = saved;
+        markSaved();
+        renderMain();
+        drawModels({ save: PROJECT_COPY.saved });
+        // A saved model can clear a Needs me item: the shell re-reads its lists.
+        refresh();
+      } catch (failure) {
+        if (active()) form.querySelector("[data-project-model-status]").textContent = failure?.payload?.code === "unknown_model" ? PROJECT_COPY.unknownModel : PROJECT_COPY.saveError;
+      } finally { button.disabled = false; }
+    };
+    const add = holder.querySelector("[data-project-model-add]");
+    add.onsubmit = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const provider = add.querySelector('[name="provider"]').value.trim(), model = add.querySelector('[name="model"]').value.trim();
+      try {
+        const saved = await api(`${path}/models/catalog`, { method: "POST", body: { provider, model } });
+        if (!active()) return;
+        project = saved;
+        const pending = {};
+        for (const role of ["main", "worker"]) pending[role] = holder.querySelector(`[data-model-role="${role}"]`)?.value;
+        drawModels({ add: PROJECT_COPY.modelAdded }, pending);
+      } catch {
+        if (active()) add.querySelector("[data-project-model-add-status]").textContent = PROJECT_COPY.addModelError;
+      }
+    };
+  }
 }
 
 const LOCAL_URL = "http://127.0.0.1:11434";
@@ -761,7 +821,7 @@ function installProjectStyles() {
 
 export function projectSettingsHTML(project, e, {origin = "", restart = false} = {}) {
   const back = settingsOrigin(project.board, origin);
-  return `<section class="workbench-project" aria-labelledby="project-settings-title"><header class="project-top"><h1 id="project-settings-title">${e(project.name)}<span class="title-sub"> <span class="desk-only">Project </span>settings</span></h1><span class="saved" role="status" data-project-saved>Changes save automatically</span><a class="btn back" data-project-back href="${e(back.href)}"${back.href.startsWith("#/board/") && !back.href.endsWith("/chat") ? ' data-keys="G B"' : ""}>${back.label}</a></header><div class="settings"><div class="settings-inner"><section class="set-sec"><h2>Orchestrator</h2><p class="lead">The project's lead agent: it reads chat and turns requests into cards. With no agent connected, chat requests wait.</p><div class="orch-card${restart ? " warn" : ""}" data-project-heading></div><p data-project-notice hidden></p><p role="status" data-project-connect-status></p><div data-project-trust></div>${restart ? '<div class="restart-box"><h3>How to restart the agent</h3><ol><li>Check that the agent app is open and the computer is awake.</li><li>Quit the agent app and start it again. It reconnects with the same setup.</li><li>Check that the computer can still reach this Commonplace (same network or VPN).</li></ol><button type="button" class="btn primary" data-project-check>Check again</button><p role="status" data-project-check-status></p></div>' : ""}<p class="phone-note set-note">Connect an agent on a computer.</p></section><section class="set-sec"><h2>Chat answers</h2><div data-project-chat></div></section><section class="set-sec"><h2>Agents</h2><div data-project-limit></div><div data-project-agents></div><p class="phone-note set-note">To connect or disconnect an agent, open Settings on a computer. Agents run there.</p></section><section class="set-sec"><h2>Project memory</h2><div data-project-memory></div></section><details class="set-sec"><summary>Agent models</summary>${modelsHTML(project, e)}</details></div></div></section>`;
+  return `<section class="workbench-project" aria-labelledby="project-settings-title"><header class="project-top"><h1 id="project-settings-title">${e(project.name)}<span class="title-sub"> <span class="desk-only">Project </span>settings</span></h1><span class="saved" role="status" data-project-saved>Changes save automatically</span><a class="btn back" data-project-back href="${e(back.href)}"${back.href.startsWith("#/board/") && !back.href.endsWith("/chat") ? ' data-keys="G B"' : ""}>${back.label}</a></header><div class="settings"><div class="settings-inner"><section class="set-sec"><h2>Orchestrator</h2><p class="lead">The project's lead agent: it reads chat and turns requests into cards. With no agent connected, chat requests wait.</p><div class="orch-card${restart ? " warn" : ""}" data-project-heading></div><p data-project-notice hidden></p><p role="status" data-project-connect-status></p><div data-project-trust></div>${restart ? '<div class="restart-box"><h3>How to restart the agent</h3><ol><li>Check that the agent app is open and the computer is awake.</li><li>Quit the agent app and start it again. It reconnects with the same setup.</li><li>Check that the computer can still reach this Commonplace (same network or VPN).</li></ol><button type="button" class="btn primary" data-project-check>Check again</button><p role="status" data-project-check-status></p></div>' : ""}<p class="phone-note set-note">Connect an agent on a computer.</p></section><section class="set-sec"><h2>Chat answers</h2><div data-project-chat></div></section><section class="set-sec"><h2>Agents</h2><div data-project-limit></div><div data-project-agents></div><p class="phone-note set-note">To connect or disconnect an agent, open Settings on a computer. Agents run there.</p></section><section class="set-sec"><h2>Project memory</h2><div data-project-memory></div></section><details class="set-sec" data-project-models-section><summary>Agent models</summary><div data-project-models-host>${modelsHTML(project, e)}</div></details></div></div></section>`;
 }
 
 export async function mountProjectAgents(host, {project, api, e, current, onUpdate}) {

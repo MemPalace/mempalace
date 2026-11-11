@@ -202,6 +202,21 @@ class Config:
         return self.runner is not None
 
     @property
+    def split_role(self) -> str | None:
+        """The role a split start runs: ``main`` when the config has one, else the runner role."""
+        if self.runner is None:
+            return None
+        return "main" if "main" in self.roles else self.runner.role
+
+    @property
+    def start_roles(self) -> tuple[str, ...]:
+        """Roles of this config a start can run: the runner role and the split start role."""
+        if self.runner is None:
+            return ()
+        names = dict.fromkeys((self.runner.role, self.split_role))
+        return tuple(name for name in names if name in self.roles)
+
+    @property
     def runner_role(self) -> Role | None:
         """The role the runner launches, or ``None`` without ``[runner]``."""
         return self.roles[self.runner.role] if self.runner else None

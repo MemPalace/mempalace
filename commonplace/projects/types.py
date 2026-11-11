@@ -8,6 +8,9 @@ SEAT_PREFIX = "orchestrator:"
 TOKEN_DAYS = 90
 SEAT_IDLE_S = 86400
 MODEL_ROLES = ("main", "worker")
+# Every role whose choices belong in the model list: the configurable slots plus reviewer and
+# gate, so widening MODEL_ROLES later keeps the list complete.
+CATALOG_ROLES = tuple(dict.fromkeys((*MODEL_ROLES, "reviewer", "gate")))
 PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 MODEL = re.compile(r"[A-Za-z0-9._:/-]{1,120}")
 

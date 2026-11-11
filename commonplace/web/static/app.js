@@ -343,7 +343,7 @@ function shell() {
   let opener = null, wasOpen = false;
   const sync = () => {
     // Needs me lends the shared panel to project settings; it draws there again once the panel closes.
-    if (panel.hidden && state.needsUI?.paused?.()) state.needsUI.pause(false);
+    resumeNeedsAfterPanel(panel);
     if (layout.classList.contains("chat-open") || layout.classList.contains("ctx-pushed")) return;
     // Project settings are a page from 700 px up (10), never a dimmed sheet; on a phone they are the m13 sheet.
     const page = panel.querySelector("[data-project-settings]") && !matchMedia("(max-width:699px)").matches;
@@ -722,20 +722,40 @@ function showFromChat(number, row) {
   const node = root.querySelector(`.workbench-board .card[data-card="${number}"]`);
   if (node) { roveTo(node); node.focus(); node.scrollIntoView({ block: "nearest" }); }
 }
+// Needs me lends the shared panel to project settings; once the panel closes it draws again and
+// re-reads its lists, so an item the owner just fixed (a saved model) is gone.
+function resumeNeedsAfterPanel(panel) {
+  if (panel.hidden && state.needsUI?.paused?.()) { state.needsUI.pause(false); void refresh({ background: true }); }
+}
+// Opens project settings in the shared panel from a shell button (the coordinator or a Needs me "Set the model").
+async function openProjectSettings(action, b, { mountProject, settingsOptions }) {
+  voice.stop();
+  const slug = b.dataset.board || currentBoard()?.slug, epoch = state.screen;
+  if (!slug) return;
+  const panel = root.querySelector("#card-panel");
+  // On Needs me the panel holds the item's detail: it waits while settings use the panel.
+  const needs = onNeeds() ? state.needsUI : null;
+  needs?.pause(true);
+  panel.hidden = false;
+  panel.innerHTML = '<section class="form-tile"><button type="button" class="close" data-action="close-panel" aria-label="Close project settings">×</button><div data-project-settings></div></section>';
+  await mountProject(panel.querySelector("[data-project-settings]"), { slug, api, e, settings: true, current: () => epoch === state.screen,
+    ...settingsOptions({ action, dataset: b.dataset, needs, panel, refresh: () => refresh({ background: true }) }) });
+}
 // The no-answer error's restart link opens project settings in the chat's Details slot; Back returns to the link.
-async function openRestart(link) {
+async function openRestart(link, projects) {
   const service = state.workbenchChat, board = service?.board, epoch = state.screen;
   if (!board) return;
   voice.stop();
   service.dock.close({ toDetails: true, row: link });
-  const { mountProject } = await import("./projects.js");
+  const { mountProject, settingsOptions } = projects || await import("./projects.js");
   if (epoch !== state.screen) return;
   const panel = root.querySelector("#card-panel");
   detailsUI?.stop(); detailsUI = null;
   panel.hidden = false;
   panel.innerHTML = '<section class="form-tile"><button type="button" class="close" data-action="settings-back-to-chat" aria-label="Back to the chat">×</button><div data-project-settings></div></section>';
   await mountProject(panel.querySelector("[data-project-settings]"), { slug: board.slug, api, e, settings: true, restart: true, origin: `#/board/${enc(board.slug)}/chat`,
-    current: () => epoch === state.screen, onBack() { void state.workbenchChat?.dock.backToChat(); } });
+    current: () => epoch === state.screen, onBack() { void state.workbenchChat?.dock.backToChat(); },
+    ...settingsOptions({ action: "restart", refresh: () => refresh({ background: true }) }) });
   if (epoch === state.screen && !panel.hidden) panel.querySelector("[data-project-back]")?.focus();
 }
 function cancelCard() {
@@ -1536,20 +1556,10 @@ root.addEventListener("click", async (event) => {
     else if (action === "space-tab") {
       voice.stop();
       const saved = remember(); state.spaceTab = b.dataset.tab; spaceView(); restore(saved);
-    } else if (action === "coordinator") {
-      voice.stop();
-      const slug = b.dataset.board || currentBoard()?.slug, epoch = state.screen;
-      if (!slug) return;
-      const { mountProject } = await import("./projects.js");
+    } else if (action === "coordinator" || action === "project-models") {
+      const epoch = state.screen, projects = await import("./projects.js");
       if (epoch !== state.screen) return;
-      const panel = root.querySelector("#card-panel");
-      // On Needs me the panel holds the item's detail: it waits while settings use the panel.
-      const needs = onNeeds() ? state.needsUI : null;
-      needs?.pause(true);
-      panel.hidden = false;
-      panel.innerHTML = '<section class="form-tile"><button type="button" class="close" data-action="close-panel" aria-label="Close project settings">×</button><div data-project-settings></div></section>';
-      await mountProject(panel.querySelector("[data-project-settings]"), { slug, api, e, settings: true, current: () => epoch === state.screen,
-        ...(needs ? { onBack() { panel.hidden = true; } } : {}) });
+      return openProjectSettings(action, b, projects);
     }
     else if (action === "close-panel") {
       closeCardPanel();

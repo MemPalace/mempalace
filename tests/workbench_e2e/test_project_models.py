@@ -21,9 +21,16 @@ def test_save_models_while_reads_are_slow_and_after_reload(ui, app):
         page.route(pattern, lambda route: held.append(route))
     open_models(page)
     assert held, "the settings reads must still be pending when the form is used"
+    # The model is listed first (that request is not held), then picked: the picker takes no free text.
+    add = page.locator("[data-project-model-add]")
+    add.locator('[name="provider"]').fill("anthropic")
+    add.locator('[name="model"]').fill("model-a")
+    add.get_by_role("button", name="Add to list").click()
+    page.locator("[data-project-model-add-status]").get_by_text(
+        "Model added to the list."
+    ).wait_for()
     form = page.locator("[data-project-models]")
-    form.locator('[name="main_provider"]').fill("anthropic")
-    form.locator('[name="main_model"]').fill("model-a")
+    form.locator('[data-model-role="main"]').select_option("anthropic model-a")
     saves = []
     page.on(
         "response",
@@ -36,11 +43,11 @@ def test_save_models_while_reads_are_slow_and_after_reload(ui, app):
     form.get_by_role("button", name="Save models").click()
     # Wait for the save, or for the navigation that replaces it when no handler is bound.
     for _ in range(100):
-        if saves or "main_provider=" in page.url:
+        if saves or "provider=" in page.url:
             break
         page.wait_for_timeout(100)
     # Without the handler the browser submits a GET and puts the values in the URL.
-    assert "main_provider=" not in page.url, "the form must not navigate with its values in the URL"
+    assert "provider=" not in page.url, "the form must not navigate with its values in the URL"
     page.locator("[data-project-model-status]").get_by_text("Project models saved.").wait_for()
     # A second save would arrive shortly after the first; give it the time to show.
     settle(page, 300)
@@ -52,6 +59,5 @@ def test_save_models_while_reads_are_slow_and_after_reload(ui, app):
     page.wait_for_selector(".shell", timeout=8000)
     open_models(page)
     form = page.locator("[data-project-models]")
-    assert form.locator('[name="main_provider"]').input_value() == "anthropic"
-    assert form.locator('[name="main_model"]').input_value() == "model-a"
+    assert form.locator('[data-model-role="main"]').input_value() == "anthropic model-a"
     assert re.search(r"/app/#/board/atlas", page.url)

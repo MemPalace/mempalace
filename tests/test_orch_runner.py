@@ -72,6 +72,7 @@ def config_text(
     steps=STEPS,
     topic="worker",
     model_role="worker",
+    main_model_role="main",
     harness="t3",
 ):
     lines = [
@@ -83,7 +84,7 @@ def config_text(
         'kind = "orchestrator"',
         'harness = "t3"',
         'topic = "orchestrate"',
-        'model_role = "main"',
+        *([f'model_role = "{main_model_role}"'] if main_model_role else []),
         'workflow = "card-pipeline"',
         "prompt = '''Coordinate this project.'''",
         "[roles.builder]",
@@ -206,6 +207,9 @@ class World:
         body = {r: {"provider": PROVIDER, "model": model} for r in ("main", "worker")}
         if role is not None:
             body = {role: None if model is None else {"provider": PROVIDER, "model": model}}
+        for choice in body.values():
+            if choice is not None:
+                models.catalog_add(self.db, self.owner, BOARD, choice)
         models.put(self.db, self.owner, BOARD, body)
 
     def machine(self):
@@ -1124,6 +1128,172 @@ def test_r24_runner_harness_and_unresolved_model_are_refused(world):
     assert world.all_jobs() == []
 
 
+def test_404_refused_start_names_the_missing_role_and_where_to_set_it(world):
+    """#404: the refusal says which role has no model and where the owner sets it."""
+    world.configure()
+    world.set_models(None, role="worker")
+    card = world.card()
+    refusal = refused("model_unresolved", world.person_start, card)
+    text = str(refusal)
+    assert "worker role" in text and BOARD in text
+    assert "project settings" in text and "Agent models" in text
+    assert refusal.details["role"] == "worker" and refusal.details["board"] == BOARD
+
+
+def model_role_items(world, principal=None):
+    service = BoardService(world.ctx(principal or world.owner))
+    return service.needs_me().get("model_roles", [])
+
+
+def owner_count(world):
+    return BoardService(world.ctx(world.owner)).needs_me()["count"]
+
+
+def test_404_unmapped_role_is_one_needs_me_item_until_mapped(world):
+    """#404: an accepted config whose role has no model raises exactly one owner item naming
+    the board and the role, with a button to the setting; it clears once the role is mapped."""
+    world.configure()
+    assert model_role_items(world) == []  # both roles are mapped
+    baseline = owner_count(world)
+    world.set_models(None, role="main")
+    items = model_role_items(world)
+    assert [(item["board"], item["role"]) for item in items] == [(BOARD, "main")]
+    item = items[0]
+    assert BOARD in item["message"] and "main" in item["message"]
+    assert item["action"] == {
+        "label": "Set the model",
+        "type": "project_models",
+        "board": BOARD,
+        "role": "main",
+    }
+    assert owner_count(world) == baseline + 1
+    world.set_models(MODEL, role="main")
+    assert model_role_items(world) == []
+    assert owner_count(world) == baseline
+    world.set_models(None, role="worker")
+    assert [item["role"] for item in model_role_items(world)] == ["worker"]
+    assert owner_count(world) == baseline + 1
+
+
+def test_404_item_copy_names_the_blocked_starts(world):
+    """#404: the copy says which starts cannot run, not that every card is stuck."""
+    world.configure()
+    world.set_models(None, role="worker")
+    [item] = model_role_items(world)
+    assert "Starts that use the worker role (builder)" in item["message"]
+    assert "cannot run" in item["message"] and "its cards cannot start" not in item["message"]
+    assert item["config_roles"] == ["builder"]
+
+
+def test_404_only_the_owner_is_asked_and_digest_and_push_stay_card_only(world):
+    """#404: members and agents get no item; the digest and phone push carry cards only."""
+    from commonplace.phone_push import evaluate
+
+    world.configure()
+    world.set_models(None, role="main")
+    assert len(model_role_items(world)) == 1
+    member_user = world.db.create_user("member-404@example.com")
+    world.db.add_member(world.ws, member_user, "member", actor=world.hub.admin)
+    member = sessions.person_principal(world.db, member_user, world.ws)
+    # A member is refused outright; an agent reads its own queue, which has no such bucket.
+    with pytest.raises(ToolError, match="only a workspace owner can do that"):
+        BoardService(world.ctx(member)).needs_me()
+    agent_groups = BoardService(world.ctx(world.a)).needs_me()
+    assert isinstance(agent_groups, dict) and "model_roles" not in agent_groups
+    assert BoardService(world.ctx(world.a))._missing_model_roles() == []
+    digest = BoardService(world.ctx(world.owner)).needs_me(format="digest")
+    assert set(digest) == {"text", "count", "items", "remaining"}
+    assert digest["count"] == 0 and "model" not in digest["text"].lower()
+    assert evaluate.current(world.gw, world.owner) == {}
+
+
+def test_404_a_role_project_settings_cannot_set_gets_an_item_without_a_button(world, monkeypatch):
+    """#404: a start role whose model_role is outside the configurable slots (reviewer, gate)
+    is reported without an action: the picker cannot set it, so no button may promise to."""
+    from commonplace.orch import schema
+
+    monkeypatch.setattr(schema, "MODEL_ROLES", ("main", "worker", "reviewer", "gate"))
+    world.configure(model_role="reviewer")
+    items = model_role_items(world)
+    assert [(item["role"], item["config_roles"]) for item in items] == [("reviewer", ["builder"])]
+    [item] = items
+    assert item["action"] is None
+    assert "model_role" in item["message"] and "reviewer" in item["message"]
+    assert "Choose one in the project's Agent models" not in item["message"]
+    assert "main or worker" in item["message"]
+    # A gate gap behaves the same, and a mapped main still leaves only the gap.
+    world.configure(model_role="gate")
+    assert [(i["role"], i["action"]) for i in model_role_items(world)] == [("gate", None)]
+
+
+def test_404_refusal_for_a_role_settings_cannot_set_points_at_the_board_config(world, monkeypatch):
+    """#404: the start refusal and the Needs me item tell the same story for a model_role
+    outside the configurable slots: the board config, not project settings."""
+    from commonplace.orch import schema
+
+    monkeypatch.setattr(schema, "MODEL_ROLES", ("main", "worker", "reviewer", "gate"))
+    world.configure(model_role="gate")
+    card = world.card()
+    with world.boards.store.connection() as conn:
+        board_row = world.boards._board(conn, BOARD)
+        card_row = conn.execute("SELECT * FROM tasks WHERE id=?", (card,)).fetchone()
+    plan = runner_bridge.prepare(
+        world.gw,
+        world.ws,
+        board_row=board_row,
+        card_row=card_row,
+        version=world.st.accepted(BOARD),
+        principal=None,
+        requested_by="test",
+        person=False,
+    )
+    assert plan.role.model_role == "gate" and plan.model is None
+    refusal = runner_bridge.model_unresolved(plan)
+    text = str(refusal)
+    assert refusal.code == "model_unresolved" and refusal.details["role"] == "gate"
+    assert "model_role" in text and "gate" in text and "orchestrator config" in text
+    assert "Agent models" not in text and "None" not in text
+    [item] = model_role_items(world)
+    assert item["action"] is None and "main or worker" in item["message"]
+    assert "main or worker" in text  # the same fix in both places
+
+
+def test_404_start_roles_agree_with_the_role_a_start_runs(world):
+    """#404: a main role with no model_role is what a split start runs; Needs me says so
+    and the refusal never reads "the None role"."""
+    from commonplace.orch import schema
+    from commonplace.projects import orchestration
+
+    world.configure(main_model_role=None)
+    config = world.st.accepted(BOARD).config()
+    assert isinstance(config, schema.Config) and config.start_roles == ("builder", "main")
+    [item] = model_role_items(world)
+    assert item["role"] is None and item["config_roles"] == ["main"] and item["action"] is None
+    assert "model_role" in item["message"] and "main" in item["message"]
+    assert "None" not in item["message"]
+    orchestration.set_enabled(world.db, world.owner, True)
+    card = world.card()
+    with world.boards.store.connection() as conn:
+        board_row = world.boards._board(conn, BOARD)
+        card_row = conn.execute("SELECT * FROM tasks WHERE id=?", (card,)).fetchone()
+    plan = runner_bridge.prepare(
+        world.gw,
+        world.ws,
+        board_row=board_row,
+        card_row=card_row,
+        version=world.st.accepted(BOARD),
+        principal=None,
+        requested_by="test",
+        person=False,
+        split_start=True,
+    )
+    assert plan.role.name == "main" and plan.model is None
+    refusal = runner_bridge.model_unresolved(plan)
+    assert refusal.code == "model_unresolved"
+    assert "None" not in str(refusal) and "main role" in str(refusal)
+    assert "model_role" in str(refusal) and refusal.details["board"] == BOARD
+
+
 def test_r24b_model_is_on_the_job_the_reply_and_the_lease_payload(world):
     """R24b: the pinned model is on the job row, the orch_card_start reply and the lease
     payload, whose message is SPAWN_MESSAGE + the role prompt + the workflow steps."""
@@ -1266,6 +1436,13 @@ def test_r2_stalled_launch_is_uncertain_in_doubt_and_never_redone(
         body={"slug": BOARD, "wing": "shared"},
     )
     assert status == 201, (status, body)
+    http(
+        hub.port,
+        "POST",
+        f"/api/projects/{BOARD}/models/catalog",
+        cookie=owner["cookie"],
+        body={"provider": PROVIDER, "model": MODEL},
+    )
     status, body = http(
         hub.port,
         "PUT",

@@ -41,6 +41,10 @@ def _view(gateway, principal, board):
             role: choice.public() if choice is not None else None
             for role, choice in choices.items()
         },
+        "model_catalog": [
+            choice.public()
+            for choice in models.catalog(gateway.db, principal.workspace_id, board["slug"])
+        ],
         "can_configure": principal.person and principal.role == "owner",
     }
     if orchestration.enabled(gateway.db, principal.workspace_id):
@@ -150,6 +154,7 @@ def _project_action(method, parts):
         ("GET", ("orchestrator", "inbox")): "inbox",
         ("POST", ("orchestrator", "split")): "split",
         ("PUT", ("models",)): "models",
+        ("POST", ("models", "catalog")): "model_catalog",
         ("PUT", ("limits",)): "limits",
         ("POST", ("wing",)): "wing",
     }
@@ -193,6 +198,8 @@ def _project_result(gateway, principal, service, board, action, body):
             limits.put(conn, board["id"], body)
     if action == "models":
         models.put(gateway.db, principal, slug, body)
+    if action == "model_catalog":
+        models.catalog_add(gateway.db, principal, slug, body)
     return 200, _view(gateway, principal, board)
 
 
@@ -234,6 +241,17 @@ def _project_route(gateway, h, principal, parts, action):
         return
     except orchestration.AdmissionRefused as exc:
         send_json(h, exc.status, {"error": str(exc).removeprefix("no: "), "code": exc.code})
+        return
+    except models.UnknownModel:
+        send_json(
+            h,
+            400,
+            {
+                "error": "That model is not in this workspace's list. Pick one from the list "
+                "or add it first.",
+                "code": "unknown_model",
+            },
+        )
         return
     except ValueError:
         send_json(h, 400, {"error": "Invalid project settings"})

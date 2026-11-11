@@ -82,9 +82,20 @@ class ProjectsHub(ChatHub):
             :2
         ]
 
-    def models(self, auth, slug, body=None):
+    def catalog_add(self, auth, slug, choice):
+        return self.request(auth, "POST", f"/api/projects/{slug}/models/catalog", choice)[:2]
+
+    def models(self, auth, slug, body=None, *, declare=None):
+        """Save choices. ``declare`` is explicit: True lists each choice first, as an owner
+        would; False sends the choice as is."""
         if body is None:
             return self.project(auth, slug)
+        if declare is None:
+            raise ValueError("pass declare=True or declare=False")
+        if declare:
+            for choice in body.values():
+                if isinstance(choice, dict):
+                    self.catalog_add(auth, slug, choice)
         return self.request(auth, "PUT", f"/api/projects/{slug}/models", body)[:2]
 
     def seats(self, ws=None):

@@ -52,6 +52,7 @@ function fixture() {
     document: { activeElement: null }, CSS: { escape: (value) => value },
     voice: { stop() {}, remember() {}, view() {} },
     needsCards: () => Object.values(state.needs).flat(),
+    onNeeds: () => state.base === "#/needs" || state.base === "#/",
     data: (form) => form.payload(),
     api: async (url, options) => {
       requests.push(plain({ url, ...options }));

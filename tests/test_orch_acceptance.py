@@ -62,6 +62,14 @@ def _machine(hub, owner):
         hub.port, "POST", "/api/boards", cookie=owner["cookie"], body={"slug": BOARD, "wing": BOARD}
     )
     _must(status == 201, f"board add failed: {status} {body}")
+    # The workspace's model list is declared first; the project's choice then picks from it.
+    http(
+        hub.port,
+        "POST",
+        f"/api/projects/{BOARD}/models/catalog",
+        cookie=owner["cookie"],
+        body={"provider": PROVIDER, "model": MODEL},
+    )
     status, body = http(
         hub.port,
         "PUT",

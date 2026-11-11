@@ -45,14 +45,29 @@ agent has used the connection within the last 24 hours.
 
 ## Model choices
 
-Owners can save provider and model labels for the main orchestrator and workers
-in project settings. These choices are stored only: saving them does not call a
-provider or start work. Applying them through the runner comes later. They do
-not change the separate workspace chat model settings. The Save models form works as soon as project settings open, even while the page's other reads (chat answers, agents) are still loading or have timed out.
+Owners pick the model for the main orchestrator and for workers in project
+settings, under Agent models. Each role is a list of the models this workspace
+can use, with "Runner default" to leave it unset. The model already stored for a
+role always stays in the list and is shown as stored. A model that is not in the
+list is refused (`unknown_model`) and nothing is saved. To add one, use "Add a
+model to the list" in the same section (an owner action, also available as
+`POST /api/projects/<board>/models/catalog`). The list belongs to the board: it holds the models an owner added to it, the models
+chosen for it and the workspace defaults, never another board's choices.
+
+Saving a choice does not call a provider or start work, and does not change the
+separate workspace chat model settings. The Save models form works as soon as project
+settings open, even while the page's other reads (chat answers, agents) are still
+loading or have timed out.
 
 Model resolution uses the project's choice, then the workspace default for
 that role, then the runner's own default. Clearing a project choice restores
 that fallback. No API key is stored with these labels.
+
+When a board's accepted orchestrator config uses a model role that resolves to
+no model, the owner gets one Needs me item per board and role, naming the starts that cannot run. Its button
+opens that role's picker, and the item clears once the role is set. A role in the
+board config with no `model_role` gets an item that says so, without a button. A card start
+refused for the same reason names the role and where to set it.
 
 ## Events and API
 

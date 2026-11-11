@@ -86,7 +86,9 @@ class RelayHub(ProjectsHub):
         )[:2]
 
     def set_main_model(self, provider, model):
-        return self.models(self.owner, "work", {"main": {"provider": provider, "model": model}})
+        return self.models(
+            self.owner, "work", {"main": {"provider": provider, "model": model}}, declare=True
+        )
 
     def _table(self, name):
         return (

@@ -259,8 +259,7 @@ def prepare(
         # The split start runs the board's orchestrator role. Configs may name it freely
         # (``main`` by convention); without a ``main`` role keep the runner's own role, so
         # a differently named orchestrator never turns every trigger sweep into an error.
-        split_role = "main" if "main" in config.roles else config.runner.role
-        config = replace(config, runner=replace(config.runner, role=split_role))
+        config = replace(config, runner=replace(config.runner, role=config.split_role))
     if config.runner is not None and config.runner.role not in config.roles:
         raise StartRefused("unknown_role", "the config has no role for this start")
     role = config.runner_role
@@ -367,10 +366,35 @@ def _wrap(exc) -> StartRefused:
     )
 
 
+def model_unresolved(plan: Plan) -> StartRefused:
+    """The refusal for a start whose role has no model: it names the role and where to fix it."""
+    role = plan.role
+    if role.model_role is None:
+        message = (
+            f"the {role.name} role of board {plan.board} has no model_role; "
+            "add one to the role in the board's orchestrator config"
+        )
+    elif role.model_role not in models.MODEL_ROLES:
+        # Project settings cannot set this role: say what the Needs me item says.
+        message = (
+            f"the board config's model_role for the {role.name} role of board {plan.board} "
+            f"({role.model_role}) has no model, and project settings cannot set it; point "
+            "the role's model_role at main or worker in the board's orchestrator config"
+        )
+    else:
+        message = (
+            f"no model is set for the {role.model_role} role of board {plan.board}; "
+            "an owner sets it in the board's project settings under Agent models"
+        )
+    return StartRefused(
+        "model_unresolved", message, role=role.model_role, config_role=role.name, board=plan.board
+    )
+
+
 def _fenced(conn, plan, *, path, role, step_key, epoch, token, request_key, now, clock):
     # 0. resolve: the model is pinned from the snapshot; the hash covers it.
     if plan.model is None:
-        raise StartRefused("model_unresolved", f"no model is set for {plan.role.model_role}")
+        raise model_unresolved(plan)
     digest = request_hash(plan, role)
     record = plan.run_record(step_key if path == "orch" else None)
     # 1. restore flag, lease (orch), version still accepted, plan label.

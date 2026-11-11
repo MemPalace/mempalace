@@ -2060,6 +2060,87 @@ class BoardService:
             for board, (r, c) in waiting.items()
         ]
 
+    def _missing_model_roles(self):
+        """One item per board and model role the board's accepted config uses with no model set.
+
+        Owner-only. The item clears itself once the role resolves to a model."""
+        if not self.principal.person or self.principal.role != "owner":
+            return []
+        from commonplace.orch import schema as orch_schema, store as orch_store
+        from commonplace.projects import models, split
+        from commonplace.projects.types import MODEL_ROLES
+
+        items = []
+        with split.runner_read(self.ctx.workspace_dir()) as reader:
+            if (
+                reader is None
+                or not reader.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='orch_configs'"
+                ).fetchone()
+            ):
+                return []
+            with self.store.connection() as conn:
+                boards = conn.execute(
+                    "SELECT slug,name,wing FROM boards WHERE archived=0 ORDER BY slug"
+                ).fetchall()
+            for board in boards:
+                if not self.principal.policy.can_read_wing(board["wing"]):
+                    continue
+                version = orch_store.accepted_in(reader, board["slug"], orch_store.LIVE)
+                if version is None:
+                    continue
+                try:
+                    config = version.config()
+                except orch_schema.ConfigError:
+                    continue
+                if not config.has_runner:
+                    continue
+                name = board["name"] or board["slug"]
+                for gap in models.missing_roles(
+                    self.ctx.db, self.principal.workspace_id, board["slug"], config
+                ):
+                    role, uses = gap["role"], ", ".join(gap["config_roles"])
+                    if role is None:
+                        message = (
+                            f"Starts that use the {uses} role on {name} cannot run: the role "
+                            "names no model_role. Add one to that role in the board's "
+                            "orchestrator config; there is no setting for it here."
+                        )
+                        action = None
+                    elif role not in MODEL_ROLES:
+                        # Project settings cannot set this role (yet): never offer a button
+                        # that would leave the item standing.
+                        message = (
+                            f"Starts that use the {uses} role on {name} cannot run: the board "
+                            f"config's model_role for it ({role}) has no model, and project "
+                            "settings cannot set it. Point the role's model_role at main or "
+                            "worker in the board's orchestrator config."
+                        )
+                        action = None
+                    else:
+                        message = (
+                            f"Starts that use the {role} role ({uses}) on {name} cannot run: no "
+                            "model is set for it. Choose one in the project's Agent models."
+                        )
+                        action = {
+                            "label": "Set the model",
+                            "type": "project_models",
+                            "board": board["slug"],
+                            "role": role,
+                        }
+                    items.append(
+                        {
+                            "kind": "model_role",
+                            "board": board["slug"],
+                            "board_name": name,
+                            "role": role,
+                            "config_roles": gap["config_roles"],
+                            "message": message,
+                            "action": action,
+                        }
+                    )
+        return items
+
     def board_set(self, board, coordinator):
         _owner(self.principal)
         with self.transaction() as conn:
@@ -4165,6 +4246,9 @@ class BoardService:
             groups["coordinator_waiting"] = self._coordinator_waiting()
             groups["orchestrator_failing"] = self._orchestrator_failing()
             groups["orchestrator_stalled"] = self._orchestrator_stalled()
+            if self.principal.person:
+                groups["model_roles"] = self._missing_model_roles()
+                groups["count"] += len(groups["model_roles"])
         return groups
 
     def _orchestrator_stalled(self):

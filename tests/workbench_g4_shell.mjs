@@ -142,16 +142,34 @@ if (which === 'details-button') {
   assert.equal(detail.innerHTML, 'settings');
   ui.pause(false); assert.notEqual(detail.innerHTML, 'settings');
   ui.stop();
-  // The shell pauses Needs me while project settings use the panel on #/needs.
-  const handlers = {}, mounted = [];
+  // The shell pauses Needs me while project settings use the panel on #/needs. The real
+  // openProjectSettings runs here, with the real settingsOptions behind the injected module.
+  const projects = await module('projects');
+  const handlers = {}, mounted = [], refreshes = [];
   let paused = null;
   root.addEventListener = (type, fn) => { handlers[type] = fn; };
   state.base = '#/needs'; state.needsUI = { pause: (on) => { paused = on; } };
-  Object.assign(context, { consoleUI: null, api() {}, currentBoard: () => board, injected: async (host, options) => mounted.push(options) });
-  run(slice('root.addEventListener("click",', 'root.addEventListener("submit",').replaceAll('await import("./projects.js")', '({mountProject: injected})'));
-  await handlers.click({ target: { closest: (s) => s.includes('.chat-recovery') ? null : { dataset: { action: 'coordinator', board: 'alpha' } } } });
+  Object.assign(context, { consoleUI: null, api() {}, onNeeds: () => state.base === '#/needs' || state.base === '#/', currentBoard: () => board, settingsOptions: projects.settingsOptions,
+    refresh: async (options) => { refreshes.push(JSON.parse(JSON.stringify(options))); },
+    injected: async (host, options) => mounted.push(options) });
+  run(slice('function resumeNeedsAfterPanel(', "// The no-answer error's restart link"));
+  run(slice('root.addEventListener("click",', 'root.addEventListener("submit",').replaceAll('await import("./projects.js")', '({mountProject: injected, settingsOptions})'));
+  const click = (dataset) => handlers.click({ target: { closest: (s) => s.includes('.chat-recovery') ? null : { dataset } } });
+  await click({ action: 'coordinator', board: 'alpha' });
   assert.equal(paused, true);
   assert.equal(mounted.length, 1); assert.equal(typeof mounted[0].onBack, 'function');
+  assert.equal(mounted[0].focus, undefined, 'the coordinator button opens settings without a focus target');
+  // "Set the model" on a Needs me row opens that board's settings on that role's picker.
+  paused = null;
+  await click({ action: 'project-models', board: 'alpha', role: 'worker' });
+  assert.equal(paused, true, 'Needs me waits while settings use the panel');
+  assert.equal(mounted.length, 2, 'the click reaches the settings mount');
+  assert.equal(mounted[1].slug, 'alpha');
+  assert.equal(mounted[1].focus, 'models');
+  assert.equal(mounted[1].role, 'worker', "the row's role reaches the picker");
+  assert.equal(typeof mounted[1].onBack, 'function');
+  mounted[1].onBack();
+  assert.deepEqual(refreshes, [{ background: true }], 'Back re-reads the lists');
 } else {
   throw new Error(`unknown case ${which}`);
 }

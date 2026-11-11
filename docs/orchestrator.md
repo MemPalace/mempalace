@@ -94,7 +94,9 @@ versions, cursors, leases, jobs and events. No area seats, tokens, subscriptions
 or runtime are created; activation belongs to a later slice.
 
 Model routing has two slots, `main` and `worker`, set per project by the owner
-(`PUT /api/projects/<board>/models`).
+(`PUT /api/projects/<board>/models`) from the workspace's model list. A role the
+accepted config uses that has no model raises one owner item in Needs me; a start
+refused as `model_unresolved` names that role and where to set it.
 
 ## Versions and experiments
 

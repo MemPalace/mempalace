@@ -90,6 +90,31 @@ async function rejectOnly(kind) {
 const cases = {
   proposal_reject_only: () => rejectOnly('proposal'),
   plan_reject_only: () => rejectOnly('plan'),
+  // #404: an unmapped model role is one Set up row whose button opens that board's setting.
+  model_roles() {
+    const item = { kind: 'model_role', board: 'atlas', board_name: 'Atlas', role: 'main', message: 'Atlas has no model set for the main role, so its cards cannot start.', action: { label: 'Set the model', type: 'project_models', board: 'atlas', role: 'main' } };
+    const html = renderNeeds({ needs: { model_roles: [item] }, boards: [board], now });
+    assert.equal((html.match(/data-model-role-item=/g) || []).length, 1);
+    assert.match(html, /data-model-role-item="atlas:main"/);
+    assert.match(html, /<button class="btn primary" data-action="project-models" data-board="atlas" data-role="main">Set the model<\/button>/);
+    assert.match(visible(html), /Atlas has no model set for the main role/);
+    assert.match(visible(html), /1 item, 1 project/);
+    assert.doesNotMatch(html, /Nothing needs you right now/);
+    assert.doesNotMatch(renderNeeds({ needs: { model_roles: [item] }, boards: [board], filter: 'approvals', now }), /data-model-role-item/);
+    // Mapped: the server sends no item and the row is gone.
+    const cleared = renderNeeds({ needs: { model_roles: [] }, boards: [board], now });
+    assert.doesNotMatch(cleared, /data-model-role-item/);
+    assert.match(cleared, /Nothing needs you right now/);
+    // A malformed item draws nothing and never a button without a board and role.
+    assert.doesNotMatch(renderNeeds({ needs: { model_roles: [{ kind: 'model_role', message: 'x' }] }, now }), /data-action="project-models"/);
+    // A role the board config leaves without a model_role has no button: the row says what to fix.
+    const config = { kind: 'model_role', board: 'atlas', board_name: 'Atlas', role: null, config_roles: ['main'], message: 'Starts that use the main role on Atlas cannot run: the role names no model_role.', action: null };
+    const bare = renderNeeds({ needs: { model_roles: [config] }, boards: [board], now });
+    assert.equal((bare.match(/data-model-role-item=/g) || []).length, 1);
+    assert.doesNotMatch(bare, /data-action="project-models"/);
+    assert.match(visible(bare), /names no model_role/);
+    assert.match(visible(bare), /board config/);
+  },
   async approve() {
     const s = setup(); await s.ui.show({ needs, boards: [board], selected: 21 });
     s.detailMount.controls.get('[data-needs-note]').value = '  Send tomorrow\n';

@@ -24,6 +24,7 @@ REDS = [
     "errors",
     "decision",
     "focus",
+    "model_roles",
 ]
 
 

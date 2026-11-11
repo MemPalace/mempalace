@@ -28,6 +28,15 @@ CREATE TABLE IF NOT EXISTS chat_model_settings (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, scope, role)
 );
+CREATE TABLE IF NOT EXISTS project_model_catalog (
+    workspace_id TEXT NOT NULL,
+    scope TEXT NOT NULL,                      -- board slug; '*' = workspace-wide
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, scope, provider, model)
+);
 """
 
 

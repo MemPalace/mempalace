@@ -126,8 +126,20 @@ if (globalThis.document?.adoptedStyleSheets) {
   document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
 }
 
+// A board whose config uses a model role with no model: one item per role, its button opens that setting.
+export function modelRoleItems(needs = {}, filter = "all") {
+  return filter === "all" || filter === "decisions" ? (needs.model_roles || []).filter((item) => item.kind === "model_role" && item.board) : [];
+}
+// An item with an action opens that role's setting; one without says what the board config needs.
+function modelRoleRow(item) {
+  const key = item.role || (item.config_roles || []).join(",") || "config";
+  const button = item.action && item.role ? `<button class="btn primary" data-action="project-models" data-board="${e(item.board)}" data-role="${e(item.role)}">${e(item.action.label || "Set the model")}</button>` : "";
+  return `<article class="row-item" data-model-role-item="${e(item.board)}:${e(key)}"><span class="typ decision">Set up</span><div><h3>${e(item.message)}</h3><div class="sub">${e(item.board_name || item.board)} · ${e(item.role ? `${item.role} role` : "board config")}</div></div>${button}</article>`;
+}
+
 export function renderNeeds({ needs = {}, boards = [], holds = [], cards = [], filter = "all", selected = null, now = Date.now() } = {}) {
   const items = needsItems(needs, filter);
+  const roles = modelRoleItems(needs, filter);
   const known = new Map([...cards, ...needsItems(needs).map((item) => item.card)].map((card) => [card.number, card]));
   const approvals = holds.filter((hold) => hold.kind === "approve");
   const held = [...new Set(approvals.map((hold) => hold.card))].map((number) => latestHold(approvals, number))
@@ -150,8 +162,9 @@ export function renderNeeds({ needs = {}, boards = [], holds = [], cards = [], f
     return rows.length ? `<h2 class="group-h">${name}</h2>${rows.map((hold) => row(known.get(hold.card), hold.kind === "approve" ? "approval" : "decision", hold)).join("")}` : "";
   };
   const visibleCards = [...new Set([...items.map((item) => item.card.number), ...held.map((hold) => hold.card)])];
-  const projects = new Set(visibleCards.map((number) => known.get(number)?.board).filter(Boolean)).size;
-  return `<section class="needs-me" aria-label="Needs me"><header class="bar"><h1>Needs me</h1><span data-needs-chat></span><span class="sub">${visibleCards.length} ${visibleCards.length === 1 ? "item" : "items"}, ${projects} ${projects === 1 ? "project" : "projects"}</span><div class="seg" role="group" aria-label="Filter">${Object.entries(filters).map(([key, text]) => `<button data-needs-filter="${key}" aria-pressed="${filter === key}">${text}</button>`).join("")}</div></header><div class="list"><p class="list-note">Only what an agent can't do without you.</p>${heldGroup("Approved, not sent yet", (hold) => ["waiting", "settling"].includes(hold.state))}${heldGroup("Recent answers", (hold) => !["waiting", "settling"].includes(hold.state))}${[...groups].map(([name, group]) => `<h2 class="group-h">${e(name)}</h2>${group.map(({ card, kind }) => row(card, kind)).join("")}`).join("")}${!items.length && !held.length ? '<p class="empty">Nothing needs you right now.</p>' : ""}</div><div class="keys" aria-label="Keyboard shortcuts"><span><kbd>J</kbd><kbd>K</kbd> move</span><span><kbd>↵</kbd> open linked card</span><span><kbd>R</kbd> ask a question</span><span>Approve and Decline have no single-key shortcut, on purpose: use the buttons.</span></div></section>`;
+  const projectSlugs = new Set([...visibleCards.map((number) => known.get(number)?.board), ...roles.map((item) => item.board)].filter(Boolean));
+  const total = visibleCards.length + roles.length, projectCount = projectSlugs.size;
+  return `<section class="needs-me" aria-label="Needs me"><header class="bar"><h1>Needs me</h1><span data-needs-chat></span><span class="sub">${total} ${total === 1 ? "item" : "items"}, ${projectCount} ${projectCount === 1 ? "project" : "projects"}</span><div class="seg" role="group" aria-label="Filter">${Object.entries(filters).map(([key, text]) => `<button data-needs-filter="${key}" aria-pressed="${filter === key}">${text}</button>`).join("")}</div></header><div class="list"><p class="list-note">Only what an agent can't do without you.</p>${roles.length ? `<h2 class="group-h">Set up</h2>${roles.map(modelRoleRow).join("")}` : ""}${heldGroup("Approved, not sent yet", (hold) => ["waiting", "settling"].includes(hold.state))}${heldGroup("Recent answers", (hold) => !["waiting", "settling"].includes(hold.state))}${[...groups].map(([name, group]) => `<h2 class="group-h">${e(name)}</h2>${group.map(({ card, kind }) => row(card, kind)).join("")}`).join("")}${!items.length && !held.length && !roles.length ? '<p class="empty">Nothing needs you right now.</p>' : ""}</div><div class="keys" aria-label="Keyboard shortcuts"><span><kbd>J</kbd><kbd>K</kbd> move</span><span><kbd>↵</kbd> open linked card</span><span><kbd>R</kbd> ask a question</span><span>Approve and Decline have no single-key shortcut, on purpose: use the buttons.</span></div></section>`;
 }
 
 export function githubPrUrl(value) {
