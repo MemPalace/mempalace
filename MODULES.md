@@ -274,6 +274,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Live-sync and capture instructions document the generic `agent-log` source for agents without a native transcript.
   - Public Space endpoint and error documentation alongside legacy board routes.
+  - `docs/design/RULES.md` documents the `rules_feedback` tool, its limits and its evidence routes.
 
   - `docs/boards/API.md` describes structured decision blocks: the `{label, detail, preview}` option shape, its bounds, and the `ask_blocks` card field; `docs/boards/schema.sql` lists the column.
 
@@ -653,6 +654,7 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_routines.py` pins routine creation per due time on a fake clock, restart recovery and owner-only access.
 
   - `tests/test_projects_seat_lease.py` creates a seat through the Project settings routes and has it take, hold, renew and release its lease over MCP.
+  - `tests/test_commonplace_rules_evidence.py` and the `rules_feedback` entries of `tests/spaces_surfaces.json` pin evidence writes, refusals, workspace isolation, bounded growth and old-database migration.
 
   - `tests/test_commonplace_goals.py` covers the goals tree, its owner-only writes, the additive schema and the card-context chain budget.
 
@@ -1615,6 +1617,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Owner-reviewed rules and their freshness gate, guard building blocks, sensitive-text flags and redaction.
 
+  - Rule evidence (`commonplace/rules/evidence.py`): bounded `rule_events` plus `rule_stats` counters per workspace, written by `rules_feedback` (MCP) and `/api/rules/<id>/feedback` (REST).
+
   - The pre-push quick check (`guards/prepush.py`): changed-file selection, the shared time budget and the report of what it skipped; and the hook installer (`guards/hooks.py`) whose scripts resolve each worktree's own environment.
 
   - `commonplace.guards.pretool`, a PreToolUse command that refuses git-hook bypasses (`docs/hook-bypass-guard.md`).
@@ -1631,11 +1635,15 @@ Format (read by `commonplace orch docs-check`):
 
   - The quick check names itself a quick check, reports every skipped or cut-off step, and fails the push only when a check it ran failed. The installed hooks work in a fresh linked worktree or say how to set it up.
 
+  - Evidence never changes a rule or its sequence. Agents write with `memory:write` and read back only their own events plus the rule's counters; people read all events, only owners write. `rules_feedback` is an exempt write: a report, not an instruction.
+
 - **How it fails:**
 
   - Missing and stale served sequences retain the 428 refresh payload.
 
   - Redaction can miss a sensitive detail; flags are hints, not blocks.
+
+  - Evidence tables are created additively in `migrate()`; events are capped (50 per writer, 200 per rule) while counters keep the full history, so a pruned event is no longer readable but still counted.
 
   - A test whose name matches no changed module is not selected, so the quick check can pass while a distant test would fail; a cut-off step is reported, not retried; a worktree with no environment blocks the hook with the setup command.
 
@@ -1645,7 +1653,7 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_rules_index.py` pins index completeness and size, keyed get with unknown keys, partial reads not serving, and unchanged defaults; `tests/spaces_surfaces.json` carries the new `rules_get` and `session_start` arguments.
 
-  - `tests/test_commonplace_rules.py`, `tests/test_commonplace_rules_enforce.py`, `tests/test_commonplace_privacy.py`, the `tests/test_guards_` files.
+  - `tests/test_commonplace_rules.py`, `tests/test_commonplace_rules_enforce.py`, `tests/test_commonplace_rules_evidence.py`, `tests/test_commonplace_privacy.py`, the `tests/test_guards_` files.
 
   - `tests/test_rules_enforcement_points.py` holds one skip-detecting check per enforcement point (injection, session hook, write sequence check, reviewers); `docs/design/RULES.md` maps each point to its tests.
 

@@ -1227,6 +1227,7 @@ def test_only_the_owner_session_can_move_rules(hub, env):
         "rules_publish",
         "rules_get",
         "rules_changed",
+        "rules_feedback",
     }
     assert mcp(hub, env.token, "rules_publish", rules=[rule()], agent="*")[0]
     original, shared = env.owner.list_rules()["rules"]

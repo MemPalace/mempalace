@@ -71,6 +71,9 @@ def migrate(conn, boards_visibility=0):
             if "summary" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN summary TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS rules_by_origin ON rules(origin_agent, key)")
+        from . import evidence
+
+        evidence.ensure(conn)
         if own_transaction:
             conn.commit()
     except BaseException:

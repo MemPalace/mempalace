@@ -59,6 +59,13 @@ def dispatch(service, h, parts, method):
         body(())
         return 200, service.accept_store()
     checks.guard(service.ctx.db, service.principal.workspace_id, service.ctx.workspace_dir())
+    if parts == ["rules", "feedback"] and method == "GET":
+        return 200, service.feedback_stats()
+    if len(parts) == 3 and parts[0] == "rules" and parts[2] == "feedback":
+        if method == "GET":
+            return 200, service.feedback(parts[1])
+        if method == "POST":
+            return 201, service.feedback(parts[1], **body(("kind", "note"), ("kind",)))
     if parts == ["rules", "count"] and method == "GET":
         return 200, service.count()
     if parts == ["rules"]:

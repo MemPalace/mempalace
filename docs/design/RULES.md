@@ -96,6 +96,7 @@ Rules tools are registered by `commonplace.rules` and are in every profile. The 
 | `session_start` | `memory:read` | read | `query?`, `board?`, `repo?`, `limit?` (default 3, maximum 5) | Effective rules plus relevant quoted memories. Underlying tool allowlists and memory visibility apply. Explicit reads follow normal served rules behavior. |
 | `rules_get` | `memory:read` | read | `board?`, `repo?`, `format?: "text" \| "md"`, `include_retired?: bool`, `effective?: bool` | The rules that apply to me: my own plus `*`, global plus the given board and repo, with `status`, `source`, `version` and the effective text. `format=md` gives a Markdown rules file grouped by kind, with retired rules left out. The last line is `seq N`. |
 | `rules_changed` | `memory:read` | read | `since: int` | `seq N` plus `key status own\|all` lines for changes after `since` (`own` for the caller's rules, `all` for `*` rules). If `since` exceeds the current sequence, returns `reset` then `seq N`. It does no text work; meant to run on every session start. |
+| `rules_feedback` | `memory:write` | write | `rule?: key`, `kind?: followed\|helped\|violated\|conflict\|outdated\|unclear\|note`, `note?: text (500)` | With `kind`, records one evidence event on a rule you can see and returns its counters. With only `rule`, returns your own events (newest 50) and the rule's counters; with neither, counters for every visible rule that has evidence. Evidence never changes a rule or `seq`. Events are capped (50 per writer, 200 per rule); counters keep the full history. People read all events at `GET /api/rules/<id>/feedback` and `GET /api/rules/feedback`; owners write with `POST /api/rules/<id>/feedback`. |
 
 Untrusted tokens may publish: what they publish starts as a proposal for the owner, and nothing else is written. Rule text is stored verbatim, and replies quote it as data the way board tools do.
 
@@ -358,6 +359,7 @@ The Rules screen's incident-count projection is a separate follow-up.
 The following paths deliberately remain open, retaining existing authorization:
 
 - `task_heartbeat`: mechanical claim renewal.
+- `rules_feedback`: evidence about a rule is a report, not an instruction; it never changes work or rules.
 - `orch_heartbeat`, `orch_release`: mechanical orchestrator lease renewal and release.
 - `webhook_add`, `webhook_remove`, `webhook_test`: configuration and outbound automation.
 - `mempalace_add_drawer`, `mempalace_update_drawer`, `mempalace_diary_write`,

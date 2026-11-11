@@ -23,6 +23,7 @@ CHECKED_WRITES = frozenset(
 
 # Explicit names make a newly exposed write fail the public-surface contract.
 EXEMPT_WRITES = {
+    "rules_feedback": "Evidence about a rule is a report, not an instruction; it never changes work or rules.",
     "task_heartbeat": "Mechanical claim renewal does not change the work or its instructions.",
     **dict.fromkeys(
         "orch_heartbeat orch_release".split(),

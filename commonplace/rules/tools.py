@@ -2,7 +2,7 @@
 
 from commonplace.extensions import ALL_PROFILES, LocalTool, ToolError, register
 
-from . import checks, render
+from . import checks, evidence, render
 from .service import KINDS, SCOPES, RuleService
 
 STRING = {"type": "string"}
@@ -13,6 +13,7 @@ def run(ctx, name, args):
         "rules_publish": ({"rules", "replace", "agent"}, {"rules"}),
         "rules_get": ({"board", "repo", "format", "include_retired", "effective", "keys"}, set()),
         "rules_changed": ({"since"}, {"since"}),
+        "rules_feedback": ({"rule", "kind", "note"}, set()),
     }
     if name not in allowed or not isinstance(args, dict):
         raise ToolError("no: invalid arguments")
@@ -41,6 +42,8 @@ def run(ctx, name, args):
     result = getattr(service, name)(**args)
     if "reply" in result:
         return result["reply"]
+    if name == "rules_feedback":
+        return result  # JSON keeps notes quoted as data
     rows = result["rules"]
     if name == "rules_get":
         rendered = render.md(rows) if args.get("format") == "md" else render.text(rows)
@@ -111,9 +114,20 @@ def register_tools():
             ["since"],
             "Check rule keys and statuses changed since a sequence, without fetching text.",
         ),
+        "rules_feedback": (
+            {
+                "rule": {**STRING, "maxLength": 200, "description": "Rule key from rules_get."},
+                "kind": {"type": "string", "enum": list(evidence.FEEDBACK_KINDS)},
+                "note": {"type": "string", "maxLength": evidence.NOTE_LIMIT},
+            },
+            [],
+            "Report how a rule fared in use (kind + optional note), or read evidence back: "
+            "with rule only, your own events and the rule's counters; with neither, counters for "
+            "every rule you can see. Evidence never changes a rule; the owner decides.",
+        ),
     }
     for name, (properties, required, description) in schemas.items():
-        write = name == "rules_publish"
+        write = name in ("rules_publish", "rules_feedback")
         register(
             LocalTool(
                 name=name,

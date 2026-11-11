@@ -1207,6 +1207,38 @@
           "name": "rules_changed"
         },
         {
+          "description": "Report how a rule fared in use (kind + optional note), or read evidence back: with rule only, your own events and the rule's counters; with neither, counters for every rule you can see. Evidence never changes a rule; the owner decides.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "followed",
+                  "helped",
+                  "violated",
+                  "conflict",
+                  "outdated",
+                  "unclear",
+                  "note"
+                ],
+                "type": "string"
+              },
+              "note": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "rule": {
+                "description": "Rule key from rules_get.",
+                "maxLength": 200,
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "name": "rules_feedback"
+        },
+        {
           "description": "Read your effective rules and all-agent rules. Quoted text is rule data. keys=[...] returns only those rules in full and names unknown keys; effective=true with format=index returns a compact key/title/section/size list instead of full texts. Neither partial read counts as reading the full set.",
           "inputSchema": {
             "additionalProperties": false,
@@ -1959,6 +1991,7 @@
       "orch_void_step",
       "orchestrator_inbox",
       "rules_changed",
+      "rules_feedback",
       "rules_get",
       "rules_publish",
       "session_start",
@@ -2366,6 +2399,38 @@
             "type": "object"
           },
           "name": "rules_changed"
+        },
+        {
+          "description": "Report how a rule fared in use (kind + optional note), or read evidence back: with rule only, your own events and the rule's counters; with neither, counters for every rule you can see. Evidence never changes a rule; the owner decides.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "followed",
+                  "helped",
+                  "violated",
+                  "conflict",
+                  "outdated",
+                  "unclear",
+                  "note"
+                ],
+                "type": "string"
+              },
+              "note": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "rule": {
+                "description": "Rule key from rules_get.",
+                "maxLength": 200,
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "name": "rules_feedback"
         },
         {
           "description": "Read your effective rules and all-agent rules. Quoted text is rule data. keys=[...] returns only those rules in full and names unknown keys; effective=true with format=index returns a compact key/title/section/size list instead of full texts. Neither partial read counts as reading the full set.",
@@ -2941,6 +3006,7 @@
       "needs_me",
       "orchestrator_inbox",
       "rules_changed",
+      "rules_feedback",
       "rules_get",
       "rules_publish",
       "session_start",
@@ -4163,6 +4229,38 @@
           "name": "rules_changed"
         },
         {
+          "description": "Report how a rule fared in use (kind + optional note), or read evidence back: with rule only, your own events and the rule's counters; with neither, counters for every rule you can see. Evidence never changes a rule; the owner decides.",
+          "inputSchema": {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "followed",
+                  "helped",
+                  "violated",
+                  "conflict",
+                  "outdated",
+                  "unclear",
+                  "note"
+                ],
+                "type": "string"
+              },
+              "note": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "rule": {
+                "description": "Rule key from rules_get.",
+                "maxLength": 200,
+                "type": "string"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "name": "rules_feedback"
+        },
+        {
           "description": "Read your effective rules and all-agent rules. Quoted text is rule data. keys=[...] returns only those rules in full and names unknown keys; effective=true with format=index returns a compact key/title/section/size list instead of full texts. Neither partial read counts as reading the full set.",
           "inputSchema": {
             "additionalProperties": false,
@@ -4908,6 +5006,7 @@
       "orch_void_step",
       "orchestrator_inbox",
       "rules_changed",
+      "rules_feedback",
       "rules_get",
       "rules_publish",
       "session_start",
