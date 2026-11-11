@@ -57,3 +57,40 @@ def test_unstamped_legacy_and_non_conversation_rows_keep_previous_visibility():
     del legacy["chunk_total"]
     rows = [("legacy", legacy), ("project", {"ingest_mode": "project"})]
     assert _visible(rows) == {"legacy", "project"}
+
+
+def test_public_neighbor_context_uses_only_the_matched_complete_generation():
+    """Enrichment must not reintroduce B text after the vector hit was gated."""
+    from types import SimpleNamespace
+
+    from mempalace.searcher import _enrich_closet_hits
+
+    a0 = _meta(filed="A", index=0, total=2, history=True)
+    a1 = _meta(filed="A", index=1, total=2, history=True)
+    b0 = _meta(filed="B", index=0, total=3)
+
+    class FakeCollection:
+        def get(self, **_kwargs):
+            return SimpleNamespace(
+                ids=["a0", "a1", "b0"],
+                documents=["A chunk zero", "A chunk one", "UNPUBLISHED B neighbor"],
+                metadatas=[a0, a1, b0],
+            )
+
+    hits = [
+        {
+            "matched_via": "drawer+closet",
+            "text": "A chunk zero",
+            "_source_file_full": "session.txt",
+            "_chunk_index": 0,
+            "_parent_drawer_id": None,
+            "_convo_generation": (1.0, "A", "exchange", True),
+        }
+    ]
+    result = _enrich_closet_hits(
+        hits,
+        FakeCollection(),
+        visibility_filter=lambda _rows: {"a0", "a1"},
+    )
+    assert result[0]["context"] == "A chunk one"
+    assert "UNPUBLISHED B" not in result[0]["context"]

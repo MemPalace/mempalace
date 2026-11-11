@@ -453,6 +453,16 @@ def search_memories(
             "_source_file_full": source,
             "_chunk_index": meta.get("chunk_index"),
             "_parent_drawer_id": meta.get("parent_drawer_id"),
+            "_convo_generation": (
+                (
+                    meta.get("source_mtime"),
+                    meta.get("filed_at"),
+                    meta.get("extract_mode"),
+                    meta.get("historical_version") is True,
+                )
+                if meta.get("ingest_mode") == "convos" and "chunk_total" in meta
+                else None
+            ),
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
@@ -463,7 +473,7 @@ def search_memories(
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:pre_enrichment_limit]
 
-    hits = _enrich_closet_hits(hits, drawers_col)
+    hits = _enrich_closet_hits(hits, drawers_col, visibility_filter=visibility_filter)
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K
