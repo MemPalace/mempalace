@@ -1241,3 +1241,37 @@ def test_r23_a_crash_after_the_clear_leaves_the_coordinator_without_a_grant(worl
     number, version = _owner_ask(hub, asker=w.asker)
     status, body = rest_decide(w, token, number, version)
     assert status == 403, body
+
+
+def test_completion_review_follows_its_reviewer_for_the_owners_app(world):
+    w = world
+    token, _cid = owner_app(w)
+    member = w.hub.db.create_user("ada@example.com", "Ada")
+    w.hub.db.add_member(w.hub.workspace, member, "member", actor=w.hub.admin)
+    with w.owner.store.transaction() as conn:
+        conn.execute("UPDATE boards SET done_needs_review=1 WHERE slug='work'")
+
+    def completed(reviewer=None):
+        card = w.owner.task_add(
+            "Finish",
+            board="work",
+            body="The release notes are ready for review.",
+            reviewer=reviewer,
+        )
+        w.asker.task_take_next(task=card["number"])
+        return w.asker.task_update(card["number"], status="done")
+
+    # No reviewer chosen: addressed to the owner, so the owner's app answers as before.
+    plain = completed()
+    status, body = rest_decide(
+        w, token, plain["number"], plain["version"], choice="Accept the completed work"
+    )
+    assert status == 200, body
+    # A chosen reviewer is the only one who answers, not the owner's app either.
+    chosen = completed(f"user:{member}")
+    assert chosen["ask_to"] == f"user:{member}"
+    status, body = rest_decide(
+        w, token, chosen["number"], chosen["version"], choice="Accept the completed work"
+    )
+    assert status == 403 and "chosen reviewer" in body["error"]
+    assert w.owner.task_show(chosen["number"])["status"] == "review"

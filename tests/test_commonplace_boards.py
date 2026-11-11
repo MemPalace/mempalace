@@ -21,7 +21,7 @@ from tests._commonplace_helpers import (
 )
 
 CARD_KEYS = set(
-    "task_type priority can_prioritize escalated_to review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number pr_state pr_head pr_reported_at checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id restricted".split()
+    "task_type priority can_prioritize reviewer can_set_reviewer escalated_to review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number pr_state pr_head pr_reported_at checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id restricted".split()
 )
 
 
@@ -1693,9 +1693,10 @@ def test_expired_version_conflict_returns_committed_card(hub, env):
     )
     assert status == 409 and conflict["current"]["status"] == "doing"
     actual = owner.task_show(created["number"])
-    # can_prioritize depends on who reads the card, not on the card.
-    assert {key: actual[key] for key in CARD_KEYS - {"can_prioritize"}} == {
-        k: v for k, v in conflict["current"].items() if k not in ("url", "can_prioritize")
+    # can_prioritize and can_set_reviewer depend on who reads the card, not on the card.
+    reader = {"can_prioritize", "can_set_reviewer"}
+    assert {key: actual[key] for key in CARD_KEYS - reader} == {
+        k: v for k, v in conflict["current"].items() if k not in {"url", *reader}
     }
     assert actual["title"] == "Expired version"
 

@@ -16,7 +16,7 @@ from commonplace.control_db import ControlError
 from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
 
-from . import priority as priorities, task_types
+from . import priority as priorities, reviewer as reviewers, task_types
 from .digest import digest
 from .display import (
     _waiting_on_person as _display_waiting,
@@ -349,13 +349,14 @@ def needs_me(
     origin_pending=None,
     origin_blocks_approval=None,
     ask_owner=None,
+    reviewing=False,
 ) -> dict:
     """Decision queue: asks, done_review, backlog_from_agents, ready_to_merge, stale, count."""
     owner_queue = True
     try:
         _owner(principal, trusted_read=True)
     except ToolError:
-        if not coordinated and not release_boards:
+        if not coordinated and not release_boards and not reviewing:
             raise
         owner_queue = False
     result = {
@@ -391,7 +392,13 @@ def needs_me(
                 and row["ask_to"] == principal.actor
                 and row["review_kind"] == "decision"
             )
-            if not owner_queue and not own_ask:
+            own_review = (
+                reviewing
+                and row["status"] == "review"
+                and row["review_kind"] == "completion"
+                and row["ask_to"] == principal.actor
+            )
+            if not owner_queue and not own_ask and not own_review:
                 continue
             if origin_pending is not None and origin_pending(row):
                 continue
@@ -2509,6 +2516,7 @@ class BoardService:
         task_type=task_types.UNSET,
         type_holder=None,
         priority=priorities.UNSET,
+        reviewer=None,
     ):
         p = self.principal
         label = "" if task_type is task_types.UNSET else task_types.owner_value(p, task_type)
@@ -2646,7 +2654,7 @@ class BoardService:
         number = cur.lastrowid
         conn.execute(
             "UPDATE tasks SET claim_until=?,heartbeat_at=?,agent_parent=?,proposal_status=?,"
-            "proposed_to=?,review_kind=?,task_type=?,priority=? WHERE id=?",
+            "proposed_to=?,review_kind=?,task_type=?,priority=?,reviewer=? WHERE id=?",
             (
                 until,
                 at if until else None,
@@ -2656,6 +2664,7 @@ class BoardService:
                 "decision" if ask is not None else None,
                 label,
                 rank,
+                reviewer,
                 number,
             ),
         )
@@ -2692,11 +2701,13 @@ class BoardService:
         blocked_by=_UNSET,
         task_type=task_types.UNSET,
         priority=priorities.UNSET,
+        reviewer=reviewers.UNSET,
     ):
         if task_type is not task_types.UNSET:
             task_types.owner_value(self.principal, task_type)
         if priority is not priorities.UNSET:
             priorities.owner_value(self.principal, priority)
+        chosen = self._reviewer_choice(reviewer)
         type_holder = (
             self._type_holder(
                 self._actor(assignee) if assignee is not None else self.principal.actor
@@ -2724,6 +2735,7 @@ class BoardService:
                 task_type=task_type,
                 type_holder=type_holder,
                 priority=priority,
+                reviewer=chosen,
             )
             if blocked_by is not _UNSET:
                 from commonplace.boards.store import CardRefused, set_blockers
@@ -3301,6 +3313,11 @@ class BoardService:
             ]
         return json.dumps(previous, ensure_ascii=False) if previous else None
 
+    def _completion_reviewer(self, chosen):
+        """Who a completion review is addressed to: the chosen reviewer, else the owner."""
+        members = self.ctx.db.members(self.principal.workspace_id)
+        return chosen if chosen in {f"user:{m['id']}" for m in members} else self._owner_actor()
+
     def _open_review(self, row, board, args, updates, done_review):
         question, offered = review_request(
             args.get(
@@ -3319,7 +3336,7 @@ class BoardService:
             ),
         )
         recipient = (
-            self._owner_actor()
+            self._completion_reviewer(updates.get("reviewer", row["reviewer"]))
             if done_review
             else self._ask_recipient(board, args.get("person_reason"))
         )
@@ -3414,6 +3431,76 @@ class BoardService:
             return {**ask, "text": "Priority set to " + priorities.name(updates["priority"])}
         return ask
 
+    def _done_needs_review(self, board, row, updates):
+        """Whether this move to Done opens a completion review instead of finishing the card.
+
+        A board may gate agents' completions; a chosen reviewer also gates anyone else's, so
+        only the reviewer can move that card to Done directly.
+        """
+        if updates["status"] != "done":
+            return False
+        if board["done_needs_review"] and not self.principal.person:
+            return True
+        return reviewers.gates_done(
+            {**dict(row), **updates},
+            self.ctx.db.members(self.principal.workspace_id),
+            self.principal.actor,
+        )
+
+    def _reviewer_note(self, ask, row, updates):
+        if "reviewer" not in updates or ask["text"] is not None:
+            return ask
+        chosen = updates["reviewer"]
+        text = (
+            "Reviewer cleared" if chosen is None else "Reviewer set to " + people(self.ctx, chosen)
+        )
+        return {**ask, "text": text}
+
+    def _announce_reviewer(self, conn, row, updates):
+        """An open completion review re-addressed to a new reviewer is news to that person."""
+        if updates.get("status") != "review" and "reviewer" in updates and "ask_to" in updates:
+            self._emit(
+                conn,
+                row["id"],
+                "card.review_needed",
+                ask_to=updates["ask_to"],
+                return_to=row["return_to"],
+            )
+
+    def _reviewing(self):
+        """Whether a chosen reviewer (not the owner queue) has completion reviews waiting."""
+        p = self.principal
+        if not p.person or p.role == "owner":
+            return False
+        with self.store.connection() as conn:
+            return (
+                conn.execute(
+                    "SELECT 1 FROM tasks WHERE status='review' AND review_kind='completion' "
+                    "AND ask_to=? LIMIT 1",
+                    (p.actor,),
+                ).fetchone()
+                is not None
+            )
+
+    def _reviewer_choice(self, value):
+        """The owner's requested reviewer ref (None clears), or None when not given."""
+        if value is reviewers.UNSET:
+            return None
+        return reviewers.owner_value(
+            self.principal, value, self.ctx.db.members(self.principal.workspace_id)
+        )
+
+    def _reviewer_change(self, conn, row, args, updates):
+        """Apply a reviewer choice; an open completion review follows the new reviewer."""
+        if "reviewer" not in args:
+            return
+        chosen = self._reviewer_choice(args["reviewer"])
+        if chosen == row["reviewer"]:
+            return
+        updates["reviewer"] = chosen
+        if row["status"] == "review" and row["review_kind"] == "completion":
+            updates["ask_to"] = chosen or self._owner_actor()
+
     def task_update(self, task, *, version=None, **args):
         type_updates = {
             key: task_types.owner_value(self.principal, value)
@@ -3425,6 +3512,7 @@ class BoardService:
         permitted = {
             "task_type",
             "priority",
+            "reviewer",
             "title",
             "body",
             "labels",
@@ -3516,6 +3604,7 @@ class BoardService:
             if "lesson" in args and args.get("status", row["status"]) != "done":
                 raise ToolError("no: a lesson requires status done")
             updates = {**type_updates, **self._priority_change(row, priority_update)}
+            self._reviewer_change(conn, row, args, updates)
             self._update_waiting(conn, row, args)
             if "labels" in args:
                 labels = args["labels"]
@@ -3587,9 +3676,7 @@ class BoardService:
                         and not self.principal.person
                         else None
                     )
-                if status == "review" or (
-                    status == "done" and board["done_needs_review"] and not self.principal.person
-                ):
+                if status == "review" or self._done_needs_review(board, row, updates):
                     done_review = status == "done"
                     self._open_review(row, board, args, updates, done_review)
             self._position(conn, row, updates, args.get("before"), args.get("after"))
@@ -3647,6 +3734,7 @@ class BoardService:
                 else {"text": review_edit_text}
             )
             ask = self._priority_note(ask, updates)
+            ask = self._reviewer_note(ask, row, updates)
             self._record_review_withdrawal(conn, row, status, reason)
             self._log(
                 conn,
@@ -3664,6 +3752,7 @@ class BoardService:
             )
             if updates.get("status") == "review":
                 self._emit(conn, row["id"], "card.review_needed", return_to=self.principal.actor)
+            self._announce_reviewer(conn, row, updates)
             return self._card(conn, task_row(conn, row["id"]), self.principal)
 
     def _handoff(
@@ -3839,6 +3928,25 @@ class BoardService:
                     log_failure(logger, "delegated decide rollback audit failed", exc)
             raise
 
+    def _check_decider(self, row, principal, delegated):
+        """Who may answer a review that is not addressed to the board coordinator.
+
+        A completion review follows its reviewer (the owner when none is chosen); the
+        owner's own app answers only an ask addressed to its person, as for any ask.
+        """
+        if row["review_kind"] == "completion" and row["status"] == "review":
+            members = self.ctx.db.members(principal.workspace_id)
+            if not delegated and not reviewers.may_decide(row, members, principal):
+                raise ToolError(
+                    "no: only the chosen reviewer can answer this completion review"
+                    if reviewers.effective(row, members)
+                    else "no: only a signed-in workspace owner can answer this"
+                )
+            return
+        _owner(principal)
+        if not principal.person and not delegated:
+            raise ToolError("no: only a signed-in workspace owner can answer this")
+
     def _decide(self, task, choice, reply, then, version, audited):
         with self.transaction() as conn:
             row, board = self._get(conn, task)
@@ -3858,9 +3966,7 @@ class BoardService:
                 and not self._agent_connection(conn, p)
             )
             if not addressed:
-                _owner(p)
-                if not p.person and not delegated:
-                    raise ToolError("no: only a signed-in workspace owner can answer this")
+                self._check_decider(row, p, delegated)
             if delegated:
                 # The app holds memory:write and may see the board, and its owner,
                 # as a person, may write the board's wing: what the owner could
@@ -4029,6 +4135,7 @@ class BoardService:
                     and not self._can_release_origin(self.principal, row)
                 ),
                 ask_owner=self._ask_owner,
+                reviewing=self._reviewing(),
             )
             approvals = self.approvals_for_me()
             origin_numbers = {

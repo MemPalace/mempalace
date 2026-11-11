@@ -25,6 +25,7 @@ export function cardTags(card, { me, board = {}, messages = [] } = {}) {
   else if (card.status === 'todo' && !card.assignee && !card.waiting) tags.push('Available for an agent');
   if (card.status === 'review' && String(card.return_to).startsWith('conn:')) tags.push(`Built by ${author(card.return_to, board)}`);
   if (card.status === 'review' && card.review_kind === 'completion' && card.ask_to) tags.push(`Reviewer: ${author(card.ask_to, board)}`);
+  else if (card.reviewer && card.status !== 'done') tags.push(`Reviewer: ${author(card.reviewer, board)}`);
   return tags;
 }
 // The time is the source message's time; without that message the tag carries no time at all.

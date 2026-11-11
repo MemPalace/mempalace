@@ -40,6 +40,7 @@ TASK_COLUMNS = {
     "escalated_to": "TEXT",
     "review_kind": "TEXT",
     "review_context": "TEXT",
+    "reviewer": "TEXT",
     "priority": f"INTEGER NOT NULL DEFAULT {DEFAULT_RANK} CHECK (priority BETWEEN 0 AND {len(PRIORITIES) - 1})",
 }
 
@@ -246,6 +247,7 @@ def card(conn, row, principal=None, *, release=None, approver=None) -> dict:
     }
     person_owner = bool(principal and principal.person and principal.role == "owner")
     result["can_prioritize"] = person_owner
+    result["can_set_reviewer"] = person_owner
     person_release = (
         release(row)
         if release is not None

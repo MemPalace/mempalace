@@ -29,6 +29,11 @@ PRIORITY = {
     "enum": list(PRIORITIES),
     "description": "Owner person only. Omit on a new card for the default (normal).",
 }
+REVIEWER = {
+    "type": ["string", "null"],
+    "description": "Owner person only: a workspace member (user:<id>) who reviews this card's completion; "
+    "null or empty clears. Omit to keep today's behaviour (the workspace owner reviews).",
+}
 
 
 def quoted(value):
@@ -396,6 +401,7 @@ def register_tools():
                 "description": "Owner person only; empty string clears. Omit to preserve the type.",
             },
             "priority": PRIORITY,
+            "reviewer": REVIEWER,
             "labels": ARRAY,
             "blocked_by": {
                 "type": "array",
@@ -443,6 +449,7 @@ def register_tools():
                 "description": "Owner person only; empty string clears. Omit to preserve the type.",
             },
             "priority": PRIORITY,
+            "reviewer": REVIEWER,
             "labels": ARRAY,
             "blocked_by": {
                 "type": "array",
