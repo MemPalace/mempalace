@@ -599,6 +599,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:**
 
+  - `tests/test_rules_index.py` pins the compact rules index (completeness, size bound), keyed `rules_get` with unknown keys, partial reads not counting as served, and unchanged defaults; `tests/spaces_surfaces.json` carries the new `rules_get` and `session_start` arguments.
+
   - Model-role regressions: the one-per-role Needs me item and its clearing and owner-only scope, the start refusal naming the role, the API and UI refusal of an unknown model id, and the Needs me row and settings focus.
 
   - `tests/test_commonplace_capacity.py` covers the unlimited default, under/at the cap, concurrent sign-ups on one and on separate connections, waitlist admit, invited and disabled accounts, and the email, provider, REST and CLI paths.
@@ -1141,6 +1143,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Enabled coordinator startup context includes unsplit inbox counts, without migrating boards.
 
+  - `session_start` takes `rules=index`: a compact list (key, section, scope, size hint, title) of the effective rules instead of full texts. The default `rules=full` is unchanged.
+
   - Accounts exist only after verification; sessions are cookie-bound and revocable; mail is configured only through the environment.
 
   - Successful email verification expires an older host-only session before setting a configured shared-domain session, so the older cookie cannot shadow the new one.
@@ -1547,6 +1551,8 @@ Format (read by `commonplace orch docs-check`):
   - Rules take effect only after owner review; writes from a client with stale rules get 428; flags are deterministic.
   - The bypass guard denies hook-skipping shell commands and edits of existing hook files with a reason, passes look-alike text, and never auto-approves.
 
+  - `rules_get` takes `keys=[...]` for selected rules in full (unknown keys named) and, with `effective=true`, `format=index` for the compact index. Both are partial reads: they never record the full set as served and give no `rules_seq`. Defaults are unchanged.
+
   - The quick check names itself a quick check, reports every skipped or cut-off step, and fails the push only when a check it ran failed. The installed hooks work in a fresh linked worktree or say how to set it up.
 
 - **How it fails:**
@@ -1560,6 +1566,8 @@ Format (read by `commonplace orch docs-check`):
 - **Tests:**
 
   - Route-aware checked REST harness and Space freshness contract tests.
+
+  - `tests/test_rules_index.py` pins index completeness and size, keyed get with unknown keys, partial reads not serving, and unchanged defaults; `tests/spaces_surfaces.json` carries the new `rules_get` and `session_start` arguments.
 
   - `tests/test_commonplace_rules.py`, `tests/test_commonplace_rules_enforce.py`, `tests/test_commonplace_privacy.py`, the `tests/test_guards_` files.
 

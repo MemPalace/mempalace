@@ -76,6 +76,18 @@ def display_summary(summary, text):
     return first if len(first) <= 240 else first[:239].rstrip() + "…"
 
 
+def rule_keys(keys):
+    """Validate a keys= argument: a bounded list of non-empty strings, de-duplicated."""
+    if (
+        not isinstance(keys, list)
+        or not keys
+        or len(keys) > render.MAX_KEYS
+        or not all(isinstance(k, str) and 0 < len(k) <= render.KEY_CHARS for k in keys)
+    ):
+        raise ToolError(f"no: keys must be 1-{render.MAX_KEYS} non-empty rule keys")
+    return list(dict.fromkeys(keys))
+
+
 def rule_text(value):
     value = validate_text(value, "text", required=True, limit=4000)
     if render.length(render.quote(value)) > render.RULE_BYTES:
@@ -448,10 +460,21 @@ class RuleService:
             return {"rules": result, "seq": sequence(conn)}
 
     def rules_get(
-        self, board=_UNSET, repo=_UNSET, format="text", include_retired=_UNSET, effective=False
+        self,
+        board=_UNSET,
+        repo=_UNSET,
+        format="text",
+        include_retired=_UNSET,
+        effective=False,
+        keys=_UNSET,
     ):
         if type(effective) is not bool:
             raise ToolError("no: effective must be a boolean")
+        keys = None if keys is _UNSET else rule_keys(keys)
+        if format == "index" and not effective:
+            raise ToolError("no: format=index needs effective=true")
+        if format == "index" and keys is not None:
+            raise ToolError("no: format=index lists every rule; use keys with text or md")
         if effective:
             if self.principal.person:
                 raise ToolError("no: effective=true is for agent connections")
@@ -459,7 +482,7 @@ class RuleService:
                 raise ToolError(
                     "no: effective=true always returns your full set and takes only format"
                 )
-            if format not in ("text", "md"):
+            if format not in ("text", "md", "index"):
                 raise ToolError("no: invalid format or include_retired")
             try:
                 if not (Path(self.ctx.workspace_dir()) / "rules.sqlite3").exists():
@@ -468,6 +491,13 @@ class RuleService:
                 mode = checks.mode(self.ctx.gateway, self.principal)
                 if mode == "unknown":
                     raise RuntimeError("check settings unavailable")
+                if format == "index" or keys is not None:
+                    # A partial read never counts as having read the full set.
+                    if format == "index":
+                        reply = render.index(result["rules"], result["seq"], mode=mode)
+                    else:
+                        reply = render.keyed(result["rules"], keys, result["seq"])
+                    return dict(result, reply=reply, state="partial")
                 reply, state = render.effective(
                     result["rules"], result["seq"], result["rules_seq"], format=format, mode=mode
                 )
@@ -495,20 +525,22 @@ class RuleService:
             repo = fields("repo", "instruction", "repo", repo)["scope_ref"]
         with self.store.read() as conn:
             rows = conn.execute("SELECT * FROM rules ORDER BY id").fetchall()
-            return {
-                "rules": [
-                    self._agent_view(rule_json(row))
-                    for row in rows
-                    if self._visible(row)
-                    and (
-                        row["scope"] == "global"
-                        or (row["scope"] == "board" and row["scope_ref"] == board)
-                        or (row["scope"] == "repo" and row["scope_ref"] == repo)
-                    )
-                    and (row["status"] != "retired" or (include_retired and format != "md"))
-                ],
-                "seq": sequence(conn),
-            }
+            selected = [
+                self._agent_view(rule_json(row))
+                for row in rows
+                if self._visible(row)
+                and (
+                    row["scope"] == "global"
+                    or (row["scope"] == "board" and row["scope_ref"] == board)
+                    or (row["scope"] == "repo" and row["scope_ref"] == repo)
+                )
+                and (row["status"] != "retired" or (include_retired and format != "md"))
+            ]
+            result = {"rules": selected, "seq": sequence(conn)}
+            if keys is not None:
+                result["rules"] = [r for r in selected if r["key"] in keys]
+                result["unknown"] = render.unknown_keys(selected, keys)
+            return result
 
     def rules_changed(self, since):
         if type(since) is not int or since < 0:

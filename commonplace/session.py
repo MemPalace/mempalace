@@ -40,9 +40,12 @@ def _read(ctx, name, args):
 
 
 def _arguments(args):
-    if not isinstance(args, dict) or args.keys() - {"query", "board", "repo", "limit"}:
+    if not isinstance(args, dict) or args.keys() - {"query", "board", "repo", "limit", "rules"}:
         raise ToolError("no: invalid arguments")
     values = {"limit": _limit(args.get("limit"), 3, 5)}
+    if args.get("rules", "full") not in ("full", "index"):
+        raise ToolError("no: rules must be full or index")
+    values["rules"] = args.get("rules", "full")
     for name in ("query", "board", "repo"):
         if args.get(name) is not None:
             values[name] = validate_text(args[name], name, required=True, limit=1000)
@@ -93,7 +96,8 @@ def session_start(ctx, args) -> str:
         raise ToolError("no: session_start unavailable for this connection")
     lines = []
     try:
-        lines.append(_read(ctx, "rules_get", {"effective": True, "format": "md"}))
+        rules_format = "index" if args["rules"] == "index" else "md"
+        lines.append(_read(ctx, "rules_get", {"effective": True, "format": rules_format}))
     except ToolError:
         lines.append("Effective rules unavailable for this connection.")
     try:
@@ -233,7 +237,8 @@ def initialize_context(ctx, *, budget, query=None) -> str:
 register(
     LocalTool(
         name="session_start",
-        description="Read effective Commonplace rules and relevant quoted memories at session start, resume or compaction.",
+        description="Read effective Commonplace rules and relevant quoted memories at session start, resume or compaction. "
+        "rules=index returns a compact rule index instead of full texts; fetch rules with rules_get keys.",
         handler=session_start,
         input_schema={
             "type": "object",
@@ -242,6 +247,7 @@ register(
                 "board": {"type": "string", "minLength": 1, "maxLength": 1000},
                 "repo": {"type": "string", "minLength": 1, "maxLength": 1000},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 5, "default": 3},
+                "rules": {"type": "string", "enum": ["full", "index"], "default": "full"},
             },
             "additionalProperties": False,
         },
