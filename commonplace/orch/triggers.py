@@ -338,7 +338,32 @@ def run(js, *, now=None) -> dict:
             _record_failure(js, st, board, exc, now or jobs._now())
         else:
             _record_success(st, board)
+            _no_progress(js, st, directory, board, now or jobs._now())
     return report
+
+
+def _no_progress(js, st, directory, board: str, now: str) -> None:
+    """The board's no-progress wake (``stall.evaluate``), after a clean sweep."""
+    from commonplace.projects import limits
+
+    from . import stall
+
+    try:
+        with BoardStore(directory).connection() as boards:
+            row = boards.execute(
+                "SELECT * FROM boards WHERE slug=? AND archived=0", (board,)
+            ).fetchone()
+            if row is None:
+                return
+            row = dict(row)
+            limit = limits.get(boards, row["id"])["max_agents"]
+        with st.connection() as conn:
+            config_cap = orch_store.resolve_in(conn, board).config().max_agents
+    except Exception as exc:
+        log_failure(logger, "orchestrator no-progress check could not read the board", exc)
+        return
+    caps = [c for c in (config_cap, limit) if c is not None]
+    stall.evaluate(js.gateway, js.workspace_id, st, row, min(caps) if caps else None, now)
 
 
 # --------------------------------------------------------------- sweep health

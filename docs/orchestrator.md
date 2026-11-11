@@ -205,6 +205,13 @@ commit is still found.
   (`not_configured`, `unknown_role`, or `config_invalid`), so one card never
   blocks the board's later cards. Only infrastructure errors leave the cursor
   for the next sweep.
+- **No-progress wake.** After a clean sweep, a board with actionable open
+  work (not blocked, not waiting on a person), a free slot, an unstarted card
+  or an expired claim, and no card done for `minutes` (default 20; 0 turns it
+  off) emits one `board.stalled` event (app and webhooks) naming the doing,
+  unstarted and expired cards. The next nudge waits another `minutes`; a done
+  card resets the count; after three nudges in a row the owner's `needs_me`
+  lists the board under `orchestrator_stalled`.
 - **Failing sweeps.** Two failed sweeps of a board in a row emit one
   `orch.trigger.failing` event (app and webhooks), and the owner's `needs_me`
   lists the board under `orchestrator_failing` until a sweep succeeds. Only

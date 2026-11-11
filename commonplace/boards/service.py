@@ -3846,7 +3846,19 @@ class BoardService:
         if self.principal.role == "owner":
             groups["coordinator_waiting"] = self._coordinator_waiting()
             groups["orchestrator_failing"] = self._orchestrator_failing()
+            groups["orchestrator_stalled"] = self._orchestrator_stalled()
         return groups
+
+    def _orchestrator_stalled(self):
+        if not self.principal.person:
+            return []
+        from commonplace.orch import stall
+
+        return [
+            item
+            for item in stall.stalled(self.ctx.gateway, self.principal.workspace_id)
+            if self._visible_board_slug(item["board"])
+        ]
 
     def _orchestrator_failing(self):
         if not self.principal.person:
