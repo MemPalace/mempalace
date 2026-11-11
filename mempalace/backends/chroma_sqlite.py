@@ -1067,6 +1067,18 @@ def _install_sqlite_convo_visibility(conn, collection_name: str) -> None:
     """
     from ..convo_visibility import visible_conversation_rows
 
+    # Legacy/hand-built Chroma schemas need not have a metadata-segment
+    # recovery watermark (or even a segments.scope column). If the palace
+    # has no conversation generations, leave its existing lexical behavior
+    # untouched instead of rejecting unrelated search queries. A stamped
+    # conversation requires the recovered snapshot below and fails closed.
+    if not conn.execute(
+        "SELECT 1 FROM embedding_metadata"
+        " WHERE key = 'ingest_mode' AND string_value = 'convos' LIMIT 1"
+    ).fetchone():
+        conn.create_function("_mempalace_convo_public", 1, lambda _row_id: True)
+        return
+
     if _sqlite_ready_metadata_segment(conn, collection_name) is None:
         raise MetadataRecoveryPending("conversation visibility needs recovered metadata")
 
