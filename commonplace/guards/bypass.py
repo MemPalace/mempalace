@@ -678,6 +678,18 @@ def _is_hook_path(path: str, subs: tuple[tuple[str, str], ...]) -> bool:
     return _HOOK_DIR.search(normalized) is not None
 
 
+def is_hook_path(path: str, *, include_config: bool = True) -> bool:
+    """True when a file path is a git hook or hook-runner file (never ``*.sample``).
+
+    Meant for file-edit tools; ``include_config=False`` limits it to the hook directories
+    (``.git/hooks``, ``.husky``) so that ordinary edits of a hook-runner config stay possible.
+    """
+    if include_config:
+        return _is_hook_path(path, ())
+    normalized = re.sub(r"^(\./)+", "", path.replace("\\", "/")).rstrip("/")
+    return not normalized.endswith(".sample") and _HOOK_DIR.search(normalized) is not None
+
+
 def _subst_text(inner: str) -> str:
     """Stand-in text for a $(git rev-parse ...) substitution that names the hooks dir."""
     if "rev-parse" in inner:
