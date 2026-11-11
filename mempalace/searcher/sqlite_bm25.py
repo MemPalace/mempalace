@@ -334,6 +334,7 @@ def _merge_bm25_union_candidates(
     before_dt=None,
     stats: dict = None,
     known_distances: dict = None,
+    visibility_filter=None,
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -374,8 +375,18 @@ def _merge_bm25_union_candidates(
         stats["candidate_strategy_fallback"] = "lexical_search_failed"
         return
 
+    lexical_hits = list(lexical.hits)
+    if visibility_filter is not None:
+        visible_ids = visibility_filter((hit.id, hit.metadata or {}) for hit in lexical_hits)
+        hidden_count = sum(hit.id not in visible_ids for hit in lexical_hits)
+        if hidden_count:
+            stats["filtered_by_uncommitted_generation"] = (
+                stats.get("filtered_by_uncommitted_generation", 0) + hidden_count
+            )
+        lexical_hits = [hit for hit in lexical_hits if hit.id in visible_ids]
+
     metric = _metric_for_collection(drawers_col)
-    unmeasured = [hit for hit in lexical.hits if hit.id not in known_distances]
+    unmeasured = [hit for hit in lexical_hits if hit.id not in known_distances]
     lexical_distances = (
         _lexical_hit_vector_distances(drawers_col, query, unmeasured, metric)
         if _has_distance_cutoff(max_distance) and unmeasured
@@ -383,7 +394,7 @@ def _merge_bm25_union_candidates(
     )
 
     bm25_extra = []
-    for hit in lexical.hits:
+    for hit in lexical_hits:
         meta = hit.metadata or {}
         if is_bookkeeping(meta, hit.id):
             continue

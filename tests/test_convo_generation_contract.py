@@ -390,3 +390,22 @@ def test_uncommitted_current_rows_must_not_displace_previous_snapshot(tmp_path, 
         "public listing leaked uncommitted B chunks before its completion"
     )
     assert all("A question" in text for text in public)
+
+    # HNSW may still rank a torn B row first. The PUBLIC vector API must
+    # filter it before the requested one-result limit, not merely in list/get.
+    from mempalace.searcher import search_memories
+
+    b_search = search_memories(
+        "B question", palace_path, source_file=str(session), n_results=1
+    )
+    assert "error" not in b_search, b_search
+    assert all("B question" not in hit["text"] for hit in b_search["results"]), (
+        "PUBLIC vector search leaked an unfinished B generation"
+    )
+    a_search = search_memories(
+        "A question", palace_path, source_file=str(session), n_results=3
+    )
+    assert "error" not in a_search, a_search
+    assert any("A question" in hit["text"] for hit in a_search["results"]), (
+        "PUBLIC vector search lost the complete A history"
+    )

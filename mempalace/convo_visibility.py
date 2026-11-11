@@ -54,3 +54,67 @@ def visible_conversation_rows(ids, metadatas):
         if not complete:
             hidden.update(index for index, _ in group)
     return [row for index, row in enumerate(rows) if index not in hidden]
+
+def visible_conversation_candidate_ids(palace_path, collection_name, candidates):
+    """Exclude unfinished stamped vector candidates using a source-wide snapshot.
+
+    The entire source/mode is inspected, not just the top-K vector winners:
+    otherwise a partly overwritten B generation could masquerade as complete.
+    Unavailable/lagging metadata fails closed only for stamped conversation
+    candidates. This does not constitute an atomic vector/SQLite read.
+    """
+    from .backends.chroma_sqlite import sqlite_list_id_metadata, sqlite_metadata_snapshot
+    from .config import get_configured_collection_name
+
+    pairs = [(row_id, meta or {}) for row_id, meta in candidates]
+    stamped = [
+        (row_id, meta)
+        for row_id, meta in pairs
+        if meta.get("ingest_mode") == "convos"
+        and meta.get("extract_mode") in ("exchange", "general")
+        and "chunk_total" in meta
+    ]
+    accepted = {row_id for row_id, _ in pairs} - {row_id for row_id, _ in stamped}
+    if not stamped:
+        return accepted
+
+    sources = sorted(
+        {
+            meta.get("source_file")
+            for _, meta in stamped
+            if isinstance(meta.get("source_file"), str) and meta.get("source_file")
+        }
+    )
+    if not sources:
+        return accepted
+    name = collection_name or get_configured_collection_name()
+    with sqlite_metadata_snapshot(palace_path, name) as connection:
+        if connection is None:
+            return accepted
+        snapshot = sqlite_list_id_metadata(
+            palace_path, name, where={"source_file": {"$in": sources}}, _connection=connection
+        )
+        if snapshot is None:
+            return accepted
+        ids, metadatas = snapshot
+        visible_ids = {row_id for row_id, _ in visible_conversation_rows(ids, metadatas)}
+        current = dict(zip(ids, metadatas))
+        generation_fields = (
+            "ingest_mode",
+            "source_file",
+            "extract_mode",
+            "source_mtime",
+            "filed_at",
+            "historical_version",
+            "chunk_total",
+            "chunk_index",
+        )
+        for row_id, meta in stamped:
+            persisted = current.get(row_id)
+            if (
+                row_id in visible_ids
+                and persisted is not None
+                and all(persisted.get(key) == meta.get(key) for key in generation_fields)
+            ):
+                accepted.add(row_id)
+    return accepted

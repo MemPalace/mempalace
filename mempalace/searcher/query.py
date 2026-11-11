@@ -351,6 +351,17 @@ def search_memories(
             return _search_error_result(refused.pop("error"), **refused)
         return _search_error_result(f"Search error: {e}")
 
+    # Vector-index candidates must be checked against source-wide metadata
+    # before the public result limit. Non-Chroma backends retain their path.
+    visibility_filter = None
+    if resolve_backend_name(palace_path) == "chroma":
+        from ..convo_visibility import visible_conversation_candidate_ids
+
+        def visibility_filter(candidates):
+            return visible_conversation_candidate_ids(
+                palace_path, collection_name, candidates
+            )
+
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
     try:
@@ -376,12 +387,22 @@ def search_memories(
     bookkeeping_dropped = 0
     drawer_docs = _first_or_empty(drawer_results, "documents")
     stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
+    drawer_metas = _first_or_empty(drawer_results, "metadatas")
+    visible_ids = (
+        visibility_filter(zip(stored_drawer_ids, drawer_metas))
+        if visibility_filter is not None
+        else set(stored_drawer_ids)
+    )
+    visibility_dropped = 0
     for stored_drawer_id, doc, meta, dist in zip(
         stored_drawer_ids,
         drawer_docs,
-        _first_or_empty(drawer_results, "metadatas"),
+        drawer_metas,
         _first_or_empty(drawer_results, "distances"),
     ):
+        if stored_drawer_id not in visible_ids:
+            visibility_dropped += 1
+            continue
         meta = meta or {}
         doc = doc or ""
         if stored_drawer_id:
@@ -439,6 +460,8 @@ def search_memories(
             entry["closet_preview"] = closet_preview
         scored.append(entry)
 
+    if visibility_dropped:
+        stats["filtered_by_uncommitted_generation"] = visibility_dropped
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:pre_enrichment_limit]
 
@@ -466,6 +489,7 @@ def search_memories(
         before_dt=before_dt,
         stats=stats,
         known_distances=measured,
+        visibility_filter=visibility_filter,
     )
     if strategy_error:
         return strategy_error
@@ -486,7 +510,11 @@ def search_memories(
         distance_metric=metric,
     )
     if _pool_left_results_short(
-        hits, n_results, candidates_fetched, pool_size, bookkeeping_dropped
+        hits,
+        n_results,
+        candidates_fetched,
+        pool_size,
+        bookkeeping_dropped + visibility_dropped,
     ):
         if _pool_scale < _MAX_POOL_SCALE and pool_size < _MAX_FOLD_POOL:
             return search_memories(
@@ -506,6 +534,8 @@ def search_memories(
                 _pool_scale=_pool_scale * 4,
             )
         envelope["distinct_results_truncated"] = True
+        if visibility_dropped:
+            envelope["visibility_candidate_pool_truncated"] = True
     return envelope
 
 

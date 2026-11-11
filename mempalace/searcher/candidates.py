@@ -267,6 +267,7 @@ def _apply_candidate_strategy(
     before_dt=None,
     stats: dict = None,
     known_distances: dict = None,
+    visibility_filter=None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -290,6 +291,7 @@ def _apply_candidate_strategy(
             before_dt=before_dt,
             stats=stats,
             known_distances=known_distances,
+            visibility_filter=visibility_filter,
         )
 
 
@@ -309,6 +311,7 @@ def _finalize_candidate_hits(
     before_dt=None,
     stats: dict = None,
     known_distances: dict = None,
+    visibility_filter=None,
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -325,6 +328,7 @@ def _finalize_candidate_hits(
             before_dt=before_dt,
             stats=stats,
             known_distances=known_distances,
+            visibility_filter=visibility_filter,
         )
     except UnsupportedCapabilityError:
         return [], _search_error_result(
