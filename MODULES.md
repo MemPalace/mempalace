@@ -249,6 +249,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The OAuth contract records the displayed callback origin, numeric-host tightening and required pre-deploy registration inventory.
 
+  - The rules write-check documentation lists the goals writes as checked (`docs/design/RULES.md`).
+
   - The operational Admin API and opt-in backup receipts, with operator provisioning and unknown-history limits.
 
   - The card API reference documents the after-Done routes (archive, restore, carry on, Pocket), their person-only authorization and what archiving hides.
@@ -1598,6 +1600,8 @@ Format (read by `commonplace orch docs-check`):
 - **Owns:**
 
   - Canonical Space create in the checked REST write inventory.
+
+  - The goals writes `goal_set` and `card_goal` in the checked MCP write inventory, because goals become agent card context.
 
   - The project panel write `PUT /api/projects/<slug>/panel` (`project_panel_set`) in the checked REST write inventory.
 

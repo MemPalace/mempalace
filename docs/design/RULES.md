@@ -320,8 +320,11 @@ exempt on every route; the owner's agent tokens remain checked.
 
 Checked MCP tools are `task_add`, `task_update`, `task_comment`, `task_take_next`,
 `task_handoff`, `task_approve`, `ask`, `space_post`, `board_add`, `board_set`,
-`decide`, `memory_save`, `memory_link`, `fact_save`, `handoff_start` and
-`rules_publish`. Their schemas gain a `rules_seq` integer or decimal string in
+`decide`, `goal_set`, `card_goal`, `memory_save`, `memory_link`, `fact_save`,
+`handoff_start` and `rules_publish`. The goals writes are checked because the
+goals tree and a card's goal become instructions in every agent's card context.
+Their REST routes (`/api/goals`, `/api/goals/card`) accept signed-in owners
+only, who are exempt like every person. Their schemas gain a `rules_seq` integer or decimal string in
 warn/enforce; it is required in enforce except for `ask`. Schemas are copied
 per caller. Every MCP call strips the argument before dispatch. Existing
 visibility and owner-only gates run first.

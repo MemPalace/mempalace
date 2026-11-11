@@ -18,7 +18,7 @@ CHECKED_WRITES = frozenset(
     "orch_config_propose orch_config_accept orch_config_write orch_config_reject "
     "orch_exp_retire orch_restore_ack orch_resume orch_force_release orch_card_start "
     "orch_journal_intent orch_journal_record orch_gate_open orch_gate_record "
-    "orch_void_step".split()
+    "orch_void_step goal_set card_goal".split()
 )
 
 # Explicit names make a newly exposed write fail the public-surface contract.
