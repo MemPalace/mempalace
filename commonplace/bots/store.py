@@ -139,13 +139,18 @@ def stamp(now=None) -> str:
 
 
 def _text(value, name, low, high):
-    if not isinstance(value, str) or not low <= len(value.strip() if low else value) <= high:
+    """``value`` unchanged when its raw length is within ``high`` (and not blank when ``low``)."""
+    if not isinstance(value, str) or len(value) > high or (low and not value.strip()):
         raise Invalid(f"{name} must be {low}-{high} characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise Invalid(f"{name} must be valid text") from None
     return value
 
 
 def _name(value):
-    return _text(value, "name", 1, NAME_MAX).strip()
+    return _text(value.strip() if isinstance(value, str) else value, "name", 1, NAME_MAX)
 
 
 _BOT_KEYS = ("id", "name", "job", "instructions", "kind", "board", "read_upto", "created_at")
@@ -584,7 +589,7 @@ class BotStore:
         at = stamp(now)
         with self._tx() as conn:
             self._own(conn, bot_id, user_id)
-            if state == "done":
+            if state != "expired":
                 conn.execute(
                     "UPDATE bot_pending SET state='expired' WHERE id=? AND bot_id=? "
                     "AND state='open' AND expires_at<=?",
@@ -695,6 +700,7 @@ class BotStore:
             self._own(conn, bot_id, user_id)
             return (
                 type(memory_id) is int
+                and 0 < memory_id < 2**63
                 and conn.execute(
                     "UPDATE bot_memory SET removed_at=? WHERE id=? AND bot_id=? "
                     "AND removed_at IS NULL",

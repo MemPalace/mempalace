@@ -326,6 +326,19 @@ def test_messages_are_redacted_on_display_but_stored_verbatim(bots_hub):
     assert hub.store().messages(bot_id, hub.hub.admin)[-1]["text"] == f"token {secret}"
 
 
+def raw_request(hub, method, path, raw):
+    """Send ``raw`` as the JSON body, which ``hub.request`` cannot for non-object or odd text."""
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", hub.hub.port, timeout=30)
+    try:
+        conn.request(method, path, raw.encode(), {"Content-Type": "application/json", **hub.owner})
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+
 def routes_for(bot_id):
     return [
         ("GET", f"/api/bots/{bot_id}/messages", None),
@@ -407,3 +420,68 @@ def test_model_resolution_codes(monkeypatch, front, key, code):
     settings, resolved, got = modelcfg.resolve(None, "ws", "board")
     assert got == code
     assert (settings is config) == (code == "") and resolved == (key if code == "" else None)
+
+
+def test_memory_ids_beyond_the_integer_range_are_404_not_a_crash(bots_hub):
+    hub = bots_hub
+    bot_id = hub.bots(hub.owner)["bots"][0]["id"]
+    for memory_id in (2**63, 10**30, 2**64 + 5, "9" * 5000):
+        status, body, _ = hub.request(hub.owner, "DELETE", f"/api/bots/{bot_id}/memory/{memory_id}")
+        assert (status, body["code"]) == (404, "not_found"), memory_id
+
+
+@pytest.mark.parametrize("raw", ["[]", "5", "null", '"text"', "true"])
+def test_bodies_that_are_not_objects_are_400(bots_hub, raw):
+    hub = bots_hub
+    bot_id = hub.bots(hub.owner)["bots"][0]["id"]
+    for method, path in (
+        ("POST", "/api/bots"),
+        ("PATCH", f"/api/bots/{bot_id}"),
+        ("POST", f"/api/bots/{bot_id}/read"),
+        ("POST", f"/api/bots/{bot_id}/memory"),
+    ):
+        status, body = raw_request(hub, method, path, raw)
+        assert status == 400, (method, path, raw)
+
+
+@pytest.mark.parametrize("board", [[], {}, ["work"], 5, True, "", None])
+def test_create_rejects_a_board_that_is_not_a_project_slug(bots_hub, board):
+    status, body, _ = bots_hub.post(bots_hub.owner, "/api/bots", {"name": "Odd", "board": board})
+    if board is None:
+        assert status == 201
+    else:
+        assert (status, body["code"]) == (400, "invalid")
+
+
+def test_text_that_cannot_be_stored_is_400(bots_hub):
+    hub = bots_hub
+    bot_id = hub.bots(hub.owner)["bots"][0]["id"]
+    status, body = raw_request(hub, "POST", f"/api/bots/{bot_id}/memory", '{"text": "a\\ud800b"}')
+    assert status == 400
+    status, body = raw_request(hub, "POST", "/api/bots", '{"name": "a\\ud800b"}')
+    assert status == 400
+
+
+def test_padded_memory_text_over_the_bound_is_400(bots_hub):
+    hub = bots_hub
+    bot_id = hub.bots(hub.owner)["bots"][0]["id"]
+    status, body, _ = hub.post(hub.owner, f"/api/bots/{bot_id}/memory", {"text": " " + "m" * 2000})
+    assert (status, body["code"]) == (400, "invalid")
+    assert hub.get(hub.owner, f"/api/bots/{bot_id}/memory")[1]["memories"] == []
+
+
+def test_a_cross_origin_write_on_a_person_session_is_refused(bots_hub):
+    hub = bots_hub
+    bot_id = hub.bots(hub.owner)["bots"][0]["id"]
+    foreign = {**hub.owner, "Origin": "http://attacker.example"}
+    for method, path, body in (
+        ("POST", "/api/bots", {"name": "Planted"}),
+        ("PATCH", f"/api/bots/{bot_id}", {"name": "Taken"}),
+        ("POST", f"/api/bots/{bot_id}/read", {"upto": 1}),
+        ("POST", f"/api/bots/{bot_id}/memory", {"text": "planted"}),
+        ("DELETE", f"/api/bots/{bot_id}/memory/1", None),
+    ):
+        assert hub.request(foreign, method, path, body)[0] == 403, (method, path)
+    names = [b["name"] for b in hub.bots(hub.owner)["bots"]]
+    assert "Planted" not in names and "Taken" not in names
+    assert hub.get(hub.owner, f"/api/bots/{bot_id}/memory")[1]["memories"] == []

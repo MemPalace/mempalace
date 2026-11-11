@@ -338,3 +338,45 @@ def test_data_survives_closing_and_reopening_the_store(bots):
     assert again.messages(b, "u1")[1]["model"] == "local/model"
     assert again.add_user_message(b, "u1", "remember me", REQ)["id"] == ask["id"]
     assert [m["id"] for m in again.memory_list(b, "u1")] == [note["id"]]
+
+
+def test_padded_text_is_bounded_by_its_raw_length_and_stored_verbatim(bots):
+    b = bot(bots)
+    for padded in (" " + "x" * 8000, "x" * 8000 + "\n"):
+        with pytest.raises(Invalid):
+            bots.add_user_message(b, "u1", padded, REQ)
+    with pytest.raises(Invalid):
+        bots.memory_add(b, "u1", " " + "m" * 2000)
+    with pytest.raises(Invalid):
+        bots.add_user_message(b, "u1", "  \n ", REQ)
+    inside = "  " + "x" * 7998
+    assert bots.add_user_message(b, "u1", inside, REQ)["text"] == inside
+    note = "\t" + "m" * 1999
+    assert bots.memory_add(b, "u1", note)["text"] == note
+    assert bots.messages(b, "u1")[0]["text"] == inside
+
+
+def test_text_that_cannot_be_stored_is_invalid_not_a_crash(bots):
+    b = bot(bots)
+    with pytest.raises(Invalid):
+        bots.memory_add(b, "u1", "lone \ud800 surrogate")
+    with pytest.raises(Invalid):
+        bots.add_user_message(b, "u1", "lone \udfff surrogate", REQ)
+
+
+def test_names_keep_their_stored_bound_when_padded(bots):
+    assert bots.create("u1", " " + "n" * 60)["name"] == "n" * 60
+
+
+def test_an_expired_pending_cannot_be_cancelled_either(bots):
+    b = bot(bots)
+    pending = bots.pending_create(b, "u1", "stop_work", {}, "Stop", ttl_s=-1)
+    assert not bots.pending_resolve(b, "u1", pending["id"], "cancelled")
+    assert bots.pending_get(b, "u1", pending["id"])["state"] == "expired"
+    assert not bots.pending_resolve(b, "u1", pending["id"], "done")
+
+
+def test_memory_ids_outside_the_integer_range_are_simply_unknown(bots):
+    b = bot(bots)
+    assert not bots.memory_remove(b, "u1", 2**63)
+    assert not bots.memory_remove(b, "u1", -1)

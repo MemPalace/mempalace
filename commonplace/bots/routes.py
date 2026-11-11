@@ -106,6 +106,8 @@ def _create(gateway, h, principal):
         return
     board = body.get("board")
     if board is not None:
+        if not isinstance(board, str):
+            raise store.Invalid("invalid board")
         service = BoardService(ToolContext(principal=principal, gateway=gateway))
         if board not in {b["slug"] for b in service.board_list()}:
             _error(h, 400, "invalid", "Unknown project")

@@ -1478,7 +1478,7 @@ A routine (name, card template, schedule, owner) creates one card per due time. 
 
 ### Bots keep conversations in the workspace store
 
-Bot threads live only in the workspace file `bots.sqlite3`; the control database, logs, audit reasons and error strings never hold message, model or tool-argument text. A bot is not a principal: every read goes through the board services as the person it belongs to, and `/api/bots*` serves signed-in people only (agent tokens and machine credentials get 404, anonymous callers 401). Display text is redacted while the stored message stays verbatim and append-only. Roster previews are cut to 200 characters for display only. When a person already has 50 live bots, default bots for further projects are simply not created.
+Bot threads live only in the workspace file `bots.sqlite3`; the control database, logs, audit reasons and error strings never hold message, model or tool-argument text. A bot is not a principal: every read goes through the board services as the person it belongs to, and `/api/bots*` serves signed-in people only (agent tokens and machine credentials get 404, anonymous callers 401). Display text is redacted while the stored message stays verbatim and append-only. Roster previews are cut to 200 characters for display only. Input bounds count raw characters, never the stripped text, so verbatim storage and the limit agree. When a person already has 50 live bots, default bots for further projects are simply not created.
 
 ### After Done: archive hides, never deletes
 

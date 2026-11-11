@@ -2021,9 +2021,13 @@ Format (read by `commonplace orch docs-check`):
 
   - Defaults (one project bot per readable, non-archived project plus General) are created lazily and an archived default is never recreated. At most 50 live bots per person.
 
+  - Text bounds count the raw characters (what is stored), so padding cannot exceed them; text that cannot be stored as UTF-8 is `invalid`. A pending confirmation past its expiry can only become `expired`, whatever the requested state.
+
 - **How it fails:**
 
   - Out-of-bound input is 400 `invalid`, the bot limit and conflicts are 409, a busy store is 429; error bodies carry fixed text, never conversation text.
+
+  - A memory id outside the integer range is an unknown id (404); a `board` that is not a project slug string is 400.
 
   - The message, stop and confirm routes are not served yet; they answer 404.
 
@@ -2032,6 +2036,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_bots_store.py` covers bounds, append-only triggers, idempotent sends and conflicts, one reply, paging, unread, the action journal, pending compare-and-set, forwards and work lookups, memory tombstones, per-user isolation and reopening the store.
 
   - `tests/test_bots_api.py` covers defaults per readable project, create/rename/archive and the 50-bot bound, thread paging, block hydration and status words, waiting decisions, read marks, memory, redacted display, and 404 for another person, another workspace and agent tokens.
+
+  - Regression tests in both bots test files cover padded text bounds, unstorable text, huge memory ids, non-string boards, non-object bodies, expiry on cancel and refused cross-origin writes.
 
 ## web-and-console
 
