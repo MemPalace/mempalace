@@ -89,12 +89,8 @@ def on_event(gateway, event: dict) -> None:
         if event.get("kind") != "space_message":
             return
         db = gateway.db
-        with db._lock:
-            stored = db._conn.execute(
-                "SELECT * FROM events WHERE seq=?", (event.get("seq"),)
-            ).fetchone()
-            if stored is None or events._row(stored) != event:
-                return
+        if not events.is_stored(db, event):
+            return
         actor = event.get("actor", "")
         if not actor.startswith("user:"):
             return

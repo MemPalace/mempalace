@@ -122,6 +122,13 @@ def record(
     return _row(row)
 
 
+def is_stored(db, event: dict) -> bool:
+    """Whether ``event`` is exactly the event the log holds under its sequence number."""
+    with db._lock:
+        row = db._conn.execute("SELECT * FROM events WHERE seq=?", (event.get("seq"),)).fetchone()
+    return row is not None and _row(row) == event
+
+
 def notify(event: dict) -> None:
     """Tell the listeners about a stored event."""
     with _listeners_lock:

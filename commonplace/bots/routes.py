@@ -15,7 +15,7 @@ tail) to a handler, so a later route (sending a message) is one more entry.
 
 from commonplace import redact
 from commonplace.boards.service import BoardService
-from commonplace.bots import auth, blocks, modelcfg, store
+from commonplace.bots import auth, blocks, modelcfg, store, updates
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import path_parts, query, read_json, send_json
 
@@ -39,7 +39,7 @@ def _asks(gateway, principal):
         return []  # a member without the needs-me tool has none waiting
 
 
-def _view(bot, asks) -> dict:
+def _view(bot, asks, working=()) -> dict:
     waiting = sum(1 for ask in asks if bot["board"] in (None, ask["board"]))
     last = bot["last"]
     return {
@@ -54,13 +54,16 @@ def _view(bot, asks) -> dict:
         },
         "unread": bot["unread"],
         "waiting": waiting,
-        "state": "needs_you" if waiting else "idle",
+        "state": "needs_you" if waiting else "working" if bot["id"] in working else "idle",
     }
 
 
 def _bot(gateway, principal, bot_id) -> dict:
+    bots = _bots(gateway, principal)
     return _view(
-        _bots(gateway, principal).roster(principal.user_id, bot_id)[0], _asks(gateway, principal)
+        bots.roster(principal.user_id, bot_id)[0],
+        _asks(gateway, principal),
+        updates.working_bots(gateway, principal, bots),
     )
 
 
@@ -78,11 +81,12 @@ def _listing(gateway, h, principal):
     bots = _bots(gateway, principal)
     bots.ensure_defaults(principal.user_id, [(b["slug"], b["name"]) for b in boards])
     asks = _asks(gateway, principal)
+    working = updates.working_bots(gateway, principal, bots)
     send_json(
         h,
         200,
         {
-            "bots": [_view(bot, asks) for bot in bots.roster(principal.user_id)],
+            "bots": [_view(bot, asks, working) for bot in bots.roster(principal.user_id)],
             "model": _model(gateway, principal),
             "can_configure": principal.role == "owner",
         },
@@ -153,7 +157,7 @@ def _messages(gateway, h, principal, bot_id, rest):
         h,
         200,
         {
-            "bot": _view(bot, asks),
+            "bot": _view(bot, asks, updates.working_bots(gateway, principal, bots)),
             "messages": [
                 {
                     "id": m["id"],

@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS bot_work (
     board TEXT NOT NULL,
     card INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
+    last_word TEXT,
+    last_seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (bot_id, board, card)
 );
 CREATE TABLE IF NOT EXISTS bot_forwards (
@@ -97,6 +99,7 @@ CREATE TABLE IF NOT EXISTS bot_forwards (
     board TEXT NOT NULL,
     space_message_id INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
+    answered_by INTEGER,
     PRIMARY KEY (bot_id, board, space_message_id)
 );
 CREATE INDEX IF NOT EXISTS bot_forwards_by_post ON bot_forwards(board, space_message_id);
@@ -116,6 +119,15 @@ WHEN OLD.removed_at IS NOT NULL OR NEW.text IS NOT OLD.text OR NEW.bot_id IS NOT
     OR NEW.created_at IS NOT OLD.created_at OR NEW.removed_at IS NULL
 BEGIN SELECT RAISE(ABORT, 'bot memory is append-only'); END;
 """
+
+
+# Columns added after the first release; ``_upgrade`` adds them to an existing file.
+_ADDED = (
+    ("bot_work", "last_word", "TEXT"),
+    ("bot_work", "last_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("bot_forwards", "answered_by", "INTEGER"),
+)
+UPDATE_MAX = 100_000  # the longest space message, so an orchestrator reply is stored whole
 
 
 class Missing(LookupError):
@@ -207,11 +219,19 @@ class BotStore:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.executescript(_SCHEMA)
+                self._upgrade(conn)
             except Exception:
                 conn.close()
                 raise
             self._conn, self._path = conn, path
         return self._conn
+
+    @staticmethod
+    def _upgrade(conn):
+        """Add columns that a file made by an earlier version lacks."""
+        for table, column, kind in _ADDED:
+            if column not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     @contextmanager
     def _tx(self, *, write=True):
@@ -627,6 +647,52 @@ class BotStore:
         """Every bot that filed ``card``: ``{bot_id, user_id, message_id}``, oldest first."""
         return self._lookup("bot_work", "card", board, card)
 
+    def work_changed(
+        self, bot_id, user_id, board, card, seq, word, text=None, blocks=()
+    ) -> dict | None:
+        """Apply hub event ``seq`` to a filed card: remember its status word, post ``text`` if it changed.
+
+        Only an event newer than the last one applied counts, and the check, the marker and the
+        message are one write. A redelivered, stale or racing handler is a no-op, and a repeated
+        event for the same word adds no second message. Returns the new event message, if any.
+        """
+        with self._tx(write=False) as conn:
+            self._own(conn, bot_id, user_id)
+            row = conn.execute(
+                "SELECT last_seq FROM bot_work WHERE bot_id=? AND board=? AND card=?",
+                (bot_id, board, card),
+            ).fetchone()
+        if row is None or row["last_seq"] >= seq:
+            return None
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT last_word FROM bot_work WHERE bot_id=? AND board=? AND card=? "
+                "AND last_seq<?",
+                (bot_id, board, card, seq),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "UPDATE bot_work SET last_word=?, last_seq=? WHERE bot_id=? AND board=? AND card=?",
+                (word, seq, bot_id, board, card),
+            )
+            if row["last_word"] != word and text is not None:
+                return self._add(conn, bot_id, "event", text, blocks=list(blocks))
+        return None
+
+    def work_by_bot(self, user_id) -> dict[str, list[tuple[str, int]]]:
+        """``{bot_id: [(board, card), ...]}`` of unfinished work for this person's live bots."""
+        with self._tx(write=False) as conn:
+            found: dict[str, list[tuple[str, int]]] = {}
+            for r in conn.execute(
+                "SELECT w.bot_id, w.board, w.card FROM bot_work w JOIN bots b ON b.id=w.bot_id "
+                "WHERE b.user_id=? AND b.archived_at IS NULL AND w.last_word IS NOT 'done' "
+                "ORDER BY w.bot_id, w.card",
+                (user_id,),
+            ):
+                found.setdefault(r["bot_id"], []).append((r["board"], r["card"]))
+            return found
+
     # Posts forwarded to the space chat
 
     def forward_add(self, bot_id, user_id, board, space_message_id, message_id) -> None:
@@ -656,6 +722,46 @@ class BotStore:
     def bots_for_post(self, board, space_message_id) -> list[dict]:
         """Every bot that forwarded this space post: ``{bot_id, user_id, message_id}``."""
         return self._lookup("bot_forwards", "space_message_id", board, space_message_id)
+
+    def unanswered_forwards(self, board, before) -> list[dict]:
+        """Forwarded posts on ``board`` older than message ``before`` that no reply answered yet."""
+        with self._tx(write=False) as conn:
+            return [
+                {
+                    "bot_id": r["bot_id"],
+                    "user_id": r["user_id"],
+                    "message_id": r["message_id"],
+                    "space_message_id": r["space_message_id"],
+                }
+                for r in conn.execute(
+                    "SELECT t.bot_id, b.user_id, t.message_id, t.space_message_id "
+                    "FROM bot_forwards t "
+                    "JOIN bots b ON b.id=t.bot_id WHERE t.board=? AND t.space_message_id<? "
+                    "AND t.answered_by IS NULL ORDER BY t.message_id, t.bot_id",
+                    (board, before),
+                )
+            ]
+
+    def forward_answered(
+        self, bot_id, user_id, board, reply_id, posts, text, blocks=()
+    ) -> dict | None:
+        """The coordinator's reply ``reply_id`` answering this bot's forwarded ``posts``, as one event.
+
+        Only posts no reply answered yet are taken, and they are marked in the same write as the
+        message, so a redelivered, racing or later reply adds nothing and never takes them over.
+        """
+        _text(text, "text", 0, UPDATE_MAX)
+        with self._tx() as conn:
+            self._own(conn, bot_id, user_id)
+            marked = sum(
+                conn.execute(
+                    "UPDATE bot_forwards SET answered_by=? WHERE bot_id=? AND board=? "
+                    "AND space_message_id=? AND space_message_id<? AND answered_by IS NULL",
+                    (reply_id, bot_id, board, post, reply_id),
+                ).rowcount
+                for post in posts
+            )
+            return self._add(conn, bot_id, "event", text, blocks=list(blocks)) if marked else None
 
     def _lookup(self, table, column, board, value) -> list[dict]:
         # Internal readers (updates, the front agent) have no user yet; they get the owner from the bot.

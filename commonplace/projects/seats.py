@@ -85,12 +85,8 @@ def on_event(gateway, event: dict) -> None:
         if event.get("kind") != "space_created":
             return
         db = gateway.db
-        with db._lock:
-            stored = db._conn.execute(
-                "SELECT * FROM events WHERE seq=?", (event.get("seq"),)
-            ).fetchone()
-            if stored is None or events._row(stored) != event:
-                return
+        if not events.is_stored(db, event):
+            return
         ensure_main(db, event["workspace_id"], event["data"]["board"])
     except Exception as exc:
         log_failure(logger, "project seat event failed", exc)
