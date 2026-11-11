@@ -29,6 +29,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `SYSTEM.md`, `MODULES.md`
 - **Owns:**
 
+  - OAuth consent documents the displayed single validated origin, canonical numeric hosts and actionable legacy validation errors.
+
   - The exact instance authority, packaged identity and opt-in receipt/mount residual contracts.
 
   - Admin card navigation restores a regular base, inventory counts match joined rows, and Retry retains the failed page mode and cursor.
@@ -239,6 +241,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `AGENTS.md`, `CHANGELOG.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `HUB-DESIGN.md`, `INSPIRATION-REPOS.md`, `LICENSE`, `MISSION.md`, `PRODUCT-DESIGN.md`, `README.md`, `REPORT.md`, `ROADMAP.md`, `SECURITY.md`, `openarena-claim.txt`, `design/`, `docs/`
 - **Owns:**
+
+  - The OAuth contract records the displayed callback origin, numeric-host tightening and required pre-deploy registration inventory.
 
   - The operational Admin API and opt-in backup receipts, with operator provisioning and unknown-history limits.
 
@@ -584,6 +588,10 @@ Format (read by `commonplace orch docs-check`):
   - Whole-response source-path and hidden-candidate regressions cover both search routes and wing selections; canonical output goldens and the three-backend union test distinguish raw owner rendering from the member's final gated render.
 
   - Protected shared-room CLI regressions cover literal-wing and fan-out search with independently readable controls; owner renderer controls, both room-list paths, cited and uncited cross-workspace mutations, and all nine projected-read literal refusals retain their distinct boundaries.
+
+  - OAuth CSP header controls and real Chromium form submissions cover normal consent, login retry and re-rendered error consent.
+
+  - OAuth CSP and destination-display controls cover normal consent, retry, canonical numeric hosts, explicit default ports and actionable validation errors.
 
   - Legacy report-source tests quiesce hold, chat and phone workers and verify removal of a pre-existing invalid reset trigger before raw status writes.
 
@@ -1066,6 +1074,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Paths:** `commonplace/sessions.py`, `commonplace/session.py`, `commonplace/email_auth.py`, `commonplace/mailer.py`, `commonplace/oauth/`, `commonplace/social/`
 - **Owns:**
+
+  - Authenticated consent displays the validated code destination origin and permits only that origin in form-action; login and generic pages remain self-only. IPv6 redirects fail closed because Chromium ignores IPv6 CSP host-sources.
 
   - Web sign-in links and cookies, startup context reads, email challenges, outgoing mail, OAuth for MCP clients and provider sign-in.
 

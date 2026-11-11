@@ -12,6 +12,20 @@ entry was written.
 
 ## Decisions
 
+- **OAuth consent navigation:** Only a consent form bound to a validated client and
+  exact registered redirect adds that redirect's parsed origin to CSP `form-action
+  'self'` and shows that same escaped origin as the code destination. Login forms and generic HTML pages remain self-only, including failed
+  login retries; a retry that renders authenticated consent gets the same single
+  origin allowance. Other CSP directives, PKCE, state and exact redirect matching
+  are unchanged. Redirect hosts must be DNS labels with numeric ports; IPv6 literals are refused because Chromium
+  ignores them in CSP host-sources; schemes remain HTTPS or loopback HTTP. New registrations
+  and authorization GET/POST reject unsafe legacy registrations locally before
+  rendering or redirecting. HTTPS hosts ending in digits or `0x` hex must be canonical
+  dotted-quad IPv4. Registered-but-invalid errors request re-registration; missing
+  registrations retain their separate error. Live redirect registrations must be
+  inventoried before deploy; that inventory is not performed here. No stored client
+  data is migrated.
+
 - **Workspace Admin foundation:** `/app/#/admin` is discoverable only when
   `/api/me.can_admin` is true (signed-in person and current-workspace owner).
   The additive `can_admin_instance` uses the operational predicate below. New GET-only users/connections/runtime/limits/stuck
