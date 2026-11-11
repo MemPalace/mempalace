@@ -34,6 +34,7 @@ from commonplace.handoff.models import (
 from commonplace.handoff.thread_store import ThreadConflict, ThreadStore, canonical_sha256
 from commonplace.handoff.wiring import install
 from commonplace.policy import Policy
+from tests._mirror_drain import drain_service
 
 
 class _NoWorker:
@@ -506,14 +507,14 @@ def test_append_failure_rolls_back_then_retry_mirrors_new_tail(harness, monkeypa
     harness.ctx.service.call_tool = metadata_only
     monkeypatch.setattr(palace_mirror, "mirror", capture_mirror)
     result = harness.ctx.service.run(harness.principal, body)
-    harness.ctx.service.wait_for_mirrors(timeout=10)
+    drain_service(harness.ctx.service)
     assert result.handoff == first.handoff
     assert not result.launch
     assert any("uniqueaddedfact" in chunk.text for chunk in mirrored)
     before = harness.rows("messages")
     mirrored_before_retry = list(mirrored)
     assert not harness.ctx.service.run(harness.principal, body).launch
-    harness.ctx.service.wait_for_mirrors(timeout=10)
+    drain_service(harness.ctx.service)
     assert harness.rows("messages") == before
     assert mirrored == mirrored_before_retry
 
@@ -736,7 +737,7 @@ def test_mirror_failure_is_best_effort_after_durable_storage(harness, monkeypatc
 
     monkeypatch.setattr(palace_mirror, "mirror_pending", fail_mirror)
     result = harness.ctx.service.run(harness.principal, request())
-    harness.ctx.service.wait_for_mirrors(timeout=10)
+    drain_service(harness.ctx.service)
     assert result.launch and calls == [True]
     assert len(harness.rows("threads")) == 1
     harness.assert_event_count(EVENT_FAILED, 0)

@@ -23,6 +23,7 @@ from commonplace.rules import checks
 from commonplace.workers import WorkerSupervisor
 from tests._commonplace_helpers import InProcessLauncher, functional_worker_transport  # noqa: F401
 from tests._mcp_server_helpers import _patch_mcp_server
+from tests._mirror_drain import drain_service
 from tests.test_commonplace_email_auth import Client, Mailbox
 
 
@@ -86,7 +87,7 @@ def words(label):
 
 
 def drain(w):
-    w.gateway.handoff.service.wait_for_mirrors(timeout=30)
+    drain_service(w.gateway.handoff.service)
 
 
 def post(w, path, data, token=None):

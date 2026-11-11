@@ -33,6 +33,7 @@ from commonplace.handoff.models import (
 from commonplace.handoff.wiring import install
 from commonplace.policy import Policy
 from tests._commonplace_helpers import hub_fixture  # noqa: F401
+from tests._mirror_drain import drain_service
 
 TEXT_MARKER = "security_transcript_891c691396424873"
 SECRET_MARKER = "security_secret_731b519981d54e42"
@@ -1232,7 +1233,7 @@ def test_normal_memory_tools_cannot_bypass_thread_read_scope(hub):
                 "messages",
             ),
         )
-        ctx.service.wait_for_mirrors(timeout=60)
+        drain_service(ctx.service)
         assert result.action == "handoff" and written
         _, response = hub.call(writer_token, "mempalace_get_drawer", drawer_id=written[0])
         assert TEXT_MARKER in response

@@ -17,6 +17,7 @@ from commonplace.handoff.recall import Recall, ThreadNotFound
 from commonplace.import_sources import parse_import
 from commonplace.policy import Policy
 from tests._commonplace_helpers import functional_worker_transport as functional_worker_transport
+from tests._mirror_drain import drain_service
 from tests.test_commonplace_email_auth import fresh as fresh
 from tests.test_commonplace_import_grant import (
     IMPORT_SCOPES,
@@ -117,7 +118,7 @@ def live(world, monkeypatch):
 
 
 def drain(j):
-    j.client.gateway.handoff.service.wait_for_mirrors(timeout=10)
+    drain_service(j.client.gateway.handoff.service)
 
 
 def memory(j, token, name, args):

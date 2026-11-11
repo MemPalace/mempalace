@@ -16,6 +16,7 @@ from commonplace.handoff import search_index
 from commonplace.handoff.models import ThreadMessage
 from commonplace.handoff.thread_store import ThreadStore, ThreadStoreV2
 from commonplace.workers import WorkerSupervisor
+from tests._mirror_drain import drain_service
 from tests.test_commonplace_email_auth import Client
 
 
@@ -79,9 +80,16 @@ def worlds(tmp_path, monkeypatch, request):
         return w
 
     yield create
-    for w, server, thread, supervisor in opened:
+    close_worlds(opened)
+
+
+def close_world(w, server, thread, supervisor):
+    # A job that never settles fails the drain, but the server thread is not a
+    # daemon: every handle below must still be released or the process hangs.
+    try:
         w.release.set()
-        w.service.wait_for_mirrors(10)
+        drain_service(w.service)
+    finally:
         server.shutdown()
         thread.join(3)
         server.server_close()
@@ -89,6 +97,17 @@ def worlds(tmp_path, monkeypatch, request):
         w.gateway.handoff.close()
         supervisor.stop_all()
         w.db.close()
+
+
+def close_worlds(opened):
+    failures = []
+    for entry in opened:
+        try:
+            close_world(*entry)
+        except BaseException as error:
+            failures.append(error)
+    if failures:
+        raise failures[0]
 
 
 def put(w, label, *, hidden=False, count=1, indexed=False, identity=None):
@@ -136,7 +155,7 @@ def test_card253_s12_progress(worlds, monkeypatch, kind):
         visible = put(w, "visible", indexed=kind not in ("units",))
         if kind == "units":
             w.service.index_later(w.ws)
-            w.service.wait_for_mirrors(10)
+            drain_service(w.service)
             assert w.writes == [(visible.id, 1)]
     assert control.store.get(visible.id) == hidden.store.get(visible.id)
     h = put(
@@ -157,7 +176,7 @@ def test_card253_s12_progress(worlds, monkeypatch, kind):
                 lambda _: plans.FREE.storage_bytes if hidden.writes else 0,
             )
         hidden.service.index_later(hidden.ws)
-        hidden.service.wait_for_mirrors(10)
+        drain_service(hidden.service)
         assert hidden.writes[-1:] == [(h.id, 64 if kind == "deferred" else 1)]
         if kind == "deferred":
             assert hidden.store.mirror_progress(h.id)[0] == -1
@@ -195,7 +214,7 @@ def test_card253_s12_all_readable_and_reauthorize_units(worlds):
     w.store.begin_mirror(other.id, -1)
     assert w.gateway.handoff.recall.can_read(w.principal, other.id)
     w.service.index_later(w.ws)
-    w.service.wait_for_mirrors(10)
+    drain_service(w.service)
     assert poll(w) == dict(state="idle", threads_indexed=2, threads_pending=0, units_written=2)
     with w.store._lock, w.store._conn:
         w.store._conn.execute(
@@ -239,7 +258,7 @@ def test_card253_s12_readable_running_and_precedence(worlds, monkeypatch):
             w.service._index_states[w.ws].blocked_threads.discard(blocked.id)
     finally:
         w.release.set()
-    w.service.wait_for_mirrors(10)
+    drain_service(w.service)
     assert stored.id not in w.service._index_states[w.ws].active_threads
 
 
@@ -264,9 +283,9 @@ def test_card253_s12_global_quota_causality(worlds, monkeypatch):
         plans.StorageMeter, "_walk", lambda _: plans.FREE.storage_bytes if hidden.writes else 0
     )
     control.service.index_later(control.ws)
-    control.service.wait_for_mirrors(10)
+    drain_service(control.service)
     hidden.service.index_later(hidden.ws)
-    hidden.service.wait_for_mirrors(10)
+    drain_service(hidden.service)
     assert hidden.writes == [(h.id, 1)]
     assert hidden.store.mirror_progress(h.id) == (0, 0)
     assert attempts[-2:] == [(hidden.ws, h.id), (hidden.ws, readable.id)]
@@ -277,7 +296,7 @@ def test_card253_s12_global_quota_causality(worlds, monkeypatch):
     )
     monkeypatch.setattr(plans.StorageMeter, "_walk", lambda _: 0)
     hidden.service.index_later(hidden.ws)
-    hidden.service.wait_for_mirrors(10)
+    drain_service(hidden.service)
     assert poll(hidden) == dict(state="idle", threads_indexed=1, threads_pending=0, units_written=1)
 
 
@@ -424,10 +443,11 @@ def test_card253_s12_failed_writes_do_not_accrue(worlds):
     put(w, "write")
     w.service.call_tool = lambda *_: {"error": "refused", "drawer_ids": ["invalid"]}
     w.service.index_later(w.ws)
-    w.service.wait_for_mirrors(10)
+    drain_service(w.service)
     assert poll(w) == dict(state="idle", threads_indexed=0, threads_pending=1, units_written=0)
 
 
+@pytest.mark.timing
 def test_card253_s12_bounded_metadata_polling(worlds, monkeypatch, record_property):
     import statistics
     from time import perf_counter

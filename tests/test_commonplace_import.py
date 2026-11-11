@@ -17,6 +17,7 @@ from commonplace.import_sources import SOURCES
 from commonplace.policy import Policy
 from commonplace.workers import WorkerSupervisor
 from commonplace.workspace_store import thread_path, workspace_path
+from tests._mirror_drain import drain_service
 
 WORDS = "  café 🦉\r\nKeep  every word.\t"
 AT = "2026-10-20T12:34:56Z"
@@ -478,7 +479,7 @@ def test_free_quota_new_and_existing_stores_and_noop_at_limit(surface):
     _, report = upload(surface)
     stored_id = report["results"][0]["stored_thread_id"]
     # Background search indexing also counts toward storage; let it settle first.
-    surface.gateway.handoff.service.wait_for_mirrors(timeout=30)
+    drain_service(surface.gateway.handoff.service)
     used = plans.StorageMeter._walk(surface.directory)
     with padding.open("wb") as stream:
         stream.truncate(plans.FREE.storage_bytes - used)

@@ -13,6 +13,7 @@ from commonplace.handoff import search_index
 from commonplace.handoff.models import ThreadMessage
 from commonplace.handoff.service import HandoffService
 from commonplace.handoff.thread_store import ThreadStore, ThreadStoreV2
+from tests._mirror_drain import drain_service
 
 
 class Worker:
@@ -65,6 +66,10 @@ def world(tmp_path, monkeypatch, request):
     db.close()
 
 
+def drain(world):
+    drain_service(world.service)
+
+
 def put(world, source="import:synthetic", count=1, text="synthetic words"):
     return world.store.store(
         world.ws,
@@ -92,7 +97,7 @@ def test_u3_a_coalescing_and_enrolment(world, monkeypatch):
     assert len(world.service._mirror_jobs) == 1
     assert world.store.mirror_progress(stored.id) == (-1, -1)
     release.set()
-    world.service.wait_for_mirrors(10)
+    drain(world)
     assert len(world.worker.entries) == 1
     assert not world.service._index_active
 
@@ -111,14 +116,14 @@ def test_u3_b_job_bounds_and_draining(world, monkeypatch):
 
     monkeypatch.setattr(search_index, "sweep", record)
     world.service.index_later(world.ws)
-    world.service.wait_for_mirrors(10)
+    drain(world)
     assert jobs == [20, 3]
     assert world.service.index_status(world.ws)["threads_pending"] == 0
     # One large thread also spans jobs, with no job exceeding the unit bound.
     put(world, "import:large", text="x" * 4000, count=1100)
     jobs.clear()
     world.service.index_later(world.ws)
-    world.service.wait_for_mirrors(20)
+    drain(world)
     assert len(jobs) >= 2
     assert max(jobs) <= 2000
     assert world.service.index_status(world.ws)["threads_pending"] == 0
@@ -128,7 +133,7 @@ def test_u3_c_crash_retry_idempotence(world):
     stored = put(world, count=40, text="x" * 8000)
     world.worker.fail_at = 1
     world.service.index_later(world.ws, [stored.id])
-    world.service.wait_for_mirrors(10)
+    drain(world)
     first = set(world.worker.entries)
     assert len(first) == 64
     assert world.store.mirror_progress(stored.id)[0] == -1
@@ -136,7 +141,7 @@ def test_u3_c_crash_retry_idempotence(world):
     # No range finished: retry must replay this pinned range, including lost units.
     world.worker.entries.clear()
     world.service.index_later(world.ws)
-    world.service.wait_for_mirrors(10)
+    drain(world)
     clean = Worker()
     from commonplace.handoff import palace_mirror
 
@@ -148,7 +153,7 @@ def test_u3_c_crash_retry_idempotence(world):
     before = len(world.worker.batches)
     units = world.service.index_status(world.ws)["units_written"]
     world.service.index_later(world.ws)
-    world.service.wait_for_mirrors(10)
+    drain(world)
     assert len(world.worker.batches) == before
     assert world.service.index_status(world.ws)["units_written"] == units
 
@@ -166,14 +171,14 @@ def test_u3_d_quota_defers_between_batches(world, monkeypatch):
         ),
     )
     world.service.index_later(world.ws, [stored.id])
-    world.service.wait_for_mirrors(10)
+    drain(world)
     assert world.worker.batches == [64]
     assert world.service.index_status(world.ws)["state"] == "deferred_storage"
     assert world.service.index_status(world.ws)["units_written"] == 64
     assert world.store.mirror_progress(stored.id)[0] == -1
     monkeypatch.setattr(plans.StorageMeter, "_walk", lambda _: 0)
     world.service.index_later(world.ws)
-    world.service.wait_for_mirrors(10)
+    drain(world)
     assert world.service.index_status(world.ws)["threads_pending"] == 0
 
 
@@ -218,7 +223,7 @@ def test_u3_f_principals_and_import_groups(world, monkeypatch):
         )
     assert search_index.import_groups(world.db, world.ws) == {holder.id, fork.id}
     world.service.index_later(world.ws)
-    world.service.wait_for_mirrors(10)
+    drain(world)
     assert world.store.mirror_progress(holder.id)[0] == 0
     assert world.store.mirror_progress(fork.id)[0] == 0
     assert world.store.mirror_progress(untouched.id) is None

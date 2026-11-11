@@ -9,6 +9,7 @@ import pytest
 from commonplace.handoff.models import HandoffRequest, SettingRow, ThreadMeta
 from commonplace.handoff.recall import ThreadNotFound
 from tests._commonplace_helpers import hub_fixture  # noqa: F401
+from tests._mirror_drain import drain_service
 
 SCOPES = [
     "memory:read",
@@ -164,7 +165,7 @@ def test_a_blocked_mirror_does_not_hold_up_fact_indexing(hub, enabled, monkeypat
         assert [f["object"] for f in query(hub, token)] == ["8443"]
     finally:
         release.set()
-        context.service.wait_for_mirrors(timeout=10)
+        drain_service(context.service)
 
 
 def test_blocked_fact_indexing_does_not_hold_up_the_handoff(hub, enabled):
