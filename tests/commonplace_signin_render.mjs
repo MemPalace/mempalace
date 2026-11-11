@@ -99,6 +99,8 @@ function app({ search = "", pathname = "/app/", hash = "", cookie = "", loadProv
     rulesHandlers: () => ({ stale: false, force: false, busy: () => false, update() {} }),
     // Imports are stripped: sign-out clears the signed-in user's chat seen ids through this.
     clearSeen: (user) => cleared.push(user),
+    // The opt-in Deck look is off here: boot applies it and builds it at the top level (deck.js).
+    applyDeck() {}, createDeck: () => null,
     setInterval() {}, setTimeout() {}, clearTimeout() {},
     async api(path) {
       calls.push(path);

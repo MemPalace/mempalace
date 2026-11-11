@@ -62,8 +62,12 @@ def test_done_on_an_unreleased_card_names_the_release_step(hub, fresh, cards):
     assert "moved to Done" in reply["error"]
 
 
-def test_done_on_a_released_todo_card_tells_the_owner_to_move_it_to_doing_first(hub, fresh, cards):
-    status, reply = move_done(hub, fresh, cards[1])
+def test_done_on_a_plain_todo_card_tells_the_owner_to_move_it_to_doing_first(hub, fresh, cards):
+    # The owner may close a released restricted-origin todo card directly (#315);
+    # any other todo card still has to go through Doing.
+    card = fresh.owner.task_add(board="work", title="Plain todo card")
+    assert card["status"] == "todo", card
+    status, reply = move_done(hub, fresh, card)
     assert_explained(status, reply, reason="only be moved to Done from Doing")
     assert "Doing" in reply["next_step"] and "handoff" not in reply["error"]
 
