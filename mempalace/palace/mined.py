@@ -163,7 +163,6 @@ def _paged_metadata(collection):
         offset += len(batch["ids"])
 
 
-
 def _mine_group_key(meta, extract_mode):
     """Separate conversation filings with identical mtimes but distinct filing times."""
     mtime = meta.get("source_mtime")
