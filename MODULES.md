@@ -114,7 +114,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Architecture describes exact-slug, workspace-local reads without implying lifecycle support.
 
-  - Cold-start readability, imported-room count compatibility and remaining search totals are documented separately from content range checks.
+  - Cold-start readability, imported-room count compatibility and bounded restricted-search refill with suppressed candidate totals are documented separately from content range checks.
 
   - Standalone mediator compatibility distinguishes policy-only local helpers from workspace-bound callers without thread authority.
 
@@ -242,6 +242,7 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `AGENTS.md`, `CHANGELOG.md`, `CLAUDE.md`, `CONTRIBUTING.md`, `HUB-DESIGN.md`, `INSPIRATION-REPOS.md`, `LICENSE`, `MISSION.md`, `PRODUCT-DESIGN.md`, `README.md`, `REPORT.md`, `ROADMAP.md`, `SECURITY.md`, `openarena-claim.txt`, `design/`, `docs/`
 - **Owns:**
 
+  - Memory sync documentation states the restricted-search refill bound, suppressed candidate counters and the restricted CLI-compatible route.
   - The project and orchestrator guides state that a role without a model raises one owner Needs me item and that Agent models are picked from the workspace's model list.
 
   - The OAuth contract records the displayed callback origin, numeric-host tightening and required pre-deploy registration inventory.
@@ -615,6 +616,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Protected shared-room CLI regressions cover literal-wing and fan-out search with independently readable controls; owner renderer controls, both room-list paths, cited and uncited cross-workspace mutations, and all nine projected-read literal refusals retain their distinct boundaries.
 
+  - Restricted-search refill regressions cover hidden ranked prefixes, counter suppression, exhaustion, work bounds, unchanged every-wing calls, restricted CLI-compatible search, filters and deadline failures; the same fixture reports information-only latency.
   - `tests/test_runner_start_context.py` is the measurement and the contract of a start prompt's card context; `tests/test_runner_start.py` allows `card_context` beside the identifier keys of a lease.
 
   - OAuth CSP header controls and real Chromium form submissions cover normal consent, login retry and re-rendered error consent.
@@ -1047,6 +1049,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Authenticated wing lists and search fan-out share the complete authorized pair projection. Hidden-only wings affect neither wings_searched nor the fan-out denial count; internal consumers inherit the same listing.
 
+  - Restricted structured drawer searches with an attached handoff context gate before limiting and double ranked prefixes up to 100 candidates in at most eight worker calls on one deadline. Responses omit candidate/filter totals and count only returned hits; every-wing and standalone paths retain existing behavior, and restricted CLI-compatible search refills before its final gate and rendering. Pinned searches preserve original protocol errors and opaque worker replies before structured refill.
+
   - Direct mediator helpers default to no gateway; workspace-bound callers still project metadata.
 
   - Policy-only callers without workspace context receive empty overview and fan-out results through the shared projection boundary.
@@ -1117,6 +1121,7 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_commonplace_gateway.py`, `tests/test_commonplace_control_db.py`, `tests/test_commonplace_policy.py`, `tests/test_hub_` files.
 
+  - `tests/test_restricted_search_fill.py` covers bounded refill and response privacy, with a synthetic latency fixture.
   - `tests/test_cards_decide_scope.py` covers granting, refusal, other people's asks, revocation and audit; `tests/test_cards_decide_scope_browser.py` covers the consent and Agents UI (needs Playwright).
 
 
