@@ -134,7 +134,7 @@ def _lease(hub, machine):
         hub.port, "POST", "/api/runner/lease", token=machine["machine_token"], body={}
     )
     assert code == 200, (code, body)
-    assert set(body) == JOB_KEYS, body
+    assert set(body) == JOB_KEYS | {"card_context"}, body
     return body
 
 

@@ -1,4 +1,7 @@
-"""Machine-only HTTP endpoints; no launch commands or user content cross this API."""
+"""Machine-only HTTP endpoints; no launch commands cross this API.
+
+User content crosses it in one place: a lease carries ``card_context``, the started
+card as the machine's own worker connection may read it (``start_context``)."""
 
 import json
 import sqlite3
@@ -11,7 +14,7 @@ from commonplace.control_db import ControlError
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.sessions import person_principal
 
-from . import jobs, predicate, registry
+from . import jobs, predicate, registry, start_context
 
 MAX_BODY_BYTES = 4096
 BODY_KEYS = {
@@ -238,12 +241,20 @@ def register(gateway):
                 else:
                     row = jobs.result(store, machine, **body)
                 payload = jobs.job_object(row, tokens=action == "lease")
-                if action == "lease" and row["config_version"] is not None:
-                    from commonplace.orch import runner_bridge
+                if action == "lease":
+                    launch = {}
+                    if row["config_version"] is not None:
+                        from commonplace.orch import runner_bridge
 
-                    # Pinned prompt, workflow and model of a config-driven start.
-                    with store.connection() as conn:
-                        payload.update(runner_bridge.launch_fields(conn, row))
+                        # Pinned prompt, workflow and model of a config-driven start.
+                        with store.connection() as conn:
+                            launch = runner_bridge.launch_fields(conn, row)
+                    # An invalid pinned config launches nothing, so it gets no card.
+                    if row["config_version"] is None or launch:
+                        launch.update(
+                            start_context.lease_fields(gateway, machine, row, launch.get("message"))
+                        )
+                    payload.update(launch)
             send_json(h, 200, payload)
         except HTTPError as exc:
             send_json(h, exc.status, {"error": str(exc)})

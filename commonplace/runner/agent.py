@@ -193,15 +193,25 @@ def _launch_text(job):
 
     A config-driven job carries ``message`` (``SPAWN_MESSAGE`` for this job, then the
     pinned role prompt and workflow) and ``modelSelection``; other jobs carry neither
-    and get ``SPAWN_MESSAGE``."""
+    and get ``SPAWN_MESSAGE``. Either kind may carry ``card_context`` (the card's own
+    text, built by the hub), which follows the message after a blank line."""
     base = SPAWN_MESSAGE.format(n=job["task_number"], job_id=job["job_id"])
     message, model = job.get("message"), job.get("modelSelection")
+    context = job.get("card_context")
+    if context is None:
+        tail = ""
+    elif isinstance(context, str) and context:
+        tail = "\n\n" + context
+    else:
+        raise ValueError("job_invalid")
     if message is None and model is None:
-        return base, None
+        if len(base) + len(tail) > MAX_MESSAGE_CHARS:
+            raise ValueError("job_invalid")
+        return base + tail, None
     if (
         not isinstance(message, str)
         or not message.startswith(base)
-        or len(message) > MAX_MESSAGE_CHARS
+        or len(message) + len(tail) > MAX_MESSAGE_CHARS
         or not isinstance(model, dict)
         or set(model) != {"instanceId", "model"}
         or not isinstance(model["instanceId"], str)
@@ -210,7 +220,7 @@ def _launch_text(job):
         or not _MODEL.fullmatch(model["model"])
     ):
         raise ValueError("job_invalid")
-    return message, {"instanceId": model["instanceId"], "model": model["model"]}
+    return message + tail, {"instanceId": model["instanceId"], "model": model["model"]}
 
 
 def _job_code(config, job):

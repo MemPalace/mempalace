@@ -1073,7 +1073,7 @@ def test_r12_pin_runner_store_gains_columns_and_keeps_digest_and_payload(world):
     ).hexdigest()
     assert row["request_hash"] == digest
     assert all(row[name] is None for name in jobs.CONFIG_COLUMNS)
-    assert set(world.lease()) == PIN_JOB_KEYS
+    assert set(world.lease()) == PIN_JOB_KEYS | {"card_context"}
 
 
 def test_r20g_plan_label_added_after_queueing_is_refused_at_starting(world):

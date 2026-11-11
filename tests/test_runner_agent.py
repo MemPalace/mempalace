@@ -367,7 +367,11 @@ def test_m2_bridge_shape(signup_hub, owners, tmp_path):  # noqa: F811
 def test_m3_fixed_agent_message(signup_hub, owners, tmp_path):  # noqa: F811
     _, _, _, number, job_id, _ = _spawn_control(signup_hub, owners["A"], tmp_path)
     launch = launches(tmp_path)[0]["launch"]
-    assert launch["message"] == _MESSAGE.format(n=number, job_id=job_id)
+    fixed, context = launch["message"].split("\n\n", 1)
+    assert fixed == _MESSAGE.format(n=number, job_id=job_id)
+    # The card itself follows the fixed message (tests/test_runner_start_context.py).
+    assert context.startswith(f"Card context for #{number}, ")
+    assert '\nTitle: "' in context and "\nBody: " in context
     assert launch["title"] == f"Card #{number} [commonplace-job:{job_id}]"
 
 
