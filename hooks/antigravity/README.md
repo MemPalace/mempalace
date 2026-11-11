@@ -11,14 +11,33 @@ format and STDOUT contract are Antigravity-specific (see
 
 ## Quick start
 
+### Option A — Official `agy plugin` CLI / Marketplace bundle (Windows, macOS, Linux)
+
+From the repo root:
+
+```bash
+agy plugin validate --strict ./plugins/mempalace
+agy plugin install ./plugins/mempalace
+```
+
+`plugins/mempalace/` is a self-contained Marketplace bundle shipping cross-platform Node.js lifecycle hooks (`node ./scripts/save-hook.mjs` and `node ./scripts/wake-hook.mjs`), the Aux Pane UI Extension (`sidecars/palace/`), skills, recall rule, and `mcp_config.json`.
+
+To export a standalone lightweight Git repository or release zip:
+
+```bash
+python hooks/antigravity/export_standalone.py --output dist/mempalace-antigravity --init-git
+```
+
+### Option B — POSIX `install.sh` installer (macOS / Linux)
+
 From the repo root:
 
 ```bash
 bash hooks/antigravity/install.sh
 ```
 
-This installs the plugin to `~/.gemini/config/plugins/mempalace/`.
-Restart Antigravity and the MCP server, skill, and hooks all register
+This installs the plugin to `~/.gemini/config/plugins/mempalace/` and renders `hooks/antigravity/hooks.json.tmpl` for the POSIX bash hooks.
+Restart Antigravity and the MCP server, UI extension, skills, rule, and hooks all register
 automatically.
 
 To dry-run first:

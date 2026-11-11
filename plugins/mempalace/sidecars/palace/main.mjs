@@ -115,6 +115,7 @@ function commonInstallCandidates() {
   // If running from inside the MemPalace repo or workspace checkout:
   const possibleRoots = [
     path.resolve(PLUGIN_ROOT, '..'),
+    path.resolve(PLUGIN_ROOT, '..', '..'),
     process.cwd(),
   ];
   for (const root of possibleRoots) {
@@ -142,8 +143,14 @@ function resolvePythonRuntime() {
   ];
 
   const seen = new Set();
-  const repoParent = path.resolve(PLUGIN_ROOT, '..');
-  const hasLocalRepo = fs.existsSync(path.join(repoParent, 'mempalace', '__init__.py'));
+  const repoParentCandidates = [
+    path.resolve(PLUGIN_ROOT, '..', '..'),
+    path.resolve(PLUGIN_ROOT, '..'),
+  ];
+  const repoParent =
+    repoParentCandidates.find((dir) => fs.existsSync(path.join(dir, 'mempalace', '__init__.py'))) ||
+    null;
+  const hasLocalRepo = Boolean(repoParent);
 
   for (const candidate of candidates) {
     if (!candidate || seen.has(candidate)) continue;

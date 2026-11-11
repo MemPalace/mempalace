@@ -3,7 +3,7 @@
   "name": "mempalace",
   "displayName": "MemPalace",
   "version": "3.12.0",
-  "description": "Local-first verbatim AI memory palace: semantic recall, temporal knowledge graph, auto-save hooks, and multi-agent logstream coordination.",
+  "description": "Local-first verbatim AI memory palace: visual Aux Pane explorer, hybrid recall, temporal knowledge graph, auto-save hooks, and agent coordination.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Search my memory palace for recent architectural decisions",
