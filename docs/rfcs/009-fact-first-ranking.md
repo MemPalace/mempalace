@@ -17,22 +17,20 @@ preserve question glue. Lowercase `who` and `can` remain fillers, including when
 the graph contains `WHO` or `Can`. A filler-only query returns no facts; every
 returned fact must match at least one remaining whole word.
 
-Ignore query terms absent from the readable fact vocabulary. If any remaining query
-term occurs in at most half the readable facts, use those terms to seed the lookup; otherwise
+Ignore query terms absent from the fact vocabulary. If any remaining query term
+occurs in at most half the facts, use those terms to seed the lookup; otherwise
 keep all remaining meaningful terms. Unknown words cannot suppress this fallback.
 This avoids scanning the corpus for universal words when a selective term is
 available. Known query terms contribute to final IDF relevance.
 
 Select at most 50 scoped subject/predicate seed keys in SQL. Selective queries
-start with 50 matches; a restricted caller's matches are ranked by the summed
-IDF of the readable matched terms, shorter facts first among equals, and an
-unrestricted caller's by FTS rank. If duplicate keys leave slots empty, fill from a
+start with 50 BM25 matches; if duplicate keys leave slots empty, fill from a
 bounded prefix of up to 1,000 recent scoped matches (`ORDER BY rowid DESC`).
-All-common queries use that bounded prefix directly, avoiding a full relevance sort.
+All-common queries use that bounded prefix directly, avoiding a full BM25 sort.
 Scope and as-of filters run inside
 both seed lookups, before their limits. Empty scopes and selective prefixes with
 distinct keys skip the fallback lookup entirely. Group the prefix by key using
-each key's best coverage score, then expand selected keys to retain their full visible
+each key's best BM25 score, then expand selected keys to retain their full visible
 history and current successors. Final lexical relevance is the fraction of query
 IDF weight matched:
 
@@ -78,18 +76,8 @@ Search-mode KG queries use the same query sanitizer as drawer search, rather
 than the entity-name length limit. CLI capture omits an empty facts list unless
 there is a fact-side error marker, matching direct MCP search.
 
-A caller restricted by wing, sensitivity or as-of reads statistics of the
-readable facts only: document IDs of the readable scope are materialized and each
-query term's FTS postings are intersected with them, so N and df never count
-another wing, an unreadable sensitivity or a fact outside the as-of interval.
-FTS5's own rank also uses whole-index counts, so it is not used for these
-callers. This work scales with the readable scope and the postings inside its
-docid range, not with unreadable facts outside it. An unrestricted caller reads
-the whole graph, so the index's own vocabulary counts and rank are already its
-readable statistics. No corpus or query statistics are cached.
-
-Seed lookups check each FTS hit against the triple primary key in wide scopes.
-Empty-scope checks reuse the capped
+Wide scopes check each FTS hit against the triple primary key instead of
+materializing every visible triple ID. Empty-scope checks reuse the capped
 visibility count, so an empty scope runs that probe once. With the default seed
 limit, all-common queries count at most 5,001 visible rows and use bounded
 document IDs for scopes of at most 5,000 rows. Selective queries retain at most
@@ -98,18 +86,11 @@ after 51, and rare terms can stop it earlier. Both small paths require fewer
 visible rows than the estimated matching population; other queries follow FTS
 hits with primary-key checks.
 The small-scope path bounds the FTS rowid range and checks membership in that
-small ID set, then sorts its matches using only the local coverage weights.
-Both paths enforce the same scope and as-of
+small ID set, then sorts its matches. This avoids recomputing BM25's global term
+counts for every individual rowid. Both paths enforce the same scope and as-of
 filters before limiting seeds and when expanding selected keys' history.
 
 ## Known limits
-
-Exact readable statistics cost work in proportion to the readable scope: a
-restricted caller's search reads that scope's docids on every call. Work no
-longer grows with unreadable facts, but a derived, scope-keyed statistics index
-would be needed to make it constant for very wide scopes. Measured on a growing
-readable wing: about 25 VM steps per added fact that does not match the query and
-about 235 per matching fact (develop: constant and about 115).
 
 Dutch stop words are out of scope; there is currently no Dutch locale. Without
 an applicable configured locale, non-English glue can still produce weak matches.

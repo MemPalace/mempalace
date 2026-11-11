@@ -10,7 +10,7 @@ Status: proposed, 31 Oct 2026. Redesign of the union default (PR #38). Revised a
 
 For a search scoped to wings W, everything the response contains (hits, scores, order, stats, reasons) is a function of the query and the content of W only. Timing is out of scope: response time already depends on unrelated load. What is in scope is anything that lets one principal observe another's queries. So caches are never shared across principals.
 
-For a restricted caller, fact term selection, seed ranking and relevance use only readable facts' document frequencies and count, including sensitivity and temporal filters. Chroma’s vector-disabled fallback, when a scope filter applies, reads the newest 50,000 in-scope matches and ranks them with local BM25, including scopes above 20,000 drawers; a scope with more matches drops its oldest before ranking (whole-word continuation reads still run). Without a scope filter it keeps the index rank. Neither path caches corpus or query statistics across calls.
+Known exceptions (pre-existing, follow-up): fact ranking uses graph-wide statistics, and Chroma’s vector-disabled fallback uses whole-index FTS rank above 20,000 scoped drawers. The drawer/closet differential tests exclude facts and that fallback.
 
 ## Rules
 
@@ -39,8 +39,6 @@ For a restricted caller, fact term selection, seed ranking and relevance use onl
   - scopes with more matches than the LIMIT;
   - closets;
   - two principals sharing one worker;
-  - fact selection and scores, including wing, sensitivity and as-of scopes;
-  - vector-disabled Chroma with more than 20,000 readable drawers;
   - filters that can't be pushed down falling back to vector;
   - the gateway multi-wing path.
 - **Latency:** union p95 ≤ max(vector p95 + 25%, vector p95 + 50 ms) on both backends, warm and cold, on:
