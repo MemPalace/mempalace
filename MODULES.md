@@ -583,6 +583,8 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `tests/`
 - **Owns:**
 
+  - The encrypted-store budget regression proves a budgeted thread write and its refusal through SQLCipher, whose `page_size` is text.
+
   - Import-reader CLI regressions retain allowed row locations and verbatim text; union fixtures acquire a protected-room hit in the readable wing before testing the drawer gate. Source-path controls pin control/format-character refusal alongside ordinary-path preservation.
 
   - Whole-response source-path and hidden-candidate regressions cover both search routes and wing selections; canonical output goldens and the three-backend union test distinguish raw owner rendering from the member's final gated render.
@@ -1472,6 +1474,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - Thread-store storage budgets read `page_size` and `page_count` as integers, so a budgeted write in an encrypted (SQLCipher) workspace is checked instead of failing with a type error.
+
   - The final search gate proves source_path like source_file, including nested folded copies and media path/title aliases, and omits acquisition counts and truncation flags for restricted readers. Body text and arbitrary provenance labels are not scanned for private words.
 
   - Graph mediation validates and rechecks the descriptor-bound SQLite sort values before traversal and ranking.
@@ -1576,6 +1580,8 @@ Format (read by `commonplace orch docs-check`):
   - A failed launch of the successor leaves the source agent running; an interrupted archive adoption resumes from its last committed step.
 
 - **Tests:**
+
+  - `tests/test_workspace_encryption.py::test_storage_budget_accepts_sqlcipher_text_page_size` covers a budgeted write and a refusal in an encrypted compact store.
 
   - Graph protocol fault, live-reader and legacy locus-order witnesses exercise mediation.
 

@@ -184,6 +184,28 @@ def test_migration_preserves_compact_threads_boards_rules_graph_and_palace(works
         assert original.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
 
+def test_storage_budget_accepts_sqlcipher_text_page_size(workspace):
+    """SQLCipher reports ``page_size`` as text; a budgeted write must still be checked."""
+    from commonplace.handoff.thread_store import ThreadStorageLimit
+
+    data, _, wid, *_ = workspace
+    root = workspace_root(data, wid)
+    root.mkdir(parents=True)
+    (root / "workspace.json").write_text('{"store":"compact"}')
+    enable(workspace)
+    message = [ThreadMessage(0, "user", "message", "budgeted", "raw")]
+    with closing(open_threads(workspace_path(data, wid))) as store:
+        try:
+            stored = store.store(
+                wid, "budgeted", message, actor="person:x", max_storage_bytes=10**9
+            )
+        except TypeError as exc:
+            pytest.fail(f"a budgeted write in an encrypted store crashed: {exc}")
+        assert stored.message_count == 1
+        with pytest.raises(ThreadStorageLimit):
+            store.store(wid, "tight", message, actor="person:x", max_storage_bytes=1)
+
+
 @pytest.mark.parametrize("failure", ["wrong", "missing", "missing-slots", "missing-driver"])
 def test_key_and_driver_fail_closed(workspace, monkeypatch, failure):
     data, _, wid, server, _, slots = workspace

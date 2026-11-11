@@ -596,8 +596,9 @@ class ThreadStore:
         if maximum is None:
             return
         path = self._conn.execute("PRAGMA database_list").fetchone()[2]
-        page_size = self._conn.execute("PRAGMA page_size").fetchone()[0]
-        pages = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        # SQLCipher reports page_size as text; plain SQLite as an integer.
+        page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
+        pages = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
 
         def size(suffix):
             if not path or path == ":memory:":

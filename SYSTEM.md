@@ -153,6 +153,8 @@ configs. No deployment, replacement importer or memory-coverage completion is cl
 
 - Raw-key `cipher_connect` is a low-level SQLCipher utility used by B2 migration, not a B3 authority boundary. Future B3 callers must use `connect` or a dedicated guarded entry point that authenticates current control state before content opens.
 
+- Thread-store storage budgets convert SQLCipher's text `page_size` (and `page_count`) to integers, so budgeted writes in encrypted workspaces are checked rather than failing with a type error.
+
 
 ### Chroma session rebuilds
 
