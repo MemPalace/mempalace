@@ -52,6 +52,7 @@ MODULES = (
     "commonplace.agent_schedules",
     "commonplace.routines",
     "commonplace.projects",
+    "commonplace.bots",
 )
 
 ALL_PROFILES = frozenset({"slim", "standard", "full"})
