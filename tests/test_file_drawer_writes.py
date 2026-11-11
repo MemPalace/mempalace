@@ -467,6 +467,7 @@ def test_history_backup_reuses_available_original_embeddings(monkeypatch):
     assert reused_vectors == [[0.1, 0.2]]
     assert observed[1][0] == []
 
+
 def test_convo_history_backup_preserves_whole_generation_on_partial_change(monkeypatch):
     """One changed chunk must not make an incomplete, invisible A history."""
     import mempalace.palace as palace
