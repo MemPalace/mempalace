@@ -679,8 +679,45 @@ def seeded_collection(collection):
     return collection
 
 
+def _raw_pytest_refusal(environ=None, home=None):
+    """Why this run may not start here, or None.
+
+    A shared test host opts in with the marker file ``~/.config/commonplace/require-test-runner``
+    (in the real account home, not the HOME this file redirects). The marker holds the name of the
+    environment variable that the host's test runner sets for the runs it admits; there a run
+    without that variable (a raw pytest that bypasses the runner's slot cap) does not start.
+    Machines without the marker are unaffected. ``COMMONPLACE_ALLOW_RAW_PYTEST=1`` overrides it
+    for one run; xdist workers inherit their controller's admission.
+    """
+    env = os.environ if environ is None else environ
+    if env.get("PYTEST_XDIST_WORKER") or env.get("COMMONPLACE_ALLOW_RAW_PYTEST") == "1":
+        return None
+    if home is None:
+        try:
+            import pwd
+
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except (ImportError, KeyError, AttributeError):
+            return None
+    marker = os.path.join(home, ".config", "commonplace", "require-test-runner")
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            variable = fh.read().strip()
+    except OSError:
+        return None
+    if not variable or env.get(variable):
+        return None
+    return (
+        f"this host runs tests only through its test runner ({marker}), so its slot cap holds; "
+        "start this run through the runner (override for one run: COMMONPLACE_ALLOW_RAW_PYTEST=1)"
+    )
+
+
 def pytest_configure(config):
-    """On Windows, replace coverage's fail_under with the pyproject Windows gate."""
+    """Refuse raw runs on a shared test host; on Windows, use the pyproject Windows coverage gate."""
+    refusal = _raw_pytest_refusal()
+    if refusal:
+        pytest.exit(refusal, returncode=4)
     from coverage_gate import apply_platform_threshold
 
     apply_platform_threshold(config)

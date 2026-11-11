@@ -287,6 +287,10 @@ records of another agent or session. No Cursor database reader is claimed.
 
 - A reported end changes neither the start job nor machine capacity nor the card (D3 stays open).
 
+### Raw test runs on a shared test host
+
+- A host that caps concurrent test runs (its test runner holds a slot per run) opts in with `~/.config/commonplace/require-test-runner`, naming the variable the runner sets; there `tests/conftest.py` stops a pytest run without it, so agents cannot overload the host by bypassing the cap. Machines without the marker run unchanged; `COMMONPLACE_ALLOW_RAW_PYTEST=1` is the one-run override.
+
 ### Mirror and search-index test waits
 
 - Tests that wait for background mirror or search-index work drain on the actual completion condition (no sweep active, no mirror job pending) through one shared test helper, with a 120 s stuck-job limit, rather than one fixed `wait_for_mirrors` budget that returns silently when it runs out.
