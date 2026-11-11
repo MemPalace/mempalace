@@ -763,6 +763,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Waiting-reason app tests drive the real `board.js`, `details.js` and `waiting.js` modules through Node against the server sentences.
 
+  - Task-type app tests drive the real `tasktypes.js` and `details.js` modules through Node; refusal-reason tests run a matching agent, a non-matching agent and untyped cards through take, status start and take-next.
   - Card reviewer tests (`test_commonplace_card_reviewer.py`) run the owner-only choice, member validation, completion routing, decide enforcement over service, MCP and REST, self-review, re-addressing and needs-me through the hub; `card_reviewer.mjs` drives `card-reviewer.js`, `details.js` and `board.js` in Node.
 
   - Origin overflow stays out of ordinary proposal buckets when the bounded approvals projection truncates; list and digest retain their truncation signals.
@@ -1209,6 +1210,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
 
+  - Task-type refusals (`boards/task_types.py`): a pickup the holder’s grants do not allow names the refused type and points the owner to Settings > Agents.
   - The card's completion reviewer (`boards/reviewer.py`): only a signed-in workspace owner chooses, changes or clears it, it must be a current member, and a reviewer who left counts as none. With none the owner reviews as before. With one, every move to Done by anyone else opens a completion review addressed to that member, and only that member may answer it; the reviewer sees it in needs-me, and changing the reviewer re-addresses an open review.
 
   - Routines (`routines.py`, `/api/routines`): an owner-defined name, card template, schedule and owner that create one card per due time through `BoardService.task_add`, with a history of runs linking to the cards. Due times come from the shared `schedule_time.py`.
@@ -1981,6 +1983,8 @@ Format (read by `commonplace orch docs-check`):
   - The latest refresh carries a pending foreground render for its screen, so background events cannot leave Settings or Console on Loading; completed Settings views keep their usual background-update policy.
 
   - The person-owner task-type API rejects non-object JSON with 400 and replaces a connection’s sorted allowlist atomically; GET never creates a boards store.
+
+  - `tasktypes.js` lets the owner set a card’s task type in the card details (empty clears it; others see it read-only) and edit each agent’s allowed types in Settings > Agents, loaded when the section is first opened. Both call the existing REST routes; the server stays the authority and refuses a pickup with the type named and the Settings > Agents next step.
 
   - The web app calls the same services as REST; it shows only what the signed-in person may read.
 

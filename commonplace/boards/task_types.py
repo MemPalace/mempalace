@@ -66,7 +66,11 @@ def eligible(conn, label, holder, *, labels=UNSET):
 
 def require(conn, label, holder, *, labels=UNSET):
     if not eligible(conn, label, holder, labels=labels):
-        raise ToolError("no: task type is not allowed for the holding connection")
+        shown = f" '{label}'" if SLUG.fullmatch(label) else ""
+        raise ToolError(
+            f"no: task type{shown} is not allowed for the holding connection; "
+            "the workspace owner can allow it for this agent in Settings > Agents"
+        )
 
 
 def read_eligible(directory, label, holder):
