@@ -616,7 +616,7 @@ Format (read by `commonplace orch docs-check`):
 
   - Synthetic Admin HTTP inventories and served-asset Node contracts, with assertion-only pinned-base RED evidence and identical selected head GREEN nodes.
 
-  - Runner block checks run the served `adminrunners.js` against a fake DOM: enroll, attest and wings edit call the owner routes with exact bodies, and enrollment tokens never reach storage, logs, list redraws or a dismissed panel.
+  - Runner block checks run the served `adminrunners.js` against a fake DOM: enroll, attest, wings edit and the two-step revoke call the owner routes with exact bodies, and enrollment tokens never reach storage, logs, list redraws or a dismissed panel.
 
 
   - Synthetic legacy safety-stop cases and explicitly classified transcript-only fixture updates.
@@ -1311,6 +1311,7 @@ Format (read by `commonplace orch docs-check`):
   - The `tests/test_runner_` files, `tests/test_orch_runner.py`, `tests/test_orch_acceptance.py`.
 
   - `tests/test_runner_wings.py` covers multi-wing starts, the ungranted-wing refusal, worker write bounds after enrollment and PATCH, and owner-only listing.
+  - `tests/test_runner_revoke_scope.py` covers a second workspace's owner failing to list or revoke a machine (404, tokens still valid) and revoke/list never returning a token.
   - The `tests/test_runner_` files (including binding migration, reset races, direct fences and lock-order instrumentation), `tests/test_orch_runner.py`, `tests/test_orch_acceptance.py`.
 
 
@@ -1833,7 +1834,7 @@ Format (read by `commonplace orch docs-check`):
 - **Paths:** `commonplace/web/`, `commonplace/console/`
 - **Owns:**
 
-  - The Admin runner block (`adminrunners.js`): owner-only machine list, enroll, attest and wings edit over `/api/runners`, with one-time token display kept outside the Admin sections' redraws.
+  - The Admin runner block (`adminrunners.js`): owner-only machine list, enroll, attest, wings edit and two-step revoke over `/api/runners`, with one-time token display (and a token-free setup note) kept outside the Admin sections' redraws; revoking a machine clears its token panel.
 
   - Runtime switch/orchestrator/machine read projectors, effective limits, stuck facts and separate legacy needs-me rendering in the existing Admin lifecycle.
 

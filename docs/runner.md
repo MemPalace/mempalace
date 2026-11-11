@@ -23,6 +23,8 @@ A workspace owner manages machines in the **Runner machines** block at the botto
 - **List.** `GET /api/runners` shows each machine's label, state, binding, projects, topics and wings. Credentials are never listed.
 - **Add runner.** Label, projects, topics, wings (picked from the readable, non-private wings), maximum runtime mode and maximum in flight go to `POST /api/runners`. The machine and worker tokens appear once in a panel with copy buttons and a warning that they are not shown again. The page keeps them only in that panel: nothing goes to storage or logs, they are not part of any list redraw, and **Done** (or leaving the page, signing out or an expired session) removes them.
 - **Attest.** Per machine: topics, provider instance id and the worker connection id (prefilled) go to `POST /api/runners/<id>/attest`. The result is still your statement, not verified.
+- **Setup note.** The token panel also says where each token goes (`token_env` for the machine token, the worker's Commonplace MCP entry for the worker token), to set `hub_url` and to run `runner check`. The note contains no token.
+- **Revoke.** Per live machine: **Revoke** asks once, naming the machine; **Revoke machine** sends `DELETE /api/runners/<id>`. Both tokens stop working at once and queued and leased starts are cancelled; a revoked row offers nothing further, and a token panel still open for that machine is cleared.
 - **Edit wings.** Per machine: `PATCH /api/runners/<id>` with the chosen wings. Changing wings (or topics) resets the machine to `unbound`, cancels its queued and leased starts and requires a new attestation; saving the same wings only refreshes the worker's access.
 
 Requesters and model choices are managed elsewhere ([projects](projects.md)).

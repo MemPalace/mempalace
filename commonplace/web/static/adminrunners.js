@@ -1,5 +1,6 @@
-/** Owner screen for runner machines: enroll, attest and edit wings. Tokens live only in the reveal panel. */
+/** Owner screen for runner machines: enroll, attest, edit wings and revoke. Tokens live only in the reveal panel. */
 const MODES = ['approval-required', 'auto-accept-edits', 'auto', 'full-access'];
+const SETUP_NOTE = 'Setup: put the machine token in the environment variable the runner config names as token_env, and the worker token in the Commonplace MCP entry of the worker\'s provider instance. Set hub_url to this site\'s address, then run "python -m commonplace runner check --config <file>" before starting the runner. See docs/runner.md.';
 const RESET_NOTE = 'Changing wings or topics resets this machine to unbound: queued and leased starts are cancelled and the machine must be attested again. Saving the same wings only refreshes the worker\'s access.';
 
 export const parseList = text => [...new Set(String(text || '').split(',').map(part => part.trim()).filter(Boolean))];
@@ -37,7 +38,7 @@ export function attestBody(values) {
 }
 
 export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.clipboard.writeText(text) }) {
-  let host = null, epoch = 0, machines = [], wings = [], wingsError = false, busy = false;
+  let host = null, epoch = 0, machines = [], wings = [], wingsError = false, busy = false, confirming = null, revealed = null;
   const region = name => host?.querySelector(`[data-runner-${name}]`);
   const status = (text, bad = false) => {
     const node = region('status');
@@ -55,6 +56,14 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
     <label>Max runtime mode<select name="max_runtime_mode">${MODES.map(m => `<option value="${e(m)}">${e(m)}</option>`).join('')}</select></label>
     <label>Max in flight<input name="max_in_flight" type="number" min="1" max="4" value="1" required></label>
     <button type="submit" class="btn">Add runner</button></form>`;
+  // Revoke is one click to ask, one to confirm; the confirm names the machine and what stops working.
+  const revokeControl = m => {
+    const id = e(m.machine_id);
+    if (confirming !== m.machine_id) return `<p><button type="button" class="btn" data-runner-action="revoke" data-runner-id="${id}" aria-label="Revoke ${e(m.label)}">Revoke</button></p>`;
+    return `<div role="group" aria-label="Confirm revoking ${e(m.label)}"><p>Revoke ${e(m.label)}? Its machine and worker tokens stop working and its queued and leased starts are cancelled. This cannot be undone; enroll a new machine to replace it.</p>
+      <button type="button" class="btn" data-runner-action="revoke-confirm" data-runner-id="${id}" aria-label="Confirm revoking ${e(m.label)}">Revoke machine</button>
+      <button type="button" class="btn" data-runner-action="revoke-cancel" data-runner-id="${id}">Keep machine</button></div>`;
+  };
   const machineView = m => {
     const id = e(m.machine_id), live = !m.revoked_at;
     const state = m.revoked_at ? 'revoked' : m.enabled ? 'enabled' : 'disabled';
@@ -65,7 +74,7 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
       <label>Worker connection id<input name="worker_connection_id" required value="${e(m.worker_connection_id)}" autocomplete="off"></label>
       <button type="submit" class="btn">Attest</button></form>
       <form class="agent-form" data-runner-form="wings" data-runner-id="${id}"><h4>Edit wings</h4>${wingBoxes(m.wings)}
-      <p>${e(RESET_NOTE)}</p><button type="submit" class="btn">Save wings</button></form>` : '';
+      <p>${e(RESET_NOTE)}</p><button type="submit" class="btn">Save wings</button></form>${revokeControl(m)}` : '';
     return `<article class="runner-machine" aria-label="${e(m.label)}"><h3>${e(m.label)}</h3>
       <p>${e(state)} · ${e(m.binding_state)}, not verified · ${e(m.max_runtime_mode)} · ${e(m.max_in_flight)} in flight</p>
       <p>Projects: ${e(m.projects.join(', '))} · Topics: ${e(m.topics.join(', '))} · Wings: ${e(m.wings.join(', '))}</p>${forms}</article>`;
@@ -77,8 +86,9 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
     if (form && resetForm) form.innerHTML = enrollForm();
   };
   const reveal = result => {
+    revealed = result.machine_id || null;
     const field = (name, label, value) => `<label>${e(label)}<input data-runner-secret="${e(name)}" value="${e(value)}" readonly autocomplete="off" spellcheck="false"></label><button type="button" class="btn" data-runner-action="copy" data-runner-copy="${e(name)}">Copy ${e(label.toLowerCase())}</button>`;
-    region('reveal').innerHTML = `<div class="agent-secret" role="group" aria-label="New runner credentials"><p><strong>Copy both tokens now. They are not shown again.</strong></p>${field('machine', 'Machine token', result.machine_token)}${field('worker', 'Worker token', result.worker_token)}<p>Next: attest this machine below once its worker is set up.</p><button type="button" class="btn" data-runner-action="dismiss">Done</button></div>`;
+    region('reveal').innerHTML = `<div class="agent-secret" role="group" aria-label="New runner credentials"><p><strong>Copy both tokens now. They are not shown again.</strong></p>${field('machine', 'Machine token', result.machine_token)}${field('worker', 'Worker token', result.worker_token)}<p>${e(SETUP_NOTE)}</p><p>Next: attest this machine below once its worker is set up.</p><button type="button" class="btn" data-runner-action="dismiss">Done</button></div>`;
   };
 
   async function load(resetForm = false) {
@@ -106,7 +116,7 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
         await api(`/api/runners/${encodeURIComponent(id)}/attest`, { method: 'POST', body: attestBody(values) });
         if (mine !== epoch) return;
         status('Attested. This is your statement; Commonplace does not verify it.');
-      } else {
+      } else if (kind === 'wings') {
         if (!(values.wings || []).length) throw new Error('Choose at least one wing.');
         await api(`/api/runners/${encodeURIComponent(id)}`, { method: 'PATCH', body: { wings: values.wings } });
         if (mine !== epoch) return;
@@ -127,10 +137,31 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
     void submit(form.dataset.runnerForm, form.dataset.runnerId, fieldValues(form));
   }
 
+  async function revoke(id) {
+    if (busy) return;
+    busy = true; status('Revoking…');
+    const mine = epoch;
+    try {
+      await api(`/api/runners/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (mine !== epoch) return;
+      confirming = null;
+      if (revealed === id) { region('reveal').replaceChildren(); revealed = null; }
+      status('Machine revoked. Its tokens no longer work.');
+      await load();
+    } catch (error) {
+      if (mine === epoch) { confirming = null; renderList(false); status(error.message || 'Request failed', true); }
+    } finally {
+      busy = false;
+    }
+  }
+
   async function onClick(event) {
     const button = event.target.closest?.('[data-runner-action]');
     if (!button) return;
-    if (button.dataset.runnerAction === 'dismiss') { region('reveal').replaceChildren(); status(''); return; }
+    const action = button.dataset.runnerAction, id = button.dataset.runnerId;
+    if (action === 'dismiss') { region('reveal').replaceChildren(); revealed = null; status(''); return; }
+    if (action === 'revoke' || action === 'revoke-cancel') { confirming = action === 'revoke' ? id : null; renderList(false); return; }
+    if (action === 'revoke-confirm') { await revoke(id); return; }
     const input = region('reveal').querySelector(`[data-runner-secret="${button.dataset.runnerCopy}"]`);
     try { await copy(input.value); status('Copied.'); } catch { status('Copy failed. Select the value and copy it manually.', true); }
   }
@@ -148,7 +179,7 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
   }
 
   function stop() {
-    epoch++; busy = false; machines = []; wings = [];
+    epoch++; busy = false; machines = []; wings = []; confirming = null; revealed = null;
     if (host) {
       host.removeEventListener('submit', onSubmit);
       host.removeEventListener('click', onClick);
