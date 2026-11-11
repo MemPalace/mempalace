@@ -250,6 +250,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The Admin runtime/limits/stuck API, independent owner queue and project/runner guide links.
 
+  - Fact-first ranking and union-where RFCs: a restricted caller's fact counts and seed ranking, and the vector-disabled Chroma fallback's candidate window, come from readable content only; the cost of exact readable statistics is a known limit.
+
   - The Admin machine requester list, its addable agents and the owner-only edit, in the Admin and runner guides.
 
 
@@ -505,6 +507,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Display-label token scans deduplicate identities without rewriting labels or changing citation parsing.
 
+  - A restricted caller's fact term counts and seed ranking, and the vector-disabled Chroma fallback's candidate pool and its BM25 order, are computed from readable facts and drawers only; unrestricted callers keep the index's own counts.
+
   - Hallway probes return bounded metadata pages in storage order; final reads revalidate exact descriptors.
 
   - KG search reuses the local tokenizer, selective terms and 50-seed candidate rules on a detached authorized index; deadline checks stop copy, indexing and scoring work. Scoped search requires its detached snapshot.
@@ -600,6 +604,8 @@ Format (read by `commonplace orch docs-check`):
   - Import-reader CLI regressions retain allowed row locations and verbatim text; union fixtures acquire a protected-room hit in the readable wing before testing the drawer gate. Source-path controls pin control/format-character refusal alongside ordinary-path preservation.
 
   - Whole-response source-path and hidden-candidate regressions cover both search routes and wing selections; canonical output goldens and the three-backend union test distinguish raw owner rendering from the member's final gated render.
+
+  - Scope-local ranking tests change hidden-wing facts and drawers and require identical fact order, relevance and degraded-fallback candidates; the fallback is also checked with vectors off. Fact search work tests bound growth outside the readable scope and keep readable growth linear.
 
   - Protected shared-room CLI regressions cover literal-wing and fan-out search with independently readable controls; owner renderer controls, both room-list paths, cited and uncited cross-workspace mutations, and all nine projected-read literal refusals retain their distinct boundaries.
 
