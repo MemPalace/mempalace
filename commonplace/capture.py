@@ -10,7 +10,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from io import StringIO
 
-from . import continuity_schema, import_grant, ingest_cadence, plans, sync_protocol
+from . import agent_log, continuity_schema, import_grant, ingest_cadence, plans, sync_protocol
 from .handoff.api import _integer, _object, _read_json, _RequestError, _text
 from .handoff.models import ThreadMessage
 from .handoff.thread_store import ThreadConflict, ThreadStorageLimit
@@ -18,7 +18,7 @@ from .handoff.transcripts import parse
 from .http_util import log_failure, query
 from .workspace_store import thread_path, workspace_path
 
-SOURCES = ("claude-code", "codex")
+SOURCES = ("claude-code", "codex", agent_log.SOURCE)
 PRIVATE_WING = "private_chats"
 RAW_NAME = "capture.raw"
 MAX_CAPTURE_BYTES = 64 * 1024 * 1024
@@ -28,7 +28,11 @@ EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 def _identity(principal, data):
     source = _text(data, "source", required=True)
     identity = _text(data, "thread_id", required=True)
-    if source not in SOURCES or len(identity) > 512:
+    if (
+        source not in SOURCES
+        or len(identity) > 512
+        or (source == agent_log.SOURCE and not agent_log.valid_thread_id(identity))
+    ):
         raise _RequestError(400, "Invalid source or thread_id")
     # Opt-in grants only a write-only capture channel for the filing actor.
     # It never widens the connection's memory/read/private policy.
@@ -140,6 +144,11 @@ def _push(db, conn, store, principal, data, identity, source, maximum, continuit
         not isinstance(op, str) or re.fullmatch(sync_protocol.OP_ID_PATTERN, op) is None
     ):
         raise _RequestError(400, "Invalid client_op_id")
+    if source == agent_log.SOURCE:
+        try:
+            agent_log.check(data["thread_id"], _text(data, "transcript", required=True))
+        except ValueError as error:
+            raise _RequestError(400, str(error)) from None
     now = plans._now()
     conn.execute(
         "DELETE FROM capture_ops WHERE at < ?",

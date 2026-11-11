@@ -118,11 +118,12 @@ def test_wire_constants_and_validation_patterns():
         200,
         (120, 3600),
     )
-    assert protocol.TRANSCRIPT_SOURCES == ("claude-code", "codex", "t3")
+    assert protocol.TRANSCRIPT_SOURCES == ("claude-code", "codex", "t3", "agent-log")
     assert (protocol.MEMORY_IMPORT_SOURCE, protocol.MEMORY_FORMAT) == ("native-memory", "file")
     assert protocol.TOKEN_ENV == {
         "claude-code": "COMMONPLACE_CAPTURE_TOKEN_CLAUDE_CODE",
         "codex": "COMMONPLACE_CAPTURE_TOKEN_CODEX",
+        "agent-log": "COMMONPLACE_CAPTURE_TOKEN_AGENT_LOG",
         "native-memory": "COMMONPLACE_IMPORT_TOKEN",
     }
     assert {"type", "message", "payload", "content"} <= protocol.PROBE_KEY_ALLOWLIST

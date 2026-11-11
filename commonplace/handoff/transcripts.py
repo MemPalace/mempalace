@@ -18,9 +18,10 @@ import json
 import re
 from io import StringIO
 
+from .. import agent_log
 from .models import ThreadMessage
 
-FORMATS = ("auto", "claude-code", "codex", "messages")
+FORMATS = ("auto", "claude-code", "codex", "messages", agent_log.SOURCE)
 _DECODER = json.JSONDecoder()
 _SPACE = re.compile(r"[ \t\r\n]*")
 _TEXT_TYPES = {"text", "input_text", "output_text", "summary_text", "reasoning_text"}
@@ -72,10 +73,16 @@ def parse(text: str, fmt: str = "auto", *, require_recognized: bool = True) -> l
                 _add(messages, raw, "")
                 continue
             raise ValueError(f"Invalid transcript line {line_number}") from error
-        recognized |= _record_format(record) == fmt
+        recognized |= (
+            agent_log.identity(record) is not None
+            if fmt == agent_log.SOURCE
+            else _record_format(record) == fmt
+        )
         at = _string(record.get("timestamp")) if isinstance(record, dict) else ""
         if not isinstance(record, dict):
             _add(messages, raw, at)
+        elif fmt == agent_log.SOURCE:
+            _message(messages, record, raw, at)
         elif fmt == "claude-code":
             if _string(record.get("type")) in {"user", "assistant"} and isinstance(
                 record.get("message"), dict

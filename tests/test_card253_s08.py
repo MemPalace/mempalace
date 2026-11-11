@@ -195,9 +195,14 @@ def producer(c, kind, role):
         value = continuity_schema.fork_id("u1", "readable-stream")
         field = kind.removeprefix("fork-")
     elif kind.startswith("capture-"):
+        source = kind.removeprefix("capture-")
         _, value = capture._identity(
             replace(c.owner, user_id="u1"),
-            {"source": kind.removeprefix("capture-"), "thread_id": "opaque7"},
+            # An agent-log identity names the agent before its session.
+            {
+                "source": source,
+                "thread_id": "gemini:opaque7" if source == "agent-log" else "opaque7",
+            },
         )
         field = "source_url"
     else:

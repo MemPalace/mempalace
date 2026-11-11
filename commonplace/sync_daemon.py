@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 
+from . import agent_log
 from .capture_client import endpoint
 from .sync_protocol import (
     BACKFILL_WRITES,
@@ -103,7 +104,11 @@ class _Session:
         self.target = endpoint(config["hub"])
         self.tokens = config["tokens"]
         self.feed_env = next(
-            (TOKEN_ENV[s] for s in ("claude-code", "codex") if self.tokens.get(TOKEN_ENV[s])),
+            (
+                TOKEN_ENV[s]
+                for s in ("claude-code", "codex", agent_log.SOURCE)
+                if self.tokens.get(TOKEN_ENV[s])
+            ),
             None,
         )
         if self.feed_env is None:

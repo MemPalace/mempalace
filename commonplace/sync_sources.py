@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import agent_log
 from .capture_client import CHUNK_BYTES, MAX_RECORD_BYTES, CaptureError, files
 from .sync_protocol import (
     CURSOR_MESSAGE,
@@ -89,7 +90,11 @@ def discover(config) -> list[Source]:
                         raw = stream.read(MAX_RECORD_BYTES)
                         info = os.fstat(stream.fileno())
                     underlying = native_source(source, "auto", raw.decode("utf-8", errors="ignore"))
-                    identity = native_identity(raw, underlying)
+                    identity = (
+                        agent_log.first_identity(raw)
+                        if underlying == agent_log.SOURCE
+                        else native_identity(raw, underlying)
+                    )
                     if state:
                         state.cache_file(source, path, info, [underlying, identity])
                 else:

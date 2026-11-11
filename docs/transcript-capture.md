@@ -83,6 +83,33 @@ the existing adapter that supplies that path. No hook is installed by these
 commands. Remove the local hook or unset the local switch to stop scheduling;
 disable the workspace setting to reject uploads immediately.
 
+## Any other agent: the agent-log source
+
+Agents without a Claude Code or Codex transcript (Cursor exports, Gemini CLI,
+OpenCode, Aider wrappers, your own scripts) append one JSON object per line to a
+`.jsonl` file:
+
+```json
+{"agent":"gemini-cli","session_id":"s-42","role":"user","content":"exact words","timestamp":"2026-11-11T09:30:00Z"}
+```
+
+`agent` is a lowercase slug of at most 32 characters (`a-z`, `0-9`, `-`); it
+cannot be `claude-code`, `codex` or `t3`. `session_id` is the agent's own session.
+Content may be text or content blocks, and `tool_calls` records are accepted.
+Every line of a stream must carry the same `agent` and `session_id`; the capture
+identity is `<agent>:<session_id>`, so provenance (which agent, which session,
+when) travels with each stored message. Never summarize or rewrite messages to
+produce this file. Use a connection with client `agent-log` and `memory:write`, then:
+
+```bash
+python -m commonplace.capture_client --source agent-log --root LOG_DIRECTORY
+```
+
+or select `--source agent-log:LOG_DIRECTORY` in [live sync](live-sync.md). Storage,
+cadence, idempotent retries, owner opt-in and the privacy rules are those of the
+native sources: the chat is private to the filing account and readable in Memory
+search only by readers of that thread.
+
 ## Find captured history in Memory
 
 After an accepted append or exact retry, background indexing makes the session's

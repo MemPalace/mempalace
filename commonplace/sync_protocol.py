@@ -7,6 +7,7 @@ import json
 import re
 from pathlib import PurePosixPath
 
+from . import agent_log
 from .capture_client import CaptureError, native_id
 from .handoff.transcripts import detect_format
 
@@ -24,7 +25,7 @@ SYNC_PAGE = 200
 OP_ID_PATTERN = r"^[A-Za-z0-9_-]{16,64}$"
 WRITE_BUDGET = (120, 3600)
 BACKFILL_WRITES = 5000
-TRANSCRIPT_SOURCES = ("claude-code", "codex", "t3")
+TRANSCRIPT_SOURCES = ("claude-code", "codex", "t3", agent_log.SOURCE)
 MEMORY_IMPORT_SOURCE = "native-memory"
 MEMORY_FORMAT = "file"
 CURSOR_MESSAGE = "Cursor transcripts are unsupported; choose Claude Code or Codex sources."
@@ -34,6 +35,7 @@ PROBE_KEY_ALLOWLIST = frozenset(
 TOKEN_ENV = {
     "claude-code": "COMMONPLACE_CAPTURE_TOKEN_CLAUDE_CODE",
     "codex": "COMMONPLACE_CAPTURE_TOKEN_CODEX",
+    agent_log.SOURCE: "COMMONPLACE_CAPTURE_TOKEN_AGENT_LOG",
     "native-memory": "COMMONPLACE_IMPORT_TOKEN",
 }
 RETRY_RE = r"retry in (\d+) seconds"
@@ -41,7 +43,7 @@ RETRY_RE = r"retry in (\d+) seconds"
 
 def native_source(source, fmt, text) -> str | None:
     """Resolve T3's underlying native format without guessing from values."""
-    if source in ("claude-code", "codex"):
+    if source in ("claude-code", "codex", agent_log.SOURCE):
         return source
     if source != "t3":
         return None

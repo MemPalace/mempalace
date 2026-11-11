@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
+from . import agent_log
+
 CHUNK_BYTES = 512 * 1024
 MAX_RECORD_BYTES = 1024 * 1024
 
@@ -91,6 +93,8 @@ def native_id(stream, source):
                 agent = record.get("agentId")
                 if agent:
                     identity = f"{identity}:agent:{agent}" if identity else None
+            elif source == agent_log.SOURCE:
+                identity = agent_log.identity(record)
             else:
                 identity = None
             if isinstance(identity, str) and identity.strip() and len(identity) <= 512:
@@ -188,7 +192,9 @@ def files(root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("COMMONPLACE_URL"))
-    parser.add_argument("--source", required=True, choices=("claude-code", "codex"))
+    parser.add_argument(
+        "--source", required=True, choices=("claude-code", "codex", agent_log.SOURCE)
+    )
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--root", type=Path)
     selection.add_argument("--file", type=Path)

@@ -14,8 +14,9 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import agent_log
 from .capture_client import CaptureError, endpoint
-from .sync_protocol import BACKFILL_WRITES, CURSOR_MESSAGE, TOKEN_ENV
+from .sync_protocol import BACKFILL_WRITES, CURSOR_MESSAGE, TOKEN_ENV, TRANSCRIPT_SOURCES
 
 
 def register(sub):
@@ -90,7 +91,7 @@ def _selections(args, home):
         source, _, root = value.partition(":")
         if source == "cursor":
             return None, None
-        if source not in ("claude-code", "codex", "t3") or (source == "t3" and not root):
+        if source not in TRANSCRIPT_SOURCES or (source in ("t3", agent_log.SOURCE) and not root):
             raise ValueError("Select a native transcript source")
         default = home / (".claude/projects" if source == "claude-code" else ".codex/sessions")
         path = Path(root).expanduser().absolute() if root else default

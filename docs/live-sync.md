@@ -38,6 +38,10 @@ at the same location so the service can restart.
 
 `--source claude-code:ROOT` and `--source codex:ROOT` narrow selection; defaults
 are `~/.claude/projects` and `~/.codex/sessions`.
+`--source agent-log:ROOT` syncs any other agent through the
+[agent-log format](transcript-capture.md#any-other-agent-the-agent-log-source); it has no
+default root and uses its own `COMMONPLACE_CAPTURE_TOKEN_AGENT_LOG`, from a connection
+with client `agent-log`.
 Native scans skip symlinks and wait for complete records.
 Legacy `--memory` synchronization is disabled; memory-once is not available yet.
 Memory roots are not inspected, even when retained in old configuration.
