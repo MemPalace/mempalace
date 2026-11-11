@@ -57,13 +57,16 @@ export function createHost({ reply } = {}) {
   }
 }
 
-function fakeHandle(spec, { exitCode = 0, stdout = '', stderr = '', delayMs = 0, hang = false }) {
+// `until` is a promise the test controls: the run ends when it settles, never on
+// a timer, so a test can hold a run open for exactly as long as it needs.
+function fakeHandle(spec, { exitCode = 0, stdout = '', stderr = '', delayMs = 0, hang = false, until }) {
   const reader = (text) => ({ readFrom: (from) => ({ text: text.slice(from), nextOffset: text.length, lossy: false }) })
   const done = new Promise((resolve) => {
     const aborted = () => resolve({ exitCode: null, signal: 'SIGTERM' })
     if (spec.signal?.aborted) return aborted()
     spec.signal?.addEventListener('abort', aborted, { once: true })
-    if (!hang) setTimeout(() => resolve({ exitCode, signal: null }), delayMs)
+    if (until !== undefined) until.then(() => resolve({ exitCode, signal: null }))
+    else if (!hang) setTimeout(() => resolve({ exitCode, signal: null }), delayMs)
   })
   return {
     stdin: undefined,
@@ -140,3 +143,39 @@ export function render(assembly) {
 }
 
 export const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Ends a wait that never comes. It is not a budget: nothing asserts it is fast. */
+export const HANG_GUARD_MS = 30_000
+
+/** Poll until `condition` (sync or async) holds; the guard only ends a test whose condition never comes true. */
+export async function waitFor(condition) {
+  const end = Date.now() + HANG_GUARD_MS
+  while (!(await condition())) {
+    if (Date.now() > end) throw new Error('condition never became true')
+    await tick(2)
+  }
+}
+
+/**
+ * Whether `promise` settles on its own. The plugin code under test then has no
+ * timer left that could end the wait, so a build that waits never settles and
+ * the hang guard answers false, however fast or slow the host is.
+ */
+export async function settles(promise) {
+  let timer
+  const guard = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(false), HANG_GUARD_MS)
+  })
+  try {
+    return await Promise.race([promise.then(() => true, () => true), guard])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * One full turn of the event loop. A step that waits only on promises has
+ * happened by then, on any host; a step that waits on I/O or a timer may not
+ * have. Use it only where the step a broken build would take is promise-only.
+ */
+export const loopTurn = () => new Promise((resolve) => setImmediate(resolve))

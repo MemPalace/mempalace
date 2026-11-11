@@ -1,11 +1,15 @@
-"""Rules injection tests give the same answers on a host too slow for the budget."""
+"""Functional rules-injection tests keep their frozen deadline clock on a starved host.
 
-import os
-import subprocess
-import sys
-from pathlib import Path
+``tests/_slow_host_plugin.py`` makes every read of the deadline clock burn the
+whole injection budget. The functional tests freeze that clock themselves
+(``frozen_deadline_clock`` in ``tests/test_commonplace_rules_inject.py``), so
+the starved clock never reaches them: this test fails if one of them stops
+freezing it. It does not exercise injection against a slow clock; the budget
+has its own deterministic and `timing` tests.
+"""
 
-ROOT = Path(__file__).resolve().parent.parent
+from tests._slow_host import run_under
+
 FUNCTIONAL = [
     "tests/test_commonplace_rules_inject.py::test_authorized_text_scopes_and_owner_edits",
     "tests/test_commonplace_rules_inject.py::test_moved_rule_and_subagent_get_only_their_own_rules",
@@ -14,18 +18,5 @@ FUNCTIONAL = [
 ]
 
 
-def test_functional_injection_tests_pass_when_every_clock_read_is_slow():
-    env = dict(
-        os.environ, PYTHONPATH=os.pathsep.join([str(ROOT), os.environ.get("PYTHONPATH", "")])
-    )
-    run = subprocess.run(
-        [
-            sys.executable, "-m", "pytest", "-p", "tests._slow_host_plugin",
-            "-p", "no:cacheprovider", "-p", "no:xdist", "-q", "--no-header",
-            "-o", "addopts=-m 'not benchmark and not slow and not stress and not timing'",
-            *FUNCTIONAL,
-        ],
-        cwd=ROOT, env=env, capture_output=True, text=True, timeout=300,
-    )  # fmt: skip
-    assert run.returncode == 0, run.stdout[-3000:] + run.stderr[-1000:]
-    assert " passed" in run.stdout and "skipped" not in run.stdout
+def test_functional_injection_tests_keep_their_frozen_clock_when_the_host_clock_is_starved():
+    run_under(["tests._slow_host_plugin"], FUNCTIONAL)

@@ -867,14 +867,15 @@ def create_tunnel(
     return stored
 
 
-def list_tunnels(wing: str = None):
+def list_tunnels(wing: str = None, config=None):
     """List all explicit tunnels, optionally filtered by wing.
 
     Returns tunnels where ``wing`` appears as either source or target
     (tunnels are symmetric, so either endpoint is a valid filter match).
+    ``config`` selects the palace, as in :func:`create_tunnel`.
     """
     norm_wing = _normalize_wing(wing)
-    tunnels = _load_tunnels()
+    tunnels = _load_tunnels(config)
     if norm_wing:
         # Normalize stored wings too: older tunnels.json records hold the
         # underscore form (from the prior write-path normalization), while
@@ -891,16 +892,19 @@ def list_tunnels(wing: str = None):
     return tunnels
 
 
-def delete_tunnel(tunnel_id: str, *, expect=None):
-    """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
-    with mine_lock(_get_tunnel_file()):
-        tunnels = _load_tunnels(for_write=True)
+def delete_tunnel(tunnel_id: str, *, expect=None, config=None):
+    """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``.
+
+    ``config`` selects the palace, as in :func:`create_tunnel`.
+    """
+    with mine_lock(_get_tunnel_file(config)):
+        tunnels = _load_tunnels(config, for_write=True)
         if expect is not None:
             target = next((t for t in tunnels if t.get("id") == tunnel_id), None)
             if target is None or {k: target.get(k) for k in ("source", "target")} != expect:
                 return {"deleted": tunnel_id}
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
-        _save_tunnels(tunnels)
+        _save_tunnels(tunnels, config)
     return {"deleted": tunnel_id}
 
 

@@ -6,7 +6,7 @@ import { test } from 'node:test'
 
 import { projectWing, yamlWing } from '../lib/palace.js'
 import * as recall from '../lib/recall.js'
-import { createAgent, createHost, render, tick } from './host.mjs'
+import { createAgent, createHost, render, settles, tick, waitFor } from './host.mjs'
 
 const WAKEUP = [
   'Wake-up text (~40 tokens):',
@@ -18,6 +18,11 @@ const WAKEUP = [
   '  - chose the append-only transcript (dsh plugin)',
   '',
 ].join('\n')
+
+// These tests assert a wall-clock budget, so a loaded host can fail them.
+// tests/test_dsh_plugin.py runs them as a `timing` test, apart from the
+// functional suite, which sets DSH_SKIP_TIMING=1.
+const timing = { skip: process.env.DSH_SKIP_TIMING === '1' && 'a timing test (tests/test_dsh_plugin.py)' }
 
 const wakeUp = (stdout, extra = {}) => (spec) => (spec.argv.includes('wake-up') ? { stdout, ...extra } : {})
 
@@ -109,7 +114,7 @@ test('session-start re-fired by compact or clear registers nothing twice', async
   assert.equal(host.warnings.length, 0)
 })
 
-test('a slow palace costs the first call at most the budget, then memory lands', async () => {
+test('a slow palace costs the first call at most the budget, then memory lands', timing, async () => {
   const host = createHost({ reply: wakeUp(WAKEUP, { delayMs: 150 }) })
   recall.apply(host.ctx, { firstAssemblyBudgetMs: 20 })
   const { agent, assemble } = createAgent()
@@ -124,18 +129,32 @@ test('a slow palace costs the first call at most the budget, then memory lands',
   assert.match(render(await assemble()), /I am Atlas/)
 })
 
-test('an aborted turn stops waiting for memory at once', async () => {
-  const host = createHost({ reply: wakeUp(WAKEUP, { delayMs: 500 }) })
-  recall.apply(host.ctx, {})
+// The palace read below is held open until the test releases it, and the
+// first-assembly budget and the CLI timeout are both longer than the hang
+// guard, so only the abort can end the wait: a build that ignored it would
+// never settle.
+const NEVER_BY_BUDGET = { firstAssemblyBudgetMs: 10 * 60_000, timeoutMs: 10 * 60_000 }
+
+function heldWakeUp() {
+  let release
+  const read = new Promise((resolve) => {
+    release = resolve
+  })
+  return { reply: wakeUp(WAKEUP, { until: read }), release }
+}
+
+test('an aborted turn stops waiting for memory without the read finishing', async () => {
+  const palace = heldWakeUp()
+  const host = createHost({ reply: palace.reply })
+  recall.apply(host.ctx, NEVER_BY_BUDGET)
   const { agent, assemble } = createAgent()
   host.emit('agent/session-start', { agent, source: 'startup' })
 
   const controller = new AbortController()
-  const started = Date.now()
   const pending = assemble({ signal: controller.signal })
   controller.abort()
-  await pending
-  assert.ok(Date.now() - started < 200)
+  assert.ok(await settles(pending), 'the aborted assembly settled while the read was still held')
+  palace.release()
 })
 
 test('subagent sessions get no memory unless opted in', async () => {
@@ -173,6 +192,9 @@ test('a hung CLI is cut off at the timeout', async () => {
   host.emit('agent/session-start', { agent, source: 'startup' })
 
   assert.equal(render(await assemble()), '')
+  // The first-assembly budget can end the wait before the CLI timeout is
+  // reported on a loaded host; the timeout warning still has to come.
+  await waitFor(() => host.warnings.length > 0)
   assert.match(host.warnings[0], /timed out after 30ms/)
 })
 
@@ -232,7 +254,7 @@ test('unloading the plugin removes the section from live agents', async () => {
   assert.equal(render(await assemble()), '')
 })
 
-test('a palace slower than the budget delays only the first assembly, not every step', async () => {
+test('a palace slower than the budget delays only the first assembly, not every step', timing, async () => {
   const host = createHost({ reply: wakeUp(WAKEUP, { delayMs: 1500 }) })
   recall.apply(host.ctx, { firstAssemblyBudgetMs: 300 })
   const { agent, assemble } = createAgent()
@@ -247,19 +269,20 @@ test('a palace slower than the budget delays only the first assembly, not every 
   assert.match(render(await assemble()), /I am Atlas/)
 })
 
-test('a turn cancelled before assembly does not wait, and leaves the wait for the next assembly', async () => {
-  const host = createHost({ reply: wakeUp(WAKEUP, { delayMs: 800 }) })
-  recall.apply(host.ctx, {})
+test('a turn cancelled before assembly settles without the read, and leaves the wait for the next assembly', async () => {
+  const palace = heldWakeUp()
+  const host = createHost({ reply: palace.reply })
+  recall.apply(host.ctx, NEVER_BY_BUDGET)
   const { agent, assemble } = createAgent()
   host.emit('agent/session-start', { agent, source: 'startup' })
 
   const controller = new AbortController()
   controller.abort()
-  const started = Date.now()
-  await assemble({ signal: controller.signal })
-  assert.ok(Date.now() - started < 400, 'an already-cancelled turn returned at once')
+  assert.ok(await settles(assemble({ signal: controller.signal })), 'an already-cancelled turn settled while the read was still held')
 
-  assert.match(render(await assemble()), /I am Atlas/, 'the next assembly still waited for the memory')
+  const next = assemble()
+  palace.release()
+  assert.match(render(await next), /I am Atlas/, 'the next assembly still waited for the memory')
 })
 
 test('a stored line that starts like a CLI hint stays in memory', () => {
@@ -274,15 +297,14 @@ test('a stored line that starts like a CLI hint stays in memory', () => {
 
 test('unloading the plugin cancels a wake-up still running, without warning about it', async () => {
   const host = createHost({ reply: () => ({ hang: true }) })
-  recall.apply(host.ctx, { timeoutMs: 60_000 })
+  // The CLI timeout is longer than the hang guard: only the cancel can end it.
+  recall.apply(host.ctx, { timeoutMs: 10 * 60_000 })
   const { agent } = createAgent()
   host.emit('agent/session-start', { agent, source: 'startup' })
-  for (let i = 0; i < 100 && host.spawns.length === 0; i += 1) await tick(5)
+  await waitFor(() => host.spawns.length > 0)
   assert.equal(host.spawns.length, 1)
 
-  const started = Date.now()
-  await host.unload()
-  assert.ok(Date.now() - started < 2000, 'unload did not wait for the CLI timeout')
+  assert.ok(await settles(host.unload()), 'unload did not wait for the CLI timeout')
   assert.equal(host.warnings.length, 0)
 })
 

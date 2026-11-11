@@ -13,6 +13,9 @@ from .client import Client
 
 MAX_INPUT_BYTES = 64 * 1024
 MAX_CONTEXT_BYTES = 256 * 1024
+# The startup hook's whole allowance for the hub; past it the hook fails open
+# to FOLLOWUP so a slow or absent hub never holds up the agent.
+HUB_TIMEOUT_S = 0.4
 GUIDANCE = (
     "Commonplace is the single source of rules and memory. "
     "Automatically call session_start at start, resume, after compaction, and whenever context is incomplete. "
@@ -47,7 +50,8 @@ def _session(args, payload):
     query = payload.get("prompt")
     if not isinstance(query, str) or not query.strip() or len(query) > 1000:
         query = None
-    context = Client(url=args.url, token_env=args.token_env, timeout=0.4).fetch_context(query=query)
+    client = Client(url=args.url, token_env=args.token_env, timeout=HUB_TIMEOUT_S)
+    context = client.fetch_context(query=query)
     if (
         not isinstance(context, str)
         or not context.strip()

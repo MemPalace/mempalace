@@ -104,10 +104,17 @@ def test_tunnel_write_requires_readable_endpoints(world, private_endpoint):
         "label": "shared control",
     }
     assert _payload(w.rpc(w.member, "mempalace_create_tunnel", args))
+    # Tunnels need real endpoint rooms, so the private room holds a drawer;
+    # no tunnel touches it yet.
+    status, saved = w.http(
+        w.owner, "/api/memory", {"text": PRIVATE, "theme": "private_notes", "topic": PRIVATE_ROOM}
+    )
+    assert status == 201 and saved["id"] == PRIVATE_ID, saved
     args[private_endpoint + "_wing"] = "private_notes"
     args[private_endpoint + "_room"] = PRIVATE_ROOM
     absent = w.rpc(w.member, "mempalace_create_tunnel", args)
-    _payload(w.rpc(w.owner, "mempalace_create_tunnel", {**args, "label": PRIVATE}))
+    created = _payload(w.rpc(w.owner, "mempalace_create_tunnel", {**args, "label": PRIVATE}))
+    assert "error" not in created, created
     before = _payload(w.rpc(w.owner, "mempalace_list_tunnels"))
     hidden = next(row for row in before if row.get("label") == PRIVATE)
     present = w.rpc(w.member, "mempalace_create_tunnel", {**args, "label": "overwrite attempt"})

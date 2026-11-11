@@ -6,7 +6,7 @@ import { afterEach, beforeEach, test } from 'node:test'
 
 import * as autosave from '../lib/autosave.js'
 import { TranscriptLog, recordFor, transcriptFileName } from '../lib/transcript.js'
-import { createAgent, createHost, tick } from './host.mjs'
+import { createAgent, createHost, loopTurn, waitFor } from './host.mjs'
 
 let dir
 beforeEach(async () => {
@@ -40,9 +40,7 @@ const readLines = async (file) =>
 
 const hookCalls = (host) => host.spawns.filter((spec) => spec.argv.includes('hook'))
 
-async function settle(host) {
-  for (let i = 0; i < 20; i += 1) await tick(5)
-}
+const linesIn = (file) => readLines(file).catch(() => [])
 
 test('only words the user wrote, and assistant text, become transcript records', () => {
   const pluginContext = { ...userSaid(1, 'harness context'), data: { ...userSaid(1, 'x').data, source: { kind: 'plugin', plugin: 'hooks-claude-code' } } }
@@ -82,7 +80,7 @@ test('a turn files the transcript through the dsh stop hook without making the t
   assert.equal(returned, undefined, 'turn-stopping schedules and returns')
   assert.equal(hookCalls(host).length, 0, 'no hook has started by the time the turn closes')
 
-  await settle(host)
+  await waitFor(() => hookCalls(host).length === 1)
   const [call] = hookCalls(host)
   assert.deepEqual(call.argv, ['/usr/local/bin/mempalace', 'hook', 'run', '--hook', 'stop', '--harness', 'dsh'])
   const file = path.join(dir, transcriptFileName('sess/1'))
@@ -114,10 +112,11 @@ test('compaction runs the precompact hook and never shrinks the transcript', asy
   host.emit('session/event', session, { type: 'compaction/start', seq: 2, time: Date.now(), data: {} })
   host.emit('session/event', session, { ...assistantSaid(3, [{ type: 'text', text: 'summary of first words' }]), surfaceOp: { op: 'replace', startSeq: 1, endSeq: 1 } })
   host.emit('session/event', session, userSaid(4, 'after compaction'))
-  await settle(host)
+  const file = path.join(dir, transcriptFileName('session-1'))
+  await waitFor(async () => hookCalls(host).length === 1 && (await linesIn(file)).length === 2)
 
   assert.deepEqual(hookCalls(host).map((spec) => spec.argv[4]), ['precompact'])
-  const lines = await readLines(path.join(dir, transcriptFileName('session-1')))
+  const lines = await readLines(file)
   assert.deepEqual(lines.map((line) => line.message.content), ['first words', 'after compaction'])
 })
 
@@ -127,7 +126,7 @@ test('a disposed session gets its session-end hook', async () => {
   const { session } = createAgent()
   host.emit('session/event', session, userSaid(1, 'short but useful'))
   host.emit('session/disposed', session)
-  await settle(host)
+  await waitFor(() => hookCalls(host).length === 1)
 
   const [call] = hookCalls(host)
   assert.equal(call.argv[4], 'session-end')
@@ -135,18 +134,29 @@ test('a disposed session gets its session-end hook', async () => {
 })
 
 test('hooks run one at a time per session, and repeats already queued collapse', async () => {
-  const host = createHost({ reply: () => ({ delayMs: 40, stdout: '{}' }) })
+  // Only the first run is held open, and the test releases it: how long a run
+  // takes never decides what the second one saw.
+  let release
+  const firstRun = new Promise((resolve) => {
+    release = resolve
+  })
+  let runs = 0
+  const host = createHost({ reply: () => ({ stdout: '{}', ...(runs++ === 0 ? { until: firstRun } : {}) }) })
   autosave.apply(host.ctx, { transcriptDir: dir })
   const { agent, session } = createAgent()
   host.emit('session/event', session, userSaid(1, 'hello'))
 
   host.emit('agent/turn-stopping', { agent, turn: 1 })
-  await tick(10)
+  await waitFor(() => hookCalls(host).length === 1)
   for (let turn = 2; turn <= 5; turn += 1) host.emit('agent/turn-stopping', { agent, turn })
-  await tick(10)
+  // A build that did not wait would have spawned the second run by now: the
+  // transcript is already flushed, so nothing but promise reactions is left.
+  await loopTurn()
   assert.equal(hookCalls(host).length, 1, 'the second run waits for the first')
 
-  await tick(150)
+  release()
+  // Unloading waits for every queued run, so the count below is final.
+  await host.unload()
   assert.equal(hookCalls(host).length, 2, 'four queued stops ran as one')
 })
 
@@ -156,7 +166,9 @@ test('a session with nothing said yet runs no hook', async () => {
   const { agent, session } = createAgent()
   host.emit('session/event', session, { type: 'turn/start', seq: 1, time: Date.now(), data: {} })
   host.emit('agent/turn-stopping', { agent, turn: 1 })
-  await settle(host)
+  // Unloading waits for every run that went through schedule(), so none of
+  // those can still be on its way. A spawn outside schedule() is not seen here.
+  await host.unload()
   assert.equal(host.spawns.length, 0)
 })
 
@@ -166,7 +178,9 @@ test('subagent sessions are not filed unless opted in', async () => {
   const child = createAgent({ id: 'child', origin: 'subagent' })
   host.emit('session/event', child.session, userSaid(1, 'delegated prompt'))
   host.emit('agent/turn-stopping', { agent: child.agent, turn: 1 })
-  await settle(host)
+  // Unloading waits for every run that went through schedule() and its
+  // transcript flush. A spawn or write outside schedule() is not seen here.
+  await host.unload()
   assert.equal(host.spawns.length, 0)
   await assert.rejects(readFile(path.join(dir, transcriptFileName('child'))), { code: 'ENOENT' })
 })
@@ -177,7 +191,7 @@ test('a legacy block decision is reported, not silently lost', async () => {
   const { agent, session } = createAgent()
   host.emit('session/event', session, userSaid(1, 'hello'))
   host.emit('agent/turn-stopping', { agent, turn: 1 })
-  await settle(host)
+  await waitFor(() => host.warnings.length > 0)
   assert.match(host.warnings.join('\n'), /hooks\.silent_save is false/)
 })
 
@@ -188,9 +202,11 @@ test('a failing hook is logged and the next turn still saves', async () => {
   const { agent, session } = createAgent()
   host.emit('session/event', session, userSaid(1, 'hello'))
   host.emit('agent/turn-stopping', { agent, turn: 1 })
-  await settle(host)
+  await waitFor(() => host.warnings.length === 1)
   host.emit('agent/turn-stopping', { agent, turn: 2 })
-  await settle(host)
+  await waitFor(() => hookCalls(host).length === 2)
+  // The count below is final once every run has finished.
+  await host.unload()
 
   assert.equal(hookCalls(host).length, 2)
   assert.match(host.warnings[0], /hook stop failed for session-1: exit 2: palace locked/)
@@ -230,7 +246,7 @@ test('a session whose workspace is gone still runs its hook, with its own cwd in
   const { session } = createAgent({ cwd: gone })
   host.emit('session/event', session, userSaid(1, 'hello'))
   host.emit('session/disposed', session)
-  await settle(host)
+  await waitFor(() => hookCalls(host).length === 1)
 
   const [call] = hookCalls(host)
   assert.equal(call.cwd, homedir())
@@ -257,7 +273,7 @@ test('a relative transcriptDir is resolved once, so the hook reads the file the 
   const { session } = createAgent({ cwd: previous })
   host.emit('session/event', session, userSaid(1, 'hello'))
   host.emit('session/disposed', session)
-  await settle(host)
+  await waitFor(() => hookCalls(host).length === 1)
 
   const { transcript_path: transcriptPath } = JSON.parse(hookCalls(host)[0].stdio.stdin.data)
   assert.ok(path.isAbsolute(transcriptPath), transcriptPath)
@@ -266,14 +282,30 @@ test('a relative transcriptDir is resolved once, so the hook reads the file the 
 })
 
 test('unloading waits for a hook still running', async () => {
-  const host = createHost({ reply: () => ({ delayMs: 60, stdout: '{}' }) })
+  // The hook ends when the test says so, not after a delay: no host, however
+  // slow, can finish it before unloading starts.
+  let release
+  const finish = new Promise((resolve) => {
+    release = resolve
+  })
+  const host = createHost({ reply: () => ({ until: finish, stdout: '{}' }) })
   autosave.apply(host.ctx, { transcriptDir: dir })
   const { agent, session } = createAgent()
   host.emit('session/event', session, userSaid(1, 'hello'))
   host.emit('agent/turn-stopping', { agent, turn: 1 })
-  await tick(10)
+  await waitFor(() => hookCalls(host).length === 1)
 
-  const started = Date.now()
-  await host.unload()
-  assert.ok(Date.now() - started >= 30, 'unload joined the in-flight hook')
+  let unloaded = false
+  const unloading = host.unload().then(() => {
+    unloaded = true
+  })
+  // An unload that did not join the hook, and returned through promises
+  // only, would be done after one turn of the loop. (One that first waited on
+  // I/O would not be caught here; the release below still checks it finishes.)
+  await loopTurn()
+  assert.equal(unloaded, false, 'unload joined the in-flight hook')
+
+  release()
+  await unloading
+  assert.equal(unloaded, true)
 })

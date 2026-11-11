@@ -1370,8 +1370,9 @@ def test_follow_tunnels_records_without_the_writer_lease(monkeypatch):
 
     captured = {}
 
-    def _fake_follow(wing, room, col=None, record=True):
+    def _fake_follow(wing, room, col=None, config=None, record=True):
         captured["record"] = record
+        captured["config"] = config
         return [{"tunnel_id": "t1"}]
 
     monkeypatch.setattr(mcp_server, "follow_tunnels", _fake_follow)
@@ -1383,6 +1384,8 @@ def test_follow_tunnels_records_without_the_writer_lease(monkeypatch):
         monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", peer_holds_lease)
         assert mcp_server.tool_follow_tunnels("wing_a", "room_a") == [{"tunnel_id": "t1"}]
         assert captured["record"] is True
+        # The tunnel file is the server's palace's, never the ambient default's.
+        assert captured["config"] is mcp_server._config
 
     mcp_server.tool_follow_tunnels("wing_a", "room_a", record=False)
     assert captured["record"] is False
