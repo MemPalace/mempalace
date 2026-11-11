@@ -460,7 +460,11 @@ def search_memories(
                     meta.get("extract_mode"),
                     meta.get("historical_version") is True,
                 )
-                if meta.get("ingest_mode") == "convos" and "chunk_total" in meta
+                if (
+                    visibility_filter is not None
+                    and meta.get("ingest_mode") == "convos"
+                    and "chunk_total" in meta
+                )
                 else None
             ),
         }
