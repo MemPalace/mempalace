@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 let input = ''; for await (const part of process.stdin) input += part;
 const sources = JSON.parse(input);
 const load = text => import(`data:text/javascript;base64,${Buffer.from(text).toString('base64')}`);
-const { createRunnerBlock, parseList } = await load(sources.adminrunners);
+const { createRunnerBlock, parseList, chosenWings } = await load(sources.adminrunners);
 const { createAdmin } = await load(sources.admin);
 const e = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const flush = async () => { for (let i = 0; i < 40; i++) await Promise.resolve(); };
@@ -42,7 +42,7 @@ function fixture({ machines, wings = ['shared', 'team'], fail = {}, wingsGate = 
     const key = `${options.method || 'GET'} ${path}`;
     if (fail[key]) throw Object.assign(new Error(fail[key]), { status: 409 });
     if (path === '/api/runners' && !options.method) return { machines: state.machines };
-    if (path === '/api/connections') { await wingsGate; return { wings, connections: [] }; }
+    if (path === '/api/runners/wings' || path === '/api/connections') { await wingsGate; return { wings, connections: [] }; }
     if (path === '/api/runners' && options.method === 'POST') return { machine_id: 'mach_0123456789abcdef', machine_token: TOKENS.machine, worker_token: TOKENS.worker, binding_state: 'unbound' };
     return { ok: true };
   };
@@ -69,7 +69,7 @@ const field = (name, value, type = 'text', checked = false) => ({ name, value, t
 {
   const f = fixture({ machines: [machine({ label: 'x<img>', wings: ['shared', 'legacy'] })], wings: ['shared', 'team'] });
   f.block.show(f.host); await flush();
-  assert.deepEqual(f.calls.map(c => c.path).sort(), ['/api/connections', '/api/runners']);
+  assert.deepEqual(f.calls.map(c => c.path).sort(), ['/api/runners', '/api/runners/wings'], 'wings come from the runner route, not the slow connections listing');
   assert.ok(f.calls.every(c => c.method === 'GET'));
   const list = f.regions.list.innerHTML, enroll = f.regions['enroll-slot'].innerHTML;
   assert.doesNotMatch(list, /<img>/); assert.match(list, /x&lt;img&gt;/);
@@ -197,12 +197,27 @@ const field = (name, value, type = 'text', checked = false) => ({ name, value, t
   const f = fixture({ wingsGate });
   f.block.show(f.host); await flush();
   assert.doesNotMatch(f.regions.list.innerHTML, /Loading runner machines/);
-  assert.ok(f.calls.timeouts['GET /api/runners'] > 0 && f.calls.timeouts['GET /api/connections'] > 0, 'both reads are bounded by a timeout');
+  assert.ok(f.calls.timeouts['GET /api/runners'] > 0 && f.calls.timeouts['GET /api/runners/wings'] > 0, 'both reads are bounded by a timeout');
   assert.match(f.regions.list.innerHTML, /bench-1/);
   assert.match(f.regions.list.innerHTML, /Loading wings/); assert.doesNotMatch(f.regions.list.innerHTML, /type="checkbox"/);
   release(); await flush();
   assert.match(f.regions.list.innerHTML, /name="wings" value="shared" checked/);
   assert.match(f.regions['enroll-slot'].innerHTML, /name="wings" value="team"/);
+  f.block.stop();
+}
+// 4g. A failed wing read still leaves a usable editor: granted wings stay ticked and new ones can be typed.
+{
+  const f = fixture({ fail: { 'GET /api/runners/wings': 'timed out', 'GET /api/connections': 'timed out' } });
+  f.block.show(f.host); await flush();
+  const list = f.regions.list.innerHTML, enroll = f.regions['enroll-slot'].innerHTML;
+  assert.match(list, /name="wings" value="shared" checked/, 'the granted wing stays editable');
+  assert.match(list, /name="typed_wings"/); assert.match(enroll, /name="typed_wings"/);
+  assert.match(list, /could not be loaded\. Type a wing name/);
+  await f.submit('wings', 'mach_aaaaaaaaaaaaaaaa', [field('wings', 'shared', 'checkbox', true), field('typed_wings', ' project_compute, shared ')]);
+  assert.deepEqual(f.calls.find(c => c.method === 'PATCH').body, { wings: ['shared', 'project_compute'] });
+  assert.match(f.regions.status.textContent, /Wings saved/);
+  await f.submit('enroll', undefined, [field('label', 'bench-2'), field('projects', 'demo'), field('topics', 'worker'), field('typed_wings', 'team'), field('max_runtime_mode', 'auto'), field('max_in_flight', '1')]);
+  assert.deepEqual(f.calls.find(c => c.method === 'POST').body.wings, ['team']);
   f.block.stop();
 }
 // 4f. A failed machine read replaces the loading text instead of leaving it up.
@@ -217,6 +232,7 @@ const field = (name, value, type = 'text', checked = false) => ({ name, value, t
 assert.deepEqual(leaks, [], 'nothing is written to local or session storage');
 assert.doesNotMatch(ledger.join('\n'), /CANARY/, 'tokens are never logged');
 assert.deepEqual(parseList(' a, b ,,a'), ['a', 'b']);
+assert.deepEqual(chosenWings({ wings: ['a'], typed_wings: 'b, a' }), ['a', 'b']);
 
 // 5. Admin keeps the runner block outside its refreshing body and tears it down.
 {

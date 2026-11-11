@@ -52,6 +52,7 @@ EXACT = {
     # Machine runner (commonplace/runner), inert until an owner attests.
     ("GET", "/api/runners"): "authenticated",
     ("POST", "/api/runners"): "authenticated",
+    ("GET", "/api/runners/wings"): "authenticated",
     ("POST", "/api/card-starts"): "authenticated",
     ("GET", "/api/card-starts"): "authenticated",
     ("POST", "/api/runner/usage"): "authenticated",

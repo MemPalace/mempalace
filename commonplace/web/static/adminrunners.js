@@ -1,11 +1,13 @@
 /** Owner screen for runner machines: enroll, attest, edit wings and revoke. Tokens live only in the reveal panel. */
 const MODES = ['approval-required', 'auto-accept-edits', 'auto', 'full-access'];
 const SETUP_NOTE = 'Setup: put the machine token in the environment variable the runner config names as token_env, and the worker token in the Commonplace MCP entry of the worker\'s provider instance. Set hub_url to this site\'s address, then run "python -m commonplace runner check --config <file>" before starting the runner. See docs/runner.md.';
-// The wings read goes through the memory backend and can be slow; the machine list must never wait on it.
-const LIST_TIMEOUT_MS = 15000, WINGS_TIMEOUT_MS = 30000;
+// The wing list is a separate read; the machine list never waits on it, and a failed read still lets the owner type a wing.
+const LIST_TIMEOUT_MS = 15000, WINGS_TIMEOUT_MS = 15000;
 const RESET_NOTE = 'Changing wings or topics resets this machine to unbound: queued and leased starts are cancelled and the machine must be attested again. Saving the same wings only refreshes the worker\'s access.';
 
 export const parseList = text => [...new Set(String(text || '').split(',').map(part => part.trim()).filter(Boolean))];
+// Ticked wings plus any typed while the wing list was unavailable; the server checks that each exists.
+export const chosenWings = values => [...new Set([...(values.wings || []), ...parseList(values.typed_wings)])];
 
 // Reads named controls through form.elements; checkbox groups become arrays.
 export function fieldValues(form) {
@@ -25,7 +27,7 @@ export function enrollBody(values) {
     label: String(values.label || '').trim(),
     projects: parseList(values.projects),
     topics: parseList(values.topics),
-    wings: values.wings || [],
+    wings: chosenWings(values),
     max_runtime_mode: values.max_runtime_mode,
     max_in_flight: Number(values.max_in_flight),
   };
@@ -46,10 +48,12 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
     const node = region('status');
     if (node) { node.textContent = text; node.dataset.state = bad ? 'error' : 'ok'; }
   };
-  const wingBoxes = (selected, name = 'wings') => {
-    const all = [...new Set([...wings, ...selected])].sort();
+  const wingBoxes = selected => {
     if (wingsPending) return '<p>Loading wings…</p>';
-    return all.length ? `<fieldset><legend>Wings</legend>${all.map(w => `<label><input type="checkbox" name="${name}" value="${e(w)}"${selected.includes(w) ? ' checked' : ''}>${e(w)}</label>`).join('')}</fieldset>` : `<p>${wingsError ? 'Wings could not be loaded. Reload to try again.' : 'No readable wings yet.'}</p>`;
+    const all = [...new Set([...wings, ...selected])].sort();
+    const boxes = all.length ? `<fieldset><legend>Wings</legend>${all.map(w => `<label><input type="checkbox" name="wings" value="${e(w)}"${selected.includes(w) ? ' checked' : ''}>${e(w)}</label>`).join('')}</fieldset>` : '';
+    if (wingsError) return `${boxes}<p>The wing list could not be loaded. Type a wing name to add it, or reload to try again.</p><label>Add wings (comma separated)<input name="typed_wings" autocomplete="off"></label>`;
+    return boxes || '<p>No readable wings yet.</p>';
   };
   const enrollForm = () => `<form class="agent-form" data-runner-form="enroll"><h3>Add runner</h3>
     <label>Label<input name="label" required maxlength="40" pattern="[a-z0-9][a-z0-9._-]*" autocomplete="off"></label>
@@ -96,7 +100,7 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
 
   async function load(resetForm = false) {
     const mine = epoch;
-    const wingsRead = api('/api/connections', { timeoutMs: WINGS_TIMEOUT_MS }).then(result => ({ wings: result.wings || [], failed: false }), () => ({ wings: [], failed: true }));
+    const wingsRead = api('/api/runners/wings', { timeoutMs: WINGS_TIMEOUT_MS }).then(result => ({ wings: result.wings || [], failed: false }), () => ({ wings: [], failed: true }));
     try {
       const list = await api('/api/runners', { timeoutMs: LIST_TIMEOUT_MS });
       if (mine !== epoch) return;
@@ -130,8 +134,9 @@ export function createRunnerBlock({ api, e, copy = text => globalThis.navigator.
         if (mine !== epoch) return;
         status('Attested. This is your statement; Commonplace does not verify it.');
       } else if (kind === 'wings') {
-        if (!(values.wings || []).length) throw new Error('Choose at least one wing.');
-        await api(`/api/runners/${encodeURIComponent(id)}`, { method: 'PATCH', body: { wings: values.wings } });
+        const chosen = chosenWings(values);
+        if (!chosen.length) throw new Error('Choose at least one wing.');
+        await api(`/api/runners/${encodeURIComponent(id)}`, { method: 'PATCH', body: { wings: chosen } });
         if (mine !== epoch) return;
         status('Wings saved. Attest the machine again if it was reset.');
       }

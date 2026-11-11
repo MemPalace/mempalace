@@ -436,3 +436,82 @@ def test_T2_labels_are_unique_until_revocation(signup_hub, owners):
     assert replacement["machine_id"] != machine["machine_id"]
     assert hub.db.authenticate_token(machine["machine_token"]) is None
     assert hub.db.authenticate_token(machine["worker_token"]) is None
+
+
+def _slow_listing(hub, monkeypatch):
+    """Stand in for the drawer-by-drawer wing listing that timed out on a large palace (#451)."""
+    from commonplace.extensions import ToolError
+
+    calls, real = [], hub.gateway.call_memory_tool
+
+    def call_memory_tool(principal, name, arguments):
+        if name == "mempalace_list_wings":
+            calls.append(name)
+            raise ToolError("Memory wing listing timed out")
+        return real(principal, name, arguments)
+
+    monkeypatch.setattr(hub.gateway, "call_memory_tool", call_memory_tool)
+    return calls
+
+
+def test_W1_wing_picker_and_wing_edit_do_not_wait_on_the_drawer_listing(
+    signup_hub, owners, config, monkeypatch
+):
+    from pathlib import Path
+
+    from commonplace.web import agents
+
+    hub, owner = signup_hub, owners["A"]
+    machine = enroll(hub, owner, wings=["shared"])
+    status, body = http(
+        hub.port,
+        "POST",
+        "/api/memory",
+        cookie=owner["cookie"],
+        body={"text": "Synthetic team example.", "theme": "team", "topic": "demo"},
+    )
+    assert status == 201, (status, body)
+    # The in-process worker keeps its palace at the test config path, not the workspace directory.
+    palace = Path(config.palace_path) / "chroma.sqlite3"
+    monkeypatch.setattr(agents, "_palace_db", lambda gateway, workspace: palace, raising=False)
+    slow = _slow_listing(hub, monkeypatch)
+
+    status, body = http(hub.port, "GET", "/api/runners/wings", cookie=owner["cookie"])
+    assert status == 200, (status, body)
+    assert {"shared", "team"} <= set(body["wings"])
+    status, body = edit(hub, owner, machine, body={"wings": ["shared", "team"]})
+    assert status == 200, (status, body)
+    assert body["wings"] == ["shared", "team"]
+    status, body = edit(hub, owner, machine, body={"wings": ["shared", "missing"]})
+    assert status == 400, (status, body)
+    assert slow == []
+
+
+def test_W2_wing_picker_falls_back_to_the_memory_listing(signup_hub, owners, monkeypatch):
+    hub, owner = signup_hub, owners["A"]
+    enroll(hub, owner, wings=["shared"])
+    status, body = http(hub.port, "GET", "/api/runners/wings", cookie=owner["cookie"])
+    assert status == 200 and "shared" in body["wings"], (status, body)
+    slow = _slow_listing(hub, monkeypatch)
+    status, body = http(hub.port, "GET", "/api/runners/wings", cookie=owner["cookie"])
+    assert status == 503 and slow == ["mempalace_list_wings"], (status, body)
+    status, _ = http(hub.port, "GET", "/api/runners/wings")
+    assert status == 401, status
+
+
+def test_W3_index_read_skips_private_and_bookkeeping_only_wings(seeded_collection, palace_path):
+    from pathlib import Path
+
+    from commonplace.web import agents
+
+    seeded_collection.add(
+        ids=["_reg_source", "sentinel_source", "drawer_private"],
+        documents=["registry row", "sentinel row", "private text"],
+        metadatas=[
+            {"wing": "only_registry", "room": "r", "ingest_mode": "registry"},
+            {"wing": "only_sentinel", "room": "r", "is_sentinel": True},
+            {"wing": "private_threads", "room": "r"},
+        ],
+    )
+    names = agents._palace_wing_names(Path(palace_path) / "chroma.sqlite3")
+    assert names == {"project", "notes", "private_threads"}

@@ -12,7 +12,7 @@ from commonplace.http_util import (
     require_principal,
     send_json,
 )
-from commonplace.web.agents import _read_wings
+from commonplace.web.agents import _read_wings, grantable_wings
 
 from . import jobs, registry
 
@@ -58,6 +58,20 @@ def _if_match(h, *, required=True):
     if not raw.isdigit():
         raise ValueError("If-Match must be the machine's grant_version")
     return int(raw)
+
+
+def _wing_picker(gateway, h):
+    """The wing picker's own read: the names that grant validation accepts."""
+    owner = require_principal(gateway, h)
+    if owner is None:
+        return
+    if not owner.person or owner.role != "owner":
+        send_json(h, 403, {"error": "a signed-in workspace owner is required"})
+        return
+    try:
+        send_json(h, 200, {"wings": grantable_wings(gateway, owner)})
+    except ToolError:
+        send_json(h, 503, {"error": "workspace wings are unavailable; try again"})
 
 
 def register(gateway):
@@ -167,5 +181,6 @@ def register(gateway):
 
     for method in ("GET", "POST"):
         gateway.add_route(method, "/api/runners", manage)
+    gateway.add_route("GET", "/api/runners/wings", lambda h: _wing_picker(gateway, h))
     for method in ("PATCH", "POST", "DELETE"):
         gateway.add_prefix_route(method, "/api/runners/", manage)
