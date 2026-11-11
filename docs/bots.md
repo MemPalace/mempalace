@@ -182,7 +182,34 @@ Filled by a later slice.
 
 ## Machines
 
-Filled by a later slice.
+A bot can list the machines its person may use and start or cancel an agent on one. It does
+this as the person, through the same checks the runner applies to a person who starts an
+agent from a task: nothing is widened. Today that means workspace owners; a member gets an
+empty list and a short reason.
+
+- **What is listed.** Enrolled machines that are switched on and not revoked: the machine's
+  name, when it was last seen (empty if no contact is recorded), what it may do (start an
+  agent; run a command) and what the owner granted it (projects, topics, areas, the highest
+  run mode). No credential, token or host name is ever shown. A machine that has not been
+  attested yet is listed as `unbound` and cannot start anything.
+- **Attested, not verified.** `owner_attested` means the workspace owner confirmed the machine
+  and its setup. Commonplace does not check the machine itself, so every machine carries
+  `verified: false`.
+- **Starting takes one tap.** The bot has three machine tools: `list_machines`, `start_work`
+  and `stop_work`. Starting an agent is a confirmed action: the bot proposes it with a button
+  whose text the server builds (`Start an agent on “<task>”`, plus the machine's name when one
+  is named) and nothing starts until the person taps. Asking twice with the same request key
+  creates one start. When no machine is named and only one can take the task, that one is
+  used; when several can, the bot asks which. `stop_work` cancels a start that has not
+  launched yet, also behind a tap; an agent that has launched cannot be stopped from here, and
+  the bot says so. While a start is in flight the task's work block reads `working`.
+- **Refusals** keep the runner's stable code (for example `not_todo`, `outside_worker_wing`,
+  `active_start`) and come with a plain sentence saying what to change.
+- **Running commands is not available** until a provider offers it. The `run_command` tool is
+  only offered to the model while some machine reports that it can run commands; without one
+  the bot says so.
+- **Other providers.** `register_provider` adds a provider; machines from all providers are
+  merged and each machine states its own capabilities.
 
 ## Updates between turns
 
