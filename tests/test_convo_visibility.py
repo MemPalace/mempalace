@@ -37,10 +37,7 @@ def test_completed_replacement_and_unrelated_source_and_mode_remain_visible():
 
 
 def test_finalization_of_only_some_rows_is_not_publication():
-    rows = [
-        (f"b_{i}", _meta(filed="B", index=i, total=3 if i < 2 else 4))
-        for i in range(3)
-    ]
+    rows = [(f"b_{i}", _meta(filed="B", index=i, total=3 if i < 2 else 4)) for i in range(3)]
     assert not _visible(rows)
 
 
