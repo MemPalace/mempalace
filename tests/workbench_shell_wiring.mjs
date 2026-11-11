@@ -59,7 +59,7 @@ if (which === 'shell') {
   const ui = await module('board');
   assert.equal(typeof ui.boardView, 'function'); assert.equal(typeof ui.bindBoard, 'function');
   let mounted = 0, cleaned = 0;
-  Object.assign(context, { fillChatTimes() {}, cardId: ui.cardId, chatTag: ui.chatTag, cancelCard() {}, renderBoard: ui.boardView, bindBoard: (mount, options) => { assert.equal(mount, nodes['#content']); assert.equal(options.board.slug, 'alpha'); mounted++; return () => cleaned++; }, boardDispose: null, currentBoard: () => board, api() {}, refresh() {} });
+  Object.assign(context, { fillChatTimes() {}, mountProjectPanel() {}, cardId: ui.cardId, chatTag: ui.chatTag, cancelCard() {}, renderBoard: ui.boardView, bindBoard: (mount, options) => { assert.equal(mount, nodes['#content']); assert.equal(options.board.slug, 'alpha'); mounted++; return () => cleaned++; }, boardDispose: null, currentBoard: () => board, api() {}, refresh() {} });
   run(slice('// The board lists child cards', 'const options ='));
   run(slice('function boardView()', 'function markOpenCard()') + '\nboardView(); boardView();');
   assert.equal(mounted, 2); assert.equal(cleaned, 1);

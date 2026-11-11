@@ -531,6 +531,7 @@ def test_checked_rest_shapes_refuse_then_accept_fresh_header(env, http, route):
         "memory_save": {"text": "Exact memory", "theme": "shared"},
         "fact_save": {"subject": "Avery", "predicate": "likes", "object": "tea"},
         "relaunch": {},
+        "project_panel_set": {"panel": {"format": "commonplace.panel/1", "highlights": ["Beta"]}},
     }
     if route.tool == "card_split_done":
         from commonplace.projects import orchestration

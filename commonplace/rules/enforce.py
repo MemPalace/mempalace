@@ -67,6 +67,7 @@ REST_ROUTES = (
     RestRoute(
         "projects.routes", "POST", "/api/projects/<slug>/orchestrator/split", "card_split_done"
     ),
+    RestRoute("projects.panel_routes", "PUT", "/api/projects/<slug>/panel", "project_panel_set"),
     RestRoute("boards.rest", "POST", "/api/spaces", "board_add"),
     RestRoute("boards.rest", "PATCH", "/api/cards/<n>", "task_update"),
     RestRoute("boards.rest", "POST", "/api/cards/<n>/comments", "task_comment"),

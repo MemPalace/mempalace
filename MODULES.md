@@ -273,6 +273,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `docs/projects.md` and `docs/orchestrator.md` state who may hold a lease on a board without `[runner]`: its own trusted project seat.
 
+  - `docs/project-panels.md` documents the project panel file format, limits and routes.
+
 - **Promises:**
 
   - `docs/agent-connections.md` explains granting, using and withdrawing `cards:decide` for an owner's own app.
@@ -624,6 +626,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_routines.py` pins routine creation per due time on a fake clock, restart recovery and owner-only access.
 
   - `tests/test_projects_seat_lease.py` creates a seat through the Project settings routes and has it take, hold, renew and release its lease over MCP.
+
+  - `tests/projectpanel.mjs` (run by `tests/test_project_panel_ui.py`) covers the panel draw: escaped text, dropped unsafe links, nothing for a project without a panel, cached redraws and failed reads.
 
   - `tests/test_rules_enforcement_points.py` checks the four rule enforcement points; hook tests that compare the startup context now feed it a complete rules section, and the import-reader hook check expects the missing-rules notice for a memory-only context.
 
@@ -1487,9 +1491,13 @@ Format (read by `commonplace orch docs-check`):
 
   - Only a signed-in owner changes models or limits; `max_agents` counts distinct connection assignees with orchestration off; opt-in orchestration shares card/job admission accounting, default cap 3, owner-only settings and atomic seat trust; model resolution goes project, then workspace, then the runner default.
 
+  - A project panel (`projects/panel.py`, `panel_routes.py`, format `commonplace.panel/1`, documented in `docs/project-panels.md`): a few highlight lines and http(s) action links per project, stored beside its board and read by anyone who can read the project. Setting or clearing it, over `PUT /api/projects/<slug>/panel`, needs the board-write authority and the rules check; the project view payload is unchanged.
+
   - **Browser GitHub connection:** Signup plan assignment accepts the provisioning transaction to preserve atomic GitHub ownership reservation.
 
 - **How it fails:**
+
+  - A panel with an unknown field, markup, control characters, an over-limit list or string, or a link that is not absolute http(s) without credentials is refused with 400 `invalid_panel`; over 4096 bytes is 413 `panel_too_large`; a read-only or add-cards-only connection is 403 `not_allowed`; nothing is stored on refusal.
 
   - Snapshot failures leave observation state untouched. Missing seats yield history only; changed bindings cancel old reports. Unknown authorization errors retain fixed-code retries without exposing exception text.
   - Corrupt existing input still raises; accounting does not create an empty substitute store or clamp actual use to its cap.
@@ -1509,6 +1517,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_projects_seat_lease.py` drives the settings routes and the seat's own MCP calls: take, hold, renew and release with no config, plus refusals without trust, after demotion or switch-off, for another project's seat, for another role and outside the wing.
 
+  - `tests/test_projects_panel.py` covers the format limits, unsafe link schemes, a stored panel read back, refusals for read-only, add-cards-only, anonymous and other-workspace callers, and a project without a panel left unchanged.
+
 
 ## rules-and-guards
 
@@ -1516,6 +1526,8 @@ Format (read by `commonplace orch docs-check`):
 - **Owns:**
 
   - Canonical Space create in the checked REST write inventory.
+
+  - The project panel write `PUT /api/projects/<slug>/panel` (`project_panel_set`) in the checked REST write inventory.
 
   - Owner-reviewed rules and their freshness gate, guard building blocks, sensitive-text flags and redaction.
 
@@ -1971,6 +1983,7 @@ Format (read by `commonplace orch docs-check`):
   - Admin requires a signed-in current-workspace owner before read-only SELECTs; explicit credential-free allowlists, display redaction, 100-row cursors, injected clocks and 2 second source/5,000 ms client deadlines preserve private state boundaries.
 
 
+  - The project panel (`projectpanel.js`): mounted on the board with one line in `app.js`, draws the stored panel as escaped text with http(s)-only links, and nothing for a project without one; covered by `tests/projectpanel.mjs` via `tests/test_project_panel_ui.py`.
   - Imported-history consent: The owner form offers independent unticked import and reader checkboxes and displays reader authority beside Revoke.
   - The Connect checklist renders the supplied webhook event recommendation, including card moves and optional card creation, with escaped values.
 

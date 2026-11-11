@@ -8,7 +8,7 @@ from commonplace.boards.store import CardRefused
 from commonplace.control_db import ControlError
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import path_parts, read_json, require_principal, send_json
-from commonplace.projects import connect, limits, models, orchestration, seats, wing
+from commonplace.projects import connect, limits, models, orchestration, panel_routes, seats, wing
 from commonplace.projects.types import ProjectDenied
 from commonplace.rules.enforce import RulesRefresh, rest_write
 from commonplace.runner import registry
@@ -157,6 +157,8 @@ def _project_action(method, parts):
         ("POST", ("models", "catalog")): "model_catalog",
         ("PUT", ("limits",)): "limits",
         ("POST", ("wing",)): "wing",
+        ("GET", ("panel",)): "panel_view",
+        ("PUT", ("panel",)): "panel_set",
     }
     return routes.get((method, tuple(parts[1:])))
 
@@ -268,6 +270,9 @@ def _project_route(gateway, h, principal, parts, action):
 def _route(gateway, h):
     parts = path_parts(h, "/api/projects/")
     action = _project_action(h.command, parts)
+    if action in ("panel_view", "panel_set"):
+        panel_routes.handle(gateway, h, parts, action)
+        return
     splitting = action in ("inbox", "split")
     principal = require_principal(gateway, h) if splitting else _person(gateway, h)
     if principal is None:
