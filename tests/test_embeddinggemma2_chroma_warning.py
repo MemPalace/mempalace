@@ -10,6 +10,8 @@ import sys
 import textwrap
 import warnings
 
+import pytest
+
 # The chromadb-only run must not import mempalace (importing the package
 # loads the chroma backend, which installs the filter), so it uses a stand-in
 # with EmbeddingGemma 2's Chroma name and config shape.
@@ -82,10 +84,31 @@ def _shown(message):
         warnings.warn_explicit(
             message, UserWarning, "types.py", 2915, module="chromadb.api.types", registry={}
         )
-    return bool(caught)
+    return any(
+        warning.category is UserWarning and str(warning.message) == message for warning in caught
+    )
 
 
-def test_the_filter_is_narrow():
+@pytest.mark.parametrize("unrelated_warning", [False, True])
+def test_the_filter_is_narrow(monkeypatch, unrelated_warning):
+    if unrelated_warning:
+        warn_explicit = warnings.warn_explicit
+
+        def warn_with_cleanup(*args, **kwargs):
+            warn_explicit(
+                "Unclosed database during collection.",
+                ResourceWarning,
+                "cleanup.py",
+                1,
+                module="sqlite3",
+                registry={},
+            )
+            return warn_explicit(*args, **kwargs)
+
+        # Python 3.13 can emit SQLite cleanup warnings during allocations in
+        # the probe. They must not decide whether this UserWarning was shown.
+        warnings.simplefilter("always", ResourceWarning)
+        monkeypatch.setattr(warnings, "warn_explicit", warn_with_cleanup)
     assert not _shown(
         "Could not reconstruct embedding function embeddinggemma2: 'embeddinggemma2'. "
         "Setting to None."
