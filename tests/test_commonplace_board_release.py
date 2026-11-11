@@ -149,11 +149,11 @@ def test_legacy_unreleased_todo_cannot_bypass_coordinator(hub, fresh, actor, rou
     assert fresh.owner.task_show(card["number"]) == before
 
 
-def test_coordinator_can_discover_release_and_owner_cannot(hub, fresh):
+def test_coordinator_can_discover_release_and_owner_can_release_from_the_card(hub, fresh):
     coordinator = seat(fresh)
     creator = fresh.connect("restricted", trust="untrusted", write_wing="inbox")
     card = creator.work.task_add(board="work", title="Release this idea")
-    assert not fresh.owner.task_show(card["number"])["can_approve"]
+    assert fresh.owner.task_show(card["number"])["can_approve"]
     assert coordinator.work.task_show(card["number"])["can_approve"]
     assert card["number"] in {
         item["number"] for item in coordinator.work.approvals_for_me()["items"]

@@ -82,7 +82,11 @@ def test_r4_pending_proposal_offers_owner_no_approval_past_live_orchestrator(fre
     sub = fresh.connect("sub", parent=orch.id)
     card = sub.work.task_add(board="work", title="Sub follow-up")
     assert card["number"] not in owner_queue(fresh)
-    assert fresh.owner.task_show(card["number"])["can_approve"] is False
+    shown = fresh.owner.task_show(card["number"])
+    # The owner may release a restricted-origin card by hand (the card panel's Release), so the
+    # card offers it; the proposal itself stays with the orchestrator and is not in needs-me.
+    assert shown["awaiting_release"] is True and shown["can_approve"] is True
+    assert shown["proposal_status"] == "pending"
 
 
 # R4 (second path): a plan the owner sees as awaiting review is in the owner's needs-me.

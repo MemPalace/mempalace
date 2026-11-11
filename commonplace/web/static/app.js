@@ -399,6 +399,9 @@ function showError(text) {
   state.error = text;
   const box = root.querySelector("#screen-error");
   if (box) { box.hidden = !text; box.innerHTML = `<div class="message error">${e(text)}<button data-action="retry">Retry</button></div>`; }
+  const panel = root.querySelector("#card-panel");
+  panel?.querySelector("[data-panel-error]")?.remove();
+  if (panel && !panel.hidden && text) panel.insertAdjacentHTML("afterbegin", `<div class="message error" role="alert" data-panel-error>${e(text)}</div>`);
 }
 function title(text, actions = "") {
   root.querySelector("#title").textContent = text;
@@ -655,6 +658,10 @@ function boardsView() {
   // A workspace without projects starts with the create dialog, once per visit.
   if (!state.boards.length && state.base === "#/start" && !state.onboardingOffered) { state.onboardingOffered = true; openOnboarding(); }
 }
+function releaseControl(card) {
+  if (!card.awaiting_release || !card.can_approve) return "";
+  return `<form class="callout info" data-form="release-origin" data-card="${card.number}"><h3>Waiting for release</h3><p>Nobody can start this card until it is released.</p><label>Reason<input name="reason" required maxlength="500"></label><button class="blockbtn" data-release-origin>Release</button></form>`;
+}
 // Needs me draws on `#/needs`, and on `#/` for a hash the router does not recognise.
 const onNeeds = () => state.base === "#/needs" || state.base === "#/";
 // A form in the panel (edit, hand off, ask) belongs to the person filling it in: only they replace it.
@@ -688,7 +695,10 @@ async function cardPanel(number, epoch, { keepForm = false } = {}) {
     // Keep the existing versioned ask actions and call tree reachable on card routes.
     // Only an ask waiting on this person needs these versioned answer controls; Activity already lists the rest (m10).
     const asks = card.ask != null && card.ask_to === state.me.actor ? `<ol class="log">${conversation({ ...card, events: (card.events || []).filter((ev) => ev.options || ev.kind === "decide") })}</ol>` : "";
-    if (tab === "details") panel.querySelector(".ctx-body")?.insertAdjacentHTML("beforeend", `${asks}${callTree(card)}`);
+    if (tab === "details") {
+      panel.querySelector(".ctx-body")?.insertAdjacentHTML("afterbegin", releaseControl(card));
+      panel.querySelector(".ctx-body")?.insertAdjacentHTML("beforeend", `${asks}${callTree(card)}`);
+    }
     restore(saved);
     await shown;
     if (request !== state.panelRequest || epoch !== state.screen) return;
@@ -773,7 +783,7 @@ function reviewForm() {
 function handoffForm(card, prefill = {}) {
   voice.stop();
   const panel = root.querySelector("#card-panel"); panel.hidden = false;
-  panel.innerHTML = `<form class="form-tile" data-form="handoff" data-card="${card.number}"${prefill.connectionsOnly ? ' data-connections-only="true"' : ""}><input type="hidden" name="version" value="${e(card.version)}"><h2>Hand off #${card.number}</h2><label>To<input name="to" value="${e(prefill.to || "")}"${prefill.connectionsOnly ? ' pattern="conn:.+" title="Use conn: followed by the agent name"' : ""} required></label><label>Note<textarea name="note" required></textarea></label><label>Context<textarea name="context">${e(card.status_line || card.body)}</textarea></label><label>Options<input name="options"></label><button class="blockbtn">Hand off</button><button class="opt" type="button" data-action="cancel-form">Cancel</button></form>`;
+  panel.innerHTML = `<form class="form-tile" data-form="handoff" data-card="${card.number}"${prefill.connectionsOnly ? ' data-connections-only="true"' : ""}><input type="hidden" name="version" value="${e(card.version)}"><h2>Hand off #${card.number}</h2><label>To<input name="to" list="handoff-recipients" value="${e(prefill.to || "")}"${prefill.connectionsOnly ? ' pattern="conn:.+" title="Use conn: followed by the agent name"' : ""} required></label><datalist id="handoff-recipients"><option value="orchestrator">This project's coordinator</option><option value="anyone">Return to the pool</option><option value="owner">Workspace owner</option></datalist><p class="set-note">Use orchestrator, anyone for the pool, owner, or an agent name.</p><label>Note<textarea name="note" required></textarea></label><label>Context<textarea name="context">${e(card.status_line || card.body)}</textarea></label><label>Options<input name="options"></label><button class="blockbtn">Hand off</button><button class="opt" type="button" data-action="cancel-form">Cancel</button></form>`;
   // On Needs me the panel holds the item's detail: it waits while the form is open.
   if (onNeeds()) state.needsUI?.pause(true);
 }
@@ -1109,7 +1119,7 @@ async function refresh({ background = false, events = [] } = {}) {
     } else state.workbenchChat?.dispose();
     restore(saved); play();
     if (state.base.startsWith("#/space/")) void hydrateSpaceTasks();
-    if (state.route.startsWith("#/card/") && !(background && panelForm())) await cardPanel(Number(state.route.slice(7)), epoch, { keepForm: background });
+    if (state.route.startsWith("#/card/") && !(background && (panelForm() || root.querySelector('form[data-form="release-origin"]')))) await cardPanel(Number(state.route.slice(7)), epoch, { keepForm: background });
     showError("");
     return true;
   } catch (error) {
@@ -1658,6 +1668,7 @@ root.addEventListener("submit", async (event) => {
     });
     else if (kind === "edit-card") await mutate(`card-${state.card.number}`, () => api(`/api/cards/${state.card.number}`, { method: "PATCH", body: { ...payload, version: state.card.version } }));
     else if (kind === "review") await move(state.card.number, "review", { ...payload, options: payload.options.split("\n").map((v) => v.trim()).filter(Boolean) });
+    else if (kind === "release-origin") await mutate(`card-${Number(form.dataset.card)}`, () => api(`/api/cards/${Number(form.dataset.card)}/approve`, { method: "POST", body: { approve: true, version: state.card.version, reason: payload.reason } }));
     else if (kind === "handoff") await mutate(`card-${Number(form.dataset.card)}`, async () => {
       await api(`/api/cards/${Number(form.dataset.card)}/handoff`, { method: "POST", body: { ...payload, version: Number(payload.version), options: payload.options.split(",").map((s) => s.trim()).filter(Boolean) } });
       if (onNeeds()) state.needsUI?.pause(false);

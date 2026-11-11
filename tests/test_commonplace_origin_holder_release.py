@@ -33,19 +33,16 @@ TOOLS = [
 SUFFIX = " Origin release does not approve the pending proposal or plan; separate review is still required."
 OWNER_WHY = "Restricted-origin work has not been released. No live coordinator with all required release grants is available. You are the workspace owner: use task_approve with a reason to release its origin."
 CONFIG = {
-    "creator": "Restricted-origin work has not been released. The live board coordinator is this card's creator. Appoint an independent coordinator in board settings; owner release is blocked.",
-    "child": "Restricted-origin work has not been released. The live board coordinator acts under this card's creator. Appoint an independent coordinator in board settings; owner release is blocked.",
-    "grandchild": "Restricted-origin work has not been released. The live board coordinator acts under this card's creator. Appoint an independent coordinator in board settings; owner release is blocked.",
-    "unsafe": "Restricted-origin work has not been released. The live board coordinator's independence from this card's creator cannot be verified. Appoint an independent coordinator in board settings; owner release is blocked.",
-    "stamp": "Restricted-origin work has not been released. This card’s creator stamp cannot be verified. Clear the coordinator in board settings, then use the existing owner release path; owner release is blocked while this live record remains.",
+    "creator": "Restricted-origin work has not been released. The live board coordinator is this card's creator. Appoint an independent coordinator in board settings, or release it yourself from the card.",
+    "child": "Restricted-origin work has not been released. The live board coordinator acts under this card's creator. Appoint an independent coordinator in board settings, or release it yourself from the card.",
+    "grandchild": "Restricted-origin work has not been released. The live board coordinator acts under this card's creator. Appoint an independent coordinator in board settings, or release it yourself from the card.",
+    "unsafe": "Restricted-origin work has not been released. The live board coordinator's independence from this card's creator cannot be verified. Appoint an independent coordinator in board settings, or release it yourself from the card.",
+    "stamp": "Restricted-origin work has not been released. This card’s creator stamp cannot be verified. Clear the coordinator in board settings, or release it yourself from the card.",
 }
 
 NO_REVIEW = "no: only the direct parent, its top-level agent, the board coordinator or the signed-in workspace owner may approve proposals"
 NO_ORIGIN = "no: restricted-origin work needs parent or workspace owner release"
 LINEAGE_REFUSAL = "no: restricted-origin creator lineage cannot release this card"
-CONFIGURE_FIRST = "no: origin release is blocked; appoint an independent board coordinator first"
-CLEAR_FIRST = "no: origin release is blocked; clear the board coordinator first"
-COORDINATOR_FIRST = "no: the live board coordinator must release restricted-origin work"
 NEEDS_OWNER = "no: only a workspace owner can do that"
 NEEDS_ACCESS = "no: only a workspace owner or an authorized connection can read needs_me"
 
@@ -482,17 +479,16 @@ def test_owner_creator_conflict_contract(hub, fresh, relation):
         s.k = s.c
         appoint(fresh, s.k)
     origin(fresh.owner, s.n, configuration=relation, notice=True)
-    for work in (fresh.owner, s.k.work):
-        refused(
-            fresh.owner,
-            s.n,
-            lambda work=work: work.task_approve(s.n, reason="Refused conflict"),
-            reason=CONFIGURE_FIRST
-            if work.principal.person
-            else (LINEAGE_REFUSAL if relation != "creator" else NO_REVIEW),
-        )
+    refused(
+        fresh.owner,
+        s.n,
+        lambda: s.k.work.task_approve(s.n, reason="Refused conflict"),
+        reason=LINEAGE_REFUSAL if relation != "creator" else NO_REVIEW,
+    )
     appoint(fresh, fresh.connect("independent"))
     no_origin(fresh.owner, s.n)
+    release(fresh.owner, s.n)
+    assert raw(fresh.owner, s.n)["approved_by"] == f"user:{fresh.user}"
 
 
 @pytest.mark.parametrize("status", ["backlog", "todo"])
@@ -507,7 +503,7 @@ def test_owner_creator_conflict_inactive_contract(hub, fresh, status):
 
 
 @pytest.mark.parametrize("kind", ["all-granted", "hidden-approve", "hidden-needs_me"])
-def test_live_creator_blocks_owner_even_with_missing_grants(hub, fresh, kind):
+def test_owner_releases_despite_live_creator_coordinator(hub, fresh, kind):
     s = setup(hub, fresh, status="backlog")
     policy(hub, s.c, trust="trusted", write_wing="shared")
     s.c.principal = hub.db.authenticate_connection(s.c.id)
@@ -515,12 +511,8 @@ def test_live_creator_blocks_owner_even_with_missing_grants(hub, fresh, kind):
     appoint(fresh, s.c)
     if kind != "all-granted":
         remove(hub, fresh, s.c, kind)
-    refused(
-        fresh.owner,
-        s.n,
-        lambda: fresh.owner.task_approve(s.n, reason="Refused conflict"),
-        reason=CONFIGURE_FIRST,
-    )
+    release(fresh.owner, s.n)
+    assert raw(fresh.owner, s.n)["approved_by"] == f"user:{fresh.user}"
 
 
 def test_owner_recovery_dedup_and_notice_per_board(hub, fresh):
@@ -637,14 +629,10 @@ def test_explicit_person_plan_review_survives_origin_routing(hub, fresh):
         )
 
 
-def test_owner_cannot_release_with_independent_capable_coordinator(hub, fresh):
+def test_owner_can_release_with_independent_capable_coordinator(hub, fresh):
     s = setup(hub, fresh, status="backlog")
-    refused(
-        fresh.owner,
-        s.n,
-        lambda: fresh.owner.task_approve(s.n, reason="Refused owner"),
-        reason=COORDINATOR_FIRST,
-    )
+    release(fresh.owner, s.n)
+    assert raw(fresh.owner, s.n)["approved_by"] == f"user:{fresh.user}"
 
 
 @pytest.mark.parametrize("kind", ["unrestricted", "already-released"])
@@ -907,12 +895,8 @@ def test_unsafe_lineage_owner_configuration(hub, fresh, lineage):
     s = setup(hub, fresh, status="backlog")
     corrupt_lineage(hub, fresh, s, lineage)
     origin(fresh.owner, s.n, configuration="unsafe", pending=True, notice=True)
-    refused(
-        fresh.owner,
-        s.n,
-        lambda: fresh.owner.task_approve(s.n, reason="Unsafe lineage"),
-        reason=CONFIGURE_FIRST,
-    )
+    release(fresh.owner, s.n)
+    assert raw(fresh.owner, s.n)["approved_by"] == f"user:{fresh.user}"
 
 
 STAMPS = ["name", "user", "created-at", "unresolvable"]
@@ -977,12 +961,8 @@ def test_unverifiable_creator_stamp_owner_configuration(hub, fresh, stamp, condi
     if condition != "live-capable":
         remove(hub, fresh, s.k, "no-memory-write")
     origin(fresh.owner, s.n, configuration="stamp", pending=True, notice=True)
-    refused(
-        fresh.owner,
-        s.n,
-        lambda: fresh.owner.task_approve(s.n, reason="Invalid stamp"),
-        reason=CLEAR_FIRST,
-    )
+    release(fresh.owner, s.n)
+    assert raw(fresh.owner, s.n)["approved_by"] == f"user:{fresh.user}"
 
 
 @pytest.mark.parametrize("stamp", STAMPS)
