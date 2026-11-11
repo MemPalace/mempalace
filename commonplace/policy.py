@@ -39,6 +39,7 @@ SCOPES = (
     "private:write",
     "threads:read",
     "handoff:write",
+    "cards:decide",
     "admin",
 )
 
@@ -344,7 +345,10 @@ class Policy:
         if role == "owner":
             return self
         return replace(
-            self, scopes=tuple(s for s in self.scopes if s not in {"private:read", "admin"})
+            self,
+            scopes=tuple(
+                s for s in self.scopes if s not in {"private:read", "admin", "cards:decide"}
+            ),
         )
 
     # ── scopes and trust ──
@@ -469,7 +473,11 @@ class Policy:
             return "tool not allowed for this connection"
         if not self.has_scope(tool.scope):
             return f"needs scope {tool.scope}"
-        if tool.trusted_only and self.trust == "untrusted":
+        if (
+            tool.trusted_only
+            and self.trust == "untrusted"
+            and not (tool.untrusted_scope and self.has_scope(tool.untrusted_scope))
+        ):
             return "untrusted connections can't use this tool"
         return None
 

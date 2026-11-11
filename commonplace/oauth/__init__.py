@@ -17,7 +17,7 @@ from html import escape
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlsplit
 
-from .. import import_grant, sessions, urls
+from .. import decide_grant, import_grant, sessions, urls
 from . import store
 from .http import OAuthError, body, callback, query, redirect, send, send_error, send_json
 from .store import OAuthAuthenticator
@@ -239,6 +239,14 @@ def _show_authorize(gateway, h, *, status=200):
                 )
             else:
                 consent += f"<p>{escape(import_grant.OWNER_ONLY_TEXT)}</p>"
+        if decide_grant.DECIDE_SCOPE in parameters["scope"].split():
+            if decide_grant.eligible(gateway.db, principal.user_id, principal.workspace_id):
+                consent += (
+                    '<label><input type="checkbox" name="grant_decide" value="1"> '
+                    f"{escape(decide_grant.SCOPE_TEXT)}</label>"
+                )
+            else:
+                consent += f"<p>{escape(decide_grant.OWNER_ONLY_TEXT)}</p>"
         content = (
             f"<h1>{escape(client['client_name'])}</h1><p>{escape(workspace)}</p>"
             f'<form method="post" action="{action}">{hidden}{consent}'
@@ -320,6 +328,11 @@ def _submit_authorize(gateway, h):
                 and "memory:read" not in parameters["scope"].split()
             ):
                 location = _response(parameters, error="invalid_scope")
+            elif decide_grant.DECIDE_SCOPE in parameters["scope"].split() and not {
+                "memory:read",
+                "memory:write",
+            }.issubset(parameters["scope"].split()):
+                location = _response(parameters, error="invalid_scope")
             elif data["decision"] == "deny":
                 location = _response(parameters, error="access_denied")
             else:
@@ -334,6 +347,11 @@ def _submit_authorize(gateway, h):
                     and import_grant.eligible(db, principal.user_id, principal.workspace_id)
                 ):
                     granted.remove(import_grant.READER_SCOPE)
+                if decide_grant.DECIDE_SCOPE in granted and not (
+                    data.get("grant_decide") == "1"
+                    and decide_grant.eligible(db, principal.user_id, principal.workspace_id)
+                ):
+                    granted.remove(decide_grant.DECIDE_SCOPE)
                 if not granted:
                     location = _response(parameters, error="invalid_scope")
                 else:

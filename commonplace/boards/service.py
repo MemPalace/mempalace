@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from time import monotonic
 from urllib.parse import urlparse
 
-from commonplace import events, privacy
+from commonplace import decide_grant, events, privacy, sessions
 from commonplace.callstack import LIMITS
 from commonplace.control_db import ControlError
 from commonplace.extensions import ToolError
@@ -1955,6 +1955,10 @@ class BoardService:
                     for candidate in [db.authenticate_connection(row["id"])]
                 ):
                     unbound.append(coordinator)
+                    # Before the NULL write and the board COMMIT (the clear is its own
+                    # control-DB commit): a grant left by a failed clear must not come
+                    # back when the app stops coordinating. A failed clear rolls back.
+                    self._clear_coordinator_grant(coordinator, "coordinator unbound")
                     coordinator = None
                     conn.execute("UPDATE boards SET coordinator=NULL WHERE id=?", (b["id"],))
             if changed or unbound:
@@ -2038,7 +2042,21 @@ class BoardService:
                     raise ToolError(
                         "no: coordinator must be an active agent with access to this board"
                     )
+            previous = b["coordinator"]
+            if previous and previous != actor:
+                # Replacing or unassigning: clear the previous coordinator's grant
+                # before the board COMMIT (the clear is its own control-DB commit, not
+                # atomic with this one), so a grant that survived a failed clear never
+                # comes back when it stops coordinating. A failed clear rolls back.
+                self._clear_coordinator_grant(previous, "coordinator removed")
             conn.execute("UPDATE boards SET coordinator=? WHERE id=?", (actor, b["id"]))
+            if actor is not None and actor.startswith("conn:"):
+                # A coordinator is agent machinery: assigning one ends any stored
+                # cards:decide grant, so unassigning it later needs fresh consent.
+                coordinator_row = self.ctx.db.connection(actor[5:], self.principal.workspace_id)
+                self.ctx.db.clear_decide(
+                    coordinator_row["id"], reason="coordinator", user_id=self.principal.user_id
+                )
             self.pending.append(
                 (
                     "space_configured",
@@ -2048,6 +2066,13 @@ class BoardService:
                 )
             )
             result = {"board": b["slug"], "coordinator": actor}
+        if actor is not None and actor.startswith("conn:"):
+            # Again after the commit: a grant written while this transaction was
+            # open is removed too (the in-transaction clear covers a rollback).
+            coordinator_row = self.ctx.db.connection(actor[5:], self.principal.workspace_id)
+            self.ctx.db.clear_decide(
+                coordinator_row["id"], reason="coordinator", user_id=self.principal.user_id
+            )
         if actor is not None:
             from commonplace import webhooks
 
@@ -3758,6 +3783,31 @@ class BoardService:
             )
 
     def decide(self, task, choice=None, reply=None, then="return", version=None):
+        audited = []
+        try:
+            return self._decide(task, choice, reply, then, version, audited)
+        except BaseException:
+            # The audit row was written inside the board transaction. The log is
+            # append-only, so a rollback after it appends a row that cancels it.
+            p = self.principal
+            for seq, card in audited:
+                try:
+                    self.ctx.db.audit(
+                        action=decide_grant.ROLLBACK_ACTION,
+                        decision="rolled_back",
+                        workspace_id=p.workspace_id,
+                        user_id=p.user_id,
+                        connection_id=p.connection_id,
+                        auth=p.auth,
+                        tool="decide",
+                        reason=f"audit_seq={seq}",
+                        target_ids=[card],
+                    )
+                except Exception as exc:
+                    log_failure(logger, "delegated decide rollback audit failed", exc)
+            raise
+
+    def _decide(self, task, choice, reply, then, version, audited):
         with self.transaction() as conn:
             row, board = self._get(conn, task)
             p = self.principal
@@ -3768,11 +3818,29 @@ class BoardService:
                 and coordinator.actor == p.actor == row["ask_to"]
                 and row["review_kind"] == "decision"
             )
+            # An owner's own app may answer only asks addressed to that owner;
+            # seats and board coordinators are agents, never the owner's app.
+            delegated = (
+                not addressed
+                and decide_grant.answers_for(p, row)
+                and not self._agent_connection(conn, p)
+            )
             if not addressed:
                 _owner(p)
-                if not p.person:
+                if not p.person and not delegated:
                     raise ToolError("no: only a signed-in workspace owner can answer this")
-            self._write(board)
+            if delegated:
+                # The app holds memory:write and may see the board, and its owner,
+                # as a person, may write the board's wing: what the owner could
+                # decide in the browser. The app's own write wings do not apply.
+                if (
+                    not p.policy.has_scope("memory:write")
+                    or not p.policy.can_read_wing(board["wing"])
+                    or not self._owner_writes(board["wing"])
+                ):
+                    raise ToolError("no: this connection cannot change this board")
+            else:
+                self._write(board)
             self._version(conn, row, version)
             if row["status"] != "review":
                 raise ToolError("no: card is not in review")
@@ -3850,7 +3918,60 @@ class BoardService:
                     "ask_to": row["ask_to"],
                 },
             )
+            if delegated:
+                # Inside the board transaction: a failed audit write fails the answer.
+                # A later rollback appends a cancelling row in decide().
+                seq = self.ctx.db.audit(
+                    action=decide_grant.AUDIT_ACTION,
+                    decision="ok",
+                    workspace_id=p.workspace_id,
+                    user_id=p.user_id,
+                    connection_id=p.connection_id,
+                    auth=p.auth,
+                    tool="decide",
+                    reason=f"board={board['slug']}",
+                    target_ids=[str(row["id"])],
+                )
+                audited.append((seq, str(row["id"])))
             return self._card(conn, task_row(conn, row["id"]), self.principal)
+
+    def _owner_writes(self, wing):
+        """Whether the app's person, signed in, could write this wing right now."""
+        p = self.principal
+        person = sessions.person_principal(self.ctx.db, p.user_id, p.workspace_id)
+        return bool(
+            person is not None
+            and person.role == "owner"
+            and person.policy.has_scope("memory:write")
+            and person.policy.can_read_wing(wing)
+            and person.policy.can_write_wing(wing)
+        )
+
+    def _clear_coordinator_grant(self, actor, reason):
+        """Clear a ``conn:`` coordinator's stored cards:decide grant (errors propagate)."""
+        if not actor or not actor.startswith("conn:"):
+            return
+        try:
+            row = self.ctx.db.connection(actor[5:], self.principal.workspace_id)
+        except ControlError:
+            return  # no such connection: nothing to clear
+        self.ctx.db.clear_decide(row["id"], reason=reason, user_id=self.principal.user_id)
+
+    def coordinator_actors(self):
+        """Every board coordinator actor in this workspace (archived boards included)."""
+        with self.store.connection() as conn:
+            return frozenset(
+                r[0]
+                for r in conn.execute(
+                    "SELECT coordinator FROM boards WHERE coordinator IS NOT NULL"
+                )
+            )
+
+    def _agent_connection(self, conn, p):
+        """A project seat or any board's coordinator: agent machinery, not an owner's app."""
+        return decide_grant.is_seat(self.ctx.db, p.connection_id, p.client) or bool(
+            conn.execute("SELECT 1 FROM boards WHERE coordinator=? LIMIT 1", (p.actor,)).fetchone()
+        )
 
     def needs_me(self, format="list"):
         if not self.principal.policy.has_scope(

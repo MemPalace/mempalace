@@ -306,7 +306,7 @@ def test_as_metadata_lists_import(journey):
     assert status == 200
     assert b"memory:import" in raw
     assert set(json.loads(raw)["scopes_supported"]) == set(
-        (IMPORT_SCOPES + " memory:import:read").split()
+        (IMPORT_SCOPES + " memory:import:read cards:decide").split()
     )
 
 

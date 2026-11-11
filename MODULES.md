@@ -263,6 +263,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - `docs/agent-connections.md` explains granting, using and withdrawing `cards:decide` for an owner's own app.
+
   - Admin documentation covers all seven sections, bootstrap capability fallback, canonical receipt timestamps and parent/mode refresh ordering.
 
   - The Admin API guide documents legacy-column defaults and enabled, unrevoked grant eligibility.
@@ -622,6 +624,8 @@ Format (read by `commonplace orch docs-check`):
 
 - **Promises:**
 
+  - `tests/spaces_surfaces.json` pins the `decide` description naming owner connections holding `cards:decide`.
+
   - Restricted event regressions cover omitted webhook numbers, keyed opaque ids, authority changes, readable-set resets, cursor recovery and saved-but-unlinked notices. Restricted recovery checks retain exact event identity and internal deduplication without exposing public sequence fields. Authority lookup failures pin one redacted diagnostic and no enqueue. Shared fixtures also retain real member wildcard and literal-wing holders alongside owner-only private readers.
 
   - `tests/test_person_private_scope_r1.py` covers event cursor equality, single/chunked unreadable writes, tunnel side effects and scrubbing, token mint/load role caps and private-save notices. Broad private-read fixtures use owner-held tokens so independent filer guards remain exercised.
@@ -933,7 +937,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## hub-core
 
-- **Paths:** `commonplace/__init__.py`, `commonplace/__main__.py`, `commonplace/gateway.py`, `commonplace/control_db.py`, `commonplace/auth.py`, `commonplace/policy.py`, `commonplace/tokens.py`, `commonplace/extensions.py`, `commonplace/_http.py`, `commonplace/http_util.py`, `commonplace/urls.py`, `commonplace/ratelimit.py`, `commonplace/backfill_allowance.py`, `commonplace/workers.py`
+- **Paths:** `commonplace/__init__.py`, `commonplace/__main__.py`, `commonplace/gateway.py`, `commonplace/control_db.py`, `commonplace/auth.py`, `commonplace/policy.py`, `commonplace/decide_grant.py`, `commonplace/tokens.py`, `commonplace/extensions.py`, `commonplace/_http.py`, `commonplace/http_util.py`, `commonplace/urls.py`, `commonplace/ratelimit.py`, `commonplace/backfill_allowance.py`, `commonplace/workers.py`
 - **Owns:**
 
   - Canonical Space REST aliases mapped to existing board tool authority.
@@ -947,6 +951,8 @@ Format (read by `commonplace orch docs-check`):
 - **Promises:**
 
   - Restricted CLI-compatible search acquires structured hits and renders only after the final drawer gate, on literal-wing and fan-out paths. Its closed response vocabulary never includes structured hits; flat rendering ignores unrelated import metadata, the pure canonical formatter is shared with the owner worker path, and CLI argument restrictions remain.
+
+  - Owner-granted `cards:decide`: only the signed-in owner's principal can grant it, to their own top-level, non-agent, non-seat connection; loaded policies drop it with ownership; the stored grant is removed on demotion (a trigger on `UPDATE` of `memberships.role` from owner), on coordinator assignment and on every coordinator removal or replacement (`board_set`, auto-unbind; a separate control-DB commit ordered before the board COMMIT, not atomic with it) and when an expired PAT is rotated; OAuth issue and refresh return only live scopes. Holders answer only asks addressed to their own person, each answer audited as `card.decide.delegated` with the connection id; `LocalTool.untrusted_scope` admits untrusted holders to `decide` only.
 
   - Tokens cannot be minted with private read for non-owner holders; PAT and durable-connection authentication cap loaded private/admin scopes to current ownership. Tunnel writes require readable endpoints and scrub outgoing results.
 
@@ -1053,6 +1059,8 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_commonplace_gateway.py`, `tests/test_commonplace_control_db.py`, `tests/test_commonplace_policy.py`, `tests/test_hub_` files.
 
+  - `tests/test_cards_decide_scope.py` covers granting, refusal, other people's asks, revocation and audit; `tests/test_cards_decide_scope_browser.py` covers the consent and Agents UI (needs Playwright).
+
 
 ## sessions-and-sign-in
 
@@ -1068,6 +1076,8 @@ Format (read by `commonplace orch docs-check`):
   - Person private read scope requires the exact current workspace owner role. Omitted, missing and unexpected roles fail closed; members temporarily lose their own private wings too.
 
   - Imported-history consent: OAuth reader consent is separate and unticked; defaults and person policies exclude the reader, while refresh descendants cannot regain a dropped scope.
+
+  - OAuth `cards:decide` consent is separate, unticked and owner-only, and requires `memory:read` plus `memory:write`; members see an owner-only notice and a forged tick grants nothing.
 
   - OAuth client revoke: a workspace owner can revoke an OAuth-connected client from Settings > Agents. One transaction marks the connection, every access and refresh token and any unredeemed code revoked and audits it; later calls and refreshes are refused, and what the client wrote stays. Members, other workspaces and the client itself cannot revoke it.
 
@@ -1098,6 +1108,8 @@ Format (read by `commonplace orch docs-check`):
   - The `commonplace` command line, the credential-scoped client, native hooks and installers, the stdio bridge and the agent skill.
 
 - **Promises:**
+
+  - `commonplace token add` refuses `cards:decide`; answering Needs-me questions needs the owner's browser consent.
 
   - Local search-index status and run pass an explicit unscoped principal and retain their printed count keys and capture enrolment behavior.
   - Opt-in backup reporting records only the final selected mode; check/cleanup/restore never report. Receipt failure preserves backup return/exception; test_backup_status.py covers both outcomes and fallback.
@@ -1143,6 +1155,8 @@ Format (read by `commonplace orch docs-check`):
   - Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
 
 - **Promises:**
+
+  - Owner-granted `cards:decide`: a live owner's top-level PAT or OAuth connection holding the scope answers only asks addressed to that owner, is refused for seats and board coordinators, needs `memory:write`, read access to the board's wing and the owner's person-level write access to it (not the app's own write wings), cannot escalate, and writes one `card.decide.delegated` audit row inside the board transaction (a failed write fails the answer; a later rollback appends `card.decide.rolled_back`; an audit row without an answer is possible after a kill between the two commits, or when the cancel write fails). Without the scope, refusals are unchanged.
 
   - Member event pages use one readable-board snapshot, an opaque access epoch and bounded SQL projection. Restricted webhook subscriptions omit public sequence fields and use opaque ids from independent server-only subscription keys, initialized on first use and durable across restarts. Neither keys nor sequence fields are exposed; raw event keys remain internal for replay deduplication without a counter or backfill. Subscription lookup exceptions log their type and stack locations while retaining fail-closed authority.
 
@@ -1769,6 +1783,8 @@ Format (read by `commonplace orch docs-check`):
   - The cookie-authenticated web app and the live console, including the owner orchestration switch, project seat-consent controls and default agent-limit display.
 
 - **Promises:**
+
+  - Settings → Agents offers an unticked `cards:decide` consent on create, shows the grant on PAT and OAuth rows with **Stop answering**, and offers **Allow answering Needs-me** only on rows the server marks `decide_grantable` (the viewing owner's own eligible, unexpired PATs; never agents, runners, seats, board coordinators or other members' connections; the grant route refuses coordinators too); the consent copy comes from `decide_consent` in `GET /api/connections`; `PATCH /api/connections/<id>` with `{"decide": bool}` grants (PAT only) or withdraws (PAT or OAuth).
 
   - Event polling sends the readable-set epoch and refetches the open screen, including card details, before adopting a reset cursor. The owner feed resets non-empty member-era epochs; pre-deploy member tabs require a reload to resume live events.
 

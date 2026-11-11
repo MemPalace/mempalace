@@ -200,12 +200,14 @@ def install(gateway):
         if principal.role != "owner":
             send_json(h, 403, {"error": "Owner access required"})
             return
+        from commonplace import decide_grant
         from commonplace.extensions import ToolError
         from commonplace.policy import canonical_wing, is_private_wing
 
-        from .agents import connection_view
+        from .agents import connection_view, decide_view
 
         rows = gateway.db.connections(principal.workspace_id)
+        view = decide_view(gateway, principal)
         try:
             known = gateway.call_memory_tool(principal, "mempalace_list_wings", {}).get("wings", {})
         except ToolError:
@@ -224,7 +226,8 @@ def install(gateway):
             h,
             200,
             {
-                "connections": [connection_view(row) for row in rows],
+                "connections": [connection_view(row, **view) for row in rows],
+                "decide_consent": decide_grant.SCOPE_TEXT,
                 "wings": wings,
                 "mcp_url": urls.AGENT_URL + "/mcp",
             },

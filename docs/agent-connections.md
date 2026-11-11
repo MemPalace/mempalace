@@ -81,6 +81,64 @@ for HTTP transcripts, Grok facts, accepted responses, multipart and retries.
 The separate existing ACL import accepts signed-in people or connections that
 already have thread read/write authority; it retains its original behavior.
 
+## Let your own app answer your Needs-me questions
+
+By default only you, signed in to the web app, can answer a Needs-me question.
+To let one of your own apps (for example a phone or car app) answer them, grant
+it the separate `cards:decide` scope. The consent text says:
+
+> Allow this app to answer your Needs-me questions as you (scope cards:decide). Every answer is recorded with this connection, and you can stop this at any time under Agents. It can answer only questions addressed to you, never another person's, and only on boards you can write to.
+
+- **PAT:** tick that box when you create the connection, or use **Allow
+  answering Needs-me** on an existing top-level connection. Through the API,
+  send `"decide": true` (a JSON boolean) with `POST /api/connections`, or
+  `PATCH /api/connections/<id>` with `{"decide": true}`.
+- **OAuth:** the client requests `memory:read memory:write cards:decide`; you
+  tick the box on the authorization form. An unticked box or an unsolicited
+  tick grants nothing, and requesting `cards:decide` without both memory scopes
+  is refused with `invalid_scope`. Authorization-server metadata advertises
+  `cards:decide`; it is never a default scope.
+
+Only a workspace owner can grant it, only to their own top-level app
+connection. Agent machinery never holds it: child agents, runner connections and
+project orchestrator seats and board coordinators are refused when granting
+(the button is not offered on their rows), and refused again when answering.
+Assigning a connection as a board coordinator removes its grant; unassigning it
+does not bring the grant back, even when the grant and the assignment happen at
+the same moment. That holds because removing or replacing a coordinator first
+clears that connection's grant, and only then saves the change; if the clear
+fails, the change is not saved. The button appears only on your own, unexpired
+connections; **Stop answering** also works on an expired connection. Members see
+no consent box and the CLI refuses it. Agent tokens cannot grant it to
+themselves or anyone else: granting needs your signed-in browser session.
+
+The app answers on the boards you could answer on yourself in the browser:
+any board it can see whose wing you, signed in, can write. Its own write wings
+(`inbox` for connections made here and for OAuth apps) do not limit answers. It
+still needs `memory:write`, cannot answer in another workspace, and is refused
+on boards whose wing you cannot write.
+
+If your role changes from owner to member, every stored `cards:decide` grant on
+your connections is removed; becoming owner again does not bring it back. An
+expired app connection keeps its grant only until you rotate it: rotation
+renews the token but removes the grant, so allow answering again afterwards.
+OAuth refresh responses list only the scopes the app still holds.
+
+With the scope, the app may call `decide` (MCP) or
+`POST /api/cards/<n>/decide` (REST) for asks addressed to you only. Asks
+addressed to another person or to an agent coordinator stay refused, as do
+escalation and boards the connection cannot read or write. The card history
+names the connection as the actor, and each answer writes an audit entry
+`card.decide.delegated` with the connection id and auth kind in the same step;
+if that audit write fails, the answer fails. The audit log and the cards are
+stored separately: an audit row without an answer is possible after a kill between the two commits, or when the cancel write fails.
+
+To stop it, use **Stop answering** under **Settings → Agents** (PAT or OAuth), or
+`PATCH /api/connections/<id>` with `{"decide": false}`. The next request is
+refused, exactly as for a connection that never had the scope. Revoking the
+connection also stops it. An OAuth client regains the scope only through fresh
+consent.
+
 ## Replace or stop a connection
 
 Use **Rotate** in **Settings → Agents** to replace a token. Confirm, copy the new

@@ -32,8 +32,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Optional
 
-from . import tokens
+from . import decide_grant, tokens
 from .admission import GATE
+from .decide_grant import DECIDE_SCOPE
 from .policy import Policy
 
 SCHEMA_VERSION = 1
@@ -218,6 +219,29 @@ class Principal:
         }
 
 
+_DECIDE_MATCH = (
+    "workspace_id = NEW.workspace_id AND user_id = NEW.user_id "
+    "AND CASE WHEN json_valid(policy) THEN EXISTS ("
+    "SELECT 1 FROM json_each(policy, '$.scopes') WHERE value = 'cards:decide') ELSE 0 END"
+)
+# Strips cards:decide from a demoted owner's connections, with one audit row each.
+_DECIDE_DEMOTE_TRIGGER = f"""
+    CREATE TRIGGER IF NOT EXISTS connections_decide_demote
+    AFTER UPDATE OF role ON memberships
+    WHEN OLD.role = 'owner' AND NEW.role != 'owner' BEGIN
+        INSERT INTO audit_log(at, workspace_id, user_id, connection_id, auth, action,
+                              decision, reason, target_ids)
+        SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), workspace_id, user_id, id, auth,
+               'connection.decide.revoke', 'ok', 'ownership lost', '[]'
+        FROM connections WHERE {_DECIDE_MATCH};
+        UPDATE connections SET policy = json_set(policy, '$.scopes', (
+            SELECT json_group_array(value) FROM json_each(connections.policy, '$.scopes')
+            WHERE value != 'cards:decide'))
+        WHERE {_DECIDE_MATCH};
+    END;
+"""
+
+
 class ControlDB:
     def __init__(self, path: str):
         self.path = path
@@ -270,6 +294,10 @@ class ControlDB:
                         SELECT RAISE(ABORT, 'connection parent cycle') FROM ancestors WHERE id = NEW.id;
                     END;
                 """)
+            # Losing ownership clears a stored cards:decide grant, so regaining
+            # ownership never revives it without fresh consent. (Connections keep
+            # their membership row from being deleted, so demotion is the path.)
+            self._conn.executescript(_DECIDE_DEMOTE_TRIGGER)
             self._conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -453,8 +481,11 @@ class ControlDB:
         actor: str,
         expires_days: Optional[int] = DEFAULT_TOKEN_DAYS,
         parent: Optional[str] = None,
+        grantor: Optional["Principal"] = None,
     ) -> tuple:
         """Create a connection with a new token. Returns ``(connection_id, token)``.
+
+        ``grantor`` is the signed-in owner's principal; only it can add cards:decide.
 
         The token is returned once and only its hash is stored.
         """
@@ -469,6 +500,21 @@ class ControlDB:
             raise ControlError("only an owner's connection can hold the admin scope")
         if "private:read" in policy.scopes and role != "owner":
             raise ControlError("only an owner's connection can hold the private:read scope")
+        if DECIDE_SCOPE in policy.scopes:
+            # Only the signed-in owner's browser grants it, for their own top-level app.
+            try:
+                decide_grant.require_grantor(self, grantor, ws["id"], user["id"])
+            except decide_grant.GrantRefused:
+                raise ControlError(
+                    "only the signed-in owner can give their own top-level connection "
+                    "the cards:decide scope"
+                ) from None
+            if (
+                actor_id != user["id"]
+                or parent is not None
+                or client.strip() == decide_grant.SEAT_CLIENT
+            ):
+                raise ControlError(decide_grant.TOP_LEVEL_TEXT)
         name = name.strip()
         client = client.strip()
         if not _CONNECTION_NAME.fullmatch(name):
@@ -632,6 +678,10 @@ class ControlDB:
                 raise RunnerLinkedError()
             if row["auth"] != "pat" or row["revoked_at"]:
                 raise ControlError("only active personal access tokens can be rotated")
+            expires = _parse(row["expires_at"])
+            if expires is not None and expires <= _now():
+                # Expiry ended the app's eligibility: reviving it needs fresh consent.
+                self.clear_decide(row["id"], reason="expired", user_id=actor_id)
             token = tokens.new_token()
             self._conn.execute(
                 "UPDATE connections SET token_hash=?, token_hint=?, expires_at=?, "
@@ -677,6 +727,50 @@ class ControlDB:
                 user_id=actor_id,
                 connection_id=row["id"],
                 auth="pat",
+            )
+
+    def set_connection_decide(self, ref, allowed, *, actor, workspace_ref):
+        """Grant or withdraw cards:decide on the signed-in owner's own top-level app.
+
+        ``actor`` is the signed-in owner's principal, never a bare user id or an
+        agent. Granting is for personal access tokens; OAuth clients gain it only
+        through consent. Withdrawing works for both and takes effect on the next
+        request. Refusals carry a message safe to show the owner.
+        """
+        with self._lock, self._tx():
+            row = self.connection(ref, workspace_ref)
+            try:
+                decide_grant.require_grantor(self, actor, row["workspace_id"], row["user_id"])
+            except decide_grant.GrantRefused as exc:
+                raise ControlError(str(exc)) from None
+            if decide_grant.is_runner(self, row["id"]):
+                raise RunnerLinkedError()
+            # Withdrawing always works, also on expired or revoked connections;
+            # granting needs a live connection.
+            if allowed and self.authenticate_connection(row["id"]) is None:
+                raise ControlError(decide_grant.INACTIVE_TEXT)
+            if allowed:
+                reason = decide_grant.refusal(self, row) or (
+                    decide_grant.OAUTH_GRANT_TEXT if row["auth"] != "pat" else None
+                )
+                if reason:
+                    raise ControlError(reason)
+            elif row["auth"] not in ("pat", "oauth"):
+                raise ControlError(decide_grant.TOP_LEVEL_TEXT)
+            policy = json.loads(row["policy"])
+            scopes = set(policy.get("scopes", ())) - {DECIDE_SCOPE}
+            policy["scopes"] = sorted(scopes | ({DECIDE_SCOPE} if allowed else set()))
+            self._conn.execute(
+                "UPDATE connections SET policy=? WHERE id=?",
+                (json.dumps(policy, sort_keys=True), row["id"]),
+            )
+            self.audit(
+                action="connection.decide.grant" if allowed else "connection.decide.revoke",
+                decision="ok",
+                workspace_id=row["workspace_id"],
+                user_id=actor.user_id,
+                connection_id=row["id"],
+                auth=row["auth"],
             )
 
     def authenticate_token(self, token: str) -> Optional[Principal]:
@@ -834,11 +928,11 @@ class ControlDB:
         reason: str = "",
         wing: Optional[str] = None,
         target_ids: Iterable[str] = (),
-    ) -> None:
-        """Append one entry. Ids and decisions only, never memory text."""
+    ) -> int:
+        """Append one entry and return its sequence number. Ids and decisions only."""
         ids = [str(t)[:200] for t in target_ids if t][:500]
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "INSERT INTO audit_log(at, workspace_id, user_id, connection_id, auth, action, "
                 "tool, decision, reason, wing, target_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
@@ -855,6 +949,39 @@ class ControlDB:
                     json.dumps(ids),
                 ),
             )
+            return cursor.lastrowid
+
+    def clear_decide(self, connection_id: str, *, reason: str, user_id=None) -> bool:
+        """Remove a stored cards:decide grant; True when one was removed (audited)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, workspace_id, user_id, auth, policy FROM connections WHERE id=?",
+                (connection_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                policy = json.loads(row["policy"])
+                scopes = list(policy.get("scopes", ()))
+            except (TypeError, ValueError, AttributeError):
+                return False
+            if DECIDE_SCOPE not in scopes:
+                return False
+            policy["scopes"] = sorted(set(scopes) - {DECIDE_SCOPE})
+            self._conn.execute(
+                "UPDATE connections SET policy=? WHERE id=?",
+                (json.dumps(policy, sort_keys=True), row["id"]),
+            )
+            self.audit(
+                action="connection.decide.revoke",
+                decision="ok",
+                workspace_id=row["workspace_id"],
+                user_id=user_id or row["user_id"],
+                connection_id=row["id"],
+                auth=row["auth"],
+                reason=reason,
+            )
+            return True
 
     def audit_entries(self, workspace_ref: Optional[str] = None, limit: int = 100) -> list:
         sql = "SELECT * FROM audit_log"

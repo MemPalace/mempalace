@@ -62,7 +62,7 @@ def ensure_schema(db: ControlDB) -> None:
 
 def person_policy(role: Optional[str] = None) -> Policy:
     """Only explicit workspace ownership proves private read authority."""
-    excluded = {"admin", "memory:import", "memory:import:read"}
+    excluded = {"admin", "memory:import", "memory:import:read", "cards:decide"}
     if role != "owner":
         excluded.add("private:read")
     return Policy.build(

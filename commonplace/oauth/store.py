@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from .. import urls
 from ..control_db import ControlError, Principal
+from ..decide_grant import DECIDE_SCOPE
 from ..policy import Policy
 from .http import OAuthError
 
@@ -23,7 +24,7 @@ ACCESS_SECONDS = 3600
 REFRESH_SECONDS = 90 * 86400
 CODE_SECONDS = 300
 REQUEST_SECONDS = 600
-SCOPES = ("memory:read", "memory:write", "memory:import", "memory:import:read")
+SCOPES = ("memory:read", "memory:write", "memory:import", "memory:import:read", "cards:decide")
 OAUTH_DEFAULT_SCOPES = ("memory:read", "memory:write")
 
 SCHEMA = """
@@ -120,6 +121,14 @@ def scope(value: str | None) -> str:
     return " ".join(sorted(set(requested)))
 
 
+def conn_role(conn, principal):
+    row = conn.execute(
+        "SELECT role FROM memberships WHERE workspace_id = ? AND user_id = ?",
+        (principal.workspace_id, principal.user_id),
+    ).fetchone()
+    return row["role"] if row else None
+
+
 def _live_connection(conn, connection_id):
     row = conn.execute(
         "SELECT c.*, u.email AS user_email, u.disabled_at AS user_disabled, m.role "
@@ -180,7 +189,17 @@ def revoke_connection(db, connection_id: str, *, actor_id: str, workspace_id: st
         )
 
 
+def _live_scope(conn, grant) -> str:
+    """The granted scopes the connection still holds now (owner role applied)."""
+    row = _live_connection(conn, grant["connection_id"])
+    live = set(Policy.from_json(row["policy"]).for_role(row["role"]).scopes) if row else set()
+    return " ".join(s for s in grant["scope"].split() if s in live)
+
+
 def _issue(conn, grant) -> dict:
+    # Issue and advertise only what is live, so a withdrawn or lost scope never
+    # reappears in a response or in the stored token rows a later refresh copies.
+    grant = dict(grant, scope=_live_scope(conn, grant))
     access = "cmmn_at_" + secrets.token_urlsafe(32)
     refresh = "cmmn_rt_" + secrets.token_urlsafe(48)
     for secret, kind, lifetime in (
@@ -228,6 +247,11 @@ def _guess_client(client_row) -> str:
 
 
 def create_code(conn, client_row, principal, parameters) -> str:
+    if DECIDE_SCOPE in parameters["scope"].split() and not (
+        principal.person and conn_role(conn, principal) == "owner"
+    ):
+        # Consent already drops an unticked or ineligible grant; never mint it otherwise.
+        raise OAuthError("invalid_scope")
     cid = "conn_" + secrets.token_hex(8)
     slug = re.sub(r"[^a-z0-9]+", "-", client_row["client_name"].lower()).strip("-")[:80] or "client"
     while True:

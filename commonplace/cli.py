@@ -153,6 +153,8 @@ def cmd_token_add(args) -> int:
 
     if "memory:import:read" in (_csv(args.scopes) or []):
         raise ValueError("Imported history requires explicit browser reader consent")
+    if "cards:decide" in (_csv(args.scopes) or []):
+        raise ValueError("Answering Needs-me questions requires the owner's browser consent")
     defaults = CLIENT_PRESETS.get(args.client, DEFAULT_CLIENT_PRESET)
 
     def value(name, fallback):
