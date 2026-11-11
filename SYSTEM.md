@@ -1453,6 +1453,10 @@ A routine (name, card template, schedule, owner) creates one card per due time. 
 
 - None are approved yet.
 
+### After Done: archive hides, never deletes
+
+A done card is final. A signed-in person (owner or member) may archive it, carry on from it in a new linked backlog card, and pin key facts to its Pocket; connections may not. Archiving only flags the card in `card_archive`: it leaves board lists and counts but stays readable and restorable, and nothing is deleted (restore and unpin mark rows, they never remove them). Archived cards refuse updates and Pocket changes until restored. These routes are person-only, so they sit outside the agent-write rules inventory.
+
 ### Reassigning active work
 
 - **Claim boundary.** Immediate owner-assignment claims apply only when handing off a todo card. Reassigning doing work, including a stuck card from needs-me, returns it to todo with no lease or automatic start so the receiver can explicitly claim it.

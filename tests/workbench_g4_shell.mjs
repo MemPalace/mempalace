@@ -28,7 +28,7 @@ const nodes = {};
 for (const selector of ['#content', '#card-panel', '#title', '#head-actions', '.shell']) nodes[selector] = node();
 const root = { querySelector: (s) => nodes[s] || null, querySelectorAll: () => [], addEventListener() {} };
 let titleActions = '';
-const context = { root, state, e, enc: encodeURIComponent, document: { activeElement: null }, location: { hash: state.route }, history: { state: null, replaceState(_s, _t, hash) { context.location.hash = hash; } },
+const context = { root, state, e, placeLifecycle: () => {}, enc: encodeURIComponent, document: { activeElement: null }, location: { hash: state.route }, history: { state: null, replaceState(_s, _t, hash) { context.location.hash = hash; } },
   matchMedia: () => ({ matches: false }), remember: () => ({}), restore() {}, markOpenCard() {}, title(_text, actions) { titleActions = actions; }, voice: { stop() {} }, showError() {}, message: (text) => text };
 const run = (s) => runInNewContext(s, context);
 // The shell's board helpers (child cards, phone width); a shell without them only lists state.cards.

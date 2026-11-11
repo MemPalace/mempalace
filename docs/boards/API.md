@@ -732,3 +732,23 @@ new-user migration and desktop synchronization are deferred.
 
 Workspace owners can inspect members and connections through the separate
 [Admin GET API](../admin.md); board actions retain their existing authority.
+
+## After Done: Archive, carry on and the Pocket
+
+A done card is final. Four actions follow it, all `POST` with the card `version` and open to signed-in
+people only (workspace owner or member). Connections get 403 `no: only a signed-in person can ...`. There
+are no MCP tools for them yet.
+
+| Route | Body | Result |
+| --- | --- | --- |
+| `/api/cards/<n>/archive` | `version` | The card, `archived: true`. Only a done card; archiving twice changes nothing. |
+| `/api/cards/<n>/restore` | `version` | The card, `archived: false`, back in Done. |
+| `/api/cards/<n>/follow-up` | `version`, optional `title`, `body` | 201 `{origin, card}`: a new backlog card on the same board, linked by `follow_up_of` / `follow_ups`. Only from a done card. |
+| `/api/cards/<n>/pocket` | `version`, `text` | The card with the fact pinned (verbatim, up to 2000 characters, at most 25 per card, no duplicates). |
+| `/api/cards/<n>/unpocket` | `version`, `pin` | The card without that fact. The row stays in storage, marked unpinned. |
+
+Archive hides, it never deletes. Archived cards leave `GET /api/boards/<slug>/cards` and the board
+`counts` (the board reports `archived` separately), stay readable through `GET /api/cards/<n>` and
+`GET /api/boards/<slug>/cards?archived=1`, and refuse updates and Pocket changes until restored.
+Every card carries `final`, `archived`, `archived_at`, `archived_by`, `follow_up_of`, `follow_ups`,
+`pocket` and the caller's `can_archive`, `can_restore`, `can_follow_up` and `can_pocket`.

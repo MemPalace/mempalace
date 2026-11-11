@@ -271,3 +271,8 @@ kbd { font: 500 11px/16px var(--mono); color: var(--text-2); background: var(--s
 .card-runs .run-start-row { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
 .card-runs .run-start-field { display: flex; flex-direction: column; gap: 2px; flex: 1 1 120px; min-width: 0; font-size: 12px; color: var(--text-2); }
 .card-runs .run-start-field select { min-width: 0; }
+
+/* Card details: the Pocket of pinned facts. */
+.workbench-details .pocket { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.workbench-details .pocket li { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+.workbench-details .pocket-text { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }

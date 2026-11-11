@@ -249,6 +249,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The operational Admin API and opt-in backup receipts, with operator provisioning and unknown-history limits.
 
+  - The card API reference documents the after-Done routes (archive, restore, carry on, Pocket), their person-only authorization and what archiving hides.
+
   - The Admin runtime/limits/stuck API, independent owner queue and project/runner guide links.
 
   - Fact-first ranking and union-where RFCs: a restricted caller's fact counts and seed ranking, and the vector-disabled Chroma fallback's candidate window, come from readable content only; the cost of exact readable statistics is a known limit.
@@ -990,6 +992,8 @@ Format (read by `commonplace orch docs-check`):
   - Thread-search tests pin rank-before-fetch and score/thread/index ordering at the limit boundary, including shuffled rowids and ID batches.
   - `tests/test_commonplace_owner_403_message.py` and `tests/owner_403_message.mjs` (base red: 6 failures on `origin/develop`) cover the reason and next step of a refused Done move or handoff, and that 404, 409 and other 403 answers keep their status.
 
+  - `tests/lifecycle_ui.mjs` (run by `tests/test_card_lifecycle_ui.py`) drives the Done and Pocket card-details module alone; the shell harnesses stub its `placeLifecycle` hook.
+
 
 ## hub-core
 
@@ -1229,6 +1233,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Canonical Space REST response projection and typed creation refusals.
 
+  - After Done (`boards/lifecycle.py`): a done card is final and can be archived, restored, carried on in a new linked backlog card and given a Pocket of pinned key facts. Archive flags a row and hides the card from board lists and counts; it is still readable (`GET /api/cards/<n>`, `?archived=1`) and restorable, and nothing is deleted (unpinning marks the fact, restoring marks the archive row). Only signed-in people (owner or member) act; connections are refused. Archived cards refuse updates until restored. Deferred: MCP tools, bulk Clear Done, agent-side Pocket.
+
   - Plain refusals for the owner REST Done move and handoff (`boards/refusals.py`): a 403 carries a reason in `error` and the next step in `next_step`; the web client (`web/static/api.js`) shows both, and a 403 without a JSON body gets a readable message. Who may move or hand off a card is unchanged.
 
   - Boards, cards, the append-only `task_events` log, approvals and decisions, the hub event log, signed webhooks and delayed person approvals.
@@ -1323,6 +1329,8 @@ Format (read by `commonplace orch docs-check`):
   - `tests/test_commonplace_boards.py`, the `tests/test_commonplace_board_` files, `tests/test_commonplace_decide.py`, `tests/test_orch_plan_gate.py`, `tests/test_commonplace_webhooks.py`.
 
   - `tests/test_commonplace_subagent_asks.py` and `tests/test_commonplace_agent_asks.py` check generic question routing, owner fallback, explicit person reasons, recipient authority and withdrawal guards through MCP and HTTP.
+
+  - `tests/test_card_lifecycle.py` holds archive/restore (hide, never delete), carry-on follow-ups and the Pocket, with owner, member, connection and anonymous authorization over the service and REST.
 
 
 ## runner
@@ -2007,6 +2015,8 @@ Format (read by `commonplace orch docs-check`):
   - Enabled waiting tags show dependency titles or occupied-slot counts and suppress the available tag.
 
   - `blockers.js` renders the card-details Blocked by section (blocker title, Waiting or Done, Clear, Add blocker by card number) only when card views carry `blocked_by`, and edits the list through the card `PATCH`.
+
+  - `lifecycle.js` renders the card-details Done and Pocket section (Archive, Restore, Carry on, pinned facts) from the server's `can_*` flags and builds its REST requests; `details.js` only exposes an `afterDraw` hook, so `tests/lifecycle_ui.mjs` (with `tests/test_card_lifecycle_ui.py`) drives the module alone.
 
   - `waiting.js` shows the server's waiting sentence as a board tag and in the card details, and a strip of `waiting_notes` above the board; it adds no sentences of its own.
 

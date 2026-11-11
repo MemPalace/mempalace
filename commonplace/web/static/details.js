@@ -125,12 +125,13 @@ export function renderDetails(card, { board = { slug: card.board }, me, messages
 }
 
 // The shell keeps ownership of card mutations, drafts, sheet modality and chat focus return.
-export function createDetails({ mount, api = request, onMemory = () => {} }) {
+export function createDetails({ mount, api = request, onMemory = () => {}, afterDraw = () => {} }) {
   let current, options, revision = 0, links = null;
   const draw = () => {
     mount.innerHTML = renderDetails(current, options);
     if (options.tab === "details") placeCardLinks(mount, links);
     void attachCardRuns(mount, current, { api });
+    if (options.tab === "details") afterDraw(mount, current);
   };
   function selectTab(tab, focus = false) {
     if (!current || !["details", "memory"].includes(tab)) return;

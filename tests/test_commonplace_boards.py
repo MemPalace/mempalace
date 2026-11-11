@@ -24,6 +24,11 @@ CARD_KEYS = set(
     "task_type priority can_prioritize reviewer can_set_reviewer escalated_to review_context claim_expired_at claim_expired agent_parent proposal_status proposed_to approved_by can_approve review_kind number parent board title body status assignee claim_until ask ask_options ask_to return_to flags repo branch pr_url pr_number pr_state pr_head pr_reported_at checks status_line heartbeat_at labels links version created_by created_at updated_at position need message_id restricted".split()
 )
 
+# Added to every card read through the service or REST; the needs-me buckets do not carry them.
+LIFECYCLE_KEYS = set(
+    "final archived archived_at archived_by follow_up_of follow_ups pocket can_archive can_restore can_follow_up can_pocket".split()
+)
+
 
 def api(hub, auth, method, path, body=None):
     connection = http.client.HTTPConnection("127.0.0.1", hub.port, timeout=10)
@@ -112,7 +117,7 @@ def test_card_shape_metadata_and_routes(hub, env):
         "/api/boards/work/cards",
         {"title": "Exact\nwords", "body": "  keep all words\n", "labels": ["backend"]},
     )
-    assert status == 201 and set(created) == CARD_KEYS | {"url"}
+    assert status == 201 and set(created) == CARD_KEYS | LIFECYCLE_KEYS | {"url"}
     assert created["created_by"] == agent.actor
     assert created["repo"] == "github.com/140er/mempalace"
     number = created["number"]
@@ -131,7 +136,7 @@ def test_card_shape_metadata_and_routes(hub, env):
             "status_line": "Testing",
         },
     )
-    assert status == 200 and set(updated) == CARD_KEYS | {"url"}
+    assert status == 200 and set(updated) == CARD_KEYS | LIFECYCLE_KEYS | {"url"}
     assert updated["pr_url"] == "https://github.com/140er/mempalace/pull/12"
     assert updated["heartbeat_at"] and updated["claim_until"]
     assert updated["body"] == "  keep all words\n" and updated["labels"] == ["backend"]
@@ -1452,7 +1457,7 @@ def test_link_api_and_seed_all_statuses(hub, env):
             branch="feat/seed",
             pr_url="https://github.com/org/repo/pull/7",
         )
-        assert set(current) == CARD_KEYS and current["status"] == status
+        assert set(current) == CARD_KEYS | LIFECYCLE_KEYS and current["status"] == status
         assert current["labels"] == ["seed"] and current["pr_number"] == 7
         changes = owner.store.changes
         repeat = owner.seed_card(board="new", title=status, status="todo", body="ignore repeat")
@@ -1693,9 +1698,16 @@ def test_expired_version_conflict_returns_committed_card(hub, env):
     )
     assert status == 409 and conflict["current"]["status"] == "doing"
     actual = owner.task_show(created["number"])
-    # can_prioritize and can_set_reviewer depend on who reads the card, not on the card.
-    reader = {"can_prioritize", "can_set_reviewer"}
-    assert {key: actual[key] for key in CARD_KEYS - reader} == {
+    # Flags that depend on who reads the card, not on the card.
+    reader = {
+        "can_prioritize",
+        "can_set_reviewer",
+        "can_pocket",
+        "can_archive",
+        "can_restore",
+        "can_follow_up",
+    }
+    assert {key: actual[key] for key in (CARD_KEYS | LIFECYCLE_KEYS) - reader} == {
         k: v for k, v in conflict["current"].items() if k not in {"url", *reader}
     }
     assert actual["title"] == "Expired version"

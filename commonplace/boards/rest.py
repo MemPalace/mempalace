@@ -8,6 +8,7 @@ from urllib.parse import quote
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.rules.enforce import RulesRefresh, rest_write
 
+from . import lifecycle
 from ._http import (
     HTTPError,
     path_parts,
@@ -182,6 +183,27 @@ def _explained(kind, service):
     return explained(kind, person=service.principal.person) if kind else nullcontext()
 
 
+def _lifecycle_route(service, h, parts, method):
+    """Archive, restore, carry on and Pocket: signed-in people only, refused in the service.
+
+    These are person-only writes (the service refuses connections), so they sit outside the
+    rules-freshness inventory, which covers agent writes."""
+    if len(parts) != 3 or method != "POST" or parts[2] not in lifecycle.ACTIONS:
+        return None
+    task, action = parts[1], parts[2]
+    body = read_json(h)
+    body.pop("task", None)
+    if action == "follow-up":
+        return 201, service.task_follow_up(task, **body)
+    handler = {
+        "archive": service.task_archive,
+        "restore": service.task_restore,
+        "pocket": service.pocket_pin,
+        "unpocket": service.pocket_unpin,
+    }[action]
+    return 200, handler(task, **body)
+
+
 def _card_route(service, h, parts, method):
     task = parts[1]
     if len(parts) == 2:
@@ -195,6 +217,9 @@ def _card_route(service, h, parts, method):
                         raise HTTPError(400, "version is required")
                     body.pop("task", None)
                     return 200, service.task_update(task, **body)
+    routed = _lifecycle_route(service, h, parts, method)
+    if routed:
+        return routed
     if len(parts) == 3 and method == "POST":
         handlers = {
             "comments": service.task_comment,
@@ -276,7 +301,10 @@ def dispatch(service, h, parts, method):
     if len(parts) == 3 and parts[0] == "boards" and parts[2] == "cards":
         if method == "GET":
             cards = service.task_list(
-                board=parts[1], status=query(h).get("status") or None, all_statuses=True
+                board=parts[1],
+                status=query(h).get("status") or None,
+                all_statuses=True,
+                archived=query(h).get("archived") in ("1", "true"),
             )
             return 200, {
                 "cards": [c for c in cards if c["parent"] is None],

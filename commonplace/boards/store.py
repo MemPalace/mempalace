@@ -382,7 +382,13 @@ class BoardStore:
         self.create = create
         self.path = str(directory / "boards.sqlite3")
         with self.connection() as conn:
-            conn.executescript(Path(__file__).with_name("schema.sql").read_text() + BLOCKERS_SCHEMA)
+            from .lifecycle import SCHEMA as LIFECYCLE_SCHEMA
+
+            conn.executescript(
+                Path(__file__).with_name("schema.sql").read_text()
+                + BLOCKERS_SCHEMA
+                + LIFECYCLE_SCHEMA
+            )
             conn.execute("BEGIN IMMEDIATE")
             try:
                 board_columns = {r[1] for r in conn.execute("PRAGMA table_info(boards)")}
