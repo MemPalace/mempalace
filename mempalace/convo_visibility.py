@@ -55,6 +55,7 @@ def visible_conversation_rows(ids, metadatas):
             hidden.update(index for index, _ in group)
     return [row for index, row in enumerate(rows) if index not in hidden]
 
+
 def visible_conversation_candidate_ids(palace_path, collection_name, candidates):
     """Exclude unfinished stamped vector candidates using a source-wide snapshot.
 

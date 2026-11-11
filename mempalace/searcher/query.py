@@ -358,9 +358,7 @@ def search_memories(
         from ..convo_visibility import visible_conversation_candidate_ids
 
         def visibility_filter(candidates):
-            return visible_conversation_candidate_ids(
-                palace_path, collection_name, candidates
-            )
+            return visible_conversation_candidate_ids(palace_path, collection_name, candidates)
 
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
