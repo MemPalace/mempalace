@@ -1461,6 +1461,10 @@ A routine (name, card template, schedule, owner) creates one card per due time. 
 
   - Approval of the waiver list below is a manual owner review.
 
+- **Capture hook spool.**
+
+  - The capture hook stores the hook JSON as received (session metadata and a transcript path, no transcript text) in `~/.commonplace/spool` and an uploader reads the transcript later. A transcript deleted or rewritten before the upload is lost to the hub; the item is set aside under `rejected/` with a log line. The spool is bounded (500 items, 8 MiB) and drops the oldest items first, logging each drop.
+
 - **Scheduled prompts:** A schedule's prompt is delivered as an owner-authored message on the board the agent coordinates, through the ordinary `space_message` wake; delivery is at most once per due time (a missed or interrupted due time is recorded, never replayed), is re-authorised at each due time, and is limited to coordinators. Non-coordinator agents have no existing prompt channel that avoids creating a card, so they are not supported yet. The worker polls every 30 seconds, so a prompt can arrive up to that much after its due time.
 
 ## Open dependencies (D1–D3)

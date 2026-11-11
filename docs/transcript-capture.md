@@ -78,6 +78,28 @@ Periodic scans are still needed to catch sessions without a final hook, late
 flushes and retryable failures. With these hook commands, Paid capture runs at
 supplied hook events. The [live-sync daemon](live-sync.md) also checks selected
 files every two seconds.
+
+### Offline spool and retry
+
+The capture hook does not wait for the hub. It writes the hook JSON, unchanged (session metadata and the
+transcript path, no transcript text), to a private spool (`~/.commonplace/spool`, directory mode 0700, files 0600,
+written atomically) and returns. The detached child then uploads spooled items
+oldest first through the same cursor protocol, sending a `client_op_id` of the
+item key and offset, so a repeated send is a no-op on the hub. An item is deleted
+only after the hub confirmed it; a crash between the upload and the delete just
+repeats a harmless upload. After a failure the item stays, later items wait, and
+the next attempt is delayed 5 s, 10 s, 20 s ... up to 15 minutes. The next hook
+event retries; `python -m commonplace.hook_spool drain --force` retries now and
+`python -m commonplace.hook_spool status` shows the queue.
+
+The spool holds at most 500 items and 8 MiB. When full it drops the oldest items
+first and writes one line per drop (key, reason, size, never text) to
+`spool.log`. A refused credential (401/403) pauses the queue with the
+same backoff but never gives items up; fix the token and the queue drains. An item that can never upload (missing transcript, repeated
+failures) moves to `rejected/` (at most 100, logged) so it cannot block later
+items. If the workspace has capture off, items are discarded with a log line;
+the transcript stays local and a later opt-in captures it from the start.
+
 Codex notifications without a native rollout path need the directory scan or
 the existing adapter that supplies that path. No hook is installed by these
 commands. Remove the local hook or unset the local switch to stop scheduling;

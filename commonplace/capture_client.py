@@ -22,6 +22,14 @@ class CaptureError(Exception):
     """Fixed diagnostics only: never include paths, credentials or source text."""
 
 
+class CaptureAuth(CaptureError):
+    """The hub refused the credential (401/403); fixing the token fixes the retry."""
+
+
+class CaptureUnavailable(CaptureError):
+    """The hub or the transcript was busy or unreachable; the same request can be retried."""
+
+
 def endpoint(url):
     try:
         target = urlsplit(url)
@@ -61,13 +69,23 @@ def request(target, token, method, route, body=None):
         if response.status == 429:
             return {"status": "deferred"}
         if response.status != 200 or len(raw) > 65536:
-            raise CaptureError(f"Capture request refused (HTTP {response.status}); saved data kept")
+            if response.status in (401, 403):
+                raise CaptureAuth(
+                    f"Capture request refused (HTTP {response.status}); saved data kept"
+                )
+            # 409 is a cursor race (another writer moved the cursor); a fresh cursor read resolves it.
+            failure = (
+                CaptureUnavailable
+                if response.status in (408, 409) or response.status >= 500
+                else CaptureError
+            )
+            raise failure(f"Capture request refused (HTTP {response.status}); saved data kept")
         result = json.loads(raw)
         if not isinstance(result, dict):
             raise ValueError
         return result
     except (OSError, http.client.HTTPException, ValueError, UnicodeError):
-        raise CaptureError("Capture request unavailable; retry the same files") from None
+        raise CaptureUnavailable("Capture request unavailable; retry the same files") from None
     finally:
         connection.close()
 
@@ -104,7 +122,8 @@ def native_id(stream, source):
     raise CaptureError("Native session identity missing; file left untouched")
 
 
-def sync_file(target, token, source, path):
+def sync_file(target, token, source, path, op_id=None):
+    """Send at most one suffix; ``op_id`` makes a retry of the same chunk idempotent."""
     # Follow no final symlink. Scans also reject symlinked ancestors.
     if any(part.is_symlink() for part in (path, *path.parents)):
         raise CaptureError("Symlinked transcript refused")
@@ -156,7 +175,7 @@ def sync_file(target, token, source, path):
             raise CaptureError("Native record too large; file left for a later manual import")
         after = os.fstat(stream.fileno())
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-            raise CaptureError("Transcript changed during read; retry after flush")
+            raise CaptureUnavailable("Transcript changed during read; retry after flush")
         if not suffix:
             return {"status": "unchanged"}
         try:
@@ -174,6 +193,7 @@ def sync_file(target, token, source, path):
                 "offset": offset,
                 "prefix_sha256": state["prefix_sha256"],
                 "transcript": text,
+                **({"client_op_id": f"{op_id}-{offset}"} if op_id else {}),
             },
         )
 

@@ -280,6 +280,8 @@ Format (read by `commonplace orch docs-check`):
 
   - Contributor and agent instructions, the mission and design notes, user and operator documentation, release history, the licence and the security policy.
 
+  - `docs/transcript-capture.md` documents the capture hook's offline spool: bounds, drop log, backoff and the `hook_spool` status and drain commands.
+
   - `CONTRIBUTING.md` documents the hook install, the pre-push quick check and its budget, and the per-worktree environment.
 
   - `docs/projects.md` and `docs/orchestrator.md` state who may hold a lease on a board without `[runner]`: its own trusted project seat.
@@ -634,6 +636,10 @@ Format (read by `commonplace orch docs-check`):
   - Whole-response source-path and hidden-candidate regressions cover both search routes and wing selections; canonical output goldens and the three-backend union test distinguish raw owner rendering from the member's final gated render.
 
   - Protected shared-room CLI regressions cover literal-wing and fan-out search with independently readable controls; owner renderer controls, both room-list paths, cited and uncited cross-workspace mutations, and all nine projected-read literal refusals retain their distinct boundaries.
+
+  - `tests/test_commonplace_hook_spool.py` covers the offline spool, ordered upload, backoff, retry after failure, a crash between upload and delete against the real gateway, and the hook time budget; the existing capture hook test spools into a temporary home.
+
+
 
   - Chromium project-connect regressions verify visible shared-memory and other conflict statuses, dialog dismissal and unchanged explicit retry bodies.
   - Restricted-search refill regressions cover hidden ranked prefixes, counter suppression, exhaustion, work bounds, unchanged every-wing calls, restricted CLI-compatible search, filters and deadline failures; the same fixture reports information-only latency.
@@ -1205,7 +1211,7 @@ Format (read by `commonplace orch docs-check`):
 
 ## cli-and-client
 
-- **Paths:** `commonplace/cli.py`, `commonplace/client.py`, `commonplace/client_hooks.py`, `commonplace/client_install.py`, `commonplace/review_rules.py`, `commonplace/bridge.py`, `commonplace/onboarding.py`, `commonplace/seed.py`, `commonplace/README.md`, `commonplace/SETUP.md`, `commonplace/agent-skill/`
+- **Paths:** `commonplace/cli.py`, `commonplace/client.py`, `commonplace/client_hooks.py`, `commonplace/hook_spool.py`, `commonplace/client_install.py`, `commonplace/review_rules.py`, `commonplace/bridge.py`, `commonplace/onboarding.py`, `commonplace/seed.py`, `commonplace/README.md`, `commonplace/SETUP.md`, `commonplace/agent-skill/`
 - **Owns:**
 
   - The `runner report` argument parser; the command itself lives in `commonplace/runner/report.py`.
@@ -1239,6 +1245,8 @@ Format (read by `commonplace orch docs-check`):
 
   - The native startup hook gives the hub `client_hooks.HUB_TIMEOUT_S` (0.4 s) and then fails open to the follow-up notice.
 
+  - The capture hook only writes its payload verbatim to a private local spool (`hook_spool.py`: atomic, owner-only, bounded by item count and bytes) and starts a detached uploader; it never waits on the network. Uploads go oldest first, retry with exponential backoff, send a `client_op_id` per item and offset, and remove an item only after the hub confirmed it. A full spool drops the oldest items and logs each drop; unuploadable items are kept under `rejected/`.
+
   - The native startup hook adds a missing-rules notice unless its context opens with a complete effective rule set.
 
   - `commonplace review-rules` prints the effective rules as a reviewer prompt block that is never empty, and `--verify` accepts a verdict only when its last `Rules checked:` line names the current complete set.
@@ -1257,7 +1265,7 @@ Format (read by `commonplace orch docs-check`):
 
   - `tests/test_search_index_progress.py` covers local status, run and explicit capture enrolment.
 
-  - `tests/test_commonplace_cli.py`, `tests/test_commonplace_client.py`, `tests/test_commonplace_client_hooks.py`, `tests/test_commonplace_client_install.py`, `tests/test_commonplace_onboarding.py`.
+  - `tests/test_commonplace_cli.py`, `tests/test_commonplace_client.py`, `tests/test_commonplace_client_hooks.py`, `tests/test_commonplace_hook_spool.py`, `tests/test_commonplace_client_install.py`, `tests/test_commonplace_onboarding.py`.
 
   - `tests/test_rules_enforcement_points.py` covers the hook's missing-rules notice and the `review-rules` block, verdict check and exit statuses.
 
@@ -1863,6 +1871,8 @@ Format (read by `commonplace orch docs-check`):
 - **Owns:**
 
   - Memory tools and routes under the caller's policy, search index progress, workspace store generations and cutovers, and opt-in chat capture.
+
+  - The capture runner classifies hub and transcript failures that a retry can fix (`CaptureUnavailable`: network, 5xx, 408, 409, transcript changed during read) and refused credentials (`CaptureAuth`, 401/403, which pause the spool without giving items up) apart from permanent ones, and `sync_file` accepts an idempotency key sent as `client_op_id`.
 
   - The generic `agent-log` capture source: any agent appends JSONL records carrying `agent` and `session_id`, and the capture identity is `<agent>:<session_id>`.
 

@@ -367,9 +367,11 @@ def test_explicit_root_runner_growth_rotation_prefix_edit_and_opt_out(
     assert saved(s, grown["stored_thread_id"]) == after
 
 
-def test_hook_explicit_opt_in_detaches_without_source_reads_or_secret_arguments(monkeypatch):
+def test_hook_explicit_opt_in_detaches_without_source_reads_or_secret_arguments(
+    monkeypatch, tmp_path
+):
     stdin = io.StringIO(json.dumps({"transcript_path": "/synthetic/session.jsonl"}))
-    args = ["--event", "capture", "--client", "claude"]
+    args = ["--event", "capture", "--client", "claude", "--home", str(tmp_path)]
     with patch.object(client_hooks.subprocess, "Popen") as spawn:
         assert client_hooks.main(args, stdin=stdin, stdout=io.StringIO()) == 0
         spawn.assert_not_called()
@@ -380,7 +382,7 @@ def test_hook_explicit_opt_in_detaches_without_source_reads_or_secret_arguments(
             assert client_hooks.main(args, stdin=stdin, stdout=io.StringIO()) == 0
         command = spawn.call_args.args[0]
         assert "synthetic-secret" not in " ".join(command)
-        assert "commonplace.capture_client" in command
+        assert "commonplace.hook_spool" in command
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from . import hook_spool
 from .client import Client
 
 MAX_INPUT_BYTES = 64 * 1024
@@ -45,16 +46,20 @@ LOCAL_WARNING = (
 )
 
 
-def _input(stream):
+class _TooLarge(ValueError):
+    pass
+
+
+def _read(stream):
     raw = getattr(stream, "buffer", stream).read(MAX_INPUT_BYTES + 1)
     if isinstance(raw, str):
         raw = raw.encode("utf-8")
     if len(raw) > MAX_INPUT_BYTES:
-        raise ValueError
+        raise _TooLarge
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError
-    return value
+    return raw.decode("utf-8"), value
 
 
 def _rules_complete(context):
@@ -96,12 +101,38 @@ def _check(args, payload):
     return {"systemMessage": LOCAL_WARNING} if changes else {}
 
 
-def _capture(args, payload):
-    """Reuse the native Stop hook, leaving network and file reads to its child."""
-    if os.environ.get("COMMONPLACE_CAPTURE") != "on":
+def _capture_on():
+    return os.environ.get("COMMONPLACE_CAPTURE") == "on"
+
+
+def _log_oversize(args):
+    """An oversized hook payload is not spooled; record that in the spool log."""
+    try:
+        spool = hook_spool.Spool(hook_spool.default_root(args.home or Path.home()))
+        spool._prepare()
+        spool.log("dropped", reason="hook payload over %d bytes" % MAX_INPUT_BYTES)
+    except OSError:
+        pass
+
+
+def _capture(args, payload, raw):
+    """Spool the hook payload, then leave network and file reads to a detached child.
+
+    The hook itself touches no network, so a slow or absent hub cannot delay it.
+    """
+    if not _capture_on():
         return {}
     path = payload.get("transcript_path") or payload.get("rollout_path")
     if not isinstance(path, str) or not Path(path).is_absolute():
+        return {}
+    home = args.home or Path.home()
+    source = "claude-code" if args.client == "claude" else "codex"
+    try:
+        hook_spool.Spool(hook_spool.default_root(home)).enqueue(source, raw)
+    except (OSError, ValueError):
+        # Spool unavailable (for example a read-only home): nothing was stored,
+        # so there is nothing to upload. Fail open; the live-sync daemon or a
+        # directory scan still covers the transcript.
         return {}
     options = (
         {"start_new_session": True}
@@ -117,11 +148,10 @@ def _capture(args, payload):
             sys.executable,
             "-I",
             "-m",
-            "commonplace.capture_client",
-            "--source",
-            "claude-code" if args.client == "claude" else "codex",
-            "--file",
-            path,
+            "commonplace.hook_spool",
+            "drain",
+            "--home",
+            str(home),
             *(["--url", args.url] if args.url else []),
         ],
         env=dict(os.environ, COMMONPLACE_TOKEN=os.environ.get(args.token_env, "")),
@@ -151,7 +181,7 @@ def main(argv=None, *, stdin=None, stdout=None) -> int:
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
     try:
-        payload = _input(stdin)
+        raw, payload = _read(stdin)
         if args.event == "session-start":
             result = {
                 "hookSpecificOutput": {
@@ -160,10 +190,12 @@ def main(argv=None, *, stdin=None, stdout=None) -> int:
                 }
             }
         elif args.event == "capture":
-            result = _capture(args, payload)
+            result = _capture(args, payload, raw)
         else:
             result = _check(args, payload)
-    except Exception:
+    except Exception as error:
+        if isinstance(error, _TooLarge) and args.event == "capture" and _capture_on():
+            _log_oversize(args)
         # Exceptions can contain tokens, paths, prompts, or saved data. None
         # are echoed; a failed check cannot prevent a tool call or a stop.
         result = (
