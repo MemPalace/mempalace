@@ -187,9 +187,7 @@ def test_every_sqlite_reader_returns_what_it_did(palace):
     assert _outputs(palace_path, col) == EXPECTED
 
 
-def test_unrelated_conversation_collection_cannot_block_legacy_lexical_reads(
-    palace, monkeypatch
-):
+def test_unrelated_conversation_collection_cannot_block_legacy_lexical_reads(palace, monkeypatch):
     """An unfinished conversation in another collection must not gate this one."""
     palace_path, _ = palace
     other = chroma.ChromaBackend().get_collection(
