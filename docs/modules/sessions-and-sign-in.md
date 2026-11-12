@@ -17,6 +17,8 @@
 
   - OAuth `cards:decide` consent is separate, unticked and owner-only, and requires `memory:read` plus `memory:write`; members see an owner-only notice and a forged tick grants nothing.
 
+  - OAuth `bots:chat` and `bots:confirm` consent is separate, unticked and open to any signed-in member; `bots:confirm` is only requested together with `bots:chat`, a lone confirm tick grants nothing, and the person policy of a session never carries either scope.
+
   - OAuth client revoke: a workspace owner can revoke an OAuth-connected client from Settings > Agents. One transaction marks the connection, every access and refresh token and any unredeemed code revoked and audits it; later calls and refreshes are refused, and what the client wrote stays. Members, other workspaces and the client itself cannot revoke it.
 
   - Enabled coordinator startup context includes unsplit inbox counts, without migrating boards.

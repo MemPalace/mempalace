@@ -187,6 +187,8 @@ def cmd_token_add(args) -> int:
         raise ValueError("Imported history requires explicit browser reader consent")
     if "cards:decide" in (_csv(args.scopes) or []):
         raise ValueError("Answering Needs-me questions requires the owner's browser consent")
+    if {"bots:chat", "bots:confirm"} & set(_csv(args.scopes) or []):
+        raise ValueError("Using bots from an app requires your own sign-in consent")
     defaults = CLIENT_PRESETS.get(args.client, DEFAULT_CLIENT_PRESET)
 
     def value(name, fallback):

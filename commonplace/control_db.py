@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Optional
 
-from . import decide_grant, tokens
+from . import bots_grant, decide_grant, tokens
 from .admission import GATE
 from .decide_grant import DECIDE_SCOPE
 from .policy import Policy
@@ -515,6 +515,22 @@ class ControlDB:
                 or client.strip() == decide_grant.SEAT_CLIENT
             ):
                 raise ControlError(decide_grant.TOP_LEVEL_TEXT)
+        if set(bots_grant.SCOPES) & set(policy.scopes):
+            # A signed-in member's grant for their own top-level app; never agent machinery.
+            try:
+                bots_grant.require_grantor(self, grantor, ws["id"], user["id"])
+            except bots_grant.GrantRefused:
+                raise ControlError(
+                    "only the signed-in member can give their own top-level connection "
+                    "the bots scopes"
+                ) from None
+            if (
+                actor_id != user["id"]
+                or parent is not None
+                or client.strip() == decide_grant.SEAT_CLIENT
+                or bots_grant.CHAT_SCOPE not in policy.scopes
+            ):
+                raise ControlError(bots_grant.TOP_LEVEL_TEXT)
         name = name.strip()
         client = client.strip()
         if not _CONNECTION_NAME.fullmatch(name):
@@ -773,6 +789,65 @@ class ControlDB:
                 auth=row["auth"],
             )
 
+    def set_connection_bots(self, ref, *, chat, confirm, actor, workspace_ref):
+        """Set ``bots:chat`` and ``bots:confirm`` on the signed-in person's own top-level app.
+
+        ``actor`` is the signed-in person's principal (any role). Confirming needs chat (asking for
+        it alone is refused); withdrawing chat withdraws both. Granting is for personal access tokens; OAuth clients
+        gain the scopes only through consent. Withdrawing works for both and takes effect on
+        the next request. Refusals carry a message safe to show the person.
+        """
+        with self._lock, self._tx():
+            row = self.connection(ref, workspace_ref)
+            try:
+                bots_grant.require_grantor(self, actor, row["workspace_id"], row["user_id"])
+            except bots_grant.GrantRefused as exc:
+                raise ControlError(str(exc)) from None
+            if decide_grant.is_runner(self, row["id"]):
+                raise RunnerLinkedError()
+            chat, confirm = bool(chat), bool(confirm)
+            if confirm and not chat:
+                raise ControlError(bots_grant.NEEDS_CHAT_TEXT)
+            policy = json.loads(row["policy"])
+            before = set(policy.get("scopes", ()))
+            wanted = {
+                s
+                for s, on in ((bots_grant.CHAT_SCOPE, chat), (bots_grant.CONFIRM_SCOPE, confirm))
+                if on
+            }
+            added = wanted - before
+            if added:
+                if self.authenticate_connection(row["id"]) is None:
+                    raise ControlError(bots_grant.INACTIVE_TEXT)
+                reason = bots_grant.refusal(self, row) or (
+                    bots_grant.OAUTH_GRANT_TEXT if row["auth"] != "pat" else None
+                )
+                if reason:
+                    raise ControlError(reason)
+            elif row["auth"] not in ("pat", "oauth"):
+                raise ControlError(bots_grant.TOP_LEVEL_TEXT)
+            policy["scopes"] = sorted((before - set(bots_grant.SCOPES)) | wanted)
+            self._conn.execute(
+                "UPDATE connections SET policy=? WHERE id=?",
+                (json.dumps(policy, sort_keys=True), row["id"]),
+            )
+            for scope in sorted(added):
+                self._audit_bots(row, actor.user_id, bots_grant.AUDIT_GRANT, scope)
+            for scope in sorted((before & set(bots_grant.SCOPES)) - wanted):
+                self._audit_bots(row, actor.user_id, bots_grant.AUDIT_REVOKE, scope)
+
+    def _audit_bots(self, row, user_id, action, scope, reason=""):
+        self.audit(
+            action=action,
+            decision="ok",
+            workspace_id=row["workspace_id"],
+            user_id=user_id,
+            connection_id=row["id"],
+            auth=row["auth"],
+            tool=scope,
+            reason=reason,
+        )
+
     def authenticate_token(self, token: str) -> Optional[Principal]:
         """The principal for a bearer token, or ``None``. Checked on every request."""
         if not tokens.looks_like_token(token):
@@ -952,7 +1027,8 @@ class ControlDB:
             return cursor.lastrowid
 
     def clear_decide(self, connection_id: str, *, reason: str, user_id=None) -> bool:
-        """Remove a stored cards:decide grant; True when one was removed (audited)."""
+        """Remove stored app-scope grants (cards:decide, bots:chat, bots:confirm); True when one
+        was removed (audited). Called when a connection turns into agent machinery or expires."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, workspace_id, user_id, auth, policy FROM connections WHERE id=?",
@@ -965,22 +1041,28 @@ class ControlDB:
                 scopes = list(policy.get("scopes", ()))
             except (TypeError, ValueError, AttributeError):
                 return False
-            if DECIDE_SCOPE not in scopes:
+            gone = {DECIDE_SCOPE, *bots_grant.SCOPES} & set(scopes)
+            if not gone:
                 return False
-            policy["scopes"] = sorted(set(scopes) - {DECIDE_SCOPE})
+            policy["scopes"] = sorted(set(scopes) - gone)
             self._conn.execute(
                 "UPDATE connections SET policy=? WHERE id=?",
                 (json.dumps(policy, sort_keys=True), row["id"]),
             )
-            self.audit(
-                action="connection.decide.revoke",
-                decision="ok",
-                workspace_id=row["workspace_id"],
-                user_id=user_id or row["user_id"],
-                connection_id=row["id"],
-                auth=row["auth"],
-                reason=reason,
-            )
+            if DECIDE_SCOPE in gone:
+                self.audit(
+                    action="connection.decide.revoke",
+                    decision="ok",
+                    workspace_id=row["workspace_id"],
+                    user_id=user_id or row["user_id"],
+                    connection_id=row["id"],
+                    auth=row["auth"],
+                    reason=reason,
+                )
+            for scope in sorted(gone & set(bots_grant.SCOPES)):
+                self._audit_bots(
+                    row, user_id or row["user_id"], bots_grant.AUDIT_REVOKE, scope, reason
+                )
             return True
 
     def audit_entries(self, workspace_ref: Optional[str] = None, limit: int = 100) -> list:

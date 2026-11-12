@@ -23,6 +23,8 @@
 
   - Owner-granted `cards:decide`: only the signed-in owner's principal can grant it, to their own top-level, non-agent, non-seat connection; loaded policies drop it with ownership; the stored grant is removed on demotion (a trigger on `UPDATE` of `memberships.role` from owner), on coordinator assignment and on every coordinator removal or replacement (`board_set`, auto-unbind; a separate control-DB commit ordered before the board COMMIT, not atomic with it) and when an expired PAT is rotated; OAuth issue and refresh return only live scopes. Holders answer only asks addressed to their own person, each answer audited as `card.decide.delegated` with the connection id; `LocalTool.untrusted_scope` admits untrusted holders to `decide` only.
 
+  - `bots:chat` and `bots:confirm` are person-granted app scopes (any member, their own top-level PAT or OAuth connection): `set_connection_bots` records one grant or revoke audit row per scope, `create_token` refuses them without the person as grantor, `clear_decide` also removes them when a connection turns into a coordinator or expires, and `decide_grant.machinery` is the one classifier of agent machinery both scopes share.
+
   - Tokens cannot be minted with private read for non-owner holders; PAT and durable-connection authentication cap loaded private/admin scopes to current ownership. Tunnel writes require readable endpoints and scrub outgoing results.
 
   - Wildcard readers without private scope use existing input-authorized projections for overview, graph, KG, tunnels, hallways and drawer pages; unprojected whole-palace operations remain refused.

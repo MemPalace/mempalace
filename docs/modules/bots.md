@@ -1,6 +1,6 @@
 ## bots
 
-- **Paths:** `commonplace/bots/`, `docs/bots.md`, `tests/_bots_helpers.py`, `tests/test_bots_api.py`, `tests/test_bots_machines.py`, `tests/test_bots_store.py`, `tests/test_bots_updates.py`, `tests/test_bots_turn.py`, `tests/test_bots_project_tools.py`, `tools/bots_overhead.py`
+- **Paths:** `commonplace/bots/`, `commonplace/bots_grant.py`, `docs/bots.md`, `tests/_bots_helpers.py`, `tests/test_bots_api.py`, `tests/test_bots_app_grant.py`, `tests/test_bots_machines.py`, `tests/test_bots_store.py`, `tests/test_bots_updates.py`, `tests/test_bots_turn.py`, `tests/test_bots_project_tools.py`, `tools/bots_overhead.py`
 - **Owns:**
 
   - The web-app part of `docs/bots.md` also says where Projects, Needs me and Console moved (the Workspace group of the account menu) and that the Bots count is the number of questions waiting on the person.
@@ -12,6 +12,8 @@
   - `updates` is the one hub event listener of the bots (installed by `bots.install`): when a card a bot filed needs its owner, is ready for review or is done, or the project's orchestrator answers a post a bot forwarded, it appends one `event` message to that bot's thread. It filters with one indexed lookup before doing anything else (and does nothing in a workspace without a `bots.sqlite3`), checks the owner's fresh person principal with `webhooks.can_receive_event` and the board service, and never raises. `updates.working_bots` feeds the roster `working` state. `store.work_changed` and `store.forward_answered` are the exactly-once writes: one transaction each, applying a hub event only when its `seq` is newer than `bot_work.last_seq` (a stale or racing handler is a no-op), and taking a forwarded post only while `bot_forwards.answered_by` is empty; the listener also checks that the reply is the coordinator's first one after the post. The columns are added to an existing file when it is opened. `events.is_stored` is the shared check that an event is the one the log holds.
 
   - `auth.person` is the single gate for `/api/bots*`: a signed-in person session, 404 for any agent token or machine credential, 401 for no credentials.
+
+  - `commonplace/bots_grant.py` holds the `bots:chat` and `bots:confirm` scopes, their one-source consent texts, the grantor rule (any signed-in member, their own top-level app) and the refusal for agent machinery, built on `decide_grant.machinery`. `auth.person` also accepts a bearer token whose connection is active, top-level, a PAT or OAuth app of a member and holds `bots:chat`, and returns that person's own principal (`h._bots_app` names the connection); `routes._guarded` answers 403 `scope_required` for `/confirm` without `bots:confirm` and records one `bots.write` audit row (connection id, route, outcome `ok`, `refused` or `error`, never text) per write made through an app, including a refused confirm and a request that dies before answering (recorded as `error`).
 
   - The turn engine: `turn.py` runs one turn per bot on its own thread (process-local `limits.REGISTRY`: one per bot, 4 per person, 32 per process), streams through `chat.model_stream.stream` with the `BOT_*` limits in `limits.py`, journals every tool call in `bot_actions`, and stores the reply in one write; `routes.py` relays it as server-sent events and serves stop and confirm. `context.py` builds the fixed system prompt and the quoted, redacted context. `tools.py` holds the `Tool`/`Result`/`Turn` contract, argument validation, the built-in `remember` and `forget`, and `bots.TOOL_MODULES` lists the tool modules imported at install. `tools/bots_overhead.py` is an informational hub-overhead measurement, not a test.
 
@@ -45,6 +47,8 @@
 
   - A memory id outside the integer range is an unknown id (404); a `board` that is not a project slug string is 400.
 
+  - An app token without `bots:chat`, or one whose connection is a child agent, runner, orchestrator seat, board coordinator or started by an agent (even with a stored scope), gets 404; a revoked or expired connection is 401; `/confirm` through an app without `bots:confirm` is 403 `scope_required` and runs nothing.
+
   - Before the stream starts: 400 `invalid`, 404, 409 `busy` (this bot already has a running turn) or `conflict` (request id with other text), 429 `busy` (person or process cap). After the user message is stored, every outcome is a stream event and a stored bot message with a fixed sentence per code; provider text never reaches the person. A model that is not usable gives a stored `setup` block and no request.
 
   - A refused machine request raises `machines.Refused` with the runner's stable code and a plain sentence; `run_command` raises `machines.Unsupported` until a provider reports the capability.
@@ -62,5 +66,7 @@
   - `tests/test_bots_machines.py` covers who sees which machines (owner, member, revoked, unattested, another workspace), one runner job per request key, refusals with the runner's code, cancelling queued and launched starts, `run_command` being unsupported, merged providers and that no credential leaks, plus the tools: a start waits for a tap and runs once, labels are server-built, refusals are plain sentences, stopping a queued start works and a launched one is reported, the machines block hydrates per reader, and `run_command` is not offered without a capable provider.
 
   - `tests/test_bots_api.py` covers defaults per readable project, create/rename/archive and the 50-bot bound, thread paging, block hydration and status words, waiting decisions, read marks, memory, redacted display, and 404 for another person, another workspace and agent tokens.
+
+  - `tests/test_bots_app_grant.py` covers 404 without the scope on every route, an app acting as its person (roster, threads, send, stop, read, memory), isolation between people and workspaces, confirm needing its own scope and running once, withdrawing the scope or revoking or expiring the connection, each kind of agent machinery refused at grant and at use, only the person granting their own app, a member app staying member-bound, audit rows without text, Settings > Agents and OAuth consent granting only what was ticked.
 
   - Regression tests in both bots test files cover padded text bounds, unstorable text, huge memory ids, non-string boards, non-object bodies, expiry on cancel and refused cross-origin writes.

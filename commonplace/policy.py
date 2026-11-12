@@ -40,6 +40,8 @@ SCOPES = (
     "threads:read",
     "handoff:write",
     "cards:decide",
+    "bots:chat",
+    "bots:confirm",
     "admin",
 )
 

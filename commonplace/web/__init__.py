@@ -200,7 +200,7 @@ def install(gateway):
         if principal.role != "owner":
             send_json(h, 403, {"error": "Owner access required"})
             return
-        from commonplace import decide_grant
+        from commonplace import bots_grant, decide_grant
         from commonplace.extensions import ToolError
 
         from .agents import connection_view, decide_view, grantable_wings
@@ -218,6 +218,10 @@ def install(gateway):
             {
                 "connections": [connection_view(row, **view) for row in rows],
                 "decide_consent": decide_grant.SCOPE_TEXT,
+                "bots_consent": {
+                    "chat": bots_grant.CHAT_TEXT,
+                    "confirm": bots_grant.CONFIRM_TEXT,
+                },
                 "wings": wings,
                 "mcp_url": urls.AGENT_URL + "/mcp",
             },

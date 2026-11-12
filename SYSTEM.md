@@ -634,6 +634,14 @@ playbooks and the original wider orchestration acceptance remain separate work.
 
 - The plan is also re-checked when the runner reports `starting`; a refused job ends `cancelled` with outcome `plan_pending`.
 
+### Bots from a person's own app (`bots:chat`, `bots:confirm`)
+
+- A person's own native or mobile app can use `/api/bots*` as that person through two scopes the person grants themselves. Unlike `cards:decide` (owner-only), any signed-in member grants them, and only for their own top-level PAT or OAuth connection in that workspace; the shared classifier `decide_grant.machinery` refuses child agents, runner connections, orchestrator seats and agent-started connections, and board coordinators are refused by the web layer and again at use.
+- At use, `bots.auth.person` re-checks everything on every request (scope, live top-level app owned by that person, not a coordinator, the person still a member) and then returns the person's own `sessions.person_principal`, so every downstream check is the person's and an app reaches only that person's bots. Anything else stays 404; a revoked or expired connection is 401.
+- `bots:confirm` is separate and useless without `bots:chat`; `/confirm` through an app without it is 403 `scope_required` and runs nothing. Buttons on a question remain the existing `cards:decide` route.
+- OAuth apps get either scope only through a ticked consent; PAT grants and withdrawals go through `PATCH /api/connections/<id>` (`bots_chat`, `bots_confirm`) or Settings > Agents, and a member may use that PATCH for their own connection only. The command line and session policies never carry them. Becoming a coordinator or expiring clears the grants.
+- Every grant and withdrawal is audited per scope, and every write made through an app adds one `bots.write` row with the connection id, route and the status actually sent as `ok`, `refused` or `error` (never text; a refused confirm and a request that dies before answering are recorded too); person-session writes add none.
+
 ### Owner-granted answers from the owner's own apps (`cards:decide`)
 
 - Answering a Needs-me ask stays a signed-in owner action by default. A separate,

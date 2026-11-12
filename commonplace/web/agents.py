@@ -3,7 +3,7 @@
 import logging
 from pathlib import Path
 
-from commonplace import control_db, decide_grant, import_grant, urls
+from commonplace import bots_grant, control_db, decide_grant, import_grant, urls
 from commonplace.control_db import ControlError
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import (
@@ -219,6 +219,20 @@ def connection_view(row, db=None, *, viewer=None, coordinators=None):
         and f"conn:{row['name']}" not in coordinators
         and decide_grant.refusal(db, row) is None
     )
+    view["bots_chat"] = policy.has_scope(bots_grant.CHAT_SCOPE)
+    view["bots_confirm"] = policy.has_scope(bots_grant.CONFIRM_SCOPE)
+    # Same rule for the person's bots, but any member's own app qualifies.
+    view["bots_grantable"] = bool(
+        db is not None
+        and viewer is not None
+        and coordinators is not None
+        and row["user_id"] == viewer.user_id
+        and row["auth"] == "pat"
+        and not row["revoked_at"]
+        and not _expired(row)
+        and f"conn:{row['name']}" not in coordinators
+        and bots_grant.refusal(db, row) is None
+    )
     return view
 
 
@@ -255,6 +269,65 @@ def _update_decide(gateway, h, principal, row, data):
             return
     fresh = gateway.db.connection(row["id"], principal.workspace_id)
     send_json(h, 200, {"connection": connection_view(fresh, **decide_view(gateway, principal))})
+
+
+def _update_bots(gateway, h, principal, row, data):
+    keys = {"bots_chat", "bots_confirm"}
+    if not data or set(data) - keys or any(type(v) is not bool for v in data.values()):
+        send_json(h, 400, {"error": "Use bots_chat and bots_confirm true or false"})
+        return
+    policy = Policy.from_json(row["policy"])
+    chat = data.get("bots_chat", policy.has_scope(bots_grant.CHAT_SCOPE))
+    if data.get("bots_confirm") and not chat:
+        send_json(h, 409, {"error": bots_grant.NEEDS_CHAT_TEXT})
+        return
+    # Withdrawing chat withdraws confirm with it.
+    confirm = data.get("bots_confirm", policy.has_scope(bots_grant.CONFIRM_SCOPE)) and chat
+    if chat or confirm:
+        # Coordinators live in the board store; control_db cannot see them.
+        current = coordinators(gateway, principal)
+        if current is None:
+            send_json(h, 503, {"error": "Boards are unavailable; try again"})
+            return
+        if f"conn:{row['name']}" in current:
+            send_json(h, 409, {"error": bots_grant.AGENT_TEXT})
+            return
+    try:
+        gateway.db.set_connection_bots(
+            row["id"],
+            chat=chat,
+            confirm=confirm,
+            actor=principal,
+            workspace_ref=principal.workspace_id,
+        )
+    except ControlError as exc:
+        send_json(h, 409, {"error": str(exc)})
+        return
+    if chat or confirm:
+        # Re-read after the write: a coordinator assigned meanwhile loses the grant.
+        current = coordinators(gateway, principal)
+        if current is None or f"conn:{row['name']}" in current:
+            gateway.db.clear_decide(row["id"], reason="coordinator", user_id=principal.user_id)
+            if current is None:
+                send_json(h, 503, {"error": "Boards are unavailable; try again"})
+            else:
+                send_json(h, 409, {"error": bots_grant.AGENT_TEXT})
+            return
+    fresh = gateway.db.connection(row["id"], principal.workspace_id)
+    send_json(h, 200, {"connection": connection_view(fresh, **decide_view(gateway, principal))})
+
+
+def _may_manage(principal, h, parts):
+    """An owner manages every connection; any other signed-in person may only PATCH one
+    connection, and ``_own_bots_body`` limits that to their own bots scopes."""
+    return bool(
+        principal.person
+        and (principal.role == "owner" or (h.command == "PATCH" and len(parts) == 1))
+    )
+
+
+def _own_bots_body(principal, row, data):
+    return not set(data) - {"bots_chat", "bots_confirm"} and row["user_id"] == principal.user_id
 
 
 def _update_read_wings(gateway, h, principal, row, data):
@@ -302,8 +375,13 @@ def _consents(data, db, principal):
 
 
 def _patch(gateway, h, principal, row, data):
+    if principal.role != "owner" and not _own_bots_body(principal, row, data):
+        send_json(h, 403, {"error": bots_grant.NOT_YOURS_TEXT})
+        return
     if "decide" in data:
         _update_decide(gateway, h, principal, row, data)
+    elif set(data) & {"bots_chat", "bots_confirm"}:
+        _update_bots(gateway, h, principal, row, data)
     elif row["auth"] != "pat":
         send_json(h, 409, {"error": "Manage this connection in its sign-in client"})
     else:
@@ -317,10 +395,10 @@ def install(gateway):
         principal = require_principal(gateway, h)
         if principal is None:
             return
-        if not principal.person or principal.role != "owner":
+        parts = path_parts(h, "/api/connections")
+        if not _may_manage(principal, h, parts):
             send_json(h, 403, {"error": "Sign in as a workspace owner to manage agents"})
             return
-        parts = path_parts(h, "/api/connections")
         if h.command == "POST" and not parts:
             try:
                 data = read_json(h)

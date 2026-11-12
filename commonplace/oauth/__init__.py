@@ -17,7 +17,7 @@ from html import escape
 from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urlsplit
 
-from .. import decide_grant, import_grant, sessions, urls
+from .. import bots_grant, decide_grant, import_grant, sessions, urls
 from . import store
 from .http import OAuthError, body, callback, query, redirect, send, send_error, send_json
 from .store import OAuthAuthenticator
@@ -278,6 +278,17 @@ def _show_authorize(gateway, h, *, status=200):
                 )
             else:
                 consent += f"<p>{escape(decide_grant.OWNER_ONLY_TEXT)}</p>"
+        requested = parameters["scope"].split()
+        if bots_grant.CHAT_SCOPE in requested:
+            consent += (
+                '<label><input type="checkbox" name="grant_bots_chat" value="1"> '
+                f"{escape(bots_grant.CHAT_TEXT)}</label>"
+            )
+            if bots_grant.CONFIRM_SCOPE in requested:
+                consent += (
+                    '<label><input type="checkbox" name="grant_bots_confirm" value="1"> '
+                    f"{escape(bots_grant.CONFIRM_TEXT)}</label>"
+                )
         content = (
             f"<h1>{escape(client['client_name'])}</h1><p>{escape(workspace)}</p>"
             f"<p>Code destination: {escape(form_origin, quote=True)}</p>"
@@ -371,6 +382,10 @@ def _submit_authorize(gateway, h):
                 "memory:write",
             }.issubset(parameters["scope"].split()):
                 location = _response(parameters, error="invalid_scope")
+            elif bots_grant.CONFIRM_SCOPE in parameters["scope"].split() and (
+                bots_grant.CHAT_SCOPE not in parameters["scope"].split()
+            ):
+                location = _response(parameters, error="invalid_scope")
             elif data["decision"] == "deny":
                 location = _response(parameters, error="access_denied")
             else:
@@ -390,6 +405,17 @@ def _submit_authorize(gateway, h):
                     and decide_grant.eligible(db, principal.user_id, principal.workspace_id)
                 ):
                     granted.remove(decide_grant.DECIDE_SCOPE)
+                for scope, field in (
+                    (bots_grant.CHAT_SCOPE, "grant_bots_chat"),
+                    (bots_grant.CONFIRM_SCOPE, "grant_bots_confirm"),
+                ):
+                    if scope in granted and not (
+                        data.get(field) == "1"
+                        and bots_grant.eligible(db, principal.user_id, principal.workspace_id)
+                    ):
+                        granted.remove(scope)
+                if bots_grant.CONFIRM_SCOPE in granted and bots_grant.CHAT_SCOPE not in granted:
+                    granted.remove(bots_grant.CONFIRM_SCOPE)
                 if not granted:
                     location = _response(parameters, error="invalid_scope")
                 else:

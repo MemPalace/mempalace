@@ -57,6 +57,8 @@
 
   - `docs/agent-connections.md` explains granting, using and withdrawing `cards:decide` for an owner's own app.
 
+  - `docs/agent-connections.md` also explains granting and withdrawing `bots:chat` and `bots:confirm` for a member's own app.
+
   - Admin documentation covers all seven sections, bootstrap capability fallback, canonical receipt timestamps and parent/mode refresh ordering.
 
   - The Admin API guide documents legacy-column defaults and enabled, unrevoked grant eligibility.

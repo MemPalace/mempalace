@@ -81,6 +81,27 @@ for HTTP transcripts, Grok facts, accepted responses, multipart and retries.
 The separate existing ACL import accepts signed-in people or connections that
 already have thread read/write authority; it retains its original behavior.
 
+## Let your own app use your bots
+
+Two more scopes, `bots:chat` and `bots:confirm`, let one of your own apps use your bots
+as you (see `docs/bots.md`, "Using bots from your own app"). Unlike `cards:decide`, any
+signed-in member grants them, for their own top-level app connection only. The consent text says:
+
+> Allow this app to use your bots as you (scope bots:chat): read your chats, send messages, stop replies and manage your bots' memory. Every change is recorded with this connection, it can reach only your own bots, and you can stop this at any time under Agents.
+
+> Also allow this app to confirm what a bot proposes (scope bots:confirm), the same as tapping a confirm button yourself. It needs bots:chat and you can stop it separately.
+
+- **PAT:** **Allow using my bots** and **Allow confirming** on the row in Settings → Agents, or
+  `PATCH /api/connections/<id>` with `{"bots_chat": true}` and `{"bots_confirm": true}`
+  (JSON booleans). Confirming without chat is refused with 409; withdrawing chat withdraws both.
+- **OAuth:** the client requests the scopes (`bots:confirm` only together with `bots:chat`); you
+  tick each box on the authorization form. Granting later needs a fresh consent; withdrawing is
+  the same PATCH.
+
+Child agents, runner connections, orchestrator seats, board coordinators and other people's
+connections are refused when granting and on every request. Assigning a coordinator removes the
+grants, and the command line refuses them.
+
 ## Let your own app answer your Needs-me questions
 
 By default only you, signed in to the web app, can answer a Needs-me question.

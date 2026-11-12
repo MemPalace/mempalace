@@ -10,8 +10,9 @@ streams the reply of the workspace's chat model, runs tools as the person and st
 
 ## Routes
 
-All routes need a signed-in person session. An agent token or machine credential gets 404,
-exactly like a path that does not exist; an anonymous caller gets 401. Writes pass the
+All routes need a signed-in person session, or that person's own app holding a granted scope
+(see [Using bots from your own app](#using-bots-from-your-own-app)). Any other agent token or
+machine credential gets 404, exactly like a path that does not exist; an anonymous caller gets 401. Writes pass the
 gateway's same-origin check. A bot id that is unknown or belongs to someone else is 404.
 
 | Route | Body, result |
@@ -292,6 +293,48 @@ the role `event`, and the roster follows (`unread` counts it, `state` changes).
 - A memory note is removed with a tombstone: it disappears from the list, the stored row stays.
 - Bots use the model the owner configured in chat settings. Without a usable model there is
   no canned answer.
+
+## Using bots from your own app
+
+A native or mobile app of yours can use your bots as you, through its own connection and two
+scopes that you grant yourself:
+
+- `bots:chat` lets the app use `/api/bots*` as you: the roster, threads, memory, sending a
+  message, stopping a reply and marking a thread read. It reaches only your own bots, with only
+  your own permissions (a member's app can do what a member can, nothing more).
+- `bots:confirm` additionally lets the app confirm what a bot proposes
+  (`POST /api/bots/<id>/confirm`), the same as tapping the confirm button yourself. It is
+  useless without `bots:chat` and is granted separately. Without it that route answers 403
+  `scope_required` and nothing runs. Buttons on a question use the separate `cards:decide`
+  scope described in the connections guide.
+
+**How to grant.** Any signed-in member can do it for their own app. Owners: Settings → Agents,
+**Allow using my bots** on the app's row (and **Allow confirming** if you want that too), or
+`PATCH /api/connections/<id>` with `{"bots_chat": true}` and optionally `{"bots_confirm": true}`.
+An app that signs in with OAuth asks for the scopes and you tick the boxes on its authorization
+form; an unticked box grants nothing. Members use the same PATCH for their own connection, or
+the authorization form.
+
+**What never qualifies.** Child agents, runner connections, project orchestrator seats, board
+coordinators, connections that belong to someone else, and revoked or expired connections. They
+are refused when granting and again on every request, even if a stored scope claims otherwise;
+they get the same 404 as any other token. Assigning an app as a board coordinator removes its
+grants. The command line cannot grant these scopes.
+
+**How to revoke.** **Stop using bots** (or `{"bots_chat": false}`, which withdraws confirming as
+well), or revoke the connection. It takes effect on the next request: a withdrawn scope answers
+404 and a revoked or expired connection 401.
+
+**Limits of this release.** There is no member-scoped list of connections, so a member grants
+through the OAuth authorization form or by `PATCH` on their own connection (the web Settings →
+Agents list is for owners). There is no create-time option on `POST /api/connections`: create the
+connection, then grant.
+
+**Audit.** Granting and withdrawing each scope is recorded with the connection. Every write the
+app makes (creating or renaming a bot, memory, sending, stopping, read marks, confirming) adds
+one record with the connection id, the route and the outcome (`ok`, `refused` or `error`; a refused
+confirm is recorded too); reads add none, and
+no message text is ever recorded.
 
 ## Using bots in the web app
 

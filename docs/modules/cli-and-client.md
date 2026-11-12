@@ -15,6 +15,8 @@
 
   - `commonplace token add` refuses `cards:decide`; answering Needs-me questions needs the owner's browser consent.
 
+  - `commonplace token add` also refuses `bots:chat` and `bots:confirm`; they need the person's own consent.
+
   - Local search-index status and run pass an explicit unscoped principal and retain their printed count keys and capture enrolment behavior.
   - Opt-in backup reporting records only the final selected mode; check/cleanup/restore never report. Receipt failure preserves backup return/exception; test_backup_status.py covers both outcomes and fallback.
 

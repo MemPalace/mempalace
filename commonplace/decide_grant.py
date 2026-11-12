@@ -78,19 +78,25 @@ def is_runner(db, connection_id) -> bool:
         )
 
 
-def refusal(db, row) -> str | None:
-    """Why this stored connection cannot hold the scope, or ``None`` (no ownership check)."""
+def machinery(db, row) -> str | None:
+    """``"agent"`` for runner, seat or agent-started connections, ``"top_level"`` for a connection
+    that is not a top-level PAT or OAuth app, else ``None``. Shared by every app-scope grant."""
     if row["auth"] not in ("pat", "oauth"):
-        return TOP_LEVEL_TEXT
+        return "top_level"
     if (
         is_runner(db, row["id"])
         or is_seat(db, row["id"], row["client"])
         or row["started_by"] == "agent"
     ):
-        return AGENT_TEXT
+        return "agent"
     if row["parent_id"] is not None:
-        return TOP_LEVEL_TEXT
+        return "top_level"
     return None
+
+
+def refusal(db, row) -> str | None:
+    """Why this stored connection cannot hold the scope, or ``None`` (no ownership check)."""
+    return {"agent": AGENT_TEXT, "top_level": TOP_LEVEL_TEXT}.get(machinery(db, row))
 
 
 def answers_for(principal, row) -> bool:

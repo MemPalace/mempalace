@@ -56,6 +56,8 @@
 
   - Settings → Agents offers an unticked `cards:decide` consent on create, shows the grant on PAT and OAuth rows with **Stop answering**, and offers **Allow answering Needs-me** only on rows the server marks `decide_grantable` (the viewing owner's own eligible, unexpired PATs; never agents, runners, seats, board coordinators or other members' connections; the grant route refuses coordinators too); the consent copy comes from `decide_consent` in `GET /api/connections`; `PATCH /api/connections/<id>` with `{"decide": bool}` grants (PAT only) or withdraws (PAT or OAuth).
 
+  - Settings → Agents shows `bots:chat` and `bots:confirm` on PAT and OAuth rows with **Allow using my bots**, **Allow confirming** and **Stop using bots** (offered only on the person's own, active, top-level rows), with the consent text from the server; a signed-in member may PATCH only the bots scopes of their own connection.
+
   - Event polling sends the readable-set epoch and refetches the open screen, including card details, before adopting a reset cursor. The owner feed resets non-empty member-era epochs; pre-deploy member tabs require a reload to resume live events.
 
   - Non-owner person event feeds project payloads and cursors into visible events; private-only insertions do not change member responses.

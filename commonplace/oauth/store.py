@@ -24,7 +24,15 @@ ACCESS_SECONDS = 3600
 REFRESH_SECONDS = 90 * 86400
 CODE_SECONDS = 300
 REQUEST_SECONDS = 600
-SCOPES = ("memory:read", "memory:write", "memory:import", "memory:import:read", "cards:decide")
+SCOPES = (
+    "memory:read",
+    "memory:write",
+    "memory:import",
+    "memory:import:read",
+    "cards:decide",
+    "bots:chat",
+    "bots:confirm",
+)
 OAUTH_DEFAULT_SCOPES = ("memory:read", "memory:write")
 
 SCHEMA = """
@@ -247,6 +255,12 @@ def _guess_client(client_row) -> str:
 
 
 def create_code(conn, client_row, principal, parameters) -> str:
+    granted = set(parameters["scope"].split())
+    if granted & {"bots:chat", "bots:confirm"} and not (
+        principal.person and ("bots:confirm" not in granted or "bots:chat" in granted)
+    ):
+        # Consent already drops an unticked grant; never mint one for anything but a person.
+        raise OAuthError("invalid_scope")
     if DECIDE_SCOPE in parameters["scope"].split() and not (
         principal.person and conn_role(conn, principal) == "owner"
     ):
