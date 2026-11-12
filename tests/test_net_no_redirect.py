@@ -48,7 +48,14 @@ class _Redirector(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    do_POST = do_GET
+    def do_POST(self):
+        # Drain the request body before answering. On Windows, closing a
+        # socket with unread POST bytes can reset the connection before the
+        # client receives the 302, making the no-redirect assertion flaky.
+        length = int(self.headers.get("Content-Length", "0"))
+        if length:
+            self.rfile.read(length)
+        self.do_GET()
 
     def log_message(self, *_args):
         pass
