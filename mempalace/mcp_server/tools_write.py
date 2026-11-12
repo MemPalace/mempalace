@@ -1614,9 +1614,7 @@ def tool_list_drawers(
 
         checked = scoped_visible_ids(metadatas, fetch_source_rows) if where else None
         result = make_page(ids, metadatas, checked_ids=checked)
-        _fill_drawer_previews(
-            col, result["drawers"], expected_metadata=dict(zip(ids, metadatas))
-        )
+        _fill_drawer_previews(col, result["drawers"], expected_metadata=dict(zip(ids, metadatas)))
         return result
     except Exception as e:
         logger.exception("tool_list_drawers failed")
