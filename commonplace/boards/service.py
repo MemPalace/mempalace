@@ -2255,7 +2255,6 @@ class BoardService(lifecycle.LifecycleMixin):
             return []
         from commonplace.orch import schema as orch_schema, store as orch_store
         from commonplace.projects import models, split
-        from commonplace.projects.types import MODEL_ROLES
 
         items = []
         with split.runner_read(self.ctx.workspace_dir()) as reader:
@@ -2292,16 +2291,6 @@ class BoardService(lifecycle.LifecycleMixin):
                             f"Starts that use the {uses} role on {name} cannot run: the role "
                             "names no model_role. Add one to that role in the board's "
                             "orchestrator config; there is no setting for it here."
-                        )
-                        action = None
-                    elif role not in MODEL_ROLES:
-                        # Project settings cannot set this role (yet): never offer a button
-                        # that would leave the item standing.
-                        message = (
-                            f"Starts that use the {uses} role on {name} cannot run: the board "
-                            f"config's model_role for it ({role}) has no model, and project "
-                            "settings cannot set it. Point the role's model_role at main or "
-                            "worker in the board's orchestrator config."
                         )
                         action = None
                     else:

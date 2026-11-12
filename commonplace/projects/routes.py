@@ -8,7 +8,16 @@ from commonplace.boards.store import CardRefused
 from commonplace.control_db import ControlError
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import path_parts, read_json, require_principal, send_json
-from commonplace.projects import connect, limits, models, orchestration, panel_routes, seats, wing
+from commonplace.projects import (
+    connect,
+    escalation,
+    limits,
+    models,
+    orchestration,
+    panel_routes,
+    seats,
+    wing,
+)
 from commonplace.projects.types import ProjectDenied
 from commonplace.rules.enforce import RulesRefresh, rest_write
 from commonplace.runner import registry
@@ -27,6 +36,7 @@ def _view(gateway, principal, board):
     with service.store.connection() as conn:
         project_limits = limits.get(conn, board["id"])
     choices = models.get(gateway.db, principal.workspace_id, board["slug"])
+    rule = escalation.get(gateway.db, principal.workspace_id, board["slug"])
     result = {
         "board": board["slug"],
         "memory": {
@@ -45,6 +55,7 @@ def _view(gateway, principal, board):
             choice.public()
             for choice in models.catalog(gateway.db, principal.workspace_id, board["slug"])
         ],
+        "escalation": rule.public() if rule is not None else None,
         "can_configure": principal.person and principal.role == "owner",
     }
     if orchestration.enabled(gateway.db, principal.workspace_id):
@@ -155,6 +166,7 @@ def _project_action(method, parts):
         ("POST", ("orchestrator", "split")): "split",
         ("PUT", ("models",)): "models",
         ("POST", ("models", "catalog")): "model_catalog",
+        ("PUT", ("escalation",)): "escalation",
         ("PUT", ("limits",)): "limits",
         ("POST", ("wing",)): "wing",
         ("GET", ("panel",)): "panel_view",
@@ -166,6 +178,9 @@ def _project_action(method, parts):
 def _valid_project_body(h, action, body):
     if action == "wing" and (not isinstance(body, dict) or body):
         send_json(h, 400, {"error": "Own-wing body must be exactly {}"})
+        return False
+    if action == "escalation" and (not isinstance(body, dict) or set(body) != {"rule"}):
+        send_json(h, 400, {"error": "Invalid escalation rule"})
         return False
     if action == "connect" and (
         not isinstance(body, dict)
@@ -202,6 +217,8 @@ def _project_result(gateway, principal, service, board, action, body):
         models.put(gateway.db, principal, slug, body)
     if action == "model_catalog":
         models.catalog_add(gateway.db, principal, slug, body)
+    if action == "escalation":
+        escalation.put(gateway.db, principal, slug, body["rule"])
     return 200, _view(gateway, principal, board)
 
 

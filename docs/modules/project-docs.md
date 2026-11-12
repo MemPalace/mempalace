@@ -54,6 +54,7 @@
   - `docs/project-panels.md` documents the project panel file format, limits and routes.
 
 - **Promises:**
+  - Project documentation and the project routes table describe the four model roles and the owner-only escalation rule.
 
   - The handoff guide counts rooms and diary topics naming a thread through a link, mcp: form, embedded or fullwidth ID, or a resolving T3 source ID as that thread's room.
 

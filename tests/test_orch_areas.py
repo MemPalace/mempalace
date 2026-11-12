@@ -94,7 +94,7 @@ def test_preview_roundtrip_diff(tmp_path):
     doc["roles"]["lead"] = doc["roles"].pop("main")
     doc["roles"]["frontend"]["parent"] = "lead"
     assert_area_preview_supported(doc)
-    assert schema.MODEL_ROLES == ("main", "worker")
+    assert schema.MODEL_ROLES == ("main", "worker", "reviewer", "gate")
 
 
 @pytest.mark.parametrize("field", ["parent", "topic"])

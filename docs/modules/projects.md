@@ -25,6 +25,7 @@
 
   - Split marker task references are range-checked before SQLite binding and settings-read failures remain retryable.
   - Default-off project reports capture the current coordinator and activation/binding generations, baseline existing staleness, scan at most 100 cards and publish at most 100 rows per workspace pass, and retain receipt-backed event identity across crashes.
+  - Project models cover four roles (orchestrator `main`, builder `worker`, `reviewer`, `gate`); one owner-only escalation rule per project (`project_model_escalation`) swaps the builder and reviewer model after N failed jobs of the card or for chosen labels, evaluated inside the runner start transaction and recorded on the job as `model_reason`; the rule's model must be in the workspace model list, a keyed retry or orchestrator step replays its stored job whatever escalation decided, judged by the job's pre-escalation request digest (a changed default model is a conflict), and a role with no default stays unmapped; with no rule a start resolves as before.
 
   - `seats.held_by` names the board and role of the seat a connection holds; the durable orchestrator uses it so a seat trusted in Project settings holds its own board's lease without a config.
 

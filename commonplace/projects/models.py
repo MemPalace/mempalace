@@ -118,7 +118,8 @@ def get(db, workspace_id: str, board: str) -> dict[str, ModelChoice | None]:
             (workspace_id, board, *MODEL_ROLES),
         ).fetchall()
     for row in rows:
-        choices[row["role"]] = ModelChoice(row["provider"], row["model"])
+        if row["role"] in choices:
+            choices[row["role"]] = ModelChoice(row["provider"], row["model"])
     return choices
 
 

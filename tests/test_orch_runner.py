@@ -1208,31 +1208,21 @@ def test_404_only_the_owner_is_asked_and_digest_and_push_stay_card_only(world):
     assert evaluate.current(world.gw, world.owner) == {}
 
 
-def test_404_a_role_project_settings_cannot_set_gets_an_item_without_a_button(world, monkeypatch):
-    """#404: a start role whose model_role is outside the configurable slots (reviewer, gate)
-    is reported without an action: the picker cannot set it, so no button may promise to."""
-    from commonplace.orch import schema
-
-    monkeypatch.setattr(schema, "MODEL_ROLES", ("main", "worker", "reviewer", "gate"))
+def test_404_reviewer_and_gate_gaps_get_an_item_with_a_button_and_the_same_fix_in_the_refusal(
+    world,
+):
+    """A start role whose model_role is reviewer or gate is a configurable slot: the item has a
+    button to the picker and the refused start points at the same project setting."""
     world.configure(model_role="reviewer")
-    items = model_role_items(world)
-    assert [(item["role"], item["config_roles"]) for item in items] == [("reviewer", ["builder"])]
-    [item] = items
-    assert item["action"] is None
-    assert "model_role" in item["message"] and "reviewer" in item["message"]
-    assert "Choose one in the project's Agent models" not in item["message"]
-    assert "main or worker" in item["message"]
-    # A gate gap behaves the same, and a mapped main still leaves only the gap.
-    world.configure(model_role="gate")
-    assert [(i["role"], i["action"]) for i in model_role_items(world)] == [("gate", None)]
-
-
-def test_404_refusal_for_a_role_settings_cannot_set_points_at_the_board_config(world, monkeypatch):
-    """#404: the start refusal and the Needs me item tell the same story for a model_role
-    outside the configurable slots: the board config, not project settings."""
-    from commonplace.orch import schema
-
-    monkeypatch.setattr(schema, "MODEL_ROLES", ("main", "worker", "reviewer", "gate"))
+    [item] = model_role_items(world)
+    assert (item["role"], item["config_roles"]) == ("reviewer", ["builder"])
+    assert item["action"] == {
+        "label": "Set the model",
+        "type": "project_models",
+        "board": BOARD,
+        "role": "reviewer",
+    }
+    assert "Choose one in the project's Agent models" in item["message"]
     world.configure(model_role="gate")
     card = world.card()
     with world.boards.store.connection() as conn:
@@ -1252,11 +1242,9 @@ def test_404_refusal_for_a_role_settings_cannot_set_points_at_the_board_config(w
     refusal = runner_bridge.model_unresolved(plan)
     text = str(refusal)
     assert refusal.code == "model_unresolved" and refusal.details["role"] == "gate"
-    assert "model_role" in text and "gate" in text and "orchestrator config" in text
-    assert "Agent models" not in text and "None" not in text
+    assert "gate" in text and "Agent models" in text and "None" not in text
     [item] = model_role_items(world)
-    assert item["action"] is None and "main or worker" in item["message"]
-    assert "main or worker" in text  # the same fix in both places
+    assert item["action"]["role"] == "gate" and "Agent models" in item["message"]
 
 
 def test_404_start_roles_agree_with_the_role_a_start_runs(world):

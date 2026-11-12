@@ -98,6 +98,12 @@ class ProjectsHub(ChatHub):
                     self.catalog_add(auth, slug, choice)
         return self.request(auth, "PUT", f"/api/projects/{slug}/models", body)[:2]
 
+    def escalation(self, auth, slug, rule, *, declare=True):
+        """PUT the escalation rule; ``declare`` first lists its model, as an owner would."""
+        if declare and isinstance(rule, dict) and isinstance(rule.get("model"), dict):
+            self.catalog_add(auth, slug, rule["model"])
+        return self.request(auth, "PUT", f"/api/projects/{slug}/escalation", {"rule": rule})[:2]
+
     def seats(self, ws=None):
         with self.db._lock:
             if not self.db._conn.execute(

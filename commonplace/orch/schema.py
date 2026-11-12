@@ -48,7 +48,8 @@ CONFIG_PATH = ".commonplace/orchestrator.toml"
 KINDS = ("orchestrator", "sub-orchestrator", "planner", "builder", "reviewer")
 HARNESSES = ("t3", "claude-code", "codex")
 RUNNER_HARNESS = "t3"
-MODEL_ROLES = ("main", "worker")  # same slots as commonplace.projects.types.MODEL_ROLES
+# Same slots as commonplace.projects.types.MODEL_ROLES.
+MODEL_ROLES = ("main", "worker", "reviewer", "gate")
 RUNTIME_MODES = ("approval-required", "auto-accept-edits", "auto", "full-access")
 TRIGGER_EVENTS = ("card.todo",)
 TEMPLATES = ("design_before_code", "resume_protocol")

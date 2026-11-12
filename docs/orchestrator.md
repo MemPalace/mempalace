@@ -93,10 +93,35 @@ writes refuse every area-bearing config, including experiment channels, with
 versions, cursors, leases, jobs and events. No area seats, tokens, subscriptions
 or runtime are created; activation belongs to a later slice.
 
-Model routing has two slots, `main` and `worker`, set per project by the owner
+Model routing has four slots, `main` (orchestrator), `worker` (builder),
+`reviewer` and `gate`, set per project by the owner
 (`PUT /api/projects/<board>/models`) from the workspace's model list. A role the
 accepted config uses that has no model raises one owner item in Needs me; a start
 refused as `model_unresolved` names that role and where to set it.
+
+A project may also carry one escalation rule
+(`PUT /api/projects/<board>/escalation`, body `{"rule": {"after_failures": 2,
+"labels": ["security"], "model": {"provider": "…", "model": "…"}}}`, or
+`{"rule": null}` to clear it); the rule's model must be in the workspace's model
+list like a role model (`unknown_model`, HTTP 400, nothing stored). It applies to runner roles whose `model_role` is
+`worker` or `reviewer`. At start, inside the fenced transaction, the card's
+`failed` jobs are counted, whatever role they ran (a failed reviewer or gate job
+counts toward a builder's escalation); when that reaches `after_failures`, or the card
+carries one of the `labels` (case-insensitive), the job is pinned to the
+rule's model instead of the slot's. The job records `model_provider`, `model`
+and `model_reason` (`failed_rounds:<n>` or `label:<name>`), and the start
+reply carries `model_reason`. Without a rule nothing changes, and a role with no
+default model stays unmapped (`model_unresolved`) even when a rule exists. Which
+model escalation picked is a decision, not part of the request: a keyed retry
+(`request_key` or an orchestrator `step_key`) replays its stored job whether it ran
+on the default or the escalation model and whether or not the rule still applies.
+The job records the digest of its request before escalation (default model
+included, `runner_jobs.request_base_hash`; an orchestrator step reaches it through
+its job), and a retry replays only when its own pre-escalation digest equals it:
+a changed default model, config or other argument is a conflict
+(`request_conflict` / `step_conflict`) for an escalated job as for any other. The rule is
+read like the rest of the control snapshot, so a change applies to the next
+start, never to a queued job.
 
 ## Versions and experiments
 

@@ -10,6 +10,7 @@ CHOICES = {
     "main": {"provider": "claude", "model": "claude-haiku-5-5"},
     "worker": {"provider": "codex", "model": "gpt-5.5"},
 }
+FULL = {**CHOICES, "reviewer": None, "gate": None}
 
 
 def test_owner_sets_models_per_project(projects_hub):
@@ -18,8 +19,8 @@ def test_owner_sets_models_per_project(projects_hub):
     status, body = h.models(h.owner, "alpha", CHOICES, declare=True)
     assert status == 200  # RED
     assert created[0] == 201
-    assert body["models"] == CHOICES and body["can_configure"] is True
-    assert h.project(h.owner, "alpha")[1]["models"] == CHOICES
+    assert body["models"] == FULL and body["can_configure"] is True
+    assert h.project(h.owner, "alpha")[1]["models"] == FULL
     models = optional("commonplace.projects.models")
     types = optional("commonplace.projects.types")
     assert models.resolve(h.db, h.workspace, "alpha", "main") == types.ModelChoice(
@@ -30,6 +31,8 @@ def test_owner_sets_models_per_project(projects_hub):
     assert h.models(h.owner, "alpha", {"main": None}, declare=True)[1]["models"] == {
         "main": None,
         "worker": CHOICES["worker"],
+        "reviewer": None,
+        "gate": None,
     }
     assert h.models(h.owner, "alpha", {"area:ui": CHOICES["main"]}, declare=True)[0] == 400
     invalid = h.models(
@@ -57,7 +60,9 @@ def test_models_are_project_scoped(projects_hub):
     status, _ = h.models(h.owner, "alpha", {"main": CHOICES["main"]}, declare=True)
     assert status == 200  # RED
     assert all(r[0] == 201 for r in created)
-    assert h.project(h.owner, "beta")[1]["models"] == {"main": None, "worker": None}
+    assert h.project(h.owner, "beta")[1]["models"] == dict.fromkeys(
+        ("main", "worker", "reviewer", "gate")
+    )
     assert h.models(h.owner, "beta", {"main": CHOICES["worker"]}, declare=True)[0] == 200
     assert h.project(h.owner, "alpha")[1]["models"]["main"] == CHOICES["main"]
     assert h.project(h.owner, "beta")[1]["models"]["main"] == CHOICES["worker"]
@@ -71,7 +76,9 @@ def test_404_unknown_model_cannot_be_saved_until_it_is_in_the_workspace_list(pro
     h.create_board(h.owner, "alpha")
     status, body = h.models(h.owner, "alpha", {"main": CHOICES["main"]}, declare=False)
     assert (status, body.get("code")) == (400, "unknown_model")
-    assert h.project(h.owner, "alpha")[1]["models"] == {"main": None, "worker": None}
+    assert h.project(h.owner, "alpha")[1]["models"] == dict.fromkeys(
+        ("main", "worker", "reviewer", "gate")
+    )
     assert h.project(h.owner, "alpha")[1]["model_catalog"] == []
     # An owner adds it; members and agents cannot.
     assert h.catalog_add(h.member, "alpha", CHOICES["main"])[0] == 403
@@ -110,7 +117,9 @@ def test_404_writes_are_owner_only_at_the_model_and_the_route(projects_hub):
     assert h.catalog_add(h.owner, "alpha", CHOICES["main"])[0] == 200
     with pytest.raises(types.ProjectDenied):
         models.put(h.db, member, "alpha", {"main": CHOICES["main"]})
-    assert models.get(h.db, h.workspace, "alpha") == {"main": None, "worker": None}
+    assert models.get(h.db, h.workspace, "alpha") == dict.fromkeys(
+        ("main", "worker", "reviewer", "gate")
+    )
     # The route refuses a member for every write, before any module runs.
     status, _, _ = h.request(h.member, "PUT", "/api/projects/alpha/limits", {"max_agents": 1})
     assert status == 403
@@ -203,9 +212,9 @@ def test_404_models_added_by_a_save_are_audited(projects_hub):
     assert audited_models()[-1] == '["alpha", "codex/gpt-5.5"]'  # board and model, no text
 
 
-def test_404_unmapped_roles_outside_the_slots_do_not_break_the_report(projects_hub):
-    """A start role whose model_role is not a configurable slot (reviewer, gate) is reported
-    after the slots, by name, instead of raising from the sort."""
+def test_404_reviewer_and_gate_are_slots_reported_in_slot_order(projects_hub):
+    """Reviewer and gate are configurable slots: a start role that uses one is reported in
+    slot order, after main and worker, and a role with no model_role comes last."""
     from types import SimpleNamespace
 
     h = projects_hub
@@ -222,19 +231,23 @@ def test_404_unmapped_roles_outside_the_slots_do_not_break_the_report(projects_h
     missing = models.missing_roles(h.db, h.workspace, "alpha", config)
     assert [(item["role"], item["config_roles"]) for item in missing] == [
         ("main", ["lead"]),
-        ("gate", ["release"]),
         ("reviewer", ["checker"]),
+        ("gate", ["release"]),
         (None, ["loose"]),
     ]
     assert h.models(h.owner, "alpha", {"main": CHOICES["main"]}, declare=True)[0] == 200
     assert [item["role"] for item in models.missing_roles(h.db, h.workspace, "alpha", config)] == [
+        "reviewer",
         "gate",
+        None,
+    ]
+    assert h.models(h.owner, "alpha", {"gate": CHOICES["main"]}, declare=True)[0] == 200
+    assert [item["role"] for item in models.missing_roles(h.db, h.workspace, "alpha", config)] == [
         "reviewer",
         None,
     ]
-    # The configurable slots and the list's roles stay consistent for later slices.
+    assert tuple(types.MODEL_ROLES) == ("main", "worker", "reviewer", "gate")
     assert set(types.MODEL_ROLES) <= set(types.CATALOG_ROLES)
-    assert {"main", "worker", "reviewer", "gate"} <= set(types.CATALOG_ROLES)
 
 
 def test_404_catalog_add_audits_only_a_row_it_adds(projects_hub):

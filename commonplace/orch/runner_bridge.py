@@ -38,7 +38,7 @@ from commonplace.boards.service import BoardService
 from commonplace.boards.store import BoardStore, task_row
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.http_util import log_failure
-from commonplace.projects import limits as project_limits, models
+from commonplace.projects import escalation, limits as project_limits, models
 from commonplace.runner import jobs, registry
 from commonplace.runner.predicate import Refused, grant_values, requester_ok, startable
 
@@ -106,6 +106,9 @@ class Plan:
     orchestration_on: bool = False
     workers: frozenset = frozenset()
     workspace_dir: str | None = None
+    escalation: escalation.Rule | None = None  # the project's rule, read with the snapshot
+    labels: tuple = ()  # the card's labels
+    model_reason: str | None = None  # why ``model`` is the escalation model
 
     @property
     def role(self) -> schema.Role:
@@ -152,8 +155,10 @@ def ensure_schema(conn) -> None:
     durable.ensure_schema(conn)
     for statement in MISSES_SCHEMA:
         conn.execute(statement)
-    if "launch_role" not in {r[1] for r in conn.execute("PRAGMA table_info(runner_jobs)")}:
-        conn.execute("ALTER TABLE runner_jobs ADD COLUMN launch_role TEXT")
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(runner_jobs)")}
+    for name in ("launch_role", "model_reason", "request_base_hash"):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE runner_jobs ADD COLUMN {name} TEXT")
 
 
 def _has_configs(directory) -> bool:
@@ -302,7 +307,29 @@ def prepare(
         orchestration_on=on,
         workers=workers,
         workspace_dir=gateway.workspace_dir(workspace_id),
+        escalation=escalation.get(gateway.db, workspace_id, board_row["slug"]),
+        labels=tuple(str(x) for x in _labels(card_row)),
     )
+
+
+def _escalated(conn, plan: Plan) -> Plan:
+    """Swap in the escalation model when the project's rule applies to this start.
+
+    Failed rounds are the card's ``failed`` jobs, counted inside the start transaction."""
+    rule = plan.escalation
+    if rule is None:
+        return plan
+    failed = 0
+    if rule.after_failures is not None:
+        failed = conn.execute(
+            "SELECT COUNT(*) FROM runner_jobs WHERE board_slug=? AND task_number=? "
+            "AND state='failed'",
+            (plan.board, plan.card),
+        ).fetchone()[0]
+    model, reason = escalation.pick(
+        rule, plan.role.model_role, plan.model, failed=failed, labels=plan.labels
+    )
+    return replace(plan, model=model, model_reason=reason)
 
 
 def request_hash(plan: Plan, role: str) -> str:
@@ -504,14 +531,7 @@ def model_unresolved(plan: Plan) -> StartRefused:
             f"the {role.name} role of board {plan.board} has no model_role; "
             "add one to the role in the board's orchestrator config"
         )
-    elif role.model_role not in models.MODEL_ROLES:
-        # Project settings cannot set this role: say what the Needs me item says.
-        message = (
-            f"the board config's model_role for the {role.name} role of board {plan.board} "
-            f"({role.model_role}) has no model, and project settings cannot set it; point "
-            "the role's model_role at main or worker in the board's orchestrator config"
-        )
-    else:
+    else:  # config validation accepts only the four slots, so project settings can set it
         message = (
             f"no model is set for the {role.model_role} role of board {plan.board}; "
             "an owner sets it in the board's project settings under Agent models"
@@ -521,8 +541,35 @@ def model_unresolved(plan: Plan) -> StartRefused:
     )
 
 
+def _replayed(stored_hash: str, stored_job: dict | None, base_digest: str) -> bool:
+    """Is this retry the request that created the stored job?
+
+    Which model escalation picked is a decision, not part of the request. A job records
+    the digest of its request before escalation (``request_base_hash``: the default
+    model included), and a retry replays only when its own pre-escalation digest equals
+    it, whether the job ran on the default or on the escalation model and whether or not
+    the rule applies now. A changed default model, config or other argument changes that
+    digest, so it conflicts. A job without the column was never escalated: its request
+    hash is the pre-escalation digest."""
+    expected = stored_job.get("request_base_hash") if stored_job else None
+    return (expected or stored_hash) == base_digest
+
+
+def base_digest(base: Plan) -> str:
+    """The person/trigger request digest of the plan before escalation."""
+    return jobs.request_digest(
+        base.config.runner.machine,
+        base.config.runner.project,
+        base.role.topic,
+        base.config.runner.runtime_mode,
+        base.run_record(),
+    )
+
+
 def _fenced(conn, plan, *, path, role, step_key, epoch, token, request_key, now, clock):
-    # 0. resolve: the model is pinned from the snapshot; the hash covers it.
+    # 0. resolve: the model is pinned from the snapshot (or the project's escalation
+    # rule); the hash covers it.
+    base, plan = plan, _escalated(conn, plan)
     if plan.model is None:
         raise model_unresolved(plan)
     digest = request_hash(plan, role)
@@ -555,8 +602,11 @@ def _fenced(conn, plan, *, path, role, step_key, epoch, token, request_key, now,
                     status=409,
                     step=stored,
                 )
-            if stored["card"] == plan.card and stored["request_hash"] == digest:
-                return Outcome(200, _job(conn, stored["job_id"]), stored)
+            job = _job(conn, stored["job_id"])
+            if stored["card"] == plan.card and _replayed(
+                stored["request_hash"], job, request_hash(base, role)
+            ):
+                return Outcome(200, job, stored)
             raise StartRefused(
                 "step_conflict", "step_key reused with a different request", step=stored
             )
@@ -566,13 +616,7 @@ def _fenced(conn, plan, *, path, role, step_key, epoch, token, request_key, now,
             (plan.card, plan.requested_by, request_key),
         ).fetchone()
         if previous is not None:
-            if previous["request_hash"] == jobs.request_digest(
-                plan.config.runner.machine,
-                plan.config.runner.project,
-                plan.role.topic,
-                plan.config.runner.runtime_mode,
-                record,
-            ):
+            if _replayed(previous["request_hash"], dict(previous), base_digest(base)):
                 return Outcome(200, dict(previous))
             raise StartRefused(
                 "request_conflict",
@@ -636,6 +680,16 @@ def _fenced(conn, plan, *, path, role, step_key, epoch, token, request_key, now,
     if path == "trigger" and plan.orchestration_on:
         conn.execute(
             "UPDATE runner_jobs SET launch_role=? WHERE id=?", (plan.config.runner.role, row["id"])
+        )
+        row = _job(conn, row["id"])
+    if status == 201:
+        conn.execute(
+            "UPDATE runner_jobs SET model_reason=?, request_base_hash=? WHERE id=?",
+            (
+                plan.model_reason,
+                request_hash(base, role) if path == "orch" else base_digest(base),
+                row["id"],
+            ),
         )
         row = _job(conn, row["id"])
     step = None
@@ -877,6 +931,7 @@ def launch_reply(plan: Plan, outcome: Outcome) -> dict:
             "provider": job.get("model_provider", plan.model.provider if plan.model else None),
             "model": job.get("model", plan.model.model if plan.model else None),
         },
+        "model_reason": job.get("model_reason", plan.model_reason),
     }
 
 

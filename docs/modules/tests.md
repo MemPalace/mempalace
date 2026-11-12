@@ -122,6 +122,7 @@
   - `tests/test_fact_readers_import_graph.py` runs a fresh interpreter over the fact read and search path and asserts `commonplace.rules` is never loaded, scans the three fact readers for any `commonplace` import, and pins the shared read deadline.
 
 - **Promises:**
+  - Project model and escalation regressions run through `tests/test_projects_escalation.py`, `tests/test_projects_escalation_unit.py`, `tests/projects_view.mjs` and the real-browser `tests/workbench_e2e/test_project_models.py`.
 
   - The pinned handoff baseline in `tests/test_handoff_adversarial_off_perf.py` overlays only leaf or board modules the current board code imports (now including `commonplace/decide_grant.py` and `mempalace/deadline.py`); the pinned gateway, policy and handoff sources stay at the baseline commit.
 

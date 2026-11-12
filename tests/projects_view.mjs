@@ -64,3 +64,35 @@ test("project memory controls preserve owner consent and escape the memory name"
   assert.doesNotMatch(html, /data-project-own-wing/);
   assert.doesNotMatch(ui.sharedWingHTML({}, e, {allowShared: false}), /data-wing-choice="shared"/);
 });
+
+test("model fields cover the four roles and the escalation rule picks from the workspace list", async () => {
+  const ui = await load("projects");
+  const strong = { provider: "p", model: "strong<x>" }, other = { provider: "p", model: "other" };
+  const rule = { after_failures: 2, labels: ["security"], model: strong };
+  const owner = { ...project, can_configure: true, escalation: rule, model_catalog: [other, strong] };
+  const html = ui.modelsHTML(owner, e);
+  for (const role of ["main", "worker", "reviewer", "gate"]) assert.match(html, new RegExp(`<select name="${role}_model"`));
+  for (const label of ["Orchestrator", "Builder", "Reviewer", "Gate"]) assert.match(html, new RegExp(label));
+  // One picker for the rule, built from the same list; no free-text provider or model field for it.
+  assert.match(html, /<select name="escalation_model"/);
+  assert.doesNotMatch(html, /name="escalation_provider"/);
+  const form = ui.escalationHTML(owner, e);
+  assert.match(form, /Save escalation/);
+  assert.match(form, /value="2"/);
+  assert.match(form, /value="security"/);
+  assert.match(form, /<option value="p strong&lt;x&gt;" selected>/);
+  assert.match(form, /<option value="p other">/);
+  assert.ok(form.includes("strong&lt;x&gt;"));
+  assert.doesNotMatch(form, /strong<x>/);
+  // A stored rule whose model left the list still shows as stored.
+  assert.match(ui.escalationHTML({ ...owner, model_catalog: [] }, e), /<option value="p strong&lt;x&gt;" selected>/);
+  const member = ui.escalationHTML({ ...owner, can_configure: false }, e);
+  assert.doesNotMatch(member, /Save escalation/);
+  assert.match(member, /<fieldset disabled>/);
+  assert.match(ui.escalationHTML({ ...project, can_configure: true, escalation: null }, e), /No escalation rule/);
+  const read = (fields) => (name) => fields[name] ?? "";
+  assert.deepEqual(ui.escalationBody(read({})), { rule: null });
+  assert.deepEqual(ui.escalationBody(read({ after_failures: "2", labels: "security, concurrency", escalation_model: "p m" })), { rule: { after_failures: 2, labels: ["security", "concurrency"], model: { provider: "p", model: "m" } } });
+  assert.equal(ui.escalationBody(read({ after_failures: "2" })), null);
+  assert.equal(ui.escalationBody(read({ escalation_model: "p m" })), null);
+});

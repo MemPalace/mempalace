@@ -14,6 +14,7 @@
   - The read-only mapping from journaled thread starts and doing-card claims to checkpoint jobs.
 
 - **Promises:**
+  - A start resolves its model from the project slots and, when the project's escalation rule applies (card failed jobs counted in the start transaction, or a card label), from the rule; the job records `model_reason` and the reply carries it. With no rule the model is unchanged.
 
   - `docs-check` reads the module map from `docs/modules/<module>.md` (plus any block left in `MODULES.md`) and accepts `docs/system/` sections as changes to `SYSTEM.md`; editing those files is not itself a module change. A module many changes touch (`tests`) also takes field fragments in `docs/modules/<module>.d/<name>.md` (`- **Owns|Promises|How it fails|Tests:**` bullets, no `Paths`): they are appended to the module's fields, and editing one is an edit of that module's block, so concurrent changes add their own file instead of editing the same lines.
 

@@ -576,10 +576,11 @@ return 404. Only workspace owners may Connect, give a project its own wing, or w
 
 | Method | Route | Body / result |
 |---|---|---|
-| GET | `/api/projects/<slug>` | `{board, name, main, models, memory, can_configure}` |
+| GET | `/api/projects/<slug>` | `{board, name, main, models, escalation, memory, can_configure}` |
 | POST | `/api/projects/<slug>/orchestrator/connect` | `{}` or boolean `replace` / `allow_shared` flags; 201 for a new connection, 200 for rotation. |
 | POST | `/api/projects/<slug>/wing` | Exactly `{}`; returns the re-read project view plus the own-wing result below. |
-| PUT | `/api/projects/<slug>/models` | Optional `main` and `worker` keys, each `{provider, model}` or `null` to clear; returns the project view. |
+| PUT | `/api/projects/<slug>/models` | Optional `main` (orchestrator), `worker` (builder), `reviewer` and `gate` keys, each `{provider, model}` or `null` to clear; returns the project view. |
+| PUT | `/api/projects/<slug>/escalation` | Exactly `{rule}`: `{after_failures: 1–10 or null, labels: [≤10 labels], model: {provider, model}}` (at least one of failures or labels), or `null` to clear. The model must be in the workspace list (`unknown_model`, 400). Owner only; returns the project view with `escalation` (`null` when unset). |
 
 `main` contains `role`, `name`, `source` (`seat` or `coordinator`), `connected`,
 `seen`, `status`, `wakeable` and `connectable`. `seen` means the connection has
