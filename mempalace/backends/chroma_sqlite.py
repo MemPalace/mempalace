@@ -477,7 +477,8 @@ def sqlite_lexical_rows(
         row_ids: list[int] = []
         recency = not tokens
         if tokens:
-            limit_sql = "ORDER BY embedding_fulltext_search.rank LIMIT ?" if scoped_in_sql else ""
+            # Preserve full scoped BM25 recall; only unscoped FTS is capped.
+            limit_sql = "" if where else "ORDER BY embedding_fulltext_search.rank LIMIT ?"
             try:
                 row_ids = [
                     row[0]
@@ -495,7 +496,7 @@ def sqlite_lexical_rows(
                         {limit_sql}
                         """,
                         (" OR ".join(tokens), collection_name, *filter_params)
-                        + ((limit,) if scoped_in_sql else ()),
+                        + (() if where else (limit,)),
                     )
                 ]
             except sqlite3.Error:
