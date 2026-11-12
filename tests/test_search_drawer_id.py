@@ -142,6 +142,57 @@ def test_filtered_query_fallback_keeps_ids_aligned_with_filtered_hits():
     assert result["distances"] == [[0.1]]
 
 
+
+def test_filtered_query_fallback_preserves_widened_pool_for_late_scoped_hit():
+    """Unfiltered retry cannot undo the searcher's wider candidate request."""
+    drawers_col = MagicMock()
+
+    def query(**kwargs):
+        if kwargs.get("where"):
+            raise RuntimeError("Error finding id")
+        # The first 80 unfiltered hits belong to a different wing. A scope
+        # match can be found only when the original expanded pool survives.
+        count = min(kwargs["n_results"], 80)
+        ids = [f"other-{i}" for i in range(count)]
+        if kwargs["n_results"] > 80:
+            ids.append("keep-id")
+        return {
+            "ids": [ids],
+            "documents": [[f"document-{row_id}" for row_id in ids]],
+            "metadatas": [
+                [
+                    {
+                        "wing": "keep" if row_id == "keep-id" else "other",
+                        "room": "notes",
+                        "source_file": "keep.md" if row_id == "keep-id" else "other.md",
+                    }
+                    for row_id in ids
+                ]
+            ],
+            "distances": [[0.1 for _ in ids]],
+        }
+
+    drawers_col.query.side_effect = query
+    result = _query_drawers_with_filter_fallback(
+        drawers_col,
+        {
+            "query_texts": ["needle"],
+            "n_results": 120,  # Expanded PUBLIC candidate pool
+            "include": ["documents", "metadatas", "distances"],
+            "where": {"wing": "keep"},
+        },
+        "needle",
+        2,
+        "keep",
+        None,
+    )
+
+    assert drawers_col.query.call_count == 2
+    assert drawers_col.query.call_args_list[1].kwargs["n_results"] >= 120
+    assert result["ids"] == [["keep-id"]]
+    assert result["documents"] == [["document-keep-id"]]
+
+
 def test_vector_drawer_id_round_trips_to_complete_chunked_drawer(
     seeded_collection,
 ):

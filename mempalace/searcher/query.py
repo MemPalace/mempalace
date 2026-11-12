@@ -60,9 +60,14 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
+        # A retry must not request fewer candidates than the original
+        # filtered query. In particular, search_memories widens that pool
+        # after incomplete generations or folded copies crowd the top hits.
+        # Otherwise the fallback silently shrinks the widened pool and can
+        # hide an otherwise reachable scoped match.
         raw = drawers_col.query(
             query_texts=[query],
-            n_results=min(n_results * 15, 500),
+            n_results=max(dkwargs.get("n_results", n_results), min(n_results * 15, 500)),
             include=["documents", "metadatas", "distances"],
         )
         raw_docs = _first_or_empty(raw, "documents")
