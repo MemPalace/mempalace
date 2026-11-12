@@ -1049,6 +1049,39 @@ every wake attempt failed. See `docs/chat.md`.
 - A coordinator may release a restricted-origin card reserved for it and keep working it after later handoffs. A seat that is neither the configured coordinator nor the live lease holder is refused on approve, update and take, and the creator never releases its own card.
 - A release recorded by an agent authorizes handed-over work only while that agent keeps every release grant (task_approve, needs_me, space_read, space_post, memory read and write, and write access to the board's wing). This holds for every agent route that can store a release: coordinator, parent, top-level agent and other trusted agents. A former approver that loses any grant no longer authorizes work it released, whoever holds the card.
 
+### Eval archives (slice 1)
+
+- `commonplace eval` is an owner-only local CLI. It archives immutable runs of
+  eligible stored threads (handoff transcripts and ACL imports in the `threads`
+  wing) and reads them back as exact bytes. No REST, MCP, UI, hook, daemon,
+  network, model, judge, score or replay is part of slice 1; later slices need
+  their own plan.
+
+- Live captures, grant imports, private chats and continuity threads refuse
+  (`eval_source_gap: unsupported_in_slice1`). Owner role, eligibility, the read
+  policy and the continuity probe are rechecked inside every archive commit and
+  every list/show/read response; a hidden run keeps its quota. A lookup error
+  refuses the response rather than hiding a run. The probe covers the
+  continuity tables that record stored IDs (`sync_streams`, `sync_groups`,
+  `sync_backfill`, `capture_ops`). `handoffs.stored_thread_id` also records
+  stored IDs and is deliberately not probed: a handoff transcript is the
+  eligible case, so its handoff record must not hide it.
+
+- `eval preflight` is the one eval command dispatched without the backup fence
+  and data lock (a deviation from slice-1 plan §6.3, accepted by the lead): it
+  only stats paths and reads `workspace.json`, so it creates nothing, even on a
+  fresh data directory.
+
+- Eval uses local OS trust like every CLI command, never constructs
+  `ControlDB`, and reads the control database `?mode=ro` behind a write-denying
+  authorizer. Its principal has only `threads:read` and `memory:read`.
+
+- Runs live in `<workspace>/evals/runs.sqlite3` (WAL, 0600 in a 0700 `evals/`,
+  encrypted with the workspace). Purge by exact run ID is the only delete; keys
+  are stored only as digests and stay retired for 30 days after purge. With
+  plans enabled, the eval DB counts against plan storage, measured under the
+  thread-store writer lock.
+
 ## Numbers
 
 | Label | Number | Source |
@@ -1065,6 +1098,8 @@ every wake attempt failed. See `docs/chat.md`.
 | M | Machine queue limit 8 queued jobs | `commonplace/runner/jobs.py:16` |
 | M | `request_key` at most 128 characters | `commonplace/runner/tools.py:92,157` |
 | M | T3 launch message at most 120,000 characters | T3 MCP launch schema |
+| M | Eval run at most 16 MiB (rows, artifacts, manifest); 256 KiB chunks and read pages; 1 GiB of active runs per workspace | `commonplace/evals/__init__.py` |
+| M | Eval key retention 30 days after purge; eval lock waits 5 s | `commonplace/evals/__init__.py` |
 | T | A resume is one call; zero duplicate jobs after a lost acknowledgement | acceptance tests |
 | T | Config at most 128 KiB, at most 16 roles, a prompt at most 32 KiB | `commonplace/orch/schema.py` |
 | T | Per board at most 8 experiments and 20 open proposals, at most 5 per principal | `commonplace/orch/store.py` |
@@ -1082,6 +1117,7 @@ every wake attempt failed. See `docs/chat.md`.
 | `runner.sqlite3` | workspace | runner jobs and their run ledger; orchestrator configs, cursors, leases, steps, journal, restore flag | yes |
 | `rules.sqlite3` | workspace | rules, append-only `rule_versions`, suggestions, served state, and rule evidence: `rule_events` (capped at 50 per writer and 200 per rule) with `rule_stats` counters that keep the full history | yes |
 | `topology.sqlite3` | workspace | Compute map facts: nodes, links, site routes, their observations (observer, verbatim evidence, expiry) and conflict records; never secrets | yes |
+| `evals/runs.sqlite3` | workspace | eval runs, their chunks and payload-free purge tombstones | yes |
 | palace and other workspace SQLite files | workspace | verbatim memory, indexes, threads | yes |
 
 - Backups copy every SQLite file in the data directory (`commonplace/backup.py`).
@@ -1168,6 +1204,30 @@ every wake attempt failed. See `docs/chat.md`.
   are unchanged.
 
 ## Residuals
+
+- **Eval guard A4 is a lint:** the scan that no code rewrites thread
+  identity or deletes thread-store content rows (the seven content tables
+  `threads`, `messages`, `line`, `message`, `block`, `blob`, `dict`) reads SQL
+  string literals, f-strings, `+` chains and `%`-formatted literals. It never
+  catches less than the original per-piece scan, allowlist included (entries
+  are scoped to a file and a statement kind). Known limits include `str.join`
+  or `+=` building, `%(name)s` formatting, comments inside or before keywords,
+  `INDEXED BY` before `SET`, tuple `SET`, quoted schemas, dynamic `SET`
+  columns, lower-case dynamic statements with an alias tail, `TRUNCATE`,
+  `ALTER TABLE … DROP COLUMN` and Postgres `DELETE FROM ONLY`. Prose with a
+  placeholder followed by the end, `;`, `)`, `WHERE` or `RETURNING` is flagged
+  as an accepted false positive and is never allowlisted (`docs/evals.md`).
+
+- **Eval archives:** slice 1 covers handoff transcripts and ACL imports only:
+  0% of live captures and grant imports, the automatic high-volume trace path;
+  the share by count is unmeasured. Purge does not erase retired store
+  generations, backups, WAL or free pages, and restoring an older generation can
+  bring runs back. Anyone who can read `runs.sqlite3` or its backup can confirm
+  a guessed key. A run whose source disappears stays unlisted until purged by
+  its retained ID. Single-part imports, palace writers and handoff filing do not
+  measure plan storage under the thread-store lock, so eval's plan-storage bound
+  holds only against writers that do. Privacy flags miss doubly escaped JSON and
+  health hints split across strings; they are signals, not gates.
 
 - **Admin observations:** All seven sections are implemented; operational sections
   request data only with instance eligibility. Health validates the existing public
