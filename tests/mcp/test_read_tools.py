@@ -1402,6 +1402,7 @@ def test_list_drawers_sdk_fallback_rejects_replaced_generation_between_reads(mon
     assert result["total"] == 0, result
     assert result["drawers"] == []
 
+
 def test_list_drawers_sdk_preview_rechecks_generation_after_positional_overwrite(monkeypatch):
     """An SDK metadata snapshot of A must never hydrate B under the same ID."""
     from mempalace import mcp_server
