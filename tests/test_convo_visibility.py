@@ -126,9 +126,11 @@ def test_vector_candidate_gate_rejects_same_id_scope_change(monkeypatch, scope_f
         return ["shared-physical-id"], [committed]
 
     monkeypatch.setattr(chroma_sqlite, "sqlite_list_id_metadata", source_snapshot)
+
     def check(meta):
         return visible_conversation_candidate_ids(
             "/unused/palace", "drawers", [("shared-physical-id", meta)]
         )
+
     assert check(stale_hit) == set(), "stale wing/room must not inherit current visibility"
     assert check(committed) == {"shared-physical-id"}
