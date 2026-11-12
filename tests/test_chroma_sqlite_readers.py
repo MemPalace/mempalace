@@ -187,6 +187,42 @@ def test_every_sqlite_reader_returns_what_it_did(palace):
     assert _outputs(palace_path, col) == EXPECTED
 
 
+
+def test_lexical_recency_source_scope_is_applied_before_candidate_limit(palace):
+    """Newer unrelated rows cannot exhaust the short-query fallback pool."""
+    palace_path, _ = palace
+    source = "/home/u/.claude/projects/p/s1.jsonl"
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path, _NAME, "an", where={"source_file": source}, limit=1
+    )
+    assert [row_id for row_id, _, _ in rows] == ["drawer_a"]
+
+    # Exercise the compound equality/$in path, not only one bare key.
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path,
+        _NAME,
+        "an",
+        where={"$and": [{"source_file": source}, {"wing": {"$in": ["my_app", "my-app"]}}]},
+        limit=1,
+    )
+    assert [row_id for row_id, _, _ in rows] == ["drawer_a"]
+
+
+def test_lexical_fts_source_scope_is_applied_before_candidate_limit(palace):
+    """The indexed lexical path also pushes supported source predicates down."""
+    palace_path, _ = palace
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path,
+        _NAME,
+        "vector",
+        where={"source_file": "/home/u/.claude/projects/p/s1.jsonl"},
+        limit=1,
+    )
+    assert [(row_id, text) for row_id, text, _ in rows] == [
+        ("drawer_a", "alpha whole word vector notes")
+    ]
+
+
 def test_missing_database_reads_as_none(tmp_path):
     empty = str(tmp_path)
     assert chroma_sqlite._sqlite_embedding_count(empty, _NAME) is None
