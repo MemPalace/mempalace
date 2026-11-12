@@ -222,6 +222,20 @@ def test_lexical_fts_source_scope_is_applied_before_candidate_limit(palace):
     ]
 
 
+def test_scoped_fts_keeps_all_candidates_for_local_bm25_ranking(palace):
+    """Push source scope to SQL without capping its BM25 input at one FTS hit."""
+    palace_path, _ = palace
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path,
+        _NAME,
+        "vector",
+        where={"wing": {"$in": ["my_app", "my-app", "wing_my_app"]}},
+        limit=1,
+    )
+    assert {row_id for row_id, _, _ in rows} == {"drawer_a", "drawer_b", "drawer_c"}
+
+
+
 def test_missing_database_reads_as_none(tmp_path):
     empty = str(tmp_path)
     assert chroma_sqlite._sqlite_embedding_count(empty, _NAME) is None
