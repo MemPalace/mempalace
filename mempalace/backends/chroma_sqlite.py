@@ -454,22 +454,31 @@ def sqlite_lexical_rows(
 ) -> list[tuple]:
     """Decoded ``(drawer_id, document, metadata)`` worth BM25-ranking for ``query``.
 
-    The best ``limit`` full-text matches by FTS rank, or every match under a
-    ``where``, which is applied to the stored metadata afterwards: a cap
-    before filtering could fill with wrong-scope rows. The newest ``limit``
-    rows stand in when no query term is three characters long or the
-    full-text query fails; a clean miss stays empty. ``[]`` when the database
-    is missing or unreadable.
+    Supported source/wing/room equalities are applied inside SQL *before*
+    the candidate LIMIT, so short-query recency fallback cannot lose the
+    only matching drawer beneath newer records from another source.
+    Unsupported complex filters retain the post-filter fallback. A clean
+    full-text miss stays empty; ``[]`` if the database is unreadable.
     """
     tokens = [t for t in tokenize(query) if len(t) >= 3]
 
     def read(conn):
         conn.execute("BEGIN")
         _install_sqlite_convo_visibility(conn, collection_name)
+        equalities = _string_equalities(where)
+        scoped_in_sql = equalities is not None
+        filter_sql, filter_params = ("", [])
+        if scoped_in_sql:
+            # Match the encoded value stored in Chroma metadata (e.g. NUL).
+            stored = [
+                (key, tuple(encode_filter(value) for value in values))
+                for key, values in equalities
+            ]
+            filter_sql, filter_params = _match_sql(stored, "e.id")
         row_ids: list[int] = []
         recency = not tokens
         if tokens:
-            limit_sql = "" if where else "ORDER BY embedding_fulltext_search.rank LIMIT ?"
+            limit_sql = "ORDER BY embedding_fulltext_search.rank LIMIT ?" if scoped_in_sql else ""
             try:
                 row_ids = [
                     row[0]
@@ -483,9 +492,11 @@ def sqlite_lexical_rows(
                         WHERE embedding_fulltext_search MATCH ?
                           AND c.name = ?
                           AND _mempalace_convo_public(e.id)
+                        {filter_sql}
                         {limit_sql}
                         """,
-                        (" OR ".join(tokens), collection_name) + (() if where else (limit,)),
+                        (" OR ".join(tokens), collection_name, *filter_params)
+                        + ((limit,) if scoped_in_sql else ()),
                     )
                 ]
             except sqlite3.Error:
@@ -495,7 +506,8 @@ def sqlite_lexical_rows(
                 conn,
                 collection_name,
                 limit,
-                " AND _mempalace_convo_public(e.id)",
+                " AND _mempalace_convo_public(e.id)" + filter_sql,
+                filter_params,
             )
         return _decoded_rows(conn, row_ids, where)
 
