@@ -8,7 +8,9 @@ import { escape as e } from './api.js';
 export const UI_KEY = 'cmmn.ui';
 // Deck-only screens by route name: name -> loader of a module exporting TITLE and mount(context).
 // mount returns { refresh?(context), stop?() }. A name without a loader is not offered in the bar.
-export const SCREENS = {};
+export const SCREENS = {
+  today: () => import('./deck-today.js'),
+};
 const SECTIONS = [['today', 'Today'], ['bots', 'Bots'], ['compute', 'Compute'], ['settings', 'Settings']];
 
 const store = () => { try { return globalThis.localStorage || null; } catch { return null; } };
