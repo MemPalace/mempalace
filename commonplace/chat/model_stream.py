@@ -14,7 +14,8 @@ from commonplace.chat.types import FrontSettings, ModelError
 ANTHROPIC_STOPS = {
     "end_turn": "end",
     "stop_sequence": "end",
-    "pause_turn": "end",
+    # "pause_turn" (the provider paused a long turn) is not mapped: a partial reply must not
+    # read as final, so it is a bad_response like any unknown stop.
     "refusal": "end",
     "tool_use": "tool",
     "max_tokens": "length",
@@ -117,6 +118,9 @@ class _OpenAI:
                 slot["args"].append(function["arguments"])
         reason = choice.get("finish_reason")
         if reason:
+            stop = OPENAI_STOPS[reason]
+            if self.calls and stop != "tool":
+                raise ValueError  # tool calls with a non-tool stop: never run half a request
             for index in sorted(self.calls):
                 slot = self.calls[index]
                 # Some local servers send no call id; the turn only needs a unique one.
@@ -126,7 +130,7 @@ class _OpenAI:
                     )
                 )
             self.finished = True
-            out.append(("stop", OPENAI_STOPS[reason]))
+            out.append(("stop", stop))
         return out
 
 
@@ -168,7 +172,10 @@ def _events(settings, endpoint, payload, names, timeout, max_bytes, on_sent, can
                 events = parser.feed(data)
             except BAD_FRAME:
                 raise ModelError("bad_response") from None
-            yield from events
+            for event in events:
+                if call.stopped.is_set():  # a cancel between events of one frame
+                    raise ModelError("stopped")
+                yield event
             if parser.finished:
                 return
         raise ModelError("bad_response")

@@ -169,7 +169,7 @@ writes the person's text calls `turn.words()` there, so model text is refused be
 pending action or chip exists. `/confirm` rebuilds the turn with the message that asked for
 the action (even when newer messages exist) and calls `check` again before `run`; a routine
 tool's `check` also runs before `run`. A confirm tool whose schema takes free text (a string
-without an `enum`) must have `check`, or `register()` refuses it. A successful `Result` may
+without an `enum` or `const`, including type lists, `anyOf`/`oneOf` branches, untyped values and open nested objects) must have `check`, or `register()` refuses it. A successful `Result` may
 carry `say`, a plain outcome sentence that becomes the text of the confirmed action's event
 message (redacted, at most 500 characters); without it the text is "Done.". A tool call
 naming a tool that was not offered is refused with `invalid` and the turn goes on. A `project`-scope tool acts on the bot's own project; for a bot
@@ -244,6 +244,9 @@ empty list and a short reason.
   the bot says so. While a start is in flight the task's work block reads `working`.
 - **Refusals** keep the runner's stable code (for example `not_todo`, `outside_worker_wing`,
   `active_start`) and come with a plain sentence saying what to change.
+  A start the runner would refuse is refused before any button is shown (only owners start
+  agents, the task's state, the machine's area, a named machine that cannot take the task),
+  and checked again at the tap.
 - **Running commands is not available** until a provider offers it. The `run_command` tool is
   only offered to the model while some machine reports that it can run commands; without one
   the bot says so.

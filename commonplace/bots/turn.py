@@ -346,8 +346,9 @@ class TurnRun:
     def _hydrated(self, block) -> dict:
         try:
             principal = sessions.person_principal(self.gateway.db, self.user_id, self.workspace_id)
-            reader = self._reader if principal is None else blocks.Reader(self.gateway, principal)
-            return blocks.hydrate(reader, [block])[0]
+            if principal is None:  # access ended mid-turn: show nothing the person lost
+                return {**block, "gone": True}
+            return blocks.hydrate(blocks.Reader(self.gateway, principal), [block])[0]
         except Exception as exc:
             log_failure(logger, "Bot block not hydrated", exc)
             return block

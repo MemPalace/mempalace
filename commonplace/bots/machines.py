@@ -11,6 +11,7 @@ stable code and carries a plain sentence a person can act on.
 import logging
 import threading
 
+from commonplace.control_db import ControlError
 from commonplace.extensions import ToolContext, ToolError
 from commonplace.orch import runner_bridge
 from commonplace.redact import redact
@@ -50,6 +51,7 @@ SENTENCES = {
     "already_finished": "That agent has already launched or finished, so it can't be stopped from here.",
     "uncertain": "It isn't clear whether that agent launched; a workspace owner has to resolve it.",
     "changed": "That start changed while I was working on it; check its status and try again.",
+    "machine_cannot_take": "That machine can't take this task. Ask which machines can, or name another.",
     "machine_not_configured": "That machine has no project or kind of work set up yet. An owner can fix that in the runner settings.",
     "unsupported": "Running commands on machines is not available yet.",
 }
@@ -117,12 +119,13 @@ def _can_use(principal) -> bool:
 
 def _last_seen(db, machine):
     """When the machine's own credential last reached the hub, or None if never recorded."""
-    with db._lock:
-        row = db._conn.execute(
-            "SELECT last_used_at FROM connections WHERE id=? AND workspace_id=?",
-            (machine["machine_connection_id"], machine["workspace_id"]),
-        ).fetchone()
-    return (row["last_used_at"] or None) if row else None
+    try:
+        row = db.connection(machine["machine_connection_id"])
+    except ControlError:
+        return None
+    if row["workspace_id"] != machine["workspace_id"]:
+        return None
+    return row["last_used_at"] or None
 
 
 def _view(db, machine) -> dict:
@@ -186,6 +189,23 @@ class RunnerProvider:
         if row is None or not row["enabled"] or row["revoked_at"]:
             raise Refused("machine_not_found")
         return row
+
+    def preflight(self, gateway, principal, card, machine=None):
+        """What a start would refuse for this card, asked before anything is created.
+
+        The runner's own start options answer it (owner only, the card's state, the
+        machine's wings, projects and topics), so a chip is never offered for a start
+        that would be turned down."""
+        ctx = ToolContext(principal, gateway)
+        try:
+            options = start_options.start_options(ctx, card)
+        except (ToolError, ValueError) as exc:
+            raise _refusal(exc) from None
+        if options.get("refusal"):
+            raise Refused(options["refusal"])
+        if machine is not None and options.get("configured") is False:
+            if not any(machine in (offer["id"], offer["label"]) for offer in options["machines"]):
+                raise Refused("machine_cannot_take")
 
     def start_agent(self, gateway, principal, card, machine, request_key):
         ctx = ToolContext(principal, gateway)
@@ -292,8 +312,8 @@ def _listed(gateway, principal) -> list:
     for provider in providers():
         try:
             found.extend((provider, _clean(m)) for m in provider.machines(gateway, principal))
-        except Exception:  # one broken provider must not hide the others
-            LOG.warning("machine provider %s failed", provider.name, exc_info=True)
+        except Exception as exc:  # one broken provider must not hide the others
+            LOG.warning("machine provider %s failed: %s", provider.name, type(exc).__name__)
     return found
 
 
@@ -325,7 +345,8 @@ def can_run_command(gateway, principal) -> bool:
     return any(m["capabilities"]["run_command"] for _p, m in _listed(gateway, principal))
 
 
-def start_agent(gateway, principal, card, machine=None, request_key=None) -> dict:
+def _provider_for(gateway, principal, machine):
+    """The provider that would take a start: the named machine's, or the one capable one."""
     found = _listed(gateway, principal)
     if machine is not None:
         provider = _owner(found, machine)
@@ -342,13 +363,31 @@ def start_agent(gateway, principal, card, machine=None, request_key=None) -> dic
                 f"More than one machine can take this task; say which one: {labels}.",
             )
         provider = next(iter(capable.values()))
+    return provider
+
+
+def preflight(gateway, principal, card, machine=None) -> None:
+    """Raise :class:`Refused` for a start that would be refused; providers may check early."""
+    provider = _provider_for(gateway, principal, machine)
+    check = getattr(provider, "preflight", None)
+    if check is not None:
+        check(gateway, principal, card, machine)
+
+
+def start_agent(gateway, principal, card, machine=None, request_key=None) -> dict:
+    provider = _provider_for(gateway, principal, machine)
     return provider.start_agent(gateway, principal, card, machine, request_key)
 
 
 def start_status(gateway, principal, card) -> list:
     rows = []
     for provider in providers():
-        rows.extend(provider.start_status(gateway, principal, card))
+        try:
+            rows.extend(provider.start_status(gateway, principal, card))
+        except Exception as exc:  # one broken provider must not hide the others' starts
+            LOG.warning(
+                "machine provider %s start status failed: %s", provider.name, type(exc).__name__
+            )
     return sorted(rows, key=lambda row: row.get("updated_at") or "")
 
 

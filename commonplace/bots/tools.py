@@ -84,12 +84,31 @@ def register(tool: Tool) -> Tool:
 
 
 def _free_text(schema) -> bool:
-    """True when the schema accepts a free string anywhere (an enum string is not free)."""
-    if schema.get("type") == "string":
-        return "enum" not in schema
-    return any(_free_text(item) for item in schema.get("properties", {}).values()) or (
-        schema.get("type") == "array" and _free_text(schema.get("items", {}))
-    )
+    """True when the schema could accept a free string anywhere.
+
+    Only an ``enum`` or ``const`` pins a value. A type list that names ``string``, any branch
+    of ``anyOf`` / ``oneOf`` / ``allOf``, an untyped schema, and an open or typed
+    ``additionalProperties`` of a nested object all count as free text.
+    """
+    if not isinstance(schema, dict):
+        return schema is not False  # `true` (or anything unknown) accepts a string
+    if "enum" in schema or "const" in schema:
+        return False
+    branches = [b for key in ("anyOf", "oneOf", "allOf") for b in schema.get(key) or ()]
+    if any(_free_text(branch) for branch in branches):
+        return True
+    kind = schema.get("type")
+    kinds = [kind] if isinstance(kind, str) else list(kind) if isinstance(kind, list) else []
+    if "string" in kinds:
+        return True
+    if not kinds and not branches:
+        return True  # no type at all: any value, a string included
+    if any(_free_text(item) for item in (schema.get("properties") or {}).values()):
+        return True
+    extra = schema.get("additionalProperties", "object" in kinds)
+    if "object" in kinds and extra is not False and _free_text(extra):
+        return True
+    return "array" in kinds and _free_text(schema.get("items", True))
 
 
 class Turn:

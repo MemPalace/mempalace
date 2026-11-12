@@ -1088,3 +1088,35 @@ def test_queued_work_with_a_start_in_flight_reads_working_as_its_block_does(
     assert detail["status"] == "working"
     status = tools.REGISTRY["project_status"].run(turn, {}).data
     assert (status["tasks"]["working"], status["tasks"]["queued"]) == (1, 0)
+
+
+# Fallbacks that hide faults are logged by code
+
+
+def test_an_unreadable_work_status_is_logged_by_code(caplog):
+    from commonplace.bots import tools_project
+
+    caplog.set_level(logging.WARNING)
+    assert tools_project._status({"title": "Secret plans"}) == ("queued", "")
+    [record] = [r for r in caplog.records if "code=status_fallback" in r.getMessage()]
+    assert "Secret plans" not in record.getMessage()
+
+
+def test_an_unreadable_orchestrator_view_is_logged_by_code(monkeypatch, caplog):
+    from commonplace.bots import tools_project
+
+    caplog.set_level(logging.WARNING)
+
+    def broken(*args, **kwargs):
+        raise LookupError("work")
+
+    monkeypatch.setattr(front, "orchestrator", broken)
+
+    class Turn:
+        gateway = None
+
+        def principal(self):
+            return None
+
+    assert tools_project._orchestrator(Turn(), "work")["state"] == "none"
+    assert any("code=orchestrator_fallback" in r.getMessage() for r in caplog.records)

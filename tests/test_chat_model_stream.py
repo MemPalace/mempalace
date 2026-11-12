@@ -448,7 +448,7 @@ def test_no_tools_means_no_tools_key_and_no_auth_header_without_a_key(provider, 
 
 def test_non_200_is_http_error_without_the_body(provider, monkeypatch):
     no_outbound(monkeypatch)
-    with fake_server([], status=500) as (origin, _):
+    with fake_server([], status=500) as (origin, state):
         monkeypatch.setattr(model, "ANTHROPIC_ORIGIN", origin)
         with pytest.raises(ModelError) as exc:
             list(
@@ -457,6 +457,7 @@ def test_non_200_is_http_error_without_the_body(provider, monkeypatch):
                 )
             )
     assert exc.value.code == "http_error"
+    assert len(state["requests"]) == 1  # no retry
     assert "PROVIDER-SECRET" not in str(exc.value) and "PROVIDER-SECRET" not in repr(exc.value)
 
 
@@ -509,10 +510,18 @@ def bad_scripts(wire):
 )
 def test_malformed_frames_are_bad_responses(monkeypatch, wire, case):
     monkeypatch.setenv("COMMONPLACE_CHAT_KEY_HOSTS", "127.0.0.1")
-    with pytest.raises(ModelError) as exc:
-        run(wire, monkeypatch, bad_scripts(wire)[case])
+    no_outbound(monkeypatch)
+    with fake_server(bad_scripts(wire)[case]) as (origin, state):
+        monkeypatch.setattr(model, "ANTHROPIC_ORIGIN", origin)
+        with pytest.raises(ModelError) as exc:
+            list(
+                model_stream.stream(
+                    settings_for(wire, origin), "k", "system", USER, tools=TOOLS, **LIMITS
+                )
+            )
     assert exc.value.code == "bad_response"
     assert "PROVIDER-SECRET" not in str(exc.value)
+    assert len(state["requests"]) == 1  # no retry
 
 
 def test_events_before_a_bad_frame_are_still_delivered(provider, monkeypatch):
@@ -645,7 +654,7 @@ def test_a_local_endpoint_that_resolves_off_loopback_is_refused(monkeypatch):
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
-        lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 9))],
+        lambda *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 9))],
     )
     monkeypatch.setattr(socket, "socket", lambda *a, **kw: attempts.append(a))
     settings = settings_for("openai_compatible", "http://127.0.0.1:9")
@@ -654,3 +663,54 @@ def test_a_local_endpoint_that_resolves_off_loopback_is_refused(monkeypatch):
     assert exc.value.code == "http_error"
     assert attempts == []
     assert "private message" not in str(exc.value)
+
+
+# Stops that must not read as a finished reply
+
+
+def test_a_paused_anthropic_turn_is_a_bad_response_not_a_final_reply(monkeypatch):
+    monkeypatch.setenv("COMMONPLACE_CHAT_KEY_HOSTS", "127.0.0.1")
+    with pytest.raises(ModelError) as exc:
+        run("anthropic", monkeypatch, [a_text("half an ans"), a_end("pause_turn")])
+    assert exc.value.code == "bad_response"
+
+
+def test_openai_tool_calls_with_a_plain_stop_are_a_bad_response(monkeypatch):
+    monkeypatch.setenv("COMMONPLACE_CHAT_KEY_HOSTS", "127.0.0.1")
+    script = [o_call(0, "t", "find_work", '{"q": "x"}'), openai_frame(finish="stop")]
+    with pytest.raises(ModelError) as exc:
+        run("openai_compatible", monkeypatch, script)
+    assert exc.value.code == "bad_response"
+
+
+def test_a_cancel_between_events_of_one_frame_stops_the_stream(monkeypatch):
+    no_outbound(monkeypatch)
+    calls = [
+        {
+            "index": n,
+            "id": f"t{n}",
+            "type": "function",
+            "function": {"name": "list_boards", "arguments": "{}"},
+        }
+        for n in range(2)
+    ]
+    choice = {"index": 0, "delta": {"tool_calls": calls}, "finish_reason": "tool_calls"}
+    frame = f"data: {json.dumps({'choices': [choice]})}\n\n".encode()
+    cancel = threading.Event()
+    with fake_server([frame, "hang"]) as (origin, _):
+        events = model_stream.stream(
+            settings_for("openai_compatible", origin),
+            None,
+            "system",
+            USER,
+            tools=TOOLS,
+            cancel=cancel,
+            **LIMITS,
+        )
+        assert next(events)[0] == "tool_call"
+        cancel.set()
+        time.sleep(0.3)  # the watcher stops the call
+        with pytest.raises(ModelError) as exc:
+            next(events)
+        events.close()
+    assert exc.value.code == "stopped"

@@ -88,10 +88,15 @@ def hydrate_machines(reader, stored) -> dict:
 
 
 def _start_check(turn, args) -> None:
-    """Refused before any chip exists: the task is not this project's, the machine is unknown."""
+    """Refused before any chip exists: the task is not this project's, the machine is unknown,
+    or the start itself would be refused (not an owner, the task's state, the machine's area)."""
     _task(turn, args)
     if args.get("machine"):
         _machine_name(turn, args["machine"])
+    try:
+        machines.preflight(turn.gateway, turn.principal(), args["ref"], args.get("machine"))
+    except machines.Refused as exc:
+        raise ToolError(exc.text) from None
 
 
 def _start_label(turn, args) -> str:

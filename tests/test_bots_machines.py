@@ -434,13 +434,20 @@ def test_the_confirm_label_names_the_machine_and_unknown_ones_are_refused(env, m
     assert refused["tool"] == "start_work" and env.jobs() == []
 
 
-def test_a_refused_start_is_a_plain_sentence_and_nothing_is_created(env, model):
+def refusal_fed_back(model):
+    """The plain refusal sentence the model was given for the last tool call."""
+    content = model.calls[-1]["messages"][-1]["content"]
+    return json.loads(content.split(": ", 1)[1])["refused"]
+
+
+def test_a_start_the_runner_would_refuse_gets_no_chip(env, model):
     env.enroll(wings=["notes"])
     configure(env.bots)
-    bot, events = ask(env, model, "start_work", "Start it", "request-0001", ref=env.card())
-    _, message = tap(env, bot, events)
-    assert message["blocks"][0]["ok"] is False and "code" not in message["blocks"][0]
-    assert "isn't allowed to work in this project's area" in message["text"]
+    _, events = ask(env, model, "start_work", "Start it", "request-0001", ref=env.card())
+    assert [d for e, d in events if e == "block" and d["type"] == "confirm"] == []
+    [refused] = [d for e, d in events if e == "action" and d["state"] == "refused"]
+    assert refused["tool"] == "start_work"
+    assert "isn't allowed to work in this project's area" in refusal_fed_back(model)
     assert env.jobs() == []
 
 
@@ -458,12 +465,40 @@ def test_a_member_is_told_plainly_that_only_owners_start_agents(env, model):
     env.enroll()
     configure(env.bots)
     card = env.card()
-    model.script = [[call("start_work", ref=card)], [("text", "Waiting.")]]
-    bot, events = talk(env.bots, "Start it", "request-0001", auth=env.bots.member)
-    pending = next(d["pending"] for e, d in events if e == "block")
-    status, body, _ = confirm(env.bots, bot["id"], pending, auth=env.bots.member)
-    assert status == 200, body
-    assert "owner" in body["message"]["text"] and env.jobs() == []
+    model.script = [[call("start_work", ref=card)], [("text", "Only owners can.")]]
+    _, events = talk(env.bots, "Start it", "request-0001", auth=env.bots.member)
+    assert [d for e, d in events if e == "block" and d["type"] == "confirm"] == []
+    assert "owner" in refusal_fed_back(model) and env.jobs() == []
+
+
+def test_a_task_that_is_not_todo_gets_no_chip(env, model):
+    env.enroll()
+    configure(env.bots)
+    later = service(env.bots.hub, env.owner).task_add(
+        title="Later", board="work", status="backlog"
+    )["number"]
+    _, events = ask(env, model, "start_work", "Start it", "request-0001", ref=later)
+    assert [d for e, d in events if e == "block" and d["type"] == "confirm"] == []
+    assert "to-do" in refusal_fed_back(model) and env.jobs() == []
+
+
+def test_a_failing_provider_does_not_hide_the_others_starts(env, caplog):
+    env.enroll()
+    machines.register_provider(FakeProvider())
+
+    class Broken(FakeProvider):
+        name = "broken"
+
+        def start_status(self, gateway, principal, card):
+            raise RuntimeError("Secret plans")
+
+    machines.register_provider(Broken())
+    try:
+        rows = machines.start_status(env.gateway, env.owner, 7)
+    finally:
+        machines.unregister_provider("broken")
+    assert [row["job"] for row in rows] == ["fake-job"]
+    assert all("Secret plans" not in r.getMessage() for r in caplog.records)
 
 
 def test_stop_work_cancels_a_start_that_has_not_launched(env, model):

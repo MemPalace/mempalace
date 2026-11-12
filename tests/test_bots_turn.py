@@ -1136,3 +1136,91 @@ def test_blocks_shown_during_a_turn_use_the_persons_current_rights(bots_hub, fak
     _, events = talk(hub, "Set up", auth=hub.member)
     [block] = [d for e, d in events if e == "block"]
     assert block["can_configure"] is True
+
+
+# Backend robustness minors
+
+
+def test_a_block_shown_after_access_ended_mid_turn_is_gone(bots_hub, fake, extra_tools):
+    hub = bots_hub
+    configure(hub)
+    card = new_card(hub, "Private plans")
+
+    def lose_access(turn, args):
+        with hub.db._lock:  # the member's account is disabled while the turn runs
+            hub.db._conn.execute(
+                "UPDATE users SET disabled_at='2026-01-01T00:00:00Z' WHERE id=?",
+                (hub.member_user,),
+            )
+        return tools.Result(True, blocks=({"type": "work", "card": card["number"]},))
+
+    extra_tools(
+        tools.Tool(
+            name="show_work",
+            description="Show work",
+            schema={"type": "object", "properties": {}, "additionalProperties": False},
+            kind="read",
+            run=lose_access,
+            label=lambda turn, args: "Looked",
+        )
+    )
+    fake.script = [[call("show_work")], [("text", "Ok.")]]
+    _, events = talk(hub, "Show it", auth=hub.member)
+    [block] = [d for e, d in events if e == "block"]
+    assert block == {"type": "work", "card": card["number"], "gone": True}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        {"type": ["string", "null"]},
+        {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+        {"oneOf": [{"type": "string", "maxLength": 5}]},
+        {"description": "anything"},
+        {"type": "object", "properties": {"note": {"type": "integer"}}},
+    ],
+)
+def test_the_registration_guard_sees_every_free_text_shape(text):
+    name = "guarded_" + str(abs(hash(json.dumps(text, sort_keys=True))))[:8]
+    try:
+        with pytest.raises(ValueError, match="needs `check`"):
+            _register_shape(name, text)
+    finally:
+        registered = tools.REGISTRY.pop(name, None)
+    assert registered is None
+
+
+def _register_shape(name, text):
+    tools.register(
+        tools.Tool(
+            name=name,
+            description="Shape",
+            schema={
+                "type": "object",
+                "properties": {"value": text},
+                "additionalProperties": False,
+            },
+            kind="confirm",
+            run=lambda turn, args: tools.Result(True),
+            label=lambda turn, args: "Shape",
+        )
+    )
+
+
+def test_the_registration_guard_lets_pinned_values_through(extra_tools):
+    for value in ({"type": "string", "enum": ["a", "b"]}, {"const": "x"}, {"type": "integer"}):
+        tools.REGISTRY.pop("pinned_shape", None)
+        extra_tools(
+            tools.Tool(
+                name="pinned_shape",
+                description="Shape",
+                schema={
+                    "type": "object",
+                    "properties": {"value": value},
+                    "additionalProperties": False,
+                },
+                kind="confirm",
+                run=lambda turn, args: tools.Result(True),
+                label=lambda turn, args: "Shape",
+            )
+        )

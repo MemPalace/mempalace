@@ -8,6 +8,7 @@ refusal comes back as one plain sentence with the next step, never the service's
 """
 
 import functools
+import logging
 import re
 from collections import Counter
 
@@ -24,6 +25,8 @@ from commonplace.bots import blocks, context
 from commonplace.bots.tools import Result, Tool, register
 from commonplace.chat import front
 from commonplace.extensions import ToolError
+
+logger = logging.getLogger(__name__)
 
 LIST_LIMIT = 20
 QUESTION_LIMIT = 12
@@ -114,7 +117,9 @@ def _clip(text, limit) -> str:
 def _status(card) -> tuple[str, str]:
     try:
         return blocks.work_status(card)
-    except (KeyError, ValueError):
+    except (KeyError, ValueError) as exc:
+        # Shown as queued, but a fault: log a code and the error type, never card text.
+        logger.warning("Bot work status unreadable (code=status_fallback, %s)", type(exc).__name__)
         return "queued", ""
 
 
@@ -165,7 +170,10 @@ def _orchestrator(turn, board) -> dict:
     """Whether the project's orchestrator is connected and would be woken, in plain words."""
     try:
         view = front.orchestrator(turn.gateway, turn.principal(), board)
-    except (ToolError, LookupError):
+    except (ToolError, LookupError) as exc:
+        logger.warning(
+            "Bot orchestrator view unreadable (code=orchestrator_fallback, %s)", type(exc).__name__
+        )
         view = None
     if view is None:
         return {
