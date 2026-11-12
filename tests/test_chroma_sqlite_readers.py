@@ -187,7 +187,6 @@ def test_every_sqlite_reader_returns_what_it_did(palace):
     assert _outputs(palace_path, col) == EXPECTED
 
 
-
 def test_lexical_recency_source_scope_is_applied_before_candidate_limit(palace):
     """Newer unrelated rows cannot exhaust the short-query fallback pool."""
     palace_path, _ = palace
