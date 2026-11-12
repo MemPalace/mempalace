@@ -109,6 +109,10 @@ def visible_conversation_candidate_ids(palace_path, collection_name, candidates)
             "historical_version",
             "chunk_total",
             "chunk_index",
+            # A concurrent same-ID metadata rewrite must not borrow an
+            # unrelated wing/room scope from the validated SQLite row.
+            "wing",
+            "room",
         )
         for row_id, meta in stamped:
             persisted = current.get(row_id)

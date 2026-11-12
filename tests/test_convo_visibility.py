@@ -94,3 +94,38 @@ def test_public_neighbor_context_uses_only_the_matched_complete_generation():
     )
     assert result[0]["context"] == "A chunk one"
     assert "UNPUBLISHED B" not in result[0]["context"]
+
+
+@pytest.mark.parametrize("scope_field", ["wing", "room"])
+def test_vector_candidate_gate_rejects_same_id_scope_change(monkeypatch, scope_field):
+    """A validated ID is not enough if its search scope changed meanwhile."""
+    from contextlib import nullcontext
+
+    from mempalace.backends import chroma_sqlite
+    from mempalace.convo_visibility import visible_conversation_candidate_ids
+
+    committed = {
+        **_meta(total=1),
+        "wing": "current-wing",
+        "room": "current-room",
+    }
+    stale_hit = {**committed, scope_field: "stale-scope"}
+    connection = object()
+
+    monkeypatch.setattr(
+        chroma_sqlite,
+        "sqlite_metadata_snapshot",
+        lambda _palace_path, _collection_name: nullcontext(connection),
+    )
+
+    def source_snapshot(_palace_path, _collection_name, *, where, _connection):
+        assert where == {"source_file": {"$in": ["session.txt"]}}
+        assert _connection is connection
+        return ["shared-physical-id"], [committed]
+
+    monkeypatch.setattr(chroma_sqlite, "sqlite_list_id_metadata", source_snapshot)
+    check = lambda meta: visible_conversation_candidate_ids(
+        "/unused/palace", "drawers", [("shared-physical-id", meta)]
+    )
+    assert check(stale_hit) == set(), "stale wing/room must not inherit current visibility"
+    assert check(committed) == {"shared-physical-id"}
