@@ -1477,7 +1477,10 @@ def tool_list_drawers(
                     raise RuntimeError("cannot verify source-wide conversation visibility")
                 source_ids.extend(found[0])
                 source_metadata.extend(found[1])
-            return {row_id for row_id, _ in visible_conversation_rows(source_ids, source_metadata)}
+            # The source-wide scan may follow a concurrent SDK overwrite.
+            # Membership by physical ID alone would authorize an older,
+            # differently-stamped candidate under the newer generation's ID.
+            return dict(visible_conversation_rows(source_ids, source_metadata))
 
         def make_page(ids, metadatas, checked_ids=None):
             from ..convo_visibility import visible_conversation_rows
@@ -1499,7 +1502,24 @@ def tool_list_drawers(
                         and (meta or {}).get("extract_mode") in ("exchange", "general")
                         and "chunk_total" in (meta or {})
                     )
-                    or row_id in checked_ids
+                    or (
+                        row_id in checked_ids
+                        and all(
+                            (checked_ids[row_id] or {}).get(key) == (meta or {}).get(key)
+                            for key in (
+                                "ingest_mode",
+                                "source_file",
+                                "extract_mode",
+                                "source_mtime",
+                                "filed_at",
+                                "historical_version",
+                                "chunk_total",
+                                "chunk_index",
+                                "wing",
+                                "room",
+                            )
+                        )
+                    )
                 ]
             drawers = _collapse_drawer_rows([i for i, _ in kept], [], [m for _, m in kept])
             if since_dt is not None or before_dt is not None:
