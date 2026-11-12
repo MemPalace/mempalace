@@ -91,9 +91,7 @@ def unknown_model_palace(monkeypatch, tmp_path, request):
     monkeypatch.setenv("MEMPALACE_EMBEDDING_DEVICE", "cpu")
     monkeypatch.delenv("MEMPALACE_EMBEDDING_MODEL", raising=False)
     monkeypatch.setattr(embedding, "_EF_CACHE", {})
-    monkeypatch.setattr(embedding, "_WARNED", set())
     monkeypatch.setattr(embedding, "_DIM_CACHE", {})
-    monkeypatch.setattr(embedding, "_REFUSALS_LOGGED", set())
     _MiniLMStandIn.instances = []
     _MiniLMStandIn.calls = []
     monkeypatch.setattr(embedding, "_build_ef_class", lambda: _MiniLMStandIn)
@@ -1141,7 +1139,15 @@ class _EmbeddingsHandler:
 
 def _openai_compat_palace_with_a_dead_endpoint(unknown_model_palace, monkeypatch):
     """Mine an openai-compat palace against a live local endpoint, then stop
-    the server: the configured URL now refuses the connection."""
+    the server: the configured URL now refuses the connection.
+
+    The refusal is answered in process. The kernel refuses a connect to the
+    closed port too, but Windows retransmits the SYN for about 1.3 s before
+    reporting it and each test here connects several times; what they check
+    is the error path above the socket, not the kernel's timing.
+    """
+    import errno
+    import socket
     import threading
     from http.server import ThreadingHTTPServer
 
@@ -1151,7 +1157,8 @@ def _openai_compat_palace_with_a_dead_endpoint(unknown_model_palace, monkeypatch
     monkeypatch.delenv("MEMPALACE_EMBEDDING_API_URL", raising=False)
     monkeypatch.delenv("MEMPALACE_EMBEDDING_API_MODEL", raising=False)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _EmbeddingsHandler.make())
-    url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+    dead = ("127.0.0.1", server.server_address[1])
+    url = f"http://{dead[0]}:{dead[1]}/v1"
     (palace.parent / "config" / "config.json").write_text(
         json.dumps(
             {
@@ -1172,6 +1179,17 @@ def _openai_compat_palace_with_a_dead_endpoint(unknown_model_palace, monkeypatch
         server.server_close()
         thread.join()
     assert _recorded_identity(palace)["mempalace_drawers"]["model_name"] == "openai-compat"
+
+    real_create_connection = socket.create_connection
+
+    def _refuse_the_dead_port(address, *args, **kwargs):
+        if tuple(address[:2]) == dead:
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+        return real_create_connection(address, *args, **kwargs)
+
+    # http.client picks ``socket.create_connection`` up per connection, so
+    # the patch reaches every request urllib makes from here on.
+    monkeypatch.setattr(socket, "create_connection", _refuse_the_dead_port)
     return palace
 
 

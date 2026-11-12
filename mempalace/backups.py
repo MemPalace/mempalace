@@ -21,7 +21,6 @@ import os
 import shutil
 import stat
 
-
 # Names for the file types a backup copy deliberately leaves behind. A socket
 # or a named pipe makes ``shutil.copytree`` record an error for that entry and
 # raise at the end. Device nodes do not, but dereferencing one copies the
@@ -150,7 +149,7 @@ def copy_palace_dir(src, dst, *, symlinks=False, log=None):
     end when a directory entry is not something it knows how to duplicate: a
     Unix domain socket, or a named pipe. The caller has to treat that as a
     failed backup, so the command died before the rebuild the backup was
-    guarding (#2207). Such entries are runtime artifacts of whatever process
+    guarding. Such entries are runtime artifacts of whatever process
     created them and never hold palace data, so a backup without them is
     still a complete backup of the palace.
 

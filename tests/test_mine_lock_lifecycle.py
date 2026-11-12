@@ -223,3 +223,99 @@ def test_mine_lock_retries_when_waiter_wakes_on_unlinked_inode(tmp_path, monkeyp
             except Exception:
                 pass
             old_lf.close()
+
+
+windows_only = pytest.mark.skipif(os.name != "nt", reason="Windows lock semantics")
+
+
+@windows_only
+def test_windows_open_retries_a_lock_file_whose_delete_is_pending(tmp_path, monkeypatch):
+    # Another process's cleanup can remove the lock file while a handle is still
+    # open; Windows then refuses opens with PermissionError until it settles.
+    lock_path = str(tmp_path / "pending.lock")
+    real_open = os.open
+    refusals = {"left": 3}
+
+    def pending_delete_open(path, flags, mode=0o777):
+        if path == lock_path and refusals["left"]:
+            refusals["left"] -= 1
+            raise PermissionError(13, "Permission denied", path)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", pending_delete_open)
+    lf = _open_mine_lock_file(lock_path, create=True)
+    try:
+        assert refusals["left"] == 0
+    finally:
+        lf.close()
+
+
+@windows_only
+def test_windows_open_gives_up_on_a_lasting_permission_error(tmp_path, monkeypatch):
+    lock_path = str(tmp_path / "denied.lock")
+
+    def always_denied(path, flags, mode=0o777):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(os, "open", always_denied)
+    monkeypatch.setattr(palace_module, "_WINDOWS_OPEN_RETRY_SECONDS", 0.05)
+    with pytest.raises(PermissionError):
+        _open_mine_lock_file(lock_path, create=True)
+
+
+@windows_only
+def test_windows_blocking_lock_waits_past_lk_locks_ten_tries(tmp_path, monkeypatch):
+    import msvcrt
+
+    calls = {"n": 0}
+
+    def busy_then_free(fd, mode, nbytes):
+        calls["n"] += 1
+        if calls["n"] <= 12:
+            raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(msvcrt, "locking", busy_then_free)
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    with open(tmp_path / "busy.lock", "w+b") as lf:
+        assert _lock_mine_lock_file(lf, blocking=True) is True
+    assert calls["n"] == 13
+
+
+@windows_only
+def test_windows_blocking_lock_raises_on_a_non_contention_error(tmp_path, monkeypatch):
+    import errno
+    import msvcrt
+
+    def bad_descriptor(fd, mode, nbytes):
+        raise OSError(errno.EBADF, "Bad file descriptor")
+
+    monkeypatch.setattr(msvcrt, "locking", bad_descriptor)
+    with open(tmp_path / "bad.lock", "w+b") as lf:
+        with pytest.raises(OSError):
+            _lock_mine_lock_file(lf, blocking=True)
+
+
+@windows_only
+def test_windows_open_fails_fast_on_a_directory_at_the_lock_path(tmp_path):
+    lock_path = tmp_path / "dir.lock"
+    lock_path.mkdir()
+    started = time.monotonic()
+    with pytest.raises(PermissionError):
+        _open_mine_lock_file(str(lock_path), create=True)
+    assert time.monotonic() - started < 0.5
+
+
+@windows_only
+def test_windows_open_fails_fast_on_a_read_only_lock_file(tmp_path):
+    import stat
+
+    lock_path = tmp_path / "ro.lock"
+    lock_path.write_bytes(b"")
+    os.chmod(lock_path, stat.S_IREAD)
+    try:
+        started = time.monotonic()
+        with pytest.raises(PermissionError):
+            _open_mine_lock_file(str(lock_path), create=True)
+        assert time.monotonic() - started < 0.5
+    finally:
+        os.chmod(lock_path, stat.S_IREAD | stat.S_IWRITE)

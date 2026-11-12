@@ -3,7 +3,6 @@
 import re
 import secrets
 
-
 _IMMUTABLE_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
 

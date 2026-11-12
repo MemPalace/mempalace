@@ -13,6 +13,7 @@ from mempalace.query_sanitizer import (
     MIN_QUERY_LENGTH,
     SAFE_QUERY_LENGTH,
     sanitize_query,
+    sanitizer_report,
 )
 
 
@@ -234,3 +235,45 @@ class TestRealWorldScenarios:
         assert result["original_length"] > 2000
         assert result["clean_length"] <= MAX_QUERY_LENGTH
         assert result["method"] == "question_extraction"
+
+
+class TestSanitizerSaysWhatItChanged:
+    """D-26: the sanitizer may truncate, but its result must say it did."""
+
+    def test_a_short_query_is_not_truncated(self):
+        result = sanitize_query("what did we decide about the cache?")
+        assert result["truncated"] is False
+        assert result["replaced_lone_surrogates"] is False
+        assert result["was_sanitized"] is False
+
+    def test_an_extracted_query_reports_truncation(self):
+        result = sanitize_query("You are a helpful assistant. " * 40 + "Where is the config?")
+        assert result["truncated"] is True
+        assert result["clean_length"] < result["original_length"]
+
+    def test_a_replaced_lone_surrogate_is_reported(self):
+        result = sanitize_query("cafe \udcff menu")
+        assert result["clean_query"] == "cafe � menu"
+        assert result["was_sanitized"] is True
+        assert result["replaced_lone_surrogates"] is True
+        assert result["truncated"] is False
+
+    def test_original_length_counts_the_raw_input(self):
+        assert sanitize_query("  short query  ")["original_length"] == 15
+
+
+class TestSanitizerReport:
+    def test_no_report_when_nothing_changed(self):
+        assert sanitizer_report(sanitize_query("what did we decide?")) is None
+
+    def test_a_changed_query_reports_what_changed(self):
+        report = sanitizer_report(
+            sanitize_query("You are a helpful assistant. " * 40 + "Where is the config?")
+        )
+        assert report["truncated"] is True
+        assert report["clean_query"] == "Where is the config"
+        assert report["original_length"] > report["clean_length"]
+
+    def test_an_empty_query_has_every_field(self):
+        assert sanitize_query("")["truncated"] is False
+        assert sanitize_query("   ")["replaced_lone_surrogates"] is False

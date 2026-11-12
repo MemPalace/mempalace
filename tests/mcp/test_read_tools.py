@@ -1,16 +1,15 @@
 """MCP server tests — status, taxonomy, metadata, list filters."""
 
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-
 from _mcp_server_helpers import (
     _get_collection,
     _patch_mcp_server,
@@ -643,7 +642,7 @@ with mine_palace_lock(sys.argv[1]):
         scan = filtered_scans[0]
         assert "substr(m.key, 1, 7) != 'chroma:'" in scan
         assert scan.count("JOIN embedding_metadata") >= 2, scan
-        assert "string_value = " in scan or "string_value = ?" in scan
+        assert "string_value IN (" in scan
 
         # The page's documents are fetched by id, not by re-reading everything.
         doc_reads = [
@@ -718,7 +717,7 @@ class TestOverviewCaches:
     def _spy(monkeypatch, name, delay=0.0):
         import time
 
-        from mempalace.backends import chroma
+        from mempalace.backends import chroma_sqlite as chroma
 
         calls: list[int] = []
         real = getattr(chroma, name)
@@ -893,13 +892,15 @@ class TestMetadataFacets:
 
         from unittest.mock import call
 
+        wing = {"wing": {"$in": ["engineering", "wing_engineering"]}}
         assert col.facet_counts.call_args_list == [
-            call("room", where={"wing": "engineering"}),
-            call("wing", where={"wing": "engineering"}),
+            call("room", where=wing),
+            call("wing", where=wing),
         ]
 
     def test_tool_get_taxonomy_uses_metadata_facets(self, monkeypatch):
         from unittest.mock import call
+
         import mempalace.mcp_server as mcp
 
         monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
@@ -1101,36 +1102,39 @@ class TestListDrawersDateFilters:
     """Unit tests for the #1128 date-filter helpers in mcp_server."""
 
     def test_parse_date_filter_none_and_blank(self):
-        from mempalace.mcp_server import _parse_date_filter
+        from mempalace.date_window import parse_date_bound as _parse_date_filter
 
         assert _parse_date_filter(None, "since") is None
         assert _parse_date_filter("   ", "since") is None
 
     def test_parse_date_filter_date_only(self):
 
-        from mempalace.mcp_server import _parse_date_filter
+        from mempalace.date_window import parse_date_bound as _parse_date_filter
 
-        assert _parse_date_filter("2026-04-01", "since") == datetime(2026, 4, 1)
+        assert _parse_date_filter("2026-04-01", "since") == datetime(
+            2026, 4, 1, tzinfo=timezone.utc
+        )
 
     def test_parse_date_filter_full_timestamp(self):
 
-        from mempalace.mcp_server import _parse_date_filter
+        from mempalace.date_window import parse_date_bound as _parse_date_filter
 
-        assert _parse_date_filter("2026-04-01T09:30:00", "since") == datetime(2026, 4, 1, 9, 30)
+        assert _parse_date_filter("2026-04-01T09:30:00", "since") == datetime(
+            2026, 4, 1, 9, 30, tzinfo=timezone.utc
+        )
 
-    def test_parse_date_filter_drops_timezone(self):
+    def test_parse_date_filter_keeps_timezone(self):
 
-        from mempalace.mcp_server import _parse_date_filter
+        from mempalace.date_window import parse_date_bound as _parse_date_filter
 
-        # tz offset dropped -> naive wall-clock, never raises vs naive filed_at.
+        # The offset is kept: bounds are instants, comparable with any filed_at.
         parsed = _parse_date_filter("2026-04-01T09:30:00+02:00", "since")
-        assert parsed == datetime(2026, 4, 1, 9, 30)
-        assert parsed.tzinfo is None
+        assert parsed == datetime(2026, 4, 1, 7, 30, tzinfo=timezone.utc)
 
     def test_parse_date_filter_rejects_garbage(self):
         import pytest
 
-        from mempalace.mcp_server import _parse_date_filter
+        from mempalace.date_window import parse_date_bound as _parse_date_filter
 
         with pytest.raises(ValueError, match="since"):
             _parse_date_filter("not-a-date", "since")
@@ -1138,14 +1142,14 @@ class TestListDrawersDateFilters:
     def test_parse_date_filter_rejects_impossible_date(self):
         import pytest
 
-        from mempalace.mcp_server import _parse_date_filter
+        from mempalace.date_window import parse_date_bound as _parse_date_filter
 
         with pytest.raises(ValueError):
             _parse_date_filter("2026-13-40", "before")
 
     def test_filed_at_in_window_since_inclusive(self):
 
-        from mempalace.mcp_server import _filed_at_in_window
+        from mempalace.date_window import filed_at_in_window as _filed_at_in_window
 
         since = datetime(2026, 1, 2)
         assert _filed_at_in_window("2026-01-02T00:00:00", since, None) is True
@@ -1153,7 +1157,7 @@ class TestListDrawersDateFilters:
 
     def test_filed_at_in_window_before_exclusive(self):
 
-        from mempalace.mcp_server import _filed_at_in_window
+        from mempalace.date_window import filed_at_in_window as _filed_at_in_window
 
         before = datetime(2026, 1, 3)
         assert _filed_at_in_window("2026-01-02T23:59:59", None, before) is True
@@ -1161,7 +1165,7 @@ class TestListDrawersDateFilters:
 
     def test_filed_at_in_window_missing_or_malformed_excluded(self):
 
-        from mempalace.mcp_server import _filed_at_in_window
+        from mempalace.date_window import filed_at_in_window as _filed_at_in_window
 
         since = datetime(2026, 1, 1)
         assert _filed_at_in_window(None, since, None) is False
@@ -1169,36 +1173,38 @@ class TestListDrawersDateFilters:
         assert _filed_at_in_window("garbage", since, None) is False
         assert _filed_at_in_window(12345, since, None) is False
 
-    def test_filed_at_in_window_tz_aware_wall_clock(self):
+    def test_filed_at_in_window_tz_aware_instant(self):
 
-        from mempalace.mcp_server import _filed_at_in_window
+        from mempalace.date_window import filed_at_in_window as _filed_at_in_window
 
-        # tz dropped on both sides -> wall-clock compare, no TypeError raised.
+        # Aware filed_at vs naive bound: compared as instants, no TypeError raised.
         since = datetime(2026, 1, 2)
         assert _filed_at_in_window("2026-01-02T08:00:00+05:00", since, None) is True
+        assert _filed_at_in_window("2026-01-02T04:00:00+05:00", since, None) is False
 
     def test_parse_date_filter_accepts_zulu_suffix(self):
 
-        from mempalace.mcp_server import _parse_date_filter
+        from mempalace.date_window import parse_date_bound as _parse_date_filter
 
         # "Z" is not accepted by datetime.fromisoformat before 3.11; the helper
-        # strips it so Zulu inputs parse on the 3.9 floor, tz then dropped.
+        # strips it so Zulu inputs parse on the 3.9 floor, as UTC.
         parsed = _parse_date_filter("2026-04-01T09:30:00Z", "since")
-        assert parsed == datetime(2026, 4, 1, 9, 30)
-        assert parsed.tzinfo is None
+        assert parsed == datetime(2026, 4, 1, 9, 30, tzinfo=timezone.utc)
+        assert parsed.utcoffset().total_seconds() == 0
 
         # Date-only with a Zulu suffix must also parse on 3.9/3.10 (appending
         # "+00:00" would have raised there; stripping Z does not).
         parsed_date = _parse_date_filter("2026-04-01Z", "since")
-        assert parsed_date == datetime(2026, 4, 1)
-        assert parsed_date.tzinfo is None
+        assert parsed_date == datetime(2026, 4, 1, tzinfo=timezone.utc)
 
         # Lowercase z is tolerated too.
-        assert _parse_date_filter("2026-04-01t09:30:00z", "since") == datetime(2026, 4, 1, 9, 30)
+        assert _parse_date_filter("2026-04-01t09:30:00z", "since") == datetime(
+            2026, 4, 1, 9, 30, tzinfo=timezone.utc
+        )
 
     def test_filed_at_in_window_accepts_zulu_filed_at(self):
 
-        from mempalace.mcp_server import _filed_at_in_window
+        from mempalace.date_window import filed_at_in_window as _filed_at_in_window
 
         since = datetime(2026, 1, 2)
         assert _filed_at_in_window("2026-01-02T08:00:00Z", since, None) is True
@@ -1273,3 +1279,32 @@ class TestFetchDrawerRowsDelegation:
         assert ids == ["a"]
         assert documents == ["doc a"]
         assert metadatas == [{"wing": "w"}]
+
+
+def test_follow_tunnels_records_without_the_writer_lease(monkeypatch):
+    """Recording takes the tunnel file's own lock, so a session that holds no
+    writer lease (never tried a mutation, or lost it to a peer) still records."""
+    from mempalace import mcp_server
+
+    captured = {}
+
+    def _fake_follow(wing, room, col=None, record=True):
+        captured["record"] = record
+        return [{"tunnel_id": "t1"}]
+
+    monkeypatch.setattr(mcp_server, "follow_tunnels", _fake_follow)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: object())
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", False)
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", None)
+
+    for peer_holds_lease in (False, True):
+        monkeypatch.setattr(mcp_server, "_MCP_WRITER_READ_ONLY", peer_holds_lease)
+        assert mcp_server.tool_follow_tunnels("wing_a", "room_a") == [{"tunnel_id": "t1"}]
+        assert captured["record"] is True
+
+    mcp_server.tool_follow_tunnels("wing_a", "room_a", record=False)
+    assert captured["record"] is False
+
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+    mcp_server.tool_follow_tunnels("wing_a", "room_a", record=True)
+    assert captured["record"] is False

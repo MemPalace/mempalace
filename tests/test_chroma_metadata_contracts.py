@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import chromadb
 import pytest
 from chromadb.config import Settings
+
 from mempalace import embedding
-from mempalace.backends import chroma as cb
-from mempalace.backends import embedding_wrapper as ew
+from mempalace.backends import chroma as cb, chroma_sqlite, embedding_wrapper as ew
 from mempalace.backends._inproc_sqlite import release
 from mempalace.config import MempalaceConfig
 from mempalace.rooms import load_pending_apply, pending_apply_path
@@ -178,7 +178,7 @@ def synthetic_db(tmp_path):
 @pytest.mark.parametrize("reader", ["list", "stream"])
 def test_readiness_and_result_share_snapshot(monkeypatch, tmp_path, reader):
     db = synthetic_db(tmp_path)
-    original = cb._sqlite_ready_metadata_segment
+    original = chroma_sqlite._sqlite_ready_metadata_segment
 
     def readiness(conn, name):
         ready = original(conn, name)
@@ -186,7 +186,7 @@ def test_readiness_and_result_share_snapshot(monkeypatch, tmp_path, reader):
             writer.execute("UPDATE embedding_metadata SET string_value='changed' WHERE key='wing'")
         return ready
 
-    monkeypatch.setattr(cb, "_sqlite_ready_metadata_segment", readiness)
+    monkeypatch.setattr(chroma_sqlite, "_sqlite_ready_metadata_segment", readiness)
     try:
         if reader == "list":
             actual = cb.sqlite_list_id_metadata(str(tmp_path), "independent_repairs")[1]

@@ -49,7 +49,6 @@ def _query_drawers_with_filter_fallback(
     drawers are ingested via two different paths (e.g. bulk import vs MCP tool
     calls), leaving the vector index inconsistent with the metadata store. We
     retry unfiltered (over-fetching) and re-apply the wing/room/source_file filter in Python.
-    See #1245 / #1035.
     """
     where = dkwargs.get("where")
     try:
@@ -69,6 +68,7 @@ def _query_drawers_with_filter_fallback(
         raw_docs = _first_or_empty(raw, "documents")
         raw_ids = _aligned_query_ids(raw, len(raw_docs))
         fids, fdocs, fmetas, fdists = [], [], [], []
+        wings = set(palace_wing_aliases(wing, drawers_col)) if wing else None
         for stored_drawer_id, doc, meta, dist in zip(
             raw_ids,
             raw_docs,
@@ -76,7 +76,7 @@ def _query_drawers_with_filter_fallback(
             _first_or_empty(raw, "distances"),
         ):
             meta = meta or {}
-            if wing and meta.get("wing") != wing:
+            if wings and meta.get("wing") not in wings:
                 continue
             if room and meta.get("room") != room:
                 continue
@@ -108,40 +108,51 @@ def _closet_boosts(closets_col, *, query: str, n_results: int, where: dict) -> d
 
     sqlite_exact (and any lexical backend) uses FTS instead of a second
     exact-cosine scan over the closet collection — closets are pointer
-    lines, so BM25 is the better signal anyway.
-    """
-    boosts: dict = {}
-    n_hits = max(1, n_results * 2)
-    if "supports_lexical_search" in _backend_capabilities(closets_col):
-        result = closets_col.lexical_search(query=query, n_results=n_hits, where=where or None)
-        hits = getattr(result, "hits", None) or []
-        for rank, hit in enumerate(hits):
-            meta = hit.metadata or {}
-            source = meta.get("source_file", "")
-            if source and source not in boosts:
-                preview = (hit.document or "")[:200]
-                boosts[source] = (rank, 0.0, preview)
-        return boosts
+    lines, so BM25 is the better signal anyway. Vector closet distances are
+    returned on the cosine scale whatever metric the closet collection uses.
 
-    ckwargs = {
-        "query_texts": [query],
-        "n_results": n_hits,
-        "include": ["documents", "metadatas", "distances"],
-    }
-    if where:
-        ckwargs["where"] = where
-    closet_results = closets_col.query(**ckwargs)
-    for rank, (cdoc, cmeta, cdist) in enumerate(
-        zip(
-            _first_or_empty(closet_results, "documents"),
-            _first_or_empty(closet_results, "metadatas"),
-            _first_or_empty(closet_results, "distances"),
-        )
-    ):
-        cmeta = cmeta or {}
-        source = cmeta.get("source_file", "")
+    AAAK summaries an older ``compress`` left in the closets are dropped
+    before ranking, and the window is widened once if they crowded it.
+    """
+    lexical = "supports_lexical_search" in _backend_capabilities(closets_col)
+    closet_metric = None if lexical else _metric_for_collection(closets_col)
+
+    def fetch(n_hits):
+        """``(document, metadata, distance)`` per hit, in rank order."""
+        if lexical:
+            result = closets_col.lexical_search(query=query, n_results=n_hits, where=where or None)
+            return [
+                (hit.document, hit.metadata, 0.0) for hit in getattr(result, "hits", None) or []
+            ]
+        ckwargs = {
+            "query_texts": [query],
+            "n_results": n_hits,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            ckwargs["where"] = where
+        closet_results = closets_col.query(**ckwargs)
+        return [
+            (cdoc, cmeta, _cosine_scale_distance(cdist, closet_metric))
+            for cdoc, cmeta, cdist in zip(
+                _first_or_empty(closet_results, "documents"),
+                _first_or_empty(closet_results, "metadatas"),
+                _first_or_empty(closet_results, "distances"),
+            )
+        ]
+
+    n_hits = max(1, n_results * 2)
+    rows = fetch(n_hits)
+    closets = [row for row in rows if not is_aaak_row(row[1])]
+    if len(closets) < len(rows) and len(rows) >= n_hits:
+        rows = fetch(n_hits * 4)
+        closets = [row for row in rows if not is_aaak_row(row[1])]
+
+    boosts: dict = {}
+    for rank, (doc, meta, distance) in enumerate(closets):
+        source = (meta or {}).get("source_file", "")
         if source and source not in boosts:
-            boosts[source] = (rank, cdist, (cdoc or "")[:200])
+            boosts[source] = (rank, distance, (doc or "")[:200])
     return boosts
 
 
@@ -163,12 +174,15 @@ def _scaled_pool_limits(limits: tuple, scale: int) -> tuple:
     )
 
 
-def _copies_left_results_short(hits, n_results, candidates_fetched, pool_size) -> bool:
-    """Whether folded copies left the page short while the pool was full."""
+def _pool_left_results_short(
+    hits, n_results, candidates_fetched, pool_size, bookkeeping_dropped=0
+) -> bool:
+    """Whether folded copies or skipped bookkeeping rows left the page short
+    while the pool came back full, so more candidates exist."""
     return (
         len(hits) < n_results
         and candidates_fetched >= pool_size
-        and any(hit.get("also_in") for hit in hits)
+        and (bookkeeping_dropped > 0 or any(hit.get("also_in") for hit in hits))
     )
 
 
@@ -181,7 +195,7 @@ def search_memories(
     since: str = None,
     before: str = None,
     n_results: int = 5,
-    max_distance: float = 0.0,
+    max_distance: Optional[float] = None,
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
     collection_name: str = None,
@@ -207,11 +221,11 @@ def search_memories(
         wing: Optional wing filter.
         room: Optional room filter.
         source_file: Optional exact source_file filter. Matches the full
-            stored source_file value verbatim (#1815).
+            stored source_file value verbatim.
         since: Optional inclusive ISO date/datetime lower bound on a
             drawer's ``filed_at`` (ingest time, the ``created_at`` shown in
             results) — ``[since, before)`` window semantics shared with
-            ``list_drawers`` (#1128): wall-clock naive comparison, drawers
+            ``list_drawers``: compared as instants (see ``date_window``), drawers
             with missing/unparseable ``filed_at`` excluded while a bound is
             active. Filtering happens after retrieval (ChromaDB rejects
             string operands for ``$gte``/``$lt``), so the candidate pool is
@@ -219,12 +233,13 @@ def search_memories(
             ``date_filter_pool_truncated`` in the response.
         before: Optional exclusive ISO upper bound; see ``since``.
         n_results: Max results to return.
-        max_distance: Max cosine distance threshold. The palace collection uses
-            cosine distance (hnsw:space=cosine) — 0 = identical, 2 = opposite.
-            Results with distance > this value are filtered out. A value of
-            0.0 disables filtering. Typical useful range: 0.3–1.0.
-        vector_disabled: When True, route to the sqlite-only BM25 fallback
-            (#1222). Set by the MCP server when the HNSW capacity probe
+        max_distance: Optional cutoff on the cosine scale — 0 = identical,
+            2 = opposite — whatever metric the collection declares (``l2`` and
+            ``ip`` distances are converted before comparing). Candidates past
+            it are dropped and counted in ``filtered_by_max_distance``.
+            ``None`` (the default), ``0`` or a negative value applies no cutoff.
+        vector_disabled: When True, route to the sqlite-only BM25 fallback.
+            Set by the MCP server when the HNSW capacity probe
             detects a divergence that would segfault chromadb on segment
             load.
         candidate_strategy: How candidates for the hybrid re-rank are gathered.
@@ -240,9 +255,10 @@ def search_memories(
               Perf depends on the selected backend; opt in until the cost is
               characterized.
 
-              When ``max_distance > 0.0`` is also set, BM25-only candidates
-              are admitted only if their stored embeddings can be loaded and
-              their computed vector distance satisfies that threshold.
+              When ``max_distance`` is also set, a BM25-only candidate whose
+              computed vector distance is past it is dropped; one whose
+              distance cannot be computed is kept with ``distance=None`` and
+              ``fallback_reason="distance_unavailable"``.
         lang: Locale code for BM25 stop-word filtering (opt-in). When
             omitted, reads ``MempalaceConfig().lang_explicit`` — returns an
             empty set unless the user has set ``MEMPALACE_LANG`` /
@@ -303,7 +319,7 @@ def search_memories(
         return open_error
 
     metric = _metric_for_collection(drawers_col)
-    where = build_where_filter(wing, room, source_file)
+    where = build_where_filter(wing, room, source_file, col=drawers_col)
 
     # Hybrid retrieval: always query drawers directly (the floor), then use
     # closet hits to boost rankings. Closets are a ranking SIGNAL, never a
@@ -353,6 +369,11 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
+    stats: dict = {}
+    # Every candidate the vector path measured, kept or dropped, so union
+    # mode neither re-admits nor re-counts a drawer this loop already gated.
+    measured: dict = {}
+    bookkeeping_dropped = 0
     drawer_docs = _first_or_empty(drawer_results, "documents")
     stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
     for stored_drawer_id, doc, meta, dist in zip(
@@ -363,7 +384,15 @@ def search_memories(
     ):
         meta = meta or {}
         doc = doc or ""
-        if _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt):
+        if stored_drawer_id:
+            measured[stored_drawer_id] = dist
+        if is_bookkeeping(meta, stored_drawer_id):
+            bookkeeping_dropped += 1
+            continue
+        gate = _candidate_out_of_scope(dist, meta, max_distance, since_dt, before_dt, metric)
+        if gate == "distance":
+            stats["filtered_by_max_distance"] = stats.get("filtered_by_max_distance", 0) + 1
+        if gate:
             continue
 
         meta = meta or {}
@@ -378,12 +407,8 @@ def search_memories(
                 matched_via = "drawer+closet"
                 closet_preview = c_preview
 
-        # Clamp to the valid cosine-distance range [0, 2]. When a strong
-        # closet boost (up to 0.40) exceeds the raw distance, the subtraction
-        # can go negative — which (a) yields ``similarity > 1.0`` downstream
-        # and (b) makes the sort key land *below* ordinary positive distances,
-        # inverting the ranking so the best hybrid matches sort last.
-        effective_dist = max(0.0, min(2.0, dist - boost))
+        # On the cosine scale, so l2 and ip palaces rank the same way.
+        effective_dist = _boosted_cosine_distance(dist, boost, metric)
         entry = {
             "drawer_id": _result_drawer_id(meta, stored_drawer_id),
             "text": doc,
@@ -417,21 +442,13 @@ def search_memories(
     scored.sort(key=lambda h: h["_sort_key"])
     hits = scored[:pre_enrichment_limit]
 
-    # Drawer-grep enrichment: retain the wider pool until repeated
-    # closet-rendered passages can be replaced by distinct candidates.
-    _enrich_closet_hits(
-        hits,
-        drawers_col,
-        query,
-        stop_words=stop_words,
-    )
+    hits = _enrich_closet_hits(hits, drawers_col)
 
     # Candidate strategy hook: optionally widen the rerank pool's *source*
     # before ranking. Default ("vector") is a no-op; "union" merges top-K
     # backend lexical candidates. See `_apply_candidate_strategy`.
-    # ``max_distance`` is forwarded so union mode can refuse to inject
-    # BM25-only (distance=None) candidates that would silently bypass the
-    # caller's strict distance threshold.
+    # ``max_distance`` is forwarded so union mode checks its BM25-only
+    # candidates against the same cutoff where their distance is computable.
     # The helper also runs the final BM25 hybrid re-rank and strips internal
     # dedup fields before returning.
     hits, strategy_error = _finalize_candidate_hits(
@@ -447,6 +464,8 @@ def search_memories(
         stop_words=stop_words,
         since_dt=since_dt,
         before_dt=before_dt,
+        stats=stats,
+        known_distances=measured,
     )
     if strategy_error:
         return strategy_error
@@ -463,8 +482,12 @@ def search_memories(
         candidates_fetched=candidates_fetched,
         pool_size=pool_size,
         date_window_active=date_window_active,
+        stats=stats,
+        distance_metric=metric,
     )
-    if _copies_left_results_short(hits, n_results, candidates_fetched, pool_size):
+    if _pool_left_results_short(
+        hits, n_results, candidates_fetched, pool_size, bookkeeping_dropped
+    ):
         if _pool_scale < _MAX_POOL_SCALE and pool_size < _MAX_FOLD_POOL:
             return search_memories(
                 query,

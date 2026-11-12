@@ -4,7 +4,7 @@ This guide explains how to set up MemPalace as a permanent memory for the [Gemin
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - Gemini CLI installed and configured
 
 ## 1. Installation

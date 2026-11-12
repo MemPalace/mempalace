@@ -104,10 +104,9 @@ def _preview_event(event: dict) -> dict:
 
 
 # ``from_agent`` means "who I am" on every other coordination call (append, ack, artifacts), and agents are told to
-# pass their identity on every call. On list/wait it used to filter by WRITER, so an agent following that rule and
-# asking for its task by correlation id saw only its own events and missed the request written to it (2026-09-29:
-# windows:codex:blender got 0 events for a task.request from windows:claude:blender). The writer filter is now the
-# explicit ``writer``; ``from_agent`` on list/wait is the caller's identity and never narrows the result.
+# pass their identity on every call. If list/wait filtered by it, an agent following that rule and asking for its
+# task by correlation id would see only its own events and miss the request written to it. So the writer filter is
+# the explicit ``writer``; ``from_agent`` on list/wait is the caller's identity and never narrows the result.
 _FROM_AGENT_NOTE = (
     "from_agent is your identity and does not filter event_list/event_wait. "
     "Filter by who wrote an event with writer=<agent>; for your inbox use to_agent=<you>."

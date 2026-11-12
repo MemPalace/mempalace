@@ -332,10 +332,17 @@ verbatim drawer per user/assistant message, idempotent and resume-safe.
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - A vector-store backend (ChromaDB by default)
-- Disk for the embedding model: ~300 MB for EmbeddingGemma q8 (the backward-compatible default), ~600 MB for its FP16 variant, or ~30 MB for `all-MiniLM-L6-v2`. Onboarding (`python -m mempalace.onboarding`) offers EmbeddingGemma (multilingual, 100+ languages, recommended) or MiniLM (English-only). On Apple Silicon, you can opt into FP16 with `embeddinggemma_variant: "fp16"` in `~/.mempalace/config.json` or `MEMPALACE_EMBEDDINGGEMMA_VARIANT=fp16`; it can be faster on CPU but requires `mempalace repair rebuild-index` when enabled for an existing palace. Switching variants can temporarily retain both downloads in the Hugging Face cache. See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
+- Disk for the embedding model: ~300 MB for EmbeddingGemma q8 (the backward-compatible default), ~600 MB for its FP16 variant, or ~30 MB for `all-MiniLM-L6-v2`. Pick it with `mempalace init --embedding-model`: `embeddinggemma` (multilingual, 100+ languages, recommended) or `minilm` (English-only). Opt into FP16 with `embeddinggemma_variant: "fp16"` in `~/.mempalace/config.json` or `MEMPALACE_EMBEDDINGGEMMA_VARIANT=fp16`; enabling it for an existing palace requires `mempalace repair rebuild-index`. Switching variants can temporarily retain both downloads in the Hugging Face cache. See the docstring at [`mempalace/embedding.py`](mempalace/embedding.py) for details and migration notes.
 - Optional — compute embeddings on a server instead of locally. Set `embedding_model: "openai-compat"` in `~/.mempalace/config.json` together with `embedding_api_url` / `embedding_api_model` (and `embedding_api_key` if the server needs auth) to use any OpenAI-compatible `/v1/embeddings` endpoint — LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, or a self-hosted server (e.g. a larger multilingual or GPU-served embedder). Each key is overridable via the matching `MEMPALACE_EMBEDDING_API_*` env var. When the endpoint is on your machine or LAN, no content leaves your network. Switching to it requires `mempalace repair rebuild-index` (different vector space).
+
+For GPU setup, see the [model/device support table](website/guide/configuration.md#embedding-models-and-devices).
+On Apple Silicon, CPU is expected for MiniLM and EmbeddingGemma ONNX: MiniLM
+disables CoreML, while EmbeddingGemma excludes it from automatic selection to
+avoid invalid vectors. Experimental [EmbeddingGemma 2](docs/embeddinggemma2.md)
+supports PyTorch MPS with health checks and CPU fallback. Changing models on an
+existing palace requires re-embedding; changing only the device does not.
 
 No API key is required for the core benchmark path.
 
@@ -357,9 +364,9 @@ PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 MIT — see [LICENSE](LICENSE).
 
 <!-- Link Definitions -->
-[version-shield]: https://img.shields.io/badge/version-3.11.0-4dc9f6?style=flat-square&labelColor=0a0e14
+[version-shield]: https://img.shields.io/badge/version-3.12.0-4dc9f6?style=flat-square&labelColor=0a0e14
 [release-link]: https://github.com/MemPalace/mempalace/releases
-[python-shield]: https://img.shields.io/badge/python-3.9+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
+[python-shield]: https://img.shields.io/badge/python-3.10+-7dd8f8?style=flat-square&labelColor=0a0e14&logo=python&logoColor=7dd8f8
 [python-link]: https://www.python.org/
 [license-shield]: https://img.shields.io/badge/license-MIT-b0e8ff?style=flat-square&labelColor=0a0e14
 [license-link]: https://github.com/MemPalace/mempalace/blob/main/LICENSE

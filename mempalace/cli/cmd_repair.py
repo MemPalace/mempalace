@@ -69,13 +69,13 @@ def cmd_palace_set_embedder(args):
         else:
             settings = f"MEMPALACE_EMBEDDING_MODEL={new.model_name}"
         print(
-            f"  ⚠ configured model is {configured!r}; set {settings} (or run onboarding) "
+            f"  ⚠ configured model is {configured!r}; set {settings} (or the matching config.json settings) "
             "so normal opens of this palace match."
         )
 
 
 def cmd_repair_status(args):
-    """Read-only HNSW capacity health check (#1222)."""
+    """Read-only HNSW capacity health check."""
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     if not _maintenance_requires_chroma(palace_path, "repair-status"):
         raise SystemExit(2)
@@ -107,7 +107,7 @@ def _finish_legacy_repair(backend, palace_path, collection_name, col, total, arg
     all_ids, all_docs, all_metas = _extract_drawers(col, total, batch_size)
     print(f"  Extracted {len(all_ids)} drawers")
 
-    # ── #1208 guard ──────────────────────────────────────────────────
+    # ── 10,000-drawer guard ──────────────────────────────────────────────────
     # Cross-check against the SQLite ground truth before doing anything
     # destructive. Catches the user-reported case where chromadb's
     # collection-layer get() silently caps at 10,000 rows even on much
@@ -133,7 +133,7 @@ def _finish_legacy_repair(backend, palace_path, collection_name, col, total, arg
                 "  Backup validation failed: backup path exists but does not contain chroma.sqlite3. "
                 f"Please remove or rename: {backup_path}"
             )
-            return
+            return None
         shutil.rmtree(backup_path)
     print(f"  Backing up to {backup_path}...")
     copy_palace_dir(palace_path, backup_path, log=print)
@@ -176,13 +176,20 @@ def _finish_legacy_repair(backend, palace_path, collection_name, col, total, arg
         sys.exit(1)
 
     # The bulk delete + re-upsert cycle above leaves the FTS5 inverted index
-    # inconsistent, which fails the next repair's integrity preflight (#1747).
+    # inconsistent, which fails the next repair's integrity preflight.
     _post_rebuild_cleanup(palace_path, backend=backend, progress=print)
     return filed, backup_path
 
 
-def _legacy_repair_after_prompt(backend, palace_path, collection_name, args):
-    """Confirm, then extract under a fresh lease. Returns None if declined."""
+def _legacy_repair_after_prompt(palace_path, collection_name, args):
+    """Confirm, then open a fresh client and extract under a fresh lease.
+
+    The caller closed its client before releasing the lease (holding a live
+    client outside the lease is the race that lock exists to close), so this
+    path must build a new backend *after* the unbounded prompt and close it
+    before releasing the lease. Returns None if declined.
+    """
+    from ..backends.chroma import ChromaBackend
     from ..migrate import confirm_destructive_action
     from ..palace import MineAlreadyRunning, mine_palace_lock
     from ..repair import index_read_recovery_guidance
@@ -191,22 +198,34 @@ def _legacy_repair_after_prompt(backend, palace_path, collection_name, args):
         return None
     try:
         with mine_palace_lock(palace_path):
+            backend = ChromaBackend()
             try:
-                col = backend.get_collection(palace_path, collection_name)
-                total = col.count()
-                print(f"  Drawers found: {total}")
-            except Exception as e:
-                print(f"  Error reading palace: {e}")
-                print(index_read_recovery_guidance())
-                return None
-            if total == 0:
-                print("  Nothing to repair.")
-                return None
-            return _finish_legacy_repair(backend, palace_path, collection_name, col, total, args)
+                try:
+                    col = backend.get_collection(palace_path, collection_name)
+                    total = col.count()
+                    print(f"  Drawers found: {total}")
+                except Exception as e:
+                    print(f"  Error reading palace: {e}")
+                    print(index_read_recovery_guidance())
+                    return None
+                if total == 0:
+                    print("  Nothing to repair.")
+                    return None
+                return _finish_legacy_repair(
+                    backend, palace_path, collection_name, col, total, args
+                )
+            finally:
+                backend.close()
     except MineAlreadyRunning as exc:
         print(f"  Another writer already holds this palace: {exc}")
         print("  Repair stopped before extracting or copying anything; nothing changed.")
         raise SystemExit(2) from exc
+
+
+def _exit_if_writer_active(result) -> None:
+    """Exit 2, like the other repair modes, when another writer held the palace."""
+    if result.get("reason") == "writer-active":
+        raise SystemExit(2)
 
 
 def cmd_repair(args):
@@ -214,7 +233,7 @@ def cmd_repair(args):
 
     On success the palace SQLite file is VACUUMed and the FTS5 index is
     rebuilt, so the next repair's integrity preflight reads a consistent
-    database (#1747).
+    database.
     """
     config = MempalaceConfig()
     collection_name = config.collection_name
@@ -225,8 +244,8 @@ def cmd_repair(args):
         raise SystemExit(2)
 
     from ..backends.chroma import ChromaBackend
-    from ..palace import MineAlreadyRunning, mine_palace_lock
     from ..migrate import confirm_destructive_action, contains_palace_database
+    from ..palace import MineAlreadyRunning, mine_palace_lock
     from ..repair import (
         _preview_legacy_repair,
         index_read_recovery_guidance,
@@ -243,7 +262,7 @@ def cmd_repair(args):
     if getattr(args, "mode", "legacy") == "max-seq-id":
         from ..repair import repair_max_seq_id
 
-        repair_max_seq_id(
+        result = repair_max_seq_id(
             palace_path,
             segment=getattr(args, "segment", None),
             from_sidecar=getattr(args, "from_sidecar", None),
@@ -251,6 +270,7 @@ def cmd_repair(args):
             dry_run=getattr(args, "dry_run", False),
             assume_yes=getattr(args, "yes", False),
         )
+        _exit_if_writer_active(result)
         return
 
     if not getattr(args, "dry_run", False):
@@ -258,7 +278,12 @@ def cmd_repair(args):
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
         from ..migrate import confirm_destructive_action
-        from ..repair import RebuildCleanupError, RebuildPartialError, rebuild_from_sqlite
+        from ..repair import (
+            RebuildCleanupError,
+            RebuildPartialError,
+            move_aaak_after_rebuild,
+            rebuild_from_sqlite,
+        )
 
         source_path = getattr(args, "source", None)
         source_path = (
@@ -277,7 +302,7 @@ def cmd_repair(args):
         # palaces).
         # A --dry-run only reads the source SQLite and prints a plan — it
         # never archives, creates, or writes — so it must not trip the
-        # destructive-action confirmation (#2095, #2133).
+        # destructive-action confirmation.
         dry_run = getattr(args, "dry_run", False)
         is_destructive_to_dest = source_path == palace_path or os.path.exists(palace_path)
         if (
@@ -321,6 +346,7 @@ def cmd_repair(args):
         # a populated dict with 0-valued counts).
         if not counts:
             sys.exit(1)
+        move_aaak_after_rebuild(palace_path, dry_run=dry_run)
         return
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
@@ -341,7 +367,7 @@ def cmd_repair(args):
     # cleanly before chromadb's compactor touches the disk.
     dry_run = getattr(args, "dry_run", False)
     # The FTS5 autoheal inside this call is a write, so a --dry-run predicts
-    # its outcome instead of performing it (#1596 is auto-healable and must
+    # its outcome instead of performing it (an auto-healable FTS5 error must
     # not surface as an abort in a preview).
     sqlite_errors = resolve_repair_preflight_errors(
         palace_path, sqlite_integrity_errors(palace_path), dry_run=dry_run
@@ -357,6 +383,7 @@ def cmd_repair(args):
         assume_yes=getattr(args, "yes", False),
     )
     if preflight is not None:
+        _exit_if_writer_active(preflight)
         return
 
     print(f"\n{'=' * 55}")
@@ -370,10 +397,10 @@ def cmd_repair(args):
         # hash changes on get_collection alone, before count()), so a preview
         # that reached it could not be inert. Staying off the chromadb layer
         # also keeps a dry run clear of the layer repair is separately reported
-        # to segfault in on a large palace (#2113). Exit non-zero on an
+        # to segfault in on a large palace. Exit non-zero on an
         # unreadable count for parity with the from-sqlite preview above, so
         # `--dry-run && repair --yes` cannot walk into the destructive run
-        # after a failed preview (#2095, #2133).
+        # after a failed preview.
         if not _preview_legacy_repair(
             palace_path=palace_path,
             collection_name=collection_name,
@@ -429,10 +456,12 @@ def cmd_repair(args):
     except MineAlreadyRunning as exc:
         print(f"  Another writer already holds this palace: {exc}")
         print("  Repair stopped before reading or copying anything; nothing changed.")
-        raise SystemExit(2)
+        raise SystemExit(2) from None
 
     if not assume_yes:
-        finished = _legacy_repair_after_prompt(backend, palace_path, collection_name, args)
+        # The interactive branch closed the client before releasing the lease;
+        # the helper opens a fresh one only after the confirmation prompt.
+        finished = _legacy_repair_after_prompt(palace_path, collection_name, args)
         if finished is None:
             return
         filed, backup_path = finished

@@ -17,6 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import ClassVar, Optional, Protocol, runtime_checkable
 
+from ..timeutil import recency_key
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -31,7 +32,7 @@ class PalaceNotFoundError(BackendError, FileNotFoundError):
     """Raised when ``get_collection(create=False)`` is called on a missing palace.
 
     Subclass of ``FileNotFoundError`` so legacy callers that catch the latter
-    (pre-#413 seam) keep working unchanged.
+    (the pre-plugin seam) keep working unchanged.
     """
 
 
@@ -406,29 +407,18 @@ class LexicalResult:
     hits: list[LexicalHit]
 
 
-def recency_sort_key(meta: Optional[dict], order_field: str = "filed_at") -> tuple[int, str]:
+def recency_sort_key(meta: Optional[dict], order_field: str = "filed_at") -> tuple:
     """Sort key for newest-first ordering on an ISO-8601 metadata field.
 
-    Returns ``(1, value)`` for a usable timestamp string and ``(0, "")``
-    otherwise, so that with ``reverse=True`` records missing the field sort
-    last instead of raising on a str/None comparison. Backends that implement
-    :meth:`BaseCollection.get_recent` with a local sort MUST use this key so
-    every backend orders identically.
-
-    This compares the timestamps as *text*, which is chronological only while
-    every value shares one offset representation. It is not a new assumption:
-    Layer 1 has sorted ``filed_at`` as text since #1630 and this key just
-    names the behaviour. It is also not currently true of ``filed_at`` --
-    ``diary_ingest`` writes ``datetime.now(timezone.utc).isoformat()``
-    (``...+00:00``) while every other writer uses ``datetime.now().isoformat()``
-    (naive local), so on a host that is not on UTC the two sort against each
-    other skewed by the local offset. Standardising the writers is a separate
-    change; it needs a migration for palaces that already hold both forms.
+    Orders by the parsed instant (:func:`timeutil.recency_key`), so naive
+    local values from older writers and UTC values interleave correctly;
+    with ``reverse=True`` records missing the field sort last. Backends that
+    implement :meth:`BaseCollection.get_recent` MUST produce this order. Text
+    order is chronological only within one form, so a SQL top-N read fetches
+    the UTC-suffixed values and the rest separately and merges them by this
+    key.
     """
-    value = (meta or {}).get(order_field)
-    if not isinstance(value, str) or not value:
-        return (0, "")
-    return (1, value)
+    return recency_key((meta or {}).get(order_field))
 
 
 def _recency_order(metadatas: list[dict], order_field: str) -> list[int]:
@@ -467,6 +457,21 @@ def initialize_last_modified_metadata(metadatas):
         result.append(updated)
 
     return result
+
+
+def validate_write_batch(ids, *, unique_ids: bool = False, **columns) -> None:
+    """Raise ``ValueError`` for a malformed write batch.
+
+    Each column passed (``None`` is skipped) must match ``ids`` in length,
+    checked in the order given; ``unique_ids`` also refuses repeated ids, as
+    ``add`` does on backends that report a duplicate instead of overwriting.
+    """
+    n = len(ids)
+    for label, value in columns.items():
+        if value is not None and len(value) != n:
+            raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
+    if unique_ids and len(set(ids)) != n:
+        raise ValueError("add ids must be unique")
 
 
 class BaseCollection(ABC):
@@ -585,7 +590,7 @@ class BaseCollection(ABC):
         return None
 
     def get_all_metadata(self, where: Optional[dict] = None) -> list[dict]:
-        """Return every matching record's metadata in one logical pass (#1796).
+        """Return every matching record's metadata in one logical pass.
 
         Default implementation pages through :meth:`get` using
         ``limit``/``offset`` -- correct for backends with a real server-side
@@ -598,7 +603,7 @@ class BaseCollection(ABC):
         cursor exactly once instead. Calling the default implementation on
         such a backend is O(n^2) in collection size: each page re-walks the
         entire collection just to discard everything outside the requested
-        slice. See issue #1796.
+        slice.
         """
         all_meta: list[dict] = []
         offset = 0
@@ -621,7 +626,7 @@ class BaseCollection(ABC):
         self, where: Optional[dict] = None, include: Optional[list[str]] = None
     ) -> GetResult:
         """Return every matching record -- ids plus the ``include``d fields --
-        in one logical pass (#2452).
+        in one logical pass.
 
         The ids-carrying sibling of :meth:`get_all_metadata`, for callers that
         need to know *which* rows they got (``list_drawers`` collapses chunk
@@ -676,8 +681,8 @@ class BaseCollection(ABC):
         """Return up to ``limit`` records, newest first by ``order_field``.
 
         ``order_field`` names a metadata key holding an ISO-8601 timestamp
-        string (``filed_at`` for drawers). Ordering is descending on that
-        string; see :func:`recency_sort_key` for what text ordering promises.
+        string (``filed_at`` for drawers). Ordering is descending on the
+        instant it names; see :func:`recency_sort_key`.
         Records whose value is missing, empty, or not a string sort last.
 
         The default implementation pages through :meth:`get` in storage order
@@ -685,7 +690,7 @@ class BaseCollection(ABC):
         when the collection holds no more than ``limit`` records matching
         ``where``, and *approximate* above that: the window is whatever the
         backend hands back first, so the genuinely newest records can fall
-        outside it (issue #1630's known limitation for Layer 1 wake-up).
+        outside it (a known limitation for Layer 1 wake-up).
         Backends able to push the ordering into storage MUST override this and
         advertise the ``supports_recency_order`` capability token. What that
         token promises, exactly:
@@ -693,9 +698,9 @@ class BaseCollection(ABC):
         * The returned records really are the top ``limit`` under the ordering
           above, at any collection size, **whenever the backend can also
           evaluate ``where`` in storage** (including ``where=None``).
-        * It says nothing about whether that text ordering matches wall-clock
-          order. That is a property of what the writers store, not of the
-          backend.
+        * The ordering is by instant (:func:`recency_sort_key`), so naive
+          local and UTC timestamps interleave correctly; an override that
+          orders text in storage must read each timestamp form separately.
         * A filter the backend cannot push into storage has to be evaluated
           record by record, so a backend MAY bound how far it walks and return
           fewer than ``limit`` records rather than read the whole collection.
@@ -808,40 +813,52 @@ class BaseCollection(ABC):
     ) -> None:
         """Default non-atomic update: get + merge + upsert.
 
+        Ids that do not exist are skipped, as on every built-in backend; an
+        update never creates a record. Stored embeddings are kept when the
+        caller passes none and the backend returns one for every row; if any
+        row has none, the whole batch is re-embedded in the same single upsert.
+
         Backends advertising ``supports_update`` MUST override with an atomic
         single-round-trip implementation.
         """
         if documents is None and metadatas is None and embeddings is None:
             raise ValueError("update requires at least one of documents, metadatas, embeddings")
 
-        n = len(ids)
-        for label, value in (
-            ("documents", documents),
-            ("metadatas", metadatas),
-            ("embeddings", embeddings),
-        ):
-            if value is not None and len(value) != n:
-                raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
+        validate_write_batch(ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
 
-        existing = self.get(ids=ids, include=["documents", "metadatas"])
+        existing = self.get(ids=list(ids), include=["documents", "metadatas", "embeddings"])
+        stored_embeddings = existing.embeddings
         by_id = {
-            rid: (existing.documents[i], existing.metadatas[i])
+            rid: (
+                existing.documents[i],
+                existing.metadatas[i],
+                stored_embeddings[i] if stored_embeddings is not None else None,
+            )
             for i, rid in enumerate(existing.ids)
         }
-        merged_docs: list[str] = []
-        merged_metas: list[dict] = []
+        out_ids, out_docs, out_metas, out_embeddings = [], [], [], []
         for i, rid in enumerate(ids):
-            prev_doc, prev_meta = by_id.get(rid, ("", {}))
-            merged_docs.append(documents[i] if documents is not None else prev_doc)
+            if rid not in by_id:
+                continue
+            prev_doc, prev_meta, prev_embedding = by_id[rid]
+            out_ids.append(rid)
+            out_docs.append(documents[i] if documents is not None else prev_doc)
             new_meta = dict(prev_meta or {})
             if metadatas is not None:
                 new_meta.update(metadatas[i] or {})
-            merged_metas.append(new_meta)
+            out_metas.append(new_meta)
+            out_embeddings.append(embeddings[i] if embeddings is not None else prev_embedding)
+        if not out_ids:
+            return
+        # One upsert, so the batch lands whole or not at all. If any row came
+        # back without a stored vector, the backend re-embeds the whole batch.
+        if any(vector is None for vector in out_embeddings):
+            out_embeddings = None
         self.upsert(
-            documents=merged_docs,
-            ids=list(ids),
-            metadatas=merged_metas,
-            embeddings=embeddings,
+            documents=out_docs,
+            ids=out_ids,
+            metadatas=out_metas,
+            embeddings=out_embeddings,
         )
 
 

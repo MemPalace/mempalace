@@ -119,17 +119,21 @@ and needs no extra.
 
 ## 3. Serve MCP over HTTP
 
-One command — `mempalace serve` — runs the server with secure defaults. On a
-network-exposed (`0.0.0.0`) bind it **auto-generates a strong bearer token**
-(stored `0600` under `~/.mempalace/server/`, printed once), prints a
-ready-to-paste client config, and runs in the foreground so Docker/systemd own
-the lifecycle.
+One command — `mempalace serve` — runs the server with secure defaults. A
+network bind, or a loopback bind a proxy publishes (see *Fronting proxies*
+below), **requires a bearer token**: unless you pass one, the server reuses or
+auto-generates a strong token stored `0600` at
+`~/.mempalace/server/<key>/token`, where local `mempalace` clients (the CLI,
+the save hooks, the stdio proxy) read it automatically. A plain loopback bind
+serves local clients with no token unless you pass `--token`. It prints the
+token's path and a ready-to-paste client config, never the token itself, and
+runs in the foreground so Docker/systemd own the lifecycle.
 
 ```bash
 mempalace serve --host 0.0.0.0 --port 8765 --backend milvus
 ```
 
-Output includes the token and the exact client command. Useful flags:
+Read the token from the printed path to hand it to remote clients. Useful flags:
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -138,12 +142,17 @@ Output includes the token and the exact client command. Useful flags:
 | `--backend` | config/env | Storage backend (e.g. `qdrant`) |
 | `--tls-cert` / `--tls-key` | _(none)_ | PEM cert + key to terminate **TLS natively** (server speaks `https`) |
 | `--read-only` | off | Expose recall only — the tools that change state are hidden and refused |
-| `--token` | auto | Use a specific bearer token instead of the generated one |
+| `--token` | auto on network binds | Use a specific bearer token (also enforces one on loopback) |
+| `--no-token` | off | Accepted for compatibility: a plain loopback bind already needs none (refused on a network bind or a proxied loopback bind) |
 | `--allow-insecure` | off | Permit a non-loopback bind with no token (only behind a trusted proxy) |
 
 The token always travels via the environment, never the command line, so it
-can't leak through `ps`. Binding to a non-loopback host with no token and no
-`--allow-insecure` refuses to start. The server also guards against
+can't leak through `ps`. Off loopback, or behind a proxy, the server never runs
+tokenless without `--allow-insecure`; `mempalace-mcp --transport http` follows
+the same rule, and `MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN=1` is its
+explicit opt-out.
+Tool arguments are checked against each tool's schema before any handler runs,
+and an internal error reaches a client as its error class only. The server also guards against
 DNS-rebinding with a `Host` allowlist and an `Origin` loopback check, and
 serializes concurrent writes — so multiple teammates can write to the shared
 palace at once over HTTP.
@@ -238,9 +247,20 @@ messages between machines.
 
   Clients connect to `https://yourbox.your-tailnet.ts.net/mcp` with the same
   bearer token. `MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS` (comma-separated `host`
-  or `host:port` values) is required because proxies preserve the public
-  name in the `Host` header, which the loopback bind's DNS-rebinding pin
-  would otherwise reject.
+  or `host:port` values) lists the public names a proxy may pass through in
+  the `Host` header (`tailscale serve` and many nginx setups do), which the
+  loopback bind's DNS-rebinding pin would otherwise reject. Setting it also
+  marks the hub as reachable from other machines, so it requires a token like
+  a network bind, and `--no-token` is refused.
+
+  **Configure a token whenever anything forwards to the hub.** A loopback hub
+  serving without one refuses requests carrying the usual proxy headers
+  (`X-Forwarded-*`, `X-Real-IP`, `X-Client-IP`, `X-Original-Host`,
+  `CF-Connecting-IP`, `True-Client-IP`, `Forwarded`, `Via`, `Tailscale-*`), but
+  that check is best effort. An nginx `proxy_pass` that rewrites `Host` to
+  `127.0.0.1` and adds no headers, or a TCP forwarder such as `ssh -R`, `socat`,
+  HAProxy in TCP mode or `tailscale serve --tcp`, makes a tokenless hub public
+  with nothing for it to detect.
 - **Backups** are now your storage backend's responsibility (Milvus / Zilliz
   Cloud backups, Qdrant snapshots, or Postgres backups) rather than a single
   laptop's palace directory.

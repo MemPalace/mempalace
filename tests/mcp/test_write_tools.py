@@ -3,7 +3,6 @@
 import json
 from unittest.mock import MagicMock
 
-
 from _mcp_server_helpers import (
     _get_collection,
     _patch_mcp_server,
@@ -42,6 +41,40 @@ class TestWriteTools:
         assert stored["metadatas"], stored
         assert stored["metadatas"][0].get("source_dir_ino") == expected
 
+    def test_add_drawer_canonicalizes_wing_slug_issue_2579_regression(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression #2579: add_drawer must store wings in canonical slug
+        form, so ``MyProject`` and ``My-App`` round-trip into the same wing
+        the project miner files under (``myproject``, ``my_app``), while
+        path-traversal inputs are still rejected rather than slugified.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(
+            wing="My-Project",
+            room="Scratch-Room",
+            content="Case and hyphen canonicalization probe.",
+        )
+
+        assert result["success"] is True
+        stored = col.get(ids=[result["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"], stored
+        assert stored["metadatas"][0]["wing"] == "my_project"
+        # Rooms are NOT canonicalized in this change — they stay as given.
+        assert stored["metadatas"][0]["room"] == "Scratch-Room"
+
+        rejected = tool_add_drawer(
+            wing="../etc/passwd",
+            room="scratch",
+            content="Must not silently slugify path traversal.",
+        )
+        assert rejected["success"] is False
+        assert "invalid path characters" in rejected["error"]
+
     def test_wal_result_entries_match_tool_outcome_issue_538_regression(
         self, monkeypatch, config, palace_path, kg, tmp_path
     ):
@@ -64,8 +97,7 @@ class TestWriteTools:
         """
         import json
 
-        from mempalace import mcp_server
-        from mempalace import wal
+        from mempalace import mcp_server, wal
 
         # Redirect the WAL to a per-test file so we can read the exact entries
         # produced by this test, independent of any prior test.
@@ -934,7 +966,7 @@ class TestWriteTools:
 
     def test_update_drawer_content(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import tool_update_drawer, tool_get_drawer
+        from mempalace.mcp_server import tool_get_drawer, tool_update_drawer
 
         result = tool_update_drawer(
             "drawer_proj_backend_aaa", content="Updated content about auth."
@@ -1009,9 +1041,14 @@ class TestWriteTools:
         assert fetched["room"] == "scratchroom"
 
     def test_update_drawer_identical_case_is_noop(self, monkeypatch, config, palace_path, kg):
-        """Regression for #2395: re-submitting the exact same casing must
-        still be a content-preserving no-op (no spurious write, old value
-        unchanged)."""
+        """Re-submitting the same wing must still be a content-preserving
+        no-op (no spurious write, old value unchanged).
+
+        Under #2579 (write-path canonicalization) the wing is stored in
+        canonical slug form regardless of the casing the client sends, so
+        re-submitting any casing collapses to the same slug and is a true
+        no-op.
+        """
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_add_drawer, tool_update_drawer
 
@@ -1021,8 +1058,73 @@ class TestWriteTools:
 
         result = tool_update_drawer(drawer_id, wing="StableWing", room="stable_room")
         assert result["success"] is True
-        assert result["wing"] == "StableWing"
+        assert result["wing"] == "stablewing"
         assert result["room"] == "stable_room"
+
+    def test_update_drawer_case_variant_with_existing_target_wing(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Regression for #2748: rename a drawer whose source wing is a
+        case-variant of an *existing* target wing.
+
+        #2395/#2426 proved the case-only rename applies when the destination
+        wing is fresh. The reporter in #2748 hit the bug on 3.10.0 with the
+        destination wing already populated (``wing_Codex`` had 1 drawer,
+        ``wing_codex`` had many). On pre-#2426 code the update returned
+        ``success:true`` but echoed the *old* wing and the drawer stayed put
+        (silent no-op); on current develop the rename applies and the
+        source wing is cleanly vacated.
+
+        This test pins that coexisting-wings scenario to the fix.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import (
+            tool_add_drawer,
+            tool_get_drawer,
+            tool_list_wings,
+            tool_update_drawer,
+        )
+
+        # Source wing with the legacy mixed-case drawer we intend to move
+        # (issue's "wing_Codex has 1" half). Seed directly into the collection
+        # because post-#2579 tool_add_drawer canonicalizes wings on write.
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+        drawer_id = "legacy_wing_Codex_diary_1"
+        col.add(
+            ids=[drawer_id],
+            documents=["the drawer we are moving"],
+            metadatas=[{"wing": "wing_Codex", "room": "diary", "added_by": "legacy"}],
+        )
+
+        # Existing destination wing with several drawers (issue's "wing_codex
+        # has many" half).
+        for i in range(3):
+            existed = tool_add_drawer(
+                wing="wing_codex", room="general", content=f"existing codex drawer {i}"
+            )
+            assert existed["success"] is True, existed
+
+        pre = tool_list_wings()
+        assert pre["wings"].get("wing_Codex") == 1
+        assert pre["wings"].get("wing_codex") == 3
+
+        res = tool_update_drawer(drawer_id, wing="wing_codex", room="diary")
+        assert res["success"] is True, res
+        # The echoed wing must be the caller's casing (the rename applied),
+        # not a stale echo of the old wing — the #2748 no-op symptom.
+        assert res["wing"] == "wing_codex", res
+
+        # Stored record must agree with the response.
+        stored = tool_get_drawer(drawer_id)
+        assert stored["wing"] == "wing_codex"
+        assert stored["room"] == "diary"
+
+        # Clean move: source wing is fully vacated, destination absorbed the
+        # drawer. No leftover ghost row, no counter drift (#2748 symptom).
+        post = tool_list_wings()
+        assert post["wings"].get("wing_codex") == 4
+        assert "wing_Codex" not in post["wings"]
 
     def test_update_drawer_content_purges_matching_closets(
         self, monkeypatch, config, palace_path, seeded_collection, kg
@@ -1069,6 +1171,118 @@ class TestWriteTools:
 
         closets_col = get_closets_collection(palace_path, create=False)
         assert len(closets_col.get(include=[])["ids"]) == 1
+
+    def test_update_drawer_keeps_prior_text_when_the_write_fails(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A failed overwrite must leave the drawer, its closets, and a verbatim copy."""
+        from mempalace import mcp_server
+        from mempalace.palace import get_closets_collection
+        from mempalace.revisions import load_drawer_revisions
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        original = (
+            "The authentication module uses JWT tokens for session management. "
+            "Tokens expire after 24 hours. Refresh tokens are stored in HttpOnly cookies."
+        )
+        closets_col = get_closets_collection(palace_path, create=True)
+        closets_col.add(
+            ids=["auth_closet_01"],
+            documents=["topic: JWT session tokens"],
+            metadatas=[{"source_file": "auth.py"}],
+        )
+
+        real_get = mcp_server._get_collection
+
+        def _failing_collection(create=False):
+            col = real_get(create=create)
+
+            def _boom(**_kwargs):
+                raise RuntimeError("write failed")
+
+            col.update = _boom
+            col.upsert = _boom
+            return col
+
+        monkeypatch.setattr(mcp_server, "_get_collection", _failing_collection)
+
+        result = mcp_server.tool_update_drawer(
+            "drawer_proj_backend_aaa", content="replacement that must not stick"
+        )
+
+        assert result["success"] is False
+        stored = seeded_collection.get(ids=["drawer_proj_backend_aaa"], include=["documents"])
+        assert stored["documents"] == [original]
+        assert closets_col.get(include=[])["ids"] == ["auth_closet_01"]
+        revisions = load_drawer_revisions(palace_path, "drawer_proj_backend_aaa")
+        assert revisions[-1]["content"] == original
+
+    def test_update_drawer_prior_text_is_recoverable_outside_the_wal(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """The WAL redacts content. The palace revision keeps the verbatim prior text."""
+        from pathlib import Path
+
+        from mempalace import mcp_server, wal
+        from mempalace.revisions import load_drawer_revisions
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        wal_file = Path(palace_path) / "isolated-wal.jsonl"
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+        monkeypatch.setattr(wal, "_WAL_INITIALIZED_DIR", None)
+        original = (
+            "The authentication module uses JWT tokens for session management. "
+            "Tokens expire after 24 hours. Refresh tokens are stored in HttpOnly cookies."
+        )
+        replacement = "replacement verbatim text for the auth drawer"
+        result = mcp_server.tool_update_drawer("drawer_proj_backend_aaa", content=replacement)
+
+        assert result["success"] is True
+        assert result["revision_id"]
+        revisions = load_drawer_revisions(palace_path, "drawer_proj_backend_aaa")
+        assert revisions[-1]["content"] == original
+        assert revisions[-1]["revision_id"] == result["revision_id"]
+        fetched = mcp_server.tool_get_drawer("drawer_proj_backend_aaa")
+        assert fetched["content"] == replacement
+
+        wal_text = wal_file.read_text(encoding="utf-8")
+        assert original not in wal_text
+        assert "[REDACTED" in wal_text
+
+    def test_update_drawer_purges_closets_only_after_the_write(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace import mcp_server, palace
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        order = []
+        real_get = mcp_server._get_collection
+        real_purge = palace.purge_source_closets
+
+        def _recording_collection(create=False):
+            col = real_get(create=create)
+            real_update = col.update
+
+            def _update(**kwargs):
+                order.append("write")
+                return real_update(**kwargs)
+
+            col.update = _update
+            return col
+
+        def _recording_purge(palace_path, source_file, *, commit=True):
+            order.append("purge")
+            return real_purge(palace_path, source_file, commit=commit)
+
+        monkeypatch.setattr(mcp_server, "_get_collection", _recording_collection)
+        monkeypatch.setattr(palace, "purge_source_closets", _recording_purge)
+
+        result = mcp_server.tool_update_drawer(
+            "drawer_proj_backend_aaa", content="updated after the closet check"
+        )
+
+        assert result["success"] is True
+        assert order == ["write", "purge"]
 
     def test_update_drawer_not_found(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -1637,6 +1851,112 @@ class TestDeleteBySource:
         content = json.loads(resp["result"]["content"][0]["text"])
         assert content["dry_run"] is True
         assert content["match_count"] == 2
+
+
+class TestDeletePurgesRevisions:
+    """Deleting a drawer removes its saved prior text; other drawers keep theirs."""
+
+    def _revise(self, monkeypatch, config, kg, *drawer_ids):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        for drawer_id in drawer_ids:
+            assert mcp_server.tool_update_drawer(drawer_id, content=f"new {drawer_id}")["success"]
+
+    def _revised_ids(self, palace_path):
+        from mempalace.revisions import load_drawer_revisions
+
+        return {row["drawer_id"] for row in load_drawer_revisions(palace_path)}
+
+    def test_delete_removes_only_that_drawers_revisions(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._revise(monkeypatch, config, kg, "drawer_proj_backend_aaa", "drawer_proj_backend_bbb")
+
+        result = mcp_server.tool_delete_drawer("drawer_proj_backend_aaa")
+
+        assert result["success"] is True
+        assert result["revisions_deleted"] == 1
+        assert self._revised_ids(palace_path) == {"drawer_proj_backend_bbb"}
+
+    def test_bulk_delete_removes_every_deleted_drawers_revisions(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._revise(
+            monkeypatch,
+            config,
+            kg,
+            "drawer_proj_backend_aaa",
+            "drawer_proj_backend_bbb",
+            "drawer_proj_frontend_ccc",
+        )
+
+        result = mcp_server.tool_delete_drawers(
+            ["drawer_proj_backend_aaa", "drawer_proj_backend_bbb", "drawer_missing"]
+        )
+
+        assert result["deleted"] == 2
+        assert result["revisions_deleted"] == 2
+        assert self._revised_ids(palace_path) == {"drawer_proj_frontend_ccc"}
+
+    def test_delete_by_source_removes_that_sources_revisions(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._revise(monkeypatch, config, kg, "drawer_proj_backend_aaa", "drawer_proj_backend_bbb")
+
+        result = mcp_server.tool_delete_by_source("auth.py", dry_run=False)
+
+        assert result["deleted"] == 1
+        assert result["revisions_deleted"] == 1
+        assert self._revised_ids(palace_path) == {"drawer_proj_backend_bbb"}
+
+    def test_a_failed_delete_keeps_the_revisions(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace import mcp_server
+
+        self._revise(monkeypatch, config, kg, "drawer_proj_backend_aaa")
+        real_get = mcp_server._get_collection
+
+        def _failing_collection(create=False):
+            col = real_get(create=create)
+
+            def _boom(**_kwargs):
+                raise RuntimeError("delete failed")
+
+            col.delete = _boom
+            return col
+
+        monkeypatch.setattr(mcp_server, "_get_collection", _failing_collection)
+
+        assert mcp_server.tool_delete_drawer("drawer_proj_backend_aaa")["success"] is False
+        assert mcp_server.tool_delete_by_source("auth.py", dry_run=False)["success"] is False
+        assert self._revised_ids(palace_path) == {"drawer_proj_backend_aaa"}
+
+    def test_a_failed_purge_keeps_the_delete_and_says_so(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        from mempalace import mcp_server, revisions
+
+        self._revise(monkeypatch, config, kg, "drawer_proj_backend_aaa")
+
+        def _locked(*_args, **_kwargs):
+            raise PermissionError("revisions file is held open")
+
+        monkeypatch.setattr(revisions, "purge_drawer_revisions", _locked)
+
+        result = mcp_server.tool_delete_drawer("drawer_proj_backend_aaa")
+
+        assert result["success"] is True
+        assert result["revisions_deleted"] is None
+        assert result["revisions_error"] == "revision purge failed: PermissionError"
+        assert self._revised_ids(palace_path) == {"drawer_proj_backend_aaa"}
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────

@@ -11,7 +11,6 @@ import json
 
 import pytest
 
-import mempalace.config as config_mod
 from mempalace.config import MempalaceConfig
 
 NON_OBJECTS = [
@@ -28,7 +27,6 @@ NON_OBJECTS = [
 
 @pytest.fixture(autouse=True)
 def _fresh_warning_state(monkeypatch):
-    monkeypatch.setattr(config_mod, "_WARNED_UNUSABLE_CONFIGS", set(), raising=False)
     for name in ("MEMPALACE_PALACE_PATH", "MEMPAL_PALACE_PATH", "MEMPALACE_BACKEND"):
         monkeypatch.delenv(name, raising=False)
 

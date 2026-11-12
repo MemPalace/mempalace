@@ -35,8 +35,8 @@ def search_with_media(
     default search retains its existing hybrid ranking and result schema.
     Missing asset files remain searchable references with ``available=False``.
     """
-    from ..palace import ASSETS_COLLECTION_NAME
     from ..embedding import embedding_section, get_embedding_function
+    from ..palace import ASSETS_COLLECTION_NAME
     from . import (
         _distance_to_similarity,
         _result_date_fields,
@@ -60,7 +60,6 @@ def search_with_media(
         since_dt, before_dt = parse_window(since, before)
         date_active = since_dt is not None or before_dt is not None
         pool_size = min(5000 if date_active else 500, n_results * (100 if date_active else 4))
-        where = build_where_filter(wing, room, source_file)
         collections = []
         names = [("text", collection_name)]
         if include_media:
@@ -102,7 +101,7 @@ def search_with_media(
             raw = col.query(
                 query_embeddings=query_vectors,
                 n_results=min(pool_size, count),
-                where=where or None,
+                where=build_where_filter(wing, room, source_file, col=col) or None,
                 include=["documents", "metadatas", "distances"],
             )
             ids = raw["ids"][0]

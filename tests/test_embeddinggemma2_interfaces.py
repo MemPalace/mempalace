@@ -71,6 +71,7 @@ def test_mcp_search_forwards_only_nondefault_controls_and_serializes_asset_hit(
     monkeypatch, config, kg
 ):
     from _mcp_server_helpers import _patch_mcp_server
+
     from mempalace import mcp_server
 
     _patch_mcp_server(monkeypatch, config, kg)
@@ -139,14 +140,47 @@ def test_mcp_search_forwards_only_nondefault_controls_and_serializes_asset_hit(
     [
         ({"include_media": "yes"}, "include_media"),
         ({"query_task": "image"}, "query_task"),
-        ({"include_media": True, "cli_compatible": True}, "cli_compatible"),
-        ({"query_task": "code", "cli_compatible": True}, "cli_compatible"),
     ],
 )
-def test_mcp_search_rejects_invalid_controls_before_search(
+def test_mcp_search_rejects_invalid_controls_at_dispatch(
     monkeypatch, config, kg, arguments, message
 ):
     from _mcp_server_helpers import _patch_mcp_server
+
+    from mempalace import mcp_server
+
+    _patch_mcp_server(monkeypatch, config, kg)
+    monkeypatch.setattr(
+        mcp_server,
+        "search_memories",
+        lambda *_args, **_kwargs: pytest.fail("invalid options must be rejected before search"),
+    )
+
+    response = mcp_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "mempalace_search", "arguments": {"query": "needle", **arguments}},
+        }
+    )
+
+    assert response["error"]["code"] == -32602
+    assert message in response["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"include_media": True, "cli_compatible": True},
+        {"query_task": "code", "cli_compatible": True},
+    ],
+)
+def test_mcp_search_rejects_cli_compatible_with_experimental_controls(
+    monkeypatch, config, kg, arguments
+):
+    from _mcp_server_helpers import _patch_mcp_server
+
     from mempalace import mcp_server
 
     _patch_mcp_server(monkeypatch, config, kg)
@@ -158,7 +192,7 @@ def test_mcp_search_rejects_invalid_controls_before_search(
 
     result = mcp_server.tool_search(query="needle", **arguments)
 
-    assert message in result["error"]
+    assert "cli_compatible" in result["error"]
 
 
 def test_mcp_search_schema_keeps_new_controls_optional():

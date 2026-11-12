@@ -80,7 +80,7 @@ mempal_log "preCompact" "$MEMPAL_CONV_ID" \
 # text back — so we must finish ingesting before returning. Background
 # mining would race the compaction and lose data.
 #
-# TIMEOUT TRADEOFF (igorls review, PR #1632): on a very large transcript
+# TIMEOUT TRADEOFF: on a very large transcript
 # this synchronous mine can exceed Cursor's per-hook timeout, in which
 # case Cursor kills the process mid-mine. That is acceptable and safe
 # here: `mempalace mine` is incremental and append-only (a crash mid-

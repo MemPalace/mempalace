@@ -3,10 +3,10 @@
 import contextlib
 
 import pytest
+from test_chroma_metadata_contracts import wrapper
 
 from mempalace import embedding
 from mempalace.backends import chroma as cb, embedding_wrapper as ew
-from test_chroma_metadata_contracts import wrapper
 
 
 @pytest.mark.parametrize("kind", ["document_title_drift", "title_document_drift"])
@@ -71,7 +71,7 @@ def test_update_without_interleaving_remains_valid(monkeypatch, collection):
 
 
 def test_embedder_resolution_occurs_inside_embedding_section(monkeypatch, collection):
-    from test_chroma_metadata_contracts import Embedder, _REAL_EMBED_TEXTS
+    from test_chroma_metadata_contracts import _REAL_EMBED_TEXTS, Embedder
 
     depth = 0
     resolved_at = []
@@ -103,8 +103,9 @@ def test_embedder_resolution_occurs_inside_embedding_section(monkeypatch, collec
 
 
 def test_gemma2_lazy_model_load_entry_runs_inside_section(monkeypatch, collection):
-    from mempalace.embeddinggemma2 import EmbeddingGemma2EmbeddingFunction
     from test_chroma_metadata_contracts import _REAL_EMBED_TEXTS
+
+    from mempalace.embeddinggemma2 import EmbeddingGemma2EmbeddingFunction
 
     ef = EmbeddingGemma2EmbeddingFunction()
     assert ef._model is None

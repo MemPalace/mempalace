@@ -1,0 +1,4 @@
+# Shell and Node ESM hook/sidecar scripts carry POSIX shebangs, so check
+# them out with LF on every platform.
+*.sh text eol=lf
+*.mjs text eol=lf

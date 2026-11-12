@@ -14,7 +14,6 @@ import pytest
 
 from mempalace import mcp_server
 
-
 LOGSTREAM_TOOLS = frozenset(
     {
         "mempalace_event_append",
