@@ -233,10 +233,15 @@ def _no_dns_lookups(request, monkeypatch):
     resolve. One that must drive the resolver itself opts out with
     ``@pytest.mark.resolves_dns`` and stubs ``socket.getaddrinfo``.
     """
-    if request.node.get_closest_marker("resolves_dns"):
-        yield
-        return
     import mempalace.llm_client as llm_client
+
+    if request.node.get_closest_marker("resolves_dns"):
+        llm_client._clear_resolve_cache()
+        try:
+            yield
+        finally:
+            llm_client._clear_resolve_cache()
+        return
 
     def _refuse(host):
         raise AssertionError(

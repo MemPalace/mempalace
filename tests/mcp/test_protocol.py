@@ -217,107 +217,101 @@ class TestColdStartDiagnostics:
         make_minimal_chroma_sqlite(palace)
         return str(palace)
 
-    @staticmethod
-    def _spy_get_collection_extra(marker_path, return_expr="None"):
-        """Render an ``extra_code`` fragment that monkeypatches ``_get_collection``.
+    @classmethod
+    def _patch_warmup_palace(cls, monkeypatch, mcp_server, tmp_path):
+        from mempalace.config import MempalaceConfig
 
-        ``marker_path`` records that the spy fired; ``return_expr`` is a Python
-        expression evaluated inside the subprocess for the call's return value
-        (e.g. ``"None"`` or ``"_FakeCol()"``).
-        """
-        return (
-            "import pathlib\n"
-            "from mempalace import mcp_server\n"
-            "def _spy_get_collection(create=False):\n"
-            f"    pathlib.Path({str(marker_path)!r}).write_text('called')\n"
-            f"    return {return_expr}\n"
-            "mcp_server._get_collection = _spy_get_collection\n"
+        palace = cls._make_fake_palace(tmp_path)
+        monkeypatch.setattr(
+            mcp_server,
+            "_config",
+            MempalaceConfig(config_dir=str(tmp_path / "cfg"), palace_path=palace),
+        )
+        return palace
+
+    def test_eager_warmup_off_by_default_does_not_open_collection(self, tmp_path, monkeypatch):
+        from mempalace import mcp_server
+
+        self._patch_warmup_palace(monkeypatch, mcp_server, tmp_path)
+        monkeypatch.delenv("MEMPALACE_EAGER_WARMUP", raising=False)
+        called = []
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False: called.append(create)
         )
 
-    def test_eager_warmup_off_by_default_does_not_open_collection(self, tmp_path):
-        marker = tmp_path / "called.txt"
-        palace = self._make_fake_palace(tmp_path)
-        result = self._run_main(
-            {"MEMPALACE_EAGER_WARMUP": None, "MEMPALACE_PALACE_PATH": palace},
-            extra_code=self._spy_get_collection_extra(marker),
-        )
-        assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert not marker.exists(), "warmup ran despite env var being unset"
+        mcp_server._maybe_eager_warmup_embedder()
+
+        assert called == []
 
     @pytest.mark.parametrize("value", ["0", "false", "no", "off", "FALSE"])
     def test_eager_warmup_explicit_falsy_skips_collection_open_without_warning(
-        self, tmp_path, value
+        self, tmp_path, monkeypatch, caplog, value
     ):
-        marker = tmp_path / "called.txt"
-        palace = self._make_fake_palace(tmp_path)
-        result = self._run_main(
-            {"MEMPALACE_EAGER_WARMUP": value, "MEMPALACE_PALACE_PATH": palace},
-            extra_code=self._spy_get_collection_extra(marker),
+        from mempalace import mcp_server
+
+        self._patch_warmup_palace(monkeypatch, mcp_server, tmp_path)
+        monkeypatch.setenv("MEMPALACE_EAGER_WARMUP", value)
+        called = []
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False: called.append(create)
         )
-        assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert not marker.exists(), f"warmup ran for explicit-falsy value {value!r}"
-        assert "not recognized" not in result.stderr, (
-            f"explicit-falsy {value!r} should not log a warning; stderr={result.stderr!r}"
-        )
+
+        with caplog.at_level("WARNING"):
+            mcp_server._maybe_eager_warmup_embedder()
+
+        assert called == []
+        assert "not recognized" not in caplog.text
 
     @pytest.mark.parametrize("value", ["tru", "maybe", "ENABLED", "2"])
-    def test_eager_warmup_unrecognized_value_warns_and_skips_collection_open(self, tmp_path, value):
-        marker = tmp_path / "called.txt"
-        palace = self._make_fake_palace(tmp_path)
-        result = self._run_main(
-            {"MEMPALACE_EAGER_WARMUP": value, "MEMPALACE_PALACE_PATH": palace},
-            extra_code=self._spy_get_collection_extra(marker),
+    def test_eager_warmup_unrecognized_value_warns_and_skips_collection_open(
+        self, tmp_path, monkeypatch, caplog, value
+    ):
+        from mempalace import mcp_server
+
+        self._patch_warmup_palace(monkeypatch, mcp_server, tmp_path)
+        monkeypatch.setenv("MEMPALACE_EAGER_WARMUP", value)
+        called = []
+        monkeypatch.setattr(
+            mcp_server, "_get_collection", lambda create=False: called.append(create)
         )
-        assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert not marker.exists(), f"warmup ran despite unrecognized value {value!r}"
-        assert "not recognized" in result.stderr, result.stderr
+
+        with caplog.at_level("WARNING"):
+            mcp_server._maybe_eager_warmup_embedder()
+
+        assert called == []
+        assert "not recognized" in caplog.text
 
     @pytest.mark.parametrize("value", ["1", "true", "YES", "On"])
-    def test_eager_warmup_truthy_opens_collection_and_invokes_query(self, tmp_path, value):
-        """C1 (#1495): warmup must call ``col.query(...)`` — not just open the collection.
+    def test_eager_warmup_truthy_opens_collection_and_invokes_query(
+        self, tmp_path, monkeypatch, caplog, value
+    ):
+        from mempalace import mcp_server
 
-        ChromaDB's ``ONNXMiniLM_L6_V2.__init__`` only imports ``onnxruntime``;
-        ``InferenceSession`` and model download happen inside ``__call__``,
-        which the chromadb query path drives. Pinning both call sites here
-        prevents a regression to a no-op resolver-only warmup (the same
-        failure mode silent-failure-hunter flagged in initial review).
-        Reporter's #1495 proposal: same path covers HNSW cold-load too.
-        """
-        open_marker = tmp_path / "open_called.txt"
-        query_marker = tmp_path / "query_called.txt"
-        palace = self._make_fake_palace(tmp_path)
-        extra = (
-            "import pathlib\n"
-            "from mempalace import mcp_server\n"
-            "class _FakeCol:\n"
-            "    def query(self, **kwargs):\n"
-            f"        pathlib.Path({str(query_marker)!r}).write_text(repr(kwargs))\n"
-            "        return {'ids': [[]], 'distances': [[]], 'documents': [[]]}\n"
-            "_fake_col = _FakeCol()\n"
-            "def _spy_get_collection(create=False):\n"
-            f"    pathlib.Path({str(open_marker)!r}).write_text('open')\n"
-            "    return _fake_col\n"
-            "mcp_server._get_collection = _spy_get_collection\n"
-        )
-        result = self._run_main(
-            {"MEMPALACE_EAGER_WARMUP": value, "MEMPALACE_PALACE_PATH": palace},
-            extra_code=extra,
-        )
-        assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert open_marker.exists(), (
-            f"_get_collection not called for {value!r}; stderr={result.stderr!r}"
-        )
-        assert query_marker.exists(), (
-            f"col.query not invoked for {value!r} — warmup is a no-op "
-            f"(would let cold-load hit first MCP call); stderr={result.stderr!r}"
-        )
-        # query was called with the sentinel probe text and n_results=1.
-        kwargs_repr = query_marker.read_text()
-        assert "__mempalace_warmup_probe__" in kwargs_repr, kwargs_repr
-        assert "n_results" in kwargs_repr and "1" in kwargs_repr, kwargs_repr
-        # Success path logs embedder + HNSW readiness + palace + device for ops.
-        assert "embedder + HNSW ready" in result.stderr, result.stderr
-        assert f"palace={palace}" in result.stderr, result.stderr
+        palace = self._patch_warmup_palace(monkeypatch, mcp_server, tmp_path)
+        monkeypatch.setenv("MEMPALACE_EAGER_WARMUP", value)
+        open_calls = []
+        query_calls = []
+
+        class _FakeCol:
+            def query(self, **kwargs):
+                query_calls.append(kwargs)
+                return {"ids": [[]], "distances": [[]], "documents": [[]]}
+
+        def _spy_get_collection(create=False):
+            open_calls.append(create)
+            return _FakeCol()
+
+        monkeypatch.setattr(mcp_server, "_get_collection", _spy_get_collection)
+
+        with caplog.at_level("INFO"):
+            mcp_server._maybe_eager_warmup_embedder()
+
+        assert open_calls == [False]
+        assert len(query_calls) == 1
+        assert query_calls[0]["query_texts"] == ["__mempalace_warmup_probe__"]
+        assert query_calls[0]["n_results"] == 1
+        assert "embedder + HNSW ready" in caplog.text
+        assert f"palace={palace}" in caplog.text
 
     def test_eager_warmup_fresh_install_skips_without_creating_palace(self, tmp_path):
         """Real integration test (no monkeypatch): an empty palace dir with no
@@ -362,38 +356,41 @@ class TestColdStartDiagnostics:
             f"(violates 'Incremental only' from CLAUDE.md); stderr={result.stderr!r}"
         )
 
-    def test_eager_warmup_collection_returning_none_surfaces_warning(self, tmp_path):
-        """_get_collection retries internally and returns None on persistent
-        failure (mcp_server.py:373). Warmup must not log a misleading
-        success line in that case."""
-        palace = self._make_fake_palace(tmp_path)
-        extra = self._spy_get_collection_extra(tmp_path / "called.txt", return_expr="None")
-        result = self._run_main(
-            {"MEMPALACE_EAGER_WARMUP": "1", "MEMPALACE_PALACE_PATH": palace},
-            extra_code=extra,
-        )
-        assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert "_get_collection returned None" in result.stderr, result.stderr
-        assert "embedder + HNSW ready" not in result.stderr, result.stderr
+    def test_eager_warmup_collection_returning_none_surfaces_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from mempalace import mcp_server
 
-    def test_eager_warmup_collection_open_failure_logs_and_does_not_block_server(self, tmp_path):
-        palace = self._make_fake_palace(tmp_path)
-        extra = (
-            "from mempalace import mcp_server\n"
-            "def _boom(create=False):\n"
-            "    raise RuntimeError('synthetic-collection-open-fail-1495')\n"
-            "mcp_server._get_collection = _boom\n"
-        )
-        result = self._run_main(
-            {"MEMPALACE_EAGER_WARMUP": "1", "MEMPALACE_PALACE_PATH": palace},
-            extra_code=extra,
-        )
-        assert result.returncode == 0, f"stderr={result.stderr!r}"
-        assert "collection open failed" in result.stderr, result.stderr
-        assert "synthetic-collection-open-fail-1495" in result.stderr, result.stderr
-        # palace + error class included in the diagnostic
-        assert f"palace={palace}" in result.stderr, result.stderr
-        assert "error=RuntimeError" in result.stderr, result.stderr
+        self._patch_warmup_palace(monkeypatch, mcp_server, tmp_path)
+        monkeypatch.setenv("MEMPALACE_EAGER_WARMUP", "1")
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: None)
+
+        with caplog.at_level("INFO"):
+            mcp_server._maybe_eager_warmup_embedder()
+
+        assert "_get_collection returned None" in caplog.text
+        assert "embedder + HNSW ready" not in caplog.text
+
+    def test_eager_warmup_collection_open_failure_logs_and_does_not_block_server(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from mempalace import mcp_server
+
+        palace = self._patch_warmup_palace(monkeypatch, mcp_server, tmp_path)
+        monkeypatch.setenv("MEMPALACE_EAGER_WARMUP", "1")
+
+        def _boom(create=False):
+            raise RuntimeError("synthetic-collection-open-fail-1495")
+
+        monkeypatch.setattr(mcp_server, "_get_collection", _boom)
+
+        with caplog.at_level("ERROR"):
+            mcp_server._maybe_eager_warmup_embedder()
+
+        assert "collection open failed" in caplog.text
+        assert "synthetic-collection-open-fail-1495" in caplog.text
+        assert f"palace={palace}" in caplog.text
+        assert "error=RuntimeError" in caplog.text
 
     def test_eager_warmup_query_failure_logs_and_persists_to_log_file(self, tmp_path):
         """Query may raise (broken HNSW, network failure during ONNX download,

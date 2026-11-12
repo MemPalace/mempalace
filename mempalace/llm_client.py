@@ -29,6 +29,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
@@ -65,9 +67,26 @@ def _is_private_address(addr) -> bool:
     return addr.version == 4 and addr in _CGNAT
 
 
+_RESOLVE_CACHE_TTL_SECS = 60.0
+_resolve_cache_lock = threading.Lock()
+_resolve_cache: dict[str, tuple[float, bool]] = {}
+
+
+def _clear_resolve_cache() -> None:
+    """Drop cached DNS locality verdicts (used by tests that swap DNS stubs)."""
+    with _resolve_cache_lock:
+        _resolve_cache.clear()
+
+
 def _resolves_private(host: str) -> bool:
     """True when every address ``host`` resolves to stays on the user's network."""
     import socket
+
+    now = time.monotonic()
+    with _resolve_cache_lock:
+        cached = _resolve_cache.get(host)
+        if cached is not None and now - cached[0] < _RESOLVE_CACHE_TTL_SECS:
+            return cached[1]
 
     try:
         infos = socket.getaddrinfo(host, None)
@@ -76,14 +95,19 @@ def _resolves_private(host: str) -> bool:
     addresses = {info[4][0] for info in infos if info and info[4]}
     if not addresses:
         return False
+    result = True
     for raw in addresses:
         try:
             addr = ipaddress.ip_address(raw.split("%", 1)[0])
         except ValueError:
             return False
         if not _is_private_address(addr):
-            return False
-    return True
+            result = False
+            break
+
+    with _resolve_cache_lock:
+        _resolve_cache[host] = (now, result)
+    return result
 
 
 def endpoint_is_local(url: Optional[str]) -> bool:
