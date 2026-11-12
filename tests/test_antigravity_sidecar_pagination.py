@@ -258,3 +258,76 @@ def test_existing_slow_path_is_preserved(bridge, collection, monkeypatch, reason
         limit=2,
         offset=3,
     )
+
+
+@pytest.fixture
+def chroma_pagination_collection(tmp_path):
+    backend = ChromaBackend()
+    path = str(tmp_path / "fallback-palace")
+    col = backend.get_collection(
+        palace=PalaceRef(id=path, local_path=path),
+        collection_name="fallback_drawers",
+        create=True,
+    )
+    yield col
+    backend.close()
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "locked"])
+def test_chroma_recent_pages_stay_exact_when_sqlite_reader_falls_back(
+    bridge, chroma_pagination_collection, monkeypatch, failure
+):
+    import sqlite3
+
+    from mempalace.backends import chroma, chroma_sqlite
+
+    col = chroma_pagination_collection
+    ids, documents, _ = _populate(col, 1501)
+    _wire(bridge, col, monkeypatch, len(ids))
+    if failure == "unavailable":
+        monkeypatch.setattr(chroma, "_sqlite_recent_records", lambda *args, **kwargs: None)
+    else:
+
+        def locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(chroma_sqlite, "open_palace_reader", locked)
+
+    drawers = _pages(bridge, len(ids))
+    assert [drawer["id"] for drawer in drawers] == ids[::-1]
+    assert [drawer["content"] for drawer in drawers] == documents[::-1]
+
+
+@pytest.mark.parametrize("include", [None, [], ["documents"], ["metadatas"]])
+def test_chroma_recent_fallback_hydrates_only_selected_records(
+    chroma_pagination_collection, monkeypatch, include
+):
+    from mempalace.backends import chroma
+
+    col = chroma_pagination_collection
+    ids, documents, _ = _populate(col, 73)
+    before = col.get(ids=ids)
+    monkeypatch.setattr(chroma, "_sqlite_recent_records", lambda *args, **kwargs: None)
+    original_get = col.get
+    text_reads = []
+
+    def get(**kwargs):
+        if kwargs.get("include") is None or "documents" in kwargs["include"]:
+            text_reads.append(kwargs)
+        return original_get(**kwargs)
+
+    monkeypatch.setattr(col, "get", get)
+    result = col.get_recent(limit=5, where={"wing": "work"}, include=include)
+    assert result.ids == ids[::-1][:5]
+    wants_documents = include is None or "documents" in include
+    wants_metadata = include is None or "metadatas" in include
+    assert result.documents == (documents[::-1][:5] if wants_documents else [])
+    expected_metadata = dict(zip(before.ids, before.metadatas))
+    assert result.metadatas == (
+        [expected_metadata[doc_id] for doc_id in result.ids] if wants_metadata else []
+    )
+    if wants_documents:
+        assert len(text_reads) == 1
+        assert set(text_reads[0]["ids"]) == set(ids[-5:])
+    else:
+        assert text_reads == []
