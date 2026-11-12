@@ -235,7 +235,6 @@ def test_scoped_fts_keeps_all_candidates_for_local_bm25_ranking(palace):
     assert {row_id for row_id, _, _ in rows} == {"drawer_a", "drawer_b", "drawer_c"}
 
 
-
 def test_missing_database_reads_as_none(tmp_path):
     empty = str(tmp_path)
     assert chroma_sqlite._sqlite_embedding_count(empty, _NAME) is None
