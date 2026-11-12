@@ -146,7 +146,8 @@ def test_owner_toggle_override_and_member_read_only(app, owner, browser_tools):
         member_principal = sessions.session_principal(app.hub.db, member_session)
         assert member_principal is not None and member_principal.person is True
         assert member_principal.role == "member"
-        assert member_principal.policy == principal.policy
+        # a member keeps the owner's grant except the owner-only scopes (#285: for_role drops private:read)
+        assert member_principal.policy == principal.policy.for_role("member")
         readonly = setting_state(member)
         assert readonly["enabled"] is True
         assert readonly["disabled"] is True
