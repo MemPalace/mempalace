@@ -142,7 +142,6 @@ def test_filtered_query_fallback_keeps_ids_aligned_with_filtered_hits():
     assert result["distances"] == [[0.1]]
 
 
-
 def test_filtered_query_fallback_preserves_widened_pool_for_late_scoped_hit():
     """Unfiltered retry cannot undo the searcher's wider candidate request."""
     drawers_col = MagicMock()
