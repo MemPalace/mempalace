@@ -2730,6 +2730,7 @@ class ChromaCollection(BaseCollection):
                     for key, values in equalities
                 ],
                 order_field=order_field,
+                ids_only=not (spec.documents or spec.metadatas),
             )
         if records is None:
             return super().get_recent(
