@@ -187,6 +187,45 @@ def test_every_sqlite_reader_returns_what_it_did(palace):
     assert _outputs(palace_path, col) == EXPECTED
 
 
+def test_unrelated_conversation_collection_cannot_block_legacy_lexical_reads(
+    palace, monkeypatch
+):
+    """An unfinished conversation in another collection must not gate this one."""
+    palace_path, _ = palace
+    other = chroma.ChromaBackend().get_collection(
+        palace=PalaceRef(id=palace_path, local_path=palace_path),
+        collection_name="other_conversations",
+        create=True,
+    )
+    other.add(
+        ids=["unfinished_elsewhere"],
+        documents=["alpha vector from an unfinished conversation"],
+        metadatas=[
+            {
+                "ingest_mode": "convos",
+                "source_file": "/home/u/.claude/projects/p/s1.jsonl",
+                "extract_mode": "exchange",
+                "chunk_index": 0,
+                "chunk_total": 2,
+            }
+        ],
+        embeddings=[[1.0, 0.5, 0.25]],
+    )
+
+    def unexpected_recovery(_conn, _collection_name):
+        raise AssertionError("an unrelated conversation triggered recovery gating")
+
+    monkeypatch.setattr(chroma_sqlite, "_sqlite_ready_metadata_segment", unexpected_recovery)
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path,
+        _NAME,
+        "vector",
+        where={"source_file": "/home/u/.claude/projects/p/s1.jsonl"},
+        limit=1,
+    )
+    assert [row_id for row_id, _, _ in rows] == ["drawer_a"]
+
+
 def test_lexical_recency_source_scope_is_applied_before_candidate_limit(palace):
     """Newer unrelated rows cannot exhaust the short-query fallback pool."""
     palace_path, _ = palace
