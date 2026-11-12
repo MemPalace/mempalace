@@ -657,6 +657,30 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     assert out["wings"].get("design") == 1
 
 
+def test_tool_status_via_sqlite_reports_logical_counts(tmp_path, monkeypatch):
+    """The diverged-index status speaks the same units as the normal one."""
+    from mempalace import mcp_server
+    from mempalace.backends import DrawerCount, chroma_sqlite
+
+    (tmp_path / "chroma.sqlite3").touch()
+
+    class _Cfg:
+        palace_path = str(tmp_path)
+        collection_name = "mempalace_drawers"
+
+    monkeypatch.setattr(mcp_server, "_config", _Cfg())
+    count = DrawerCount(drawers=1, chunks=2, rows=2)
+    monkeypatch.setattr(
+        chroma_sqlite, "_sqlite_wing_room_counts", lambda *a: (count, {"w": {"r": count}})
+    )
+
+    out = mcp_server._tool_status_via_sqlite()
+
+    assert (out["total_drawers"], out["total_chunks"], out["total_rows"]) == (1, 2, 2)
+    assert out["wings"] == {"w": 1}
+    assert out["rooms"] == {"r": 1}
+
+
 def test_tool_status_via_sqlite_logs_an_unreadable_database(tmp_path, monkeypatch, caplog):
     from mempalace import mcp_server
 

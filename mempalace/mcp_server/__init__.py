@@ -85,7 +85,13 @@ from .. import (  # noqa: E402
 )
 from .._env import env_bool, env_float, env_int, env_list, env_str  # noqa: E402
 from .._once import first_time  # noqa: E402
-from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
+from ..backends import (  # noqa: E402
+    DRAWER_COUNT_ZERO,
+    BackendMismatchError,
+    DrawerCount,
+    PalaceRef,
+    detect_backend_for_path,
+)
 from ..backends.base import (  # noqa: E402
     DimensionMismatchError,
     EmbedderIdentityMismatchError,
@@ -134,7 +140,7 @@ from ..hallways import (  # noqa: E402
 from ..ids import ID_RECIPE, make_drawer_id_from_content  # noqa: E402
 from ..knowledge_graph import KnowledgeGraph, knowledge_graph_notice  # noqa: E402
 from ..logstream import LOGSTREAM_DB_FILENAME, Logstream  # noqa: E402
-from ..metadata_types import BOOKKEEPING_WHERE, is_bookkeeping  # noqa: E402
+from ..metadata_types import is_bookkeeping  # noqa: E402
 from ..palace_graph import (  # noqa: E402
     GraphUnavailable,
     _load_tunnels as _load_graph_tunnels,
