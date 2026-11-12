@@ -1401,3 +1401,51 @@ def test_list_drawers_sdk_fallback_rejects_replaced_generation_between_reads(mon
     assert "error" not in result, result
     assert result["total"] == 0, result
     assert result["drawers"] == []
+
+def test_list_drawers_sdk_preview_rechecks_generation_after_positional_overwrite(monkeypatch):
+    """An SDK metadata snapshot of A must never hydrate B under the same ID."""
+    from mempalace import mcp_server
+
+    a = {
+        "ingest_mode": "convos",
+        "extract_mode": "exchange",
+        "source_file": "/sessions/live.jsonl",
+        "source_mtime": 1.0,
+        "filed_at": "A",
+        "chunk_total": 1,
+        "chunk_index": 0,
+        "wing": "sessions",
+        "room": "chat",
+    }
+    b = {**a, "filed_at": "B", "source_mtime": 2.0}
+
+    class OverwritingCollection:
+        swapped = False
+        hydrated = False
+
+        def get(self, **kwargs):
+            if "ids" in kwargs:
+                self.hydrated = True
+                assert kwargs["ids"] == ["same-id"]
+                return {
+                    "ids": ["same-id"],
+                    "documents": ["UNCOMMITTED B content" if self.swapped else "A content"],
+                    "metadatas": [b if self.swapped else a],
+                }
+            # The first pass has validated the complete one-chunk A generation.
+            return {"ids": ["same-id"], "documents": [], "metadatas": [a]}
+
+    collection = OverwritingCollection()
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+
+    original = mcp_server.tool_list_drawers(limit=10)
+    assert "error" not in original, original
+    assert original["drawers"][0]["content_preview"] == "A content"
+    assert collection.hydrated
+
+    collection.swapped = True
+    raced = mcp_server.tool_list_drawers(limit=10)
+    assert collection.hydrated
+    assert "error" in raced, raced
+    assert "UNCOMMITTED B content" not in str(raced)

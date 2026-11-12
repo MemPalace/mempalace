@@ -428,14 +428,50 @@ def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
         drawer["content_preview"] = _content_preview(content)
 
 
-def _fill_drawer_previews(col, page: list) -> None:
-    """Hydrate ``content_preview`` for a page of logical drawers only."""
+def _fill_drawer_previews(col, page: list, *, expected_metadata=None) -> None:
+    """Hydrate page previews, rejecting an SDK race with a conversation re-mine.
+
+    The SDK fallback selects metadata and fetches documents in separate reads.
+    A positional ID can be overwritten in between; without checking the
+    hydrated metadata, a list authorized as generation A could show B text.
+    The SQLite fast path instead hydrates within its original transaction.
+    """
     physical_ids = _page_physical_ids(page)
     if not physical_ids:
         return
-    result = col.get(ids=physical_ids, include=["documents"])
+    include = ["documents", "metadatas"] if expected_metadata is not None else ["documents"]
+    result = col.get(ids=physical_ids, include=include)
     ids = _chroma_field(result, "ids", []) or []
     docs = _chroma_field(result, "documents", []) or []
+    if expected_metadata is not None:
+        current = dict(zip(ids, _chroma_field(result, "metadatas", []) or []))
+        generation_fields = (
+            "ingest_mode",
+            "source_file",
+            "extract_mode",
+            "source_mtime",
+            "filed_at",
+            "historical_version",
+            "chunk_total",
+            "chunk_index",
+            "wing",
+            "room",
+        )
+        for row_id in physical_ids:
+            selected = expected_metadata.get(row_id) or {}
+            if (
+                selected.get("ingest_mode") != "convos"
+                or selected.get("extract_mode") not in ("exchange", "general")
+                or "chunk_total" not in selected
+            ):
+                continue
+            hydrated = current.get(row_id)
+            if hydrated is None or any(
+                selected.get(key) != hydrated.get(key) for key in generation_fields
+            ):
+                raise RuntimeError(
+                    "conversation generation changed during drawer preview hydration; retry"
+                )
     docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
     _apply_drawer_previews(page, docs_by_id)
 
@@ -1578,7 +1614,9 @@ def tool_list_drawers(
 
         checked = scoped_visible_ids(metadatas, fetch_source_rows) if where else None
         result = make_page(ids, metadatas, checked_ids=checked)
-        _fill_drawer_previews(col, result["drawers"])
+        _fill_drawer_previews(
+            col, result["drawers"], expected_metadata=dict(zip(ids, metadatas))
+        )
         return result
     except Exception as e:
         logger.exception("tool_list_drawers failed")
