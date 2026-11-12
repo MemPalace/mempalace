@@ -471,8 +471,7 @@ def sqlite_lexical_rows(
         if scoped_in_sql:
             # Match the encoded value stored in Chroma metadata (e.g. NUL).
             stored = [
-                (key, tuple(encode_filter(value) for value in values))
-                for key, values in equalities
+                (key, tuple(encode_filter(value) for value in values)) for key, values in equalities
             ]
             filter_sql, filter_params = _match_sql(stored, "e.id")
         row_ids: list[int] = []
