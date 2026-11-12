@@ -7,9 +7,15 @@
 
 - **Promises:**
 
+  - Diary reads accept a server-only `thread_scope` (declared with `x-mempalace-server-only`, so `tools/list` omits it): `probe` lists at most 1000 entry topics from metadata only and names the serving store, and `exclude_topics` with that `source` skips those entries before counting and windowing on the same store (the SQLite fast path or the collection); a store change in either direction or any other scope is refused, an empty exclusion list leaves the SQLite page path unchanged, and an over-limit probe names the limit.
+
+  - Search rows (including unified media/code search) and `check_duplicate` matches carry a drawer's `topic` when it has one, so the gateway can hide diary entries whose topic names an unreadable thread from search, CLI search and duplicate checks.
+
+  - The checkpoint schema caps `items` at 500 (`maxItems`), and the tool refuses larger batches.
+
   - The fact readers (`knowledge_graph`, `fact_index`, `searcher/facts`) take the read deadline from the stdlib-only `mempalace/deadline.py` and never import `commonplace.rules`, so an import-following test selector does not widen every change into most of the suite; `commonplace.rules.checks` re-uses the same context variable and keeps its own clock.
 
-  - Local CLI and gated gateway CLI use the same pure drawer formatter, preserving headers, match scores, folded-copy labels, body whitespace conventions, empty results and BM25 fallback output. The gateway explicitly selects flat rows even when they carry import-authorization metadata; the owner default remains unchanged.
+  - Local CLI and gated gateway CLI use the same pure drawer formatter, preserving headers, match scores, folded-copy labels, body whitespace conventions, empty results and BM25 fallback output. The gateway explicitly selects flat rows even when they carry import-authorization metadata and renders CLI text from gated rows for every principal; the local CLI keeps its metadata mode.
 
   - Drawer retries retain replay status for readable owners while also returning request-derived fresh-write fields, allowing the gateway to hide replay status for unreadable wings.
 

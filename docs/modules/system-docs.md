@@ -25,6 +25,8 @@
 
 - **Promises:**
 
+  - Thread-valued rooms and diary topics: one thread-ID definition and one room check cover link, mcp:, embedded, fullwidth and source-ID forms on every room- or topic-returning route and write, with the fail-closed residuals for hex-looking names, undecodable values and unchecked wing names.
+
   - Private-read containment includes event cursor projection, indistinguishable unreadable write retries, readable tunnel endpoints, current-role token caps and explicit private-save notices.
 
   - Documents owner-only person private reads, retained scoped shared projections and unavailable whole-palace operations for members.

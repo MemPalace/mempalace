@@ -171,27 +171,51 @@ def _diary_read_response(agent_name: str, entries: list, total: int) -> dict:
     }
 
 
-def _sqlite_diary_read(agent_name: str, last_n: int, wing: str):
+# Distinct diary topics one probe may report; more is a probe fault.
+_DIARY_TOPIC_LIMIT = 1000
+
+
+def _topic_probe_result(topics, source):
+    if len(topics) > _DIARY_TOPIC_LIMIT:
+        return {
+            "error": "diary topic probe limit exceeded",
+            "probe_fault": True,
+            "topic_limit": _DIARY_TOPIC_LIMIT,
+        }
+    return {"topics": topics, "source": source}
+
+
+def _sqlite_diary_read(agent_name: str, last_n: int, wing: str, scope=None):
     """Read the requested diary page without cold-loading Chroma's HNSW index.
 
     ``None`` preserves the collection path for other backends, unavailable
     databases, unsupported schemas, and records SQLite cannot safely order.
-    This does not cache content or change diary chunk/total semantics.
+    This does not cache content or change diary chunk/total semantics. A
+    server-set ``scope`` probes topics or excludes them on this same store.
     """
     if not _is_chroma_backend():
         return None
+    scope = scope or {}
     try:
         from ..backends.chroma_sqlite import sqlite_diary_rows
 
+        scoped = {}
+        if scope.get("probe"):
+            scoped["topics_limit"] = _DIARY_TOPIC_LIMIT
+        elif "exclude_topics" in scope:
+            scoped["exclude_topics"] = scope["exclude_topics"]
         result = sqlite_diary_rows(
             _config.palace_path,
             _config.collection_name,
             agent_name=agent_name,
             wing=_palace_wing_aliases(wing) if wing else "",
             limit=last_n,
+            **scoped,
         )
         if result is None:
             return None
+        if scope.get("probe"):
+            return _topic_probe_result(result[1], "sqlite")
         total, rows = result
         entries = []
         for _drawer_id, doc, meta in rows:
@@ -210,7 +234,28 @@ def _sqlite_diary_read(agent_name: str, last_n: int, wing: str):
         return None
 
 
-def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
+def _diary_scope(thread_scope):
+    """Server-set read scope.
+
+    ``{"probe": true}`` lists entry topics and names the store that served
+    them. ``{"exclude_topics": [...], "source": store}`` reads from that same
+    store while skipping those topics before counting and windowing.
+    """
+    if not isinstance(thread_scope, dict):
+        return None
+    if set(thread_scope) == {"probe"} and thread_scope["probe"] is True:
+        return thread_scope
+    excluded = thread_scope.get("exclude_topics")
+    if (
+        set(thread_scope) == {"exclude_topics", "source"}
+        and isinstance(excluded, list)
+        and thread_scope["source"] in ("sqlite", "collection")
+    ):
+        return thread_scope
+    return None
+
+
+def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = "", thread_scope: dict = None):
     """
     Read an agent's recent diary entries. Returns the last N entries
     in chronological order — the agent's personal journal.
@@ -234,10 +279,22 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
             wing = sanitize_name(wing)
     except ValueError as e:
         return {"error": str(e)}
+    if thread_scope is not None and _diary_scope(thread_scope) is None:
+        return {"error": "invalid thread_scope"}
+    probe = thread_scope is not None and "probe" in thread_scope
+    excluded = (thread_scope or {}).get("exclude_topics") or []
+    store = (thread_scope or {}).get("source")
     last_n = max(1, min(last_n, 100))
-    result = _sqlite_diary_read(agent_name, last_n, wing)
-    if result is not None:
-        return result
+    if store != "collection":
+        result = _sqlite_diary_read(agent_name, last_n, wing, thread_scope)
+        if result is not None:
+            return result
+        if store == "sqlite":
+            # The probe ran on SQLite; never count on a different store.
+            return {"error": "diary store changed during read", "probe_fault": True}
+    elif _sqlite_diary_read(agent_name, 1, wing, {"probe": True}) is not None:
+        # The probe ran on the collection, but SQLite would serve now.
+        return {"error": "diary store changed during read", "probe_fault": True}
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
@@ -255,10 +312,12 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
         total = 0
         offset = 0
 
+        topics = []
+
         while True:
             results = col.get(
                 where=where,
-                include=["documents", "metadatas"],
+                include=["metadatas"] if probe else ["documents", "metadatas"],
                 limit=_DIARY_READ_PAGE_SIZE,
                 offset=offset,
             )
@@ -268,11 +327,17 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
 
             documents = _chroma_field(results, "documents", []) or []
             metadatas = _chroma_field(results, "metadatas", []) or []
-            total += len(batch_ids)
 
             for index in range(len(batch_ids)):
                 doc = documents[index] if index < len(documents) else ""
                 meta = _safe_meta(metadatas[index] if index < len(metadatas) else None)
+                if probe:
+                    if meta.get("topic", "") not in topics:
+                        topics.append(meta.get("topic", ""))
+                    continue
+                if meta.get("topic", "") in excluded:
+                    continue
+                total += 1
                 entries.append(
                     {
                         "date": meta.get("date", ""),
@@ -288,9 +353,11 @@ def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
             del entries[last_n:]
 
             offset += len(batch_ids)
-            if len(batch_ids) < _DIARY_READ_PAGE_SIZE:
+            if len(batch_ids) < _DIARY_READ_PAGE_SIZE or len(topics) > _DIARY_TOPIC_LIMIT:
                 break
 
+        if probe:
+            return _topic_probe_result(topics, "collection")
         return _diary_read_response(agent_name, entries, total)
     except Exception:
         logger.exception("diary_read failed")
@@ -585,6 +652,8 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
     out = {"added": [], "duplicates": [], "errors": []}
     if not isinstance(items, list):
         return {"error": "items must be a list of {wing, room, content} objects"}
+    if len(items) > 500:
+        return {"error": "checkpoint takes at most 500 items"}
     # Drawer attribution: an explicit ``added_by`` wins; otherwise fall back to
     # the diary's ``agent_name`` (the agent filing this session); otherwise the
     # legacy ``"checkpoint"`` label. A blank, whitespace-only, or non-string

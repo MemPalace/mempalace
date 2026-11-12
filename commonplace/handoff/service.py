@@ -137,8 +137,10 @@ class HandoffService:
     def run(self, principal, request: HandoffRequest, *, manual: bool = False) -> HandoffResult:
         require_launch_authority(principal)
         meta = request.meta
-        if not meta.thread_id or not meta.thread_id.strip():
-            raise ValueError("thread_id must not be empty")
+        problem = thread_store.thread_id_error(meta.thread_id)
+        if problem:
+            # Rooms are matched against stored IDs by key; only canonical IDs are filed.
+            raise ValueError(problem)
         if meta.thread_id.startswith(("import-private:", "capture:", "capture-fork:")):
             raise ValueError("thread_id uses a reserved namespace")
         workspace_id = principal.workspace_id
@@ -483,6 +485,9 @@ class HandoffService:
         return principal.role == "owner" or handoff.connection_id == principal.connection_id
 
     def register_successor(self, principal, handoff_id: str, ref: SuccessorRef) -> Handoff:
+        problem = thread_store.thread_id_error(ref.thread_id) if ref.thread_id else None
+        if problem:
+            raise ValueError(problem)
         with self.control_db._lock:
             handoff = self._authorized(principal, handoff_id)
             if handoff.state == "done":

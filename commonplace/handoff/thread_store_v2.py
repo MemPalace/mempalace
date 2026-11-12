@@ -22,6 +22,7 @@ from mempalace.sqlite_crypto import connect, row_factory
 from . import thread_frames as frames
 from .models import THREADS_WING, RecallHit, ThreadMessage
 from .thread_store import (
+    _SOURCE_KEYS_SQL,
     MIRROR_PROGRESS_SQL,
     Chunk,
     ThreadConflict,
@@ -107,6 +108,10 @@ class ThreadStoreV2(V1ThreadStore):
                         self._conn.execute(statement)
                         statement = ""
             self._conn.execute(MIRROR_PROGRESS_SQL)
+            for statement in _SOURCE_KEYS_SQL.split(";"):
+                if statement.strip():
+                    self._conn.execute(statement)
+            self._backfill_source_keys()
             self._conn.execute(f"PRAGMA user_version={USER_VERSION}")
             for name, sql in BLOCK_TRIGGERS.items():
                 self._conn.execute(f"DROP TRIGGER IF EXISTS {name}")
@@ -284,6 +289,7 @@ class ThreadStoreV2(V1ThreadStore):
                     actor,
                 ),
             )
+            self._record_source_key(stored_id, workspace_id, source_thread_id)
             cache = self._write_messages(stored_id, messages)
             self._write_chunks(stored_id, chunks, messages, cache=cache)
             self._check_storage_budget(max_storage_bytes)

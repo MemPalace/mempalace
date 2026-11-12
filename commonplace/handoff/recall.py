@@ -21,11 +21,12 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from . import provenance_refs
 from .models import RecallHit, StoredThread, ThreadMessage
 
 MAX_RANGE = 200  # messages per thread_get
 _GRANT_PREFIX = "import-private:"
-_THREAD_ID = re.compile(r"thr_[0-9a-fA-F]+")
+_THREAD_ID = provenance_refs.THREAD_ID
 _logger = logging.getLogger(__name__)
 
 

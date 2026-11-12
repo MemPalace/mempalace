@@ -32,7 +32,7 @@ From the CLI, use your workspace and connection names:
 ```bash
 commonplace handoff enable --workspace personal --threshold 0.80
 commonplace handoff status --workspace personal
-commonplace handoff disable --workspace personal --agent codex:local
+commonplace handoff disable --workspace personal --agent my-agent:local
 commonplace handoff enable --workspace personal --task '#142'
 ```
 
@@ -107,7 +107,7 @@ workspace selections show the available local names and IDs.
 Claude Code → Codex:
 
 ```bash
-commonplace handoff start --thread '<t3-thread-id>' --to codex/gpt-6.1-sol --effort max --workspace personal
+commonplace handoff start --thread '<t3-thread-id>' --to <provider>/<model> --effort max --workspace personal
 ```
 
 Codex → Claude Code:
@@ -204,8 +204,8 @@ has `source_settled:false`; retry the same command to retry settlement.
 
 `t3 thread show <id> --json --messages 0` supplies the provider instance,
 model, project ID, branch and worktree. It does **not** supply a transcript.
-The adapter opens `$T3CODE_HOME/userdata/statev2.sqlite` read-only (default
-`~/.t3/userdata/statev2.sqlite`) and reads:
+The adapter opens `userdata/statev2.sqlite` under the T3 home directory read-only
+(default `~/.t3/userdata/statev2.sqlite`) and reads:
 
 - `projection_projects.workspace_root` for a project-root thread's cwd.
 - `orchestration_v2_projection_provider_threads.payload_json`, specifically
@@ -261,7 +261,7 @@ it needs `handoff:write`, a `standard` or `full` tool profile (or an explicit
 select another workspace. For example:
 
 ```json
-{"thread_id":"mcp:source-id","to":"codex/gpt-6.1-sol","effort":"max","note":"Continue the deployment checks."}
+{"thread_id":"mcp:source-id","to":"<provider>/<model>","effort":"max","note":"Continue the deployment checks."}
 ```
 
 For automatic threshold handoffs too, set `COMMONPLACE_URL` and a
@@ -802,7 +802,10 @@ cannot read. When the card's assignee is an agent that person's Console lists,
   the same response. Mirror copies do not count as duplicates for anyone. Similarity
   dedup exclusion (D5) is verified on compact, sqlite_exact and chroma. Adding,
   updating, deleting or linking drawers in a stored-thread room requires permission to
-  read that thread. Known exceptions: `delete_by_source`, `delete_tunnel` and
+  read that thread. A room or diary topic naming a thread through an
+  `/app/threads/` path, `t3-thread://v1/` link, `mcp:` form, embedded or
+  fullwidth ID, or a T3 source ID that resolves to a stored thread, counts as
+  that thread's room, for reads and writes alike. Known exceptions: `delete_by_source`, `delete_tunnel` and
   `delete_hallway` take no room and are not checked yet. Fact mutations
   (`kg_invalidate`, `kg_supersede`, `kg_save` merges, and single-valued supersedes through `kg_save` or `fact_save`) on thread-derived facts are not
   room-checked. A member with fact-write permissions but no source-thread read access

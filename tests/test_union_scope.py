@@ -621,7 +621,11 @@ def test_cli_compatible_wing_union_never_prints_private_drawer(monkeypatch, conf
         "include_facts": False,
     }
     result = mediator._fan_out_search(principal, "mempalace_search", args)
-    assert "PUBLIC_NEEDLE" in result["cli_output"] and "PRIVATE_SECRET" not in result["cli_output"]
+    # Every principal acquires structured rows; the gateway renders CLI text later.
+    assert "cli_output" not in result
+    texts = [row["text"] for row in result["results"]]
+    assert any("PUBLIC_NEEDLE" in text for text in texts)
+    assert not any("PRIVATE_SECRET" in text for text in texts)
     member = SimpleNamespace(
         workspace_id="fixture-workspace",
         policy=Policy.build(profile="full", scopes=["memory:read"], read_wings=["public"]),

@@ -3,6 +3,10 @@
 - **Paths:** `tests/`
 - **Owns:**
 
+  - Thread-reference room regressions run every reference form against every room- or topic-returning MCP read and REST get/search, and the writable forms against every room- or topic-writing tool, with thread-reader parity on every route, owner-session, ordinary-room and undecodable-value controls; count rows prove diary totals, search counters and duplicate flags describe only visible rows, and a partial source-family reader is refused; source IDs containing each character the old token scan stopped at, upper-case IDs, a client `thread_scope`, store pinning, probe faults, unavailable memory, hidden-topic diary words on search, CLI search, media/code search, duplicate checks and REST search, `mcp` namespace spellings, non-leading `mcp:` sources (`xmcp:`, leading space or no-break space, percent-encoded namespace), the topic cap and the empty-exclusion fast path have their own rows.
+
+  - Thread-ID canonicalisation regressions refuse every non-canonical reviewer form at filing and successor registration, accept T3-shaped IDs, hide legacy rows on every read, and bound the store queries of a 500-drawer batch.
+
   - Card path-contract regressions: glob overlap rules, refusal against running cards with mutation-pinned guards, and the Spaces tool-schema snapshot for `task_update(paths)`.
 
   - #451 wing editor regressions: `tests/test_runner_owner.py` (W1-W3: picker and wing edit with the memory listing failing, fallback, bookkeeping-only and private wings), case 4g of `tests/admin_runners_ui.mjs`, and two Chromium cases in `tests/workbench_e2e/test_admin_runners.py` that add a wing while `/api/connections` hangs or the wing read fails.

@@ -1403,8 +1403,15 @@ def sqlite_diary_rows(
     agent_name: str,
     wing=(),
     limit: int = 10,
-) -> Optional[tuple[int, list[tuple[str, Optional[str], dict]]]]:
+    exclude_topics=None,
+    topics_limit=None,
+) -> Optional[tuple[int, list]]:
     """Count physical diary rows and hydrate only the newest ``limit`` rows.
+
+    ``exclude_topics`` skips rows whose decoded ``topic`` is listed before
+    counting and windowing. ``topics_limit`` instead returns ``(total,
+    topics)``: the distinct decoded topics, newest first, at most
+    ``topics_limit + 1`` of them so a caller can detect overflow.
 
     All reads share one SQLite snapshot. Rows order by the instant in
     ``filed_at``, newest first; missing timestamps sort last, with storage
@@ -1472,6 +1479,23 @@ def sqlite_diary_rows(
             # Ordered here, not in SQL: text order is not instant order across
             # naive local and UTC timestamps. One agent's diary is small.
             stamped = conn.execute("SELECT e.id, stamp.string_value " + scope, params).fetchall()
+            # An empty exclusion list leaves the page unchanged; skip the decode.
+            if topics_limit is not None or exclude_topics:
+                ids = [row_id for row_id, _ in stamped]
+                metas = _decoded_rows(conn, ids, with_row_ids=True, metadata_only=True)
+                if len(metas) != len(ids):
+                    return None
+                topic = {row_id: (metas[row_id][2] or {}).get("topic", "") for row_id in ids}
+                if topics_limit is not None:
+                    found = []
+                    for row_id, _ in _newest_first(stamped):
+                        if topic[row_id] not in found:
+                            found.append(topic[row_id])
+                            if len(found) > topics_limit:
+                                break
+                    return total, found
+                stamped = [row for row in stamped if topic[row[0]] not in exclude_topics]
+                total = len(stamped)
             selected = [row_id for row_id, _ in _newest_first(stamped)[:limit]]
             rows = _decoded_rows(conn, selected)
             return total, _scalar_rows(rows)

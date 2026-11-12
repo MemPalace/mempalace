@@ -2094,17 +2094,139 @@ shared overview, graph, KG, tunnel, hallway and drawer listings without hidden
 labels, ranks or counts. Wildcard policies can reach those projections without
 private scope; literal-wing policies keep their existing tool visibility.
 
-For principals without every-wing access, CLI-compatible search acquires structured
-hits and renders only after the same drawer gate as structured search: room and
-provenance checks; body text is not scanned. This applies with a literal wing and
-with no wing. Both CLI paths use the same pure formatter. The gateway explicitly
-renders flat rows, so import-authorization metadata cannot replace a
-readable row's wing, room or source; the owner renderer retains its metadata mode.
-Restricted CLI responses contain only query, CLI text, an empty results array,
-optional searched wings and
-non-empty facts; structured search also omits acquisition counts and truncation
-flags that could include hidden candidates. Every-wing policies retain those
-diagnostics and their existing CLI output.
+A room, or a diary topic, names a thread when any copy of its value contains a
+thread ID or a T3 source ID. The copies are the raw value and every result of
+percent-decoding followed by NFKC normalisation, repeated until the value stops
+changing (at most four rounds). The thread ID may appear as a bare ID, in an
+`/app/threads/` path or URL, in a `t3-thread://v1/` link, after `mcp:`, or next
+to letters, digits or underscores (`notes_thr_…`, `thr_…_notes`); fullwidth
+spellings count after NFKC, and an upper-case `THR_` or hex spelling names the
+stored lower-case thread, so its readers keep the room. A T3 source ID may contain
+any character (`mcp:github.com/o/r`, spaces, quotes), so each `mcp:` occurrence
+(any case) names the whole remaining value, which is resolved through the
+workspace thread store: every stored source ID, or hash-variant base, that is a
+prefix of that remainder counts, including `mcp:<source>_notes`. Source IDs are
+compared after NFKC; only the namespace case-folds. A stored source is keyed as
+NFKC first, then its variant base (cut at `#sha256:` in any case), then the
+namespace folded; the room's whole value is NFKC-normalised with its namespace
+folded and never cut at a hash marker. The tested stored spellings that match
+`mcp:x` are `MCP:x`, `Mcp:x`, a fullwidth `ｍｃｐ:x`, and the mixed-width
+`mｃｐ:x`, `mcｐ:x` and `mｃｐ：x`; any other ASCII and fullwidth mix folds the
+same way through NFKC. A stored `mcp:x#` matches a room `mcp:x#sha256:...`, a
+stored variant marked with a fullwidth number sign or an upper-case marker
+matches its base, and a bare stored `mcp:` source is a prefix of every `mcp:`
+value (it fails closed). Apart from the namespace, case is exact: `mcp:Probe`
+and `mcp:probe` are different sources (thread IDs, by contrast, match in any
+case).
+
+Filing a thread or naming a successor thread accepts only canonical thread IDs:
+the ID equals its NFKC form, has no control or format characters, no leading or
+trailing whitespace and no percent-encoding, names `mcp:` (any case, after NFKC)
+only as its leading namespace, and writes any `#sha256:` marker in lower case.
+Other IDs are refused with a `thread_id ...` error before any side effect. T3
+thread IDs (`[A-Za-z0-9][A-Za-z0-9._:@-]*`) and their `mcp:` forms pass. Each
+stored thread is keyed in an indexed side table (`thread_source_keys`: NFKC
+source, match key, legacy flag), written with the thread and backfilled for
+older stores; a room check probes the room's candidate prefixes and its whole
+NFKC value with indexed lookups, cached for the response. Sources filed before
+this check that are not canonical are legacy rows: they form a small index built
+once per response from those rows only, keyed by every `mcp:` remainder the room
+resolver could extract after percent-decoding and NFKC rounds with control and
+format characters removed and trailing whitespace stripped, cut at a variant
+marker in any case; rooms are matched against it by prefix. A room value equal
+to any stored source ID after NFKC is also hidden from readers who cannot read
+that thread. If a source lookup fails, every value that is not a bare thread ID
+is hidden. Write-side room checks share one reader per gateway call, final
+tunnel pages share one reader, and a checkpoint takes at most 500 items.
+
+One definition of a thread ID (`provenance_refs.THREAD_ID`) and one room
+check (`provenance_refs.room_references`, used through
+`mirror_access.private_thread_reference`) cover every route that returns or
+writes a room or topic. Reads: drawer reads, search (structured and
+CLI-compatible), drawer listings, room lists and status (overview projection),
+taxonomy, tunnels, graph traversal and statistics, hallways, duplicate checks and
+diary reads, including drawer `metadata.topic`. Writes: add, update, delete,
+checkpoint items and diary, tunnel creation and diary writes. A reader who cannot
+read every named thread, including every thread filed under a named source ID,
+receives the drawer or entry as not found, and the room is omitted from listings,
+exactly as for a bare thread-ID room. Readers of all those threads, including
+owners, keep the room verbatim. A source ID naming no stored thread names
+nothing; a source lookup failure hides the value.
+
+Counts and flags describe only what the reader receives. Diary reads probe the
+entry topics first, and the worker excludes entries whose topic names an
+unreadable thread before it counts or windows them, so `total` and `showing`
+cover visible entries; the final gate recounts any entry it still drops. The
+probe reports which store served it (the SQLite fast path or the collection),
+and the read is pinned to that store; a store change between the two refuses the
+read in either direction. The probe reports at most 1000 distinct topics; beyond
+that every read of that diary fails closed with an error saying the agent has too
+many diary topics to check. An empty hidden-topic list leaves the read's SQLite
+page path unchanged. A diary read never falls
+back to an unscoped count: a probe validation error is returned as the read's
+answer; paused or unavailable memory is reported exactly as on other routes (an
+error, with `retry_after_s` during an online-backup pause); any other probe fault
+is logged by class only and answered with an explicit error, for owners and
+everyone else. The diary `thread_scope` is server-only: the gateway drops any
+client value before every route and always sets its own, and the worker accepts
+it without listing it. A diary entry hidden by its topic is hidden from diary
+reads, drawer reads and listings, structured search (including unified media and
+code search), CLI search text and `check_duplicate` matches: search rows and
+duplicate matches carry the entry's `topic`, so the gate drops them.
+`check_duplicate` recomputes `is_duplicate` from the matches that pass the gate. Search acquisition counters
+and truncation flags (`total_before_filter`, `filtered_by_max_distance`,
+`date_filter_pool_truncated`, `candidates_truncated`,
+`distinct_results_truncated`) precede authorization and are omitted for every
+principal.
+
+Residual costs of failing closed. A hex run shorter than 16 digits directly
+followed by an ASCII letter is an ordinary word (`thr_deadline`, `thr_notes`).
+Any other `thr_<hex>` run counts as an ID, so hex-looking ordinary names such
+as `thr_cafe` or `notes thr_add` resolve to no thread and are hidden from every
+reader, owners included. Room-name validation refuses `/`, `:`, `%` and control
+characters in rooms written through the tools, so link, `mcp:` and undecodable
+forms reach storage through older or imported data and through owner
+configuration: the project miner files drawers under room names taken from the
+project's `mempalace.yml` without that validation. Values that cannot be decoded
+(control or format characters, invalid percent-encoded UTF-8, more than four
+percent levels in one round, still changing after four decode/NFKC rounds, or
+over the citation length limit) are also hidden from every reader. Wing names
+are outside this check: a wing named like a thread ID is filtered by wing policy
+alone.
+
+Known residuals. A legacy stored source whose `mcp:` is not the leading
+namespace (for example `xmcp:x`, filed before thread IDs were checked) still
+counts as naming `mcp:x`, so a room `mcp:x` is hidden from readers who can read
+a canonical `mcp:x` thread but not that legacy twin; no new such twin can be
+filed. The diary probe and the read are two worker calls: a hidden
+entry filed between them with a `filed_at` older than the newest `last_n`
+entries is neither excluded nor in the window, so `total` can count it once.
+Its words and topic are never returned. `mcp:` source IDs in knowledge-graph
+fact sources, tunnel labels and drawer provenance (`source_thread`,
+`source_kept.thread`) are checked only for thread IDs and capture references,
+not resolved as T3 sources; those paths predate this room check.
+
+CLI rendering rule (replaces the earlier rule that
+every-wing policies keep worker-rendered CLI output and search diagnostics):
+CLI-compatible search, for every principal, acquires structured hits and renders
+only after the same drawer gate as structured search: room, topic and provenance
+checks; body text is not scanned. A see-all reader may still lack a thread that a
+room names, so no principal receives worker-rendered CLI text. This applies with
+a literal wing and with no wing. Both CLI paths use the same pure formatter. The
+gateway explicitly renders flat rows, so import-authorization metadata cannot
+replace a readable row's wing, room or source. CLI responses contain only query,
+CLI text, an empty results array, optional searched wings and non-empty facts.
+
+Owner-visible changes from this rule set. Search acquisition counters and
+truncation flags are no longer returned to owners. Owner CLI search uses the
+gateway's flat rendering, so an empty result reads `No results found for:
+"<query>"`, and owner CLI searches with `source_file`, `min_similarity`,
+`max_distance`, `context`, `include_media` or a non-search `query_task` are
+refused with the same errors as for other principals. Structured search rows and
+`check_duplicate` matches for diary entries carry their `topic`. Diary reads cost
+one extra metadata-only worker call (the topic probe). Rooms and topics naming a
+thread the owner cannot read (another person's capture thread, a hex-looking
+name, an undecodable value) are hidden from owners too.
 
 Content placed in an ordinary shared room is visible on every route. Body text
 and arbitrary provenance labels are not scanned for private words or fingerprinted;

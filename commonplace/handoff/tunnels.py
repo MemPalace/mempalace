@@ -118,6 +118,7 @@ def project(gateway, principal, workers, name, args, *, timeout=660.0, raise_on_
             access = reader(gateway, principal)
             allowed = [item for item in allowed if visible(item, access)]
             output = []
+            current_access = None
             for start in range(0, max(1, len(allowed)), TUNNEL_PAGE):
                 result = workers.call_tool(
                     principal,
@@ -135,7 +136,8 @@ def project(gateway, principal, workers, name, args, *, timeout=660.0, raise_on_
                     return failed()
                 # Final rows carry the current label; authorize it again after
                 # endpoint revalidation, before any public label is returned.
-                current_access = reader(gateway, principal)
+                # One reader serves every final page.
+                current_access = current_access or reader(gateway, principal)
                 if name == "mempalace_list_tunnels":
                     result = [
                         row

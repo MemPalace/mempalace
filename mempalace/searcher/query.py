@@ -487,6 +487,7 @@ def _search_drawer_memories(
             "source_path": source,
             **_result_date_fields(meta),
             **_result_author_fields(meta),
+            **_result_topic_fields(meta),
             # Similarity is the raw vector score. Closet boost ranks via
             # effective_distance but must not inflate the advertised score.
             "similarity": round(_distance_to_similarity(dist, metric), 3),

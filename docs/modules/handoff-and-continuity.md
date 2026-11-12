@@ -9,9 +9,11 @@
 
 - **Promises:**
 
+  - `provenance_refs.THREAD_ID` is the one thread-ID definition (stores, recall and scans). `room_references` names the lower-cased thread IDs and the whole remaining value after each `mcp:` in a room, topic or link across the raw value and repeated decode/NFKC rounds until stable, and returns None for undecodable or still-changing values; `private_thread_reference` resolves source IDs through `by_source_prefix` (every stored source or hash-variant base that is a prefix of the room's whole `room_match_value`, probed by indexed prefix lookups on `source_match_key`: NFKC, then the variant base cut at `#sha256:` in any case, then the namespace folded; a bare `mcp:` matches every value); `exact_source_readable` also hides a value equal to a stored source ID after NFKC, or naming an `mcp:` remainder a legacy stored source resolves to, using indexed store lookups cached per response, and hides any value naming a thread the reader cannot read, in rooms, diary topics and read_wing room filtering. `thread_id_error` refuses non-canonical thread IDs at filing and successor registration, and `thread_source_keys` indexes every stored source by NFKC value, match key and legacy flag. The gate recounts diary `total`/`showing` and recomputes `is_duplicate` after dropping rows. Ordinary words such as `thr_deadline` name no thread.
+
   - Thread-store storage budgets read `page_size` and `page_count` as integers, so a budgeted write in an encrypted (SQLCipher) workspace is checked instead of failing with a type error.
 
-  - The final search gate proves source_path like source_file, including nested folded copies and media path/title aliases, and omits acquisition counts and truncation flags for restricted readers. Body text and arbitrary provenance labels are not scanned for private words.
+  - The final search gate proves source_path like source_file, including nested folded copies and media path/title aliases, and omits acquisition counts and truncation flags for every reader, since acquisition precedes thread authorization. Body text and arbitrary provenance labels are not scanned for private words.
 
   - Graph mediation validates and rechecks the descriptor-bound SQLite sort values before traversal and ranking.
 

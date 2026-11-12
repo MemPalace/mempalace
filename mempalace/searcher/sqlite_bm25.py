@@ -38,6 +38,11 @@ def _result_author_fields(meta: dict) -> dict:
     return {k: meta[k] for k in _AUTHOR_FIELDS if isinstance(meta.get(k), str)}
 
 
+def _result_topic_fields(meta: dict) -> dict:
+    """A diary entry's topic, so a gateway can check any thread it names."""
+    return {"topic": meta["topic"]} if meta.get("topic") is not None else {}
+
+
 def _window_sql_prefilters(since_dt, before_dt) -> list:
     """(operator, bound-string) pairs for the SQL date-window narrowing.
 
@@ -288,6 +293,7 @@ def _bm25_only_via_sqlite(
                 "source_path": full_source,
                 **_result_date_fields(meta),
                 **_result_author_fields(meta),
+                **_result_topic_fields(meta),
                 # No vector distance available in BM25-only mode.
                 "similarity": None,
                 "distance": None,
@@ -457,6 +463,7 @@ def _merge_bm25_union_candidates(
             "source_path": full_source,
             **_result_date_fields(meta),
             **_result_author_fields(meta),
+            **_result_topic_fields(meta),
             "similarity": (
                 None if distance is None else round(_distance_to_similarity(distance, metric), 3)
             ),

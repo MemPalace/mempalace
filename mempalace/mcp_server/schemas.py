@@ -646,6 +646,7 @@ TOOLS = {
             "properties": {
                 "items": {
                     "type": "array",
+                    "maxItems": 500,
                     "description": "Verbatim items to file. Each is {wing, room, content} — content is the exact words, never summarized.",
                     "items": {
                         "type": "object",
@@ -986,6 +987,8 @@ TOOLS = {
                     "type": "string",
                     "description": "Wing to read diary entries from (optional). If omitted, reads from wing_{agent_name}.",
                 },
+                # Server-only: accepted from the Commonplace gateway, never listed.
+                "thread_scope": {"type": "object", "x-mempalace-server-only": True},
             },
             "required": ["agent_name"],
         },

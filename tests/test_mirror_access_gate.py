@@ -220,7 +220,8 @@ def test_restricted_search_omits_acquisition_diagnostics(world):
         "candidates_truncated": True,
         "distinct_results_truncated": True,
     }
-    assert gate(world.gateway, world.principal, "search", payload) == payload
+    # Acquisition precedes thread authorization even for see-all readers.
+    assert gate(world.gateway, world.principal, "search", payload) == {"results": []}
     principal = replace(
         world.principal, policy=replace(world.principal.policy, scopes=("memory:read",))
     )
@@ -767,7 +768,9 @@ def test_fact_search_is_gated_before_cli_rendering(world, monkeypatch):
     )
     result = _tool_result(response)
     assert result.get("facts", []) == []
-    assert result["cli_output"] == "No drawers"
+    # CLI text is rendered by the gateway from gated rows, never by the worker.
+    assert "hidden words" not in result["cli_output"]
+    assert result["cli_output"] == '\n  No results found for: "Sample"\n'
 
 
 def test_memory_map_uses_same_fact_source_rule(world, tmp_path):

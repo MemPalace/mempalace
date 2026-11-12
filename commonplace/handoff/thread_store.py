@@ -18,14 +18,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote
 
 from mempalace.sqlite_crypto import connect, integrity_error_type, row_factory
 
@@ -151,6 +154,118 @@ def _stored_thread(row: Optional[sqlite3.Row]) -> Optional[StoredThread]:
     )
 
 
+_MCP = re.compile("mcp:", re.IGNORECASE)
+_HASH_MARKER = re.compile(re.escape("#sha256:"), re.IGNORECASE)
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
+# Percent-decode/NFKC rounds when deriving keys for legacy source IDs.
+_LEGACY_ROUNDS = 5
+# Room-check probes are sent in chunks below SQLite's parameter limit.
+_PROBE_CHUNK = 500
+
+
+def _fold_namespace(text: str) -> str:
+    namespace, sep, rest = text.partition(":")
+    return "mcp:" + rest if sep and namespace.lower() == "mcp" else text
+
+
+def _variant_base(text: str) -> str:
+    """Cut at a ``#sha256:`` variant marker, in any case."""
+    marker = _HASH_MARKER.search(text)
+    return text[: marker.start()] if marker else text
+
+
+def _without_controls(text: str) -> str:
+    return "".join(c for c in text if unicodedata.category(c) not in ("Cc", "Cf"))
+
+
+def thread_id_error(thread_id) -> Optional[str]:
+    """Why a client-chosen thread ID cannot be filed, or None when it is canonical.
+
+    A canonical ID equals its NFKC form, has no control or format characters,
+    no leading or trailing whitespace and no percent-encoding, names ``mcp:``
+    (any case) only as its leading namespace, and writes any ``#sha256:``
+    variant marker in lower case. Rooms are matched against stored IDs, so
+    only these spellings can be resolved by key.
+    """
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return "thread_id must not be empty"
+    if any(unicodedata.category(c) in ("Cc", "Cf") for c in thread_id):
+        return "thread_id must not contain control or format characters"
+    if thread_id != thread_id.strip():
+        return "thread_id must not have leading or trailing whitespace"
+    if unicodedata.normalize("NFKC", thread_id) != thread_id:
+        return "thread_id must be NFKC-normalised"
+    if _PERCENT_ESCAPE.search(thread_id):
+        return "thread_id must not contain percent-encoded characters"
+    if any(match.start() != 0 for match in _MCP.finditer(thread_id)):
+        return "thread_id may contain mcp: only as its leading namespace"
+    if any(match[0] != "#sha256:" for match in _HASH_MARKER.finditer(thread_id)):
+        return "thread_id must write the #sha256: variant marker in lower case"
+    return None
+
+
+def source_match_key(source: str) -> str:
+    """How a stored source ID is compared for room authorization: NFKC first,
+    then its hash-variant base (marker in any case), then an ``mcp`` namespace
+    in any case as ``mcp:``."""
+    return _fold_namespace(_variant_base(unicodedata.normalize("NFKC", source)))
+
+
+def room_match_value(value: str) -> str:
+    """A room's whole value, NFKC-normalised with the namespace folded; never cut
+    at a hash marker, so a stored source ending inside one still matches."""
+    return _fold_namespace(unicodedata.normalize("NFKC", value))
+
+
+def legacy_match_keys(source: str) -> set:
+    """Keys for a stored source ID that is not canonical (filed before IDs were
+    checked). Each ``mcp:`` remainder the room resolver could extract, after
+    percent-decoding and NFKC rounds with control and format characters
+    removed and trailing whitespace stripped, cut at its variant marker."""
+    texts, current = [], source
+    for _ in range(_LEGACY_ROUNDS):
+        cleaned = _without_controls(unicodedata.normalize("NFKC", current))
+        texts.append(cleaned)
+        decoded = unquote(cleaned, errors="replace")
+        if decoded == cleaned:
+            break
+        current = decoded
+    keys = set()
+    for text in texts:
+        for match in _MCP.finditer(text):
+            keys.add(_variant_base("mcp:" + text[match.end() :]).rstrip())
+    return keys
+
+
+def _source_key_row(thread_id, workspace_id, source):
+    return (
+        thread_id,
+        workspace_id,
+        unicodedata.normalize("NFKC", source),
+        source_match_key(source),
+        0 if thread_id_error(source) is None else 1,
+    )
+
+
+_SOURCE_KEYS_SQL = """
+CREATE TABLE IF NOT EXISTS thread_source_keys (
+    thread_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    source_nfkc TEXT NOT NULL,
+    source_key TEXT NOT NULL,
+    legacy INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS thread_source_keys_key
+    ON thread_source_keys(workspace_id, source_key);
+CREATE INDEX IF NOT EXISTS thread_source_keys_nfkc
+    ON thread_source_keys(workspace_id, source_nfkc);
+CREATE INDEX IF NOT EXISTS thread_source_keys_legacy
+    ON thread_source_keys(workspace_id, legacy);
+CREATE INDEX IF NOT EXISTS thread_source_keys_length
+    ON thread_source_keys(workspace_id, length(source_key));
+"""
+
+
 class ThreadStore:
     def __init__(self, path: str):
         self._lock = threading.RLock()
@@ -217,6 +332,8 @@ class ThreadStore:
                 """
             )
             self._conn.execute(MIRROR_PROGRESS_SQL)
+            self._conn.executescript(_SOURCE_KEYS_SQL)
+            self._backfill_source_keys()
             self._fts_verified_version = None
             self._fts_enabled = self._init_fts()
         except BaseException:
@@ -559,6 +676,7 @@ class ThreadStore:
                         actor,
                     ),
                 )
+                self._record_source_key(stored.id, workspace_id, source_thread_id)
                 self._conn.executemany(
                     """INSERT INTO messages
                        (thread_id, seq, role, kind, name, call_id, at, text, raw)
@@ -737,6 +855,82 @@ class ThreadStore:
                 (workspace_id, base, prefix, prefix),
             ).fetchall()
             return [_stored_thread(row) for row in rows]
+
+    def _backfill_source_keys(self):
+        """Key every stored thread once; additive, so older stores catch up."""
+        rows = self._conn.execute(
+            "SELECT id, workspace_id, source_thread_id FROM threads "
+            "WHERE id NOT IN (SELECT thread_id FROM thread_source_keys)"
+        ).fetchall()
+        if rows:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO thread_source_keys VALUES (?, ?, ?, ?, ?)",
+                [_source_key_row(row[0], row[1], row[2]) for row in rows],
+            )
+
+    def _record_source_key(self, thread_id, workspace_id, source):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO thread_source_keys VALUES (?, ?, ?, ?, ?)",
+            _source_key_row(thread_id, workspace_id, source),
+        )
+
+    def _keyed_threads(self, workspace_id, column, values):
+        found = []
+        for start in range(0, len(values), _PROBE_CHUNK):
+            chunk = values[start : start + _PROBE_CHUNK]
+            found.extend(
+                self._conn.execute(
+                    "SELECT t.* FROM thread_source_keys k JOIN threads t ON t.id = k.thread_id "
+                    f"WHERE k.workspace_id=? AND k.{column} IN ({','.join('?' for _ in chunk)}) "
+                    "ORDER BY t.id",
+                    (workspace_id, *chunk),
+                ).fetchall()
+            )
+        return [_stored_thread(row) for row in found]
+
+    def by_source_prefix(self, workspace_id: str, value: str) -> list[StoredThread]:
+        """Threads whose source key is a prefix of the room's ``room_match_value``.
+
+        Source keys are NFKC-normalised, cut at a ``#sha256:`` marker in any case,
+        and fold the ``mcp`` namespace in any case. The room's candidate prefixes
+        are probed with indexed lookups, so ``mcp:<source>_notes`` finds threads
+        filed under ``mcp:<source>``, a stored ``mcp:<source>#`` matches a room
+        ``mcp:<source>#sha256:...``, and a bare stored ``mcp:`` matches every
+        ``mcp:`` value. Legacy (non-canonical) sources are resolved separately.
+        """
+        target = room_match_value(value)
+        if not target.startswith("mcp:"):
+            return []
+        with self._lock:
+            # No stored key is longer than the longest one, so a long room costs
+            # no more than a short one (indexed on the key length).
+            longest = self._conn.execute(
+                "SELECT max(length(source_key)) FROM thread_source_keys WHERE workspace_id=?",
+                (workspace_id,),
+            ).fetchone()[0]
+            if not longest:
+                return []
+            prefixes = [target[:end] for end in range(len("mcp:"), min(len(target), longest) + 1)]
+            return self._keyed_threads(workspace_id, "source_key", prefixes)
+
+    def by_source_value(self, workspace_id: str, value: str) -> list[StoredThread]:
+        """Threads whose whole NFKC source ID equals the room's NFKC value."""
+        with self._lock:
+            return self._keyed_threads(
+                workspace_id, "source_nfkc", [unicodedata.normalize("NFKC", value)]
+            )
+
+    def legacy_sources(self, workspace_id: str) -> list[tuple[str, str]]:
+        """Thread ID and source ID of every stored source filed before IDs were
+        checked; expected to be empty or tiny."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT t.id, t.source_thread_id FROM thread_source_keys k "
+                "JOIN threads t ON t.id = k.thread_id "
+                "WHERE k.workspace_id=? AND k.legacy=1 ORDER BY t.id",
+                (workspace_id,),
+            ).fetchall()
+            return [(row[0], row[1]) for row in rows]
 
     def list_source_range(self, workspace_id, prefix, *, after=None, limit):
         """Page a literal source namespace in binary identity order."""

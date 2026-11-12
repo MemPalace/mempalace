@@ -141,7 +141,8 @@ def test_search_hides_candidate_counts(case, wing, cli):
         **({"wing": wing} if wing else {}),
     }
     owner = call(case.w, case.owner, "search", **args)
-    assert owner.get("total_before_filter", 0) > 0 and owner.get("results")
+    assert owner.get("results")
+    assert "total_before_filter" not in owner, "Pre-gate counts are never returned"
     result = call(case.w, case.actor, "search", cli_compatible=cli, **args)
     # Restricted searches refill the limit after authorization (#299), so a
     # readable drawer may take the hidden match's place; the hidden one must not.
@@ -191,7 +192,7 @@ def test_cli_search_hides_protected_shared_copy(case, wing, query):
 
 
 @pytest.mark.parametrize("wing", [None, "shared"])
-def test_cli_search_owner_keeps_existing_renderer(case, wing, monkeypatch):
+def test_cli_search_owner_renders_from_gated_rows(case, wing, monkeypatch):
     seen = []
     original = case.w.gateway.mediator.workers.post
 
@@ -211,7 +212,9 @@ def test_cli_search_owner_keeps_existing_renderer(case, wing, monkeypatch):
         **({"wing": wing} if wing else {}),
     )
     assert "zqmutationfixture synthetic verbatim words" in result.get("cli_output", "")
-    assert seen and all(seen), "Every-wing principal no longer uses the worker CLI renderer"
+    # A see-all owner may still lack a thread a room names: the worker never
+    # renders CLI text; the gateway renders it after the drawer gate.
+    assert seen and not any(seen), "Every-wing principal received worker-rendered CLI text"
 
 
 def save(c, obj="old", actor=None, wing="shared", **kwargs):

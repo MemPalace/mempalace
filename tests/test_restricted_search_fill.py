@@ -150,8 +150,9 @@ def test_every_wing_principal_keeps_single_worker_search(filters):
     world = search_world(every_wing=True)
     result = request(world, **filters)
     assert [call["limit"] for call in world.calls] == [2]
-    assert result["total_before_filter"] == 13
-    assert result["filtered_by_max_distance"] == 9
+    # Candidate acquisition precedes thread authorization, so no reader (a
+    # see-all one included) gets counts that describe more than its visible rows.
+    assert not {"total_before_filter", "filtered_by_max_distance"}.intersection(result)
 
 
 def test_refill_retains_filters_and_one_joint_wing_ranking():

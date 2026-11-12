@@ -1,7 +1,7 @@
 """Apply thread read boundaries to every outgoing mirror drawer."""
 
 import math
-import re
+import unicodedata
 from pathlib import Path
 
 from commonplace.policy import canonical_wing
@@ -11,9 +11,9 @@ from . import provenance_refs
 from .hallway_fields import NUMERIC_KEYS, public_row
 from .models import MIRROR_WING
 from .recall import Recall
+from .thread_store import legacy_match_keys, room_match_value
 
 _DROP = object()
-_THREAD_ROOM = re.compile(r"thr_[0-9a-f]+\Z")
 
 
 class _ResponseAccess:
@@ -90,11 +90,84 @@ class _ResponseAccess:
 
     def reference(self, token):
         if token.lower().startswith("thr_"):
-            return self(token)
-        mode = "exact" if "#sha256:" in token.lower() else "family"
+            # Stored IDs are lower case; an upper-case spelling names the same thread.
+            return self(token.lower())
+        rows = self._source_rows(token)
+        return bool(rows) and any(self(row.id) for row in rows)
+
+    def exact_source_readable(self, value, names):
+        """A value equal to a stored source ID (after NFKC), or naming an ``mcp:``
+        remainder that a legacy (non-canonical) stored source resolves to, is
+        shown only to readers of every such thread.
+
+        Both are indexed store lookups, cached for this response. If a lookup
+        fails, every value that is not a bare thread ID is hidden.
+        """
+        rows = self._lookup(
+            ("value", unicodedata.normalize("NFKC", value)),
+            lambda store, workspace: store.by_source_value(workspace, value),
+        )
+        legacy = self._lookup(
+            ("legacy",),
+            lambda store, workspace: [
+                (key, thread)
+                for thread, source in store.legacy_sources(workspace)
+                for key in legacy_match_keys(source)
+            ],
+        )
+        if rows is None or legacy is None:
+            return provenance_refs.is_thread_id(value)
+        threads = [row.id for row in rows]
+        for name in names:
+            if name.startswith("mcp:"):
+                target = room_match_value(name)
+                threads.extend(thread for key, thread in legacy if target.startswith(key))
+        return all(self(thread) for thread in threads)
+
+    def _lookup(self, key, fetch):
+        """One cached store lookup; no handoff (or a workspace without threads)
+        means no stored sources, and a failed or unreadable lookup is None."""
+        if key not in self.private:
+            self.private[key] = None
+            try:
+                ctx = getattr(self.gateway, "handoff", None)
+                workspace = self.principal.workspace_id
+                has_threads = getattr(ctx, "has_threads", None)
+                if ctx is None or (
+                    # A workspace that never stored a thread has no sources;
+                    # never create its thread store just to look.
+                    ctx._stores.get(workspace) is None
+                    and has_threads is not None
+                    and not has_threads(workspace)
+                ):
+                    self.private[key] = []
+                else:
+                    checks.remaining(0)
+                    store = (
+                        ctx._stores.get(self.principal.workspace_id)
+                        if checks._deadline.get() is not None
+                        else ctx.store_for(self.principal.workspace_id)
+                    )
+                    # Under a deadline an unloaded store of a workspace that has
+                    # threads cannot be read in time: fail closed, like _source_rows.
+                    if store is not None:
+                        self.private[key] = fetch(store, self.principal.workspace_id)
+            except Exception:
+                pass
+        return self.private[key]
+
+    def source_readable(self, token):
+        """A room naming source IDs is shown only to readers of every thread filed
+        under any of them; naming no stored thread reveals none; faults hide it."""
+        rows = self._source_rows(token, "prefix")
+        return rows is not None and all(self(row.id) for row in rows)
+
+    def _source_rows(self, token, mode=None):
+        """Stored threads filed under a source ID in this workspace; None on fault."""
+        mode = mode or ("exact" if "#sha256:" in token.lower() else "family")
         key = (self.principal.workspace_id, mode, token)
         if key not in self.private:
-            self.private[key] = False
+            self.private[key] = None
             try:
                 ctx = self.gateway.handoff
                 checks.remaining(0)
@@ -104,13 +177,15 @@ class _ResponseAccess:
                     else ctx.store_for(self.principal.workspace_id)
                 )
                 if store is None:
-                    return False
+                    return None
                 if mode == "exact":
                     found = store.by_source(self.principal.workspace_id, token)
                     rows = [found] if found is not None else []
+                elif mode == "prefix":
+                    rows = store.by_source_prefix(self.principal.workspace_id, token)
                 else:
                     rows = store.by_source_family(self.principal.workspace_id, token)
-                self.private[key] = any(self(row.id) for row in rows)
+                self.private[key] = rows
             except Exception:
                 pass
         return self.private[key]
@@ -163,10 +238,34 @@ def reader(gateway, principal):
     return _ResponseAccess(gateway, principal)
 
 
+def private_thread_reference(access, value):
+    """A value naming any thread this reader cannot read is not shown to them."""
+    names = provenance_refs.room_references(value)
+    if names is None:
+        return True
+    exact = getattr(access, "exact_source_readable", None)
+    if isinstance(value, str) and exact is not None and not exact(value, names):
+        return True
+    source = getattr(access, "source_readable", None)
+    return any(
+        not access(name) if name[:4].lower() == "thr_" else source is None or not source(name)
+        for name in names
+    )
+
+
 def unreadable_room(can_read, wing, room):
-    mirror = isinstance(wing, str) and canonical_wing(wing) == MIRROR_WING
-    thread = isinstance(room, str) and _THREAD_ROOM.fullmatch(room)
-    return bool((mirror or thread) and (not isinstance(room, str) or not can_read(room)))
+    if isinstance(wing, str) and canonical_wing(wing) == MIRROR_WING:
+        return not isinstance(room, str) or not can_read(room)
+    return private_thread_reference(can_read, room)
+
+
+def _hidden_place(can_read, node, fact, import_row):
+    """Rooms and diary topics name threads alike; a proved import row keeps its room."""
+    wing = None if fact else node.get("wing")
+    if not import_row and unreadable_room(can_read, wing, node.get("room")):
+        return True
+    # Diary entries and their drawer metadata carry a topic beside the room.
+    return "topic" in node and private_thread_reference(can_read, node["topic"])
 
 
 def fact_visible(candidate, can_read):
@@ -223,7 +322,7 @@ def filter_room_keys(rule, result, can_read):
         rooms = {
             r: count
             for r, count in result["rooms"].items()
-            if not (_THREAD_ROOM.fullmatch(r) and not can_read(r))
+            if not private_thread_reference(can_read, r)
         }
         return result if rooms == result["rooms"] else {**result, "rooms": rooms}
     return result
@@ -346,22 +445,23 @@ def _proved_thread(value, access):
     )
 
 
+_ACQUISITION_COUNTS = frozenset(
+    {
+        "total_before_filter",
+        "filtered_by_max_distance",
+        "date_filter_pool_truncated",
+        "candidates_truncated",
+        "distinct_results_truncated",
+    }
+)
+
+
 def _without_search_acquisition_counts(principal, rule, result):
-    if rule == "search" and isinstance(result, dict) and not principal.policy.sees_all_wings:
-        # Candidate acquisition precedes drawer authorization. Neither its
-        # counts nor its truncation flags describe this reader's visible set.
-        result = {
-            key: value
-            for key, value in result.items()
-            if key
-            not in {
-                "total_before_filter",
-                "filtered_by_max_distance",
-                "date_filter_pool_truncated",
-                "candidates_truncated",
-                "distinct_results_truncated",
-            }
-        }
+    # Candidate acquisition precedes drawer and thread authorization, for every
+    # principal: even a see-all reader may lack a thread a room names. Neither
+    # its counts nor its truncation flags describe the visible set.
+    if rule == "search" and isinstance(result, dict) and _ACQUISITION_COUNTS & set(result):
+        result = {key: value for key, value in result.items() if key not in _ACQUISITION_COUNTS}
     return result
 
 
@@ -406,9 +506,7 @@ def gate(gateway, principal, rule, result, *, access=None):
                 if node is _DROP:
                     return _DROP
             node = scrub_provenance(node, access)
-            if not import_row and unreadable_room(
-                can_read, None if fact else node.get("wing"), node.get("room")
-            ):
+            if _hidden_place(can_read, node, fact, import_row):
                 return _DROP
             if "connected_wing" in node and unreadable_room(
                 can_read, node.get("connected_wing"), node.get("connected_room")
@@ -530,19 +628,41 @@ def _reader_fact(node, reader_recall, principal):
 
 
 def _recount(original, cleaned):
+    """Counts and flags in a gated reply describe only what the reader receives."""
     for key in ("drawers", "results"):
         if isinstance(cleaned.get(key), list) and cleaned[key] is not original.get(key):
             cleaned.pop("total", None)
             if "count" in cleaned:
                 cleaned["count"] = len(cleaned[key])
+    matches = cleaned.get("matches")
+    if isinstance(matches, list) and matches is not original.get("matches"):
+        if "is_duplicate" in cleaned:
+            cleaned["is_duplicate"] = bool(matches)
+    entries, before = cleaned.get("entries"), original.get("entries")
+    if (
+        "showing" in original
+        and isinstance(entries, list)
+        and isinstance(before, list)
+        and entries is not before
+    ):
+        # A diary page. The worker already excluded hidden topics outside this
+        # window before counting, so only the entries dropped here remain.
+        total = original.get("total")
+        cleaned["total"] = max(
+            0, (total if type(total) is int else 0) - (len(before) - len(entries))
+        )
+        cleaned["showing"] = len(entries)
+        if not entries and cleaned["total"] == 0:
+            for key in ("total", "showing"):
+                cleaned.pop(key)
+            cleaned["message"] = "No diary entries yet."
 
 
 def _is_fact(node):
     return bool({"predicate", "object", "fact", "triple_id"}.intersection(node))
 
 
-def _thread_id(value):
-    return isinstance(value, str) and _THREAD_ROOM.fullmatch(value) is not None
+_thread_id = provenance_refs.is_thread_id
 
 
 def _fact_sources(node):

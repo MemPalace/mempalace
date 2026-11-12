@@ -1221,6 +1221,9 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
                             "id": drawer_id,
                             "wing": meta.get("wing", "?"),
                             "room": meta.get("room", "?"),
+                            # A diary entry's topic, so a gateway can check
+                            # any thread it names before returning the match.
+                            **({"topic": meta["topic"]} if meta.get("topic") is not None else {}),
                             "similarity": similarity,
                             "content": doc[:200] + "..." if len(doc) > 200 else doc,
                         }

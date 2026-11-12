@@ -42,6 +42,7 @@ def search_with_media(
         _distance_to_similarity,
         _result_author_fields,
         _result_date_fields,
+        _result_topic_fields,
         _search_result_envelope,
         build_where_filter,
     )
@@ -137,6 +138,7 @@ def search_with_media(
                     "matched_via": "shared_vector",
                     **_result_date_fields(metadata),
                     **_result_author_fields(metadata),
+                    **_result_topic_fields(metadata),
                 }
                 if result_type == "asset":
                     hit.update(

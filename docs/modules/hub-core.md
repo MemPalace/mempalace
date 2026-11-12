@@ -19,7 +19,13 @@
 
 - **Promises:**
 
-  - Restricted CLI-compatible search acquires structured hits and renders only after the final drawer gate, on literal-wing and fan-out paths. Its closed response vocabulary never includes structured hits; flat rendering ignores unrelated import metadata, the pure canonical formatter is shared with the owner worker path, and CLI argument restrictions remain.
+  - Diary reads probe entry topics through the worker and exclude topics naming unreadable threads before the worker counts or windows entries, pinned to the probe's store. A client `thread_scope` never reaches the worker. A probe validation error is returned as the answer, an over-limit probe answers that the agent has too many diary topics to check, paused or unavailable memory propagates as on other routes, and other probe faults are logged by class and answered with an explicit error; no read falls back to an unscoped count.
+
+  - The write-side room check shares the handoff thread-reference check, including diary and checkpoint diary topics, so a room or topic naming an unreadable thread in any form is refused as not found.
+
+  - Write-side room checks (`_check_thread_room`, `_drawer_wings` and the checkpoint loop) share one reader per gateway call, and a checkpoint takes at most 500 items.
+
+  - CLI-compatible search, for every principal, acquires structured hits and renders only after the final drawer gate, on literal-wing and fan-out paths. Its closed response vocabulary never includes structured hits; flat rendering ignores unrelated import metadata, the pure canonical formatter is shared with the owner worker path, and CLI argument restrictions remain.
 
   - Owner-granted `cards:decide`: only the signed-in owner's principal can grant it, to their own top-level, non-agent, non-seat connection; loaded policies drop it with ownership; the stored grant is removed on demotion (a trigger on `UPDATE` of `memberships.role` from owner), on coordinator assignment and on every coordinator removal or replacement (`board_set`, auto-unbind; a separate control-DB commit ordered before the board COMMIT, not atomic with it) and when an expired PAT is rotated; OAuth issue and refresh return only live scopes. Holders answer only asks addressed to their own person, each answer audited as `card.decide.delegated` with the connection id; `LocalTool.untrusted_scope` admits untrusted holders to `decide` only.
 

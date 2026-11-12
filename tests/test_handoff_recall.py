@@ -1,6 +1,7 @@
 """Recall access, chains, ranking and verbatim range reads without a worker."""
 
 import builtins
+import unicodedata
 from dataclasses import replace
 
 import pytest
@@ -9,6 +10,7 @@ from commonplace.control_db import Principal
 from commonplace.handoff import palace_mirror
 from commonplace.handoff.models import RecallHit, StoredThread, ThreadMessage
 from commonplace.handoff.recall import MAX_RANGE, Recall, ThreadNotFound
+from commonplace.handoff.thread_store import room_match_value, source_match_key, thread_id_error
 from commonplace.policy import Policy
 
 
@@ -39,6 +41,33 @@ class MemoryStore:
     def search(self, stored_ids, query, limit=8):
         self.calls.append(("search", stored_ids, query, limit))
         return self.hits[:limit]
+
+    # The source-key lookups real thread stores index; not recorded in calls.
+    def by_source_value(self, workspace_id, value):
+        key = unicodedata.normalize("NFKC", value)
+        return [
+            thread
+            for thread in self.threads.values()
+            if thread.workspace_id == workspace_id
+            and unicodedata.normalize("NFKC", thread.source_thread_id) == key
+        ]
+
+    def by_source_prefix(self, workspace_id, value):
+        target = room_match_value(value)
+        return [
+            thread
+            for thread in self.threads.values()
+            if thread.workspace_id == workspace_id
+            and target.startswith("mcp:")
+            and target.startswith(source_match_key(thread.source_thread_id))
+        ]
+
+    def legacy_sources(self, workspace_id):
+        return [
+            (thread.id, thread.source_thread_id)
+            for thread in self.threads.values()
+            if thread.workspace_id == workspace_id and thread_id_error(thread.source_thread_id)
+        ]
 
 
 def reader(*, scopes=("threads:read", "memory:read"), wings=("threads",)):

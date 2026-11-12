@@ -58,7 +58,20 @@ REFUSE = object()
 # Four decoding rounds remain O(input length); scanning is bounded by this cap.
 MAX_REFERENCE_CHARS = 16_384
 _MAX_REFERENCE_CHARS = MAX_REFERENCE_CHARS
-_THREAD = re.compile(r"thr_[0-9a-f]+", re.IGNORECASE)
+# The one definition of a thread ID. Stored IDs fullmatch THREAD_ID; scans
+# also accept an upper-case prefix, so no spelling escapes the check.
+THREAD_ID = re.compile(r"thr_[0-9a-fA-F]+")
+_THREAD = re.compile(THREAD_ID.pattern, re.IGNORECASE)
+# Stored threads keep their caller's source ID; T3 source IDs carry this prefix.
+# A source ID may contain any character, so a match is the whole remaining
+# value: thread stores resolve every stored source that prefixes it.
+_SOURCE = re.compile("mcp:", re.IGNORECASE)
+# Real thread IDs have 16 hex digits. A shorter run directly followed by an
+# ASCII letter is an ordinary word such as thr_deadline, not an ID.
+_ID_DIGITS = 16
+# Decode/NFKC rounds before a room value must be stable (each refs() call
+# already decodes up to four percent levels).
+_NORMALISE_ROUNDS = 4
 _PRIVATE = re.compile(r"(?:capture-fork|capture|import-private):[^\s?]+", re.IGNORECASE)
 _PERCENT = re.compile(r"%[0-9a-f]{2}", re.IGNORECASE)
 
@@ -220,6 +233,51 @@ def _tokens(text):
         for match in _THREAD.finditer(token):
             tokens[match[0]] = None
     return tuple(tokens)
+
+
+def is_thread_id(value):
+    """A stored thread ID exactly, as thread stores issue and accept them."""
+    return isinstance(value, str) and THREAD_ID.fullmatch(value) is not None
+
+
+def _named_threads(text):
+    for match in _THREAD.finditer(text):
+        after = text[match.end() : match.end() + 1]
+        if len(match[0]) - 4 < _ID_DIGITS and after.isascii() and after.isalpha():
+            continue
+        # Stored IDs are lower case; an upper-case spelling names the same thread.
+        yield match[0].lower()
+    yield from ("mcp:" + text[match.end() :] for match in _SOURCE.finditer(text))
+
+
+def room_references(value):
+    """Thread IDs and T3 source IDs a room, topic or link names.
+
+    Every route that returns or writes a room or topic shares this check.
+    Percent-decoding and NFKC normalisation repeat until the value stops
+    changing, and every intermediate copy is scanned, so link forms, mcp:
+    forms, IDs next to letters or underscores, fullwidth spellings and
+    encodings hidden behind normalisation all count. Returns None when the
+    value cannot be decoded or is still changing after the round bound:
+    callers treat that as naming a thread nobody can prove readable.
+    """
+    if not isinstance(value, str):
+        return ()
+    texts = [value, unicodedata.normalize("NFKC", value)]
+    current = value
+    for _ in range(_NORMALISE_ROUNDS):
+        parsed = refs(current)
+        if parsed is REFUSE:
+            return None
+        decoded = parsed.text or ""
+        normal = unicodedata.normalize("NFKC", decoded)
+        texts.extend((decoded, normal))
+        if normal == current:
+            break
+        current = normal
+    else:
+        return None
+    return tuple(dict.fromkeys(token for text in texts for token in _named_threads(text)))
 
 
 def refs(value, *, raise_on_limit=False):
