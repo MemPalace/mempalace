@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 from time import monotonic
@@ -651,6 +652,7 @@ class BoardService(lifecycle.LifecycleMixin):
             row["created_at"],
             row["proposed_to"],
             row["board_coordinator"],
+            row["board"],
         )
         if key in cache:
             return cache[key]
@@ -669,6 +671,9 @@ class BoardService(lifecycle.LifecycleMixin):
         coordinator = row["board_coordinator"] or ""
         if coordinator.startswith("conn:"):
             refs.append(coordinator[5:])
+        leased = self._lease_coordinator(row)
+        if leased is not None:
+            refs.append(leased.actor[5:])
         cache[key] = tuple(self._live_connection(ref) for ref in dict.fromkeys(refs))
         return cache[key]
 
@@ -734,7 +739,11 @@ class BoardService(lifecycle.LifecycleMixin):
             candidates.append(self._live_connection(row["created_by"][5:]))
         live = {}
         for q in candidates:
-            if q is not None and self._approval_visible(q, row):
+            if (
+                q is not None
+                and q.policy.tool_visible("needs_me")
+                and self._approval_visible(q, row)
+            ):
                 role = self._approval_role(q, row)
                 if role:
                     live[q.actor] = role
@@ -745,13 +754,13 @@ class BoardService(lifecycle.LifecycleMixin):
         p = self.principal
         if p.person:
             return ()
+        leased = self._leased_boards()
         with self.store.connection() as conn:
             return tuple(
                 b["id"]
-                for b in conn.execute(
-                    "SELECT * FROM boards WHERE archived=0 AND coordinator=?", (p.actor,)
-                )
-                if (q := self._live_connection(p.connection_id)) is not None
+                for b in conn.execute("SELECT * FROM boards WHERE archived=0")
+                if (b["coordinator"] == p.actor or b["slug"] in leased)
+                and (q := self._live_connection(p.connection_id)) is not None
                 and self._release_grants(q, b["wing"])
             )
 
@@ -819,14 +828,16 @@ class BoardService(lifecycle.LifecycleMixin):
         coordinator = "b.coordinator" if "coordinator" in board_columns else "NULL"
         columns = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
         escalated = "AND t.escalated_to IS NULL " if "escalated_to" in columns else ""
+        leased = self._leased_boards()
+        leases = ",".join("?" for _ in leased)
         sql = (
             f"SELECT t.*, b.slug AS board,b.wing AS board_wing,{coordinator} AS board_coordinator "
             "FROM tasks t JOIN boards b ON b.id=t.board_id WHERE b.archived=0 AND t.id>? AND t.status!='done' "
             + escalated
             + "AND ((t.proposal_status='pending' OR (t.status IN ('todo','doing') AND t.labels LIKE '%\"plan\"%')) "
-            f"AND (t.proposed_to=? OR t.created_by IN ({placeholders}) OR {coordinator}=?) "
+            f"AND (t.proposed_to=? OR t.created_by IN ({placeholders}) OR {coordinator}=? OR b.slug IN ({leases})) "
             "OR ((COALESCE(t.restricted_origin,1)!=0 OR t.agent_parent IS NOT NULL) "
-            f"AND t.status IN ('backlog','todo','doing') AND (? OR {coordinator}=?))) ORDER BY t.id LIMIT 50"
+            f"AND t.status IN ('backlog','todo','doing') AND (? OR {coordinator}=? OR b.slug IN ({leases})))) ORDER BY t.id LIMIT 50"
         )
         cap = 60 if budget == "session" else 200
         checked, last = 0, 0
@@ -834,7 +845,17 @@ class BoardService(lifecycle.LifecycleMixin):
         with self._projection():
             while True:
                 rows = conn.execute(
-                    sql, (last, p.actor, *actors, p.actor, p.person and p.role == "owner", p.actor)
+                    sql,
+                    (
+                        last,
+                        p.actor,
+                        *actors,
+                        p.actor,
+                        *leased,
+                        p.person and p.role == "owner",
+                        p.actor,
+                        *leased,
+                    ),
                 ).fetchall()
                 if not rows:
                     break
@@ -843,9 +864,11 @@ class BoardService(lifecycle.LifecycleMixin):
                     if not p.policy.can_read_wing(row["board_wing"]):
                         continue
                     ordinary_visible = ordinary_reader and self._approval_visible(p, row)
-                    origin_visible = (p.person and p.role == "owner") or row[
-                        "board_coordinator"
-                    ] == p.actor
+                    origin_visible = (
+                        (p.person and p.role == "owner")
+                        or row["board_coordinator"] == p.actor
+                        or row["board"] in leased
+                    )
                     if not ordinary_visible and not origin_visible:
                         continue
                     if checked >= cap:
@@ -890,7 +913,13 @@ class BoardService(lifecycle.LifecycleMixin):
     def _supervisors(self, row):
         cache = getattr(self, "_projection_cache", None)
         cache = cache if cache is not None else {}
-        key = ("supervisors", row["assignee"], row["board_coordinator"], row["board_wing"])
+        key = (
+            "supervisors",
+            row["assignee"],
+            row["board_coordinator"],
+            row["board_wing"],
+            row["board"],
+        )
         if key in cache:
             return cache[key]
         candidates = []
@@ -911,6 +940,9 @@ class BoardService(lifecycle.LifecycleMixin):
         coordinator = row["board_coordinator"] or ""
         if coordinator.startswith("conn:"):
             candidates.append((coordinator[5:], "board coordinator"))
+        leased = self._lease_coordinator(row)
+        if leased is not None:
+            candidates.append((leased.actor[5:], "board coordinator"))
         routes = {}
         for ref, role in candidates:
             try:
@@ -1292,11 +1324,44 @@ class BoardService(lifecycle.LifecycleMixin):
                     not self._restricted_origin(row)
                     or self._origin_lineage(q, row) == "independent"
                 )
-                and row["board_coordinator"] == q.actor
+                and (row["board_coordinator"] == q.actor or self._holds_lease(q, row))
                 and _can_coordinate(q, row["board_wing"])
             )
         except (ControlError, ValueError, TypeError):
             return False
+
+    def _lease_holders(self):
+        """Live coordinator-lease holders by board slug; any store error names nobody.
+
+        Only a live lease of exactly one board counts: a replaced epoch, a released or
+        expired lease and another board's lease name nobody for this board."""
+        from commonplace.orch import durable
+        from commonplace.projects import split
+
+        cache = getattr(self, "_projection_cache", None)
+        cache = cache if cache is not None else {}
+        if "leases" not in cache:
+            try:
+                with split.runner_read(self.ctx.workspace_dir()) as reader:
+                    cache["leases"] = durable.coordinator_holders_in(reader)
+            except sqlite3.Error:
+                cache["leases"] = {}
+        return cache["leases"]
+
+    def _lease_coordinator(self, row):
+        """The live principal holding the coordinator lease of this card's board, if any."""
+        slug = row["board"] if "board" in row.keys() else None
+        actor = self._lease_holders().get(slug) if slug else None
+        return self._live_connection(actor[5:]) if actor and actor.startswith("conn:") else None
+
+    def _leased_boards(self):
+        """Slugs of boards whose live coordinator lease this connection holds."""
+        actor = self.principal.actor
+        return sorted(slug for slug, holder in self._lease_holders().items() if holder == actor)
+
+    def _holds_lease(self, q, row):
+        leased = self._lease_coordinator(row)
+        return leased is not None and leased.actor == q.actor
 
     def _top_level_actor(self, actor):
         try:
@@ -1342,20 +1407,30 @@ class BoardService(lifecycle.LifecycleMixin):
             and q.policy.tool_visible("needs_me")
         )
 
-    def _origin_authority(self, row):
-        """Nonrecursive shared owner/coordinator classification for this card."""
-        actor = row["board_coordinator"] or ""
-        q = self._live_connection(actor[5:]) if actor.startswith("conn:") else None
-        if q is None:
-            return "owner", None
+    def _authority_of(self, q, row):
+        """Classify one live candidate as this card's origin coordinator."""
         lineage = self._origin_lineage(q, row)
         if row["created_by"].startswith("conn:") and self._creator_connection(row) is None:
-            return "stamp", q
+            return "stamp"
         if lineage != "independent":
-            return lineage, q
+            return lineage
         if self._release_grants(q, row["board_wing"]):
-            return "coordinator", q
-        return "owner", q
+            return "coordinator"
+        return "owner"
+
+    def _origin_authority(self, row):
+        """Nonrecursive shared owner/coordinator classification for this card.
+
+        The configured coordinator comes first; the live holder of the board's
+        coordinator lease counts when the configured one does not qualify."""
+        actor = row["board_coordinator"] or ""
+        q = self._live_connection(actor[5:]) if actor.startswith("conn:") else None
+        state = self._authority_of(q, row) if q is not None else "owner"
+        if state != "coordinator":
+            leased = self._lease_coordinator(row)
+            if leased is not None and self._authority_of(leased, row) == "coordinator":
+                return "coordinator", leased
+        return state, q
 
     @staticmethod
     def _restricted_origin(row):
@@ -1498,6 +1573,7 @@ class BoardService(lifecycle.LifecycleMixin):
                 current = bool(
                     approver.policy.has_scope("memory:write")
                     and approver.policy.can_read_wing(row["board_wing"])
+                    and self._release_grants(approver, row["board_wing"])
                     and (
                         (
                             not _restricted(approver)
@@ -1727,6 +1803,9 @@ class BoardService(lifecycle.LifecycleMixin):
             return None
         if alias in ("orchestrator", "coordinator"):
             value = board["coordinator"]
+            configured = (value or "").startswith("conn:") and self._live_connection(value[5:])
+            if not configured:
+                value = self._lease_holders().get(board["slug"]) or value
             if not value:
                 raise ToolError(
                     "no: this project has no board coordinator; name an agent, "

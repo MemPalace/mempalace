@@ -51,6 +51,7 @@ import json
 import logging
 import re
 import secrets
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from commonplace.boards.priority import name as priority_name
@@ -299,6 +300,57 @@ def lease_in(conn, board: str, role: str) -> dict | None:
 
 def _lease_live(row, now) -> bool:
     return row["token_hash"] is not None and row["released_at"] is None and row["expires_at"] > now
+
+
+def coordinator_holder_in(conn, board: str, now: str | None = None) -> str | None:
+    """Actor holding the live coordinator lease of exactly ``board``, else ``None``.
+
+    The coordinator lease is the lease of the accepted live config's orchestrator role.
+    An unreleased, unexpired lease with a token counts; the actor is the claim's holder,
+    so a replaced epoch, a released or expired lease, another board's lease, a missing or
+    unparsable config and a pending restore all give ``None`` (fail closed). ``conn`` may
+    be read-only; ``None`` means there is no runner store."""
+    if conn is None:
+        return None
+    now = _clock(now)
+    try:
+        if orch_store.restore_state_in(conn).flagged:
+            return None
+        version = orch_store.accepted_in(conn, board)
+        if version is None:
+            return None
+        roles = [r.name for r in version.config().roles.values() if r.kind == "orchestrator"]
+        if len(roles) != 1:
+            return None
+        row = conn.execute(
+            "SELECT * FROM orch_leases WHERE board=? AND role=?", (board, roles[0])
+        ).fetchone()
+    except (sqlite3.Error, ValueError, TypeError, KeyError):
+        return None
+    return row["holder_actor"] if row is not None and _lease_live(row, now) else None
+
+
+def coordinator_holders_in(conn, now: str | None = None) -> dict[str, str]:
+    """``{board: actor}`` for every board with a live coordinator lease (see ``coordinator_holder_in``)."""
+    if conn is None:
+        return {}
+    now = _clock(now)
+    try:
+        boards = [
+            r["board"]
+            for r in conn.execute(
+                "SELECT board FROM orch_configs WHERE channel=? AND status='accepted'",
+                (orch_store.LIVE,),
+            )
+        ]
+    except sqlite3.Error:
+        return {}
+    holders = {}
+    for board in boards:
+        actor = coordinator_holder_in(conn, board, now)
+        if actor:
+            holders[board] = actor
+    return holders
 
 
 def check_lease(

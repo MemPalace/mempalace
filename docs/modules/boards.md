@@ -72,6 +72,7 @@
   - Trusted agents retain their title/body edit alternative on unassigned restricted-origin todo cards. Coordinator-derived edits require verified independence: creators, descendants and unsafe lineage cannot use that exception. Content edits never release origin or grant claims.
 
   - With workspace orchestration enabled, claims hold runner admission through board commit and person assignments or handoffs cannot reserve a busy agent.
+  - The board coordinator is the configured coordinator or the live holder of the board's coordinator lease; stale, expired, released and other-board leases, a pending restore and an unreadable runner store name nobody. The lease holder has the whole coordinator role on that board except routed asks and runner or planner routing: release, approver and supervisor candidacy, the orchestrator handoff alias and release discovery. A candidate approver must be able to see the card in needs-me, so the owner's item is never hidden by one that cannot. A stored agent release (coordinator, parent, top-level or trusted agent) authorizes handed-over work only while the approver keeps every release grant.
 
   - The owner's `needs_me` lists boards nudged three times in a row without a done card (`orchestrator_stalled`); `board.stalled` and `orch.trigger.failing` are hub events with webhook labels.
 
