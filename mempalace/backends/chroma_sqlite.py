@@ -638,6 +638,7 @@ def _sqlite_recent_records(
     limit: int,
     equalities: list[tuple[str, tuple]],
     order_field: str,
+    ids_only: bool = False,
 ) -> Optional[list[tuple[str, str, Optional[dict]]]]:
     """Decoded ``(id, document, metadata)`` for the newest ``limit`` records.
 
@@ -646,6 +647,7 @@ def _sqlite_recent_records(
     ``equalities`` filter on stored string metadata, each key matching any of
     its values. A missing document reads as ``""``. ``None`` when the database
     is missing or the read fails, so the caller can fall back to Chroma.
+    ``ids_only`` skips document/metadata hydration and returns empty placeholders.
     """
     filter_sql, filter_params = _match_sql(equalities, "e.id")
 
@@ -717,6 +719,17 @@ def _sqlite_recent_records(
                     (collection_name, order_field, *filter_params, limit - len(row_ids)),
                 )
             ]
+        if ids_only:
+            drawer_ids = {}
+            for start in range(0, len(row_ids), 500):
+                chunk = row_ids[start : start + 500]
+                drawer_ids.update(
+                    conn.execute(
+                        f"SELECT id, embedding_id FROM embeddings WHERE id IN ({_marks(chunk)})",
+                        chunk,
+                    )
+                )
+            return [(drawer_ids[i], "", None) for i in row_ids if i in drawer_ids]
         return [(i, doc or "", meta) for i, doc, meta in _decoded_rows(conn, row_ids)]
 
     return _read_db(palace_path, read)

@@ -4,7 +4,7 @@
 Engineered for massive palaces (400k+ drawers):
 - On-disk + in-memory overview/taxonomy cache keyed by palace DB fingerprint (<5ms cold start)
 - Taxonomy-derived graph_stats in 0.1ms (eliminates duplicate 2.1s full-table SQLite scan)
-- O(limit) indexed SQLite drawer pagination via col.get_recent / col.get (<65ms vs 9.5s scan)
+- Indexed SQLite drawer pagination via col.get_recent / col.get
 - Instant FTS5 lexical search (~6ms) alongside warm Hybrid (Vector + BM25) search (~65ms)
 - Background thread pre-warming of the ONNX embedder and vector matrix
 """
@@ -26,6 +26,7 @@ if _repo_override and os.path.isdir(_repo_override) and _repo_override not in sy
     sys.path.insert(0, _repo_override)
 
 import mempalace.mcp_server as mp  # noqa: E402
+from mempalace.backends.base import GetResult  # noqa: E402
 from mempalace.version import __version__  # noqa: E402
 
 # mempalace.mcp_server redirects fd 1 -> fd 2 on import so C-level
@@ -55,7 +56,7 @@ _VECTOR_WARMING: bool = False
 _WARMUP_MS: int | None = None
 _FIRST_OVERVIEW_DONE = threading.Event()
 
-# Threshold above which drawer pagination uses O(limit) indexed col.get / col.get_recent
+# Threshold above which drawer pagination uses indexed col.get / col.get_recent
 # instead of scanning and collapsing all rows in Python.
 _LARGE_LOCUS_THRESHOLD = 1500
 
@@ -335,6 +336,34 @@ def _locus_total_from_cache(wing: str | None, room: str | None) -> int:
     return int((structure.get("status") or {}).get("total_drawers") or 0)
 
 
+def _recent_drawer_page(col, *, where, limit: int, offset: int) -> GetResult:
+    """Slice one newest-first ordering, then hydrate only the selected page."""
+    capabilities = getattr(getattr(col, "_backend", None), "capabilities", ())
+    exact_recency = "supports_recency_order" in (capabilities or ())
+    if exact_recency and offset == 0:
+        return col.get_recent(limit=limit, where=where)
+
+    # get_recent has no offset argument. Select the ordered ID prefix, not
+    # a storage-order page. The base implementation sorts only its scanned
+    # window, so backends without exact recency must scan all metadata.
+    scan_limit = offset + limit if exact_recency else col.count()
+    ordered = col.get_recent(limit=scan_limit, where=where, include=[])
+    page_ids = ordered.ids[offset : offset + limit]
+    if not page_ids:
+        return GetResult.empty()
+
+    page = col.get(ids=page_ids, where=where, include=["documents", "metadatas"])
+    positions = {doc_id: i for i, doc_id in enumerate(page.ids)}
+    # get(ids=...) can return storage order. Reapply the selected order and
+    # tolerate a record disappearing between selection and hydration.
+    order = [positions[doc_id] for doc_id in page_ids if doc_id in positions]
+    return GetResult(
+        ids=[page.ids[i] for i in order],
+        documents=[page.documents[i] for i in order],
+        metadatas=[page.metadatas[i] for i in order],
+    )
+
+
 def _handle_drawers(params: dict[str, Any]) -> dict[str, Any]:
     wing = str(params.get("wing") or "").strip() or None
     room = str(params.get("room") or "").strip() or None
@@ -348,15 +377,15 @@ def _handle_drawers(params: dict[str, Any]) -> dict[str, Any]:
         est_total = _locus_total_from_cache(wing, room)
 
         # For large loci (>1,500 drawers) without custom date window filters,
-        # use O(limit) indexed collection reads instead of scanning all 400k+ rows.
+        # use indexed collection reads where the backend supports them.
         if not since and not before and est_total > _LARGE_LOCUS_THRESHOLD:
             col = mp._get_collection()
             if col is not None:
                 known = mp._palace_known_wings() if wing else frozenset()
                 where = mp.build_where_filter(wing, room, known=known) or None
                 try:
-                    if sort_order == "recent" and offset == 0 and hasattr(col, "get_recent"):
-                        raw = col.get_recent(limit=limit, where=where)
+                    if sort_order == "recent" and hasattr(col, "get_recent"):
+                        raw = _recent_drawer_page(col, where=where, limit=limit, offset=offset)
                     else:
                         raw = col.get(
                             where=where,

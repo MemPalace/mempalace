@@ -2686,6 +2686,25 @@ class ChromaCollection(BaseCollection):
                     logger.debug("sqlite metadata scan failed; paging instead", exc_info=True)
         return super().get_all_metadata(where=where)
 
+    def _recent_from_metadata(self, *, limit, where, order_field, include, spec):
+        """Keep recency exact when the indexed SQLite ordering is unavailable."""
+        ordered = super().get_recent(
+            limit=self.count(), where=where, order_field=order_field, include=[]
+        )
+        selected_ids = ordered.ids[:limit]
+        if not (spec.documents or spec.metadatas) or not selected_ids:
+            return GetResult(ids=selected_ids, documents=[], metadatas=[], embeddings=None)
+
+        page = self.get(ids=selected_ids, where=where, include=include)
+        positions = {drawer_id: index for index, drawer_id in enumerate(page.ids)}
+        order = [positions[drawer_id] for drawer_id in selected_ids if drawer_id in positions]
+        return GetResult(
+            ids=[page.ids[index] for index in order],
+            documents=[page.documents[index] for index in order] if spec.documents else [],
+            metadatas=[page.metadatas[index] for index in order] if spec.metadatas else [],
+            embeddings=None,
+        )
+
     def get_recent(
         self,
         *,
@@ -2703,8 +2722,9 @@ class ChromaCollection(BaseCollection):
         This reads the ordered window from the metadata tables instead, which
         also makes the window exact rather than whatever ``get`` paged first.
         ``where`` made of string equalities (what Layer 1 passes) is evaluated
-        in sqlite; any other filter, or a database the read cannot reach, goes
-        through the base implementation.
+        in sqlite. If that read is unavailable, the fallback orders all matching
+        metadata before hydrating the selected records. Other filters retain
+        the base implementation's bounded scan.
 
         String equalities and an unfiltered read are the true top ``limit``
         at any collection size, which is why :class:`ChromaBackend` advertises
@@ -2714,12 +2734,13 @@ class ChromaCollection(BaseCollection):
         equalities = _string_equalities(where)
         spec = _IncludeSpec.resolve(include, default_distances=False)
         records = None
-        if (
+        sqlite_ordering = (
             limit > 0
             and self._palace_path is not None
             and equalities is not None
             and not spec.embeddings
-        ):
+        )
+        if sqlite_ordering:
             validate_where(where)
             records = _sqlite_recent_records(
                 self._palace_path,
@@ -2730,8 +2751,13 @@ class ChromaCollection(BaseCollection):
                     for key, values in equalities
                 ],
                 order_field=order_field,
+                ids_only=not (spec.documents or spec.metadatas),
             )
         if records is None:
+            if sqlite_ordering:
+                return self._recent_from_metadata(
+                    limit=limit, where=where, order_field=order_field, include=include, spec=spec
+                )
             return super().get_recent(
                 limit=limit, where=where, order_field=order_field, include=include
             )
