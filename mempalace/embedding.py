@@ -313,6 +313,45 @@ def _resolve_embeddinggemma_batch_size() -> int:
         return _EMBEDDINGGEMMA_BATCH_SIZE
 
 
+def _minilm_forward(ef, documents, batch_size=32):
+    """ChromaDB's ``ONNXMiniLM_L6_V2._forward`` without the fixed-width padding.
+
+    Upstream's tokenizer pads every document to 256 tokens, so embedding a
+    five-word search query costs as much as embedding a full drawer. Padded
+    positions are masked out of attention and out of the mean pooling, so
+    each sub-batch is cut after the last column any of its documents uses
+    before the session runs. Tokenization, pooling and normalization are
+    upstream's; the vectors differ from the padded run only by float32
+    rounding.
+    """
+    import numpy as np
+
+    all_embeddings = []
+    for i in range(0, len(documents), batch_size):
+        encoded = [ef.tokenizer.encode(d) for d in documents[i : i + batch_size]]
+        attention_mask = np.array([e.attention_mask for e in encoded], dtype=np.int64)
+        used = np.flatnonzero(attention_mask.any(axis=0))
+        width = int(used[-1]) + 1 if used.size else attention_mask.shape[1]
+        attention_mask = attention_mask[:, :width]
+        input_ids = np.array([e.ids[:width] for e in encoded], dtype=np.int64)
+        last_hidden_state = ef.model.run(
+            None,
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "token_type_ids": np.zeros_like(input_ids),
+            },
+        )[0]
+        input_mask_expanded = np.broadcast_to(
+            np.expand_dims(attention_mask, -1), last_hidden_state.shape
+        )
+        embeddings = np.sum(last_hidden_state * input_mask_expanded, 1) / np.clip(
+            input_mask_expanded.sum(1), a_min=1e-9, a_max=None
+        )
+        all_embeddings.append(ef._normalize(embeddings).astype(np.float32))
+    return np.concatenate(all_embeddings)
+
+
 def _build_ef_class():
     """Subclass ``ONNXMiniLM_L6_V2`` with name ``"default"``.
 
@@ -344,7 +383,7 @@ def _build_ef_class():
             # Every upstream embed path (__call__, embed_query) runs the
             # session here, so this is the one place to serialize it.
             with _run_guard(self._preferred_providers, self._run_lock):
-                return super()._forward(documents, batch_size)
+                return _minilm_forward(self, documents, batch_size)
 
         @cached_property
         def model(self):

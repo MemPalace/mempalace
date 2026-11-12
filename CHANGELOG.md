@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Performance
+
+- **MiniLM no longer pads every text to 256 tokens.** ChromaDB's bundled
+  tokenizer pads each document to a fixed 256 tokens, so a five-word search
+  query cost as much to embed as a full drawer. Each sub-batch now runs only
+  as wide as its longest document; padded positions were already masked out
+  of attention and pooling, so the vectors match the padded run. Embedding
+  one search query drops from 32.8 ms to 2.4 ms and `search_memories` from
+  56.7 ms to 26.3 ms (medians, 2 embedding threads, 7,105-drawer palace).
+  Mining is unchanged: its chunks nearly fill 256 tokens anyway.
+
 ---
 
 ## [3.12.0] — 2026-11-09
