@@ -1085,8 +1085,10 @@ def _install_sqlite_convo_visibility(conn, collection_name: str) -> None:
     # untouched instead of rejecting unrelated search queries. A stamped
     # conversation requires the recovered snapshot below and fails closed.
     if not conn.execute(
-        f"SELECT 1 {_DRAWERS_SQL}"
-        " JOIN embedding_metadata m ON m.id = e.id"
+        "SELECT 1 FROM embedding_metadata m"
+        " JOIN embeddings e ON m.id = e.id"
+        " JOIN segments s ON e.segment_id = s.id"
+        " JOIN collections c ON s.collection = c.id"
         " WHERE c.name = ? AND m.key = 'ingest_mode'"
         " AND m.string_value = 'convos' LIMIT 1",
         (collection_name,),
