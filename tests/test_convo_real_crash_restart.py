@@ -86,12 +86,13 @@ sys.exit(74)  # Injection never fired.
     reader = """
 import json
 import sys
+from pathlib import Path
 from mempalace import mcp_server
 from mempalace.config import MempalaceConfig
 from mempalace.palace import get_collection
 from mempalace.searcher import search_memories
 
-source_file, palace_path = sys.argv[1:3]
+source_file, palace_path, output_file = sys.argv[1:4]
 mcp_server._config = MempalaceConfig(palace_path=palace_path)
 mcp_server._get_collection = lambda *args, **kwargs: get_collection(palace_path)
 collection = get_collection(palace_path)
@@ -105,20 +106,22 @@ listing = mcp_server.tool_list_drawers(limit=100)
 bulk = mcp_server.tool_get_drawers(unfinished)
 a_search = search_memories("A question", palace_path, source_file=source_file, n_results=3)
 b_search = search_memories("B question", palace_path, source_file=source_file, n_results=1)
-print("__CRASH_READER__" + json.dumps({
+Path(output_file).write_text(json.dumps({
     "uncommitted_ids": unfinished,
     "single": [mcp_server.tool_get_drawer(row_id) for row_id in unfinished],
     "bulk": bulk,
     "listing": listing,
     "a_search": a_search,
     "b_search": b_search,
-}))
+}), encoding="utf-8")
 """
-    checked = _child(reader, session, palace_path)
+    # The MCP server owns the process stdout for its protocol; a sidecar
+    # result file avoids depending on redirected stdout in the probe.
+    snapshot_path = tmp_path / "fresh_reader.json"
+    checked = _child(reader, session, palace_path, snapshot_path)
     assert checked.returncode == 0, checked.stdout + "\n" + checked.stderr
-    marker = "__CRASH_READER__"
-    assert marker in checked.stdout, checked.stdout
-    snapshot = json.loads(checked.stdout.split(marker, 1)[1].splitlines()[0])
+    assert snapshot_path.is_file(), checked.stdout + "\n" + checked.stderr
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
 
     unpublished = snapshot["uncommitted_ids"]
     assert unpublished, "the killed writer never persisted an uncommitted B chunk"
