@@ -3,6 +3,7 @@
 - **Paths:** `commonplace/web/`, `commonplace/console/`
 - **Owns:**
 
+  - Owner-only Project settings list orchestrator config versions with their changes and an Accept control, plus Release for cards waiting for release.
   - The card panel offers Release with a required reason on cards awaiting release, the handoff form names the orchestrator and pool recipients, and refused card actions appear inside the open panel.
 
   - Deck Compute (`deck-compute.js`, `deck-topology.js`) draws owner-visible enrolled machines as a pixel-sized hub map with label-safe geometry, enrollment readiness dots, keyboard selection, four detail tabs and General-bot draft handoffs; no liveness or network routes are inferred.
