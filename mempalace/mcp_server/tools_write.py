@@ -1614,7 +1614,18 @@ def tool_list_drawers(
 
         checked = scoped_visible_ids(metadatas, fetch_source_rows) if where else None
         result = make_page(ids, metadatas, checked_ids=checked)
-        _fill_drawer_previews(col, result["drawers"], expected_metadata=dict(zip(ids, metadatas)))
+        # Keep the extra consistency metadata bounded to the displayed page,
+        # not all drawers in a possibly six-figure collection.
+        page_ids = set(_page_physical_ids(result["drawers"]))
+        preview_metadata = {
+            row_id: meta
+            for row_id, meta in zip(ids, metadatas)
+            if row_id in page_ids
+            and (meta or {}).get("ingest_mode") == "convos"
+            and (meta or {}).get("extract_mode") in ("exchange", "general")
+            and "chunk_total" in (meta or {})
+        }
+        _fill_drawer_previews(col, result["drawers"], expected_metadata=preview_metadata or None)
         return result
     except Exception as e:
         logger.exception("tool_list_drawers failed")
