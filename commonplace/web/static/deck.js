@@ -10,6 +10,7 @@ export const UI_KEY = 'cmmn.ui';
 // mount returns { refresh?(context), stop?() }. A name without a loader is not offered in the bar.
 export const SCREENS = {
   today: () => import('./deck-today.js'),
+  compute: () => import('./deck-compute.js'),
 };
 const SECTIONS = [['today', 'Today'], ['bots', 'Bots'], ['compute', 'Compute'], ['settings', 'Settings']];
 
