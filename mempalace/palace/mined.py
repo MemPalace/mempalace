@@ -183,6 +183,10 @@ def _add_mine_group(groups, key, meta, extract_mode):
         extract_mode not in ("exchange", "general")
         or meta.get("ingest_mode") != "convos"
         or meta.get("extract_mode") not in ("exchange", "general")
+        # Pre-index legacy rows carried chunk_total but neither generation
+        # identity nor chunk_index. Preserve their original count-based proof;
+        # any row with either field present still needs strict index validation.
+        or ("filed_at" not in meta and "chunk_index" not in meta)
     ):
         return
     if entry[3] is None:
