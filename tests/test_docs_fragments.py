@@ -388,3 +388,123 @@ def test_the_repository_layout_parses_cleanly():
     modules = docs_check.load_modules(repo, "HEAD")
     assert modules is not None and modules.problems == []
     assert len(modules.blocks) >= 27
+
+
+# ------------------------------------------------ per-change field fragments
+
+
+def frag(field, text):
+    return f"- **{field}:**\n\n  - {text}\n"
+
+
+def test_a_field_fragment_is_the_module_block_change(repo):
+    commit(repo, {"core/a.py": "A = 2\n", "docs/system/new.md": "### New\n\n- New.\n"})
+    assert check(repo) == ["module 'core' changed ('core/a.py') but its MODULES.md block did not"]
+    commit(
+        repo, {"docs/modules/core.d/card-1.md": frag("Tests", "`tests/test_core_a.py` covers A.")}
+    )
+    assert check(repo) == []
+
+
+def test_fragments_extend_the_fields_of_their_module(repo):
+    commit(
+        repo,
+        {
+            "docs/modules/core.d/one.md": frag("Tests", "fragment test one.")
+            + "\n"
+            + frag("Owns", "fragment owns."),
+            "docs/modules/core.d/two.md": frag("Tests", "fragment test two."),
+        },
+    )
+    block = docs_check.load_modules(repo, "HEAD").blocks["core"]
+    assert "fragment test one." in block.fields["Tests"]
+    assert "fragment test two." in block.fields["Tests"]
+    assert "fragment owns." in block.fields["Owns"]
+    assert "core test one." in block.fields["Tests"]
+    assert docs_check.load_modules(repo, "HEAD").problems == []
+
+
+@pytest.mark.parametrize(
+    ("files", "needle"),
+    [
+        ({"docs/modules/ghost.d/a.md": frag("Tests", "x.")}, "unknown module 'ghost'"),
+        ({"docs/modules/core.d/a.md": "- **Paths:** `core/x/`\n"}, "field Paths is not allowed"),
+        ({"docs/modules/core.d/a.md": "- **Tests:**\n"}, "field Tests is empty"),
+        ({"docs/modules/core.d/a.md": "loose text\n"}, "unexpected line outside a field"),
+        ({"docs/modules/core.d/a.md": ""}, "holds no field"),
+        ({"docs/modules/core.d/a.txt": frag("Tests", "x.")}, "not a field fragment"),
+    ],
+)
+def test_bad_field_fragments_fail_the_check(repo, files, needle):
+    commit(repo, files)
+    assert any(needle in problem for problem in docs_check.load_modules(repo, "HEAD").problems)
+    assert docs_check.main(["--repo", str(repo), "--base", "develop"]) == 1
+
+
+def test_a_directory_named_like_a_fragment_dir_is_not_a_module_file(repo):
+    commit(repo, {"docs/modules/core.d/a.md": frag("Tests", "x.")})
+    problems = docs_check.load_modules(repo, "HEAD").problems
+    assert not any("is not a module file" in problem for problem in problems)
+
+
+def test_printing_the_module_map_includes_the_fragments(repo, capsys):
+    commit(repo, {"docs/modules/core.d/a.md": frag("Tests", "printed fragment line.")})
+    assert docs_check.main(["--repo", str(repo), "--print", "modules"]) == 0
+    assert "printed fragment line." in capsys.readouterr().out
+
+
+def test_two_changes_to_one_module_merge_cleanly_with_fragments(tmp_path):
+    def change(name):
+        return lambda repo: {
+            f"core/{name}.py": "A = 1\n",
+            f"docs/modules/core.d/{name}.md": frag(
+                "Tests", f"`tests/test_{name}.py` covers {name}."
+            ),
+        }
+
+    repo = two_branches(tmp_path, fragment_base(), change("a"), change("b"))
+    assert_clean(merge_both_orders(repo))
+
+
+def test_two_changes_to_one_block_conflict_without_fragments(tmp_path):
+    def change(name):
+        return lambda repo: {
+            f"core/{name}.py": "A = 1\n",
+            "docs/modules/core.md": edit(
+                read(repo, "docs/modules/core.md"),
+                "  - core test three.\n",
+                f"  - core test three.\n\n  - added by {name}.\n",
+            ),
+        }
+
+    repo = two_branches(tmp_path, fragment_base(), change("a"), change("b"))
+    assert_conflicting(merge_both_orders(repo))
+
+
+ATTRIBUTES = "docs/modules/tests.md merge=union\nSYSTEM.md merge=union\n"
+
+
+def test_repository_attributes_union_merge_the_append_only_docs():
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / ".gitattributes").read_text(encoding="utf-8")
+    for line in ATTRIBUTES.splitlines():
+        assert line in text.splitlines()
+
+
+def test_union_attribute_keeps_both_appended_bullets(tmp_path):
+    base = dict(fragment_base(), **{".gitattributes": ATTRIBUTES})
+
+    def change(name):
+        return lambda repo: {
+            f"core/{name}.py": "A = 1\n",
+            "SYSTEM.md": edit(
+                read(repo, "SYSTEM.md"),
+                "- Old decision.\n",
+                f"- Old decision.\n- {name} decision.\n",
+            ),
+        }
+
+    repo = two_branches(tmp_path, base, change("a"), change("b"))
+    assert_clean(merge_both_orders(repo))
+    assert "- a decision." in read(repo, "SYSTEM.md") and "- b decision." in read(repo, "SYSTEM.md")

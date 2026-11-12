@@ -6,7 +6,11 @@ directly in ``MODULES.md`` are still read). ``SYSTEM.md`` may be extended by one
 section per file in ``docs/system/``. Parallel changes then edit different files and merge
 without a git conflict. The fragment files themselves are exempt from the module-block
 obligation (they *are* the blocks), and a change under ``docs/system/`` counts as a change
-to ``SYSTEM.md``.
+to ``SYSTEM.md``. A module that many changes touch (``tests``) may also take per-change
+*field fragments* in ``docs/modules/<module>.d/<name>.md``: each holds ``- **Owns:**``,
+``- **Promises:**``, ``- **How it fails:**`` or ``- **Tests:**`` bullets that are appended
+to the same field of the module's block, so two changes never edit the same lines. Editing
+a field fragment is an edit of that module's block.
 
 ``commonplace orch docs-check --base <ref> --head <ref>`` compares ``head`` with the merge
 base of ``base`` and ``head`` and exits 1 when:
@@ -45,6 +49,8 @@ SYSTEM = "SYSTEM.md"
 FIELDS = ("Paths", "Owns", "Promises", "How it fails", "Tests")
 MODULES_DIR = "docs/modules/"
 SYSTEM_DIR = "docs/system/"
+FRAGMENT_SUFFIX = ".d"
+FRAGMENT_FIELDS = FIELDS[1:]  # Paths stay in the module file: it owns the path map
 EXEMPT = frozenset({MODULES, SYSTEM})
 SPLIT_DIRS = ("commonplace/",)
 WAIVER_KEY = "Docs-waiver"
@@ -137,6 +143,46 @@ def parse_modules(text: str) -> Modules:
             else:
                 owners[path] = block.name
     return Modules(blocks, owners, problems)
+
+
+def parse_field_fragment(text: str) -> tuple[dict, list[str]]:
+    """``({field: text}, problems)`` of one ``docs/modules/<module>.d/<name>.md`` file."""
+    fields: dict[str, str] = {}
+    problems: list[str] = []
+    last = None
+    for line in text.splitlines():
+        match = _FIELD.match(line)
+        if match:
+            last = match.group(1)
+            if last not in FRAGMENT_FIELDS:
+                problems.append(f"field {last} is not allowed in a fragment")
+                last = None
+            elif last in fields:
+                problems.append(f"field {last} appears twice")
+            else:
+                fields[last] = match.group(2).strip()
+        elif last and line.startswith((" ", "\t")) and line.strip():
+            item = line.strip()
+            if item in {"-", "*", "+"}:
+                problems.append(f"field {last} has an empty list item")
+            else:
+                fields[last] = (fields[last] + " " + item).strip()
+        elif line.strip():
+            problems.append(f"unexpected line outside a field: {line.strip()[:40]!r}")
+            last = None
+    for name, value in fields.items():
+        if not value:
+            problems.append(f"field {name} is empty")
+    if not fields and not problems:
+        problems.append("holds no field")
+    return fields, problems
+
+
+def field_fragment_dir(entry: str) -> str | None:
+    """The module a ``docs/modules/<module>.d/`` directory belongs to, else None."""
+    if entry.startswith(MODULES_DIR) and entry.endswith(FRAGMENT_SUFFIX + "/"):
+        return entry[len(MODULES_DIR) : -len(FRAGMENT_SUFFIX + "/")] or None
+    return None
 
 
 def owner(path: str, owners: dict) -> str | None:
@@ -256,25 +302,62 @@ def _fragments(repo, commit: str, directory: str) -> list[tuple[str, str]]:
     ]
 
 
+def _module_files(repo, commit: str) -> list[tuple[str, str]]:
+    """``(entry, text)`` of every module file; the ``<module>.d/`` directories are not files."""
+    return [
+        (entry, text)
+        for entry, text in _fragments(repo, commit, MODULES_DIR)
+        if field_fragment_dir(entry) is None
+    ]
+
+
+def _field_fragments(repo, commit: str) -> list[tuple[str, str, str]]:
+    """``(module, entry, text)`` of every field fragment, ordered by module then name."""
+    found = []
+    for entry, _text in _fragments(repo, commit, MODULES_DIR):
+        module = field_fragment_dir(entry)
+        if module is not None:
+            found += [(module, name, text) for name, text in _fragments(repo, commit, entry)]
+    return found
+
+
 def module_texts(repo, commit: str) -> list[str] | None:
-    """``MODULES.md`` followed by every module file; None when ``MODULES.md`` is missing."""
+    """``MODULES.md``, every module file, each followed by its field fragments."""
     legacy = show(repo, commit, MODULES)
     if legacy is None:
         return None
-    return [legacy] + [text for _entry, text in _fragments(repo, commit, MODULES_DIR)]
+    fragments = _field_fragments(repo, commit)
+    texts = [legacy]
+    for entry, text in _module_files(repo, commit):
+        stem = entry[len(MODULES_DIR) :].removesuffix(".md")
+        extra = [frag for module, _name, frag in fragments if module == stem]
+        texts.append("\n".join([text.rstrip("\n")] + [frag.rstrip("\n") for frag in extra]) + "\n")
+    return texts
 
 
 def load_modules(repo, commit: str) -> Modules | None:
     """The module map at ``commit`` from ``MODULES.md`` plus ``docs/modules/``."""
-    texts = module_texts(repo, commit)
-    if texts is None:
+    legacy = show(repo, commit, MODULES)
+    if legacy is None:
         return None
-    modules = parse_modules("\n".join(texts))
+    files = _module_files(repo, commit)
+    modules = parse_modules("\n".join([legacy] + [text for _entry, text in files]))
     modules.problems[:0] = [
-        problem
-        for entry, text in _fragments(repo, commit, MODULES_DIR)
-        for problem in module_fragment_problems(entry, text)
+        problem for entry, text in files for problem in module_fragment_problems(entry, text)
     ]
+    for module, entry, text in _field_fragments(repo, commit):
+        block = modules.blocks.get(module)
+        if block is None:
+            modules.problems.append(f"'{entry}' belongs to the unknown module '{module}'")
+            continue
+        if not entry.endswith(".md"):
+            modules.problems.append(f"'{entry}' is not a field fragment (<name>.md)")
+            continue
+        fields, problems = parse_field_fragment(text)
+        modules.problems += [f"'{entry}': {problem}" for problem in problems]
+        for name, value in fields.items():
+            block.fields[name] = (block.fields.get(name, "") + " " + value).strip()
+        block.text += "\n" + "\n".join(line.rstrip() for line in text.splitlines()).strip()
     return modules
 
 

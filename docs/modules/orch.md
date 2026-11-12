@@ -15,7 +15,7 @@
 
 - **Promises:**
 
-  - `docs-check` reads the module map from `docs/modules/<module>.md` (plus any block left in `MODULES.md`) and accepts `docs/system/` sections as changes to `SYSTEM.md`; editing those files is not itself a module change.
+  - `docs-check` reads the module map from `docs/modules/<module>.md` (plus any block left in `MODULES.md`) and accepts `docs/system/` sections as changes to `SYSTEM.md`; editing those files is not itself a module change. A module many changes touch (`tests`) also takes field fragments in `docs/modules/<module>.d/<name>.md` (`- **Owns|Promises|How it fails|Tests:**` bullets, no `Paths`): they are appended to the module's fields, and editing one is an edit of that module's block, so concurrent changes add their own file instead of editing the same lines.
 
   - Up to eight distinct area sub-orchestrators sit directly under one parentless orchestrator; areas remain preview-only across live and experiment accept/write paths. No-area graph rules and main/worker model slots remain unchanged.
 

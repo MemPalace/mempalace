@@ -28,6 +28,13 @@ Format (read by `commonplace orch docs-check`):
   more specific path (for example `docs/runner.md`) may be listed in another
   block than its directory (`docs/`). `commonplace/` itself is split into its
   entries.
+- A module that nearly every change touches (`tests`) also takes per-change
+  field fragments in `docs/modules/<module>.d/<name>.md`: the same
+  `- **Tests:**` (or Owns, Promises, How it fails) field with its own bullets,
+  never **Paths**. They are appended to the module's fields, and adding or
+  editing one counts as updating the block. Prefer a fragment over editing the
+  shared block when your PR only adds bullets, and put SYSTEM.md notes in
+  `docs/system/<section>.md`.
 - A change that touches a module's paths updates that module's block (its file
   in `docs/modules/`), unless a `Docs-waiver` from `SYSTEM.md` applies. Editing
   the files in `docs/modules/` or `docs/system/` does not itself touch a module.

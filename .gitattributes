@@ -1,3 +1,7 @@
 # Shell scripts run under bash, which rejects CRLF line endings, so check
 # them out with LF on every platform.
 *.sh text eol=lf
+# Append-only docs that every change touches: keep both sides of a concurrent append
+# when a local batch merge meets them (docs-check validates the result).
+docs/modules/tests.md merge=union
+SYSTEM.md merge=union
