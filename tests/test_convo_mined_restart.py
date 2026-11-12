@@ -92,3 +92,32 @@ def test_legacy_unstamped_conversation_remains_skippable():
     meta.pop("chunk_total")
     meta.pop("chunk_index")
     _assert_restart_status([("legacy", meta)], True)
+
+
+@pytest.mark.parametrize(("row_count", "expected"), [(2, True), (1, False)])
+def test_pre_index_legacy_chunk_total_keeps_count_based_mine_skip(row_count, expected):
+    """Old conversation rows used chunk_total but had no filed_at/chunk_index.
+
+    Restore the existing SQLite bulk-prefetch contract without mistaking
+    an incomplete legacy count for a finished generation.
+    """
+    meta = _meta(total=2)
+    meta.pop("filed_at")
+    meta.pop("chunk_index")
+    rows = [(f"legacy-{index}", dict(meta)) for index in range(row_count)]
+    _assert_restart_status(rows, expected)
+
+
+def test_filed_generation_missing_chunk_index_is_not_complete():
+    """A newly filed batch cannot evade the strict check by omitting indices."""
+    meta = _meta(total=2)
+    meta.pop("chunk_index")
+    _assert_restart_status([("bad-0", dict(meta)), ("bad-1", dict(meta))], False)
+
+
+def test_indexed_generation_without_filed_at_still_requires_unique_indices():
+    """The legacy exemption requires both generation fields to be absent."""
+    meta = _meta(total=2)
+    meta.pop("filed_at")
+    rows = [("bad-0", dict(meta)), ("bad-1", dict(meta))]
+    _assert_restart_status(rows, False)
