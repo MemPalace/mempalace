@@ -54,6 +54,8 @@
   - Card lists share a runner read and per-board usage; a capacity refusal retains its original error when no display reason is available.
 
   - Board REST maps only database lock timeouts to busy; waiting summaries reuse one runner read and two board usage counts; split-key edits preserve child identity.
+
+  - Cards may declare a path contract (`paths`, relative globs; `commonplace/boards/contracts.py`): `task_update(paths=)` validates it and stores it canonical and brace-free (an editing field; while the card has a runner job only the workspace owner may clear or narrow it; any change takes the runner write lock before the board transaction, and a running card that gains globs is checked like a start), the card shows it, and the orchestrator start refuses `path_overlap` against a running card with an overlapping contract.
   - Card task types are owner-person edits; stable-ID grants in the workspace store guard new typed acquisition while existing holders retain their claims.
   - Owner todo assignments validate the target’s typed grant before claiming; repeat takes preserve an existing holder’s claim after grant removal.
 

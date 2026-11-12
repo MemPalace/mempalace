@@ -47,6 +47,13 @@ const cases = {
     assert.ok(!renderDetails({ ...card, review_kind: 'completion' }, opts).includes('Blocked since'));
     assert.ok(!renderDetails({ ...card, status: 'done' }, opts).includes('data-context-text'));
   },
+  paths() {
+    assert.ok(!html.includes('data-path-contract'));
+    assert.ok(!renderDetails({ ...card, paths: [] }, opts).includes('Owns paths'));
+    const owned = renderDetails({ ...card, paths: ['src/api/**', 'a<b>.md'] }, opts);
+    assert.ok(owned.includes('<dt>Owns paths</dt>'));
+    assert.ok(owned.includes('<code>src/api/**</code> <code>a&lt;b&gt;.md</code>'));
+  },
   proposal() {
     const proposal = { ...card, status: 'backlog', proposal_status: 'pending', body: '\n  Proposal <body> & exact\r\n\t', events: [{ kind: 'add', actor: 'conn:builder' }, ...card.events.slice(1)] };
     const result = renderDetails(proposal, opts);

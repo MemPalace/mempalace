@@ -178,6 +178,22 @@ def card_start(
     ):
         raise ToolError("no: runtime mode not allowed")
     _check_request_key(request_key)
+    card_id = row["id"]
+
+    def contract_guard(conn, now):
+        # No orchestrator config here, so ``_fenced`` does not run: the same path-contract
+        # check applies before the job is inserted.
+        refusal = runner_bridge.contract_refusal(
+            conn,
+            workspace_dir=ctx.workspace_dir(),
+            board_slug=board["slug"],
+            board_id=board["id"],
+            card=card_id,
+            now=now,
+        )
+        if refusal is not None:
+            raise refusal
+
     status, row = jobs.create(
         store,
         machine=machine,
@@ -193,6 +209,7 @@ def card_start(
         topic=topic,
         runtime_mode=runtime_mode,
         request_key=request_key,
+        guard=contract_guard,
     )
     return status, jobs.job_object(row, tokens=False)
 

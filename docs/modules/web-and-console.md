@@ -30,6 +30,8 @@
 
   - The GET-only Admin dispatcher, scoped users/connections projections, account/palette navigation and independently settling page controller.
 
+  - The card panel shows a card's path contract (`Owns paths`).
+
 
   - The card panel's Runs section (`cardruns.js`) lists the card's start jobs with Cancel and the owner's Resolve choice, and offers the owner a Start agent control fed by the options route, with plain words for each refusal.
 

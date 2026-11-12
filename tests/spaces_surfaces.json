@@ -1477,6 +1477,14 @@
                   "integer"
                 ]
               },
+              "paths": {
+                "description": "Path contract: repo globs this card will edit (src/api/**); [] clears. Cards with overlapping contracts are not started together.",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
               "priority": {
                 "description": "Owner person only. Omit on a new card for the default (normal).",
                 "enum": [
@@ -2621,6 +2629,14 @@
                   "string",
                   "integer"
                 ]
+              },
+              "paths": {
+                "description": "Path contract: repo globs this card will edit (src/api/**); [] clears. Cards with overlapping contracts are not started together.",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
               },
               "priority": {
                 "description": "Owner person only. Omit on a new card for the default (normal).",
@@ -4498,6 +4514,14 @@
                   "string",
                   "integer"
                 ]
+              },
+              "paths": {
+                "description": "Path contract: repo globs this card will edit (src/api/**); [] clears. Cards with overlapping contracts are not started together.",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
               },
               "priority": {
                 "description": "Owner person only. Omit on a new card for the default (normal).",

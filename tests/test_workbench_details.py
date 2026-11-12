@@ -8,7 +8,17 @@ import pytest
 
 STATIC = Path(__file__).resolve().parents[1] / "commonplace" / "web" / "static"
 HARNESS = Path(__file__).with_name("workbench_details.mjs")
-REDS = ["origin", "blocked", "proposal", "actions", "tabs", "strips", "loading", "priority"]
+REDS = [
+    "paths",
+    "origin",
+    "blocked",
+    "proposal",
+    "actions",
+    "tabs",
+    "strips",
+    "loading",
+    "priority",
+]
 
 
 @pytest.mark.parametrize("case", REDS)

@@ -21,6 +21,8 @@
 
   - A machine's worker policy reads and writes exactly its granted wings (first is the default write wing); starts on any other board wing are refused with a message naming the board wing and the granted wings, and the worker cannot write to an ungranted wing through any tool.
 
+  - A `card_start` on a board without an orchestrator config refuses with `path_overlap` inside the runner write transaction when the card's path contract overlaps a running card's; `jobs.create` takes an optional `guard(conn, now)` for such start-time checks.
+
   - Admin keeps machine and worker contact separate and always reports owner attestation as unverified; expired job inspection never sweeps or renews leases.
 
   - Admin lists each machine's requesters and the active trusted agents an owner may add, and edits them only through owner-only per-requester add and remove routes that act on the stored row under the registry lock and require the grant version the caller read (409 when stale); a grant edit vets added requesters and keeps ones the machine already holds.

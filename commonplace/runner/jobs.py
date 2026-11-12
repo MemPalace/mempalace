@@ -288,10 +288,15 @@ def create(
     runtime_mode="approval-required",
     request_key=None,
     person=False,
+    guard=None,
 ):
     """Return (HTTP status, stored row); machine is the resolved registry row.
 
     requested_by is user:<id> or conn:<connection_id>, never a connection name.
+    ``guard(conn, now)``, when given, runs inside the write transaction after the other
+    guards and may raise to refuse the start. It is opt-in: ``card_start`` is the only
+    caller and passes the path-contract check (``runner_bridge.contract_refusal``); a new
+    caller that starts cards must pass it too, or contracts are silently skipped.
     """
     from commonplace.projects import orchestration as orch
 
@@ -304,6 +309,15 @@ def create(
         if on
         else store.transaction() as conn
     ):
+
+        def admission_check():
+            if on:
+                orch.check_start(
+                    store.gateway, store.workspace_id, conn, board_slug, task_number, workers, now
+                )
+            if guard is not None:
+                guard(conn, now)
+
         return create_in(
             conn,
             now=now,
@@ -316,13 +330,7 @@ def create(
             runtime_mode=runtime_mode,
             request_key=request_key,
             person=person,
-            admission_check=(
-                lambda: orch.check_start(
-                    store.gateway, store.workspace_id, conn, board_slug, task_number, workers, now
-                )
-            )
-            if on
-            else None,
+            admission_check=admission_check if on or guard is not None else None,
         )
 
 

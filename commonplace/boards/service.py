@@ -18,6 +18,7 @@ from commonplace.extensions import ToolError
 from commonplace.http_util import log_failure
 
 from . import (
+    contracts,
     decision_blocks,
     goals,
     lifecycle,
@@ -1120,7 +1121,10 @@ class BoardService(lifecycle.LifecycleMixin):
         return creator is None or _restricted(creator)
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, *, runner_lock=False):
+        """One board transaction. ``runner_lock`` takes the runner write lock first (the
+        order of runner starts: runner, then board) and keeps it until the board
+        transaction has ended."""
         from commonplace.projects import orchestration as orch, reports
 
         self.pending = []
@@ -1146,6 +1150,10 @@ class BoardService(lifecycle.LifecycleMixin):
         self._admission_conn = None
         # Commit/rollback boards before releasing the admission lock.
         with ExitStack() as self._admissions:
+            if runner_lock:
+                self._admission_conn = self._admissions.enter_context(
+                    orch.admission(self.ctx.gateway, self.principal.workspace_id)
+                )
             with self.store.transaction() as conn:
                 self._report_existing_boards = {r[0] for r in conn.execute("SELECT id FROM boards")}
                 try:
@@ -3749,6 +3757,60 @@ class BoardService(lifecycle.LifecycleMixin):
             actor = self._update_acquisition_actor(prospective, args)
         return actor, self._type_holder(actor)
 
+    def _paths_change(self, args):
+        """Any contract change. It takes the runner write lock before the board
+        transaction (runner, then board, like a start), so it cannot land between a start's
+        contract read and its job commit, and a start cannot read half a change. A workspace
+        without a runner database has no jobs and nothing to race: the lock is skipped there
+        rather than creating the database."""
+        if "paths" not in args:
+            return False
+        from commonplace.orch import runner_bridge
+
+        return runner_bridge.runner_db_exists(self.ctx.gateway, self.principal.workspace_id)
+
+    def _paths_update(self, row, args):
+        """Stored ``paths`` for a contract update, inside the runner write lock. A card that
+        has a runner job holds its contract: only the workspace owner may clear or narrow
+        it; anyone else who may edit the card can only keep every glob and add more. A card
+        that counts as running (a live job, or a ``doing`` claim held by a connection) that
+        gains globs is checked like a start against the other running cards, whoever edits
+        it, so two running cards cannot be edited into an overlap."""
+        update = contracts.column_update(args)
+        if not update:
+            return update
+        from commonplace.orch import runner_bridge
+        from commonplace.runner import jobs
+
+        new = json.loads(update["paths"])
+        old = contracts.parse(row["paths"] if "paths" in row.keys() else None)
+        if old is None:
+            old = list(contracts.ANY)
+        live = runner_bridge.has_live_job(
+            self.ctx.gateway, self.principal.workspace_id, row["board"], row["id"]
+        )
+        owner = self.principal.person and self.principal.role == "owner"
+        if live and not owner and not set(old) <= set(new):
+            raise ToolError(
+                f"no: #{row['id']} has a running job, so only the workspace owner can clear "
+                "or narrow its paths; ask the owner (adding globs is allowed unless it makes "
+                "the card overlap another running card)"
+            )
+        claimed = row["status"] == "doing" and (row["assignee"] or "").startswith("conn:")
+        if set(new) - set(old) and (live or claimed):
+            refusal = runner_bridge.contract_refusal(
+                self._admission_conn,
+                workspace_dir=self.ctx.workspace_dir(),
+                board_slug=row["board"],
+                board_id=row["board_id"],
+                card=row["id"],
+                now=jobs._now(),
+                paths=new,
+            )
+            if refusal is not None:
+                raise refusal
+        return update
+
     def _priority_rank(self, args):
         """The owner's requested rank, or None when the update does not set one."""
         if "priority" not in args:
@@ -3850,6 +3912,7 @@ class BoardService(lifecycle.LifecycleMixin):
             "title",
             "body",
             "labels",
+            "paths",
             "blocked_by",
             "status",
             "before",
@@ -3871,7 +3934,7 @@ class BoardService(lifecycle.LifecycleMixin):
             "context",
             "person_reason",
         }
-        with self.transaction() as conn:
+        with self.transaction(runner_lock=self._paths_change(args)) as conn:
             row, board = self._get(conn, task)
             lifecycle.refuse_if_archived(conn, row)
             # Coordination may refine available work without releasing its origin.
@@ -3911,7 +3974,9 @@ class BoardService(lifecycle.LifecycleMixin):
                 moving=args.get("status", row["status"]) != row["status"],
                 completing=args.get("status") == "done",
                 dropping=set(args) == {"status"} and args["status"] == "backlog",
-                editing=bool(set(args) & {"title", "body", "labels", "blocked_by", "task_type"})
+                editing=bool(
+                    set(args) & {"title", "body", "labels", "blocked_by", "task_type", "paths"}
+                )
                 and not content_edit,
                 reopening=set(args) == {"status"} and args["status"] == "todo",
                 annotating=bool(set(args) - {"status"})
@@ -3953,6 +4018,7 @@ class BoardService(lifecycle.LifecycleMixin):
                 self._plan_label_check(conn, row, labels)
                 self._check_split_labels(conn, board, row, labels)
                 updates["labels"] = json.dumps(labels)
+            updates.update(self._paths_update(row, args))
             for key in ("title", "body", "branch", "status_line"):
                 if key in args:
                     updates[key] = validate_text(

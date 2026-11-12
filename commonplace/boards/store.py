@@ -13,7 +13,7 @@ from commonplace.admission import GATE
 from commonplace.extensions import ToolError
 from mempalace.sqlite_crypto import connect, row_factory
 
-from . import decision_blocks
+from . import contracts, decision_blocks
 from .display import need_for, plan_waiting
 from .goals import GOALS_SCHEMA
 from .priority import DEFAULT_RANK, PRIORITIES, name as priority_name
@@ -35,6 +35,7 @@ TASK_COLUMNS = {
     "status_line": "TEXT",
     "heartbeat_at": "TEXT",
     "labels": "TEXT",
+    "paths": "TEXT",
     "claim_expired_at": "TEXT",
     "agent_parent": "TEXT",
     "proposal_status": "TEXT CHECK (proposal_status IN ('pending', 'approved', 'rejected'))",
@@ -216,6 +217,13 @@ def owns_card(row, actor):
     )
 
 
+def _paths(raw) -> list:
+    """The card's path contract; an unreadable stored value shows as ``**``, the way the
+    start check reads it, so the owner can see it and clear it."""
+    paths = contracts.parse(raw)
+    return list(contracts.ANY) if paths is None else paths
+
+
 def card(conn, row, principal=None, *, release=None, approver=None) -> dict:
     """The public card shape, deliberately independent of SQLite's schema."""
     result = {
@@ -237,11 +245,20 @@ def card(conn, row, principal=None, *, release=None, approver=None) -> dict:
             key: row[key] if key in row.keys() else None
             for key in TASK_COLUMNS
             if key
-            not in ("labels", "parent_number", "pr_repo", "task_type", "priority", "ask_blocks")
+            not in (
+                "labels",
+                "paths",
+                "parent_number",
+                "pr_repo",
+                "task_type",
+                "priority",
+                "ask_blocks",
+            )
         },
         "ask_blocks": decision_blocks.public(row),
         "priority": priority_name(row["priority"] if "priority" in row.keys() else None),
         "labels": json.loads(row["labels"] or "[]"),
+        "paths": _paths(row["paths"] if "paths" in row.keys() else None),
         "links": len(BoardStore.links(conn, row["id"], principal)),
         "version": row["version"],
         "created_by": row["created_by"],

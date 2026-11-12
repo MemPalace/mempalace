@@ -3,6 +3,8 @@
 - **Paths:** `tests/`
 - **Owns:**
 
+  - Card path-contract regressions: glob overlap rules, refusal against running cards with mutation-pinned guards, and the Spaces tool-schema snapshot for `task_update(paths)`.
+
   - #451 wing editor regressions: `tests/test_runner_owner.py` (W1-W3: picker and wing edit with the memory listing failing, fallback, bookkeeping-only and private wings), case 4g of `tests/admin_runners_ui.mjs`, and two Chromium cases in `tests/workbench_e2e/test_admin_runners.py` that add a wing while `/api/connections` hangs or the wing read fails.
 
   - `tests/test_commonplace_deck_bots.py` (`commonplace_deck_bots.mjs`) covers draft hand-off in both looks, Deck tile and strip markup, project work status mapping, week-bounded completion groups, escaped text and the read-only project sheet lifecycle.
