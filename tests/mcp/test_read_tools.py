@@ -1350,3 +1350,54 @@ def test_follow_tunnels_records_without_the_writer_lease(monkeypatch):
     monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
     mcp_server.tool_follow_tunnels("wing_a", "room_a", record=True)
     assert captured["record"] is False
+
+
+def test_list_drawers_sdk_fallback_rejects_replaced_generation_between_reads(monkeypatch):
+    """A source-wide scan may see a newer version under the same physical ID.
+
+    The filtered SDK read selected B, but a concurrent writer replaces its
+    metadata with a complete C generation before the source-wide validation.
+    An ID-only check incorrectly authorizes B using C's completeness proof.
+    """
+    from mempalace import mcp_server
+
+    source = "/sessions/racing.jsonl"
+    common = {
+        "wing": "mempalace",
+        "room": "first",
+        "source_file": source,
+        "ingest_mode": "convos",
+        "extract_mode": "general",
+        "source_mtime": 7.0,
+        "chunk_total": 2,
+    }
+    stale = {**common, "filed_at": "B", "chunk_index": 0}
+    fresh = [
+        {**common, "filed_at": "C", "chunk_index": 0},
+        {**common, "room": "second", "filed_at": "C", "chunk_index": 1},
+    ]
+
+    class SwitchingCollection:
+        def get(self, **kwargs):
+            if "ids" in kwargs:
+                raise AssertionError("an inconsistent result reached page hydration")
+            where = kwargs.get("where") or {}
+            offset = kwargs.get("offset", 0)
+            if "source_file" in where:
+                ids, metas = ["same_id", "new_id"], fresh
+            else:
+                ids, metas = ["same_id"], [stale]
+            return {
+                "ids": ids[offset:],
+                "metadatas": metas[offset:],
+                "documents": [],
+            }
+
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+    monkeypatch.setattr(mcp_server, "_palace_known_wings", lambda: {"mempalace"})
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda: SwitchingCollection())
+
+    result = mcp_server.tool_list_drawers(wing="mempalace", room="first")
+    assert "error" not in result, result
+    assert result["total"] == 0, result
+    assert result["drawers"] == []
