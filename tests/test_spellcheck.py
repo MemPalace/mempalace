@@ -6,11 +6,8 @@ from mempalace.spellcheck import (
     _edit_distance,
     _get_system_words,
     _should_skip,
-    spellcheck_transcript,
-    spellcheck_transcript_line,
     spellcheck_user_text,
 )
-
 
 # --- _should_skip ---
 
@@ -122,39 +119,3 @@ def test_spellcheck_preserves_technical_terms():
             assert "ChromaDB" in result
             assert "bge-large" in result
             assert "WRONG" not in result
-
-
-# --- spellcheck_transcript_line ---
-
-
-def test_transcript_line_user_turn():
-    """Lines starting with '>' should be processed."""
-    with patch("mempalace.spellcheck.spellcheck_user_text", return_value="corrected"):
-        result = spellcheck_transcript_line("> hello world")
-        assert "corrected" in result
-
-
-def test_transcript_line_assistant_turn():
-    """Lines not starting with '>' should pass through unchanged."""
-    line = "This is an assistant response"
-    assert spellcheck_transcript_line(line) == line
-
-
-def test_transcript_line_empty_user_turn():
-    """A '> ' line with no message content should pass through."""
-    line = "> "
-    assert spellcheck_transcript_line(line) == line
-
-
-# --- spellcheck_transcript ---
-
-
-def test_spellcheck_transcript_processes_content():
-    """Full transcript: only '>' lines are touched."""
-    content = "Assistant line\n> user line\nAnother assistant line"
-    with patch("mempalace.spellcheck.spellcheck_user_text", return_value="fixed"):
-        result = spellcheck_transcript(content)
-        lines = result.split("\n")
-        assert lines[0] == "Assistant line"
-        assert "fixed" in lines[1]
-        assert lines[2] == "Another assistant line"

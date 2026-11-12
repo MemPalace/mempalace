@@ -124,7 +124,7 @@ def _open_collection_or_explain(
     this helper: it uses ``_get_collection(create=db_exists)`` so a valid
     palace whose collection was never bootstrapped lazily gets one on the
     first status call, and a corruption-detection sqlite-only probe fires
-    first when the vector path is disabled (see PR #831 / issue #830).
+    first when the vector path is disabled.
 
     State A: palace dir is absent.
     State B: dir is present but no backend database artifact is present.

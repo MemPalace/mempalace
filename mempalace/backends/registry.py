@@ -35,9 +35,9 @@ _lock = Lock()
 def _config_file_hint() -> str:
     """The config.json this install resolves, for error messages."""
     try:
-        from ..config import _default_config_dir
+        from ..paths import config_dir
 
-        return str(_default_config_dir() / "config.json")
+        return str(config_dir() / "config.json")
     except Exception:
         return "config.json in the MemPalace config directory"
 

@@ -168,21 +168,32 @@ def test_collection_write_roundtrip_fails_when_delete_silently_drops():
 
 
 def _make_minimal_chromadb_sqlite(tmp_path):
-    """Build a SQLite file with the minimal schema extract_drawers_from_sqlite reads."""
+    """Schema ``extract_via_sqlite`` reads, with a closet row that must not leak."""
     db = tmp_path / "chroma.sqlite3"
     conn = sqlite3.connect(str(db))
     conn.executescript(
         """
-        CREATE TABLE embeddings (id INTEGER PRIMARY KEY, embedding_id TEXT);
+        CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT, scope TEXT);
+        CREATE TABLE embeddings (
+            id INTEGER PRIMARY KEY, embedding_id TEXT, segment_id TEXT
+        );
         CREATE TABLE embedding_metadata (
             id INTEGER, key TEXT,
             string_value TEXT, int_value INTEGER,
             float_value REAL, bool_value INTEGER
         );
-        INSERT INTO embeddings VALUES (1, 'd-001');
+        INSERT INTO collections VALUES ('col-d', 'mempalace_drawers');
+        INSERT INTO collections VALUES ('col-c', 'mempalace_closets');
+        INSERT INTO segments VALUES ('seg-d', 'col-d', 'METADATA');
+        INSERT INTO segments VALUES ('seg-c', 'col-c', 'METADATA');
+        INSERT INTO embeddings VALUES (1, 'd-001', 'seg-d');
+        INSERT INTO embeddings VALUES (2, 'c-001', 'seg-c');
         INSERT INTO embedding_metadata VALUES (1, 'chroma:document', 'hello', NULL, NULL, NULL);
         INSERT INTO embedding_metadata VALUES (1, 'wing', 'personal', NULL, NULL, NULL);
         INSERT INTO embedding_metadata VALUES (1, 'room', '2026-04-26', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES (2, 'chroma:document', 'closet line', NULL, NULL, NULL);
+        INSERT INTO embedding_metadata VALUES (2, 'wing', 'personal', NULL, NULL, NULL);
         """
     )
     conn.commit()
@@ -197,6 +208,7 @@ def test_extract_drawers_returns_drawers(tmp_path):
     assert drawers[0]["id"] == "d-001"
     assert drawers[0]["document"] == "hello"
     assert drawers[0]["metadata"] == {"wing": "personal", "room": "2026-04-26"}
+    assert all(row["id"] != "c-001" for row in drawers)
 
 
 def test_migrate_skips_count_on_hnsw_divergence(tmp_path, capsys):
@@ -271,67 +283,57 @@ def test_migrate_dry_run_rebuilds_when_collection_is_readable_but_not_writable(t
     assert "DRY RUN" in out
 
 
-def test_migrate_cleans_temp_palace_on_chromadb_failure(tmp_path):
-    """If chromadb fails after the temp palace is created, mkdtemp's
-    directory must be removed — without try/finally it leaked into the
-    system temp root forever."""
-    import tempfile as _tempfile
+_ONE_DRAWER = [{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}]
 
+
+def _unreadable_palace_patches(rebuild):
+    """Route migrate past the probe to the rebuild, which ``rebuild`` replaces."""
+    import mempalace.backends.chroma as _chroma_mod
+
+    failing_backend = MagicMock()
+    failing_backend.get_collection.side_effect = Exception("unreadable")
+    return (
+        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
+        patch("mempalace.migrate.extract_drawers_from_sqlite", return_value=_ONE_DRAWER),
+        patch.object(_chroma_mod, "ChromaBackend", return_value=failing_backend),
+        patch("mempalace.repair.rebuild_from_sqlite", side_effect=rebuild),
+    )
+
+
+def test_migrate_cleans_temp_palace_on_rebuild_failure(tmp_path):
+    """A failed rebuild must not leave its work dir beside the palace."""
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
+    seen = []
 
-    captured_temp_paths = []
-    real_mkdtemp = _tempfile.mkdtemp
+    def rebuild(source, dest):
+        seen.append(dest)
+        os.makedirs(dest)
+        raise RuntimeError("chromadb boom")
 
-    def tracking_mkdtemp(*args, **kwargs):
-        path = real_mkdtemp(*args, **kwargs)
-        captured_temp_paths.append(path)
-        return path
-
-    failing_backend = MagicMock()
-    # First ChromaBackend().get_collection() must raise so we drop into
-    # the SQL-extraction path; the second ChromaBackend().get_or_create_collection()
-    # raises to trigger the cleanup we are testing.
-    failing_backend.get_collection.side_effect = Exception("unreadable")
-    failing_backend.get_or_create_collection.side_effect = RuntimeError("chromadb boom")
-
-    import mempalace.backends.chroma as _chroma_mod
-
-    with (
-        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
-        patch(
-            "mempalace.migrate.extract_drawers_from_sqlite",
-            return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
-        ),
-        patch("builtins.input", return_value="y"),
-        patch("mempalace.migrate.copy_palace_dir"),
-        patch("mempalace.migrate.tempfile.mkdtemp", side_effect=tracking_mkdtemp),
-        patch.object(_chroma_mod, "ChromaBackend", return_value=failing_backend),
-    ):
-        try:
+    p1, p2, p3, p4 = _unreadable_palace_patches(rebuild)
+    with p1, p2, p3, p4, patch("mempalace.migrate.copy_palace_dir"):
+        with pytest.raises(RuntimeError, match="chromadb boom"):
             migrate(str(palace_dir), confirm=True)
-        except Exception:
-            pass
 
-    assert captured_temp_paths, "mkdtemp was never called — flow short-circuited"
-    for p in captured_temp_paths:
-        assert not os.path.exists(p), f"temp palace was not cleaned up: {p}"
+    assert seen, "the rebuild was never reached"
+    # Same volume as the palace, so the swap is a rename, not a copy.
+    assert os.path.dirname(os.path.dirname(seen[0])) == str(tmp_path)
+    assert not os.path.exists(os.path.dirname(seen[0]))
+    assert (palace_dir / "chroma.sqlite3").read_text() == "db"
 
 
 def test_migrate_prunes_old_pre_migrate_backups(tmp_path, monkeypatch):
     """Repeated migrations must not accumulate full-palace copies forever.
 
-    The backup + prune happen right after the directory copy, before the
-    (mocked) chromadb step, so even a migration that fails afterward still
-    trims the backup set. We let the copy run for real so the fresh backup
-    exists on disk for the prune to evaluate.
+    The backup + prune happen before the rebuild, so even a migration that
+    fails afterward still trims the backup set.
     """
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
 
-    # Pre-seed 3 stale .pre-migrate.* sibling dirs with old mtimes.
     for i in range(3):
         stale = tmp_path / f"palace.pre-migrate.2026010{i}_000000"
         stale.mkdir()
@@ -340,30 +342,13 @@ def test_migrate_prunes_old_pre_migrate_backups(tmp_path, monkeypatch):
 
     monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "2")
 
-    failing_backend = MagicMock()
-    failing_backend.get_collection.side_effect = Exception("unreadable")
-    failing_backend.get_or_create_collection.side_effect = RuntimeError("chromadb boom")
-
-    import mempalace.backends.chroma as _chroma_mod
-
-    with (
-        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
-        patch(
-            "mempalace.migrate.extract_drawers_from_sqlite",
-            return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
-        ),
-        patch("builtins.input", return_value="y"),
-        patch.object(_chroma_mod, "ChromaBackend", return_value=failing_backend),
-    ):
-        try:
-            migrate(str(palace_dir), confirm=True)
-        except Exception:
-            pass
+    p1, p2, p3, p4 = _unreadable_palace_patches(RuntimeError("chromadb boom"))
+    with p1, p2, p3, p4, pytest.raises(RuntimeError):
+        migrate(str(palace_dir), confirm=True)
 
     backups = sorted(p.name for p in tmp_path.glob("palace.pre-migrate.*"))
     # 3 stale + 1 fresh = 4 created; retention keeps only the 2 newest.
     assert len(backups) == 2
-    # The two oldest stale backups must be gone.
     assert "palace.pre-migrate.20260100_000000" not in backups
     assert "palace.pre-migrate.20260101_000000" not in backups
 
@@ -375,24 +360,20 @@ def test_migrate_prunes_old_pre_migrate_backups(tmp_path, monkeypatch):
 def test_migrate_backup_survives_a_socket_in_the_palace_directory(tmp_path, monkeypatch, capsys):
     """#2207 in the second full-palace copy: migrate takes the same backup.
 
-    The backend is mocked to fail after the backup, so the expected
+    The rebuild is mocked to fail after the backup, so the expected
     RuntimeError proves the copy got past the socket instead of dying on it.
     """
-    # Retention comes from the user's config file otherwise, which this test
-    # must not read; the sibling backup tests pin it the same way.
     monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "2")
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
     # Pins that migrate still copies with ``symlinks=True``: links are
     # recreated as links, so a link to a file outside the palace does not get
-    # duplicated by content into every ``.pre-migrate.*`` copy. The target is
-    # real, so the link resolves and only the copy mode decides the outcome.
+    # duplicated by content into every ``.pre-migrate.*`` copy.
     (tmp_path / "outside.json").write_text("payload", encoding="utf-8")
     try:
         (palace_dir / "tunnels.json").symlink_to(tmp_path / "outside.json")
     except OSError as exc:
-        # Only a permission refusal is a skip; anything else is a bug here.
         if os.name != "nt" and exc.errno not in (errno.EPERM, errno.EACCES):
             raise
         pytest.skip(f"symlink creation not permitted for this user: {exc}")
@@ -405,20 +386,8 @@ def test_migrate_backup_survives_a_socket_in_the_palace_directory(tmp_path, monk
     finally:
         leftover.close()
 
-    failing_backend = MagicMock()
-    failing_backend.get_or_create_collection.side_effect = RuntimeError("chromadb boom")
-
-    import mempalace.backends.chroma as _chroma_mod
-
-    with (
-        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
-        patch(
-            "mempalace.migrate.extract_drawers_from_sqlite",
-            return_value=[{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}],
-        ),
-        patch.object(_chroma_mod, "ChromaBackend", return_value=failing_backend),
-        pytest.raises(RuntimeError, match="chromadb boom"),
-    ):
+    p1, p2, p3, p4 = _unreadable_palace_patches(RuntimeError("chromadb boom"))
+    with p1, p2, p3, p4, pytest.raises(RuntimeError, match="chromadb boom"):
         migrate(str(palace_dir), confirm=True)
 
     out = capsys.readouterr().out
@@ -431,73 +400,247 @@ def test_migrate_backup_survives_a_socket_in_the_palace_directory(tmp_path, monk
     assert (backups[0] / "tunnels.json").is_symlink()
 
 
-def test_migrate_restores_palace_on_swap_failure(tmp_path, capsys):
-    """End-to-end coverage for swap-failure rollback.
+def _fake_rebuild(source, dest):
+    os.makedirs(dest)
+    with open(os.path.join(dest, "chroma.sqlite3"), "w") as f:
+        f.write("rebuilt")
+    return {"mempalace_drawers": 1}
 
-    `migrate` swaps the old palace aside via `os.replace` rather than
-    deleting it. If `os.replace(temp_palace, palace_path)` raises EXDEV
-    (cross-filesystem) AND its `shutil.move` fallback ALSO fails,
-    `_restore_stale_palace` rolls back by renaming the aside-copy back
-    into place. This exercises that full failure path through the public
-    `migrate()` entry point; develop already has unit-level tests for the
-    helper itself.
-    """
+
+def test_migrate_restores_palace_on_swap_failure(tmp_path, capsys):
+    """If moving the rebuild into place fails, the aside copy comes back."""
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("dummy db")
-    # Sentinel file we verify survives the failed swap via rename-aside rollback.
     (palace_dir / "sentinel.txt").write_text("original")
 
-    fake_col = MagicMock()
-    fake_col.count.return_value = 1
-    fake_col.add.return_value = None
-
-    drawers = [{"id": "id1", "document": "doc", "metadata": {"wing": "w", "room": "r"}}]
-
-    # Selective os.replace mock: pass-through for the rename-aside (call A,
-    # palace -> palace.old) and the rollback (call C, palace.old -> palace);
-    # raise EXDEV exactly once on the swap-in (call B, temp -> palace).
     real_os_replace = os.replace
-    fail_state = {"swap_in_failed": False}
 
     def selective_replace(src, dst):
-        if os.fspath(dst) == os.fspath(palace_dir) and not fail_state["swap_in_failed"]:
-            fail_state["swap_in_failed"] = True
-            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        if os.fspath(dst) == os.fspath(palace_dir) and "mempalace_migrate" in os.fspath(src):
+            raise OSError(errno.EIO, "swap-in failed")
         return real_os_replace(src, dst)
 
+    p1, p2, p3, p4 = _unreadable_palace_patches(_fake_rebuild)
     with (
-        patch("mempalace.migrate.detect_chromadb_version", return_value="0.5.x"),
-        patch("mempalace.backends.chroma.ChromaBackend") as mock_backend_cls,
-        patch("mempalace.migrate.collection_write_roundtrip_works", return_value=False),
-        patch("mempalace.migrate.extract_drawers_from_sqlite", return_value=drawers),
-        patch("mempalace.migrate.confirm_destructive_action", return_value=True),
+        p1,
+        p2,
+        p3,
+        p4,
+        patch("mempalace.migrate._rebuilt_counts_match", return_value=True),
         patch("mempalace.migrate.os.replace", side_effect=selective_replace),
-        patch(
-            "mempalace.migrate.shutil.move",
-            side_effect=OSError("fallback move also failed"),
-        ),
-        pytest.raises(OSError),
+        pytest.raises(OSError, match="swap-in failed"),
     ):
-        mock_backend_cls.backend_version.return_value = "1.5.4"
-        mock_backend_cls.return_value.get_collection.return_value = fake_col
-        mock_backend_cls.return_value.get_or_create_collection.return_value = fake_col
-        migrate(str(palace_dir))
+        migrate(str(palace_dir), confirm=True)
 
-    # Palace directory restored from the rename-aside copy.
-    assert palace_dir.is_dir(), "palace directory missing after rollback"
-    sentinel = palace_dir / "sentinel.txt"
-    assert sentinel.is_file(), "sentinel file not restored"
-    assert sentinel.read_text() == "original", "restored contents differ from original"
+    assert (palace_dir / "sentinel.txt").read_text() == "original"
+    assert (palace_dir / "chroma.sqlite3").read_text() == "dummy db"
+    assert list(tmp_path.glob("palace.pre-migrate.*")), "pre-migrate backup missing"
+    assert not list(tmp_path.glob("palace.old*")), "aside copy should be renamed back"
+    assert not list(tmp_path.glob(".mempalace_migrate_*")), "work dir left behind"
+    assert "CRITICAL" not in capsys.readouterr().out
 
-    # Pre-migrate backup remains on disk for post-mortem.
-    backups = [p for p in tmp_path.iterdir() if p.name.startswith("palace.pre-migrate.")]
-    assert backups, "pre-migrate backup directory missing"
 
-    # Stale .old aside-copy was consumed by the rollback (renamed back).
-    stale_path = tmp_path / "palace.old"
-    assert not stale_path.exists(), "stale .old should have been consumed by rollback"
+def test_migrate_reports_a_palace_held_open(tmp_path, capsys):
+    """Windows refuses to rename a directory with an open file inside it."""
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("dummy db")
 
-    # No CRITICAL message — rollback succeeded cleanly.
+    real_os_replace = os.replace
+
+    def refuse_aside(src, dst):
+        if os.fspath(src) == os.fspath(palace_dir):
+            raise PermissionError(errno.EACCES, "in use")
+        return real_os_replace(src, dst)
+
+    p1, p2, p3, p4 = _unreadable_palace_patches(_fake_rebuild)
+    with (
+        p1,
+        p2,
+        p3,
+        p4,
+        patch("mempalace.migrate._rebuilt_counts_match", return_value=True),
+        patch("mempalace.migrate.os.replace", side_effect=refuse_aside),
+    ):
+        assert migrate(str(palace_dir), confirm=True) is False
+
     out = capsys.readouterr().out
-    assert "CRITICAL" not in out
+    assert "held open by another process" in out
+    assert "left unchanged" in out
+    assert (palace_dir / "chroma.sqlite3").read_text() == "dummy db"
+    assert not list(tmp_path.glob(".mempalace_migrate_*"))
+
+
+def _ids_and_docs(collection):
+    result = collection.get(include=["documents"])
+    return dict(zip(result.ids, result.documents))
+
+
+def _seed_real_palace(palace):
+    """Drawers, a closet, a live knowledge graph, and palace state files."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    backend = ChromaBackend()
+    try:
+        backend.get_or_create_collection(str(palace), "mempalace_drawers").add(
+            ids=["d1", "d2"],
+            documents=["drawer words stay here", ""],
+            metadatas=[{"wing": "w", "room": "r"}, {"wing": "w", "room": "r"}],
+        )
+        backend.get_or_create_collection(str(palace), "mempalace_closets").add(
+            ids=["c1"],
+            documents=["topic|Alice|→d1"],
+            metadatas=[{"wing": "w", "source_file": "a.md"}],
+        )
+    finally:
+        backend.close()
+    for name in ("knowledge_graph.sqlite3", "logstream.sqlite3"):
+        conn = sqlite3.connect(str(palace / name))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (v TEXT)")
+        conn.execute("INSERT INTO t VALUES (?)", (name,))
+        conn.commit()
+        conn.close()
+    for name in ("replica.json", "peers.json", "entities.json", "sentinel.txt"):
+        (palace / name).write_text(name, encoding="utf-8")
+    (palace / "drawer_state").mkdir()
+    (palace / "drawer_state" / "nested.txt").write_text("nested", encoding="utf-8")
+
+
+def _table_value(db):
+    conn = sqlite3.connect(str(db))
+    try:
+        return conn.execute("SELECT v FROM t").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_migrate_rebuild_keeps_every_palace_file(tmp_path, monkeypatch):
+    """Un-mocked destructive path: a real palace is rebuilt and swapped.
+
+    Closets must not come back as drawers, empty-document drawers must not
+    be dropped, and every non-Chroma file in the palace must survive.
+    """
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "4")
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    _seed_real_palace(palace)
+    # A writer still holds the graph open with an unflushed WAL write.
+    live = sqlite3.connect(str(palace / "knowledge_graph.sqlite3"))
+    live.execute("PRAGMA wal_autocheckpoint=0")
+    live.execute("UPDATE t SET v = 'kg-latest'")
+    live.commit()
+    if os.name == "nt":
+        # Windows will not rename a directory with a file open inside it;
+        # that refusal is covered by test_migrate_reports_a_palace_held_open.
+        live.close()
+    if os.name != "nt" and hasattr(socket, "AF_UNIX"):
+        # A leftover runtime socket must not stop the carry-over.
+        monkeypatch.chdir(palace)
+        leftover = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        leftover.bind("mcp.sock")
+        leftover.close()
+    rollback = tmp_path / "palace.old"
+    rollback.mkdir()
+    (rollback / "DO_NOT_DELETE").write_text("previous rollback", encoding="utf-8")
+
+    try:
+        with patch("mempalace.migrate.collection_write_roundtrip_works", return_value=False):
+            assert migrate(str(palace), confirm=True) is True
+    finally:
+        live.close()
+
+    from mempalace.backends.chroma import ChromaBackend
+
+    backend = ChromaBackend()
+    try:
+        drawers = _ids_and_docs(backend.get_collection(str(palace), "mempalace_drawers"))
+        closets = _ids_and_docs(backend.get_collection(str(palace), "mempalace_closets"))
+    finally:
+        backend.close()
+
+    assert drawers == {"d1": "drawer words stay here", "d2": ""}
+    assert closets == {"c1": "topic|Alice|→d1"}
+    assert _table_value(palace / "knowledge_graph.sqlite3") == "kg-latest"
+    assert _table_value(palace / "logstream.sqlite3") == "logstream.sqlite3"
+    for name in ("replica.json", "peers.json", "entities.json", "sentinel.txt"):
+        assert (palace / name).read_text(encoding="utf-8") == name
+    assert (palace / "drawer_state" / "nested.txt").read_text(encoding="utf-8") == "nested"
+    assert (palace / "mempalace_embedder.json").is_file()
+    assert (rollback / "DO_NOT_DELETE").read_text(encoding="utf-8") == "previous rollback"
+    assert not list(tmp_path.glob("palace.old.*"))
+    assert not list(tmp_path.glob(".mempalace_migrate_*"))
+
+
+def test_count_mismatch_against_the_source_does_not_swap(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "4")
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    _seed_real_palace(palace)
+
+    import mempalace.repair as repair
+
+    real_count = repair.sqlite_drawer_count
+
+    def source_has_one_more(path, name=None):
+        n = real_count(path, name)
+        return n + 1 if os.path.abspath(path) == str(palace) and n is not None else n
+
+    monkeypatch.setattr(repair, "sqlite_drawer_count", source_has_one_more)
+    with patch("mempalace.migrate.collection_write_roundtrip_works", return_value=False):
+        assert migrate(str(palace), confirm=True) is False
+
+    out = capsys.readouterr().out
+    assert "left unchanged" in out
+    assert "Migration complete" not in out
+    assert (palace / "sentinel.txt").read_text(encoding="utf-8") == "sentinel.txt"
+    assert not list(tmp_path.glob(".mempalace_migrate_*"))
+
+
+def test_migrate_refuses_assets_it_cannot_re_embed(tmp_path, monkeypatch, capsys):
+    """Media vectors are never silently replaced by text vectors."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    monkeypatch.setenv("MEMPALACE_MAX_BACKUPS", "4")
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    _seed_real_palace(palace)
+    backend = ChromaBackend()
+    try:
+        backend.get_or_create_collection(str(palace), "mempalace_assets").add(
+            ids=["a1"],
+            documents=["photo of the dock"],
+            metadatas=[{"wing": "w", "room": "r", "source_path": str(tmp_path / "gone.jpg")}],
+        )
+    finally:
+        backend.close()
+
+    with patch("mempalace.migrate.collection_write_roundtrip_works", return_value=False):
+        assert migrate(str(palace), confirm=True) is False
+
+    out = capsys.readouterr().out
+    assert "left unchanged" in out
+    assert (palace / "sentinel.txt").read_text(encoding="utf-8") == "sentinel.txt"
+
+
+def test_migrate_reports_a_held_palace_lock(tmp_path, capsys):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_bytes(b"db")
+    from mempalace.palace import MineAlreadyRunning
+
+    with (
+        patch(
+            "mempalace.palace.mine_palace_lock",
+            side_effect=MineAlreadyRunning("palace held by 9"),
+        ),
+        pytest.raises(SystemExit) as caught,
+    ):
+        migrate(str(palace), dry_run=True)
+
+    assert caught.value.code == 2
+    out = capsys.readouterr().out
+    assert "Another writer already holds this palace" in out
+    assert "nothing changed" in out
+    assert (palace / "chroma.sqlite3").read_bytes() == b"db"

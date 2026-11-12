@@ -63,7 +63,11 @@ follow a restarted hub — without touching their config. Set
 `MEMPALACE_HUB_FORWARD=0` to opt out.
 
 Local agents that speak HTTP natively can also connect directly to
-`http://127.0.0.1:8765/mcp`.
+`http://127.0.0.1:8765/mcp`, with no token:
+
+```bash
+claude mcp add --transport http mempalace http://127.0.0.1:8765/mcp
+```
 
 ## 3. Bring in remote machines
 
@@ -79,21 +83,17 @@ claude mcp add --transport http mempalace https://memory.example.com/mcp \
   --header "Authorization: Bearer $MEMPALACE_MCP_HTTP_TOKEN"
 ```
 
-One trap worth calling out: the hub **auto-generates a bearer token only for
-non-loopback binds**. A loopback bind fronted by a proxy is tokenless unless
-you set one explicitly — mint one and pass it at startup:
-
-```bash
-mempalace serve --host 127.0.0.1 --port 8765 --token "$(openssl rand -hex 32)"
-```
-
-(or export `MEMPALACE_MCP_HTTP_TOKEN` before starting the hub).
+Once a proxy publishes the hub (`MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS` set) or it
+binds a network address, it requires a bearer token: it reuses or
+auto-generates one stored `0600` at `~/.mempalace/server/<key>/token` (the
+path is printed at startup), and local `mempalace` clients read it from there.
+Hand that token to remote agents, or pass your own with `--token` /
+`MEMPALACE_MCP_HTTP_TOKEN`. A plain loopback hub needs none.
 
 ::: warning Never expose the logstream unauthenticated
 Events and artifacts carry work metadata and patch contents. The hub's
-bearer-token policy covers them — don't weaken it with `--allow-insecure`
-outside a trusted proxy setup, and verify the token is actually set when
-fronting a loopback bind.
+bearer-token policy covers them — don't weaken it with `--no-token` or
+`--allow-insecure` outside a trusted setup.
 :::
 
 ## 4. Give every agent a name

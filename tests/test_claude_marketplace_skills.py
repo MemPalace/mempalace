@@ -2,7 +2,6 @@
 
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CANONICAL_SKILLS = REPO_ROOT / "skills"
 CLAUDE_SKILLS = REPO_ROOT / ".claude-plugin" / "skills"

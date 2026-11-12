@@ -11,7 +11,9 @@ PreInvocation) for background mining and startup memory injection.
 | Surface         | Antigravity component                                      |
 |-----------------|------------------------------------------------------------|
 | MCP server      | `mempalace` (stdio, runs `mempalace-mcp`)                  |
-| Skill           | `mempalace` (in-plugin `skills/mempalace/SKILL.md`)        |
+| UI Extension    | `MemPalace` Aux Pane (`Extensions > MemPalace`, `sidecar://mempalace/palace/`) |
+| Skills          | `mempalace` and `mempalace-recall` (`skills/*/SKILL.md`)   |
+| Rule            | `mempalace-recall` (`rules/mempalace-recall.md`, `trigger: model_decision`) |
 | Stop hook       | `mempalace-save` — background-mines the conversation        |
 | PreInvocation   | `mempalace-wake` — injects memory on the first model call   |
 
@@ -20,13 +22,26 @@ deliberately do not ship is in [`hooks/antigravity/INVESTIGATION.md`](https://gi
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+
 - [`mempalace`](https://github.com/MemPalace/mempalace) installed and
   on `$PATH` (`mempalace --version` to verify)
 - [Antigravity IDE](https://antigravity.google/) installed (`~/.gemini/`
   exists)
 
 ## Install
+
+### Option 1: Antigravity CLI (`agy plugin install`) — Windows, macOS & Linux
+
+From a cloned `mempalace` checkout:
+
+```bash
+agy plugin validate --strict ./plugins/mempalace
+agy plugin install ./plugins/mempalace
+```
+
+`plugins/mempalace/` is a self-contained Antigravity Marketplace bundle with cross-platform Node.js lifecycle hooks (`scripts/save-hook.mjs` and `scripts/wake-hook.mjs`), the visual **MemPalace** Aux Pane UI Extension (`sidecars/palace/`), skills, recall rule, and `mcp_config.json`.
+
+### Option 2: POSIX `install.sh` (macOS & Linux)
 
 From the cloned `mempalace` repo:
 
@@ -36,7 +51,7 @@ bash hooks/antigravity/install.sh
 
 This installs to `~/.gemini/config/plugins/mempalace/`. Restart
 Antigravity and the plugin loads automatically — you'll see
-`mempalace` in the MCP store and the skill list.
+`mempalace` in the MCP store, the skill list, and under **Extensions > MemPalace** in the Aux Pane `+` menu.
 
 ### Dry run first
 

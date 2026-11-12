@@ -1,38 +1,57 @@
-"""Schema tests for the .antigravity-plugin/ directory.
+"""Schema and Marketplace readiness tests for `plugins/mempalace/`.
 
 Covers:
 
-* `plugin.json` matches the verified-minimal Antigravity schema
-  (`{"name": "..."}`, no fabricated fields).
-* `mcp_config.json` registers `mempalace-mcp` under the `mcpServers`
-  key with the verified shape from
-  https://antigravity.google/docs/mcp.
-* `hooks.json.tmpl` is valid JSON, references both hook scripts via
-  the `__PLUGIN_DIR__` placeholder, and pins per-event timeouts
-  inside the safety bounds.
-* `skills/mempalace/SKILL.md` exists as a real file (no symlinks) and
-  carries the required YAML frontmatter (`description`).
-
-These are contract tests — they fail as soon as anyone changes the
-in-repo shape in a way that drifts from Antigravity's documented
-schema. See [hooks/antigravity/INVESTIGATION.md](../hooks/antigravity/INVESTIGATION.md)
-for the source-of-truth audit driving the assertions.
+* `plugin.json` matches https://antigravity.google/schemas/v1/plugin.json
+  with all Marketplace fields and no fabricated `permissions` key.
+* `mcp_config.json` registers `mempalace-mcp` under `mcpServers`.
+* `hooks.json` is committed directly for zero-touch Marketplace / `agy plugin install`
+  bundles, uses relative `node ./scripts/...` paths (no `${PLUGIN_ROOT}` or
+  `__PLUGIN_DIR__`), and bundles LF-shebang scripts under `scripts/`.
+* `hooks/antigravity/hooks.json.tmpl` remains valid for the POSIX `install.sh` path.
+* `skills/*/SKILL.md` and `rules/mempalace-recall.md` exist as real files
+  with valid Antigravity frontmatter.
+* When `agy` CLI is installed locally, `agy plugin validate --strict` passes
+  with 0 errors and 0 warnings directly against `plugins/mempalace/`.
 """
 
 import json
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_DIR = REPO_ROOT / ".antigravity-plugin"
+PLUGIN_DIR = REPO_ROOT / "plugins" / "mempalace"
+LEGACY_DOT_DIR = REPO_ROOT / ".antigravity-plugin"
 
 PLUGIN_JSON = PLUGIN_DIR / "plugin.json"
+PLUGIN_LICENSE = PLUGIN_DIR / "LICENSE"
+LOGO_SVG = PLUGIN_DIR / "assets" / "logo.svg"
 MCP_CONFIG = PLUGIN_DIR / "mcp_config.json"
-HOOKS_TMPL = PLUGIN_DIR / "hooks.json.tmpl"
+HOOKS_JSON = PLUGIN_DIR / "hooks.json"
+HOOKS_TMPL = REPO_ROOT / "hooks" / "antigravity" / "hooks.json.tmpl"
+SCRIPTS_DIR = PLUGIN_DIR / "scripts"
+HOOK_SCRIPTS = (
+    SCRIPTS_DIR / "hook-common.mjs",
+    SCRIPTS_DIR / "save-hook.mjs",
+    SCRIPTS_DIR / "wake-hook.mjs",
+)
 SKILL_MD = PLUGIN_DIR / "skills" / "mempalace" / "SKILL.md"
 PLUGIN_README = PLUGIN_DIR / "README.md"
+SIDECAR_DIR = PLUGIN_DIR / "sidecars" / "palace"
+SIDECAR_JSON = SIDECAR_DIR / "sidecar.json"
+SIDECAR_FILES = (
+    SIDECAR_JSON,
+    SIDECAR_DIR / "main.mjs",
+    SIDECAR_DIR / "bridge.py",
+    SIDECAR_DIR / "index.html",
+    SIDECAR_DIR / "styles.css",
+    SIDECAR_DIR / "app.js",
+)
 
 # Recall layer (mirrors the Cursor branch's recall skill + rule + shared protocol)
 RECALL_SKILL_MD = PLUGIN_DIR / "skills" / "mempalace-recall" / "SKILL.md"
@@ -45,11 +64,13 @@ SHARED_PROTOCOL_REF = (
 
 EXPECTED_HOOKS = {
     "Stop": {
+        "node_command": "node ./scripts/save-hook.mjs",
         "script_basename": "mempal_save_hook_antigravity.sh",
         "timeout_floor": 10,
         "timeout_ceiling": 60,
     },
     "PreInvocation": {
+        "node_command": "node ./scripts/wake-hook.mjs",
         "script_basename": "mempal_wake_hook_antigravity.sh",
         "timeout_floor": 1,
         "timeout_ceiling": 10,
@@ -58,27 +79,86 @@ EXPECTED_HOOKS = {
 
 
 def test_plugin_dir_exists() -> None:
-    """The in-repo plugin directory exists and is laid out as expected."""
+    """The in-repo Marketplace plugin bundle exists at plugins/mempalace/."""
     assert PLUGIN_DIR.is_dir(), f"missing: {PLUGIN_DIR}"
-    for required in (PLUGIN_JSON, MCP_CONFIG, HOOKS_TMPL, SKILL_MD, PLUGIN_README):
+    assert not LEGACY_DOT_DIR.exists(), (
+        ".antigravity-plugin/ must not exist at repo root because Antigravity "
+        "treats .antigravity-plugin as a manifest-only override whose parent "
+        "(the entire monorepo) becomes <plugin-root>."
+    )
+    for required in (
+        PLUGIN_JSON,
+        PLUGIN_LICENSE,
+        LOGO_SVG,
+        MCP_CONFIG,
+        HOOKS_JSON,
+        HOOKS_TMPL,
+        SKILL_MD,
+        PLUGIN_README,
+        *HOOK_SCRIPTS,
+        *SIDECAR_FILES,
+    ):
         assert required.is_file(), f"missing: {required}"
 
 
-def test_plugin_json_minimal_schema() -> None:
-    """plugin.json must be `{"name": "mempalace"}` exactly — no fabricated fields.
+def test_plugin_json_build_plugins_schema() -> None:
+    """plugin.json follows https://antigravity.google/schemas/v1/plugin.json.
 
-    The third-party "antigravity-plugins" community skill at
-    ~/.gemini/skills/antigravity-plugins/SKILL.md documents a
-    `permissions` field that does not exist in any real
-    Google-shipped plugin. We pin to the verified minimal shape and
-    fail loudly if anyone re-introduces the fabrication.
+    Validates all recommended Marketplace & `agy plugin validate --strict`
+    fields (`$schema`, `name`, `displayName`, `version`, `description`,
+    `logo`, `suggestedPrompts`, `author`, `homepage`, `repository`,
+    `license`, `keywords`) and ensures no fabricated `permissions` key
+    exists.
     """
+    from mempalace.version import __version__
+
     data = json.loads(PLUGIN_JSON.read_text(encoding="utf-8"))
     assert isinstance(data, dict), "plugin.json must be a JSON object"
-    assert data == {"name": "mempalace"}, (
-        f"plugin.json must equal {{'name': 'mempalace'}} (verified shape); "
-        f"got {data!r}. The `permissions` field documented in the third-party "
+    assert "permissions" not in data, (
+        "The `permissions` field documented in the third-party "
         "antigravity-plugins community skill is fabricated; do not add it."
+    )
+    assert data.get("$schema") == "https://antigravity.google/schemas/v1/plugin.json"
+    assert data.get("name") == "mempalace"
+    assert data.get("displayName") == "MemPalace"
+    assert data.get("version") == __version__
+    assert isinstance(data.get("description"), str) and len(data["description"]) >= 30
+    assert data.get("logo") == "assets/logo.svg"
+    assert (PLUGIN_DIR / data["logo"]).is_file(), "plugin.json logo path must exist"
+    prompts = data.get("suggestedPrompts")
+    assert isinstance(prompts, list) and len(prompts) >= 1
+    assert all(isinstance(p, str) and p.strip() for p in prompts)
+    author = data.get("author")
+    assert isinstance(author, dict) and author.get("name") == "MemPalace"
+    assert data.get("license") == "MIT"
+    keywords = data.get("keywords")
+    assert isinstance(keywords, list) and "mempalace" not in keywords or isinstance(keywords, list)
+
+
+def test_logo_svg_is_square_128() -> None:
+    """assets/logo.svg must be a valid 1:1 square >=128x128 SVG."""
+    svg = LOGO_SVG.read_text(encoding="utf-8")
+    assert "<svg" in svg and "</svg>" in svg
+    assert 'viewBox="0 0 128 128"' in svg
+
+
+def test_sidecar_manifest_and_ui_files() -> None:
+    """sidecars/palace/sidecar.json configures the Aux Pane UI extension."""
+    data = json.loads(SIDECAR_JSON.read_text(encoding="utf-8"))
+    assert data.get("command") == "node"
+    assert data.get("args") == ["main.mjs"]
+    assert data.get("display_name") == "MemPalace"
+    assert data.get("has_web_ui") is True
+    ui_config = data.get("ui_config")
+    assert isinstance(ui_config, dict)
+    views = ui_config.get("views")
+    assert isinstance(views, list) and len(views) == 1
+    assert views[0].get("entrypoint") == "SIDECAR_UI_ENTRYPOINT_AUX_PANE"
+    assert views[0].get("path") == "/"
+
+    html = (SIDECAR_DIR / "index.html").read_text(encoding="utf-8")
+    assert '<script src="/preload.js"></script>' in html, (
+        "Sidecar index.html must load /preload.js for window.sidecar & host theme tokens"
     )
 
 
@@ -95,6 +175,74 @@ def test_mcp_config_registers_mempalace_mcp() -> None:
     assert entry.get("command") == "mempalace-mcp", (
         f"mcpServers.mempalace.command must be 'mempalace-mcp'; got {entry.get('command')!r}"
     )
+
+
+@pytest.mark.parametrize("event", sorted(EXPECTED_HOOKS))
+def test_marketplace_hooks_json_uses_relative_node_scripts(event: str) -> None:
+    """plugins/mempalace/hooks.json follows the official build-plugins checklist:
+    named hook group, flat handler array for Stop/PreInvocation, relative
+    `node ./scripts/...` paths (no ${PLUGIN_ROOT} or __PLUGIN_DIR__).
+    """
+    raw = HOOKS_JSON.read_text(encoding="utf-8")
+    assert "${PLUGIN_ROOT}" not in raw
+    assert "__PLUGIN_DIR__" not in raw
+    data = json.loads(raw)
+    bounds = EXPECTED_HOOKS[event]
+    matching = [
+        (ns, payload[event])
+        for ns, payload in data.items()
+        if isinstance(payload, dict) and event in payload
+    ]
+    assert len(matching) == 1
+    _, entries = matching[0]
+    assert isinstance(entries, list) and len(entries) == 1
+    handler = entries[0]
+    assert handler.get("type") == "command"
+    assert handler.get("command") == bounds["node_command"]
+    timeout = handler.get("timeout")
+    assert isinstance(timeout, int) and not isinstance(timeout, bool)
+    assert bounds["timeout_floor"] <= timeout <= bounds["timeout_ceiling"]
+
+
+def test_bundled_node_scripts_have_lf_shebang() -> None:
+    """Bundled scripts under plugins/mempalace/scripts/ must use LF line endings."""
+    for script in HOOK_SCRIPTS:
+        raw = script.read_bytes()
+        assert raw.startswith(b"#!/usr/bin/env node\n"), (
+            f"{script} must start with LF '#!/usr/bin/env node\\n'"
+        )
+        assert b"\r\n" not in raw, f"{script} must use LF line endings, not CRLF"
+
+
+def test_agy_cli_strict_validation_passes_when_installed() -> None:
+    """When `agy` is installed, `agy plugin validate --strict` passes with 0 findings."""
+    agy_bin = shutil.which("agy")
+    if not agy_bin and os.name == "nt":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        candidate = Path(local_app) / "agy" / "bin" / "agy.exe"
+        if candidate.is_file():
+            agy_bin = str(candidate)
+    if not agy_bin:
+        pytest.skip("agy CLI not installed on this runner")
+
+    proc = subprocess.run(
+        [agy_bin, "plugin", "validate", "--strict", "--json", str(PLUGIN_DIR)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"agy validate --strict failed:\n{proc.stdout}\n{proc.stderr}"
+    report = json.loads(proc.stdout)
+    assert report.get("name") == "mempalace"
+    assert report.get("findings") == []
+    assert report.get("components") == {
+        "agents": 0,
+        "hooks": 2,
+        "mcpServers": 1,
+        "rules": 1,
+        "sidecars": 1,
+        "skills": 2,
+    }
 
 
 def test_hooks_template_valid_json() -> None:
@@ -309,21 +457,29 @@ def test_recall_rule_exists() -> None:
     assert not RECALL_RULE_MD.is_symlink(), f"{RECALL_RULE_MD} must be a real file"
 
 
-def test_recall_rule_is_plain_markdown_not_mdc() -> None:
-    """Antigravity rules are plain `.md` with no YAML frontmatter.
+def test_recall_rule_has_valid_antigravity_frontmatter() -> None:
+    """Antigravity named rules (`rules/<name>.md`) require trigger frontmatter.
 
-    Per https://antigravity.google/docs plugins use `rules/<name>.md`
-    (no `.mdc`, no Cursor-style `alwaysApply` frontmatter). Pin the
-    plain-markdown shape so nobody copies the Cursor `.mdc` verbatim.
+    `agy plugin validate --strict` requires named rules under `rules/` to carry
+    YAML frontmatter with `trigger: always_on | model_decision | glob | manual`
+    (and `description` when `trigger: model_decision`), using `.md` (not `.mdc`).
     """
     assert RECALL_RULE_MD.suffix == ".md", "Antigravity rule must use the .md extension"
     assert not (RECALL_RULE_MD.parent / "mempalace-recall.mdc").exists(), (
         "an .mdc rule leaked in; Antigravity rules are plain .md"
     )
     body = RECALL_RULE_MD.read_text(encoding="utf-8")
-    assert not body.startswith("---"), (
-        "Antigravity rule must NOT carry YAML frontmatter (no Cursor-style "
-        "`alwaysApply`); it is plain markdown"
+    assert body.startswith("---\n"), "Named Antigravity rule must begin with YAML frontmatter"
+    end = body.find("\n---\n", 4)
+    assert end > 0, "Rule frontmatter is missing closing fence"
+    front = body[4:end]
+    assert "alwaysApply" not in front, "Do not use Cursor-style alwaysApply in Antigravity rules"
+    trigger_match = re.search(r"^trigger:\s*(\S+)\s*$", front, re.MULTILINE)
+    assert trigger_match is not None, "Rule frontmatter missing `trigger` key"
+    assert trigger_match.group(1) in ("always_on", "model_decision", "glob", "manual")
+    desc_match = re.search(r"^description:\s*(.+)$", front, re.MULTILINE)
+    assert desc_match is not None and desc_match.group(1).strip(), (
+        "model_decision rule must include a non-empty description"
     )
 
 
@@ -356,3 +512,36 @@ def test_installer_copies_recall_rule() -> None:
     assert "rules/mempalace-recall.md" in body, (
         "install.sh must copy_file the mempalace-recall rule"
     )
+
+
+def test_installer_copies_logo_and_sidecar() -> None:
+    """install.sh must copy assets/logo.svg and sidecars/palace/* into the install dir."""
+    body = INSTALL_SH.read_text(encoding="utf-8")
+    assert "assets/logo.svg" in body, "install.sh must copy assets/logo.svg"
+    for fname in ("sidecar.json", "main.mjs", "bridge.py", "index.html", "styles.css", "app.js"):
+        assert f"sidecars/palace/{fname}" in body, f"install.sh must copy sidecars/palace/{fname}"
+
+
+def test_sidecar_massive_palace_optimizations_present() -> None:
+    """bridge.py and app.js must retain massive-palace fast paths (FTS5 lexical, cached overview, slice pagination)."""
+    bridge_body = (SIDECAR_DIR / "bridge.py").read_text(encoding="utf-8")
+    for required_symbol in (
+        "_derive_graph_stats_from_taxonomy",
+        "_locus_total_from_cache",
+        "_background_warmup",
+        "lexical_search",
+        "get_recent",
+        "agy_sidecar_overview_cache.json",
+    ):
+        assert required_symbol in bridge_body, (
+            f"bridge.py missing massive-palace fast-path symbol {required_symbol!r}"
+        )
+
+    html_body = (SIDECAR_DIR / "index.html").read_text(encoding="utf-8")
+    for required_id in (
+        "engine-badge",
+        "workspace-wing-pill",
+        "search-wings-bar",
+        "palace-wings-bar",
+    ):
+        assert required_id in html_body, f"index.html missing UI element #{required_id}"

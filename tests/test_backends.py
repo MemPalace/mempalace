@@ -2,6 +2,7 @@ import os
 import pickle
 import shutil
 import sqlite3
+import threading
 from contextlib import closing
 from pathlib import Path
 
@@ -16,15 +17,21 @@ from mempalace.backends import (
     QueryResult,
     UnsupportedFilterError,
     available_backends,
+    chroma as chroma_module,
+    chroma_sqlite,
     get_backend,
 )
-from mempalace.backends import chroma as chroma_module
 from mempalace.backends.chroma import (
+    _CORRUPT_SUFFIX,
+    _DRIFT_SUFFIX,
+    _HNSW_METADATA_STABILITY_ATTEMPTS,
+    _HNSW_METADATA_STABILITY_DELAY_SECONDS,
+    _HNSW_MISSING_METADATA_DATA_FLOOR,
     ChromaBackend,
     ChromaCollection,
-    _HNSW_MISSING_METADATA_DATA_FLOOR,
     _fix_blob_seq_ids,
     _fix_missing_collection_type,
+    _load_hnsw_metadata_stable,
     _pin_hnsw_threads,
     _segment_appears_healthy,
     quarantine_invalid_hnsw_metadata,
@@ -951,13 +958,16 @@ def test_chroma_get_recent_matches_exact_order_from_sqlite(tmp_path, monkeypatch
     from mempalace.backends.base import BaseCollection
 
     col = _recent_palace(tmp_path)
-    monkeypatch.setattr(chroma_module, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
+    monkeypatch.setattr(chroma_sqlite, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
     wheres = [
         None,
         {"wing": "a"},
         {"wing": "rare"},
         {"$and": [{"room": "x"}, {"wing": {"$eq": "b"}}]},
         {"wing": "missing"},
+        # A wing with its old spellings (wing_aliases).
+        {"wing": {"$in": ["rare", "missing", "b"]}},
+        {"$and": [{"wing": {"$in": ["a", "rare"]}}, {"room": "y"}]},
     ]
     exact = {
         repr(where): BaseCollection.get_recent(col, limit=10_000, where=where) for where in wheres
@@ -981,7 +991,7 @@ def test_chroma_get_recent_falls_back_for_filters_sqlite_does_not_evaluate(tmp_p
 
     col = _recent_palace(tmp_path)
     where = {"n": {"$gte": 150}}
-    assert chroma_module._string_equalities(where) is None
+    assert chroma_sqlite._string_equalities(where) is None
     got = col.get_recent(limit=5, where=where)
     assert got.ids == BaseCollection.get_recent(col, limit=5, where=where).ids
     assert all(meta["n"] >= 150 for meta in got.metadatas)
@@ -1042,7 +1052,7 @@ def test_chroma_sqlite_readers_skip_vector_segment_rows(tmp_path, monkeypatch, f
         backend.close()
     _insert_vector_segment_ghost(palace)
 
-    monkeypatch.setattr(chroma_module, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
+    monkeypatch.setattr(chroma_sqlite, "_RECENT_FILTER_DRIVEN_MAX", 10**9 if filter_driven else 0)
     backend = ChromaBackend()
     try:
         col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=False)
@@ -1509,6 +1519,7 @@ def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
     never want to open it again, even read-only.
     """
     from unittest.mock import patch
+
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     # Pre-create the marker so the function should short-circuit.
@@ -2001,8 +2012,16 @@ def test_client_quarantines_corrupt_segment_on_first_open(tmp_path, monkeypatch)
         backend.close()
 
     assert not seg.exists(), "_client() should have quarantined the corrupt segment"
-    drift_dirs = [p for p in palace.iterdir() if ".drift-" in p.name]
-    assert len(drift_dirs) == 1
+    quarantined_segments = []
+    for palace_entry in palace.iterdir():
+        is_quarantined = _DRIFT_SUFFIX in palace_entry.name or _CORRUPT_SUFFIX in palace_entry.name
+        if is_quarantined:
+            quarantined_segments.append(palace_entry)
+
+    assert len(quarantined_segments) == 1
+    quarantined_name = quarantined_segments[0].name
+    assert quarantined_name.count(_CORRUPT_SUFFIX) == 1
+    assert _DRIFT_SUFFIX not in quarantined_name
 
 
 def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch):
@@ -2359,6 +2378,223 @@ def test_quarantine_invalid_hnsw_metadata_skips_truncated_pickle(tmp_path, monke
 
     assert moved == []
     assert seg.exists()
+
+
+# Pickle opcodes that raise ``AttributeError: 'int' object has no attribute
+# 'append'`` on load: push int 5, push int 6, APPEND tries ``5.append(6)``.
+# A torn ``index_metadata.pickle`` read mid-rewrite produces exactly this
+# failure (#2897) — it is not a truncated-pickle error, so the old guard
+# quarantined the segment on first sight.
+_TORN_PICKLE_ATTRIBUTE_ERROR = b"\x80\x02K\x05K\x06a."
+_TORN_PICKLE_ATTRIBUTE_ERROR_ALT = b"\x80\x02K\x07K\x08a."
+
+
+def test_quarantine_invalid_hnsw_metadata_renames_stable_torn_pickle_attribute_error(tmp_path):
+    """A torn pickle that stays byte-identical is still quarantined (#2897).
+
+    The stability gate only protects files that are moving; settled bytes
+    that keep failing the same way are genuine corruption.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "index_metadata.pickle").write_bytes(_TORN_PICKLE_ATTRIBUTE_ERROR)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_skips_live_writer_rewrite(tmp_path):
+    """A writer rewriting the pickle in place is never quarantined (#2897).
+
+    The guard scans while the writer alternates torn bytes; the segment
+    must survive and the writer must be able to finish with valid metadata
+    instead of dying with FileNotFoundError on a renamed directory.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    meta.write_bytes(_TORN_PICKLE_ATTRIBUTE_ERROR)
+
+    stop = threading.Event()
+    errors = []
+
+    def _rewrite_while_scanning():
+        toggle = False
+        while not stop.is_set():
+            try:
+                meta.write_bytes(
+                    _TORN_PICKLE_ATTRIBUTE_ERROR if toggle else _TORN_PICKLE_ATTRIBUTE_ERROR_ALT
+                )
+            except OSError as exc:  # the test records writer failures
+                errors.append(exc)
+                return
+            toggle = not toggle
+
+    writer = threading.Thread(target=_rewrite_while_scanning, daemon=True)
+    writer.start()
+    try:
+        moved = quarantine_invalid_hnsw_metadata(str(palace))
+    finally:
+        stop.set()
+        writer.join(timeout=5)
+
+    assert moved == []
+    assert seg.exists()
+    assert errors == []
+
+    with open(meta, "wb") as f:
+        pickle.dump({"dimensionality": 8, "id_to_label": {}}, f)
+    assert pickle.loads(meta.read_bytes()) == {"dimensionality": 8, "id_to_label": {}}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        EOFError("flush in progress"),
+        OSError("read interrupted"),
+        pickle.UnpicklingError("pickle data was truncated"),
+        pickle.UnpicklingError("pickle exhausted before end of frame: ran out of input"),
+    ],
+)
+def test_load_hnsw_metadata_stable_transient_errors_skip_without_delay(
+    tmp_path, monkeypatch, error
+):
+    """Known-transient read errors skip quarantine with no stability delay."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    meta.write_bytes(b"partial")
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load",
+        lambda path: (_ for _ in ()).throw(error),
+    )
+    sleeps = []
+
+    outcome, value = _load_hnsw_metadata_stable(str(meta), sleep=lambda s: sleeps.append(s))
+
+    assert outcome == "transient"
+    assert value is None
+    assert sleeps == []
+
+
+def test_load_hnsw_metadata_stable_returns_uncertain_when_bytes_change(tmp_path, monkeypatch):
+    """A file that moves between stability checks is uncertain, not corrupt."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    meta.write_bytes(_TORN_PICKLE_ATTRIBUTE_ERROR)
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load",
+        lambda path: (_ for _ in ()).throw(
+            AttributeError("'int' object has no attribute 'append'")
+        ),
+    )
+
+    def _rewrite_during_sleep(seconds):
+        meta.write_bytes(_TORN_PICKLE_ATTRIBUTE_ERROR_ALT)
+
+    outcome, value = _load_hnsw_metadata_stable(str(meta), sleep=_rewrite_during_sleep)
+
+    assert outcome == "uncertain"
+    assert value is None
+
+
+def test_load_hnsw_metadata_stable_spots_same_stat_rewrite(tmp_path, monkeypatch):
+    """The sha256 snapshot catches a rewrite that keeps size and mtime.
+
+    A rewrite landing with the same size and a restored mtime leaves the
+    stat signature identical, so only the content hash can tell the file
+    moved. Without it the guard would quarantine a live rewrite.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    meta.write_bytes(_TORN_PICKLE_ATTRIBUTE_ERROR)
+    stat = os.stat(meta)
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load",
+        lambda path: (_ for _ in ()).throw(
+            AttributeError("'int' object has no attribute 'append'")
+        ),
+    )
+
+    def _rewrite_with_same_stat(seconds):
+        meta.write_bytes(_TORN_PICKLE_ATTRIBUTE_ERROR_ALT)
+        os.utime(meta, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    outcome, value = _load_hnsw_metadata_stable(str(meta), sleep=_rewrite_with_same_stat)
+
+    assert outcome == "uncertain"
+    assert value is None
+
+
+def test_load_hnsw_metadata_stable_quarantines_after_bounded_attempts(tmp_path, monkeypatch):
+    """A stable file that keeps failing is corrupt after exactly 6 checks."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    meta.write_bytes(_TORN_PICKLE_ATTRIBUTE_ERROR)
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load",
+        lambda path: (_ for _ in ()).throw(
+            AttributeError("'int' object has no attribute 'append'")
+        ),
+    )
+    sleeps = []
+
+    outcome, value = _load_hnsw_metadata_stable(str(meta), sleep=lambda s: sleeps.append(s))
+
+    assert outcome == "corrupt"
+    assert "'int' object has no attribute 'append'" in value
+    assert sleeps == [_HNSW_METADATA_STABILITY_DELAY_SECONDS] * _HNSW_METADATA_STABILITY_ATTEMPTS
+
+
+def test_load_hnsw_metadata_stable_returns_loaded_when_retry_succeeds(tmp_path, monkeypatch):
+    """A load that succeeds on retry is healthy; no further checks run."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    meta = seg / "index_metadata.pickle"
+    meta.write_bytes(_TORN_PICKLE_ATTRIBUTE_ERROR)
+
+    calls = []
+
+    def _fail_once_then_load(path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise AttributeError("'int' object has no attribute 'append'")
+        return {"dimensionality": 8, "id_to_label": {}}
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load", _fail_once_then_load
+    )
+    sleeps = []
+
+    outcome, value = _load_hnsw_metadata_stable(str(meta), sleep=lambda s: sleeps.append(s))
+
+    assert outcome == "loaded"
+    assert value == {"dimensionality": 8, "id_to_label": {}}
+    assert len(sleeps) == 1
 
 
 def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, monkeypatch):

@@ -3,6 +3,7 @@ test_query_parser.py — Unit tests for MemPalace Query and Command Parser.
 """
 
 import pytest
+
 from mempalace.query_parser import (
     QueryParseError,
     parse_coordinate_input,
@@ -65,6 +66,34 @@ class TestPalaceQueryParser:
         target, params = parse_query_input('FIND "status: active"')
         assert target == "search"
         assert params["query"] == "status: active"
+
+    def test_search_keeps_lowercase_words_as_text(self):
+        """Only the upper-case spelling of a PQL keyword is a keyword."""
+        for text in [
+            "notes in the auth service",
+            "source of truth for the refund policy",
+            "rate limit 5 requests per user",
+            "context switch overhead in the runtime",
+            "what strategy did we choose for the migration",
+            "since the before state was lost",
+        ]:
+            target, params = parse_query_input(text)
+            assert target == "search"
+            assert params == {"query": text}, text
+
+    def test_search_quoted_keyword_word_stays_text(self):
+        target, params = parse_query_input('FIND "SOURCE" material for the audit')
+        assert target == "search"
+        assert params["query"] == "SOURCE material for the audit"
+        assert "source_file" not in params
+
+    def test_search_uppercase_keywords_still_filter(self):
+        target, params = parse_query_input("auth notes IN backend LIMIT 5 SOURCE auth.py")
+        assert target == "search"
+        assert params["query"] == "auth notes"
+        assert params["wing"] == "backend"
+        assert params["limit"] == 5
+        assert params["source_file"] == "auth.py"
 
     def test_taxonomy_and_wings(self):
         target, params = parse_query_input("TAXONOMY")
@@ -195,6 +224,65 @@ class TestPalaceExecParser:
             assert target == "update_drawer"
             assert params["content"] == quoted
             assert isinstance(params["content"], str)
+
+    def test_update_content_keeps_backslash_escapes(self):
+        target, params = parse_exec_input(
+            r'UPDATE drw_1 CONTENT "path C:\new\table and regex \t\\d+"'
+        )
+        assert target == "update_drawer"
+        assert params["content"] == "path C:\\new\\table and regex \\t\\d+"
+        assert "\n" not in params["content"]
+        assert "\t" not in params["content"]
+
+    def test_add_and_diary_keep_space_runs(self):
+        target, params = parse_exec_input("ADD IN notes/day keep   these    spaces")
+        assert target == "add_drawer"
+        assert params["content"] == "keep   these    spaces"
+
+        target, params = parse_exec_input("DIARY WRITE ada keep   these    spaces")
+        assert target == "diary_write"
+        assert params["entry"] == "keep   these    spaces"
+
+    def test_keywords_between_content_runs_are_not_stored(self):
+        target, params = parse_exec_input("ADD hello  world IN w/r more words SOURCE x.md tail")
+        assert target == "add_drawer"
+        assert params["content"] == "hello  world more words tail"
+        assert (params["wing"], params["room"], params["source_file"]) == ("w", "r", "x.md")
+
+        _, params = parse_exec_input('ADD "quoted part" IN w/r trailing')
+        assert params["content"] == "quoted part trailing"
+
+        target, params = parse_exec_input("DIARY WRITE agent1 did a thing TOPIC work then more")
+        assert target == "diary_write"
+        assert params["entry"] == "did a thing then more"
+        assert params["topic"] == "work"
+
+    def test_update_content_keeps_trailing_zero_in_version(self):
+        target, params = parse_exec_input("UPDATE drw_1 CONTENT 3.10")
+        assert target == "update_drawer"
+        assert params["content"] == "3.10"
+        assert isinstance(params["content"], str)
+
+        target, params = parse_exec_input("UPDATE drw_1 content:3.10")
+        assert params["content"] == "3.10"
+
+    def test_update_content_keeps_leading_zeros(self):
+        target, params = parse_exec_input("UPDATE drw_1 CONTENT 007")
+        assert target == "update_drawer"
+        assert params["content"] == "007"
+        assert isinstance(params["content"], str)
+
+    def test_update_content_keeps_null_as_text(self):
+        target, params = parse_exec_input("UPDATE drw_1 CONTENT null")
+        assert target == "update_drawer"
+        assert params["content"] == "null"
+        assert isinstance(params["content"], str)
+
+    def test_filter_values_still_coerce(self):
+        target, params = parse_exec_input("MINE /repo MODE projects LIMIT 007")
+        assert target == "mine"
+        assert params["limit"] == 7
+        assert isinstance(params["limit"], int)
 
     def test_structured_agent_name_plus_content_is_diary_write(self):
         action, params = parse_exec_input({"agent_name": "bot", "content": "observation"})

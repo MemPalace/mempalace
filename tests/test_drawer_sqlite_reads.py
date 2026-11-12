@@ -1,14 +1,13 @@
 """Singular drawer SQLite lookups preserve logical-ID and mutation semantics."""
 
+import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-import sqlite3
 from unittest.mock import Mock
 
 import chromadb
 import pytest
-
 from _mcp_server_helpers import _patch_mcp_server
 
 
@@ -65,12 +64,12 @@ def _without_sdk_drawer_get(monkeypatch, collection):
         forbidden.assert_not_called()
 
 
-class _Clock(datetime):
+class _Clock:
     at = datetime(2026, 10, 2, 12, 0, 0)
 
     @classmethod
-    def now(cls, tz=None):
-        return cls.at if tz is None else cls.at.replace(tzinfo=tz)
+    def iso(cls):
+        return cls.at.isoformat()
 
 
 def _written_metadata(server, *, wing="wing_alpha", room="notes", **extra):
@@ -314,7 +313,7 @@ def test_drawer_sqlite_array_metadata_falls_back_without_losing_values(
 
 @pytest.mark.parametrize("backend", ["sqlite_exact", "custom_backend"])
 def test_drawer_sqlite_non_chroma_backend_uses_original_lookup(drawer_palace, monkeypatch, backend):
-    from mempalace.backends import chroma as chroma_backend
+    from mempalace.backends import chroma_sqlite as chroma_backend
 
     server, collection = drawer_palace
     _seed(collection, [("drawer", "Backend-independent content", {"room": "notes"})])
@@ -336,7 +335,7 @@ def test_drawer_sqlite_non_chroma_backend_uses_original_lookup(drawer_palace, mo
 def test_drawer_sqlite_unavailable_or_error_reads_fall_back_once(
     drawer_palace, monkeypatch, config, failure
 ):
-    from mempalace.backends import chroma as chroma_backend
+    from mempalace.backends import chroma_sqlite as chroma_backend
 
     server, collection = drawer_palace
     _seed(collection, [("drawer", "Original fallback content", {"room": "notes"})])
@@ -381,7 +380,7 @@ def test_drawer_sqlite_fresh_single_add_update_delete_without_intervening_sdk_re
     from mempalace.backends.chroma import sqlite_drawer_rows
 
     server, collection = drawer_palace
-    monkeypatch.setattr(server, "datetime", _Clock)
+    monkeypatch.setattr(server, "utc_now_iso", _Clock.iso)
     monkeypatch.setattr(_Clock, "at", datetime(2026, 10, 2, 12, 0, 0))
     content = "New 日本語 🧠\n  exact content"
     added = server.tool_add_drawer("wing_alpha", "notes", content, added_by="test-writer")
@@ -423,7 +422,7 @@ def test_drawer_sqlite_fresh_chunk_mutations_preserve_physical_vs_logical_scope(
     from mempalace.backends.chroma import sqlite_drawer_rows
 
     server, collection = drawer_palace
-    monkeypatch.setattr(server, "datetime", _Clock)
+    monkeypatch.setattr(server, "utc_now_iso", _Clock.iso)
     monkeypatch.setattr(_Clock, "at", datetime(2026, 10, 2, 12, 0, 0))
     monkeypatch.setitem(config._file_config, "chunk_size", 80)
     content = "A" * 80 + "B" * 80 + "日本語 🧠 end"

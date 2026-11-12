@@ -8,6 +8,7 @@ only the configured model name (cheap), and persistence is exercised with
 ``EmbedderIdentity`` objects and explicit vectors.
 """
 
+import errno
 import json
 import os
 import warnings
@@ -23,7 +24,6 @@ from mempalace.backends.base import (
     PalaceRef,
     check_embedder_identity,
 )
-
 
 # ---------------------------------------------------------------------------
 # Three-state helper
@@ -101,7 +101,7 @@ def test_chroma_empty_palace_records_identity_without_count(tmp_path, monkeypatc
 
 
 def test_sqlite_collection_has_rows(tmp_path):
-    from mempalace.backends.chroma import _sqlite_collection_has_rows
+    from mempalace.backends.chroma_sqlite import _sqlite_collection_has_rows
 
     assert _sqlite_collection_has_rows(str(tmp_path / "missing"), "mempalace_drawers") is None
     col = _chroma_collection(tmp_path)
@@ -487,15 +487,22 @@ def test_stored_core_model_names_normalize_to_the_model_that_embedded_them(store
 
 
 def test_chroma_corrupt_sidecar_returns_none(tmp_path):
-    # A malformed sidecar (non-dict JSON) must not raise — degrade to unknown.
+    # A read of a malformed sidecar degrades to unknown. A later write must
+    # not replace those bytes with a one-collection document.
+    from mempalace.backends.base import EmbedderIdentityRecordError
+
     col = _chroma_collection(tmp_path)
     path = os.path.join(str(tmp_path), "mempalace_embedder.json")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write('["not", "a", "dict"]')
+    original = b'["not", "a", "dict"]'
+    with open(path, "wb") as f:
+        f.write(original)
     assert col.get_stored_embedder_identity() is None
-    # And a subsequent set still works (overwrites the junk).
-    col.set_embedder_identity(EmbedderIdentity("minilm", 384))
-    assert col.get_stored_embedder_identity().model_name == "minilm"
+    with pytest.raises(EmbedderIdentityRecordError):
+        col.set_embedder_identity(EmbedderIdentity("minilm", 384))
+    kept = list(tmp_path.glob("mempalace_embedder.json.corrupt-*"))
+    assert len(kept) == 1
+    assert kept[0].read_bytes() == original
+    assert not os.path.exists(path) or open(path, "rb").read() == original
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +624,62 @@ def test_sidecar_write_keeps_other_entries_and_owner_only_mode(tmp_path):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
+def test_a_failed_probe_keeps_the_recorded_dimension_of_the_same_model(tmp_path):
+    from mempalace.backends import _sidecar
+
+    path = tmp_path / "mempalace_embedder.json"
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 0))
+    assert json.loads(path.read_text())["mempalace_drawers"] == {
+        "model_name": "minilm",
+        "dimension": 384,
+    }
+
+
+def test_a_failed_probe_for_a_new_model_records_unknown_and_warns(tmp_path, caplog):
+    from mempalace.backends import _sidecar
+
+    path = tmp_path / "mempalace_embedder.json"
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    with caplog.at_level("WARNING", logger="mempalace"):
+        _sidecar.write_embedder_sidecar(
+            str(path), "mempalace_drawers", EmbedderIdentity("embeddinggemma", 0)
+        )
+    assert json.loads(path.read_text())["mempalace_drawers"] == {
+        "model_name": "embeddinggemma",
+        "dimension": 0,
+    }
+    assert "unknown dimension" in caplog.text
+
+
+def test_a_probed_dimension_replaces_the_recorded_one(tmp_path):
+    from mempalace.backends import _sidecar
+
+    path = tmp_path / "mempalace_embedder.json"
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 512))
+    assert json.loads(path.read_text())["mempalace_drawers"]["dimension"] == 512
+
+
+def test_set_embedder_with_a_failed_probe_keeps_the_recorded_dimension(
+    tmp_path, monkeypatch, clear_identity_cache
+):
+    monkeypatch.setenv("MEMPALACE_BACKEND", "chroma")
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_MODEL", "minilm")
+    from mempalace import palace as P
+    from mempalace.backends import _sidecar
+
+    P.get_collection(str(tmp_path), collection_name="mempalace_drawers", create=True)
+    path = tmp_path / _sidecar.EMBEDDER_SIDECAR_FILENAME
+    _sidecar.write_embedder_sidecar(str(path), "mempalace_drawers", EmbedderIdentity("minilm", 384))
+    monkeypatch.setattr(
+        "mempalace.embedding.get_embedder_identity",
+        lambda device=None, model=None: EmbedderIdentity("minilm", 0),
+    )
+    P.set_palace_embedder_identity(str(tmp_path), model=None)
+    assert json.loads(path.read_text())["mempalace_drawers"]["dimension"] == 384
+
+
 @pytest.mark.parametrize("failure", ["mid-write", "fsync", "replace"])
 def test_a_failed_sidecar_write_leaves_the_previous_sidecar_intact(tmp_path, monkeypatch, failure):
     """A crash or I/O error mid-write must not truncate the sidecar: a
@@ -639,7 +702,11 @@ def test_a_failed_sidecar_write_leaves_the_previous_sidecar_intact(tmp_path, mon
 
         monkeypatch.setattr(_sidecar.json, "dump", dump_half)
     elif failure == "fsync":
-        monkeypatch.setattr(_sidecar.os, "fsync", boom)
+
+        def no_fsync(fd):
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+        monkeypatch.setattr(_sidecar.os, "fsync", no_fsync)
     else:
         monkeypatch.setattr(_sidecar.os, "replace", boom)
 

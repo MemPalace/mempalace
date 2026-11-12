@@ -28,17 +28,44 @@ def mine_lock(source_file: str):
 
 
 def _mine_lock_path(source_file: str) -> str:
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    lock_dir = paths.lock_dir()
     os.makedirs(lock_dir, exist_ok=True)
     return os.path.join(lock_dir, hashlib.sha256(source_file.encode()).hexdigest()[:16] + ".lock")
+
+
+# Windows refuses to open a file whose delete is still pending (another
+# process's cleanup removed it while a handle was open), for a moment.
+_WINDOWS_OPEN_RETRY_SECONDS = 1.0
+# What msvcrt.locking raises while another process holds the byte.
+_WINDOWS_LOCK_BUSY_ERRNOS = (13, 36)  # EACCES, EDEADLOCK
 
 
 def _open_mine_lock_file(lock_path: str, *, create: bool):
     flags = os.O_RDWR
     if create:
         flags |= os.O_CREAT
-    fd = os.open(lock_path, flags, 0o600)
+    deadline = time.monotonic() + _WINDOWS_OPEN_RETRY_SECONDS
+    while True:
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+            break
+        except PermissionError:
+            if (
+                os.name != "nt"
+                or time.monotonic() >= deadline
+                or _permission_error_is_lasting(lock_path)
+            ):
+                raise
+            time.sleep(0.01)
     return os.fdopen(fd, "r+b")
+
+
+def _permission_error_is_lasting(lock_path: str) -> bool:
+    # A directory or a read-only file at the lock path will not settle; only a
+    # pending delete (the name may already be gone) is worth waiting out.
+    if os.path.isdir(lock_path):
+        return True
+    return os.path.exists(lock_path) and not os.access(lock_path, os.W_OK)
 
 
 def _lock_mine_lock_file(lock_file, *, blocking: bool) -> bool:
@@ -46,14 +73,21 @@ def _lock_mine_lock_file(lock_file, *, blocking: bool) -> bool:
     if os.name == "nt":
         import msvcrt
 
-        mode = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
-        try:
-            msvcrt.locking(lock_file.fileno(), mode, 1)
-        except OSError:
-            if not blocking:
+        if not blocking:
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
                 return False
-            raise
-        return True
+            return True
+        # LK_LOCK gives up after ten one-second tries; a blocking lock must wait.
+        while True:
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                return True
+            except OSError as exc:
+                if exc.errno not in _WINDOWS_LOCK_BUSY_ERRNOS:
+                    raise
+                time.sleep(0.05)
 
     import fcntl
 
@@ -222,7 +256,7 @@ def reap_stale_mine_locks(*, min_age_seconds: int = 3600) -> tuple[int, int]:
     Returns ``(reaped, skipped)`` counts, for logging/testing — callers
     don't need to act on them.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    lock_dir = paths.lock_dir()
     try:
         entries = os.listdir(lock_dir)
     except OSError:
@@ -260,7 +294,7 @@ def _maybe_reap_stale_mine_locks() -> None:
     are swallowed — lock maintenance must never be allowed to break an
     actual mine.
     """
-    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    lock_dir = paths.lock_dir()
     marker = os.path.join(lock_dir, ".last_reap")
     try:
         if (

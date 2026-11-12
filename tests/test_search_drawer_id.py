@@ -378,7 +378,9 @@ def test_cli_scoped_search_uses_existing_filter_fallback(capsys):
     assert drawers_col.query.call_count == 2
 
     filtered_call, fallback_call = drawers_col.query.call_args_list
-    assert filtered_call.kwargs["where"] == {"$and": [{"wing": "keep"}, {"room": "notes"}]}
+    assert filtered_call.kwargs["where"] == {
+        "$and": [{"wing": {"$in": ["keep", "wing_keep"]}}, {"room": "notes"}]
+    }
     assert "where" not in fallback_call.kwargs
     assert fallback_call.kwargs["n_results"] == 30
 
