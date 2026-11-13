@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "mempalace": {
+      "url": "http://localhost:8766/mcp"
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.devin/hooks/mcp_validate.py",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}
