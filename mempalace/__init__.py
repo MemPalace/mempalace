@@ -37,12 +37,62 @@ def _strip_leaked_pythonpath_from_sys_path() -> None:
     paths = sysconfig.get_paths()
     own_site_packages = {_norm(os.path.realpath(paths[name])) for name in ("purelib", "platlib")}
 
+    def _read_pyvenv_home(cfg_path: str) -> str:
+        # pyvenv.cfg is a small key=value file (no section header); parse the
+        # ``home`` line directly so we never need a full INI parser on the
+        # import hot path.
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith(("#", ";")):
+                        continue
+                    key, sep, value = line.partition("=")
+                    if sep and key.strip().lower() == "home":
+                        return value.strip()
+        except OSError:
+            return ""
+        return ""
+
+    def _is_detached_venv_site_packages(resolved: str) -> bool:
+        # Detached-venv layout (#2613, Hermes PM): the host runs a standalone
+        # interpreter (``sys.executable``) and activates a *second* venv purely
+        # via PYTHONPATH. That venv's site-packages is never in the running
+        # interpreter's own sysconfig paths, so the set check above misses it
+        # and would strip the directory where mempalace/chromadb actually live,
+        # breaking ``import mempalace``'s later dependency imports. Preserve
+        # any leaked entry that is a venv's site-packages and whose venv is a
+        # different environment from the one we are running in.
+        #
+        # "Different environment" means the venv root (first ancestor with a
+        # pyvenv.cfg) is not the running interpreter's own prefix, and the
+        # venv's pyvenv.cfg names a base interpreter other than the running
+        # one. Comparing against the running prefix is what keeps the foreign
+        # same-prefix cases (a sibling lib/pythonX.Y, a nested venv) stripped,
+        # while a genuine separate venv is preserved.
+        if not resolved.endswith("site-packages"):
+            return False
+        running_prefixes = {_norm(p) for p in (sys.prefix, getattr(sys, "base_prefix", sys.prefix))}
+        running_dir = _norm(os.path.dirname(sys.executable))
+        cur = os.path.dirname(resolved)
+        for _ in range(8):
+            if os.path.isfile(os.path.join(cur, "pyvenv.cfg")):
+                venv_root = _norm(cur)
+                if venv_root in running_prefixes:
+                    return False  # the running environment's own venv: let the set check decide
+                home = _read_pyvenv_home(os.path.join(cur, "pyvenv.cfg"))
+                return bool(home) and _norm(os.path.realpath(home)) != running_dir
+            if cur == os.path.dirname(cur):
+                break  # reached the filesystem root without finding a venv
+            cur = os.path.dirname(cur)
+        return False
+
     def _belongs_to_this_environment(path: str) -> bool:
         try:
             resolved = _norm(os.path.realpath(path))
         except OSError:
             return False
-        return resolved in own_site_packages
+        return resolved in own_site_packages or _is_detached_venv_site_packages(resolved)
 
     leaked_entries = {_norm(p) for p in leaked.split(os.pathsep) if p}
     sys.path[:] = [

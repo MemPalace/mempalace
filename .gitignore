@@ -47,3 +47,6 @@ target/
 *.dylib
 *.exe
 
+# Runtime test fixture (built on demand by the detached-env regression test)
+fixtures/detached_env/
+
