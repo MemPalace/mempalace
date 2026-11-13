@@ -8,6 +8,7 @@ core embedding wrapper before vectors are sent to Qdrant.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from ..lexical import bm25_scores, tokenize
 from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
 from ..timeutil import utc_now_iso as _utcnow
 from ..version import __version__
+from . import _qdrant_lexical_cache as _lexical_cache
 from ._filters import matches_where, matches_where_document, validate_where
 from ._remote_common import (
     RemoteMarkerMixin,
@@ -263,12 +265,17 @@ class _QdrantRESTClient:
             raise
 
     def upsert_points(self, collection: str, points: list[dict]) -> None:
-        self.request(
-            "PUT",
-            f"/collections/{urlparse.quote(collection, safe='')}/points",
-            query={"wait": "true"},
-            body={"points": points},
-        )
+        try:
+            self.request(
+                "PUT",
+                f"/collections/{urlparse.quote(collection, safe='')}/points",
+                query={"wait": "true"},
+                body={"points": points},
+            )
+        finally:
+            _lexical_cache.invalidate(
+                self._config.url, collection, [str(point["id"]) for point in points]
+            )
 
     def query_points(
         self,
@@ -322,10 +329,11 @@ class _QdrantRESTClient:
         limit: int = _SCROLL_PAGE_SIZE,
         offset: Any = None,
         with_vector: bool = False,
+        with_payload: bool = True,
     ) -> tuple[list[dict], Any]:
         body: dict[str, Any] = {
             "limit": int(limit),
-            "with_payload": True,
+            "with_payload": bool(with_payload),
             "with_vector": bool(with_vector),
         }
         if qdrant_filter:
@@ -352,12 +360,15 @@ class _QdrantRESTClient:
             if point_ids is not None
             else {"filter": qdrant_filter or {}}
         )
-        self.request(
-            "POST",
-            f"/collections/{urlparse.quote(collection, safe='')}/points/delete",
-            query={"wait": "true"},
-            body=selector,
-        )
+        try:
+            self.request(
+                "POST",
+                f"/collections/{urlparse.quote(collection, safe='')}/points/delete",
+                query={"wait": "true"},
+                body=selector,
+            )
+        finally:
+            _lexical_cache.invalidate(self._config.url, collection, point_ids)
 
     def count_points(self, collection: str) -> int:
         response = self.request(
@@ -401,7 +412,10 @@ class _QdrantRESTClient:
         }
 
     def delete_collection(self, collection: str) -> None:
-        self.request("DELETE", f"/collections/{urlparse.quote(collection, safe='')}")
+        try:
+            self.request("DELETE", f"/collections/{urlparse.quote(collection, safe='')}")
+        finally:
+            _lexical_cache.invalidate(self._config.url, collection)
 
 
 def _condition(field: str, expression: Any) -> tuple[Optional[dict], list[dict]]:
@@ -1176,6 +1190,16 @@ class QdrantCollection(BaseCollection):
         rows = []
         text_filter = _text_any_filter(query)
         text_filter_success = False
+        if text_filter and _lexical_cache.ttl_seconds() > 0:
+            try:
+                cached = self._lexical_search_cached(
+                    query, n_results, where, _combine_filters(q_filter, text_filter)
+                )
+            except BackendError:
+                logger.debug("Qdrant cached lexical search failed; scanning", exc_info=True)
+                cached = None
+            if cached is not None:
+                return cached
         if text_filter:
             try:
                 rows = self._scroll_all(
@@ -1204,6 +1228,59 @@ class QdrantCollection(BaseCollection):
         ]
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return LexicalResult(hits=hits[:n_results])
+
+    def _lexical_search_cached(self, query, n_results, where, qdrant_filter):
+        """``lexical_search`` over cached, pre-tokenized rows (see ``_qdrant_lexical_cache``).
+
+        Qdrant still decides which points match (``qdrant_filter``, ids only); only rows missing
+        from the cache are fetched with payload. Returns ``None`` to fall back to the scan.
+        """
+        self._ensure_open()
+        if not self._remote_exists():
+            return None  # missing-collection/marker semantics stay with the scan
+        point_ids: list[str] = []
+        offset = None
+        while True:
+            points, offset = self._client.scroll_points(
+                self._remote_collection,
+                qdrant_filter=qdrant_filter,
+                offset=offset,
+                with_payload=False,
+            )
+            point_ids.extend(str(point["id"]) for point in points)
+            if offset is None:
+                break
+
+        def load(missing: list[str]) -> dict[str, "_lexical_cache.Row"]:
+            fresh = {}
+            for start in range(0, len(missing), _SCROLL_PAGE_SIZE):
+                chunk = missing[start : start + _SCROLL_PAGE_SIZE]
+                points, _ = self._client.scroll_points(
+                    self._remote_collection,
+                    qdrant_filter={"must": [{"has_id": chunk}]},
+                    limit=len(chunk),
+                )
+                for point in points:
+                    row = _payload_row(point)
+                    fresh[str(point["id"])] = _lexical_cache.Row(row, tokenize(row["document"]))
+            return fresh
+
+        rows = _lexical_cache.rows_for(self._config.url, self._remote_collection, point_ids, load)
+        rows = [row for row in rows if matches_where(row.metadata, where)]
+        scores = _lexical_cache.bm25_scores(set(tokenize(query)), rows)
+        ranked = [(score, row) for row, score in zip(rows, scores) if score > 0]
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        return LexicalResult(
+            hits=[
+                LexicalHit(
+                    id=row.id,
+                    document=row.document,
+                    metadata=copy.deepcopy(row.metadata),
+                    score=score,
+                )
+                for score, row in ranked[:n_results]
+            ]
+        )
 
     def close(self) -> None:
         self._closed = True
