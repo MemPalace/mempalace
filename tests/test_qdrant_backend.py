@@ -153,6 +153,7 @@ class _FakeQdrantClient:
         limit=256,
         offset=None,
         with_vector=False,
+        with_payload=True,
     ):
         self.scroll_calls.append(qdrant_filter)
         self.scroll_details.append((qdrant_filter, limit, offset, with_vector))
@@ -168,7 +169,9 @@ class _FakeQdrantClient:
         next_offset = points[limit]["id"] if len(points) > limit else None
         out = []
         for point in selected:
-            item = {"id": point["id"], "payload": point["payload"]}
+            item = {"id": point["id"]}
+            if with_payload:
+                item["payload"] = point["payload"]
             if with_vector:
                 item["vector"] = point["vector"]
             out.append(item)
