@@ -16,6 +16,8 @@ def drawer_palace(monkeypatch, config, collection, kg):
     from mempalace import mcp_server
 
     _patch_mcp_server(monkeypatch, config, kg)
+    # Compare storage paths with stable counters; access behavior has separate tests.
+    monkeypatch.setattr(mcp_server, "_record_drawer_reads", lambda ids: None)
     monkeypatch.delenv("MEMPALACE_BACKEND", raising=False)
     monkeypatch.delenv("MEMPALACE_BACKEND_EXPLICIT", raising=False)
     return mcp_server, collection
@@ -94,6 +96,7 @@ def _payload(drawer_id, content, metadata, *, chunk_ids=None):
         "wing": metadata.get("wing", ""),
         "room": metadata.get("room", ""),
         "metadata": metadata,
+        "access": {"retrieval_count": 0, "last_retrieved": None},
     }
     if chunk_ids is not None:
         result.update(chunks=len(chunk_ids), chunk_ids=chunk_ids)

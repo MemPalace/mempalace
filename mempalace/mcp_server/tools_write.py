@@ -487,7 +487,12 @@ def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int)
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    _extra_metadata: dict = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -508,6 +513,7 @@ def tool_add_drawer(
         if source_file:
             source_file = strip_lone_surrogates(source_file)
         added_by = strip_lone_surrogates(added_by)
+        extra_metadata = _normalize_extra_metadata(_extra_metadata)
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
@@ -524,6 +530,7 @@ def tool_add_drawer(
             "wing": wing,
             "room": room,
             "added_by": added_by,
+            "extra_metadata_keys": sorted(extra_metadata.keys()),
             "content_length": len(content),
             "content_preview": content[:200],
         },
@@ -538,6 +545,7 @@ def tool_add_drawer(
         "filed_at": utc_now_iso(),
         "id_recipe": ID_RECIPE,
     }
+    base_meta.update(extra_metadata)
     if source_file:
         # A drawer filed here names a source file the same way a mined one
         # does, and ``sync`` decides both by the same rule, so it records the
@@ -1228,7 +1236,12 @@ def _with_source_bytes(payload: dict) -> dict:
 
 def tool_get_drawer(drawer_id: str, include_source_bytes: bool = False):
     """Fetch a single logical drawer by ID."""
-    finish = _with_source_bytes if include_source_bytes else (lambda payload: payload)
+
+    def finish(payload):
+        _record_drawer_reads([payload["drawer_id"]])
+        payload["access"] = _drawer_access(payload["drawer_id"])
+        return _with_source_bytes(payload) if include_source_bytes else payload
+
     try:
         record = _sqlite_logical_drawer_record(drawer_id)
         if record is not None:
@@ -1330,6 +1343,15 @@ def tool_get_drawers(drawer_ids: list):
         except Exception as e:
             errors += 1
             results.append({"drawer_id": drawer_id, "error": str(e)})
+
+    ids = [item["drawer_id"] for item in results if "error" not in item]
+    _record_drawer_reads(ids)
+    access = _drawer_access_many(ids)
+    for item in results:
+        if "error" not in item:
+            item["access"] = access.get(
+                item["drawer_id"], {"retrieval_count": 0, "last_retrieved": None}
+            )
 
     return {
         "results": results,
@@ -1579,6 +1601,112 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
         outcome = _embed_failure(e, success=False)
         _wal_result("update_drawer", outcome)
         return outcome
+
+
+def _coerce_non_negative_int(value, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Fields the write path owns, which caller-supplied extra metadata cannot
+# overwrite: a forged parent id would make an ordinary drawer look like a chunk,
+# and a forged source_encoding would misstate the drawer's source bytes.
+_DRAWER_META_RESERVED_KEYS = frozenset(
+    {
+        "wing",
+        "room",
+        "source_file",
+        "source_encoding",
+        "added_by",
+        "filed_at",
+        "last_modified",
+        "id_recipe",
+        "retrieval_count",
+        "last_retrieved",
+        "chunk_index",
+        "chunk_total",
+        "chunk_ids",
+        "parent_drawer_id",
+        "parent_entry_id",
+        "ingest_mode",
+        "is_sentinel",
+    }
+)
+
+
+def _normalize_extra_metadata(extra_meta):
+    """Return scalar-only metadata safe for Chroma storage."""
+    if extra_meta is None:
+        return {}
+    if not isinstance(extra_meta, dict):
+        raise ValueError("extra metadata must be an object")
+
+    normalized = {}
+    for key, value in extra_meta.items():
+        if not isinstance(key, str):
+            continue
+        key = strip_lone_surrogates(key).strip()
+        if not key or key in _DRAWER_META_RESERVED_KEYS:
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (bool, int, float)):
+            normalized[key] = value
+            continue
+        if isinstance(value, str):
+            normalized[key] = strip_lone_surrogates(value)
+            continue
+        normalized[key] = strip_lone_surrogates(str(value))
+
+    return normalized
+
+
+def _record_drawer_reads(logical_ids) -> None:
+    """Count one read of each logical drawer id, beside the palace.
+
+    Counts go to ``access_stats`` (``<palace>/access.sqlite3``), never into
+    drawer metadata, so a read never writes to the drawer store. Read-only
+    servers record nothing.
+    """
+    if _READ_ONLY or not _config.palace_path:
+        return
+    from .. import access_stats
+
+    access_stats.record_access(_config.palace_path, logical_ids)
+
+
+def _drawer_access(drawer_id: str) -> dict:
+    """``{retrieval_count, last_retrieved}`` for one logical drawer."""
+    found = _drawer_access_many([drawer_id]).get(drawer_id)
+    return found or {"retrieval_count": 0, "last_retrieved": None}
+
+
+def _drawer_access_many(drawer_ids: list[str]) -> dict[str, dict]:
+    """Read access counters in batches without opening or mutating the drawer store."""
+    from .. import access_stats
+
+    return access_stats.access_for(_config.palace_path, drawer_ids)
+
+
+def _logical_drawer_id_for_any_id(col, drawer_id: str) -> str:
+    """Resolve a row/chunk id to its logical drawer id when possible."""
+    record = _single_drawer_record(col, drawer_id)
+    if record is None:
+        return drawer_id
+    parent_id = _logical_parent_id(_safe_meta(record.get("metadata")))
+    if isinstance(parent_id, str) and parent_id:
+        return parent_id
+    return drawer_id
+
+
+def _height_from_record(record) -> int:
+    if not record:
+        return 0
+    meta = _safe_meta(record.get("metadata") or {})
+    return _coerce_non_negative_int(meta.get("height"), default=0)
 
 
 def tool_delete_drawers(drawer_ids: list):

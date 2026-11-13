@@ -12,6 +12,7 @@ from mempalace import mcp_server, service, tool_capabilities
 
 READ_ONLY_REFUSED = {
     "mempalace_add_drawer",
+    "mempalace_apply_merge",
     "mempalace_artifact_put",
     "mempalace_checkpoint",
     "mempalace_create_tunnel",
@@ -62,6 +63,23 @@ def test_reads_advertise_read_only_hint_and_nothing_else_does():
     }
     assert hinted == reads
     assert hinted.isdisjoint(READ_ONLY_REFUSED)
+
+
+def test_lineage_tools_are_classified_by_what_they_touch():
+    assert service.classify_tool("mempalace_resolve_canonical") == "read"
+    for name in (
+        "mempalace_get_height",
+        "mempalace_find_merge_candidates",
+        "mempalace_find_closet_lineage_issues",
+    ):
+        # These open the drawer collection, so HTTP keeps them under its lock.
+        assert service.classify_tool(name) == "read"
+        assert name not in tool_capabilities.HTTP_LOCK_FREE_TOOLS
+    # apply_merge reads the collection to check its nodes (so it takes the
+    # lease) but writes only the graph (so a diverged HNSW has no say over it).
+    assert "mempalace_apply_merge" in tool_capabilities.MUTATING_TOOLS
+    assert "mempalace_apply_merge" not in tool_capabilities.PEER_WRITER_EXEMPT_TOOLS
+    assert "mempalace_apply_merge" not in tool_capabilities.VECTOR_WRITE_TOOLS
 
 
 def test_reconnect_stays_available_in_read_only_mode():
