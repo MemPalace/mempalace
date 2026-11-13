@@ -19,6 +19,7 @@ Usage:
 import hashlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -268,7 +269,12 @@ def ingest_diaries(
             }
         days_updated += 1
 
-    state_file.write_text(json.dumps(state, indent=2))
+    # Write to a sibling file and swap it in, so a crash mid-write cannot
+    # leave a truncated state file (which the reader would treat as empty and
+    # re-ingest every diary).
+    tmp_file = state_file.with_name(state_file.name + ".tmp")
+    tmp_file.write_text(json.dumps(state, indent=2))
+    os.replace(tmp_file, state_file)
     if days_updated:
         print(f"Diary: {days_updated} days updated, {closets_created} new closets")
 
