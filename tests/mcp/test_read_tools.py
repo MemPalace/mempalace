@@ -1450,3 +1450,62 @@ def test_list_drawers_sdk_preview_rechecks_generation_after_positional_overwrite
     assert collection.hydrated
     assert "error" in raced, raced
     assert "UNCOMMITTED B content" not in str(raced)
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("ingest_mode", "manual"),
+        ("wing", "other-wing"),
+        ("room", "other-room"),
+    ],
+)
+def test_public_get_rejects_same_id_scope_change_during_validation(
+    monkeypatch, changed_field, changed_value
+):
+    """The source scan must not authorize an earlier same-ID get from another scope."""
+    from mempalace import mcp_server
+
+    before = {
+        "ingest_mode": "convos",
+        "source_file": "/sessions/racing.jsonl",
+        "extract_mode": "general",
+        "source_mtime": 5.0,
+        "filed_at": "A",
+        "chunk_total": 1,
+        "chunk_index": 0,
+        "wing": "sessions",
+        "room": "chat",
+    }
+    after = {**before, changed_field: changed_value}
+    record = {"ids": ["same-id"], "metadatas": [before]}
+
+    class SwitchingCollection:
+        current = before
+
+        def get(self, **kwargs):
+            assert kwargs.get("where") == {"source_file": before["source_file"]}
+            return {"ids": ["same-id"], "documents": [], "metadatas": [self.current]}
+
+    collection = SwitchingCollection()
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+    monkeypatch.setattr(mcp_server, "_sqlite_logical_drawer_record", lambda _id: None)
+    monkeypatch.setattr(
+        mcp_server, "_collection_logical_drawer_record", lambda _col, _id: record
+    )
+    monkeypatch.setattr(
+        mcp_server, "_bulk_drawer_records", lambda _col, _ids: {"same-id": record}
+    )
+
+    assert mcp_server._public_conversation_record_visible(record, col=collection)
+    collection.current = after
+    assert not mcp_server._public_conversation_record_visible(record, col=collection)
+
+    single = mcp_server.tool_get_drawer("same-id")
+    assert single == {"error": "Drawer not found: same-id"}
+    bulk = mcp_server.tool_get_drawers(["same-id"])
+    assert bulk["errors"] == 1
+    assert bulk["results"] == [
+        {"drawer_id": "same-id", "error": "Drawer not found: same-id"}
+    ]

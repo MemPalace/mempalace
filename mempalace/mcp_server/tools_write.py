@@ -318,6 +318,7 @@ def _public_conversation_record_visible(record, *, col=None, source_cache=None):
         # A row can be replaced between the direct read and the source scan.
         # Never authorize a different version simply because it shares an ID.
         compare_keys = (
+            "ingest_mode",
             "source_file",
             "extract_mode",
             "source_mtime",
@@ -325,6 +326,10 @@ def _public_conversation_record_visible(record, *, col=None, source_cache=None):
             "chunk_total",
             "chunk_index",
             "historical_version",
+            # Metadata from a later same-ID write must not authorize content
+            # under an earlier generation's placement or record kind.
+            "wing",
+            "room",
         )
         if any((stored or {}).get(key) != meta.get(key) for key in compare_keys):
             return False
