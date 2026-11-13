@@ -1914,7 +1914,7 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
 
     calls: list[str] = []
 
-    def _spy(path, stale_seconds=300.0):
+    def _spy(path, stale_seconds=300.0, *, fail_if_held=False):
         calls.append(path)
         return []
 
@@ -1945,7 +1945,7 @@ def test_make_client_gates_invalid_metadata_on_first_call(tmp_path, monkeypatch)
         calls.append(path)
         return []
 
-    def _stale(path, stale_seconds=300.0):
+    def _stale(path, stale_seconds=300.0, *, fail_if_held=False):
         return []
 
     monkeypatch.setattr("mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _invalid)
@@ -1972,7 +1972,7 @@ def test_make_client_quarantines_each_palace_independently(tmp_path, monkeypatch
 
     calls: list[str] = []
 
-    def _spy(path, stale_seconds=300.0):
+    def _spy(path, stale_seconds=300.0, *, fail_if_held=False):
         calls.append(path)
         return []
 
@@ -2036,7 +2036,7 @@ def test_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeypatch)
 
     calls: list[str] = []
 
-    def _spy(path, stale_seconds=300.0):
+    def _spy(path, stale_seconds=300.0, *, fail_if_held=False):
         calls.append(path)
         return []
 
@@ -2071,7 +2071,7 @@ def test_client_rearms_quarantine_on_mtime_change(tmp_path, monkeypatch):
 
     calls: list[str] = []
 
-    def _spy(path, stale_seconds=300.0):
+    def _spy(path, stale_seconds=300.0, *, fail_if_held=False):
         calls.append(path)
         return []
 
