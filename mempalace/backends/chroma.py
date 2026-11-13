@@ -1956,6 +1956,14 @@ def quarantine_invalid_hnsw_metadata(palace_path: str, *, fail_if_held: bool = F
 
 
 def _quarantine_hnsw_under_palace_lock(palace_path: str) -> bool:
+    if sys.platform == "darwin":
+        # Darwin's policy never renames a candidate. These read-only checks
+        # must also run when another client holds the writer lease, otherwise
+        # lock contention would bypass refusal and load the unsafe index.
+        quarantine_invalid_hnsw_metadata(palace_path, fail_if_held=True)
+        quarantine_stale_hnsw(palace_path, fail_if_held=True)
+        return True
+
     # Avoid the palace -> backends import cycle.
     from ..palace import MineAlreadyRunning, mine_palace_lock
 

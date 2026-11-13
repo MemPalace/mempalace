@@ -69,6 +69,34 @@ def test_healthy_darwin_palace_does_not_require_quarantine(tmp_path, monkeypatch
     assert str(tmp_path) in chroma.ChromaBackend._quarantined_paths
 
 
+@pytest.mark.parametrize("unsafe", [True, False])
+def test_darwin_safety_check_cannot_be_bypassed_by_unavailable_writer_lock(
+    tmp_path, monkeypatch, unsafe
+):
+    from mempalace import palace
+
+    segment = _invalid_segment(tmp_path) if unsafe else None
+    monkeypatch.setattr(chroma.ChromaBackend, "_quarantined_paths", set())
+    monkeypatch.setattr(chroma, "_fix_blob_seq_ids", lambda _path: None)
+    monkeypatch.setattr(chroma, "_fix_missing_collection_type", lambda _path: None)
+    monkeypatch.setattr(chroma, "sys", SimpleNamespace(platform="darwin"))
+
+    def locked(*args, **kwargs):
+        raise palace.MineAlreadyRunning("synthetic writer lease held")
+
+    monkeypatch.setattr(palace, "mine_palace_lock", locked)
+    opened = []
+    monkeypatch.setattr(chroma.chromadb, "PersistentClient", lambda **kw: opened.append(kw))
+    if unsafe:
+        with pytest.raises(chroma.HNSWQuarantineDeferredError):
+            chroma.ChromaBackend.make_client(str(tmp_path))
+        assert segment.is_dir()
+        assert opened == []
+    else:
+        chroma.ChromaBackend.make_client(str(tmp_path))
+        assert len(opened) == 1
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires native macOS mappings")
 @pytest.mark.parametrize("mode", ["open", "mmap"])
 def test_native_darwin_preserves_open_and_descriptor_free_mapped_segment(tmp_path, mode):
