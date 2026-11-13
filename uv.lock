@@ -1855,6 +1855,9 @@ pgvector = [
 spellcheck = [
     { name = "autocorrect" },
 ]
+turso = [
+    { name = "pyturso" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1899,6 +1902,7 @@ requires-dist = [
     { name = "pytest-rerunfailures", marker = "extra == 'dev'", specifier = ">=12.0" },
     { name = "pytest-xdist", marker = "extra == 'dev'", specifier = ">=3.0" },
     { name = "python-dateutil", specifier = ">=2.8" },
+    { name = "pyturso", marker = "extra == 'turso'", specifier = ">=0.8" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.16.6" },
     { name = "scipy", marker = "extra == 'dev'", specifier = ">=1.10" },
@@ -1915,7 +1919,7 @@ requires-dist = [
     { name = "transformers", marker = "extra == 'embeddinggemma2'", specifier = ">=5.19.0" },
     { name = "transformers", marker = "extra == 'multimodal'", specifier = ">=5.19.0" },
 ]
-provides-extras = ["dev", "spellcheck", "milvus", "pgvector", "gpu", "dml", "coreml", "embeddinggemma2", "multimodal", "multilingual", "extract"]
+provides-extras = ["dev", "spellcheck", "milvus", "pgvector", "turso", "gpu", "dml", "coreml", "embeddinggemma2", "multimodal", "multilingual", "extract"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -4186,6 +4190,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/52/a9/0c0db8d37b2b8a645666f7fd8accea4c6224e013c42b1d5c17c93590cd06/python_pptx-1.0.2.tar.gz", hash = "sha256:479a8af0eaf0f0d76b6f00b0887732874ad2e3188230315290cd1f9dd9cc7095", size = 10109297, upload-time = "2024-08-07T17:33:37.772Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d9/4f/00be2196329ebbff56ce564aa94efb0fbc828d00de250b1980de1a34ab49/python_pptx-1.0.2-py3-none-any.whl", hash = "sha256:160838e0b8565a8b1f67947675886e9fea18aa5e795db7ae531606d68e785cba", size = 472788, upload-time = "2024-08-07T17:33:28.192Z" },
+]
+
+[[package]]
+name = "pyturso"
+version = "0.8.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f3/26/da3ff5e767ff1d8018fe635d6a703ff1c89ede60d21b225ce93d5f925bea/pyturso-0.8.3.tar.gz", hash = "sha256:4a30e0441dff270e2f28cf06c09cbcff958fa9c0f156547f0b0f9a6601be6622", size = 3327117, upload-time = "2026-10-12T14:53:23.983Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/09/8bdeb9683455222fdcb0de798cfe9cb6f23372b8fdbcd368785ed25ca107/pyturso-0.8.3-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:7464f9aa3a2a69fc1848b00f5950cf37e05624b8bb1d5bbe2b7a62e14fce3483", size = 9422599, upload-time = "2026-10-12T14:53:11.352Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/ad/e29c81ba2795d0d6dff497a17d485206ed3c73a1d0b0ecfb6a40531b9a05/pyturso-0.8.3-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:1038aeeaa788e1633c437e3076de90ea6753a3fccb93f2f2ff93e4dbc4075db1", size = 8262096, upload-time = "2026-10-12T14:53:14.632Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/5a/4f59f9ff84237f49f66f1e4eee337cbf446b438e80e3d53076d040b757a0/pyturso-0.8.3-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e7c9382df866dac2abf90bad6f5d8da14c309c525f349aeb6dce66e37e3be449", size = 27661232, upload-time = "2026-10-12T14:53:17.355Z" },
+    { url = "https://files.pythonhosted.org/packages/47/f5/8d5515d382350be43bbaf0319ff74aa12ccce3a07d636f6c799b12968b07/pyturso-0.8.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8ad417fb991351daf9fd6fbd984f16504da3f398137653a2b89cefed03d18616", size = 28137972, upload-time = "2026-10-12T14:53:20.862Z" },
 ]
 
 [[package]]

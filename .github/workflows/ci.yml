@@ -97,6 +97,26 @@ jobs:
           --cov-config=.github/coverage-milvus.toml
           --durations=10
 
+  test-turso:
+    name: Measure Turso extra
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+      # backends/turso.py is omitted from the default gate (pyturso is not
+      # a dev dependency). This job measures that module. The package
+      # threshold stays in pyproject.toml and is not restated here.
+      - run: pip install -e ".[dev,turso]"
+      - run: >-
+          python -m pytest tests/test_turso_backend.py -v
+          --cov
+          --cov-report=term-missing
+          --cov-config=.github/coverage-turso.toml
+          --durations=10
+
   lint:
     runs-on: ubuntu-latest
     steps:
