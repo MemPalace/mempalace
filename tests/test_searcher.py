@@ -1030,7 +1030,8 @@ def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tm
     conn.executescript(
         """
         CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');
-        CREATE TABLE embedding_metadata (id INTEGER, key TEXT, string_value TEXT, int_value INTEGER);
+        CREATE TABLE embedding_metadata (
+            id INTEGER, key TEXT, string_value TEXT, int_value INTEGER, float_value REAL);
         CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT);
         CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT);
         CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT, embedding_id TEXT, created_at TEXT);
@@ -1038,11 +1039,11 @@ def test_bm25_only_via_sqlite_forwards_stop_words_to_bm25_scores(monkeypatch, tm
         INSERT INTO segments VALUES ('s1', 'c1');
         INSERT INTO embeddings VALUES (1, 's1', 'drawer-cat-1', '2026-05-03');
         INSERT INTO embedding_fulltext_search (rowid, string_value) VALUES (1, 'the cat sat');
-        INSERT INTO embedding_metadata VALUES (1, 'chroma:document', 'the cat sat', NULL);
-        INSERT INTO embedding_metadata VALUES (1, 'wing', 'general', NULL);
-        INSERT INTO embedding_metadata VALUES (1, 'room', 'inbox', NULL);
-        INSERT INTO embedding_metadata VALUES (1, 'source_file', '/x/cat.md', NULL);
-        INSERT INTO embedding_metadata VALUES (1, 'filed_at', '2026-05-03', NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'chroma:document', 'the cat sat', NULL, NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'wing', 'general', NULL, NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'room', 'inbox', NULL, NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'source_file', '/x/cat.md', NULL, NULL);
+        INSERT INTO embedding_metadata VALUES (1, 'filed_at', '2026-05-03', NULL, NULL);
         """
     )
     conn.commit()
