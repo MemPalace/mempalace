@@ -565,8 +565,17 @@ class SQLiteExactCollection(BaseCollection):
                     _bump_write_generation(cur)
                 self._handle.conn.commit()
                 if write:
-                    self._handle._vector_cache.clear()
-                    self._handle._native_cache.clear()
+                    # Evict only what this cursor wrote: the other collections'
+                    # warm matrices and native indexes stay valid, so a one-row
+                    # write no longer forces a full re-read of every embedding
+                    # in the palace on the next search (#2907).
+                    self._handle._native_cache.pop(self._collection_name, None)
+                    try:
+                        self._handle._vector_cache.pop(self._collection_id(cur), None)
+                    except CollectionNotInitializedError:
+                        # DDL or a collection row that is not there yet: we
+                        # cannot attribute the write, so fall back to a reset.
+                        self._handle._vector_cache.clear()
             finally:
                 cur.close()
 
