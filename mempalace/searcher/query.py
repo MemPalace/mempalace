@@ -392,7 +392,7 @@ def search_memories(
     stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
     drawer_metas = _first_or_empty(drawer_results, "metadatas")
     visible_ids = (
-        visibility_filter(zip(stored_drawer_ids, drawer_metas))
+        visibility_filter(zip(stored_drawer_ids, drawer_metas, drawer_docs))
         if visibility_filter is not None
         else set(stored_drawer_ids)
     )

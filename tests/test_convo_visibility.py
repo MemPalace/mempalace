@@ -134,3 +134,76 @@ def test_vector_candidate_gate_rejects_same_id_scope_change(monkeypatch, scope_f
 
     assert check(stale_hit) == set(), "stale wing/room must not inherit current visibility"
     assert check(committed) == {"shared-physical-id"}
+
+
+def test_vector_candidate_gate_rejects_same_id_torn_document(monkeypatch):
+    """The query text must match the body in the validated SQLite snapshot."""
+    from contextlib import nullcontext
+
+    from mempalace.backends import chroma_sqlite
+    from mempalace.convo_visibility import visible_conversation_candidate_ids
+
+    committed = _meta(total=1)
+    connection = object()
+    monkeypatch.setattr(
+        chroma_sqlite,
+        "sqlite_metadata_snapshot",
+        lambda _palace_path, _collection_name: nullcontext(connection),
+    )
+
+    def source_snapshot(_palace_path, _collection_name, *, where, _connection):
+        assert where == {"source_file": {"$in": ["session.txt"]}}
+        assert _connection is connection
+        return ["same-id"], [committed]
+
+    monkeypatch.setattr(chroma_sqlite, "sqlite_list_id_metadata", source_snapshot)
+
+    def documents(_palace_path, _collection_name, ids, *, _connection):
+        assert ids == ["same-id"]
+        assert _connection is connection
+        return {"same-id": "published A"}
+
+    monkeypatch.setattr(chroma_sqlite, "sqlite_documents_for_ids", documents)
+
+    def check(candidate):
+        return visible_conversation_candidate_ids("/unused", "drawers", [candidate])
+
+    assert check(("same-id", committed, "unfinished B")) == set()
+    assert check(("same-id", committed, "published A")) == {"same-id"}
+    # Metadata-only callers preserve their existing contract.
+    assert check(("same-id", committed)) == {"same-id"}
+
+    # Failure to read an exact body from SQLite must fail closed.
+    monkeypatch.setattr(chroma_sqlite, "sqlite_documents_for_ids", lambda *_args, **_kw: None)
+    assert check(("same-id", committed, "published A")) == set()
+
+
+def test_public_vector_search_passes_candidate_text_to_visibility_guard(monkeypatch):
+    """Ensure PUBLIC vector search actually invokes the body-aware gate."""
+    from unittest.mock import MagicMock
+
+    import mempalace.convo_visibility as visibility
+    import mempalace.searcher as searcher
+
+    meta = {**_meta(total=1), "wing": "sessions", "room": "notes"}
+    collection = MagicMock()
+    collection.distance_metric = "cosine"
+    collection.query.return_value = {
+        "ids": [["same-id"]],
+        "documents": [["unpublished B"]],
+        "metadatas": [[meta]],
+        "distances": [[0.1]],
+    }
+    monkeypatch.setattr(searcher, "get_collection", lambda *_args, **_kw: collection)
+    monkeypatch.setattr(searcher, "get_closets_collection", lambda *_args, **_kw: None)
+    monkeypatch.setattr(searcher, "resolve_backend_name", lambda *_args: "chroma")
+    seen = []
+
+    def refuse(_palace_path, _collection_name, candidates):
+        seen.extend(candidates)
+        return set()
+
+    monkeypatch.setattr(visibility, "visible_conversation_candidate_ids", refuse)
+    result = searcher.search_memories("needle", "/unused", n_results=1)
+    assert seen == [("same-id", meta, "unpublished B")]
+    assert result["results"] == []

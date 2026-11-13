@@ -110,7 +110,7 @@ def _load_source_chunks(
         ids = field("ids")
         docs = field("documents")
         metadatas = field("metadatas")
-        allowed = visibility_filter(zip(ids, metadatas))
+        allowed = visibility_filter(zip(ids, metadatas, docs))
         indexed = []
         for offset, (row_id, doc, meta) in enumerate(zip(ids, docs, metadatas)):
             meta = meta or {}

@@ -1,7 +1,8 @@
-"""Conservative metadata-only visibility guard for conversation re-mines.
+"""Conservative visibility guards for conversation re-mines.
 
-This guards listings against torn positional writes, not physical generation
-staging, atomic publication, vector search, MCP get, or lexical/SQLite/BM25.
+Metadata completeness and optional body checks help public search and listing
+reject torn positional writes. They are not immutable staging, an atomic
+publication marker, or a global snapshot across HNSW, MCP, and SQLite.
 """
 
 from collections import defaultdict
@@ -62,12 +63,26 @@ def visible_conversation_candidate_ids(palace_path, collection_name, candidates)
     The entire source/mode is inspected, not just the top-K vector winners:
     otherwise a partly overwritten B generation could masquerade as complete.
     Unavailable/lagging metadata fails closed only for stamped conversation
-    candidates. This does not constitute an atomic vector/SQLite read.
+    candidates. If a third candidate field carries document text, it must
+    also agree with the body from the same SQLite snapshot. This does not
+    constitute atomic vector/SQLite publication or a global reader snapshot.
     """
-    from .backends.chroma_sqlite import sqlite_list_id_metadata, sqlite_metadata_snapshot
+    from .backends.chroma_sqlite import (
+        sqlite_documents_for_ids,
+        sqlite_list_id_metadata,
+        sqlite_metadata_snapshot,
+    )
     from .config import get_configured_collection_name
 
-    pairs = [(row_id, meta or {}) for row_id, meta in candidates]
+    # Vector/lexical candidates can include a third field (document).
+    # Metadata-only callers retain the earlier two-field contract.
+    pairs = []
+    candidate_texts = {}
+    for candidate in candidates:
+        row_id, meta = candidate[:2]
+        pairs.append((row_id, meta or {}))
+        if len(candidate) >= 3:
+            candidate_texts[row_id] = candidate[2]
     stamped = [
         (row_id, meta)
         for row_id, meta in pairs
@@ -98,6 +113,17 @@ def visible_conversation_candidate_ids(palace_path, collection_name, candidates)
         if snapshot is None:
             return accepted
         ids, metadatas = snapshot
+        # Validate only the candidate bodies against the *same* metadata
+        # transaction. A vector result can span a same-ID positional rewrite
+        # even when its generation stamps match a previously complete row.
+        persisted_texts = None
+        if candidate_texts:
+            persisted_texts = sqlite_documents_for_ids(
+                palace_path,
+                name,
+                [row_id for row_id, _ in stamped if row_id in candidate_texts],
+                _connection=connection,
+            )
         visible_ids = {row_id for row_id, _ in visible_conversation_rows(ids, metadatas)}
         current = dict(zip(ids, metadatas))
         generation_fields = (
@@ -120,6 +146,15 @@ def visible_conversation_candidate_ids(palace_path, collection_name, candidates)
                 row_id in visible_ids
                 and persisted is not None
                 and all(persisted.get(key) == meta.get(key) for key in generation_fields)
+                and (
+                    row_id not in candidate_texts
+                    or (
+                        isinstance(candidate_texts[row_id], str)
+                        and persisted_texts is not None
+                        and row_id in persisted_texts
+                        and persisted_texts[row_id] == candidate_texts[row_id]
+                    )
+                )
             ):
                 accepted.add(row_id)
     return accepted

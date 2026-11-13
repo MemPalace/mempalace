@@ -377,7 +377,9 @@ def _merge_bm25_union_candidates(
 
     lexical_hits = list(lexical.hits)
     if visibility_filter is not None:
-        visible_ids = visibility_filter((hit.id, hit.metadata or {}) for hit in lexical_hits)
+        visible_ids = visibility_filter(
+            (hit.id, hit.metadata or {}, hit.document) for hit in lexical_hits
+        )
         hidden_count = sum(hit.id not in visible_ids for hit in lexical_hits)
         if hidden_count:
             stats["filtered_by_uncommitted_generation"] = (
