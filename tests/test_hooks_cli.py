@@ -906,6 +906,50 @@ def test_late_checkpoint_child_does_not_re_mine_what_the_foreground_dispatched(t
     ingest.assert_not_called()
 
 
+def test_ingest_claim_contender_skips_instead_of_waiting(tmp_path):
+    """The owner of the ingest claim may wait on a slow daemon submit. A Stop
+    at the same mark must not block behind it past the hook budget: it finds
+    the claim taken and returns at once, leaving the owner to record the mark."""
+    import threading
+    import time
+
+    owner_dispatching = threading.Event()
+    release_owner = threading.Event()
+    calls = []
+
+    def slow_ingest(path):
+        calls.append(threading.current_thread().name)
+        owner_dispatching.set()
+        release_owner.wait(5)
+        return True
+
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._ingest_transcript", side_effect=slow_ingest),
+    ):
+        owner = threading.Thread(
+            target=hooks_cli_mod._ingest_if_due, args=("s", 15, "t.jsonl"), name="owner"
+        )
+        contender = threading.Thread(target=hooks_cli_mod._ingest_if_due, args=("s", 15, "t.jsonl"))
+        owner.start()
+        try:
+            assert owner_dispatching.wait(5)
+            started = time.perf_counter()
+            contender.start()
+            contender.join(0.4)
+            waited = time.perf_counter() - started
+            assert not contender.is_alive(), "contender blocked behind the owner"
+            assert waited < 0.4
+            assert not (tmp_path / "s_last_ingest").exists()  # owner still dispatching
+        finally:
+            release_owner.set()
+            owner.join(5)
+            if contender.ident is not None:
+                contender.join(5)
+    assert calls == ["owner"]
+    assert (tmp_path / "s_last_ingest").read_text(encoding="utf-8") == "15"
+
+
 def test_ingest_claim_is_atomic_between_foreground_and_child(tmp_path):
     """Two dispatchers for the same mark: the second waits for the first to
     record its mine, then skips. A check-then-dispatch without the marker lock

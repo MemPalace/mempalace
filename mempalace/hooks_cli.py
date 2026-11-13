@@ -1152,9 +1152,10 @@ def _advance_save_marker(session_id: str, exchange_count) -> None:
 
 
 @contextmanager
-def _save_marker_lock(marker: Path):
+def _save_marker_lock(marker: Path, blocking: bool = True):
     """Hold an exclusive cross-process lock on ``marker`` for a read-compare-write.
 
+    With ``blocking=False`` a lock held elsewhere raises ``OSError`` at once.
     ``palace.mine_lock`` would do, but importing ``mempalace.palace`` costs over
     a second, far past the hook budget.
     """
@@ -1164,7 +1165,7 @@ def _save_marker_lock(marker: Path):
             import msvcrt
 
             fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
             try:
                 yield
             finally:
@@ -1173,7 +1174,7 @@ def _save_marker_lock(marker: Path):
         else:
             import fcntl
 
-            fcntl.flock(fh, fcntl.LOCK_EX)
+            fcntl.flock(fh, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
             yield
 
 
@@ -1182,17 +1183,19 @@ def _ingest_if_due(session_id: str, exchange_count: int, transcript_path: str) -
 
     The Stop hook and a queued checkpoint child can both reach the same mark,
     so the check, the dispatch and ``{session_id}_last_ingest`` happen under
-    one lock: whoever comes second sees the mark recorded and skips.
+    one lock. The owner may wait on a slow daemon submit, so a contender skips
+    instead of blocking the hook: the owner records the mark.
     """
     marker = STATE_DIR / f"{_sanitize_session_id(session_id)}_last_ingest"
     try:
-        with _save_marker_lock(marker):
+        with _save_marker_lock(marker, blocking=False):
             if exchange_count - _read_save_marker(marker) < SAVE_INTERVAL:
                 return
             if _ingest_transcript(transcript_path):
                 marker.write_text(str(exchange_count), encoding="utf-8")
     except OSError:
-        # Lock or marker write failed: the next save-due Stop tries again.
+        # Claim held elsewhere, or the lock or marker write failed: the next
+        # save-due Stop tries again if no mine was recorded.
         pass
 
 
