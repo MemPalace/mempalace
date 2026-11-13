@@ -679,9 +679,7 @@ def _tool_result_is_error(result) -> bool:
 
 def _tool_call_response(req_id, result) -> dict:
     """The JSON-RPC response carrying a tool's result as MCP text content."""
-    tool_result = {
-        "content": [{"type": "text", "text": json.dumps(result, indent=2, ensure_ascii=False)}]
-    }
+    tool_result = {"content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}
     if _tool_result_is_error(result):
         tool_result["isError"] = True
     return {"jsonrpc": "2.0", "id": req_id, "result": tool_result}
