@@ -740,8 +740,57 @@ def test_save_diary_direct_retry_reuses_the_pending_daemon_checkpoint(tmp_path, 
         patch("mempalace.hooks_cli._current_hook_write_routing", return_value=Routing()),
         patch("mempalace.hooks_cli._submit_daemon_job", return_value={}) as submit,
     ):
+        hooks_cli_mod._save_diary_direct(
+            str(transcript), "s1", agent_name="claude", wait=wait, exchange_count=15
+        )
+        assert submit.call_args.kwargs["dedupe_key"] == "hook:diary:s1:15"
+        # Without a mark there is nothing to pin the content to: no dedupe.
         hooks_cli_mod._save_diary_direct(str(transcript), "s1", agent_name="claude", wait=wait)
-    assert submit.call_args.kwargs["dedupe_key"] == "hook:diary:s1"
+        assert submit.call_args.kwargs["dedupe_key"] is None
+
+
+def test_stale_daemon_checkpoint_cannot_acknowledge_a_newer_mark(tmp_path):
+    """The checkpoint for mark 15 times out and stays pending. The Stop at mark
+    30 must file its own content; attaching to the pending mark-15 job would
+    move the save marker to 30 with the newer messages never filed."""
+    from mempalace.daemon import DaemonWaitTimeout
+
+    pending = {}
+    filed = []
+
+    def fake_daemon(kind, payload, *, dedupe_key=None, priority=0, wait=False, timeout=60.0):
+        if kind != "diary_write":
+            return {}
+        if dedupe_key in pending:
+            filed.append(pending.pop(dedupe_key)["entry"])
+            return {"state": "succeeded", "result": {"success": True, "entry_id": "old"}}
+        if not filed and not pending:
+            pending[dedupe_key] = payload
+            raise DaemonWaitTimeout("job15", "queued")
+        filed.append(payload["entry"])
+        return {"state": "succeeded", "result": {"success": True, "entry_id": "new"}}
+
+    class Routing:
+        blocked = False
+        use_daemon = True
+        notice = ""
+
+    transcript = tmp_path / "t.jsonl"
+    data = {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)}
+    with (
+        patch("mempalace.hooks_cli._compute_hook_write_routing", return_value=Routing()),
+        patch("mempalace.hooks_cli._submit_daemon_job", side_effect=fake_daemon),
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=True),
+        patch("mempalace.hooks_cli._maybe_auto_ingest"),
+    ):
+        for mark in (15, 30):
+            _write_transcript(
+                transcript,
+                [{"message": {"role": "user", "content": f"msg {i}"}} for i in range(mark)],
+            )
+            _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert (tmp_path / "test_last_save").read_text(encoding="utf-8") == "30"
+    assert any("msg 29" in entry for entry in filed), filed
 
 
 def test_save_diary_direct_queues_no_ingest_when_not_due(tmp_path):
@@ -806,7 +855,7 @@ def _run_checkpoint_child(tmp_path, *, hub_result, ingest_ok, exchange_count=30)
         patch("mempalace.miner._cleanup_mine_pid_file"),
     ):
         hooks_cli_mod.run_detached_diary_checkpoint(str(payload_path))
-    ingest.assert_called_once()
+    return ingest
 
 
 _HUB_FILED = (True, {"success": True, "entry_id": "e1"})
@@ -840,9 +889,59 @@ def test_checkpoint_child_leaves_markers_when_nothing_succeeded(tmp_path):
 
 def test_checkpoint_children_completing_out_of_order_keep_the_newer_markers(tmp_path):
     _run_checkpoint_child(tmp_path, hub_result=_HUB_FILED, ingest_ok=True, exchange_count=45)
-    _run_checkpoint_child(tmp_path, hub_result=_HUB_FILED, ingest_ok=True, exchange_count=30)
+    late = _run_checkpoint_child(tmp_path, hub_result=_HUB_FILED, ingest_ok=True, exchange_count=30)
+    late.assert_not_called()  # the mine for this interval is already in flight
     assert (tmp_path / "child_last_save").read_text(encoding="utf-8") == "45"
     assert (tmp_path / "child_last_ingest").read_text(encoding="utf-8") == "45"
+
+
+def test_late_checkpoint_child_does_not_re_mine_what_the_foreground_dispatched(tmp_path):
+    """A Stop at mark 15 queues a child; a later Stop at mark 15 finds it still
+    running, mines inline and records the ingest marker. The child must
+    re-check that marker instead of trusting the payload it was queued with."""
+    (tmp_path / "child_last_ingest").write_text("15", encoding="utf-8")
+    ingest = _run_checkpoint_child(
+        tmp_path, hub_result=_HUB_FILED, ingest_ok=True, exchange_count=15
+    )
+    ingest.assert_not_called()
+
+
+def test_ingest_claim_is_atomic_between_foreground_and_child(tmp_path):
+    """Two dispatchers for the same mark: the second waits for the first to
+    record its mine, then skips. A check-then-dispatch without the marker lock
+    lets both through."""
+    import threading
+
+    first_dispatching = threading.Event()
+    release_first = threading.Event()
+    calls = []
+
+    def slow_ingest(path):
+        calls.append(threading.current_thread().name)
+        if threading.current_thread().name == "first":
+            first_dispatching.set()
+            release_first.wait(5)
+        return True
+
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._ingest_transcript", side_effect=slow_ingest),
+    ):
+        first = threading.Thread(
+            target=hooks_cli_mod._ingest_if_due, args=("s", 15, "t.jsonl"), name="first"
+        )
+        second = threading.Thread(
+            target=hooks_cli_mod._ingest_if_due, args=("s", 15, "t.jsonl"), name="second"
+        )
+        first.start()
+        assert first_dispatching.wait(5)
+        second.start()
+        second.join(0.3)
+        release_first.set()
+        first.join(5)
+        second.join(5)
+    assert calls == ["first"]
+    assert (tmp_path / "s_last_ingest").read_text(encoding="utf-8") == "15"
 
 
 def test_session_end_cleanup_drops_the_ingest_marker(tmp_path):

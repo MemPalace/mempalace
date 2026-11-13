@@ -702,7 +702,7 @@ def _submit_daemon_job(
     kind: str,
     payload: dict,
     *,
-    dedupe_key: str = None,
+    dedupe_key: Optional[str] = None,
     priority: int = 0,
     wait: bool = False,
     timeout: float = 60.0,
@@ -1060,10 +1060,17 @@ def run_detached_diary_checkpoint(payload_path: str) -> None:
             return
         with _hook_write_routing_context():
             transcript = payload.get("ingest_transcript")
-            if isinstance(transcript, str) and transcript and _ingest_transcript(transcript):
-                # Ingest progress has its own marker. The save marker moves only
-                # for a confirmed diary, so a failed one is retried next Stop.
-                _advance_payload_save_marker(payload, "last_ingest")
+            if isinstance(transcript, str) and transcript:
+                # Ingest progress has its own marker, re-checked here: the
+                # foreground may have mined this mark since the payload was
+                # queued. The save marker moves only for a confirmed diary.
+                exchange_count = payload.get("exchange_count")
+                if isinstance(exchange_count, int) and not isinstance(exchange_count, bool):
+                    _ingest_if_due(
+                        str(payload.get("session_id") or "unknown"), exchange_count, transcript
+                    )
+                else:
+                    _ingest_transcript(transcript)
             _maybe_auto_ingest()
     except SystemExit as exc:
         exit_code = (
@@ -1124,17 +1131,16 @@ def _diary_write_in_process(arguments: dict) -> dict:
     return result
 
 
-def _advance_save_marker(session_id: str, exchange_count, kind: str = "last_save") -> None:
-    """Move one of the Stop hook's per-session markers forward to ``exchange_count``.
+def _advance_save_marker(session_id: str, exchange_count) -> None:
+    """Move the Stop hook's save marker forward to ``exchange_count``.
 
-    ``last_save`` acknowledges a persisted diary checkpoint; ``last_ingest``
-    records a transcript mine put in flight. Never moves a marker back: a
-    checkpoint child that finishes after a newer Stop would otherwise re-arm
-    the work.
+    The save marker acknowledges a persisted diary checkpoint. Never moves it
+    back: a checkpoint child that finishes after a newer Stop would otherwise
+    re-arm a save.
     """
     if not isinstance(exchange_count, int) or isinstance(exchange_count, bool):
         return
-    marker = STATE_DIR / f"{_sanitize_session_id(session_id)}_{kind}"
+    marker = STATE_DIR / f"{_sanitize_session_id(session_id)}_last_save"
     try:
         with _save_marker_lock(marker):
             if _read_save_marker(marker) >= exchange_count:
@@ -1171,6 +1177,25 @@ def _save_marker_lock(marker: Path):
             yield
 
 
+def _ingest_if_due(session_id: str, exchange_count: int, transcript_path: str) -> None:
+    """Mine the transcript unless a mine for this interval is already in flight.
+
+    The Stop hook and a queued checkpoint child can both reach the same mark,
+    so the check, the dispatch and ``{session_id}_last_ingest`` happen under
+    one lock: whoever comes second sees the mark recorded and skips.
+    """
+    marker = STATE_DIR / f"{_sanitize_session_id(session_id)}_last_ingest"
+    try:
+        with _save_marker_lock(marker):
+            if exchange_count - _read_save_marker(marker) < SAVE_INTERVAL:
+                return
+            if _ingest_transcript(transcript_path):
+                marker.write_text(str(exchange_count), encoding="utf-8")
+    except OSError:
+        # Lock or marker write failed: the next save-due Stop tries again.
+        pass
+
+
 def _read_save_marker(marker: Path) -> int:
     """The exchange count a save marker holds, or 0 when it is missing or unreadable."""
     try:
@@ -1179,10 +1204,8 @@ def _read_save_marker(marker: Path) -> int:
         return 0
 
 
-def _advance_payload_save_marker(payload: dict, kind: str = "last_save") -> None:
-    _advance_save_marker(
-        str(payload.get("session_id") or "unknown"), payload.get("exchange_count"), kind
-    )
+def _advance_payload_save_marker(payload: dict) -> None:
+    _advance_save_marker(str(payload.get("session_id") or "unknown"), payload.get("exchange_count"))
 
 
 def _apply_diary_checkpoint(payload: dict) -> bool:
@@ -1258,8 +1281,8 @@ def _save_diary_direct(
     child (``run_detached_diary_checkpoint``) and returns immediately with
     ``checkpoint_queued`` and ``drawers_filed`` 0. The child files the drawer
     and writes the ack and the save marker on a confirmed write. It then runs
-    the transcript mine (when ``ingest``), advancing the ingest marker, and the
-    project mines, so the caller must not start them itself.
+    the transcript mine (when ``ingest`` and the ingest marker still shows it
+    due) and the project mines, so the caller must not start them itself.
 
     The entry is filed under `agent_name` so the agent that later calls
     `mempalace_diary_read(agent_name=...)` discovers it. If `wing` is
@@ -1308,9 +1331,13 @@ def _save_diary_direct(
         if routing.use_daemon:
             from .daemon import DaemonWaitTimeout
 
-            # A timed-out or deferred checkpoint is still filed later, and the
-            # save marker stays put until it is, so a retry joins the pending job.
-            diary_key = f"hook:diary:{_sanitize_session_id(session_id)}"
+            # A timed-out or deferred checkpoint is still filed later, so a retry
+            # for the same mark joins it. A newer mark files its own content.
+            diary_key = (
+                f"hook:diary:{_sanitize_session_id(session_id)}:{exchange_count}"
+                if isinstance(exchange_count, int) and not isinstance(exchange_count, bool)
+                else None
+            )
             daemon_args = {
                 "agent_name": agent_name,
                 "entry": entry,
@@ -1764,8 +1791,8 @@ def hook_stop(data: dict, harness: str):
                     )
                 queued = result.get("checkpoint_queued", False)
                 if not queued:
-                    if transcript_path and ingest_due and _ingest_transcript(transcript_path):
-                        _advance_save_marker(session_id, exchange_count, "last_ingest")
+                    if transcript_path and ingest_due:
+                        _ingest_if_due(session_id, exchange_count, transcript_path)
                     _maybe_auto_ingest()
                 # The save marker acknowledges a filed drawer only. A queued
                 # checkpoint's child advances both markers itself.
