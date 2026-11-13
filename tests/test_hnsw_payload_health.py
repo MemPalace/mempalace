@@ -1,6 +1,8 @@
 import os
 from pathlib import Path
 
+import pytest
+
 from mempalace.backends.chroma import (
     _CORRUPT_SUFFIX,
     _DRIFT_SUFFIX,
@@ -9,6 +11,8 @@ from mempalace.backends.chroma import (
     _segment_appears_healthy,
     quarantine_stale_hnsw,
 )
+
+pytestmark = pytest.mark.usefixtures("synthetic_hnsw_without_holders")
 
 
 def _write_segment(

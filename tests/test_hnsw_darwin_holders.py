@@ -1,4 +1,4 @@
-"""Portable coverage for Darwin's quarantine ownership check."""
+"""macOS preserves unsafe indexes when holder absence cannot be established."""
 
 import subprocess
 import sys
@@ -22,69 +22,56 @@ def _invalid_segment(tmp_path):
 @pytest.mark.parametrize(
     "quarantine", [chroma.quarantine_invalid_hnsw_metadata, chroma.quarantine_stale_hnsw]
 )
-def test_darwin_quarantine_retains_holder_and_retries_after_release(
+def test_darwin_preserves_unsafe_segment_without_holder_absence_proof(
     tmp_path, monkeypatch, quarantine
 ):
     segment = _invalid_segment(tmp_path)
-    monkeypatch.setattr(chroma, "sys", SimpleNamespace(platform="darwin"), raising=False)
-    results = iter(
-        [
-            subprocess.CompletedProcess([], 0, "p123\n", ""),
-            subprocess.CompletedProcess([], 1, "", ""),
-        ]
-    )
-    calls = []
-
-    def lsof(arguments, **kwargs):
-        calls.append((arguments, kwargs))
-        return next(results)
-
-    monkeypatch.setattr(subprocess, "run", lsof)
+    monkeypatch.setattr(chroma, "sys", SimpleNamespace(platform="darwin"))
+    # Even a no-holder result cannot account for invisible descriptor-free mappings.
+    monkeypatch.setattr(chroma, "_segment_holder_pid", lambda _segment: None)
 
     assert quarantine(str(tmp_path)) == []
     assert segment.is_dir()
-    moved = quarantine(str(tmp_path))
-    assert len(moved) == 1
-    assert not segment.exists()
-    assert calls[0][0] == ["/usr/sbin/lsof", "-nP", "-Fp", "+d", str(segment.resolve())]
-    assert calls[0][1]["timeout"] == 5
+    with pytest.raises(chroma.HNSWQuarantineDeferredError, match="separate palace"):
+        quarantine(str(tmp_path), fail_if_held=True)
+    assert segment.is_dir()
 
 
-@pytest.mark.parametrize("held", [True, False])
-def test_pre_open_refuses_invalid_segment_until_holder_probe_is_clear(tmp_path, monkeypatch, held):
+def test_pre_open_refuses_unsafe_darwin_segment_before_loading_native_client(tmp_path, monkeypatch):
     segment = _invalid_segment(tmp_path)
     monkeypatch.setattr(chroma.ChromaBackend, "_quarantined_paths", set())
     monkeypatch.setattr(chroma, "_fix_blob_seq_ids", lambda _path: None)
     monkeypatch.setattr(chroma, "_fix_missing_collection_type", lambda _path: None)
     monkeypatch.setattr(chroma, "sys", SimpleNamespace(platform="darwin"))
-
-    def lsof(*args, **kwargs):
-        if not held:
-            raise FileNotFoundError("lsof unavailable")
-        return subprocess.CompletedProcess([], 0, "p123\n", "")
-
-    monkeypatch.setattr(subprocess, "run", lsof)
     opened = []
     monkeypatch.setattr(chroma.chromadb, "PersistentClient", lambda **kw: opened.append(kw))
 
-    with pytest.raises(chroma.HNSWQuarantineDeferredError, match="Cannot safely open HNSW"):
-        chroma.ChromaBackend.make_client(str(tmp_path))
+    for _ in range(2):
+        with pytest.raises(
+            chroma.HNSWQuarantineDeferredError, match="Original files were preserved"
+        ):
+            chroma.ChromaBackend.make_client(str(tmp_path))
     assert segment.is_dir()
     assert opened == []
     assert str(tmp_path) not in chroma.ChromaBackend._quarantined_paths
 
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess([], 1, "", "")
-    )
+
+def test_healthy_darwin_palace_does_not_require_quarantine(tmp_path, monkeypatch):
+    monkeypatch.setattr(chroma.ChromaBackend, "_quarantined_paths", set())
+    monkeypatch.setattr(chroma, "_fix_blob_seq_ids", lambda _path: None)
+    monkeypatch.setattr(chroma, "_fix_missing_collection_type", lambda _path: None)
+    monkeypatch.setattr(chroma, "sys", SimpleNamespace(platform="darwin"))
+    opened = []
+    monkeypatch.setattr(chroma.chromadb, "PersistentClient", lambda **kw: opened.append(kw))
+
     chroma.ChromaBackend.make_client(str(tmp_path))
-    assert not segment.exists()
     assert len(opened) == 1
     assert str(tmp_path) in chroma.ChromaBackend._quarantined_paths
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="requires native macOS holder inspection")
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires native macOS mappings")
 @pytest.mark.parametrize("mode", ["open", "mmap"])
-def test_native_darwin_quarantine_preserves_open_and_mapped_segment(tmp_path, mode):
+def test_native_darwin_preserves_open_and_descriptor_free_mapped_segment(tmp_path, mode):
     if mode == "mmap" and sys.version_info < (3, 13):
         pytest.skip("descriptor-free mmap requires Python 3.13's trackfd option")
     segment = _invalid_segment(tmp_path)
@@ -98,7 +85,9 @@ def test_native_darwin_quarantine_preserves_open_and_mapped_segment(tmp_path, mo
             "m=mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ, trackfd=False) "
             "if sys.argv[2]=='mmap' else None; "
             "f.close() if m is not None else None; "
-            "print('READY', flush=True); sys.stdin.readline()",
+            "print('MAPPED_CLOSED' if m is not None and f.closed else 'OPEN', flush=True); "
+            "sys.stdin.readline(); "
+            "print(m[0] if m is not None else f.read(1).hex(), flush=True)",
             str(held_file),
             mode,
         ],
@@ -108,57 +97,19 @@ def test_native_darwin_quarantine_preserves_open_and_mapped_segment(tmp_path, mo
         text=True,
     )
     try:
-        assert child.stdout.readline().strip() == "READY"
-        if mode == "mmap":
-            descriptors = subprocess.run(
-                ["/usr/sbin/lsof", "-nP", "-a", "-p", str(child.pid), "-Ff", "+d", str(segment)],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            )
-            assert not any(
-                field.startswith("f") and field[1:].isdigit()
-                for field in descriptors.stdout.splitlines()
-            )
-        assert chroma._segment_holder_pid(str(segment)) == child.pid
+        assert child.stdout.readline().strip() == ("MAPPED_CLOSED" if mode == "mmap" else "OPEN")
         assert chroma.quarantine_invalid_hnsw_metadata(str(tmp_path)) == []
+        assert chroma.quarantine_stale_hnsw(str(tmp_path)) == []
         with pytest.raises(chroma.HNSWQuarantineDeferredError):
             chroma.quarantine_invalid_hnsw_metadata(str(tmp_path), fail_if_held=True)
         assert segment.is_dir()
+        stdout, stderr = child.communicate("stop\n", timeout=10)
+        assert child.returncode == 0, stderr
+        assert stdout.strip() == ("0" if mode == "mmap" else "00")
     finally:
-        try:
-            child.communicate("stop\n", timeout=10)
-        except subprocess.TimeoutExpired:
+        if child.poll() is None:
             child.kill()
             child.communicate(timeout=10)
-    assert child.returncode == 0
-    assert len(chroma.quarantine_invalid_hnsw_metadata(str(tmp_path))) == 1
-    assert not segment.exists()
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        FileNotFoundError("lsof unavailable"),
-        subprocess.TimeoutExpired("lsof", 5),
-        subprocess.CompletedProcess([], 1, "", "permission denied"),
-        subprocess.CompletedProcess([], 2, "", ""),
-        subprocess.CompletedProcess([], 0, "unexpected output", ""),
-    ],
-)
-def test_darwin_quarantine_preserves_segment_when_probe_is_inconclusive(
-    tmp_path, monkeypatch, failure
-):
-    segment = _invalid_segment(tmp_path)
-    monkeypatch.setattr(chroma, "sys", SimpleNamespace(platform="darwin"), raising=False)
-
-    def lsof(*args, **kwargs):
-        if isinstance(failure, Exception):
-            raise failure
-        return failure
-
-    monkeypatch.setattr(subprocess, "run", lsof)
-
+    # Exiting the child still cannot prove that all other possible holders are gone.
     assert chroma.quarantine_invalid_hnsw_metadata(str(tmp_path)) == []
     assert segment.is_dir()

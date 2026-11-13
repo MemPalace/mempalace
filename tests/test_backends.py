@@ -40,6 +40,7 @@ from mempalace.backends.chroma import (
 
 # embeddinggemma-300m Matryoshka truncation (first 384 of 768 dims).
 _TEST_EMBED_DIM = 384
+pytestmark = pytest.mark.usefixtures("synthetic_hnsw_without_holders")
 
 
 class _FakeCollection:

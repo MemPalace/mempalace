@@ -9,7 +9,6 @@ import pickle
 import shlex
 import sqlite3
 import struct
-import subprocess
 import sys
 import threading
 import time
@@ -680,34 +679,9 @@ def _process_has_mapped_segment_file(proc_dir: str, segment_prefix: str) -> bool
         return False
 
 
-def _darwin_segment_holder_pid(seg_dir: str) -> Optional[int]:
-    """Check open and mapped segment files without relying on Linux's /proc."""
-    try:
-        result = subprocess.run(
-            ["/usr/sbin/lsof", "-nP", "-Fp", "+d", seg_dir],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise OSError("Could not inspect HNSW segment holders with lsof") from exc
-
-    for field in result.stdout.splitlines():
-        if field.startswith("p") and field[1:].isdigit() and int(field[1:]) > 0:
-            return int(field[1:])
-    # lsof returns 1 for a successful search with no matches. Warnings, an
-    # unexpected status or unrecognized output are not evidence of no holder.
-    if result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip():
-        return None
-    raise OSError("HNSW segment holder inspection was inconclusive")
-
-
 def _segment_holder_pid(seg_dir: str) -> Optional[int]:
-    """Return a visible holder PID, raising if Darwin's probe is inconclusive."""
+    """Return a holder PID from /proc, or None if no holder is visible."""
     resolved_seg_dir = os.path.realpath(seg_dir)
-    if sys.platform == "darwin":
-        return _darwin_segment_holder_pid(resolved_seg_dir)
     segment_prefix = f"{resolved_seg_dir}{os.sep}"
     try:
         process_names = os.listdir("/proc")
@@ -728,11 +702,18 @@ def _segment_holder_pid(seg_dir: str) -> Optional[int]:
 
 def _segment_is_held(seg_dir: str) -> bool:
     # A process with open or mapped files can keep writing into the renamed directory.
-    try:
-        holder_pid = _segment_holder_pid(seg_dir)
-    except OSError as exc:
-        logger.warning("Skipped HNSW quarantine for %s: %s.", seg_dir, exc)
+    if sys.platform == "darwin":
+        # There is no /proc, and Apple's lsof can miss descriptor-free mmap
+        # holders. No matches cannot establish that a rename is safe. Until
+        # readers participate in an exclusive recovery lease, preserve the
+        # segment and make the pre-open pass refuse the unsafe native load.
+        logger.warning(
+            "Deferred HNSW quarantine for %s: macOS cannot establish that no "
+            "mapped holders remain; automatic quarantine is unavailable.",
+            seg_dir,
+        )
         return True
+    holder_pid = _segment_holder_pid(seg_dir)
     if holder_pid is None:
         return False
 
@@ -745,17 +726,23 @@ def _segment_is_held(seg_dir: str) -> bool:
 
 
 class HNSWQuarantineDeferredError(RuntimeError):
-    """An unsafe native index cannot be quarantined until its holders are gone."""
+    """An unsafe native index cannot be quarantined safely."""
 
 
 def _quarantine_blocked_by_holder(seg_dir: str, fail_if_held: bool) -> bool:
     if not _segment_is_held(seg_dir):
         return False
     if fail_if_held:
+        if sys.platform == "darwin":
+            raise HNSWQuarantineDeferredError(
+                f"Cannot safely open HNSW segment {seg_dir}: macOS holder inspection "
+                "cannot establish safe automatic quarantine. Original files were preserved. "
+                "Close all palace clients and recover into a separate palace using "
+                "repair --mode from-sqlite --source <original-palace>."
+            )
         raise HNSWQuarantineDeferredError(
             f"Cannot safely open HNSW segment {seg_dir}: its files are held or holder "
-            "inspection is unavailable. Close other palace clients and retry; "
-            "on macOS, ensure /usr/sbin/lsof can inspect the segment."
+            "inspection is unavailable. Close other palace clients and retry."
         )
     return True
 
