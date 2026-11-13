@@ -55,7 +55,7 @@ def _strip_leaked_pythonpath_from_sys_path() -> None:
         return ""
 
     def _is_detached_venv_site_packages(resolved: str) -> bool:
-        # Detached-venv layout (#2613, Hermes PM): the host runs a standalone
+        # Detached-venv layout: the host runs a standalone
         # interpreter (``sys.executable``) and activates a *second* venv purely
         # via PYTHONPATH. That venv's site-packages is never in the running
         # interpreter's own sysconfig paths, so the set check above misses it
