@@ -802,16 +802,24 @@ def _sqlite_wing_room_counts(
         if not _has_collection(conn, collection_name):
             return None
         # Registry rows and sentinels track sources; they are not drawers.
+        # Count LOGICAL drawers, not physical rows. A chunked drawer is
+        # stored as N rows, each carrying parent_drawer_id (or legacy
+        # parent_entry_id); a plain drawer has neither. The collapse key
+        # mirrors mcp_server.tools_write._logical_parent_id: prefer the
+        # parent id, else the row's own physical id. COUNT(DISTINCT key)
+        # folds every chunk of one drawer to a single logical count.
         rows = conn.execute(
             f"""
             SELECT COALESCE(wm.string_value, CAST(wm.int_value AS TEXT),
                             CAST(wm.float_value AS TEXT), '?') AS wing,
                    COALESCE(rm.string_value, CAST(rm.int_value AS TEXT),
                             CAST(rm.float_value AS TEXT), '?') AS room,
-                   COUNT(*) AS n
+                   COUNT(DISTINCT COALESCE(pd.string_value, pe.string_value, e.embedding_id)) AS n
             {_DRAWERS_SQL}
             LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
             LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
+            LEFT JOIN embedding_metadata pd ON pd.id = e.id AND pd.key = 'parent_drawer_id'
+            LEFT JOIN embedding_metadata pe ON pe.id = e.id AND pe.key = 'parent_entry_id'
             WHERE c.name = ? AND {not_bookkeeping_sql(conn)}
             GROUP BY wing, room
             """,
@@ -848,13 +856,15 @@ def sqlite_room_wing_hall_counts(palace_path: str, collection_name: str) -> Opti
                          CAST(wm.float_value AS TEXT), '') AS wing,
                 COALESCE(hm.string_value, CAST(hm.int_value AS TEXT),
                          CAST(hm.float_value AS TEXT), '') AS hall,
-                COUNT(*) AS n,
+                COUNT(DISTINCT COALESCE(pd.string_value, pe.string_value, e.embedding_id)) AS n,
                 COALESCE(MAX(dm.string_value), '') AS last_date
             {_DRAWERS_SQL}
             LEFT JOIN embedding_metadata rm ON rm.id = e.id AND rm.key = 'room'
             LEFT JOIN embedding_metadata wm ON wm.id = e.id AND wm.key = 'wing'
             LEFT JOIN embedding_metadata hm ON hm.id = e.id AND hm.key = 'hall'
             LEFT JOIN embedding_metadata dm ON dm.id = e.id AND dm.key = 'date'
+            LEFT JOIN embedding_metadata pd ON pd.id = e.id AND pd.key = 'parent_drawer_id'
+            LEFT JOIN embedding_metadata pe ON pe.id = e.id AND pe.key = 'parent_entry_id'
             WHERE c.name = ?
             GROUP BY room, wing, hall
             """,
