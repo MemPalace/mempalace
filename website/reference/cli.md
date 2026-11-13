@@ -23,15 +23,15 @@ request.
 Scan a project directory for people, projects, and rooms, and set up the palace.
 
 ```bash
-mempalace init <dir>                 # <dir> is required
+mempalace init                       # current directory
 mempalace init <dir> --yes           # non-interactive mode
 mempalace init ~/projects/myapp      # example
-mempalace init .                     # initialize from the current directory
+mempalace init .                     # same as omitting <dir>
 ```
 
 | Option  | Description                                                                  |
 |---------|------------------------------------------------------------------------------|
-| `<dir>` | **Required.** Project directory to scan. Pass `.` for the current directory. |
+| `<dir>` | Project directory to scan. Defaults to the current directory (`.`).          |
 | `--yes` | Auto-accept all detected entities                                            |
 | `--embedding-model` | Record the embedding model in `config.json`: `embeddinggemma` (multilingual, ~300 MB download), `minilm` (English-only, ~30 MB), `embeddinggemma2` or `openai-compat` |
 
@@ -42,8 +42,7 @@ What it does:
 3. Saves detected entities to `<dir>/entities.json`
 4. Ensures the global `~/.mempalace/` config directory exists
 
-Running `mempalace init` with no argument will exit with
-`error: the following arguments are required: dir`.
+`mempalace init` with no directory uses the current directory. `mempalace init <dir>` still scans that path.
 
 ## `mempalace mine`
 

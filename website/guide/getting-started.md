@@ -41,13 +41,13 @@ Three steps: **init**, **mine**, **search**.
 
 ### 1. Initialize Your Palace
 
-`mempalace init` requires a project directory to scan. Pass a path,
-or `.` to use the current directory.
+`mempalace init` scans a project directory. With no path it uses the
+current directory.
 
 ```bash
+mempalace init
+# or an explicit path:
 mempalace init ~/projects/myapp
-# or, from inside the project:
-mempalace init .
 ```
 
 This scans your project directory and:
