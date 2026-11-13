@@ -10,8 +10,10 @@ def _print_search_results_bm25_only(
     room: str,
     n_results: int,
     stop_words: frozenset = frozenset(),
+    source_file: str = None,
     since_dt=None,
     before_dt=None,
+    json_output: bool = False,
 ) -> None:
     """CLI fallback printer for when HNSW divergence fences off vector search.
 
@@ -35,12 +37,35 @@ def _print_search_results_bm25_only(
         palace_path=palace_path,
         wing=wing,
         room=room,
+        source_file=source_file,
         n_results=n_results,
         stop_words=stop_words,
         since_dt=since_dt,
         before_dt=before_dt,
     )
     hits = result.get("results", [])
+
+    if json_output:
+        # Normalize the BM25-only response into the same shape the vector
+        # path emits so callers like staging_watcher can still parse it.
+        out = []
+        for hit in hits:
+            full_source = hit.get("source_path") or hit.get("source_file", "?")
+            out.append(
+                {
+                    "drawer_id": hit.get("drawer_id") or hit.get("_id", "?"),
+                    "source_file": full_source,
+                    "source_file_name": Path(full_source).name,
+                    "wing": hit.get("wing", "?"),
+                    "room": hit.get("room", "?"),
+                    "text": hit.get("text", ""),
+                    "distance": None,
+                    "similarity": None,
+                    "bm25_score": hit.get("bm25_score", 0.0),
+                }
+            )
+        print(json.dumps({"query": query, "results": out}, ensure_ascii=False, indent=2))
+        return
 
     print(
         "\n  NOTICE: vector search disabled — HNSW index has diverged from SQLite.\n"
@@ -53,6 +78,8 @@ def _print_search_results_bm25_only(
         print(f"  Wing: {wing}")
     if room:
         print(f"  Room: {room}")
+    if source_file:
+        print(f"  Source: {source_file}")
     print(f"{'=' * 60}\n")
 
     if not hits:
@@ -76,6 +103,93 @@ def _print_search_results_bm25_only(
         print(f"  {'-' * 56}")
 
     print()
+
+
+def _display_cli_results(
+    query: str,
+    hits: list,
+    *,
+    metric: str,
+    wing: str,
+    room: str,
+    source_file: str,
+    since: str,
+    before: str,
+    json_output: bool,
+) -> None:
+    """Print the ``search`` hit page — JSON when ``json_output``, else formatted."""
+    if not hits:
+        if json_output:
+            print(json.dumps({"query": query, "results": []}, ensure_ascii=False))
+        else:
+            print(f'\n  No results found for: "{query}"')
+        return
+
+    if json_output:
+        _emit_json_results(query, hits, metric)
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f'  Results for: "{query}"')
+    if wing:
+        print(f"  Wing: {wing}")
+    if room:
+        print(f"  Room: {room}")
+    if source_file:
+        print(f"  Source: {source_file}")
+    if since:
+        print(f"  Since: {since}")
+    if before:
+        print(f"  Before: {before}")
+    print(f"{'=' * 60}\n")
+
+    for i, hit in enumerate(hits, 1):
+        vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
+        bm25 = hit.get("bm25_score", 0.0)
+        meta = hit["metadata"]
+        source = Path(meta.get("source_file", "?")).name
+        wing_name = meta.get("wing", "?")
+        room_name = meta.get("room", "?")
+        drawer_id = hit.get("id") or meta.get("drawer_id", "?")
+        parent_drawer_id = meta.get("parent_drawer_id")
+
+        print(f"  [{i}] {wing_name} / {room_name}")
+        print(f"      Drawer: {drawer_id}")
+        if parent_drawer_id and parent_drawer_id != drawer_id:
+            print(f"      Parent drawer: {parent_drawer_id}")
+        print(f"      Source: {source}")
+        _print_also_in(hit)
+        print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
+        print()
+        # Print the verbatim text, indented
+        for line in hit["text"].strip().split("\n"):
+            print(f"      {line}")
+        print()
+        print(f"  {'-' * 56}")
+
+    print()
+
+
+def _emit_json_results(query: str, hits: list, metric: str) -> None:
+    """Print ``hits`` as a machine-readable JSON object on stdout."""
+    out = []
+    for hit in hits:
+        meta = hit["metadata"]
+        out.append(
+            {
+                "drawer_id": hit.get("id") or meta.get("drawer_id", "?"),
+                "parent_drawer_id": meta.get("parent_drawer_id"),
+                "source_file": meta.get("source_file", "?"),
+                "source_file_name": Path(meta.get("source_file", "?")).name,
+                "wing": meta.get("wing", "?"),
+                "room": meta.get("room", "?"),
+                "text": hit["text"],
+                "distance": hit["distance"],
+                "similarity": round(_distance_to_similarity(hit["distance"], metric), 3),
+                "bm25_score": hit.get("bm25_score", 0.0),
+            }
+        )
+    print(json.dumps({"query": query, "results": out}, ensure_ascii=False, indent=2))
 
 
 def _cli_hit_source(hit: dict):
@@ -139,27 +253,33 @@ def _cli_ranked_hits(
     docs = _first_or_empty(results, "documents")
     metas = _first_or_empty(results, "metadatas")
     dists = _first_or_empty(results, "distances")
+    ids = _first_or_empty(results, "ids")
+    if not ids:
+        # Backends (and test doubles) may omit ids — pad so the zip
+        # below does not collapse every hit.
+        ids = [None] * len(docs)
     fetched = len(docs)
     if window is not None:
         # Keep the whole in-window pool: the hybrid re-rank must see every
         # survivor before the display cut, or a BM25-strong drawer deep in the
         # pool could never surface.
         kept = [
-            (doc, meta, dist)
-            for doc, meta, dist in zip(docs, metas, dists)
+            (rid, doc, meta, dist)
+            for rid, doc, meta, dist in zip(ids, docs, metas, dists)
             if filed_at_in_window((meta or {}).get("filed_at"), *window)
         ]
-        docs = [k[0] for k in kept]
-        metas = [k[1] for k in kept]
-        dists = [k[2] for k in kept]
+        ids = [k[0] for k in kept]
+        docs = [k[1] for k in kept]
+        metas = [k[2] for k in kept]
+        dists = [k[3] for k in kept]
 
     # Pure-cosine retrieval on the CLI path was missing lexical matches: a
     # drawer whose text contains every query term can still score distance
     # >= 1.0 when it is a mechanical artifact (directory listing, diff, log
     # fragment). Hybridize with BM25 as `mempalace_search` does.
     hits = [
-        {"text": doc or "", "distance": float(dist), "metadata": meta or {}}
-        for doc, meta, dist in zip(docs, metas, dists)
+        {"id": rid, "text": doc or "", "distance": float(dist), "metadata": meta or {}}
+        for rid, doc, meta, dist in zip(ids, docs, metas, dists)
         if not is_bookkeeping(meta)
     ]
     # Bookkeeping rows held slots in the fetch, so the caller widens for them too.
@@ -181,18 +301,22 @@ def search(
     palace_path: str,
     wing: str = None,
     room: str = None,
+    source_file: str = None,
     n_results: int = 5,
     since: str = None,
     before: str = None,
     collection=None,
     include_media: bool = False,
     query_task: str = "search",
+    json_output: bool = False,
 ):
     """
     Search the palace. Returns verbatim drawer content.
-    Optionally filter by wing (project) or room (aspect), and/or narrow to
-    drawers whose ``filed_at`` falls in the ``[since, before)`` window —
-    same semantics as ``search_memories``/``list_drawers``.
+    Optionally filter by wing (project), room (aspect), or source_file,
+    and/or narrow to drawers whose ``filed_at`` falls in the
+    ``[since, before)`` window — same semantics as
+    ``search_memories``/``list_drawers`` (#1128/#463).
+    With json_output=True, emits a machine-readable JSON array on stdout.
     """
     if include_media or query_task != "search":
         result = search_memories(
@@ -267,8 +391,10 @@ def search(
                 room,
                 n_results,
                 stop_words=stop_words,
+                source_file=source_file,
                 since_dt=since_dt,
                 before_dt=before_dt,
+                json_output=json_output,
             )
 
         col = _open_collection_or_explain(palace_path, opener=get_collection, read_only=True)
@@ -281,7 +407,7 @@ def search(
     # creation — their similarity scores will be junk until they run repair.
     _warn_if_legacy_metric(col)
 
-    where = build_where_filter(wing, room, col=col)
+    where = build_where_filter(wing, room, source_file, col=col)
 
     metric = _metric_for_collection(col)
     fetch = _candidate_pool_size(n_results, date_window_active)
@@ -310,39 +436,14 @@ def search(
             break
         fetch = min(fetch * 4, _MAX_FOLD_POOL)
     hits = hits[:n_results]
-    if not hits:
-        print(f'\n  No results found for: "{query}"')
-        return None
-
-    print(f"\n{'=' * 60}")
-    print(f'  Results for: "{query}"')
-    if wing:
-        print(f"  Wing: {wing}")
-    if room:
-        print(f"  Room: {room}")
-    if since:
-        print(f"  Since: {since}")
-    if before:
-        print(f"  Before: {before}")
-    print(f"{'=' * 60}\n")
-
-    for i, hit in enumerate(hits, 1):
-        vec_sim = round(_distance_to_similarity(hit["distance"], metric), 3)
-        bm25 = hit.get("bm25_score", 0.0)
-        meta = hit["metadata"]
-        source = Path(meta.get("source_file", "?")).name
-        wing_name = meta.get("wing", "?")
-        room_name = meta.get("room", "?")
-
-        print(f"  [{i}] {wing_name} / {room_name}")
-        print(f"      Source: {source}")
-        _print_also_in(hit)
-        print(f"      Match:  {metric}_sim={vec_sim}  bm25={bm25}")
-        print()
-        # Print the verbatim text, indented
-        for line in hit["text"].strip().split("\n"):
-            print(f"      {line}")
-        print()
-        print(f"  {'-' * 56}")
-
-    print()
+    _display_cli_results(
+        query,
+        hits,
+        metric=metric,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        since=since,
+        before=before,
+        json_output=json_output,
+    )
