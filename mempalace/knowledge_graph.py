@@ -783,7 +783,11 @@ class KnowledgeGraph:
 
     @_sqlite_retry()
     def invalidate(self, subject: str, predicate: str, obj: str, ended: str = None):
-        """Mark a relationship as no longer valid (set valid_to date/time)."""
+        """Mark a relationship as no longer valid (set valid_to date/time).
+
+        Returns the number of active triples that were ended. ``0`` means no
+        active fact matched, so nothing changed.
+        """
         pred = predicate.lower().replace(" ", "_")
         ended = sanitize_iso_temporal(ended or date.today().isoformat(), "ended")
 
@@ -806,11 +810,12 @@ class KnowledgeGraph:
                         "an inverted interval would be invisible to every KG query"
                     )
 
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE triples SET valid_to=? "
                 "WHERE subject=? AND predicate=? AND object=? AND valid_to IS NULL",
                 (ended, sub_id, pred, obj_id),
             )
+            return int(cur.rowcount or 0)
 
     @_sqlite_retry()
     def supersede(
