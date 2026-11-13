@@ -329,6 +329,78 @@ class TestPalaceReadsDoNotStarveTheHub:
         assert search_at < names.index("m:file2:end"), "the read waited for the whole mine"
         assert names[search_at - 1].endswith(":end"), f"read ran inside a file: {names}"
 
+    def test_reader_progress_inside_cpu_phase_does_not_admit_mutation(
+        self, http_server, monkeypatch
+    ):
+        """An HTTP mine's CPU handoff permits a search, not a competing write."""
+        from mempalace.palace import mine_yield_readers_point
+
+        port, _ = http_server
+        cpu_started = threading.Event()
+        resume_cpu = threading.Event()
+        finish_mine = threading.Event()
+        read_ran = threading.Event()
+        other_write_ran = threading.Event()
+        errors = []
+
+        def in_cpu_mine(**_kwargs):
+            cpu_started.set()
+            assert resume_cpu.wait(timeout=5)
+            assert mine_yield_readers_point() is True
+            assert not other_write_ran.is_set()
+            assert finish_mine.wait(timeout=5)
+            return {"success": True}
+
+        def read(**_kwargs):
+            read_ran.set()
+            return {"query": "needle", "results": []}
+
+        def other_write(**_kwargs):
+            other_write_ran.set()
+            return {"success": True}
+
+        monkeypatch.setitem(mcp.TOOLS["mempalace_mine"], "handler", in_cpu_mine)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", read)
+        monkeypatch.setitem(mcp.TOOLS["mempalace_add_drawer"], "handler", other_write)
+
+        def call(name, args, request_id):
+            try:
+                self._call(port, name, args, req_id=request_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        mine_thread = threading.Thread(
+            target=call, args=("mempalace_mine", {"source": "project"}, 951), daemon=True
+        )
+        read_thread = threading.Thread(
+            target=call, args=("mempalace_search", {"query": "needle"}, 952), daemon=True
+        )
+        write_thread = threading.Thread(
+            target=call, args=("mempalace_add_drawer", {"text": "x"}, 953), daemon=True
+        )
+        mine_thread.start()
+        assert cpu_started.wait(timeout=5)
+        read_thread.start()
+        deadline = time.monotonic() + 5
+        while mcp._HTTP_REQUEST_LOCK._waiting_readers == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert mcp._HTTP_REQUEST_LOCK._waiting_readers > 0
+
+        write_thread.start()
+        try:
+            resume_cpu.set()
+            assert read_ran.wait(timeout=5), "a reader was not served inside hallway CPU work"
+            assert not other_write_ran.is_set(), "a competing mutation slipped into CPU work"
+        finally:
+            finish_mine.set()
+            resume_cpu.set()
+            mine_thread.join(timeout=5)
+            read_thread.join(timeout=5)
+            write_thread.join(timeout=5)
+        assert not any(t.is_alive() for t in (mine_thread, read_thread, write_thread))
+        assert other_write_ran.is_set()
+        assert not errors, errors
+
     def test_a_second_mine_waits_for_the_first(self, http_server, monkeypatch):
         port, _ = http_server
         log: list = []
@@ -740,6 +812,148 @@ class TestRWLockYield:
         self._in_thread(lambda: (lock.acquire_read(), entered.set()))
         assert not entered.wait(timeout=0.2), "writer preference was lost"
         lock.release_read()
+
+
+class TestRWLockReaderOnlyHandoff:
+    """A hallway CPU stage yields to reads but never another mutation."""
+
+    def test_queued_reader_runs_without_admitting_waiting_writer(self):
+        lock = mcp._RWLock()
+        order = []
+        lock.acquire_write()
+
+        def reader():
+            with lock.read_lock():
+                order.append("reader")
+
+        def other_writer():
+            with lock:
+                order.append("other writer")
+
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        writer_thread = threading.Thread(target=other_writer, daemon=True)
+        reader_thread.start()
+        time.sleep(0.05)
+        writer_thread.start()
+        time.sleep(0.05)
+        assert lock._waiting_readers >= 1
+        assert lock._waiting_writers >= 1
+
+        try:
+            assert lock.yield_to_waiting_readers() is True
+            order.append("mine resumed")
+            assert order == ["reader", "mine resumed"]
+            assert lock.owns_write()
+        finally:
+            lock.release_write()
+        reader_thread.join(timeout=2)
+        writer_thread.join(timeout=2)
+        assert order == ["reader", "mine resumed", "other writer"]
+
+    def test_late_reader_cannot_extend_reader_only_handoff(self):
+        """Only the readers queued before the CPU yield may enter it."""
+        lock = mcp._RWLock()
+        initial_entered = threading.Event()
+        late_started = threading.Event()
+        late_entered = threading.Event()
+        observed = []
+
+        def late_reader():
+            late_started.set()
+            with lock.read_lock():
+                late_entered.set()
+
+        late_thread = threading.Thread(target=late_reader, daemon=True)
+
+        def initial_reader():
+            with lock.read_lock():
+                initial_entered.set()
+                late_thread.start()
+                if not late_started.wait(timeout=3):
+                    observed.append("late thread never started")
+                    return
+                observed.append(late_entered.wait(timeout=0.2))
+
+        initial_thread = threading.Thread(target=initial_reader, daemon=True)
+        lock.acquire_write()
+        initial_thread.start()
+        deadline = time.monotonic() + 3
+        while lock._waiting_readers == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert lock._waiting_readers == 1, "initial reader did not queue"
+        try:
+            assert lock.yield_to_waiting_readers() is True
+            assert initial_entered.is_set()
+            assert observed == [False], "a late reader entered the frozen handoff"
+            assert not late_entered.is_set()
+            assert lock.owns_write()
+            assert lock.try_acquire_read() is False
+        finally:
+            lock.release_write()
+        initial_thread.join(timeout=3)
+        late_thread.join(timeout=3)
+        assert not initial_thread.is_alive()
+        assert not late_thread.is_alive()
+        assert late_entered.is_set()
+
+    def test_late_reader_rejected_during_frozen_handoff(self):
+        """Exercise the frozen admission interval independently of scheduling."""
+        lock = mcp._RWLock()
+        entered = threading.Event()
+        started = threading.Event()
+
+        # The writer has yielded to previously queued readers. The existing
+        # handoff must not admit a late read, even with writer preference
+        # temporarily lifted for that original cohort.
+        with lock._cond:
+            lock._readers_only_handoff = True
+            lock._readers_only_owed = {object()}
+            lock._handoff = True
+            lock._waiting_writers = 1
+
+        def late_reader():
+            started.set()
+            with lock.read_lock():
+                entered.set()
+
+        thread = threading.Thread(target=late_reader, daemon=True)
+        thread.start()
+        try:
+            assert started.wait(timeout=2)
+            assert not entered.wait(timeout=0.15)
+            assert lock.try_acquire_read() is False
+        finally:
+            with lock._cond:
+                lock._readers_only_handoff = False
+                lock._readers_only_owed = set()
+                lock._handoff = False
+                lock._waiting_writers = 0
+                lock._cond.notify_all()
+            thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert entered.is_set()
+
+    def test_no_reader_does_not_yield_to_writer(self):
+        lock = mcp._RWLock()
+        lock.acquire_write()
+        entered = threading.Event()
+
+        def other_writer():
+            with lock:
+                entered.set()
+
+        thread = threading.Thread(target=other_writer, daemon=True)
+        thread.start()
+        time.sleep(0.05)
+        try:
+            assert lock._waiting_writers >= 1
+            assert lock.yield_to_waiting_readers() is False
+            assert lock.owns_write()
+            assert not entered.is_set()
+        finally:
+            lock.release_write()
+        assert entered.wait(timeout=2)
+        thread.join(timeout=2)
 
 
 def test_healthz_ok(http_server):
