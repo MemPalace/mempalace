@@ -1,0 +1,42 @@
+# mempalace-proxy.service — systemd unit for the MCP proxy (Linux).
+#
+# Install:
+#   sudo cp deploy/proxy/mempalace-proxy.service /etc/systemd/system/
+#   sudo cp deploy/proxy/mempalace_mcp_proxy.py /usr/local/bin/
+#   sudo chmod +x /usr/local/bin/mempalace_mcp_proxy.py
+#   pip install aiohttp httpx  # or add to requirements
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mempalace-proxy
+#
+# Edit EnvironmentFile to match your setup (copy proxy.env.example).
+
+[Unit]
+Description=MemPalace MCP Streamable-HTTP Proxy
+After=network-online.target mempalace-server.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=mempalace
+Group=mempalace
+EnvironmentFile=/etc/mempalace/proxy.env
+ExecStart=/usr/local/bin/mempalace_mcp_proxy.py
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/var/lib/mempalace
+
+[Install]
+WantedBy=multi-user.target
