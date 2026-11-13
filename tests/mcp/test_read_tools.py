@@ -1491,12 +1491,8 @@ def test_public_get_rejects_same_id_scope_change_during_validation(
     monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
     monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
     monkeypatch.setattr(mcp_server, "_sqlite_logical_drawer_record", lambda _id: None)
-    monkeypatch.setattr(
-        mcp_server, "_collection_logical_drawer_record", lambda _col, _id: record
-    )
-    monkeypatch.setattr(
-        mcp_server, "_bulk_drawer_records", lambda _col, _ids: {"same-id": record}
-    )
+    monkeypatch.setattr(mcp_server, "_collection_logical_drawer_record", lambda _col, _id: record)
+    monkeypatch.setattr(mcp_server, "_bulk_drawer_records", lambda _col, _ids: {"same-id": record})
 
     assert mcp_server._public_conversation_record_visible(record, col=collection)
     collection.current = after
@@ -1506,6 +1502,4 @@ def test_public_get_rejects_same_id_scope_change_during_validation(
     assert single == {"error": "Drawer not found: same-id"}
     bulk = mcp_server.tool_get_drawers(["same-id"])
     assert bulk["errors"] == 1
-    assert bulk["results"] == [
-        {"drawer_id": "same-id", "error": "Drawer not found: same-id"}
-    ]
+    assert bulk["results"] == [{"drawer_id": "same-id", "error": "Drawer not found: same-id"}]
