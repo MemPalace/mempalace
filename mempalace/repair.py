@@ -1822,7 +1822,7 @@ def _post_rebuild_cleanup(palace_path: str, backend: "ChromaBackend", progress=p
 
 
 def _require_valid_embedding_model() -> None:
-    """Refuse a misspelled ``embedding_model`` before anything is archived or created.
+    """Validate the model and its precision before anything is archived or created.
 
     Reading the config raises :class:`~mempalace.embedding.UnknownEmbeddingModelError`
     for a near miss; without this the rebuild would archive the palace and
@@ -1830,7 +1830,9 @@ def _require_valid_embedding_model() -> None:
     """
     from .config import MempalaceConfig
 
-    _ = MempalaceConfig().embedding_model
+    config = MempalaceConfig()
+    if config.embedding_model == "embeddinggemma":
+        _ = config.embeddinggemma_variant
 
 
 def rebuild_index(
