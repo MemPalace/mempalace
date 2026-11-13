@@ -563,6 +563,7 @@ def test_stop_hook_saves_silently_at_interval(tmp_path):
         toast=False,
         agent_name="claude",
         exchange_count=SAVE_INTERVAL,
+        ingest=True,
     )
 
 
@@ -589,6 +590,7 @@ def test_stop_hook_derives_wing_from_transcript_path(tmp_path):
         toast=False,
         agent_name="claude",
         exchange_count=SAVE_INTERVAL,
+        ingest=True,
     )
 
 
@@ -651,34 +653,117 @@ def _stop_data(tmp_path):
     return {"session_id": "test", "stop_hook_active": False, "transcript_path": str(transcript)}
 
 
-def test_stop_hook_failed_diary_does_not_refire_dispatched_ingest(tmp_path):
-    """#2403 defect 4: the save marker advanced only when the diary filed,
-    while the transcript ingest ran regardless. A diary that kept failing
-    (no writable hub, local lock refused) re-fired a full transcript mine on
-    every Stop. Once the ingest is in flight the marker must advance."""
+def test_stop_hook_failed_diary_retries_without_refiring_ingest(tmp_path):
+    """#2403 defect 4: a failed diary is retried at the next Stop, but the
+    transcript mine already in flight is not re-fired. Ingest progress has
+    its own marker; the save marker waits for a confirmed diary."""
     data = _stop_data(tmp_path)
     failed = {"drawers_filed": 0, "messages_folded": 0}
 
     with (
-        patch("mempalace.hooks_cli._save_diary_direct", return_value=failed),
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=failed) as mock_save,
         patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest,
     ):
         assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
     mock_ingest.assert_called_once()
+    assert mock_save.call_args.kwargs["ingest"] is True
+    assert not (tmp_path / "test_last_save").exists()
+    assert (tmp_path / "test_last_ingest").read_text(encoding="utf-8") == str(SAVE_INTERVAL)
 
-    # Same exchange count: the marker advanced, so nothing re-fires.
+    # Same exchange count: the diary is retried, the mine is not.
     with (
         patch("mempalace.hooks_cli._save_diary_direct", return_value=failed) as mock_save,
         patch("mempalace.hooks_cli._ingest_transcript", return_value=True) as mock_ingest,
+    ):
+        assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
+    mock_save.assert_called_once()
+    assert mock_save.call_args.kwargs["ingest"] is False
+    mock_ingest.assert_not_called()
+    assert not (tmp_path / "test_last_save").exists()
+
+
+def test_stop_hook_save_marker_advances_only_after_confirmed_diary(tmp_path):
+    data = _stop_data(tmp_path)
+    failed = {"drawers_filed": 0, "messages_folded": 0}
+    filed = {"drawers_filed": 1, "messages_folded": 3, "themes": []}
+
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=failed),
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=True),
+    ):
+        _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=filed),
+        patch("mempalace.hooks_cli._ingest_transcript", return_value=True),
+    ):
+        result = _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    assert "1 checkpoint saved" in result["systemMessage"]
+    assert (tmp_path / "test_last_save").read_text(encoding="utf-8") == str(SAVE_INTERVAL)
+
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct") as mock_save,
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
     ):
         assert _capture_hook_output(hook_stop, data, state_dir=tmp_path) == {}
     mock_save.assert_not_called()
     mock_ingest.assert_not_called()
 
 
+def test_stop_hook_queued_checkpoint_leaves_both_markers_to_the_child(tmp_path):
+    data = _stop_data(tmp_path)
+    queued = {"drawers_filed": 0, "messages_folded": 3, "checkpoint_queued": True}
+    with (
+        patch("mempalace.hooks_cli._save_diary_direct", return_value=queued),
+        patch("mempalace.hooks_cli._ingest_transcript") as mock_ingest,
+    ):
+        _capture_hook_output(hook_stop, data, state_dir=tmp_path)
+    mock_ingest.assert_not_called()
+    assert not (tmp_path / "test_last_save").exists()
+    assert not (tmp_path / "test_last_ingest").exists()
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_save_diary_direct_retry_reuses_the_pending_daemon_checkpoint(tmp_path, wait):
+    """A checkpoint the daemon timed out on or deferred is still filed later.
+    The save marker stays put, so the next Stop retries; one dedupe key per
+    session makes that retry attach to the pending job instead of filing a
+    duplicate entry."""
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": "hello there"}}])
+
+    class Routing:
+        blocked = False
+        use_daemon = True
+
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._current_hook_write_routing", return_value=Routing()),
+        patch("mempalace.hooks_cli._submit_daemon_job", return_value={}) as submit,
+    ):
+        hooks_cli_mod._save_diary_direct(str(transcript), "s1", agent_name="claude", wait=wait)
+    assert submit.call_args.kwargs["dedupe_key"] == "hook:diary:s1"
+
+
+def test_save_diary_direct_queues_no_ingest_when_not_due(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(transcript, [{"message": {"role": "user", "content": "hello there"}}])
+
+    class Routing:
+        blocked = False
+        use_daemon = False
+
+    with (
+        patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
+        patch("mempalace.hooks_cli._current_hook_write_routing", return_value=Routing()),
+        patch("mempalace.hooks_cli._queue_diary_checkpoint", return_value=True) as queue,
+    ):
+        hooks_cli_mod._save_diary_direct(str(transcript), "s", agent_name="claude", ingest=False)
+    assert queue.call_args.args[0]["ingest_transcript"] == ""
+
+
 def test_stop_hook_retries_when_nothing_succeeded(tmp_path):
-    """The counterpart: diary failed AND the ingest could not be dispatched,
-    so the marker stays put and the next Stop retries the whole save."""
+    """Diary failed AND the ingest could not be dispatched: neither marker
+    moves, so the next Stop retries both."""
     data = _stop_data(tmp_path)
     failed = {"drawers_filed": 0, "messages_folded": 0}
 
@@ -697,14 +782,15 @@ def test_stop_hook_retries_when_nothing_succeeded(tmp_path):
     mock_ingest.assert_called_once()
 
 
-def _run_checkpoint_child(tmp_path, *, diary_ok, ingest_ok):
-    payload_path = tmp_path / "payload.json"
+def _run_checkpoint_child(tmp_path, *, hub_result, ingest_ok, exchange_count=30):
+    """Run the real checkpoint child; only the hub call and the mines are stubbed."""
+    payload_path = tmp_path / f"payload_{exchange_count}.json"
     payload_path.write_text(
         json.dumps(
             {
                 "entry": "CHECKPOINT:x",
                 "session_id": "child",
-                "exchange_count": 30,
+                "exchange_count": exchange_count,
                 "ingest_transcript": str(tmp_path / "t.jsonl"),
             }
         ),
@@ -712,7 +798,8 @@ def _run_checkpoint_child(tmp_path, *, diary_ok, ingest_ok):
     )
     with (
         patch("mempalace.hooks_cli.STATE_DIR", tmp_path),
-        patch("mempalace.hooks_cli._apply_diary_checkpoint", return_value=diary_ok),
+        patch("mempalace.hooks_cli.MempalaceConfig"),
+        patch("mempalace.hub_client.forward_tool_call", return_value=hub_result),
         patch("mempalace.hooks_cli._ingest_transcript", return_value=ingest_ok) as ingest,
         patch("mempalace.hooks_cli._maybe_auto_ingest"),
         patch("mempalace.miner._arm_hook_mine_exit_watchdog"),
@@ -720,20 +807,51 @@ def _run_checkpoint_child(tmp_path, *, diary_ok, ingest_ok):
     ):
         hooks_cli_mod.run_detached_diary_checkpoint(str(payload_path))
     ingest.assert_called_once()
-    return tmp_path / "child_last_save"
 
 
-def test_checkpoint_child_advances_marker_when_ingest_dispatched_after_failed_diary(tmp_path):
-    """#2403 defect 4, queued path: the checkpoint child ingests after its
-    diary write, so a failed diary with a dispatched ingest must still
-    advance the marker, or the next Stop queues another full mine."""
-    marker = _run_checkpoint_child(tmp_path, diary_ok=False, ingest_ok=True)
-    assert marker.read_text(encoding="utf-8") == "30"
+_HUB_FILED = (True, {"success": True, "entry_id": "e1"})
 
 
-def test_checkpoint_child_leaves_marker_when_nothing_succeeded(tmp_path):
-    marker = _run_checkpoint_child(tmp_path, diary_ok=False, ingest_ok=False)
-    assert not marker.exists()
+def test_checkpoint_child_failed_diary_with_ingest_in_flight_leaves_save_marker(tmp_path):
+    """A failed diary leaves the save marker put even with the child's mine in
+    flight: only the ingest marker moves, and the next Stop retries the diary."""
+    _run_checkpoint_child(tmp_path, hub_result=(True, {"success": False}), ingest_ok=True)
+    assert not (tmp_path / "child_last_save").exists()
+    assert (tmp_path / "child_last_ingest").read_text(encoding="utf-8") == "30"
+
+
+def test_checkpoint_child_unacknowledged_diary_leaves_save_marker(tmp_path):
+    """A hub that took the request but gave no answer is not a confirmed write."""
+    _run_checkpoint_child(tmp_path, hub_result=(True, None), ingest_ok=True)
+    assert not (tmp_path / "child_last_save").exists()
+
+
+def test_checkpoint_child_confirmed_diary_advances_save_marker(tmp_path):
+    _run_checkpoint_child(tmp_path, hub_result=_HUB_FILED, ingest_ok=False)
+    assert (tmp_path / "child_last_save").read_text(encoding="utf-8") == "30"
+    assert not (tmp_path / "child_last_ingest").exists()
+
+
+def test_checkpoint_child_leaves_markers_when_nothing_succeeded(tmp_path):
+    _run_checkpoint_child(tmp_path, hub_result=(True, {"success": False}), ingest_ok=False)
+    assert not (tmp_path / "child_last_save").exists()
+    assert not (tmp_path / "child_last_ingest").exists()
+
+
+def test_checkpoint_children_completing_out_of_order_keep_the_newer_markers(tmp_path):
+    _run_checkpoint_child(tmp_path, hub_result=_HUB_FILED, ingest_ok=True, exchange_count=45)
+    _run_checkpoint_child(tmp_path, hub_result=_HUB_FILED, ingest_ok=True, exchange_count=30)
+    assert (tmp_path / "child_last_save").read_text(encoding="utf-8") == "45"
+    assert (tmp_path / "child_last_ingest").read_text(encoding="utf-8") == "45"
+
+
+def test_session_end_cleanup_drops_the_ingest_marker(tmp_path):
+    (tmp_path / "s_last_save").write_text("30", encoding="utf-8")
+    (tmp_path / "s_last_ingest").write_text("30", encoding="utf-8")
+    with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+        hooks_cli_mod._clear_session_last_save("s")
+    assert not (tmp_path / "s_last_save").exists()
+    assert not (tmp_path / "s_last_ingest").exists()
 
 
 def test_ingest_transcript_reports_already_running_mine_as_dispatched(tmp_path):
