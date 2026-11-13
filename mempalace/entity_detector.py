@@ -295,6 +295,13 @@ READABLE_EXTENSIONS = {
     # PowerShell, so an AL-only repo still has files to sample.
     ".al",
     ".ps1",
+    # Mirrors miner.READABLE_EXTENSIONS: infrastructure-as-code sources, so an
+    # IaC-only repo still has files to sample (#2990).
+    ".tf",
+    ".tfvars",
+    ".hcl",
+    ".bicep",
+    ".bicepparam",
 }
 
 SKIP_DIRS = {

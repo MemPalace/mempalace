@@ -74,6 +74,9 @@ SKIP_DIRS = {
     "htmlcov",
     "target",
     ".worktrees",
+    # ``terraform init`` downloads third-party modules here as readable .tf
+    # files; it is the IaC equivalent of ``node_modules`` (#2990).
+    ".terraform",
 }
 
 _DEFAULT_BACKEND = get_backend("chroma")
