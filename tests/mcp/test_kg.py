@@ -138,13 +138,51 @@ class TestKGTools:
 
         # Caller-omitted date resolves to today's ISO date — never the
         # literal string "today" the buggy implementation used to return.
+        #
+        # This used to target ("Max", "loves", "Chess"), a fact the seeded_kg
+        # fixture never creates ("loves" is not seeded and the object is the
+        # lowercase "chess"). It passed only because invalidate reported
+        # success for an UPDATE that matched zero rows.
         implicit = tool_kg_invalidate(
             subject="Max",
-            predicate="loves",
-            object="Chess",
+            predicate="does",
+            object="chess",
         )
+        assert implicit["success"] is True, implicit
+        assert implicit["matched"] == 1
         assert implicit["ended"] != "today"
         assert implicit["ended"] == _date.today().isoformat()
+
+    def test_kg_invalidate_reports_matched_count(self, monkeypatch, config, palace_path, seeded_kg):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        result = tool_kg_invalidate(
+            subject="Max", predicate="does", object="swimming", ended="2026-04-28"
+        )
+        assert result["success"] is True
+        assert result["matched"] == 1
+        assert result["ended"] == "2026-04-28"
+
+    def test_kg_invalidate_fails_when_no_active_fact_matches(
+        self, monkeypatch, config, palace_path, seeded_kg
+    ):
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        # Unknown fact.
+        missing = tool_kg_invalidate(subject="Max", predicate="loves", object="Chess")
+        assert missing["success"] is False
+        assert missing["matched"] == 0
+        assert "no active fact matched" in missing["error"]
+        assert "ended" not in missing
+
+        # A fact that was already ended has no active row left to end.
+        first = tool_kg_invalidate(subject="Max", predicate="does", object="swimming")
+        assert first["success"] is True
+        again = tool_kg_invalidate(subject="Max", predicate="does", object="swimming")
+        assert again["success"] is False
+        assert again["matched"] == 0
 
     def test_kg_timeline(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)

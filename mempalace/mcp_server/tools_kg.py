@@ -162,6 +162,10 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     omits ``ended``, the underlying graph stamps ``date.today()`` and the
     response reflects that resolved value.
 
+    ``matched`` is the number of active facts that were ended. If no active
+    fact matches, the call fails with ``success: False`` and ``matched: 0``
+    instead of reporting a fact as ended when nothing changed.
+
     Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
     """
@@ -185,12 +189,23 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
         },
     )
 
-    _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    matched = _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    matched = int(matched or 0)
+    if matched == 0:
+        return {
+            "success": False,
+            "error": (
+                f"no active fact matched {subject!r} -> {predicate!r} -> {object!r}; "
+                "nothing was invalidated"
+            ),
+            "matched": 0,
+        }
     return _with_kg_notice(
         {
             "success": True,
             "fact": f"{subject} → {predicate} → {object}",
             "ended": resolved_ended,
+            "matched": matched,
         }
     )
 

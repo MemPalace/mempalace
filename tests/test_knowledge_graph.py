@@ -247,6 +247,35 @@ class TestInvalidation:
         assert chess[0]["current"] is False
 
 
+class TestInvalidateMatchCount:
+    def test_returns_one_when_a_fact_is_ended(self, seeded_kg):
+        assert seeded_kg.invalidate("Max", "does", "chess", ended="2026-01-01") == 1
+
+    def test_returns_zero_when_no_active_fact_matches(self, seeded_kg):
+        assert seeded_kg.invalidate("Max", "loves", "Chess", ended="2026-01-01") == 0
+        assert seeded_kg.invalidate("Nobody", "does", "chess", ended="2026-01-01") == 0
+        # Nothing changed: the real fact is still open.
+        chess = [
+            r for r in seeded_kg.query_entity("Max", direction="outgoing") if r["object"] == "chess"
+        ]
+        assert len(chess) == 1 and chess[0]["current"] is True
+
+    def test_second_invalidate_of_the_same_fact_matches_nothing(self, seeded_kg):
+        assert seeded_kg.invalidate("Max", "does", "chess", ended="2026-01-01") == 1
+        assert seeded_kg.invalidate("Max", "does", "chess", ended="2026-02-01") == 0
+
+    def test_counts_every_active_row_it_ends(self, seeded_kg):
+        conn = seeded_kg._conn()
+        with conn:
+            conn.execute(
+                "INSERT INTO triples (id, subject, predicate, object, valid_from, valid_to) "
+                "SELECT 'dup-active-row', subject, predicate, object, '2024-07-01', NULL "
+                "FROM triples WHERE predicate='does' AND valid_to IS NULL "
+                "AND valid_from='2024-06-01'"
+            )
+        assert seeded_kg.invalidate("Max", "does", "chess", ended="2026-01-01") == 2
+
+
 class TestTimeline:
     def test_timeline_all(self, seeded_kg):
         tl = seeded_kg.timeline()
