@@ -19,6 +19,7 @@ Usage:
 """
 
 import glob
+import json
 import os
 import shutil
 import tempfile
@@ -550,7 +551,10 @@ def migrate_wing_names(palace_path: str, dry_run: bool = False, confirm: bool = 
     separators), so palaces built before the separator strip keep their memories discoverable.
 
     Re-keys the ``wing`` metadata on drawers and closets in place (IDs untouched)
-    and the ``topics_by_wing`` registry, merging collisions. Idempotent.
+    and the ``topics_by_wing`` registry, merging collisions. Hallway wings/IDs
+    and tunnel endpoints/IDs follow the same map, preserving learned dynamics.
+    A pending map survives partial failures so a retry can finish the graph
+    after metadata has moved. Completed migrations are idempotent.
 
     Returns True if anything was (or, in dry-run, would be) migrated.
     """
@@ -590,8 +594,36 @@ def _migrate_wing_names_locked(
         closets = None
 
     topic_renames = _plan_topics_by_wing_renames()
+    # Keep only this migration's map, not a retroactive graph scan. Persist it
+    # before metadata moves: otherwise the next run cannot recover old names.
+    pending_path = os.path.join(palace_path, "wing-name-migration.pending.json")
+    rename_map = {}
+    required_graph_inputs = {}
+    if os.path.exists(pending_path):
+        with open(pending_path, encoding="utf-8") as f:
+            pending = json.load(f)
+        # Accept the earlier map-only journal when resuming a normal failure.
+        if isinstance(pending, dict) and "rename_map" in pending:
+            rename_map = pending["rename_map"]
+            required_graph_inputs = pending.get("required_graph_inputs", {})
+        else:
+            rename_map = pending
+        if not isinstance(rename_map, dict) or any(
+            not isinstance(old, str) or _normalized_wing_target(old) != new
+            for old, new in rename_map.items()
+        ):
+            raise ValueError(f"Invalid pending wing-name migration map: {pending_path}")
+        if not isinstance(required_graph_inputs, dict) or any(
+            name not in ("hallway", "tunnel") or not isinstance(required, bool)
+            for name, required in required_graph_inputs.items()
+        ):
+            raise ValueError(f"Invalid pending graph input expectations: {pending_path}")
+        print("  Resuming an interrupted wing-name migration.")
+    rename_map.update({old: new for old, new in d_summary})
+    rename_map.update({old: new for old, new in c_summary})
+    rename_map.update(topic_renames)
 
-    if not d_updates and not c_updates and not topic_renames:
+    if not d_updates and not c_updates and not rename_map:
         print("  All wing names are already normalized -- nothing to migrate.")
         return False
 
@@ -607,6 +639,7 @@ def _migrate_wing_names_locked(
     if topic_renames:
         print(f"    topics_by_wing: {len(topic_renames)} key(s) re-keyed")
 
+    print(f"    Graph wings follow {len(rename_map)} rename(s).")
     if dry_run:
         print("\n  DRY RUN -- no changes made.\n")
         return True
@@ -620,15 +653,50 @@ def _migrate_wing_names_locked(
             print("  Aborted.")
             return False
 
+    from .hallways import _has_hallway_input, rekey_hallway_wings
+    from .palace_graph import rekey_tunnel_wings
+
+    graph_config = MempalaceConfig(palace_path=palace_path)
+    graph_inputs = {
+        "hallway": _has_hallway_input(graph_config),
+        "tunnel": os.path.exists(graph_config.tunnel_file),
+    }
+    # Record expected input before any strict graph read can quarantine it,
+    # including a process exit before that read's exception is caught below.
+    required_graph_inputs = {
+        name: required_graph_inputs.get(name, False) or present
+        for name, present in graph_inputs.items()
+    }
+    atomic_write_json(
+        pending_path,
+        {"rename_map": rename_map, "required_graph_inputs": required_graph_inputs},
+    )
     _apply_wing_updates(drawers, d_updates)
     if closets is not None and c_updates:
         _apply_wing_updates(closets, c_updates)
     _apply_topics_by_wing_renames(topic_renames)
+
+    graph_counts = {}
+    for name, rekey in (("hallway", rekey_hallway_wings), ("tunnel", rekey_tunnel_wings)):
+        try:
+            if required_graph_inputs[name] and not graph_inputs[name]:
+                raise OSError("expected graph input is missing; repair and restore it before retry")
+            graph_counts[name] = rekey(rename_map, config=graph_config)
+        except Exception as exc:
+            print(
+                f"  WARNING: {name} re-key failed ({exc}). Metadata changes are not rolled back; "
+                "graph migration is incomplete. Restore any corrupt graph file from its kept "
+                "copy after repairing it, then re-run migrate-wings with the same palace. "
+                f"The rename map is retained at {pending_path}."
+            )
+    if len(graph_counts) == 2:
+        os.unlink(pending_path)
 
     parts = [f"{len(d_updates)} drawer(s)"]
     if c_updates:
         parts.append(f"{len(c_updates)} closet(s)")
     if topic_renames:
         parts.append(f"{len(topic_renames)} topic key(s)")
+    parts.extend(f"{count} {name}(s)" for name, count in graph_counts.items())
     print(f"\n  Migrated {', '.join(parts)}.\n")
     return True
