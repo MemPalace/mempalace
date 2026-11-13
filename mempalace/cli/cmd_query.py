@@ -34,6 +34,7 @@ def cmd_search(args):
             n_results=args.results,
             since=args.since,
             before=args.before,
+            expand_wings=getattr(args, "expand_wings", False),
             **experimental,
         )
     except SearchError:
