@@ -129,6 +129,8 @@ behavior. `mempalace hook run` owns that:
 - **`MEMPAL_PYTHON`** — Interpreter used by every hook wrapper, legacy and plugin. Resolution (`mempal_hook_run.sh`): `$MEMPAL_PYTHON`, then `mempalace` on `PATH`, then `python3`, then `python`, taking the first that can import mempalace. When none can, the legacy hooks print `{}` and exit 0; the Claude Code and Codex plugin hooks exit 1 so the harness reports the failure.
 - **`MEMPAL_VERBOSE`** — No longer read by the legacy Stop wrapper. To have the Stop hook block and ask the AI to save instead of saving silently, set `hooks.silent_save` to `false` in `~/.mempalace/config.json`.
 
+- **`MEMPALACE_HOOK_REMOTE_URL`** / **`MEMPALACE_HOOK_REMOTE_TOKEN`** — Send the hook's diary checkpoints to a remote server instead of the local palace. Nothing is written locally in this mode, and mining is skipped. See [Remote / Team Server](../website/guide/remote-server.md#_5-save-hooks-on-client-machines).
+
 ### Disabling Auto-Save (Silent Mode)
 
 To keep hooks installed but disable auto-save blocking entirely, set `hooks.auto_save` to `false` in your config:
