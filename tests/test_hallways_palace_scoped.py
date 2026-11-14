@@ -244,7 +244,9 @@ class TestSQLiteOnlyLegacyUpgrade:
 
         monkeypatch.setattr(hallways_mod, "_get_hallway_db", lambda *a, **kw: str(keyed_db))
         monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(keyed_json))
-        monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(palace_parent / "hallways.json"))
+        monkeypatch.setattr(
+            hallways_mod, "_legacy_hallway_file", lambda: str(palace_parent / "hallways.json")
+        )
         # The legacy DB is derived from the legacy JSON's directory.
         monkeypatch.setattr(hallways_mod, "_legacy_hallway_db", lambda: str(legacy_db))
 
@@ -282,7 +284,15 @@ class TestSQLiteOnlyLegacyUpgrade:
         conn.execute(
             "INSERT INTO hallways (id, wing, entity_a, entity_b, co_occurrence_count, signature, record) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("d", "w", "A", "B", 1, "sig", '{"id":"d","wing":"w","entity_a":"A","entity_b":"B","co_occurrence_count":1}'),
+            (
+                "d",
+                "w",
+                "A",
+                "B",
+                1,
+                "sig",
+                '{"id":"d","wing":"w","entity_a":"A","entity_b":"B","co_occurrence_count":1}',
+            ),
         )
         conn.commit()
         conn.close()
@@ -312,8 +322,14 @@ class TestSQLiteOnlyLegacyUpgrade:
         """
         same = tmp_path / "hallways.sqlite3"
         monkeypatch.setattr(hallways_mod, "_get_hallway_db", lambda *a, **kw: str(same))
-        monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(same)[:-len(".sqlite3")] + ".json")
-        monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(same)[:-len(".sqlite3")] + ".json")
+        monkeypatch.setattr(
+            hallways_mod,
+            "_get_hallway_file",
+            lambda *a, **kw: str(same)[: -len(".sqlite3")] + ".json",
+        )
+        monkeypatch.setattr(
+            hallways_mod, "_legacy_hallway_file", lambda: str(same)[: -len(".sqlite3")] + ".json"
+        )
         monkeypatch.setattr(hallways_mod, "_legacy_hallway_db", lambda: str(same))
 
         with caplog.at_level(logging.WARNING, logger="mempalace"):

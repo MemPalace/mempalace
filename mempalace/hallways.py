@@ -380,10 +380,9 @@ def _import_legacy_db_once(config=None) -> int:
     legacy_json = _legacy_hallway_file()
     current_json = _get_hallway_file(config)
     current_json_present = os.path.exists(current_json)
-    legacy_json_present = (
-        os.path.exists(legacy_json)
-        and os.path.abspath(legacy_json) != os.path.abspath(current_json)
-    )
+    legacy_json_present = os.path.exists(legacy_json) and os.path.abspath(
+        legacy_json
+    ) != os.path.abspath(current_json)
 
     if current_json_present:
         # A JSON is present at the configured path, so the JSON-fallback path
@@ -430,9 +429,7 @@ def _import_legacy_db_once(config=None) -> int:
                 " FROM hallways ORDER BY rowid"
             ).fetchall()
     except sqlite3.Error:
-        logger.warning(
-            "hallways: legacy store %s could not be read; leaving it in place", legacy
-        )
+        logger.warning("hallways: legacy store %s could not be read; leaving it in place", legacy)
         logger.debug("hallways: legacy store open failed", exc_info=True)
         return 0
     finally:
