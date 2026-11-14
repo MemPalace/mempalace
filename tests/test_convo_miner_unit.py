@@ -18,6 +18,29 @@ from mempalace.convo_miner import (
 from mempalace.palace import _source_file_delete_ids, file_already_mined
 
 
+def test_normalization_failure_remains_retryable_without_registry_sentinel(tmp_path, monkeypatch):
+    """A read error is not a successfully empty source."""
+    import mempalace.convo_miner as convo_mod
+
+    source = tmp_path / "session.jsonl"
+    source.write_text('{"type":"future_format"}\n', encoding="utf-8")
+
+    def fail_read(*_args, **_kwargs):
+        raise IOError("injected transient read failure")
+
+    def should_not_register(*_args, **_kwargs):
+        pytest.fail("an unreadable source must not be registered as already mined")
+
+    monkeypatch.setattr(convo_mod, "normalize_conversations_with_mtime", fail_read)
+    monkeypatch.setattr(convo_mod, "_register_file", should_not_register)
+    assert (
+        convo_mod._normalize_convo_conversations(
+            source, str(source), object(), "wing", "agent", "exchange", False
+        )
+        is None
+    )
+
+
 class TestChunkExchanges:
     def test_exchange_chunking(self):
         content = (
