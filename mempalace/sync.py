@@ -27,6 +27,7 @@ from .palace import (
     get_collection,
     mine_palace_lock,
 )
+from .retention import is_preserved
 from .source_identity import directory_identity
 
 logger = logging.getLogger(__name__)
@@ -41,11 +42,13 @@ class SyncReport(TypedDict):
     unresolved: int
     no_source: int
     out_of_scope: int
+    preserved: int
     removed_drawers: int
     removed_closets: int
     dry_run: bool
     by_source: dict[str, int]
     unresolved_by_source: dict[str, int]
+    preserved_by_source: dict[str, int]
 
 
 def _resolve_project_root(source_file: Path, project_roots: list) -> Optional[Path]:
@@ -713,7 +716,10 @@ def sync_palace(
     Returns a SyncReport with bucket counts. Dry-run by default; pass
     dry_run=False to actually delete drawers and matching closets.
 
-    Only ``gitignored`` and ``missing`` are removed. A source file this
+    Only ``gitignored`` and ``missing`` are removed, and only drawers that
+    index a file. A conversation, sweep, diary or manual drawer is memory the
+    palace is the only copy of (:mod:`mempalace.retention`): when its source
+    is ignored or gone it is counted as ``preserved`` and kept. A source file this
     could not establish as deleted, or as ignored by a rule of the directory
     it was mined from, lands in ``unresolved`` and is counted, printed and
     kept: an unmounted volume must not be read as a deletion, and a volume's
@@ -803,8 +809,10 @@ def sync_palace(
         "unresolved": 0,
         "no_source": 0,
         "out_of_scope": 0,
+        "preserved": 0,
     }
     by_source: dict = defaultdict(int)
+    preserved_by_source: dict = defaultdict(int)
     unresolved_by_source: dict = defaultdict(int)
     removable_ids: list = []
     removable_sources: set = set()
@@ -855,7 +863,9 @@ def sync_palace(
                     classification_cache[source_file] = (bucket, verdict_identity)
 
             if bucket == "absent":
-                not_there.append((drawer_id, source_file, meta.get("source_dir_ino")))
+                not_there.append(
+                    (drawer_id, source_file, meta.get("source_dir_ino"), is_preserved(meta))
+                )
                 continue
 
             # A registry row is kept without the file being looked at, so it
@@ -874,6 +884,11 @@ def sync_palace(
                 meta.get("source_dir_ino"), verdict_identity
             ):
                 bucket = "unresolved"
+            # A conversation, diary or manual drawer is memory, not an index
+            # of the file: an ignore rule is no reason to forget it.
+            if bucket == "gitignored" and is_preserved(meta):
+                bucket = "preserved"
+                preserved_by_source[source_file] += 1
 
             counts[bucket] += 1
             if bucket == "unresolved":
@@ -909,7 +924,7 @@ def sync_palace(
         # that flaps between them is not covered by anything here.
         settled: dict = {}
         identity_now: dict = {}
-        for drawer_id, source_file, source_dir_ino in not_there:
+        for drawer_id, source_file, source_dir_ino, preserved in not_there:
             # ``absent`` is only reachable through a source_file that is a
             # non-empty absolute path, so nothing here guards against a
             # missing one, the same way the removal below does not.
@@ -945,6 +960,11 @@ def sync_palace(
             established = settled[source_file] and _mined_directory_still_answers(
                 source_dir_ino, identity_now[source_file]
             )
+            if established and preserved:
+                # The transcript or diary file is gone; what was said is not.
+                counts["preserved"] += 1
+                preserved_by_source[source_file] += 1
+                continue
             counts["missing" if established else "unresolved"] += 1
             if established:
                 removable_ids.append(drawer_id)
@@ -960,6 +980,7 @@ def sync_palace(
             "dry_run": dry_run,
             "by_source": dict(by_source),
             "unresolved_by_source": dict(unresolved_by_source),
+            "preserved_by_source": dict(preserved_by_source),
         }
 
         if dry_run or not removable_ids:

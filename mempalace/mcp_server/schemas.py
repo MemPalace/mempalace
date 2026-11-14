@@ -462,7 +462,7 @@ TOOLS = {
         "handler": tool_checkpoint,
     },
     "mempalace_delete_drawer": {
-        "description": "Delete a drawer by ID. Irreversible. Its earlier revisions in drawer_revisions.jsonl are removed too.",
+        "description": "Delete a drawer by ID. Irreversible. Its earlier revisions in drawer_revisions.jsonl are removed too, except text a re-mine journaled for that position, which stays until its source is deleted with mempalace_delete_by_source.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -484,7 +484,8 @@ TOOLS = {
             "`deleted`/`errors` totals, including a one-ID call. An empty "
             "list, a non-list, or more than 500 IDs is rejected with `error` "
             "and deletes nothing. Each deleted drawer's earlier revisions are "
-            "removed too."
+            "removed too, except re-mine history, which goes with its source "
+            "(mempalace_delete_by_source)."
         ),
         "input_schema": {
             "type": "object",
@@ -684,7 +685,7 @@ TOOLS = {
         "handler": tool_list_drawers,
     },
     "mempalace_update_drawer": {
-        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. The replaced text is kept verbatim in the palace's drawer_revisions.jsonl until the drawer is deleted.",
+        "description": "Update an existing drawer's content and/or metadata (wing, room). Fetches existing drawer first; returns error if not found. The replaced text is kept verbatim in the palace's drawer_revisions.jsonl until the drawer or its source is deleted.",
         "input_schema": {
             "type": "object",
             "properties": {

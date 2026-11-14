@@ -140,15 +140,35 @@ def test_project_remine_of_a_file_cut_below_the_minimum_keeps_its_drawers(tmp_pa
     assert sorted(doc for doc, _ in project.rows()) == before
 
 
-def test_project_remine_replaces_every_drawer_for_the_path(tmp_path):
-    """The project miner's purge scope is the whole path, whatever filed it."""
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        {"ingest_mode": "convos", "extract_mode": "exchange"},
+        {"ingest_mode": "sweep"},
+        {"source_session": "daily_diary"},
+        {"id_recipe": "v3", "added_by": "mcp"},
+        {},
+    ],
+    ids=["conversation", "sweep", "diary", "manual", "unrecognised"],
+)
+def test_project_remine_keeps_drawers_another_producer_filed_for_the_path(tmp_path, foreign):
+    """A path is not an ownership scope: the project miner replaces only its own drawers."""
     project = _Project(tmp_path)
     project.write(_paragraphs("long", 2))
     project.mine()
     get_collection(project.palace).upsert(
-        ids=["other_scope"],
-        documents=["filed by another miner"],
-        metadatas=[{"source_file": str(project.doc), "wing": "elsewhere", "chunk_index": 0}],
+        ids=["other_scope", "old_project_chunk"],
+        documents=["filed by another producer", "an old project chunk"],
+        metadatas=[
+            {"source_file": str(project.doc), "wing": "elsewhere", "chunk_index": 0, **foreign},
+            {
+                "source_file": str(project.doc),
+                "wing": "proj",
+                "chunk_index": 9,
+                "normalize_version": 1,
+                "chunk_total": 10,
+            },
+        ],
     )
 
     project.write(_paragraphs("new", 2))
@@ -156,8 +176,9 @@ def test_project_remine_replaces_every_drawer_for_the_path(tmp_path):
     project.mine()
 
     docs = [doc for doc, _ in project.rows()]
-    assert "filed by another miner" not in docs
-    assert all("new paragraph" in doc for doc in docs)
+    assert "filed by another producer" in docs
+    assert "an old project chunk" not in docs
+    assert all("new paragraph" in doc for doc in docs if doc != "filed by another producer")
 
 
 def test_project_failed_write_keeps_the_previous_drawers(tmp_path, monkeypatch):

@@ -1060,8 +1060,10 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
     Also purges the matching closets (the AAAK index layer) so deleting the
     drawers doesn't strand stale index pointers at the dead source.
 
-    Defaults to a dry run: it reports the drawer match count, the closet match
-    count, and a small sample so the caller can confirm the blast radius before
+    Defaults to a dry run: it reports the drawer match count, how many of
+    those are preserved memory rather than an index of the file
+    (``by_class``, see :mod:`mempalace.retention`), the closet match count,
+    and a small sample so the caller can confirm the blast radius before
     anything is removed. Pass ``dry_run=False`` to commit the deletion
     (irreversible).
     """
@@ -1085,6 +1087,14 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
         return {"success": False, "error": str(e)}
 
     match_count = len(metas)
+    # One path can hold a project file's index and conversation, diary or
+    # manual memory filed under the same path; say how much of each the
+    # delete would take.
+    from ..retention import retention_class
+
+    by_class = {"preserve": 0, "index_current": 0, "unknown": 0}
+    for meta in metas:
+        by_class[retention_class(_safe_meta(meta)) or "unknown"] += 1
     # Distinct (wing, room) pairs so the caller sees where the hits live.
     sample = []
     seen = set()
@@ -1106,29 +1116,52 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
 
     if dry_run:
         closet_match_count = purge_source_closets(_config.palace_path, source_file, commit=False)
+        hint = (
+            "No drawers were deleted. Re-run with dry_run=false to remove "
+            f"these {match_count} drawer(s) and {closet_match_count} index "
+            "entr(y/ies)."
+            if match_count
+            else "No drawers match this source_file."
+        )
+        if by_class["preserve"]:
+            hint += (
+                f" {by_class['preserve']} of them are conversation, diary or manual "
+                "memory, not an index of the file; a re-mine will not bring them back."
+            )
+        from ..revisions import count_source_revisions
+
+        try:
+            revision_match_count = count_source_revisions(_config.palace_path, source_file)
+        except OSError:
+            revision_match_count = None
+        if revision_match_count:
+            hint += (
+                f" The delete also erases {revision_match_count} earlier text "
+                "revision(s) recorded for this source."
+            )
         return {
             "success": True,
             "dry_run": True,
             "source_file": source_file,
             "match_count": match_count,
+            "by_class": by_class,
+            "revision_match_count": revision_match_count,
             "closet_match_count": closet_match_count,
             "sample": sample,
-            "hint": (
-                "No drawers were deleted. Re-run with dry_run=false to remove "
-                f"these {match_count} drawer(s) and {closet_match_count} index "
-                "entr(y/ies)."
-                if match_count
-                else "No drawers match this source_file."
-            ),
+            "hint": hint,
         }
 
     if match_count == 0:
-        # Idempotent: deleting an absent source is a no-op, not an error.
+        # Idempotent: deleting an absent source is a no-op, not an error. Its
+        # journaled earlier text can outlive its drawers (deleting one drawer
+        # keeps the re-mine history of its slot), so it still goes here.
+        purged = drawers_removed(_config.palace_path, revision_source=source_file)
         return {
             "success": True,
             "dry_run": False,
             "source_file": source_file,
             "deleted": 0,
+            **purged,
         }
 
     _wal_log(
@@ -1156,6 +1189,7 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
             "dry_run": False,
             "source_file": source_file,
             "deleted": match_count,
+            "by_class": by_class,
             "closets_deleted": closets_deleted,
             **purged,
         }
