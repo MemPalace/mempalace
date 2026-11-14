@@ -1093,6 +1093,9 @@ def test_docker_host_is_resolved_not_trusted(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
     assert endpoint_is_local("http://host.docker.internal:11434")
     # Outside Docker the same name can resolve anywhere.
+    import mempalace.llm_client as llm_client
+
+    llm_client._clear_resolve_cache()
     answers["host.docker.internal"] = "8.8.8.8"
     assert not endpoint_is_local("http://host.docker.internal:11434")
 
