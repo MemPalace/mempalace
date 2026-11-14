@@ -149,6 +149,10 @@ export MEMPALACE_HOOKS_AUTO_SAVE=false
 
 When disabled, both the stop hook and precompact hook pass through without blocking. You can still save manually with `mempalace mine <dir> --mode convos`.
 
+### Checkpoints Without the Transcript Mine
+
+The hooks do two things: file a short diary checkpoint, and mine the whole session transcript verbatim, tool output included. To keep the checkpoints but skip the transcript mine, set `hooks.mine_transcript` to `false` (or `MEMPALACE_HOOKS_MINE_TRANSCRIPT=false`). With the mine off, the precompact hook files a diary checkpoint instead, so compaction still captures the session.
+
 ### mempalace CLI
 
 The relevant commands are:

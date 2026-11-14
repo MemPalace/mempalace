@@ -965,6 +965,23 @@ class MempalaceConfig:
         return hooks.get("auto_save", True)
 
     @property
+    def hooks_mine_transcript(self):
+        """Whether the hooks mine the raw session transcript into the palace.
+
+        Separate from ``hooks_auto_save``, which also gates the diary
+        checkpoint. The checkpoint holds the last prompts, truncated; the
+        transcript mine files the whole session verbatim, tool output
+        included. Set False to keep checkpoints without that archive.
+        """
+        flag = env_flag("MEMPALACE_HOOKS_MINE_TRANSCRIPT")
+        if flag is not None:
+            return flag
+        hooks = self._file_config.get("hooks", {})
+        if not isinstance(hooks, dict):
+            return True
+        return hooks.get("mine_transcript", True)
+
+    @property
     def convo_spellcheck(self):
         """Whether the conversation miner spell-corrects user turns. Off by default.
 
