@@ -590,6 +590,7 @@ def _register_file(
             extract_mode="format",
             prune=empty,
             aaak_col=aaak_col,
+            owner="format",
         )
 
 
@@ -688,7 +689,12 @@ def _file_chunks_locked(
             drawer_id = make_drawer_id_from_chunk(wing, room, source_file, chunk["chunk_index"])
             drawers.append((drawer_id, text, meta))
         drawers_added = write_file_drawers(
-            collection, source_file, drawers, extract_mode="format", aaak_col=aaak_col
+            collection,
+            source_file,
+            drawers,
+            extract_mode="format",
+            aaak_col=aaak_col,
+            owner="format",
         )
     return drawers_added, False
 

@@ -163,8 +163,13 @@ def file_already_mined(
     source_file: str,
     check_mtime: bool = False,
     extract_mode: Optional[str] = None,
+    owner: Optional[str] = None,
 ) -> bool:
     """Check if a file has already been filed in the palace.
+
+    ``owner`` (see :mod:`mempalace.retention`) counts only the drawers that
+    miner filed: a conversation or format drawer stored under the same path
+    is not proof the project miner indexed the file.
 
     Returns False (so the file gets re-mined) when:
       - no drawers exist for this source_file
@@ -218,6 +223,8 @@ def file_already_mined(
     groups: dict = {}
     unprovable = False
     offset = 0
+    if owner is not None:
+        from ..retention import owns
     while True:
         try:
             results = collection.get(
@@ -235,6 +242,8 @@ def file_already_mined(
         for meta in results.get("metadatas") or []:
             meta = coerce_metadata_types(meta or {})
             if extract_mode is not None and not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            if owner is not None and not owns(owner, meta):
                 continue
             if not _is_comparable(meta, extract_mode):
                 unprovable = True
@@ -381,8 +390,19 @@ def prefetch_mined_set(
     return mined
 
 
-# The keys file_already_mined() reads when called without an extract_mode.
-_PROJECT_MINED_KEYS = ("source_file", "source_mtime", "chunk_total", "normalize_version")
+# The keys file_already_mined() reads for the project miner, including the
+# ones mempalace.retention needs to tell its drawers from another producer's.
+_PROJECT_MINED_KEYS = (
+    "source_file",
+    "source_mtime",
+    "chunk_total",
+    "normalize_version",
+    "ingest_mode",
+    "source_session",
+    "type",
+    "adapter_name",
+    "id_recipe",
+)
 
 
 def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tuple]]:
@@ -427,12 +447,16 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
     groups: dict[str, dict] = {}
     unprovable: set = set()
     from ..backends.chroma_sqlite import MetadataRecoveryPending
+    from ..retention import owns
 
     try:
         for meta in rows:
             meta = coerce_metadata_types(meta or {})
             src = meta.get("source_file")
             if src not in wanted or src in unprovable:
+                continue
+            if not owns("project", meta):
+                # file_already_mined(owner="project") does not count it either.
                 continue
             if not _is_comparable(meta) or not _is_plain_number(meta.get("normalize_version", 1)):
                 unprovable.add(src)

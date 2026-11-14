@@ -2003,8 +2003,12 @@ def test_process_file_reports_a_failed_stale_drawer_purge(tmp_path, monkeypatch)
             self.update_called = False
 
         def get(self, where=None, offset=0, **kwargs):
+            # One stale drawer the project miner filed earlier for this path.
+            old = {"source_file": str(source), "normalize_version": 1, "chunk_total": 1}
             if where and not offset:
-                return {"ids": ["old"], "metadatas": [{"source_file": where["source_file"]}]}
+                return {"ids": ["old"], "metadatas": [old]}
+            if kwargs.get("ids") == ["old"]:
+                return {"ids": ["old"], "documents": ["old text"], "metadatas": [old]}
             return {"ids": [], "metadatas": []}
 
         def delete(self, *args, **kwargs):
@@ -4006,9 +4010,13 @@ def test_prefetch_complete_mtimes_never_skips_a_file_the_per_file_check_would_mi
 
     fast = {name for name, path in paths.items() if _prefetched_as_mined(path, mined_mtimes)}
     per_file = {
-        name for name, path in paths.items() if file_already_mined(col, path, check_mtime=True)
+        name
+        for name, path in paths.items()
+        if file_already_mined(col, path, check_mtime=True, owner="project")
     }
-    assert fast == {"complete", "legacy", "sentinel", "two_groups", "drift"}
+    # The convo miner's registry row ("sentinel") does not prove the project
+    # miner indexed the file.
+    assert fast == {"complete", "legacy", "two_groups", "drift"}
     assert per_file == fast
 
     # Sources outside this mine's file list are not tracked.
