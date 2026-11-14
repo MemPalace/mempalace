@@ -8,6 +8,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`NORMALIZE_VERSION` is now 4,** so the next mine rebuilds conversation
+  drawers filed at v3 to drop injected skill bodies. Text that comes out the
+  same keeps its stored embedding, so that pass mostly costs reading files.
+
+### Bug Fixes
+
+- **Claude Code transcripts no longer file the body of every skill the session
+  loaded.** Running a skill makes Claude Code inject its `SKILL.md` as a user
+  message flagged `isMeta`. The miner filed it as if the user had said it, once
+  per session that loaded the skill and once per `/loop` tick that re-ran one:
+  on real palaces those copies were half or more of all exact duplicate
+  drawers, and search returned the same copy from unrelated wings. An `isMeta`
+  entry is now skipped when it is linked to the Skill tool call
+  (`sourceToolUseID`) or, for a skill started as a slash command, which carries
+  no such link, when it opens with the `Base directory for this skill:`
+  header. `isMeta` alone (peer-session messages, images, `/loop` prompts) is
+  kept.
+
 ---
 
 ## [3.12.0] — 2026-11-09
