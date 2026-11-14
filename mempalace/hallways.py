@@ -338,7 +338,7 @@ def _legacy_hallway_db() -> str:
     Mirrors :func:`_legacy_hallway_file` for the database: the pre-scoping
     store sat at ``~/.mempalace/hallways.sqlite3`` regardless of the
     configured palace_path. Kept only for one-time detection and a one-time
-    import into the keyed store (PR 2903).
+    import into the keyed store.
     """
     return os.path.splitext(_legacy_hallway_file())[0] + ".sqlite3"
 
@@ -474,7 +474,7 @@ def _load_hallways(config=None) -> list[dict]:
     the JSON until then (``[]`` if that is missing or corrupt). When the keyed
     store holds no records yet, also probes for a legacy pre-scoped
     ``hallways.sqlite3`` — independent of the JSON — and imports it if it is
-    the sole source of prior data (PR 2903).
+    the sole source of prior data.
     """
     conn = _reader(config)
     if conn is not None:
@@ -540,7 +540,7 @@ def _load_hallways_json(config=None) -> list[dict]:
             db_hint,
         )
 
-    # PR 2903: the SQLite-only legacy store is probed and (if unambiguous)
+    # The SQLite-only legacy store is probed and (if unambiguous)
     # imported by the caller (:func:`_load_hallways`) before falling back
     # here. This function stays focused on JSON detection + warning.
     return []
