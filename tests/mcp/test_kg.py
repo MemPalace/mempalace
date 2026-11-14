@@ -29,6 +29,66 @@ class TestKGTools:
         result = tool_kg_query(entity="Max")
         assert result["count"] > 0
 
+    def test_kg_query_returns_the_triple_id_and_source_file_kg_add_stored(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add, tool_kg_query
+
+        added = tool_kg_add(
+            subject="Alice",
+            predicate="works_at",
+            object="NewCo",
+            valid_from="2026-01-05",
+            source_file="session:2026-01-05-standup",
+        )
+
+        result = tool_kg_query(entity="Alice")
+
+        (fact,) = result["facts"]
+        assert fact["id"] == added["triple_id"]
+        assert fact["source_file"] == "session:2026-01-05-standup"
+        assert result["active_facts"] == [fact]
+
+    def test_kg_query_incoming_fact_returns_the_triple_id_and_source_file(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add, tool_kg_query
+
+        added = tool_kg_add(
+            subject="Alice",
+            predicate="works_at",
+            object="NewCo",
+            valid_from="2026-01-05",
+            source_file="session:2026-01-05-standup",
+        )
+
+        result = tool_kg_query(entity="NewCo", direction="incoming")
+
+        (fact,) = result["facts"]
+        assert fact["id"] == added["triple_id"]
+        assert fact["source_file"] == "session:2026-01-05-standup"
+
+    def test_kg_query_keeps_historical_facts_distinguishable_by_id(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add, tool_kg_invalidate, tool_kg_query
+
+        first = tool_kg_add(
+            subject="Alice", predicate="uses", object="Vim", valid_from="2020-01-01"
+        )
+        tool_kg_invalidate(subject="Alice", predicate="uses", object="Vim", ended="2022-01-01")
+        second = tool_kg_add(
+            subject="Alice", predicate="uses", object="Vim", valid_from="2024-01-01"
+        )
+
+        result = tool_kg_query(entity="Alice", direction="outgoing")
+
+        assert [f["id"] for f in result["historical_facts"]] == [first["triple_id"]]
+        assert [f["id"] for f in result["active_facts"]] == [second["triple_id"]]
+
     def test_kg_invalidate(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
         from mempalace.mcp_server import tool_kg_invalidate
@@ -155,6 +215,20 @@ class TestKGTools:
         assert result["total"] >= result["count"]
         assert result["offset"] == 0
         assert result["limit"] == 100
+
+    def test_kg_timeline_returns_the_triple_id_kg_add_stored(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add, tool_kg_timeline
+
+        added = tool_kg_add(
+            subject="Alice", predicate="works_at", object="NewCo", valid_from="2026-01-05"
+        )
+
+        result = tool_kg_timeline(entity="Alice")
+
+        assert [f["id"] for f in result["timeline"]] == [added["triple_id"]]
 
     def test_kg_timeline_paginates(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
