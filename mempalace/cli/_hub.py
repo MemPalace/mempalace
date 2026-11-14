@@ -208,6 +208,11 @@ def _mine_args_forwardable(args, include_ignored) -> bool:
         return False
     if getattr(args, "max_chunks_per_file", None) is not None:
         return False
+    # Extension overrides are CLI-layer config; the mempalace_mine tool has
+    # no parameters for them, so they keep the direct path rather than being
+    # silently dropped by an older hub.
+    if getattr(args, "include_extension", None) or getattr(args, "exclude_extension", None):
+        return False
     if _backend_arg(args):
         return False
     return True

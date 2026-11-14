@@ -215,6 +215,100 @@ MAX_CHUNKS_PER_FILE = 50_000
 # memory before chunking), so memory use scales with source size too.
 
 
+# Extension normalization is shared with the config layer (config.json)
+# so every include/exclude source normalizes identically.
+from .config import (  # noqa: E402
+    normalize_extension_list,
+)
+
+
+def resolve_readable_extensions(
+    cli_include: Optional[list] = None,
+    cli_exclude: Optional[list] = None,
+    project_include: Optional[list] = None,
+    project_exclude: Optional[list] = None,
+    machine_include: Optional[list] = None,
+    machine_exclude: Optional[list] = None,
+) -> frozenset:
+    """Resolve the effective mineable-extension whitelist.
+
+    Additive, never a replacement: :data:`READABLE_EXTENSIONS` always
+    forms the base, ``include`` lists add to it and ``exclude`` lists
+    remove from it — there is deliberately no key that replaces the whole
+    list, because a pinned copy goes stale the moment upstream adds new
+    extensions and silently narrows what gets remembered.
+
+    When layers disagree about one suffix, the most specific layer that
+    mentions it decides: CLI flags over the project ``mempalace.yaml``
+    over machine-wide ``config.json``. Within a single layer, ``exclude``
+    wins over ``include`` for the same suffix (the include is applied
+    first, the exclude removes after). A suffix no layer mentions falls
+    through to the built-in default.
+
+    All inputs are already-normalized extension lists (see
+    :func:`mempalace.config.normalize_extension_list`).
+    """
+    layers = (
+        (cli_include, cli_exclude),
+        (project_include, project_exclude),
+        (machine_include, machine_exclude),
+    )
+    decided = {}
+    for include, exclude in layers:
+        layer = {}
+        for ext in include or []:
+            layer[ext] = "include"
+        for ext in exclude or []:
+            layer[ext] = "exclude"
+        for ext, decision in layer.items():
+            decided.setdefault(ext, decision)
+    effective = set(READABLE_EXTENSIONS)
+    for ext, decision in decided.items():
+        if decision == "include":
+            effective.add(ext)
+        else:
+            effective.discard(ext)
+    return frozenset(effective)
+
+
+def effective_readable_extensions(
+    project_dir: str,
+    cli_include: Optional[list] = None,
+    cli_exclude: Optional[list] = None,
+    project_config: Optional[dict] = None,
+) -> frozenset:
+    """Resolve the effective whitelist for ``project_dir`` from all layers.
+
+    Reads the machine-wide ``config.json`` (via
+    :class:`mempalace.config.MempalaceConfig`) and, unless
+    ``project_config`` supplies an already-loaded one, the project's
+    ``mempalace.yaml``. Invalid values in any layer are reported on
+    stderr, never silently ignored. Callers that scan a project before
+    mining (``mempalace init``'s single walk) should pass the result to
+    :func:`scan_project` as ``readable_extensions`` so the estimate and
+    the mine see the same corpus.
+    """
+    from .config import MempalaceConfig
+
+    if project_config is None:
+        project_config = load_config(project_dir)
+    palace_config = MempalaceConfig()
+    return resolve_readable_extensions(
+        cli_include=normalize_extension_list(cli_include, "--include-extension"),
+        cli_exclude=normalize_extension_list(cli_exclude, "--exclude-extension"),
+        project_include=normalize_extension_list(
+            project_config.get("include_extensions"),
+            "mempalace.yaml include_extensions",
+        ),
+        project_exclude=normalize_extension_list(
+            project_config.get("exclude_extensions"),
+            "mempalace.yaml exclude_extensions",
+        ),
+        machine_include=palace_config.include_extensions,
+        machine_exclude=palace_config.exclude_extensions,
+    )
+
+
 def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
     """Resolve the effective per-file chunk cap.
 
@@ -564,6 +658,27 @@ def _apply_exclude_patterns_to_prescanned_files(
         for file_path in files
         if is_force_included(file_path, project_path, include_paths)
         or exclude_matcher.matches(file_path, is_dir=False) is not True
+    ]
+
+
+def _filter_prescanned_by_extensions(
+    files: list, readable_extensions, project_path: Path, include_ignored: list
+) -> list:
+    """Filter a caller-provided (already-scanned) file list by the whitelist.
+
+    scan_project() applies the extension whitelist itself, but a caller
+    that passes its own pre-scanned ``files`` list bypasses that — so a
+    scan performed with different include/exclude layers in play (init's
+    single walk, a daemon payload) is re-filtered here against the
+    effective whitelist. Exact force-included paths keep bypassing the
+    filter, exactly as in scan_project.
+    """
+    include_paths = normalize_include_paths(include_ignored)
+    return [
+        file_path
+        for file_path in files
+        if file_path.suffix.lower() in readable_extensions
+        or is_exact_force_include(file_path, project_path, include_paths)
     ]
 
 
@@ -1938,12 +2053,18 @@ def scan_project(
     respect_gitignore: bool = True,
     include_ignored: list = None,
     exclude_patterns: list = None,
+    readable_extensions=None,
 ) -> list:
     """Return list of all readable file paths under ``project_dir``.
 
     Skips symlinks and oversized files. Each skipped symlink is logged to
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why a directory looks empty after walking.
+
+    ``readable_extensions`` overrides the built-in
+    :data:`READABLE_EXTENSIONS` whitelist — pass the result of
+    :func:`effective_readable_extensions` so the configured
+    include/exclude layers apply. ``None`` keeps the built-in list.
 
     When ``respect_gitignore`` is set, both per-directory ``.gitignore``
     files AND the repository-level ``<project>/.git/info/exclude`` are
@@ -1956,6 +2077,9 @@ def scan_project(
     pruned via :func:`should_skip_dir`, independent of ``respect_gitignore``.
     """
     project_path = Path(project_dir).expanduser().resolve()
+    effective_extensions = (
+        readable_extensions if readable_extensions is not None else READABLE_EXTENSIONS
+    )
     files = []
     active_matchers = []
     matcher_cache = {}
@@ -2013,7 +2137,7 @@ def scan_project(
 
             if not force_include and filename in SKIP_FILENAMES:
                 continue
-            if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
+            if filepath.suffix.lower() not in effective_extensions and not exact_force_include:
                 continue
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
@@ -2092,6 +2216,8 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    include_extensions: list = None,
+    exclude_extensions: list = None,
 ):
     """Mine a project directory into the palace.
 
@@ -2099,13 +2225,26 @@ def mine(
     :func:`scan_project`. When provided, the corpus walk is skipped — the
     caller (e.g. ``init`` showing a file-count estimate before the mine
     prompt) avoids walking the tree twice. When ``None`` (the default),
-    ``mine`` walks the tree itself just like before.
+    ``mine`` walks the tree itself just like before. A pre-scanned list
+    is still filtered against the effective extension whitelist, minus
+    exact force-included paths.
 
     ``max_chunks_per_file`` overrides the per-file chunk cap (see
     :func:`_resolve_max_chunks_per_file`). ``None`` defers to
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
+
+    ``include_extensions`` / ``exclude_extensions`` are the most specific
+    layer of the configurable extension whitelist (CLI flags
+    ``--include-extension`` / ``--exclude-extension``); the project
+    ``mempalace.yaml`` and machine-wide ``config.json`` keys of the same
+    names sit below them. See
+    :func:`resolve_readable_extensions` for the precedence rules.
     """
+    mine_kwargs = {
+        "include_extensions": include_extensions,
+        "exclude_extensions": exclude_extensions,
+    }
     try:
         if dry_run:
             return _mine_impl(
@@ -2119,6 +2258,7 @@ def mine(
                 include_ignored=include_ignored,
                 files=files,
                 max_chunks_per_file=max_chunks_per_file,
+                **mine_kwargs,
             )
 
         # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -2136,6 +2276,7 @@ def mine(
                 include_ignored=include_ignored,
                 files=files,
                 max_chunks_per_file=max_chunks_per_file,
+                **mine_kwargs,
             )
     finally:
         _cleanup_mine_pid_file()
@@ -2165,6 +2306,101 @@ def _project_wing(raw, project_path: Path) -> str:
     return wing
 
 
+def _mine_corpus_files(
+    project_dir: str,
+    project_path: Path,
+    config: dict,
+    files: Optional[list],
+    respect_gitignore: bool,
+    include_ignored: list,
+    include_extensions: list,
+    exclude_extensions: list,
+) -> tuple:
+    """Resolve the effective extension whitelist and the file list to mine.
+
+    Returns ``(files, extension_additions, extension_removals)`` — the
+    additions/removals are the deltas from :data:`READABLE_EXTENSIONS`
+    that the mine header prints as its ``Ext:`` line. ``files`` is a
+    pre-scanned list when the caller provided one, else a fresh scan.
+
+    A pre-scanned list may come from a scan that used different extension
+    layers; it is re-filtered against the effective whitelist so the mine
+    never files what the configuration excludes. Exact force-included
+    paths keep bypassing it, exactly as in scan_project.
+    """
+    effective_extensions = effective_readable_extensions(
+        project_dir,
+        cli_include=include_extensions,
+        cli_exclude=exclude_extensions,
+        project_config=config,
+    )
+    extension_additions = sorted(effective_extensions - READABLE_EXTENSIONS)
+    extension_removals = sorted(READABLE_EXTENSIONS - effective_extensions)
+
+    if files is None:
+        files = scan_project(
+            project_dir,
+            respect_gitignore=respect_gitignore,
+            include_ignored=include_ignored,
+            exclude_patterns=config.get("exclude_patterns", []),
+            readable_extensions=effective_extensions,
+        )
+        return files, extension_additions, extension_removals
+
+    files = _filter_prescanned_by_extensions(
+        files, effective_extensions, project_path, include_ignored
+    )
+    exclude_patterns = config.get("exclude_patterns", [])
+    if exclude_patterns:
+        files = _apply_exclude_patterns_to_prescanned_files(
+            files, project_path, exclude_patterns, include_ignored
+        )
+    return files, extension_additions, extension_removals
+
+
+def _print_mine_header(
+    wing,
+    rooms,
+    files,
+    limit,
+    extension_additions,
+    extension_removals,
+    palace_path,
+    dry_run,
+    respect_gitignore,
+    include_ignored,
+):
+    """Print the mine banner. The device line is resolved here, before the
+    banner, so an explicit device torch cannot use warns above the header
+    rather than inside it."""
+    from .embedding import describe_device
+
+    device = describe_device()
+    print(f"\n{'=' * 55}")
+    print("  MemPalace Mine")
+    print(f"{'=' * 55}")
+    print(f"  Wing:    {wing}")
+    print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
+    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
+    print(f"  Files:   {len(files)}{limit_suffix}")
+    if extension_additions or extension_removals:
+        ext_parts = []
+        if extension_additions:
+            ext_parts.append("+" + ",".join(extension_additions))
+        if extension_removals:
+            ext_parts.append("-" + ",".join(extension_removals))
+        print(f"  Ext:     {'  '.join(ext_parts)}")
+    print(f"  Palace:  {palace_path}")
+    print(f"  Device:  {device}")
+    if dry_run:
+        print("  DRY RUN -- nothing will be filed")
+    if not respect_gitignore:
+        print("  .gitignore: DISABLED")
+    if include_ignored:
+        print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
+    print(f"{'-' * 55}\n")
+
+
 def _mine_impl(
     project_dir: str,
     palace_path: str,
@@ -2176,6 +2412,8 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    include_extensions: list = None,
+    exclude_extensions: list = None,
 ):
     from .config import MempalaceConfig
 
@@ -2190,41 +2428,32 @@ def _mine_impl(
 
     wing = wing_override or _project_wing(config.get("wing"), project_path)
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
-    exclude_patterns = config.get("exclude_patterns", [])
 
-    if files is None:
-        files = scan_project(
-            project_dir,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            exclude_patterns=exclude_patterns,
-        )
-    elif exclude_patterns:
-        files = _apply_exclude_patterns_to_prescanned_files(
-            files, project_path, exclude_patterns, include_ignored
-        )
-
-    from .embedding import describe_device
+    files, extension_additions, extension_removals = _mine_corpus_files(
+        project_dir,
+        project_path,
+        config,
+        files,
+        respect_gitignore=respect_gitignore,
+        include_ignored=include_ignored,
+        include_extensions=include_extensions,
+        exclude_extensions=exclude_extensions,
+    )
 
     # Resolved before the header: an explicit device torch cannot use warns
     # here, so the warning is printed above the header, not inside it.
-    device = describe_device()
-    print(f"\n{'=' * 55}")
-    print("  MemPalace Mine")
-    print(f"{'=' * 55}")
-    print(f"  Wing:    {wing}")
-    print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
-    limit_suffix = f" (limit: {limit} new)" if limit > 0 else ""
-    print(f"  Files:   {len(files)}{limit_suffix}")
-    print(f"  Palace:  {palace_path}")
-    print(f"  Device:  {device}")
-    if dry_run:
-        print("  DRY RUN -- nothing will be filed")
-    if not respect_gitignore:
-        print("  .gitignore: DISABLED")
-    if include_ignored:
-        print(f"  Include: {', '.join(sorted(normalize_include_paths(include_ignored)))}")
-    print(f"{'-' * 55}\n")
+    _print_mine_header(
+        wing=wing,
+        rooms=rooms,
+        files=files,
+        limit=limit,
+        extension_additions=extension_additions,
+        extension_removals=extension_removals,
+        palace_path=palace_path,
+        dry_run=dry_run,
+        respect_gitignore=respect_gitignore,
+        include_ignored=include_ignored,
+    )
 
     if not dry_run:
         collection = get_collection(palace_path)

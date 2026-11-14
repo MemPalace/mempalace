@@ -5,7 +5,7 @@ import errno
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 
@@ -687,7 +687,9 @@ def test_init_auto_mine_daemon_preserves_prescan(
     ):
         cli._maybe_run_mine_after_init(args, config)
 
-    scan.assert_called_once_with(str(project))
+    # The init pre-scan resolves the configured extension layers (config.json
+    # / mempalace.yaml) into the effective whitelist it passes to scan_project.
+    scan.assert_called_once_with(str(project), readable_extensions=ANY)
     direct_mine.assert_not_called()
     submit.assert_called_once()
 

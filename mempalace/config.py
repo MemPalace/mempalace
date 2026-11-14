@@ -515,6 +515,90 @@ def _json_type_name(value) -> str:
     return type(value).__name__
 
 
+# One configured file extension, normalized: a leading dot, then at least
+# one alphanumeric, then any run of extension-safe characters. Rejects
+# inner whitespace, path separators, and empty/bare-dot values. A single
+# dot only: ``Path.suffix`` returns just the last segment (``.gz`` for
+# ``archive.tar.gz``), so a compound value like ``.tar.gz`` could never
+# match a file and is reported as invalid instead of silently useless.
+_EXTENSION_RE = re.compile(r"^\.[a-z0-9][a-z0-9+_-]*$")
+
+
+def normalize_file_extension(value):
+    """Normalize one configured file extension to ``".ext"`` form.
+
+    Returns the normalized extension, or ``None`` when ``value`` cannot name
+    one: only strings name extensions, surrounding whitespace is tolerated
+    but inner whitespace is not, the leading dot is optional (``mdx`` and
+    ``.mdx`` are the same suffix), and the result is lowercased so it
+    matches the miner's case-insensitive ``filepath.suffix.lower()``
+    check. Callers report rejects rather than silently ignoring them —
+    a mistyped extension means files quietly stop being remembered.
+
+    Shared by every include/exclude layer (``config.json``,
+    ``mempalace.yaml``, CLI flags) so all three normalize identically.
+    """
+    if not isinstance(value, str):
+        return None
+    ext = value.strip().lower()
+    if not ext.startswith("."):
+        ext = "." + ext
+    if _EXTENSION_RE.match(ext) is None:
+        return None
+    return ext
+
+
+def _warn_invalid_extensions_once(source: str, values) -> None:
+    """Say on stderr that ``values`` from ``source`` are being ignored."""
+    rendered = ", ".join(repr(v) for v in values)
+    if not first_time("extensions", "invalid", source, rendered):
+        return
+    print(
+        f"  ! ignoring invalid file extension(s) from {source}: {rendered}. "
+        "Extensions are suffixes like '.mdx' (leading dot optional, no path "
+        "separators).",
+        file=sys.stderr,
+    )
+
+
+def _warn_not_a_list_once(source: str, value) -> None:
+    """Say on stderr that a non-list extension setting is being ignored."""
+    problem = f"{source} is a JSON {_json_type_name(value)}, not a list"
+    if not first_time("extensions", "not-a-list", source):
+        return
+    print(
+        f"  ! ignoring {problem}. Expected a list of extensions like ['.mdx'].",
+        file=sys.stderr,
+    )
+
+
+def normalize_extension_list(values, source: str) -> list:
+    """Normalize a configured include/exclude extension list.
+
+    ``values`` is whatever a config layer provided (``config.json`` key,
+    ``mempalace.yaml`` key, or CLI flag arguments); ``source`` names it for
+    the warning lines. Invalid entries are reported on stderr and skipped,
+    valid ones are normalized, de-duplicated in order, and returned. The
+    empty list is returned when ``values`` is ``None`` or empty.
+    """
+    if not values:
+        return []
+    if not isinstance(values, list):
+        _warn_not_a_list_once(source, values)
+        return []
+    normalized = []
+    invalid = []
+    for value in values:
+        ext = normalize_file_extension(value)
+        if ext is None:
+            invalid.append(value)
+        elif ext not in normalized:
+            normalized.append(ext)
+    if invalid:
+        _warn_invalid_extensions_once(source, invalid)
+    return normalized
+
+
 def _warn_unusable_config_once(config_file: Path, problem: str) -> None:
     """Say on stderr that ``config_file`` is being ignored, once per process.
 
@@ -1407,6 +1491,34 @@ class MempalaceConfig:
         # ``tool_hook_settings`` does not wrap its call.
         _make_config_dir(self._config_dir)
         self._persist_file_config()
+
+    @property
+    def include_extensions(self) -> list:
+        """Machine-wide mineable-extension additions from ``config.json``.
+
+        The ``include_extensions`` key lists suffixes (leading dot optional,
+        e.g. ``[".mdx"]``) added to the miner's built-in whitelist on this
+        machine. Invalid entries are reported on stderr, not silently
+        dropped. See :func:`mempalace.miner.resolve_readable_extensions`
+        for how the layers combine.
+        """
+        return normalize_extension_list(
+            self._file_config.get("include_extensions"),
+            f"{self._config_file} include_extensions",
+        )
+
+    @property
+    def exclude_extensions(self) -> list:
+        """Machine-wide mineable-extension removals from ``config.json``.
+
+        The ``exclude_extensions`` key lists suffixes removed from the
+        miner's built-in whitelist on this machine. Invalid entries are
+        reported on stderr, not silently dropped.
+        """
+        return normalize_extension_list(
+            self._file_config.get("exclude_extensions"),
+            f"{self._config_file} exclude_extensions",
+        )
 
     def _resolve_str_setting(self, env_var: str, config_key: str):
         """Resolve a string setting: env var > ``config.json`` > ``None``.
