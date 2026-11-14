@@ -191,6 +191,138 @@ class TestLegacyHallwayFileDetection:
 
 
 # =============================================================================
+# SQLite-only legacy store upgrade (PR 2903): a pre-scoped hallways.sqlite3
+# exists, but no legacy hallways.json is present at the configured path.
+# =============================================================================
+
+
+class TestSQLiteOnlyLegacyUpgrade:
+    def test_load_hallways_imports_sqlite_only_legacy_store(self, tmp_path, monkeypatch, caplog):
+        """A user upgrading from a build that wrote the keyed sibling (e.g.
+        3.4.x) but who switched palaces — the keyed store exists at the
+        configured path, but the prior data only lives in the legacy
+        pre-scoped hallways.sqlite3 at a different path — gets the legacy
+        records into the keyed store automatically on the next read, without
+        touching any JSON.
+
+        This is the regression guard for the "silent data loss on upgrade"
+        case where the legacy file was the SQLite store only (no JSON).
+        """
+        import sqlite3
+
+        palace_parent = tmp_path / "palace-parent"
+        palace_parent.mkdir()
+        # The legacy pre-scoped store (no JSON beside it, so the JSON
+        # fallback never warns; this test covers the SQLite-only probe).
+        legacy_db = palace_parent / "hallways.sqlite3"
+        conn = sqlite3.connect(str(legacy_db))
+        conn.executescript(hallways_mod._DDL)
+        conn.execute(
+            "INSERT INTO hallways (id, wing, entity_a, entity_b, co_occurrence_count, signature, record) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy_rec",
+                "wing_a",
+                "Alice",
+                "Bob",
+                2,
+                "sig",
+                '{"id":"legacy_rec","wing":"wing_a","entity_a":"Alice","entity_b":"Bob","co_occurrence_count":2}',
+            ),
+        )
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            ("json_imported", '{"source": null, "records": 1, "at": "2026-01-01T00:00:00Z"}'),
+        )
+        conn.commit()
+        conn.close()
+
+        # The current keyed store lives at a different path. Point the
+        # resolver at it so _reader returns the keyed DB (which starts empty).
+        keyed_db = palace_parent / "hallways_keyed.sqlite3"
+        keyed_json = palace_parent / "hallways_keyed.json"
+
+        monkeypatch.setattr(hallways_mod, "_get_hallway_db", lambda *a, **kw: str(keyed_db))
+        monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(keyed_json))
+        monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(palace_parent / "hallways.json"))
+        # The legacy DB is derived from the legacy JSON's directory.
+        monkeypatch.setattr(hallways_mod, "_legacy_hallway_db", lambda: str(legacy_db))
+
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
+            result = hallways_mod._load_hallways()
+
+        # The keyed store now has the legacy records.
+        assert any(r.get("id") == "legacy_rec" for r in result), (
+            "legacy SQLite store was not imported into the keyed store"
+        )
+        # The warning names both paths.
+        assert str(legacy_db) in caplog.text
+        assert str(keyed_db) in caplog.text
+
+    def test_load_hallways_refuses_ambiguous_both_present(self, tmp_path, monkeypatch, caplog):
+        """When BOTH a legacy hallways.json AND a legacy hallways.sqlite3
+        exist at the legacy path (no JSON at the configured path), the
+        upgrade REFUSES to auto-merge: it cannot know which holds the newer
+        data. Both files are kept as-is and the user is told which paths to
+        recover. The keyed store stays empty.
+        """
+        palace_parent = tmp_path / "palace-parent"
+        palace_parent.mkdir()
+        legacy_json = palace_parent / "hallways.json"
+        legacy_json.write_text(
+            '{"hallways": [{"id":"j","wing":"w","entity_a":"A","entity_b":"B","co_occurrence_count":1}]}',
+            encoding="utf-8",
+        )
+        # A real SQLite store with one row.
+        import sqlite3
+
+        legacy_db = palace_parent / "hallways.sqlite3"
+        conn = sqlite3.connect(str(legacy_db))
+        conn.executescript(hallways_mod._DDL)
+        conn.execute(
+            "INSERT INTO hallways (id, wing, entity_a, entity_b, co_occurrence_count, signature, record) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("d", "w", "A", "B", 1, "sig", '{"id":"d","wing":"w","entity_a":"A","entity_b":"B","co_occurrence_count":1}'),
+        )
+        conn.commit()
+        conn.close()
+
+        keyed_db = palace_parent / "hallways_keyed.sqlite3"
+        keyed_json = palace_parent / "hallways_keyed.json"
+
+        monkeypatch.setattr(hallways_mod, "_get_hallway_db", lambda *a, **kw: str(keyed_db))
+        monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(keyed_json))
+        monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(legacy_json))
+        monkeypatch.setattr(hallways_mod, "_legacy_hallway_db", lambda: str(legacy_db))
+
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
+            result = hallways_mod._load_hallways()
+
+        # Refused: keyed store stays empty, both legacy files are untouched.
+        assert result == []
+        assert os.path.exists(str(legacy_json)), "legacy JSON must be preserved"
+        assert os.path.exists(str(legacy_db)), "legacy SQLite must be preserved"
+        # The refusal message names both paths.
+        assert str(legacy_json) in caplog.text
+        assert str(legacy_db) in caplog.text
+
+    def test_no_warning_when_legacy_db_is_same_as_keyed(self, tmp_path, monkeypatch, caplog):
+        """If the legacy DB path resolves to the keyed DB (default install
+        before scoping), we must not warn about an 'ignored' legacy store.
+        """
+        same = tmp_path / "hallways.sqlite3"
+        monkeypatch.setattr(hallways_mod, "_get_hallway_db", lambda *a, **kw: str(same))
+        monkeypatch.setattr(hallways_mod, "_get_hallway_file", lambda *a, **kw: str(same)[:-len(".sqlite3")] + ".json")
+        monkeypatch.setattr(hallways_mod, "_legacy_hallway_file", lambda: str(same)[:-len(".sqlite3")] + ".json")
+        monkeypatch.setattr(hallways_mod, "_legacy_hallway_db", lambda: str(same))
+
+        with caplog.at_level(logging.WARNING, logger="mempalace"):
+            assert hallways_mod._load_hallways() == []
+
+        assert "Legacy hallway store detected" not in caplog.text
+
+
+# =============================================================================
 # Multi-palace isolation: two palaces no longer share the file
 # =============================================================================
 
