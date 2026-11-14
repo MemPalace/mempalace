@@ -133,12 +133,20 @@ def test_mine_convos_allows_general_after_exchange(capsys):
 
 
 def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
-    """When stored drawers have an older normalize_version, the next mine
-    silently purges them and refiles — no manual erase required.
+    """A schema-bump re-mine re-files the fresh generation AND preserves the
+    prior generation's verbatim bodies.
 
-    This is what makes the strip_noise upgrade apply to existing corpora:
-    users just run `mempalace mine` again and old noise-filled drawers get
-    replaced with clean ones."""
+    Under the additive-history contract (#1593 / #2793) a prior body is
+    *immutable history*, not stale noise: an older-schema (``normalize_version=1``)
+    drawer with a unique non-empty body is NOT a deletion candidate.  The bump
+    re-normalises the *current* generation (so the fresh drawers carry the
+    current version), but the prior generation's text is a different document
+    and must survive.  Currentness is decided by the generation marker
+    (``chunk_total``), not by version identity — so a ``v=1`` body and the
+    ``v=NORMALIZE_VERSION`` fresh bodies coexist.  This flips the old
+    "wholesale replace on schema bump" assertion to "prior bodies preserved
+    as verbatim history".
+    """
     from mempalace.palace import NORMALIZE_VERSION
 
     tmpdir = tempfile.mkdtemp()
@@ -165,7 +173,8 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
             assert meta.get("normalize_version") == NORMALIZE_VERSION
 
         # Simulate pre-v2 drawers: rewrite metadata to an older version,
-        # and replace content with "noise" so we can see it get cleaned up.
+        # and replace the positional bodies with "STALE NOISE" — text that the
+        # fresh pass will NOT re-derive, so it is unique prior history.
         stale_metas = []
         for meta in first_pass["metadatas"]:
             stale = dict(meta)
@@ -176,7 +185,8 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
             documents=["STALE NOISE"] * len(first_pass["ids"]),
             metadatas=stale_metas,
         )
-        # Add an extra orphan drawer that should also be purged.
+        # Add an extra older-schema orphan drawer: unique non-empty body with
+        # no current positional slot — the shrink-preserve case.
         col.add(
             ids=["orphan_drawer"],
             documents=["OLD ORPHAN"],
@@ -192,7 +202,7 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         )
         del col, client
 
-        # Second mine — version gate should trigger rebuild
+        # Second mine — version gate should trigger a rebuild, not a skip.
         mine_convos(tmpdir, palace_path, wing="test")
         out = capsys.readouterr().out
         assert "Files skipped (already filed): 0" in out, (
@@ -202,14 +212,44 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         rebuilt = col.get(where={"source_file": resolved})
-        # Orphan is gone
-        assert "orphan_drawer" not in rebuilt["ids"]
-        # No stale content survived
-        assert all("STALE NOISE" not in d for d in rebuilt["documents"])
-        assert all("OLD ORPHAN" not in d for d in rebuilt["documents"])
-        # All rebuilt drawers carry the current version
-        for meta in rebuilt["metadatas"]:
-            assert meta.get("normalize_version") == NORMALIZE_VERSION
+        docs = rebuilt["documents"]
+        metas = rebuilt["metadatas"]
+
+        # (1) The FRESH generation is re-filed in full and carries the current
+        #     schema version — this is what the bump re-normalises.
+        fresh = [
+            (d, m) for d, m in zip(docs, metas) if m.get("normalize_version") == NORMALIZE_VERSION
+        ]
+        assert len(fresh) == 3, f"fresh generation must be re-filed in full (got {len(fresh)})"
+        assert any("Memory is persistence" in (d or "") for d, _ in fresh)
+        assert any("It enables continuity" in (d or "") for d, _ in fresh)
+        assert any("With structured storage" in (d or "") for d, _ in fresh)
+
+        # (2) The PRIOR bodies are preserved as verbatim history (additive
+        #     contract #1593): the older-schema "STALE NOISE" and the
+        #     older-schema orphan "OLD ORPHAN" both survive the bump.  This is
+        #     the flip of the old "no stale content survived" assertion — a
+        #     unique non-empty older-schema row is verbatim history, NOT a
+        #     deletion candidate (@igorls 2026-11-13 triage).
+        assert any("STALE NOISE" in (d or "") for d in docs), (
+            "older-schema unique body must be PRESERVED as verbatim history, "
+            f"not purged.  Alive: {sorted(rebuilt['ids'])}"
+        )
+        assert any("OLD ORPHAN" in (d or "") for d in docs), (
+            "older-schema orphan body must be preserved as verbatim history "
+            f"(shrink-preserve), not purged.  Alive: {sorted(rebuilt['ids'])}"
+        )
+
+        # (3) Currentness is INDEPENDENT of version identity: the preserved
+        #     prior bodies still carry the older ``normalize_version=1`` stamp
+        #     (they ARE the prior generation) yet are NOT deleted, while the
+        #     fresh bodies carry the current version.  Both generations coexist.
+        for d, m in zip(docs, metas):
+            if "STALE NOISE" in (d or ""):
+                assert m.get("normalize_version") == 1, (
+                    "preserved prior body must keep its original schema stamp "
+                    "(it is the prior generation), not be re-stamped current"
+                )
         del col, client
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -218,7 +258,16 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
 def test_mine_convos_rebuilds_drawers_from_older_chunker(capsys):
     """Exchange drawers from an older chunker revision are rebuilt on the next
     mine, which recovers text the old chunker discarded (here: everything
-    after a ``---`` rule inside a response)."""
+    after a ``---`` rule inside a response) — AND the prior generation's
+    bodies are preserved as verbatim history.
+
+    Under the additive-history contract (#1593 / #2793) the rebuild re-files
+    the *current* generation (carrying the current ``convo_chunker_version``,
+    having recovered the marker text) but does NOT purge the prior generation's
+    unique non-empty bodies: currentness is decided by the generation marker,
+    not by version identity.  This flips the old "no V1 CHUNK survived"
+    assertion to "the older-chunker bodies are preserved as verbatim history".
+    """
     tmpdir = tempfile.mkdtemp()
     try:
         convo_path = Path(tmpdir) / "chat.txt"
@@ -240,6 +289,8 @@ def test_mine_convos_rebuilds_drawers_from_older_chunker(capsys):
             assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
 
         # Simulate drawers written by the v1 chunker, which lost the marker.
+        # "V1 CHUNK" is a unique non-empty prior body — the rebuild will not
+        # re-derive it, so it is verbatim history that must survive.
         col.update(
             ids=list(first_pass["ids"]),
             documents=["V1 CHUNK"] * len(first_pass["ids"]),
@@ -254,13 +305,48 @@ def test_mine_convos_rebuilds_drawers_from_older_chunker(capsys):
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_collection("mempalace_drawers")
         rebuilt = col.get(where={"source_file": resolved})
-        assert all("V1 CHUNK" not in d for d in rebuilt["documents"])
-        assert any("AFTER_RULE_MARKER" in d for d in rebuilt["documents"])
-        for meta in rebuilt["metadatas"]:
-            assert meta["convo_chunker_version"] == CONVO_CHUNKER_VERSION
+        docs = rebuilt["documents"]
+        metas = rebuilt["metadatas"]
+
+        # (1) The FRESH generation is re-filed in full, carries the current
+        #     chunker version, and RECOVERS the text the old chunker dropped
+        #     (the AFTER_RULE_MARKER, which sits after the ``---`` rule).
+        fresh = [
+            (d, m)
+            for d, m in zip(docs, metas)
+            if m.get("convo_chunker_version") == CONVO_CHUNKER_VERSION
+        ]
+        assert any("AFTER_RULE_MARKER" in (d or "") for d, _ in fresh), (
+            "current-chunker rebuild must recover the marker text the old "
+            f"chunker discarded.  Fresh docs: {[(d or '')[:30] for d, _ in fresh]}"
+        )
+        assert any("Freeze the branch" in (d or "") for d, _ in fresh)
+        assert any("Yank the release" in (d or "") for d, _ in fresh)
+        assert any("Curate it by theme" in (d or "") for d, _ in fresh)
+
+        # (2) The PRIOR generation's "V1 CHUNK" body is preserved as verbatim
+        #     history (additive contract #1593) — NOT purged.  This is the flip
+        #     of the old "all V1 CHUNK gone" assertion.
+        assert any("V1 CHUNK" in (d or "") for d in docs), (
+            "older-chunker unique body must be PRESERVED as verbatim history, "
+            f"not purged by the rebuild.  Alive: {sorted(rebuilt['ids'])}"
+        )
+
+        # (3) Currentness is INDEPENDENT of version identity: the preserved
+        #     prior body still carries the older chunker stamp (it IS the prior
+        #     generation) yet is not deleted, while the fresh bodies carry the
+        #     current chunker version.  Both generations coexist.
+        for d, m in zip(docs, metas):
+            if "V1 CHUNK" in (d or ""):
+                assert m.get("convo_chunker_version") == 1, (
+                    "preserved prior body must keep its original chunker stamp "
+                    "(it is the prior generation), not be re-stamped current"
+                )
         del col, client
 
-        # Current drawers are skipped again (only mined files are listed).
+        # Idempotency: a further mine over an already-current file skips it
+        # (the file is read as mined via the current generation's
+        # chunk_total; the preserved prior row does not mark it unfinished).
         mine_convos(tmpdir, palace_path, wing="test")
         assert "chat.txt" not in capsys.readouterr().out
     finally:

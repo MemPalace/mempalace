@@ -31,14 +31,19 @@ def _source_file_delete_ids(
 
     When ``pass_contents`` is a non-empty set of drawer text bodies produced
     by the current mine pass, the function applies additive-history filtering:
-    a drawer is kept (excluded from the delete list) only if (a) its metadata
-    matches the current schema version (_meta_is_current) AND (b) its document
-    text is a non-empty string that is NOT in ``pass_contents``.  Drawers that
-    fail either check are included in the list and will be deleted — these are
-    the stale-schema drawers, re-derived drawers, and blank orphans the PR
-    intends to remove.  When ``pass_contents`` is None, the function falls
-    back to the original blanket behavior (every in-scope drawer is a delete
-    candidate), preserving backward compatibility for all existing callers.
+    a drawer is a *delete candidate* only if (a) its document text is non-empty
+    AND in ``pass_contents`` (redundant — the same body is re-derived this pass,
+    so the upsert replaces it), or (b) its document text is blank/empty (an
+    orphan).  A drawer whose unique non-empty content is not re-derived this
+    pass is kept as verbatim history — the shrink-preserve guarantee —
+    **regardless of schema version**.  A prior generation filed under an older
+    ``normalize_version`` (a schema-bump rebuild) is still a unique document
+    and is NOT a deletion candidate; currentness is decided by the explicit
+    generation marker (``chunk_total``), not by version identity.  So a unique
+    non-empty older-schema row is preserved, not purged.
+    When ``pass_contents`` is None the function falls back to the
+    original blanket behavior (every in-scope drawer is a delete candidate),
+    preserving backward compatibility for the whole-file re-mine callers.
     """
     ids: list = []
     offset = 0
@@ -58,17 +63,17 @@ def _source_file_delete_ids(
                 continue
             if pass_contents is not None:
                 # Additive-history rules:
-                #   Rule 1 KEEP  : current schema + content not in pass_contents
-                #   Rule 2 DEL   : older schema (normalize_version < current)
-                #   Rule 3 DEL   : current schema + content IS in pass_contents
-                #   Rule 4 DEL   : blank / empty document text
+                #   Rule 1 KEEP  : content not in pass_contents (unique — kept
+                #                  as verbatim history on ANY schema version)
+                #   Rule 2 DEL   : content IS in pass_contents (redundant —
+                #                  the same body is re-derived this pass, so the
+                #                  upsert replaces it in place)
+                #   Rule 3 DEL   : blank / empty document text (orphan)
                 if content and content in pass_contents:
-                    ids.append(drawer_id)  # Rule 3: redundant, upsert replaces
+                    ids.append(drawer_id)  # Rule 2: redundant, upsert replaces
                 elif not content:
-                    ids.append(drawer_id)  # Rule 4: blank orphan
-                elif not _meta_is_current(meta or {}, extract_mode):
-                    ids.append(drawer_id)  # Rule 2: stale schema
-                # else Rule 1: keep — not added to ids
+                    ids.append(drawer_id)  # Rule 3: blank orphan
+                # else Rule 1: keep — verbatim history, unique (any schema)
             else:
                 ids.append(drawer_id)
         if not batch_ids:
@@ -152,6 +157,89 @@ def _split_unchanged(collection, batch: list) -> tuple:
     return to_embed, reuse, reuse_vectors
 
 
+def _preserved_prior_rows(collection, drawers: list, pass_contents: Optional[set] = None) -> tuple:
+    """Lift prior bodies that the upcoming upsert would silently clobber.
+
+    ``drawers`` is the batch about to be upserted, as ``(id, doc, meta)``.
+    For each row we read the body currently stored at that id; if it holds a
+    *different* non-blank body that is not re-derived this pass, we re-file it
+    under its own content-addressed id so the upsert lands on a fresh id and
+    the prior text survives verbatim. Returns ``(lifted_rows, lifted_ids)``
+    where ``lifted_rows`` are ``(id, doc, meta)`` ready to upsert alongside
+    the batch, and ``lifted_ids`` is the set of new ids.
+
+    Only the additive-history path lifts: when ``pass_contents`` is ``None``
+    the caller is doing a whole-file replace (project / format / diary
+    miners), whose new chunks are authoritative and whose rechunking
+    legitimately changes content — the blanket stale-purge owns cleanup
+    there, and lifting would fight the replace.
+
+    Prior rows on *any* schema version are lifted, including those filed
+    under an older ``normalize_version`` or an older chunker stamp.  The
+    additive-history contract says a unique non-empty prior body is verbatim
+    history regardless of schema: currentness is decided by the explicit
+    generation marker (``chunk_total``), not by version identity.  A schema
+    bump re-normalises the current generation, but the prior generation's
+    text was a different document and must survive — a unique non-empty
+    older-schema row is preserved, not purged.
+
+    A blank stored body, a body that is blank/empty, a body that matches the
+    incoming text (no-op re-file), and a body whose content is in
+    ``pass_contents`` (re-derived this pass) are all left to the upsert —
+    they are not unique history worth preserving.
+    """
+    if not drawers or pass_contents is None:
+        return [], set()
+    import re
+
+    from ..ids import make_drawer_id_from_content
+
+    # Whitespace-insensitive comparison: the chunker can produce
+    # byte-different text for the same logical turn depending on file
+    # context (internal trailing spaces, blank-line separators).  Collapsing
+    # all runs of whitespace to single spaces means a normalised match is
+    # the same turn — the upsert overwrites it, no lift needed.
+    def _norm(s):
+        return re.sub(r"\s+", " ", s.strip()) if s else ""
+
+    norm_pc = {_norm(pc) for pc in pass_contents}
+
+    batch_ids = [drawer_id for drawer_id, _, _ in drawers]
+    existing = collection.get(ids=batch_ids, include=["documents", "metadatas"])
+    stored_ids = existing.get("ids") or []
+    stored_docs = existing.get("documents") or [None] * len(stored_ids)
+    stored_metas = existing.get("metadatas") or [None] * len(stored_ids)
+    stored = {
+        drawer_id: (doc, meta or {})
+        for drawer_id, doc, meta in zip(stored_ids, stored_docs, stored_metas)
+    }
+    lifted: list = []
+    lifted_ids: set = set()
+    seen: set = set()
+    for drawer_id, doc, meta in drawers:
+        prior_doc, prior_meta = stored.get(drawer_id, (None, {}))
+        if prior_doc is None or not str(prior_doc).strip():
+            continue
+        if _norm(prior_doc) == _norm(doc):
+            continue
+        if _norm(prior_doc) in norm_pc:
+            continue
+        # Prior rows on any schema version are unique history — the
+        # additive-history contract does not carve out older-schema bodies.
+        # Currentness is the generation marker, not the normalize_version.
+        wing = meta.get("wing") or prior_meta.get("wing")
+        room = meta.get("room") or prior_meta.get("room")
+        if not wing or not room:
+            continue
+        new_id = make_drawer_id_from_content(wing, room, prior_doc)
+        if new_id in lifted_ids or new_id in seen:
+            continue
+        seen.add(new_id)
+        lifted.append((new_id, prior_doc, dict(prior_meta)))
+        lifted_ids.add(new_id)
+    return lifted, lifted_ids
+
+
 def _stored_vectors(collection, ids: list) -> dict:
     if not ids:
         return {}
@@ -217,8 +305,25 @@ def write_file_drawers(
     removed; an error in :data:`MINE_ABORTS` (a dead backend) propagates as is.
     """
     if prune:
+        # Lift prior bodies that the upcoming upsert would silently clobber:
+        # any positional ID that currently holds a different non-blank body
+        # not re-derived this pass is re-filed under its own content-addressed
+        # ID so the upsert lands on a fresh ID and the prior text survives.
+        # ``total`` counts the *fresh generation only*, so the fresh group's
+        # ``chunk_total`` finalises to its real size and ``file_already_mined``
+        # reads the file as mined; the lifted rows keep their prior group's
+        # bookkeeping (their ``source_mtime`` differs), so they never inflate
+        # the fresh group's completion count.
+        lifted, lifted_ids = _preserved_prior_rows(collection, drawers, pass_contents)
         total = len(drawers)
-        drawers = [(i, doc, {**meta, "chunk_total": total + 1}) for i, doc, meta in drawers]
+        fresh_rows = [(i, doc, {**meta, "chunk_total": total + 1}) for i, doc, meta in drawers]
+        if lifted:
+            drawers = fresh_rows + lifted
+        else:
+            drawers = fresh_rows
+    else:
+        drawers = list(drawers)
+        lifted_ids = set()
     written = []
     rewritten = []
     for start in range(0, len(drawers), DRAWER_UPSERT_BATCH_SIZE):
@@ -249,8 +354,12 @@ def write_file_drawers(
         ) from exc
     if rewritten or stale:
         drawers_removed(None, aaak_ids=rewritten + stale, aaak_col=aaak_col, reraise=MINE_ABORTS)
-    for start in range(0, len(written), DRAWER_UPSERT_BATCH_SIZE):
-        batch = written[start : start + DRAWER_UPSERT_BATCH_SIZE]
+    # Finalise only the fresh generation to its real size. Lifted prior rows
+    # keep their own generation's ``chunk_total`` (their bookkeeping), so the
+    # finalisation update must not overwrite it with the new generation's count.
+    fresh_written = [row for row in written if row[0] not in lifted_ids]
+    for start in range(0, len(fresh_written), DRAWER_UPSERT_BATCH_SIZE):
+        batch = fresh_written[start : start + DRAWER_UPSERT_BATCH_SIZE]
         collection.update(
             ids=[drawer_id for drawer_id, _, _ in batch],
             metadatas=[{**meta, "chunk_total": total} for _, _, meta in batch],

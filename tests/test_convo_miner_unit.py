@@ -1245,6 +1245,27 @@ class _StoredCol:
                 self.store[i] = (content, {**existing_meta, **(m or {})})
 
 
+class _RetryCol(_StoredCol):
+    """A _StoredCol that can simulate a failed purge-scan (a ``where``-get)
+    on demand, modelling an interrupted publication: the fresh + lifted rows
+    are already upserted, but the stale-drawer scan — and therefore the purge
+    and the chunk_total finalisation — never completes.
+
+    Only the ``where``-based scan is made to fail; the ``ids``-based reads
+    used by the lift and by unchanged-vector detection still succeed, which
+    matches a backend that dies between the upsert and the stale scan.
+    """
+
+    def __init__(self, pre_stored: dict):
+        super().__init__(pre_stored)
+        self.fail_where_get = False
+
+    def get(self, where=None, limit=None, offset=0, include=None, **kw):
+        if self.fail_where_get and where is not None:
+            raise RuntimeError("simulated purge-scan backend error (interrupted publication)")
+        return super().get(where=where, limit=limit, offset=offset, include=include, **kw)
+
+
 class TestAdditiveHistoryOrphanDelete:
     """Regression tests for the additive-history / version-identity fix
     (upstream issue #1593, filed as #2793 on MemPalace/mempalace).
@@ -1367,6 +1388,69 @@ class TestAdditiveHistoryOrphanDelete:
         )
 
     # ------------------------------------------------------------------
+    # Rechunk: the source is rewritten so the SAME text now lands at a
+    # different chunk_index (chunk boundaries moved). The prior drawer at
+    # the old index is redundant (its content is re-derived) and must be
+    # purged so there is exactly one copy; a prior drawer whose content is
+    # NOT re-derived (the surrounding context changed) is preserved.
+    # ------------------------------------------------------------------
+
+    def test_rechunk_redundant_prior_purged_unique_preserved(self, monkeypatch):
+        """Rewriting the file shifts chunk boundaries: the prior drawer whose
+        verbatim content is re-derived (now at a different index) is purged so
+        the re-upserted copy is the sole occurrence, while a prior drawer whose
+        content is NOT re-derived survives as additive history."""
+        import mempalace.convo_miner as convo_miner
+
+        shared_content = (
+            "User: how do I configure the database?\n"
+            "AI: Set DATABASE_URL in your .env file and run migrate.\n"
+        )
+        unique_content = (
+            "User: and what about the connection pool size?\n"
+            "AI: Default is 10; raise it under heavy load.\n"
+        )
+        # Prior pass: shared at chunk_index 1, unique at chunk_index 2.
+        prior_shared_meta = dict(self.CURRENT_SCHEMA)
+        prior_shared_meta["chunk_index"] = 1
+        prior_unique_meta = dict(self.CURRENT_SCHEMA)
+        prior_unique_meta["chunk_index"] = 2
+        col = _StoredCol(
+            {
+                "drawer_convos_conversations_re1": (shared_content, prior_shared_meta),
+                "drawer_convos_conversations_re2": (unique_content, prior_unique_meta),
+            }
+        )
+
+        # This pass rechunks: the SAME shared text is now at chunk_index 3
+        # (surrounding text shifted), and the unique text is gone from the
+        # file entirely.
+        chunks = [
+            {"content": "User: brand new lead-in text", "chunk_index": 0},
+            {"content": "User: more new text", "chunk_index": 1},
+            {"content": "User: yet another new block", "chunk_index": 2},
+            {"content": shared_content, "chunk_index": 3},
+        ]
+        self._patch_helpers(monkeypatch, convo_miner)
+
+        drawers, _rooms, skipped = convo_miner._file_chunks_locked(
+            col, "rechunk_me.txt", chunks, "convos", "conversations", "agent-under-test", "exchange"
+        )
+
+        assert skipped is False
+        assert drawers == 4
+        # The shared content is stored exactly once (old re1 purged, new at re3).
+        shared_count = sum(1 for c in col.alive_contents() if c == shared_content)
+        assert shared_count == 1, (
+            f"shared content appears {shared_count} times after rechunk; expected 1"
+        )
+        # The unique prior body is preserved and retrievable.
+        assert unique_content in col.alive_contents(), (
+            "Unique prior body lost during rechunk — additive history must "
+            "retain verbatim content not re-derived this pass"
+        )
+
+    # ------------------------------------------------------------------
     # Rule 4 (deleted): prior drawer with blank/empty content → PURGED
     # (genuinely orphan — no verbatim content to preserve).
     # ------------------------------------------------------------------
@@ -1401,15 +1485,25 @@ class TestAdditiveHistoryOrphanDelete:
         )
 
     # ------------------------------------------------------------------
-    # Rule 2 (deleted): prior drawer at OLDER schema (normalize_version <
-    # current) → PURGED (schema bump supersedes, matches existing develop
-    # test test_mine_convos_rebuilds_stale_drawers_after_schema_bump).
+    # Rule 2 (removed by igorls review): a prior drawer at an OLDER schema
+    # (normalize_version < current) whose content is NOT re-derived this
+    # pass is now PRESERVED as verbatim history.  Currentness is decided by
+    # content identity, not by schema version.
     # ------------------------------------------------------------------
 
-    def test_stale_schema_drawer_purged_not_preserved(self, monkeypatch):
-        """A prior drawer at an older normalize_version (schema bump) must
-        still be purged — the additive-history preservation rule does NOT
-        rescue superseded-schema content."""
+    def test_stale_schema_unique_drawer_preserved_on_schema_bump(self, monkeypatch):
+        """A prior drawer at an older normalize_version (a schema bump) that
+        holds unique nonempty content is PRESERVED, not purged — per the
+        additive-history contract (#1593, #2793) and @igorls's 2026-11-13
+        triage: "a unique nonempty older-schema row is also still a deletion
+        candidate" and must not be.  Currentness is decided by the explicit
+        generation marker (``chunk_total``), not by version identity.
+
+        This pins the boundary that was previously the *opposite* direction
+        from ``test_shrink_preserves_surviving_content_not_rederived`` (which
+        is same-schema); now the two agree: unique nonempty prior bodies are
+        immutable across rewrite, shrink, rechunk, AND schema change.
+        """
         import mempalace.convo_miner as convo_miner
 
         stale_content = (
@@ -1417,12 +1511,15 @@ class TestAdditiveHistoryOrphanDelete:
             "AI: and it was filed with normalize_version 1\n"
         )
         stale_meta = dict(self.CURRENT_SCHEMA)
-        stale_meta["normalize_version"] = 1  # older than current (2)
+        stale_meta["normalize_version"] = 1  # older than current (3)
         stale_meta["chunk_index"] = 0
         stale_id = "drawer_convos_conversations_v1"
         col = _StoredCol({stale_id: (stale_content, stale_meta)})
 
-        # This pass derives a fresh chunk.
+        # This pass derives a fresh chunk whose content is different from the
+        # stale one.  The stale row is on an *older schema*, but its content
+        # is unique and nonempty — the lift helper re-files it under its own
+        # content-addressed id so the positional upsert cannot clobber it.
         chunks = [{"content": "User: v2 schema new content", "chunk_index": 0}]
         self._patch_helpers(monkeypatch, convo_miner)
 
@@ -1431,11 +1528,200 @@ class TestAdditiveHistoryOrphanDelete:
         )
 
         assert skipped is False
-        assert drawers == 1
-        # The older-schema drawer must be purged regardless of its content.
-        assert stale_id not in col.alive(), (
-            "Older-schema (v1) drawer survived re-mine — schema-bump purge "
-            "must take precedence over additive-history preservation"
+        assert drawers >= 1
+        # The older-schema (v1) drawer's verbatim content must survive the
+        # schema-bump rebuild.  It may live under its original id (if the
+        # positional upsert did not land on it) or under a lifted
+        # content-addressed id; in either case the bytes are retrievable and
+        # still stamped with their original normalize_version (they are the
+        # prior generation, not the fresh one).
+        alive_ids = col.alive()
+        survivors = [
+            (i, content, meta)
+            for i, (content, meta) in ((i, col.store[i]) for i in alive_ids)
+            if content is not None and "v1 schema said this text" in content
+        ]
+        assert survivors, (
+            "Older-schema (v1) unique drawer's verbatim content was LOST to a "
+            f"schema-bump rebuild.  Alive ids: {sorted(alive_ids)} — a unique "
+            "nonempty older-schema row must NOT be a deletion candidate; it "
+            "is verbatim history, and currentness is the generation marker, "
+            "not the normalize_version."
+        )
+        # The surviving prior body keeps its original schema stamp — it is the
+        # prior generation, not a re-normalized copy of the fresh one.
+        for _sid, _sdoc, smeta in survivors:
+            assert (smeta or {}).get("normalize_version") == 1, (
+                "Lifted prior body must retain its original normalize_version "
+                "(it is the prior generation), not be re-stamped with the "
+                "fresh schema's version."
+            )
+        # And the fresh generation's body is also present (both generations
+        # coexist).
+        all_docs = [col.store[i][0] for i in alive_ids if col.store[i][0]]
+        assert any("v2 schema new content" in d for d in all_docs), (
+            "Fresh generation's body is missing — the schema bump re-filed the "
+            f"new chunk but the prior body was also lost.  Alive: {sorted(alive_ids)}"
+        )
+
+    # ------------------------------------------------------------------
+    # Acceptance: REWRITE AT THE SAME POSITIONAL ID (primary clobber path).
+    #
+    # This is the case the earlier unit tests *sidestep*: they seed the prior
+    # drawer under a synthetic id (``pre0`` / ``v1``) that never equals the
+    # real positional id, so only the purge-classifier KEEP rule is exercised.
+    # Here the prior drawer sits at the *exact* positional id the fresh upsert
+    # will land on — a genuine in-place rewrite. The only thing that saves the
+    # prior bytes is the lift (``_preserved_prior_rows``) re-filing them under
+    # their own content-addressed id *before* the overwrite. This pins
+    # @igorls's 2026-11-13 point that "the preservation classifier runs after
+    # the overwrite and cannot recover those bytes": recovery must happen
+    # before, by lift. RED on develop (blanket purge + positional clobber),
+    # GREEN at branch head (lift precedes the upsert).
+    # ------------------------------------------------------------------
+
+    def test_rewrite_preserves_prior_body_on_same_positional_id(self, monkeypatch):
+        """A prior drawer stored at the real positional id is rewritten in
+        place (same chunk_index, different text). The prior verbatim body must
+        survive under a lifted content-addressed id, and the fresh body must
+        take the positional id — both generations coexist, neither clobbers
+        the other. Currentness is the generation marker, not the id."""
+        import mempalace.convo_miner as convo_miner
+        from mempalace.ids import make_convo_drawer_id
+
+        source_file = "rewrite_me.txt"
+        wing, room, extract_mode = "convos", "conversations", "exchange"
+        # The REAL positional id for chunk_index 0 — exactly what this pass's
+        # fresh upsert will write to.
+        positional_id = make_convo_drawer_id(wing, room, source_file, extract_mode, 0)
+
+        prior_content = (
+            "User: tell me the original auth design\n"
+            "AI: It used session cookies stored in HttpOnly headers.\n"
+        )
+        prior_meta = dict(self.CURRENT_SCHEMA)
+        prior_meta["chunk_index"] = 0
+        # Seed the prior drawer AT the positional id (an in-place rewrite).
+        col = _StoredCol({positional_id: (prior_content, prior_meta)})
+
+        # This pass rewrites chunk 0 in place: same id, different text.
+        new_content = (
+            "User: what is the new auth design?\nAI: It uses stateless JWTs signed with Ed25519.\n"
+        )
+        chunks = [{"content": new_content, "chunk_index": 0}]
+
+        self._patch_helpers(monkeypatch, convo_miner)
+
+        drawers, _rooms, skipped = convo_miner._file_chunks_locked(
+            col, source_file, chunks, wing, room, "agent-under-test", extract_mode
+        )
+
+        assert skipped is False
+        # The fresh body owns the positional id now.
+        assert col.store[positional_id][0] == new_content, (
+            f"Fresh body did not take the positional id {positional_id}; "
+            f"stored={col.store[positional_id][0]!r}"
+        )
+        # The prior verbatim body must survive under a *different*,
+        # content-addressed id (lifted before the overwrite).
+        survivors = [
+            (i, c)
+            for i, (c, _m) in col.store.items()
+            if i != positional_id and c and "original auth design" in c
+        ]
+        assert survivors, (
+            "Prior body stored at the SAME positional id was clobbered by the "
+            "in-place rewrite. A unique non-blank prior body must be lifted to "
+            f"a content-addressed id BEFORE the upsert. Alive: "
+            f"{sorted(col.alive())}"
+        )
+        # ...and it keeps its prior-generation stamp (normalize_version), not
+        # the fresh one — it is history, not a re-derivation.
+        lift_id, _lift_content = survivors[0]
+        lift_meta = col.store[lift_id][1] or {}
+        assert lift_meta.get("normalize_version") == self.CURRENT_SCHEMA["normalize_version"]
+
+    # ------------------------------------------------------------------
+    # Acceptance: INTERRUPTED PUBLICATION + RETRY (write → mark-current).
+    #
+    # ``write_file_drawers`` writes the fresh + lifted rows FIRST, then
+    # scans/deletes the stale set, and only then finalises ``chunk_total`` to
+    # the real count. If the backend dies between the upsert and the
+    # finalisation (a failed purge-scan), the exception must be raised, the
+    # already-written lifted + fresh rows must remain readable (they carry an
+    # unfinished ``chunk_total``), and a subsequent retry must re-file the same
+    # content without duplicating the lifted prior body. RED on develop (a
+    # blanket purge could delete the prior body, or a crash loses it), GREEN
+    # at branch head (lift rows persist and the retry is idempotent on the
+    # content-addressed id).
+    # ------------------------------------------------------------------
+
+    def test_interrupted_publication_retry_preserves_lifted_rows(self, monkeypatch):
+        """An interrupted publication (backend dies during the stale-scan,
+        after the fresh + lifted upsert) must not lose the lifted prior body,
+        and the retry must not duplicate it. The lifted row is keyed by a
+        content-addressed id, so re-filing the same prior content is a
+        no-op upsert — verbatim preserved exactly once across the retry."""
+        import mempalace.convo_miner as convo_miner
+        from mempalace.ids import make_convo_drawer_id
+        from mempalace.palace import StaleDrawerPurgeFailed
+
+        source_file = "interrupt_me.txt"
+        wing, room, extract_mode = "convos", "conversations", "exchange"
+        positional_id = make_convo_drawer_id(wing, room, source_file, extract_mode, 0)
+
+        prior_content = (
+            "User: the pre-interrupt design notes\nAI: We cached embeddings with an LRU of 10k.\n"
+        )
+        prior_meta = dict(self.CURRENT_SCHEMA)
+        prior_meta["chunk_index"] = 0
+        new_content = (
+            "User: the post-interrupt redesign\nAI: We moved to a content-addressed store.\n"
+        )
+        chunks = [{"content": new_content, "chunk_index": 0}]
+
+        def _run(col):
+            convo_miner._file_chunks_locked(
+                col, source_file, chunks, wing, room, "agent-under-test", extract_mode
+            )
+
+        # --- Attempt 1: the purge-scan fails after the upsert. -------------
+        col1 = _RetryCol({positional_id: (prior_content, prior_meta)})
+        self._patch_helpers(monkeypatch, convo_miner)
+        # The lift reads by ids (succeeds); the stale-scan reads by where (fails).
+        col1.fail_where_get = True
+        with pytest.raises(StaleDrawerPurgeFailed):
+            _run(col1)
+        # After the interruption the lifted prior body is still readable
+        # (it was upserted before the scan died), under a lifted id, and the
+        # positional id carries the fresh body.
+        survivors = [
+            (i, c)
+            for i, (c, _m) in col1.store.items()
+            if i != positional_id and c and "pre-interrupt design notes" in c
+        ]
+        assert survivors, (
+            "Interrupted publication LOST the lifted prior body before the "
+            f"retry could see it. Alive: {sorted(col1.alive())}"
+        )
+        assert col1.store[positional_id][0] == new_content
+        # The fresh rows are marked unfinished (chunk_total one too high), so
+        # file_already_mined must still read the file as not mined.
+        fresh_meta = col1.store[positional_id][1] or {}
+        assert fresh_meta.get("chunk_total") == 2  # total=1, written as +1=2
+
+        # --- Attempt 2: the retry, with the backend healthy again. ---------
+        # It re-files the same chunks; the prior body is already lifted, so
+        # the lift is a no-op on its content-addressed id — no duplication.
+        col2 = _RetryCol({i: (c, m) for i, (c, m) in col1.store.items()})
+        col2.fail_where_get = False
+        _run(col2)
+        # Exactly ONE copy of the prior body survives the retry (no dup from
+        # re-lifting the same content-addressed id).
+        count = sum(1 for c in col2.alive_contents() if "pre-interrupt design notes" in c)
+        assert count == 1, (
+            f"Retry duplicated the lifted prior body ({count} copies) — the "
+            "content-addressed lift must be idempotent across retries."
         )
 
     # ------------------------------------------------------------------
