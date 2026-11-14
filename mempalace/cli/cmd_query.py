@@ -40,6 +40,14 @@ def cmd_search(args):
         sys.exit(1)
 
 
+def cmd_brief(args):
+    from ..searcher import brief
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    result = brief(palace_path=palace_path, wing=args.wing, room=args.room)
+    print(result)
+
+
 def cmd_wakeup(args):
     """Show L0 (identity) + L1 (essential story) — the wake-up context."""
     from ..layers import MemoryStack
