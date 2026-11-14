@@ -31,10 +31,10 @@ def _fail_purge_for(monkeypatch, names):
 
     real = palace._source_file_delete_ids
 
-    def delete_ids(collection, source_file, extract_mode):
+    def delete_ids(collection, source_file, extract_mode, pass_contents=None):
         if os.path.basename(source_file) in names:
             raise RuntimeError("simulated closed backend handle")
-        return real(collection, source_file, extract_mode)
+        return real(collection, source_file, extract_mode, pass_contents=pass_contents)
 
     monkeypatch.setattr(palace, "_source_file_delete_ids", delete_ids)
 
