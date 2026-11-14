@@ -524,6 +524,7 @@ class OpenAICompatProvider(LLMProvider):
             api_key_source=source,
         )
         self._send_temperature = True
+        self._send_json_mode = True
 
     def _resolve_url(self) -> str:
         if not self.endpoint:
@@ -600,6 +601,12 @@ class OpenAICompatProvider(LLMProvider):
         OpenAI's reasoning models accept only the default ``temperature``. An
         HTTP 400 that names the field drops it and later calls on this provider
         skip it, so they do not repeat a request that would fail.
+
+        ``json_mode`` asks for ``response_format: {"type": "json_object"}``.
+        vLLM rejects that form and wants a JSON schema instead, so a 400 that
+        names ``response_format`` drops the field for the retry and for later
+        calls. Callers parse JSON out of the reply text either way, which makes
+        the structured hint an optimization rather than a requirement.
         """
         body: dict = {
             "model": self.model,
@@ -610,7 +617,7 @@ class OpenAICompatProvider(LLMProvider):
         }
         if self._send_temperature:
             body["temperature"] = 0.1
-        if json_mode:
+        if json_mode and self._send_json_mode:
             body["response_format"] = {"type": "json_object"}
         if think is False:
             body["reasoning_effort"] = "none"
@@ -629,6 +636,9 @@ class OpenAICompatProvider(LLMProvider):
                 if "temperature" in body and "temperature" in str(e):
                     body.pop("temperature")
                     self._send_temperature = False
+                elif "response_format" in body and "response_format" in str(e):
+                    body.pop("response_format")
+                    self._send_json_mode = False
                 elif "reasoning_effort" in body:
                     body.pop("reasoning_effort")
                 else:
