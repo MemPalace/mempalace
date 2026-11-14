@@ -365,17 +365,34 @@ PALACE_ROOMS = [
 _PALACE_ROOM_LIST = "\n".join(f"  - {r}" for r in PALACE_ROOMS)
 
 
+def _llm_base_url(model):
+    """Route explicitly selected MiniMax models to their configured endpoint."""
+    if model.startswith("MiniMax"):
+        return os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.io/anthropic").rstrip("/")
+    return "https://api.anthropic.com"
+
+
+def _llm_options(model, max_tokens):
+    """Leave room for Flash's required adaptive reasoning before the short answer."""
+    if model == "MiniMax-M3.1-Flash":
+        return {
+            "max_tokens": max(max_tokens, 16384),
+            "thinking": {"type": "adaptive"},
+        }
+    return {"max_tokens": max_tokens}
+
+
 def _llm_call(prompt, api_key, model="claude-haiku-4-5-20251001", max_tokens=32):
     """Minimal LLM call. Returns text response or empty string on failure."""
     payload = json.dumps(
         {
             "model": model,
-            "max_tokens": max_tokens,
+            **_llm_options(model, max_tokens),
             "messages": [{"role": "user", "content": prompt}],
         }
     ).encode("utf-8")
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
+        f"{_llm_base_url(model)}/v1/messages",
         data=payload,
         headers={
             "x-api-key": api_key,
@@ -387,7 +404,9 @@ def _llm_call(prompt, api_key, model="claude-haiku-4-5-20251001", max_tokens=32)
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             result = json.loads(resp.read())
-        return result["content"][0]["text"].strip()
+        return "".join(
+            b.get("text", "") for b in result["content"] if b.get("type") == "text"
+        ).strip()
     except Exception:
         return ""
 
@@ -501,11 +520,11 @@ def llm_rerank_locomo(
         if api_key:
             headers["authorization"] = f"Bearer {api_key}"
     else:
-        url = "https://api.anthropic.com/v1/messages"
+        url = f"{_llm_base_url(model)}/v1/messages"
         payload = json.dumps(
             {
                 "model": model,
-                "max_tokens": 8,
+                **_llm_options(model, 8),
                 "messages": [{"role": "user", "content": prompt}],
             }
         ).encode("utf-8")
@@ -527,7 +546,9 @@ def llm_rerank_locomo(
                 msg = result["choices"][0]["message"]
                 raw = (msg.get("content") or "").strip() or (msg.get("reasoning") or "").strip()
             else:
-                raw = result["content"][0]["text"].strip()
+                raw = "".join(
+                    b.get("text", "") for b in result["content"] if b.get("type") == "text"
+                ).strip()
             # Take LAST integer — reasoning models often count candidates first
             m = re.search(r"\b(\d+)\b", raw[::-1])
             if m:
@@ -548,10 +569,12 @@ def llm_rerank_locomo(
     return retrieved_ids
 
 
-def _load_api_key(key_arg):
-    """Load API key from --llm-key arg or ANTHROPIC_API_KEY env var."""
+def _load_api_key(key_arg, model="", backend="anthropic"):
+    """Use an explicit key or the selected provider's environment variable."""
     if key_arg:
         return key_arg
+    if backend == "anthropic" and model.startswith("MiniMax"):
+        return os.environ.get("MINIMAX_API_KEY", "")
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if env_key:
         return env_key
@@ -588,14 +611,16 @@ def run_benchmark(
         data = data[:limit]
 
     api_key = ""
-    if llm_rerank_enabled or mode == "palace":
-        api_key = _load_api_key(llm_key)
-        # Ollama backend doesn't require an Anthropic key. Palace mode still does
-        # (it uses Anthropic for room-assignment indexing) — so only relax the
-        # requirement when rerank is the ONLY llm use and backend is ollama.
-        needs_key = mode == "palace" or (llm_rerank_enabled and llm_backend == "anthropic")
-        if needs_key and not api_key:
-            print(f"ERROR: --mode {mode} / --llm-rerank (anthropic) requires an API key.")
+    palace_api_key = ""
+    if llm_rerank_enabled:
+        api_key = _load_api_key(llm_key, llm_model, llm_backend)
+        if llm_backend == "anthropic" and not api_key:
+            print("ERROR: --llm-rerank requires an API key for the selected model.")
+            sys.exit(1)
+    if mode == "palace":
+        palace_api_key = _load_api_key(llm_key, palace_model)
+        if not palace_api_key:
+            print("ERROR: --mode palace requires an API key for --palace-model.")
             sys.exit(1)
 
     # Palace mode: load or create room assignment cache
@@ -644,7 +669,7 @@ def run_benchmark(
         room_assignments = {}
         if mode == "palace":
             room_assignments = palace_assign_rooms(
-                sessions, sample_id, api_key, palace_cache, model=palace_model
+                sessions, sample_id, palace_api_key, palace_cache, model=palace_model
             )
             # Persist updated cache after each conversation
             if _palace_cache_path:
@@ -992,9 +1017,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm-model",
         default="claude-sonnet-4-6",
-        help="Model for LLM rerank (default: claude-sonnet-4-6)",
+        help="Model for LLM rerank (default: claude-sonnet-4-6). "
+        "MiniMax models: MiniMax-M3.1-Flash (recommended), MiniMax-M3. "
+        "Set MINIMAX_API_KEY; MINIMAX_BASE_URL overrides the endpoint. "
+        "Explicit legacy/custom model IDs are passed through.",
     )
-    parser.add_argument("--llm-key", default="", help="API key (or set ANTHROPIC_API_KEY env var)")
+    parser.add_argument(
+        "--llm-key",
+        default="",
+        help="API key (or set MINIMAX_API_KEY/ANTHROPIC_API_KEY for the selected model)",
+    )
     parser.add_argument(
         "--llm-backend",
         choices=["anthropic", "ollama"],
