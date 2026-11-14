@@ -62,8 +62,9 @@ logger = logging.getLogger(__name__)
 # The store is resolved through ``_get_hallway_file`` below, which mirrors
 # ``palace_graph._get_tunnel_file`` (the 3.3.6 palace-scoped pattern), and the
 # database sits beside that path. Tests should monkey-patch
-# ``_get_hallway_file`` and ``_legacy_hallway_file`` rather than poking a
-# module-level constant: both the database and the imported JSON follow it.
+# ``_get_hallway_file``, ``_legacy_hallway_file`` and ``_legacy_hallway_db``
+# rather than poking a module-level constant: the database and the imported
+# JSON all follow those helpers.
 
 
 __all__ = [
@@ -327,8 +328,131 @@ def _hallway_file_lock(config=None):
 
 
 def _legacy_hallway_file() -> str:
-    """The pre-palace-scoped hardcoded path. Kept only for one-time orphan detection."""
+    """The pre-palace-scoped hardcoded JSON path. Kept only for one-time orphan detection."""
     return str(paths.state_path("hallways.json"))
+
+
+def _legacy_hallway_db() -> str:
+    """The pre-palace-scoped hardcoded SQLite store, beside the legacy JSON.
+
+    Mirrors :func:`_legacy_hallway_file` for the database: the pre-scoping
+    store sat at ``~/.mempalace/hallways.sqlite3`` regardless of the
+    configured palace_path. Kept only for one-time detection and a one-time
+    import into the keyed store.
+    """
+    return os.path.splitext(_legacy_hallway_file())[0] + ".sqlite3"
+
+
+def _rowcount(conn: sqlite3.Connection) -> int:
+    """How many hallway rows a connection's store currently holds (0 if no table)."""
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hallways'"
+    ).fetchone()
+    if not has_table:
+        return 0
+    return conn.execute("SELECT COUNT(*) FROM hallways").fetchone()[0] or 0
+
+
+def _import_legacy_db_once(config=None) -> int:
+    """One-time, self-contained import of the legacy pre-scoped SQLite store.
+
+    Detects a legacy ``hallways.sqlite3`` at the pre-scoping path — INDEPENDENT
+    of the JSON — and, if it is safe to do so, imports its rows into the keyed
+    store in one write transaction under the store lock, under the existing
+    imported-once guard. Returns the number of rows imported (0 otherwise).
+
+    Detection always warns naming BOTH the legacy DB path and the new keyed DB
+    path, so the user can see where the prior data lived and where it now
+    lives. Import only happens when it is unambiguous: the keyed store is
+    empty, not yet the source of truth, and no JSON (configured or legacy) is
+    present that would make the source unclear. In the ambiguous both-present
+    case the auto-merge is REFUSED — both legacy stores are kept as-is and the
+    user is told which paths to recover — rather than guess which is newer.
+
+    The legacy store is never moved aside: it is preserved for the user.
+    """
+    legacy = _legacy_hallway_db()
+    keyed = _get_hallway_db(config)
+    if not os.path.exists(legacy) or os.path.abspath(legacy) == os.path.abspath(keyed):
+        return 0
+
+    # Detect: name both the legacy store and the keyed store it would feed.
+    legacy_json = _legacy_hallway_file()
+    current_json = _get_hallway_file(config)
+    current_json_present = os.path.exists(current_json)
+    legacy_json_present = os.path.exists(legacy_json) and os.path.abspath(
+        legacy_json
+    ) != os.path.abspath(current_json)
+
+    if current_json_present:
+        # A JSON is present at the configured path, so the JSON-fallback path
+        # already warns about it (naming both paths and the keyed DB). This
+        # probe stays silent here to avoid double-warning the same file.
+        return 0
+
+    if legacy_json_present:
+        # Ambiguous: both a legacy JSON and a legacy SQLite store are present.
+        # We cannot know which holds the newer data, so we refuse the
+        # auto-merge and keep both for the user to recover.
+        logger.warning(
+            "Legacy hallways found at both '%s' (JSON) and '%s' (SQLite), but the keyed "
+            "store '%s' is empty. Refusing to auto-merge ambiguous data — both legacy "
+            "stores are kept as-is. Move or copy the one you want to the configured path "
+            "to recover it.",
+            legacy_json,
+            legacy,
+            keyed,
+        )
+        return 0
+
+    # Sole source: only the legacy SQLite store has prior data. Warn naming
+    # both the legacy DB path and the new keyed DB path, then import.
+    logger.warning(
+        "Legacy hallway store detected at '%s'; the keyed store is '%s'. "
+        "Importing its records into the keyed store so they are not lost.",
+        legacy,
+        keyed,
+    )
+
+    # Unambiguous: read the legacy store's rows, then import them into the
+    # keyed store in a single write transaction.
+    legacy_rows: list = []
+    lconn = None
+    try:
+        lconn = _connect(legacy, readonly=True)
+        has_table = lconn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hallways'"
+        ).fetchone()
+        if has_table:
+            legacy_rows = lconn.execute(
+                "SELECT id, wing, entity_a, entity_b, co_occurrence_count, signature, record"
+                " FROM hallways ORDER BY rowid"
+            ).fetchall()
+    except sqlite3.Error:
+        logger.warning("hallways: legacy store %s could not be read; leaving it in place", legacy)
+        logger.debug("hallways: legacy store open failed", exc_info=True)
+        return 0
+    finally:
+        if lconn is not None:
+            lconn.close()
+
+    if not legacy_rows:
+        return 0
+
+    with _writing(config) as conn:
+        # _import_json_once has already run (setting the marker). If the
+        # keyed store now holds rows from a previous JSON import, bail —
+        # the data there is the source of truth.
+        if _rowcount(conn) > 0:
+            return 0
+        conn.executemany(_UPSERT, legacy_rows)
+    logger.info(
+        "hallways: imported %d record(s) from legacy store %s into %s",
+        len(legacy_rows),
+        legacy,
+        keyed,
+    )
+    return len(legacy_rows)
 
 
 def _load_hallways_for_write(config=None) -> list[dict]:
@@ -347,13 +471,23 @@ def _load_hallways(config=None) -> list[dict]:
     """Read all hallway records in list order. ``[]`` when there are none.
 
     Reads the store once a write has imported ``hallways.json`` into it, and
-    the JSON until then (``[]`` if that is missing or corrupt).
+    the JSON until then (``[]`` if that is missing or corrupt). When the keyed
+    store holds no records yet, also probes for a legacy pre-scoped
+    ``hallways.sqlite3`` — independent of the JSON — and imports it if it is
+    the sole source of prior data.
     """
     conn = _reader(config)
-    if conn is None:
-        return _load_hallways_json(config)
-    with contextlib.closing(conn):
-        return _records(conn.execute("SELECT record FROM hallways ORDER BY rowid"))
+    if conn is not None:
+        with contextlib.closing(conn):
+            return _records(conn.execute("SELECT record FROM hallways ORDER BY rowid"))
+    # No keyed records yet. Probe for a legacy store and import it if it is
+    # the sole source, then re-read it.
+    if _import_legacy_db_once(config):
+        conn = _reader(config)
+        if conn is not None:
+            with contextlib.closing(conn):
+                return _records(conn.execute("SELECT record FROM hallways ORDER BY rowid"))
+    return _load_hallways_json(config)
 
 
 def _load_hallways_json(config=None) -> list[dict]:
@@ -389,6 +523,26 @@ def _load_hallways_json(config=None) -> list[dict]:
             legacy,
             current_hallway_file,
         )
+
+    pre_keyed = os.path.join(os.path.dirname(current_hallway_file), "hallways.json")
+    if pre_keyed != current_hallway_file and os.path.exists(pre_keyed):
+        pre_keyed_db = os.path.splitext(pre_keyed)[0] + ".sqlite3"
+        db_hint = (
+            f" Its SQLite store at '{pre_keyed_db}' also needs to be renamed."
+            if os.path.exists(pre_keyed_db)
+            else ""
+        )
+        logger.warning(
+            "Hallways file at '%s' is being ignored; the per-palace name is now '%s'. "
+            "Move or copy the file (preserving its contents) to the new path to recover its hallways.%s",
+            pre_keyed,
+            current_hallway_file,
+            db_hint,
+        )
+
+    # The SQLite-only legacy store is probed and (if unambiguous)
+    # imported by the caller (:func:`_load_hallways`) before falling back
+    # here. This function stays focused on JSON detection + warning.
     return []
 
 
