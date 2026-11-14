@@ -454,19 +454,30 @@ def sqlite_lexical_rows(
 ) -> list[tuple]:
     """Decoded ``(drawer_id, document, metadata)`` worth BM25-ranking for ``query``.
 
-    The best ``limit`` full-text matches by FTS rank, or every match under a
-    ``where``, which is applied to the stored metadata afterwards: a cap
-    before filtering could fill with wrong-scope rows. The newest ``limit``
-    rows stand in when no query term is three characters long or the
-    full-text query fails; a clean miss stays empty. ``[]`` when the database
-    is missing or unreadable.
+    Supported source/wing/room equalities are applied inside SQL *before*
+    the candidate LIMIT, so short-query recency fallback cannot lose the
+    only matching drawer beneath newer records from another source.
+    Unsupported complex filters retain the post-filter fallback. A clean
+    full-text miss stays empty; ``[]`` if the database is unreadable.
     """
     tokens = [t for t in tokenize(query) if len(t) >= 3]
 
     def read(conn):
+        conn.execute("BEGIN")
+        _install_sqlite_convo_visibility(conn, collection_name)
+        equalities = _string_equalities(where)
+        scoped_in_sql = equalities is not None
+        filter_sql, filter_params = ("", [])
+        if scoped_in_sql:
+            # Match the encoded value stored in Chroma metadata (e.g. NUL).
+            stored = [
+                (key, tuple(encode_filter(value) for value in values)) for key, values in equalities
+            ]
+            filter_sql, filter_params = _match_sql(stored, "e.id")
         row_ids: list[int] = []
         recency = not tokens
         if tokens:
+            # Preserve full scoped BM25 recall; only unscoped FTS is capped.
             limit_sql = "" if where else "ORDER BY embedding_fulltext_search.rank LIMIT ?"
             try:
                 row_ids = [
@@ -480,15 +491,24 @@ def sqlite_lexical_rows(
                         JOIN collections c ON s.collection = c.id
                         WHERE embedding_fulltext_search MATCH ?
                           AND c.name = ?
+                          AND _mempalace_convo_public(e.id)
+                        {filter_sql}
                         {limit_sql}
                         """,
-                        (" OR ".join(tokens), collection_name) + (() if where else (limit,)),
+                        (" OR ".join(tokens), collection_name, *filter_params)
+                        + (() if where else (limit,)),
                     )
                 ]
             except sqlite3.Error:
                 recency = True
         if not row_ids and recency:
-            row_ids = _newest_row_ids(conn, collection_name, limit)
+            row_ids = _newest_row_ids(
+                conn,
+                collection_name,
+                limit,
+                " AND _mempalace_convo_public(e.id)" + filter_sql,
+                filter_params,
+            )
         return _decoded_rows(conn, row_ids, where)
 
     return _read_db(palace_path, read) or []
@@ -906,6 +926,8 @@ def _sqlite_iter_metadata(
     keys: Optional[Iterable[str]],
     require_key: Optional[str],
     equals: Optional[dict] = None,
+    *,
+    with_ids: bool = False,
 ) -> Iterator[Optional[dict]]:
     """Stream each drawer's stored metadata from an open connection, in row order.
 
@@ -958,14 +980,14 @@ def _sqlite_iter_metadata(
     for row_id, key, sval, ival, fval, bval in cursor:
         if row_id != current_id:
             if current_id is not None:
-                yield current
+                yield (current_id, current) if with_ids else current
             current_id, current = row_id, None
         if key is not None:
             if current is None:
                 current = {}
             current[key] = _cell_value(sval, ival, fval, bval)
     if current_id is not None:
-        yield current
+        yield (current_id, current) if with_ids else current
 
 
 def sqlite_iter_metadata(
@@ -1060,6 +1082,64 @@ def _sqlite_ready_metadata_segment(conn, collection_name):
     return collection_id, segment_id
 
 
+def _install_sqlite_convo_visibility(conn, collection_name: str) -> None:
+    """Apply source-wide conversation completeness inside this SQLite snapshot.
+
+    The scalar predicate is evaluated by FTS/recency SQL *before* candidate
+    LIMIT, so an interrupted B batch cannot displace the last visible A hit.
+    It is only a metadata completeness check, not an atomic publish marker.
+    A pending metadata projection is never treated as an authorized snapshot.
+    """
+    from ..convo_visibility import visible_conversation_rows
+
+    # Legacy/hand-built Chroma schemas need not have a metadata-segment
+    # recovery watermark (or even a segments.scope column). If the palace
+    # has no conversation generations, leave its existing lexical behavior
+    # untouched instead of rejecting unrelated search queries. A stamped
+    # conversation requires the recovered snapshot below and fails closed.
+    if not conn.execute(
+        "SELECT 1 FROM embedding_metadata m"
+        " JOIN embeddings e ON m.id = e.id"
+        " JOIN segments s ON e.segment_id = s.id"
+        " JOIN collections c ON s.collection = c.id"
+        " WHERE c.name = ? AND m.key = 'ingest_mode'"
+        " AND m.string_value = 'convos' LIMIT 1",
+        (collection_name,),
+    ).fetchone():
+        conn.create_function("_mempalace_convo_public", 1, lambda _row_id: True)
+        return
+
+    if _sqlite_ready_metadata_segment(conn, collection_name) is None:
+        raise MetadataRecoveryPending("conversation visibility needs recovered metadata")
+
+    keys = (
+        "ingest_mode",
+        "source_file",
+        "extract_mode",
+        "source_mtime",
+        "filed_at",
+        "historical_version",
+        "chunk_index",
+        "chunk_total",
+    )
+    ids = []
+    metadatas = []
+    for row_id, metadata in _sqlite_iter_metadata(
+        conn,
+        collection_name,
+        keys,
+        require_key=None,
+        equals={"ingest_mode": "convos"},
+        with_ids=True,
+    ):
+        ids.append(row_id)
+        metadatas.append(decode_record(None, metadata)[1] or {})
+
+    visible = {row_id for row_id, _ in visible_conversation_rows(ids, metadatas)}
+    hidden = set(ids).difference(visible)
+    conn.create_function("_mempalace_convo_public", 1, lambda row_id: row_id not in hidden)
+
+
 @contextlib.contextmanager
 def _ready_snapshot(palace_path: str, collection_name: str):
     """``(conn, (collection_id, segment_id))`` in one read transaction, or ``None``.
@@ -1110,7 +1190,7 @@ def sqlite_list_id_metadata(
     render one page of previews. Callers hydrate the page they display via
     :func:`sqlite_documents_for_ids`.
 
-    ``where`` supports equality or ``$in`` on ``wing``/``room`` and ``$and``
+    ``where`` supports equality or ``$in`` on ``wing``/``room``/``source_file`` and ``$and``
     of those, matching ``tool_list_drawers``; it is applied in SQL. Returns
     ``None`` when sqlite cannot be trusted so the caller can fall back to
     ``col.get`` paging.
@@ -1118,7 +1198,7 @@ def sqlite_list_id_metadata(
     if _db_file(palace_path) is None:
         return None
     pairs = _where_pairs(where)
-    if pairs is None or any(key not in ("wing", "room") for key, _ in pairs):
+    if pairs is None or any(key not in ("wing", "room", "source_file") for key, _ in pairs):
         return None
     filters = dict(pairs)
     reader = (

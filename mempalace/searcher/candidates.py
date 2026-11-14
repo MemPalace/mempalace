@@ -72,8 +72,15 @@ def _ordered_source_chunks(source_drawers) -> list:
     return indexed
 
 
-def _load_source_chunks(cache: dict, drawers_col, full_source: str, parent_drawer_id):
-    cache_key = (full_source, parent_drawer_id)
+def _load_source_chunks(
+    cache: dict,
+    drawers_col,
+    full_source: str,
+    parent_drawer_id,
+    generation=None,
+    visibility_filter=None,
+):
+    cache_key = (full_source, parent_drawer_id, generation)
     if cache_key in cache:
         return cache[cache_key]
     try:
@@ -85,6 +92,44 @@ def _load_source_chunks(cache: dict, drawers_col, full_source: str, parent_drawe
         logger.debug("Neighbor fetch failed for %s", full_source, exc_info=True)
         cache[cache_key] = None
         return None
+    if generation is not None:
+        # Search hits have already passed the public candidate gate, but
+        # neighbor hydration is a second read. Never splice unfinished B
+        # chunks, or chunks from a different complete A/B generation, into
+        # the context of a published result.
+        if visibility_filter is None:
+            cache[cache_key] = None
+            return None
+
+        def field(name):
+            value = getattr(source_drawers, name, None)
+            if value is None and isinstance(source_drawers, dict):
+                value = source_drawers.get(name)
+            return list(value or [])
+
+        ids = field("ids")
+        docs = field("documents")
+        metadatas = field("metadatas")
+        allowed = visibility_filter(zip(ids, metadatas, docs))
+        indexed = []
+        for offset, (row_id, doc, meta) in enumerate(zip(ids, docs, metadatas)):
+            meta = meta or {}
+            row_generation = (
+                meta.get("source_mtime"),
+                meta.get("filed_at"),
+                meta.get("extract_mode"),
+                meta.get("historical_version") is True,
+            )
+            if (
+                row_id in allowed
+                and meta.get("ingest_mode") == "convos"
+                and row_generation == generation
+            ):
+                indexed.append((_source_chunk_index(meta, offset), doc or ""))
+        indexed.sort(key=lambda pair: pair[0])
+        cache[cache_key] = indexed
+        return indexed
+
     cache[cache_key] = _ordered_source_chunks(source_drawers)
     return cache[cache_key]
 
@@ -120,7 +165,7 @@ def _neighbor_context(indexed: list, matched: int) -> str:
     return context
 
 
-def _enrich_closet_hits(hits: list, drawers_col) -> list:
+def _enrich_closet_hits(hits: list, drawers_col, visibility_filter=None) -> list:
     """Keep each closet hit's own drawer text and attach neighbor context.
 
     ``text`` is the matched drawer, verbatim. Chunks beside that drawer's
@@ -140,6 +185,8 @@ def _enrich_closet_hits(hits: list, drawers_col) -> list:
             drawers_col,
             full_source,
             hit.get("_parent_drawer_id") or None,
+            hit.get("_convo_generation"),
+            visibility_filter,
         )
         if not indexed or len(indexed) <= 1:
             continue
@@ -267,6 +314,7 @@ def _apply_candidate_strategy(
     before_dt=None,
     stats: dict = None,
     known_distances: dict = None,
+    visibility_filter=None,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -290,6 +338,7 @@ def _apply_candidate_strategy(
             before_dt=before_dt,
             stats=stats,
             known_distances=known_distances,
+            visibility_filter=visibility_filter,
         )
 
 
@@ -309,6 +358,7 @@ def _finalize_candidate_hits(
     before_dt=None,
     stats: dict = None,
     known_distances: dict = None,
+    visibility_filter=None,
 ) -> tuple:
     try:
         _apply_candidate_strategy(
@@ -325,6 +375,7 @@ def _finalize_candidate_hits(
             before_dt=before_dt,
             stats=stats,
             known_distances=known_distances,
+            visibility_filter=visibility_filter,
         )
     except UnsupportedCapabilityError:
         return [], _search_error_result(
@@ -353,6 +404,7 @@ def _finalize_candidate_hits(
         hit.pop("_source_file_full", None)
         hit.pop("_chunk_index", None)
         hit.pop("_parent_drawer_id", None)
+        hit.pop("_convo_generation", None)
 
     return hits, None
 

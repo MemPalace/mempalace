@@ -796,16 +796,18 @@ class TestFileChunksLocked:
             def __init__(self):
                 self.upserted = []
                 self.update_called = False
+                self.wrote_current_rows = False
 
             def get(self, where=None, ids=None, **kwargs):
-                if where is not None:
+                if where is not None and self.wrote_current_rows:
                     raise RuntimeError("simulated transient backend error")
-                return {"ids": [], "metadatas": []}
+                return {"ids": [], "metadatas": [], "documents": []}
 
             def delete(self, *args, **kwargs):
                 pass
 
             def upsert(self, documents, ids, metadatas):
+                self.wrote_current_rows = True
                 self.upserted.extend(metadatas)
 
             def update(self, *args, **kwargs):

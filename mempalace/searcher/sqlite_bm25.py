@@ -166,6 +166,7 @@ def _bm25_only_via_sqlite(
 
     def _metadata_filter_sql(row_id_expr: str) -> tuple[str, list[str]]:
         sql, params = _match_sql(equalities, row_id_expr, "mf")
+        sql += f" AND _mempalace_convo_public({row_id_expr})"
         for op, sql_bound in _window_sql_prefilters(since_dt, before_dt):
             sql += (
                 " AND EXISTS (SELECT 1 FROM embedding_metadata mf"
@@ -179,6 +180,12 @@ def _bm25_only_via_sqlite(
         conn = open_palace_reader(db_path)
     except sqlite3.Error as e:
         return _search_error_result(f"sqlite open failed: {e}")
+    try:
+        conn.execute("BEGIN")
+        _install_sqlite_convo_visibility(conn, collection_name)
+    except sqlite3.Error as e:
+        conn.close()
+        return _search_error_result(f"sqlite conversation visibility unavailable: {e}")
 
     window_active = since_dt is not None or before_dt is not None
     try:
@@ -327,6 +334,7 @@ def _merge_bm25_union_candidates(
     before_dt=None,
     stats: dict = None,
     known_distances: dict = None,
+    visibility_filter=None,
 ) -> None:
     """Append top-K backend lexical candidates into ``hits`` in place.
 
@@ -367,8 +375,20 @@ def _merge_bm25_union_candidates(
         stats["candidate_strategy_fallback"] = "lexical_search_failed"
         return
 
+    lexical_hits = list(lexical.hits)
+    if visibility_filter is not None:
+        visible_ids = visibility_filter(
+            (hit.id, hit.metadata or {}, hit.document) for hit in lexical_hits
+        )
+        hidden_count = sum(hit.id not in visible_ids for hit in lexical_hits)
+        if hidden_count:
+            stats["filtered_by_uncommitted_generation"] = (
+                stats.get("filtered_by_uncommitted_generation", 0) + hidden_count
+            )
+        lexical_hits = [hit for hit in lexical_hits if hit.id in visible_ids]
+
     metric = _metric_for_collection(drawers_col)
-    unmeasured = [hit for hit in lexical.hits if hit.id not in known_distances]
+    unmeasured = [hit for hit in lexical_hits if hit.id not in known_distances]
     lexical_distances = (
         _lexical_hit_vector_distances(drawers_col, query, unmeasured, metric)
         if _has_distance_cutoff(max_distance) and unmeasured
@@ -376,7 +396,7 @@ def _merge_bm25_union_candidates(
     )
 
     bm25_extra = []
-    for hit in lexical.hits:
+    for hit in lexical_hits:
         meta = hit.metadata or {}
         if is_bookkeeping(meta, hit.id):
             continue

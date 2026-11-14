@@ -264,6 +264,78 @@ def _bulk_drawer_records(col, drawer_ids):
     return found
 
 
+def _public_conversation_record_visible(record, *, col=None, source_cache=None):
+    """Fail closed for torn conversation generations on public get APIs.
+
+    Metadata-only completeness, not an atomic commit protocol: each source
+    must also have a staged physical generation and durable publication marker
+    before this can guarantee concurrent-reader snapshot isolation.
+    """
+    from ..convo_visibility import visible_conversation_rows
+
+    watched = [
+        (row_id, meta or {})
+        for row_id, meta in zip(record["ids"], record["metadatas"])
+        if (meta or {}).get("ingest_mode") == "convos"
+        and (meta or {}).get("extract_mode") in ("exchange", "general")
+        and "chunk_total" in (meta or {})
+    ]
+    if not watched:
+        return True
+
+    cache = source_cache if source_cache is not None else {}
+    for row_id, meta in watched:
+        source = meta.get("source_file")
+        if not isinstance(source, str) or not source:
+            return False
+        if source not in cache:
+            listed = None
+            if _is_chroma_backend() and _config.palace_path:
+                from ..backends.chroma_sqlite import sqlite_list_id_metadata
+
+                listed = sqlite_list_id_metadata(
+                    _config.palace_path,
+                    _config.collection_name,
+                    where={"source_file": source},
+                )
+            if listed is None:
+                if col is None:
+                    col = _get_collection()
+                if col is None:
+                    raise RuntimeError("cannot verify conversation generation without a collection")
+                source_ids, _, source_meta = _fetch_drawer_rows(
+                    col, where={"source_file": source}, include=["metadatas"]
+                )
+            else:
+                source_ids, source_meta = listed
+            if len(source_ids) != len(source_meta):
+                raise RuntimeError("incomplete conversation visibility snapshot")
+            cache[source] = dict(visible_conversation_rows(source_ids, source_meta))
+
+        stored = cache[source].get(row_id)
+        if stored is None:
+            return False
+        # A row can be replaced between the direct read and the source scan.
+        # Never authorize a different version simply because it shares an ID.
+        compare_keys = (
+            "ingest_mode",
+            "source_file",
+            "extract_mode",
+            "source_mtime",
+            "filed_at",
+            "chunk_total",
+            "chunk_index",
+            "historical_version",
+            # Metadata from a later same-ID write must not authorize content
+            # under an earlier generation's placement or record kind.
+            "wing",
+            "room",
+        )
+        if any((stored or {}).get(key) != meta.get(key) for key in compare_keys):
+            return False
+    return True
+
+
 def _drawer_payload(record):
     safe_meta = _response_safe_meta(record["metadata"])
 
@@ -361,14 +433,50 @@ def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
         drawer["content_preview"] = _content_preview(content)
 
 
-def _fill_drawer_previews(col, page: list) -> None:
-    """Hydrate ``content_preview`` for a page of logical drawers only."""
+def _fill_drawer_previews(col, page: list, *, expected_metadata=None) -> None:
+    """Hydrate page previews, rejecting an SDK race with a conversation re-mine.
+
+    The SDK fallback selects metadata and fetches documents in separate reads.
+    A positional ID can be overwritten in between; without checking the
+    hydrated metadata, a list authorized as generation A could show B text.
+    The SQLite fast path instead hydrates within its original transaction.
+    """
     physical_ids = _page_physical_ids(page)
     if not physical_ids:
         return
-    result = col.get(ids=physical_ids, include=["documents"])
+    include = ["documents", "metadatas"] if expected_metadata is not None else ["documents"]
+    result = col.get(ids=physical_ids, include=include)
     ids = _chroma_field(result, "ids", []) or []
     docs = _chroma_field(result, "documents", []) or []
+    if expected_metadata is not None:
+        current = dict(zip(ids, _chroma_field(result, "metadatas", []) or []))
+        generation_fields = (
+            "ingest_mode",
+            "source_file",
+            "extract_mode",
+            "source_mtime",
+            "filed_at",
+            "historical_version",
+            "chunk_total",
+            "chunk_index",
+            "wing",
+            "room",
+        )
+        for row_id in physical_ids:
+            selected = expected_metadata.get(row_id) or {}
+            if (
+                selected.get("ingest_mode") != "convos"
+                or selected.get("extract_mode") not in ("exchange", "general")
+                or "chunk_total" not in selected
+            ):
+                continue
+            hydrated = current.get(row_id)
+            if hydrated is None or any(
+                selected.get(key) != hydrated.get(key) for key in generation_fields
+            ):
+                raise RuntimeError(
+                    "conversation generation changed during drawer preview hydration; retry"
+                )
     docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
     _apply_drawer_previews(page, docs_by_id)
 
@@ -1232,6 +1340,8 @@ def tool_get_drawer(drawer_id: str, include_source_bytes: bool = False):
     try:
         record = _sqlite_logical_drawer_record(drawer_id)
         if record is not None:
+            if not _public_conversation_record_visible(record):
+                return {"error": f"Drawer not found: {drawer_id}"}
             return finish(_drawer_payload(record))
     except Exception as e:
         return {"error": str(e)}
@@ -1242,7 +1352,7 @@ def tool_get_drawer(drawer_id: str, include_source_bytes: bool = False):
 
     try:
         record = _collection_logical_drawer_record(col, drawer_id)
-        if record is None:
+        if record is None or not _public_conversation_record_visible(record, col=col):
             return {"error": f"Drawer not found: {drawer_id}"}
         return finish(_drawer_payload(record))
     except Exception as e:
@@ -1309,6 +1419,7 @@ def tool_get_drawers(drawer_ids: list):
 
     results = []
     errors = 0
+    visibility_cache = {}
     for drawer_id in drawer_ids:
         try:
             if found is None:
@@ -1316,6 +1427,10 @@ def tool_get_drawers(drawer_ids: list):
             else:
                 record = found.get(drawer_id)
             error = None
+            if record is not None and not _public_conversation_record_visible(
+                record, col=col, source_cache=visibility_cache
+            ):
+                record = None
         except Exception as e:
             record = None
             error = str(e)
@@ -1373,8 +1488,80 @@ def tool_list_drawers(
         known = _palace_known_wings() if wing else frozenset()
         where = build_where_filter(wing, room, known=known) or None
 
-        def make_page(ids, metadatas):
-            kept = [(i, m) for i, m in zip(ids, metadatas) if not is_bookkeeping(m, i)]
+        def scoped_visible_ids(metadatas, load_source_rows):
+            """Validate filtered conversation rows against their full source snapshots.
+
+            A general-mode generation may span multiple rooms. Checking just
+            the rows selected by wing/room would wrongly hide a complete
+            generation. Fetch source-wide metadata in bounded batches, still
+            under the same SQLite snapshot when that reader is available.
+            """
+            from ..convo_visibility import visible_conversation_rows
+
+            sources = sorted(
+                {
+                    meta["source_file"]
+                    for meta in metadatas
+                    if isinstance(meta, dict)
+                    and meta.get("ingest_mode") == "convos"
+                    and meta.get("extract_mode") in ("exchange", "general")
+                    and "chunk_total" in meta
+                    and isinstance(meta.get("source_file"), str)
+                    and meta["source_file"]
+                }
+            )
+            source_ids, source_metadata = [], []
+            for start in range(0, len(sources), 200):
+                source_where = {"source_file": {"$in": sources[start : start + 200]}}
+                found = load_source_rows(source_where)
+                if found is None or len(found[0]) != len(found[1]):
+                    raise RuntimeError("cannot verify source-wide conversation visibility")
+                source_ids.extend(found[0])
+                source_metadata.extend(found[1])
+            # The source-wide scan may follow a concurrent SDK overwrite.
+            # Membership by physical ID alone would authorize an older,
+            # differently-stamped candidate under the newer generation's ID.
+            return dict(visible_conversation_rows(source_ids, source_metadata))
+
+        def make_page(ids, metadatas, checked_ids=None):
+            from ..convo_visibility import visible_conversation_rows
+
+            candidates = [(i, m) for i, m in zip(ids, metadatas) if not is_bookkeeping(m, i)]
+            if checked_ids is None:
+                kept = visible_conversation_rows(
+                    [i for i, _ in candidates], [m for _, m in candidates]
+                )
+            else:
+                # The filtered SQL/SDK query sees only some rooms of a source.
+                # Reject any stamped conversation row not validated by the
+                # full source snapshot, before logical collapse or pagination.
+                kept = [
+                    (row_id, meta)
+                    for row_id, meta in candidates
+                    if not (
+                        (meta or {}).get("ingest_mode") == "convos"
+                        and (meta or {}).get("extract_mode") in ("exchange", "general")
+                        and "chunk_total" in (meta or {})
+                    )
+                    or (
+                        row_id in checked_ids
+                        and all(
+                            (checked_ids[row_id] or {}).get(key) == (meta or {}).get(key)
+                            for key in (
+                                "ingest_mode",
+                                "source_file",
+                                "extract_mode",
+                                "source_mtime",
+                                "filed_at",
+                                "historical_version",
+                                "chunk_total",
+                                "chunk_index",
+                                "wing",
+                                "room",
+                            )
+                        )
+                    )
+                ]
             drawers = _collapse_drawer_rows([i for i, _ in kept], [], [m for _, m in kept])
             if since_dt is not None or before_dt is not None:
                 drawers = [
@@ -1404,7 +1591,18 @@ def tool_list_drawers(
                         _config.palace_path, _config.collection_name, where=where, _connection=conn
                     )
                     if listed is not None:
-                        result = make_page(*listed)
+                        checked = None
+                        if where:
+                            checked = scoped_visible_ids(
+                                listed[1],
+                                lambda source_where: sqlite_list_id_metadata(
+                                    _config.palace_path,
+                                    _config.collection_name,
+                                    where=source_where,
+                                    _connection=conn,
+                                ),
+                            )
+                        result = make_page(*listed, checked_ids=checked)
                         if _fill_drawer_previews_from_sqlite(result["drawers"], connection=conn):
                             return result
 
@@ -1412,8 +1610,27 @@ def tool_list_drawers(
         if not col:
             return _collection_error_or_no_palace()
         ids, _documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
-        result = make_page(ids, metadatas)
-        _fill_drawer_previews(col, result["drawers"])
+
+        def fetch_source_rows(source_where):
+            source_ids, _, source_metadata = _fetch_drawer_rows(
+                col, where=source_where, include=["metadatas"]
+            )
+            return source_ids, source_metadata
+
+        checked = scoped_visible_ids(metadatas, fetch_source_rows) if where else None
+        result = make_page(ids, metadatas, checked_ids=checked)
+        # Keep the extra consistency metadata bounded to the displayed page,
+        # not all drawers in a possibly six-figure collection.
+        page_ids = set(_page_physical_ids(result["drawers"]))
+        preview_metadata = {
+            row_id: meta
+            for row_id, meta in zip(ids, metadatas)
+            if row_id in page_ids
+            and (meta or {}).get("ingest_mode") == "convos"
+            and (meta or {}).get("extract_mode") in ("exchange", "general")
+            and "chunk_total" in (meta or {})
+        }
+        _fill_drawer_previews(col, result["drawers"], expected_metadata=preview_metadata or None)
         return result
     except Exception as e:
         logger.exception("tool_list_drawers failed")

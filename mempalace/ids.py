@@ -97,6 +97,30 @@ def make_convo_drawer_id(
     )
 
 
+def make_convo_history_generation_token(rows: list[tuple[str, str]]) -> str:
+    """Hash a whole content-generation, regardless of source mtime.
+
+    Stream length-prefixed ID/text pairs rather than concatenate a potentially
+    large transcript. Shared chunks from distinct versions need different
+    history IDs, but a later return to A should reuse A's original backup.
+    """
+    digest = hashlib.sha256()
+    for drawer_id, content in sorted(rows):
+        for part in (drawer_id, content):
+            encoded = part.encode("utf-8", errors="surrogatepass")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()[:_HASH_TRUNC_DRAWER]
+
+
+def make_convo_history_id(physical_id: str, content: str, generation_token: str = "") -> str:
+    """Stable historical ID, optionally scoped to a complete source generation."""
+    parts = (physical_id, content)
+    if generation_token:
+        parts += (generation_token,)
+    return f"{physical_id}_hist_{_delimited_sha256(parts, _HASH_TRUNC_DRAWER)}"
+
+
 def make_convo_sentinel_id(source_file: str, extract_mode: str) -> str:
     """Sentinel registry ID for the conversation miner zero-chunk-file path.
 

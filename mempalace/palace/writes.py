@@ -36,6 +36,8 @@ def _source_file_delete_ids(collection, source_file: str, extract_mode: Optional
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
         for drawer_id, meta in zip(batch_ids, metadatas):
+            if extract_mode is not None and (meta or {}).get("historical_version") is True:
+                continue
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
                 ids.append(drawer_id)
         if not batch_ids:
@@ -147,6 +149,152 @@ def _upsert(collection, rows: list, embeddings=None) -> None:
     )
 
 
+def _backup_changed_conversation_drawers(
+    collection, source_file: str, extract_mode: str, drawers: list
+) -> None:
+    """Back up prior text before positional upserts can replace or prune it.
+
+    This protects verbatim content, but does not implement atomic generation
+    publication: uncommitted new chunks still require a separate visibility
+    gate before concurrent Hub reads can be enabled.
+    """
+    from ..ids import make_convo_history_generation_token, make_convo_history_id
+
+    desired = {drawer_id: document for drawer_id, document, _ in drawers}
+    # A failed positional replacement can leave B rows next to the old A
+    # snapshot. Never promote those *unpublished* rows to immutable history
+    # on the next attempt: check each filed generation's completion first.
+    candidates = []
+    generation_rows = {}
+    backup_rows = []
+    offset = 0
+    while True:
+        page = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["documents", "metadatas"],
+        )
+        ids = page.get("ids") or []
+        documents = page.get("documents") or []
+        metadata = page.get("metadatas") or []
+        if len(ids) != len(documents) or len(ids) != len(metadata):
+            raise RuntimeError("incomplete old conversation snapshot; refusing an unsafe re-mine")
+        for original_id, old_text, old_meta in zip(ids, documents, metadata):
+            old_meta = old_meta or {}
+            if old_meta.get("historical_version") is True:
+                continue
+            if not _metadata_matches_extract_mode(old_meta, extract_mode):
+                continue
+            # Stale parser/chunker caches are not verified verbatim user
+            # history; keep the established migration contract that removes
+            # obsolete extraction noise instead of archiving it.
+            if not _meta_is_current(old_meta, extract_mode):
+                continue
+            if not isinstance(old_text, str):
+                raise RuntimeError("old conversation text unavailable; refusing an unsafe re-mine")
+            key = (old_meta.get("source_mtime"), old_meta.get("filed_at"))
+            generation_rows.setdefault(key, []).append(
+                (old_meta.get("chunk_total"), old_meta.get("chunk_index"))
+            )
+            candidates.append((original_id, old_text, old_meta, key))
+        if len(ids) < 1000:
+            break
+        offset += len(ids)
+
+    # A count alone cannot prove a generation was complete: a torn write can
+    # have duplicate/missing chunk indices or conflicting chunk_total stamps.
+    # Do not promote any such rows into public immutable history on retry.
+    # Entirely unstamped legacy groups retain the previous archive behavior.
+    complete_generations = set()
+    for key, markers in generation_rows.items():
+        totals = [total for total, _ in markers]
+        if all(total is None for total in totals):
+            complete_generations.add(key)
+            continue
+        expected = totals[0]
+        if (
+            type(expected) is int
+            and expected > 0
+            and len(markers) == expected
+            and all(type(total) is int and total == expected for total in totals)
+            and all(type(index) is int and 0 <= index < expected for _, index in markers)
+            and len({index for _, index in markers}) == expected
+        ):
+            complete_generations.add(key)
+
+    # History visibility is checked as an entire source/mode generation.
+    # If just one chunk changes, archiving only that chunk creates a torn
+    # historical batch (chunk_total still names *all* the old chunks).
+    # Snapshot every old chunk of any changed complete generation, while
+    # keeping no-op re-mines free of unnecessary historical copies.
+    changed_generations = {
+        key for original_id, old_text, _, key in candidates if desired.get(original_id) != old_text
+    }
+    # Content-scoped tokens allow two historical versions to reuse one text
+    # chunk without collapsing their full snapshot into a single physical row.
+    # The token ignores source mtime so A -> B -> A remains idempotent.
+    grouped_text = {}
+    for original_id, old_text, _, key in candidates:
+        if key in changed_generations:
+            grouped_text.setdefault(key, []).append((original_id, old_text))
+    generation_tokens = {
+        key: make_convo_history_generation_token(rows) for key, rows in grouped_text.items()
+    }
+    for original_id, old_text, old_meta, key in candidates:
+        if key not in complete_generations:
+            # An interrupted positional upsert, missing chunk, or unfinished
+            # metadata finalize cannot become published historical content.
+            continue
+        if key not in changed_generations:
+            continue
+        history_id = make_convo_history_id(original_id, old_text, generation_tokens[key])
+        historical = {
+            **old_meta,
+            "source_file": source_file,
+            "historical_version": True,
+            "history_source_drawer_id": original_id,
+        }
+        backup_rows.append((history_id, old_text, historical))
+
+    # Snapshot the backup set before writing: this scan must not page across
+    # historical rows added by our own writes.
+    for start in range(0, len(backup_rows), DRAWER_UPSERT_BATCH_SIZE):
+        batch = backup_rows[start : start + DRAWER_UPSERT_BATCH_SIZE]
+        ids = [row[0] for row in batch]
+        existing = collection.get(ids=ids, include=["documents"])
+        got = dict(zip(existing.get("ids") or [], existing.get("documents") or []))
+        to_file = []
+        for row in batch:
+            if row[0] in got:
+                if got[row[0]] != row[1]:
+                    raise RuntimeError("historical content-address collision; refusing re-mine")
+                continue
+            to_file.append(row)
+        if to_file:
+            assert_no_collisions([(item_id, meta) for item_id, _, meta in to_file], collection)
+            # The prior text already has an embedding. Re-embed only when the
+            # backend cannot return a compatible vector, e.g. after an embedder
+            # change or interrupted Chroma index persist.
+            source_ids = [meta["history_source_drawer_id"] for _, _, meta in to_file]
+            vectors = _stored_vectors(collection, source_ids)
+            dimension = 0
+            if vectors:
+                from ..embedding import probe_dimension
+
+                dimension = probe_dimension()
+            reuse, reuse_vectors, to_embed = [], [], []
+            for row in to_file:
+                vector = vectors.get(row[2]["history_source_drawer_id"])
+                if _reusable_vector(vector, dimension):
+                    reuse.append(row)
+                    reuse_vectors.append(vector)
+                else:
+                    to_embed.append(row)
+            _upsert(collection, reuse, embeddings=reuse_vectors)
+            _upsert(collection, to_embed)
+
+
 def write_file_drawers(
     collection,
     source_file: str,
@@ -154,6 +302,7 @@ def write_file_drawers(
     *,
     extract_mode: Optional[str] = None,
     prune: bool = True,
+    preserve_convo_history: bool = False,
     aaak_col=None,
 ) -> int:
     """File one source file's drawers: write the new ones, then drop the stale.
@@ -182,6 +331,10 @@ def write_file_drawers(
     :class:`StaleDrawerPurgeFailed` when the stale drawers could not be
     removed; an error in :data:`MINE_ABORTS` (a dead backend) propagates as is.
     """
+    if preserve_convo_history:
+        if extract_mode is None or not prune:
+            raise ValueError("conversation history requires a scoped pruning re-mine")
+        _backup_changed_conversation_drawers(collection, source_file, extract_mode, drawers)
     if prune:
         total = len(drawers)
         drawers = [(i, doc, {**meta, "chunk_total": total + 1}) for i, doc, meta in drawers]

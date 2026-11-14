@@ -714,7 +714,12 @@ def _file_chunks_locked(
             )
             drawers.append((drawer_id, chunk["content"], meta))
         drawers_added = write_file_drawers(
-            collection, source_file, drawers, extract_mode=extract_mode, aaak_col=aaak_col
+            collection,
+            source_file,
+            drawers,
+            extract_mode=extract_mode,
+            preserve_convo_history=True,
+            aaak_col=aaak_col,
         )
     return drawers_added, room_counts_delta, False
 

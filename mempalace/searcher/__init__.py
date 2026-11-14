@@ -36,6 +36,7 @@ from ..backends.chroma_sqlite import (
     _decoded_rows,
     _filtered_candidate_rows,
     _fts_candidate_rows,
+    _install_sqlite_convo_visibility,
     _match_sql,
     _newest_row_ids,
 )

@@ -187,6 +187,91 @@ def test_every_sqlite_reader_returns_what_it_did(palace):
     assert _outputs(palace_path, col) == EXPECTED
 
 
+def test_unrelated_conversation_collection_cannot_block_legacy_lexical_reads(palace, monkeypatch):
+    """An unfinished conversation in another collection must not gate this one."""
+    palace_path, _ = palace
+    other = chroma.ChromaBackend().get_collection(
+        palace=PalaceRef(id=palace_path, local_path=palace_path),
+        collection_name="other_conversations",
+        create=True,
+    )
+    other.add(
+        ids=["unfinished_elsewhere"],
+        documents=["alpha vector from an unfinished conversation"],
+        metadatas=[
+            {
+                "ingest_mode": "convos",
+                "source_file": "/home/u/.claude/projects/p/s1.jsonl",
+                "extract_mode": "exchange",
+                "chunk_index": 0,
+                "chunk_total": 2,
+            }
+        ],
+        embeddings=[[1.0, 0.5, 0.25]],
+    )
+
+    def unexpected_recovery(_conn, _collection_name):
+        raise AssertionError("an unrelated conversation triggered recovery gating")
+
+    monkeypatch.setattr(chroma_sqlite, "_sqlite_ready_metadata_segment", unexpected_recovery)
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path,
+        _NAME,
+        "vector",
+        where={"source_file": "/home/u/.claude/projects/p/s1.jsonl"},
+        limit=1,
+    )
+    assert [row_id for row_id, _, _ in rows] == ["drawer_a"]
+
+
+def test_lexical_recency_source_scope_is_applied_before_candidate_limit(palace):
+    """Newer unrelated rows cannot exhaust the short-query fallback pool."""
+    palace_path, _ = palace
+    source = "/home/u/.claude/projects/p/s1.jsonl"
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path, _NAME, "an", where={"source_file": source}, limit=1
+    )
+    assert [row_id for row_id, _, _ in rows] == ["drawer_a"]
+
+    # Exercise the compound equality/$in path, not only one bare key.
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path,
+        _NAME,
+        "an",
+        where={"$and": [{"source_file": source}, {"wing": {"$in": ["my_app", "my-app"]}}]},
+        limit=1,
+    )
+    assert [row_id for row_id, _, _ in rows] == ["drawer_a"]
+
+
+def test_lexical_fts_source_scope_is_applied_before_candidate_limit(palace):
+    """The indexed lexical path also pushes supported source predicates down."""
+    palace_path, _ = palace
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path,
+        _NAME,
+        "vector",
+        where={"source_file": "/home/u/.claude/projects/p/s1.jsonl"},
+        limit=1,
+    )
+    assert [(row_id, text) for row_id, text, _ in rows] == [
+        ("drawer_a", "alpha whole word vector notes")
+    ]
+
+
+def test_scoped_fts_keeps_all_candidates_for_local_bm25_ranking(palace):
+    """Push source scope to SQL without capping its BM25 input at one FTS hit."""
+    palace_path, _ = palace
+    rows = chroma_sqlite.sqlite_lexical_rows(
+        palace_path,
+        _NAME,
+        "vector",
+        where={"wing": {"$in": ["my_app", "my-app", "wing_my_app"]}},
+        limit=1,
+    )
+    assert {row_id for row_id, _, _ in rows} == {"drawer_a", "drawer_b", "drawer_c"}
+
+
 def test_missing_database_reads_as_none(tmp_path):
     empty = str(tmp_path)
     assert chroma_sqlite._sqlite_embedding_count(empty, _NAME) is None
@@ -619,3 +704,65 @@ EXPECTED = {
         ],
     ),
 }
+
+
+def test_conversation_visibility_precedes_sqlite_lexical_and_bm25_candidate_limits(palace):
+    """A torn B must neither leak nor take the sole candidate slot from A."""
+    from mempalace.searcher import _bm25_only_via_sqlite
+
+    palace_path, col = palace
+    source = "/sessions/visibility.jsonl"
+    base = {
+        "ingest_mode": "convos",
+        "source_file": source,
+        "extract_mode": "general",
+        "source_mtime": 12.5,
+    }
+    col.add(
+        ids=["visible_a_0", "visible_a_1", "torn_b_0"],
+        documents=[
+            "ultrarewrite A preserved text zero",
+            "ultrarewrite A preserved text one",
+            "ultrarewrite B unpublished text",
+        ],
+        metadatas=[
+            {
+                **base,
+                "filed_at": "A",
+                "historical_version": True,
+                "room": room,
+                "chunk_index": index,
+                "chunk_total": 2,
+            }
+            for index, room in enumerate(("ideas", "notes"))
+        ]
+        + [
+            {
+                **base,
+                "filed_at": "B",
+                "historical_version": False,
+                "room": "notes",
+                "chunk_index": 0,
+                "chunk_total": 3,
+            }
+        ],
+        embeddings=[[0.1, 0.2, 0.3]] * 3,
+    )
+
+    lexical = chroma_sqlite.sqlite_lexical_rows(
+        palace_path, _NAME, "ultrarewrite", where=None, limit=1
+    )
+    assert len(lexical) == 1
+    assert "A preserved" in lexical[0][1]
+
+    fallback = _bm25_only_via_sqlite(
+        "ultrarewrite",
+        palace_path,
+        source_file=source,
+        collection_name=_NAME,
+        n_results=1,
+        max_candidates=1,
+    )
+    assert "error" not in fallback, fallback
+    assert len(fallback["results"]) == 1, fallback
+    assert "A preserved" in fallback["results"][0]["text"]

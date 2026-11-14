@@ -593,6 +593,48 @@ with mine_palace_lock(sys.argv[1]):
         assert result["drawers"][0]["drawer_id"] == "keep"
         assert "keep me" in result["drawers"][0]["content_preview"]
 
+    def test_list_drawers_room_filter_validates_complete_source_across_rooms(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """A complete general-mode generation spans rooms; a torn one stays hidden."""
+        common = {
+            "wing": "mempalace",
+            "source_file": "/sessions/multi-room.jsonl",
+            "ingest_mode": "convos",
+            "extract_mode": "general",
+            "source_mtime": 7.0,
+            "filed_at": "2026-11-11T00:00:00Z",
+            "chunk_total": 2,
+        }
+        collection.add(
+            ids=["multi_room_0", "multi_room_1"],
+            documents=["first room content", "second room content"],
+            metadatas=[
+                {**common, "room": "first", "chunk_index": 0},
+                {**common, "room": "second", "chunk_index": 1},
+            ],
+        )
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        complete = mcp_server.tool_list_drawers(wing="mempalace", room="first", limit=20)
+        assert "error" not in complete, complete
+        assert complete["total"] == 1, complete
+        assert [row["drawer_id"] for row in complete["drawers"]] == ["multi_room_0"]
+        assert mcp_server.tool_get_drawer("multi_room_0")["content"] == "first room content"
+        assert mcp_server.tool_get_drawers(["multi_room_0"])["results"][0]["content"] == (
+            "first room content"
+        )
+
+        collection.delete(ids=["multi_room_1"])
+        interrupted = mcp_server.tool_list_drawers(wing="mempalace", room="first", limit=20)
+        assert "error" not in interrupted, interrupted
+        assert interrupted["total"] == 0, interrupted
+        assert "error" in mcp_server.tool_get_drawer("multi_room_0")
+        bulk = mcp_server.tool_get_drawers(["multi_room_0"])
+        assert bulk["errors"] == 1
+        assert "error" in bulk["results"][0]
+
     def test_list_drawers_scan_filters_in_sql_and_skips_documents(
         self, monkeypatch, config, palace_path, collection, kg
     ):
@@ -1308,3 +1350,156 @@ def test_follow_tunnels_records_without_the_writer_lease(monkeypatch):
     monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
     mcp_server.tool_follow_tunnels("wing_a", "room_a", record=True)
     assert captured["record"] is False
+
+
+def test_list_drawers_sdk_fallback_rejects_replaced_generation_between_reads(monkeypatch):
+    """A source-wide scan may see a newer version under the same physical ID.
+
+    The filtered SDK read selected B, but a concurrent writer replaces its
+    metadata with a complete C generation before the source-wide validation.
+    An ID-only check incorrectly authorizes B using C's completeness proof.
+    """
+    from mempalace import mcp_server
+
+    source = "/sessions/racing.jsonl"
+    common = {
+        "wing": "mempalace",
+        "room": "first",
+        "source_file": source,
+        "ingest_mode": "convos",
+        "extract_mode": "general",
+        "source_mtime": 7.0,
+        "chunk_total": 2,
+    }
+    stale = {**common, "filed_at": "B", "chunk_index": 0}
+    fresh = [
+        {**common, "filed_at": "C", "chunk_index": 0},
+        {**common, "room": "second", "filed_at": "C", "chunk_index": 1},
+    ]
+
+    class SwitchingCollection:
+        def get(self, **kwargs):
+            if "ids" in kwargs:
+                raise AssertionError("an inconsistent result reached page hydration")
+            where = kwargs.get("where") or {}
+            offset = kwargs.get("offset", 0)
+            if "source_file" in where:
+                ids, metas = ["same_id", "new_id"], fresh
+            else:
+                ids, metas = ["same_id"], [stale]
+            return {
+                "ids": ids[offset:],
+                "metadatas": metas[offset:],
+                "documents": [],
+            }
+
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+    monkeypatch.setattr(mcp_server, "_palace_known_wings", lambda: {"mempalace"})
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda: SwitchingCollection())
+
+    result = mcp_server.tool_list_drawers(wing="mempalace", room="first")
+    assert "error" not in result, result
+    assert result["total"] == 0, result
+    assert result["drawers"] == []
+
+
+def test_list_drawers_sdk_preview_rechecks_generation_after_positional_overwrite(monkeypatch):
+    """An SDK metadata snapshot of A must never hydrate B under the same ID."""
+    from mempalace import mcp_server
+
+    a = {
+        "ingest_mode": "convos",
+        "extract_mode": "exchange",
+        "source_file": "/sessions/live.jsonl",
+        "source_mtime": 1.0,
+        "filed_at": "A",
+        "chunk_total": 1,
+        "chunk_index": 0,
+        "wing": "sessions",
+        "room": "chat",
+    }
+    b = {**a, "filed_at": "B", "source_mtime": 2.0}
+
+    class OverwritingCollection:
+        swapped = False
+        hydrated = False
+
+        def get(self, **kwargs):
+            if "ids" in kwargs:
+                self.hydrated = True
+                assert kwargs["ids"] == ["same-id"]
+                return {
+                    "ids": ["same-id"],
+                    "documents": ["UNCOMMITTED B content" if self.swapped else "A content"],
+                    "metadatas": [b if self.swapped else a],
+                }
+            # The first pass has validated the complete one-chunk A generation.
+            return {"ids": ["same-id"], "documents": [], "metadatas": [a]}
+
+    collection = OverwritingCollection()
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+
+    original = mcp_server.tool_list_drawers(limit=10)
+    assert "error" not in original, original
+    assert original["drawers"][0]["content_preview"] == "A content"
+    assert collection.hydrated
+
+    collection.swapped = True
+    raced = mcp_server.tool_list_drawers(limit=10)
+    assert collection.hydrated
+    assert "error" in raced, raced
+    assert "UNCOMMITTED B content" not in str(raced)
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("ingest_mode", "manual"),
+        ("wing", "other-wing"),
+        ("room", "other-room"),
+    ],
+)
+def test_public_get_rejects_same_id_scope_change_during_validation(
+    monkeypatch, changed_field, changed_value
+):
+    """The source scan must not authorize an earlier same-ID get from another scope."""
+    from mempalace import mcp_server
+
+    before = {
+        "ingest_mode": "convos",
+        "source_file": "/sessions/racing.jsonl",
+        "extract_mode": "general",
+        "source_mtime": 5.0,
+        "filed_at": "A",
+        "chunk_total": 1,
+        "chunk_index": 0,
+        "wing": "sessions",
+        "room": "chat",
+    }
+    after = {**before, changed_field: changed_value}
+    record = {"ids": ["same-id"], "metadatas": [before]}
+
+    class SwitchingCollection:
+        current = before
+
+        def get(self, **kwargs):
+            assert kwargs.get("where") == {"source_file": before["source_file"]}
+            return {"ids": ["same-id"], "documents": [], "metadatas": [self.current]}
+
+    collection = SwitchingCollection()
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda: collection)
+    monkeypatch.setattr(mcp_server, "_sqlite_logical_drawer_record", lambda _id: None)
+    monkeypatch.setattr(mcp_server, "_collection_logical_drawer_record", lambda _col, _id: record)
+    monkeypatch.setattr(mcp_server, "_bulk_drawer_records", lambda _col, _ids: {"same-id": record})
+
+    assert mcp_server._public_conversation_record_visible(record, col=collection)
+    collection.current = after
+    assert not mcp_server._public_conversation_record_visible(record, col=collection)
+
+    single = mcp_server.tool_get_drawer("same-id")
+    assert single == {"error": "Drawer not found: same-id"}
+    bulk = mcp_server.tool_get_drawers(["same-id"])
+    assert bulk["errors"] == 1
+    assert bulk["results"] == [{"drawer_id": "same-id", "error": "Drawer not found: same-id"}]

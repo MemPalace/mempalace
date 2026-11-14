@@ -75,6 +75,7 @@ class _Convo:
             (doc, meta)
             for doc, meta in _rows(self.palace, self.doc)
             if meta.get("extract_mode") == extract_mode
+            and meta.get("historical_version") is not True
         ]
 
 
@@ -198,6 +199,29 @@ def test_project_failed_stale_delete_keeps_text_and_converges(tmp_path, monkeypa
 
 
 # -- conversation miner -------------------------------------------------------
+
+
+def test_convo_rewrite_retains_verbatim_prior_text_as_history(tmp_path):
+    convo = _Convo(tmp_path)
+    convo.write(range(3))
+    convo.mine()
+    before = {doc for doc, _ in convo.rows()}
+    assert len(before) == 3
+
+    convo.write([9])
+    _touch(convo.doc)
+    convo.mine()
+    all_rows = _rows(convo.palace, convo.doc)
+    history = {doc for doc, meta in all_rows if meta.get("historical_version") is True}
+    assert before.issubset(history)
+    assert len(convo.rows()) == 1
+    assert "question 9" in convo.rows()[0][0]
+
+    # A no-op mining pass must not generate another physical copy.
+    before_ids = set(get_collection(convo.palace).get(where={"source_file": str(convo.doc)})["ids"])
+    convo.mine()
+    after_ids = set(get_collection(convo.palace).get(where={"source_file": str(convo.doc)})["ids"])
+    assert after_ids == before_ids
 
 
 def test_convo_remine_of_a_shorter_transcript_leaves_only_its_new_drawers(tmp_path):
@@ -392,3 +416,245 @@ def test_format_emptied_file_sentinel_replaces_drawers_under_the_file_lock(tmp_p
     format_miner._register_file(None, "/src/b.docx", "w", "agent", empty=False)
 
     assert calls == [(["/src/a.docx"], True), (["/src/a.docx"], False)]
+
+
+def test_history_backup_reuses_available_original_embeddings(monkeypatch):
+    """Archiving must not re-embed old text when its stored vector is usable."""
+    import mempalace.embedding as embedding
+    import mempalace.palace as palace
+
+    previous = {
+        "source_file": "/transcripts/live.jsonl",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": palace.NORMALIZE_VERSION,
+        "convo_chunker_version": palace.CONVO_CHUNKER_VERSION,
+        "source_mtime": 1.0,
+        "chunk_index": 0,
+    }
+
+    class SavedCollection:
+        def get(self, ids=None, where=None, **kwargs):
+            if where is not None:
+                return {
+                    "ids": ["drawer_old"],
+                    "documents": ["original text"],
+                    "metadatas": [previous],
+                }
+            return {"ids": [], "documents": [], "metadatas": []}
+
+    coll = SavedCollection()
+    observed = []
+    monkeypatch.setattr(palace, "_stored_vectors", lambda _coll, _ids: {"drawer_old": [0.1, 0.2]})
+    monkeypatch.setattr(embedding, "probe_dimension", lambda: 2)
+    monkeypatch.setattr(palace, "assert_no_collisions", lambda *_args: None)
+    monkeypatch.setattr(
+        palace,
+        "_upsert",
+        lambda _coll, rows, embeddings=None: observed.append((rows, embeddings)),
+    )
+    palace._backup_changed_conversation_drawers(
+        coll,
+        "/transcripts/live.jsonl",
+        "exchange",
+        [("drawer_old", "replacement text", previous)],
+    )
+    assert len(observed) == 2
+    archived, reused_vectors = observed[0]
+    assert len(archived) == 1
+    assert archived[0][1] == "original text"
+    assert archived[0][2]["historical_version"] is True
+    assert reused_vectors == [[0.1, 0.2]]
+    assert observed[1][0] == []
+
+
+def test_convo_history_backup_preserves_whole_generation_on_partial_change(monkeypatch):
+    """One changed chunk must not make an incomplete, invisible A history."""
+    import mempalace.palace as palace
+    from mempalace.convo_visibility import visible_conversation_rows
+
+    source = "/transcripts/partial-edit.jsonl"
+    metadata = {
+        "source_file": source,
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": palace.NORMALIZE_VERSION,
+        "convo_chunker_version": palace.CONVO_CHUNKER_VERSION,
+        "source_mtime": 1.0,
+        "filed_at": "2026-11-11",
+        "chunk_total": 2,
+    }
+    old = [
+        ("drawer_0", "unchanged original", {**metadata, "chunk_index": 0}),
+        ("drawer_1", "changed original", {**metadata, "chunk_index": 1}),
+    ]
+
+    class SavedCollection:
+        def get(self, ids=None, where=None, **_kwargs):
+            if where is not None:
+                return {
+                    "ids": [row[0] for row in old],
+                    "documents": [row[1] for row in old],
+                    "metadatas": [row[2] for row in old],
+                }
+            return {"ids": [], "documents": [], "metadatas": []}
+
+    archived = []
+    monkeypatch.setattr(palace, "_stored_vectors", lambda *_args: {})
+    monkeypatch.setattr(palace, "assert_no_collisions", lambda *_args: None)
+    monkeypatch.setattr(
+        palace,
+        "_upsert",
+        lambda _col, rows, embeddings=None: archived.extend(rows),
+    )
+
+    incoming = [old[0], ("drawer_1", "new replacement", old[1][2])]
+    palace._backup_changed_conversation_drawers(SavedCollection(), source, "exchange", incoming)
+
+    assert {doc for _, doc, _ in archived} == {"unchanged original", "changed original"}
+    assert all(meta["historical_version"] is True for _, _, meta in archived)
+    assert (
+        len(
+            visible_conversation_rows(
+                [drawer_id for drawer_id, _, _ in archived],
+                [meta for _, _, meta in archived],
+            )
+        )
+        == 2
+    ), "the historical source snapshot must be complete"
+
+    archived.clear()
+    palace._backup_changed_conversation_drawers(SavedCollection(), source, "exchange", old)
+    assert not archived, "a no-op re-mine must not archive an unchanged generation"
+
+
+def test_convo_shared_chunk_history_is_generation_scoped_and_idempotent(monkeypatch):
+    """A and B share text but both entire snapshots must remain readable."""
+    import mempalace.palace as palace
+    from mempalace.convo_visibility import visible_conversation_rows
+
+    source = "/transcripts/alternating.jsonl"
+    common = {
+        "source_file": source,
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": palace.NORMALIZE_VERSION,
+        "convo_chunker_version": palace.CONVO_CHUNKER_VERSION,
+        "chunk_total": 2,
+    }
+
+    def version(label, changed, mtime):
+        meta = {**common, "filed_at": label, "source_mtime": mtime}
+        return [
+            ("drawer_shared", "same first chunk", {**meta, "chunk_index": 0}),
+            ("drawer_changed", changed, {**meta, "chunk_index": 1}),
+        ]
+
+    a1 = version("A", "only A", 1.0)
+    b1 = version("B", "only B", 2.0)
+    a2 = version("A2", "only A", 3.0)
+    b2 = version("B2", "only B", 4.0)
+
+    class SavedCollection:
+        def __init__(self):
+            self.current = a1
+            self.history = {}
+
+        def get(self, ids=None, where=None, **_kwargs):
+            rows = (
+                self.current + list(self.history.values())
+                if where is not None
+                else [self.history[item] for item in ids if item in self.history]
+            )
+            return {
+                "ids": [row[0] for row in rows],
+                "documents": [row[1] for row in rows],
+                "metadatas": [row[2] for row in rows],
+            }
+
+    collection = SavedCollection()
+
+    def save_history(_collection, rows, embeddings=None):
+        for row in rows:
+            collection.history[row[0]] = row
+
+    monkeypatch.setattr(palace, "_stored_vectors", lambda *_args: {})
+    monkeypatch.setattr(palace, "assert_no_collisions", lambda *_args: None)
+    monkeypatch.setattr(palace, "_upsert", save_history)
+
+    for current, replacement in ((a1, b1), (b1, a2), (a2, b2)):
+        collection.current = current
+        palace._backup_changed_conversation_drawers(collection, source, "exchange", replacement)
+
+    assert len(collection.history) == 4, (
+        "shared text must have one immutable backup in each distinct generation"
+    )
+    history = list(collection.history.values())
+    visible = visible_conversation_rows(
+        [row_id for row_id, _, _ in history],
+        [metadata for _, _, metadata in history],
+    )
+    assert len(visible) == 4, "A/B historical chunks must be complete source snapshots"
+    assert {
+        label: sum(meta["filed_at"] == label for _, _, meta in history) for label in ("A", "B")
+    } == {"A": 2, "B": 2}
+
+
+@pytest.mark.parametrize(
+    ("indices", "totals"),
+    [
+        ([0, 0], [2, 2]),  # duplicate index hides a missing chunk
+        ([0, 2], [2, 2]),  # out-of-range index hides a missing chunk
+        ([0, 1], [2, 1]),  # conflicting finalization markers
+        ([0, 1], [None, 2]),  # partially stamped generation
+    ],
+)
+def test_convo_torn_generation_is_never_archived_with_duplicate_or_missing_indices(
+    monkeypatch, indices, totals
+):
+    """A row count matching chunk_total alone is not proof of a committed B."""
+    import mempalace.palace as palace
+
+    source = "/transcripts/torn-previous-pass.jsonl"
+    base = {
+        "source_file": source,
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": palace.NORMALIZE_VERSION,
+        "convo_chunker_version": palace.CONVO_CHUNKER_VERSION,
+        "source_mtime": 2.0,
+        "filed_at": "failed-B",
+    }
+    torn = [
+        (
+            f"drawer_{number}",
+            f"unpublished B {number}",
+            {**base, "chunk_index": indices[number], "chunk_total": totals[number]},
+        )
+        for number in range(2)
+    ]
+
+    class SavedCollection:
+        def get(self, ids=None, where=None, **_kwargs):
+            rows = torn if where is not None else []
+            return {
+                "ids": [item_id for item_id, _, _ in rows],
+                "documents": [text for _, text, _ in rows],
+                "metadatas": [meta for _, _, meta in rows],
+            }
+
+    archived = []
+    monkeypatch.setattr(palace, "_stored_vectors", lambda *_args: {})
+    monkeypatch.setattr(palace, "assert_no_collisions", lambda *_args: None)
+    monkeypatch.setattr(
+        palace,
+        "_upsert",
+        lambda _col, rows, embeddings=None: archived.extend(rows),
+    )
+
+    replacement = [
+        (item_id, f"committed C {number}", meta) for number, (item_id, _, meta) in enumerate(torn)
+    ]
+    palace._backup_changed_conversation_drawers(SavedCollection(), source, "exchange", replacement)
+
+    assert not archived, "a malformed, unpublished generation was promoted to history"
