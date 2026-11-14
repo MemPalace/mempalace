@@ -173,6 +173,28 @@ class TestKGTools:
         # pages are disjoint and in timeline order
         assert page1["timeline"] + page2["timeline"] == full["timeline"][: 2 + page2["count"]]
 
+    def test_kg_timeline_returns_the_provenance_kg_add_stored(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_add, tool_kg_timeline
+
+        tool_kg_add(
+            subject="Alice",
+            predicate="works_at",
+            object="NewCo",
+            valid_from="2026-01-05",
+            source_closet="career",
+            source_file="jobs.md",
+        )
+
+        result = tool_kg_timeline(entity="Alice")
+
+        (fact,) = result["timeline"]
+        assert fact["confidence"] == 1.0
+        assert fact["source_closet"] == "career"
+        assert fact["source_file"] == "jobs.md"
+
     def test_kg_timeline_clamps_pagination_args(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
         from mempalace.mcp_server import tool_kg_timeline
