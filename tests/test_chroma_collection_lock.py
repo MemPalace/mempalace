@@ -208,30 +208,42 @@ def test_reentrant_inside_mine_passes_through(tmp_path, monkeypatch):
     assert len(fake.deletes) == 1
 
 
-class _SlowFakeChromaCollection(_FakeChromaCollection):
-    """Fake whose write methods hold the caller for ``hold_seconds``.
+class _GatedFakeChromaCollection(_FakeChromaCollection):
+    """Fake whose upsert, reached only inside the write lock, says so and
+    then holds the lock until the test releases it.
 
-    Used to keep ``mine_palace_lock`` acquired long enough for a sibling
-    process to contend deterministically.
+    A fixed hold time made the contention depend on how fast two ``spawn``
+    children start: on a loaded runner the second one could arrive after
+    the first had already let go, and both succeeded.
     """
 
-    def __init__(self, hold_seconds: float = 0.3):
+    def __init__(self, inside_flag: str, release_flag: str):
         super().__init__()
-        self._hold = hold_seconds
+        self._inside = inside_flag
+        self._release = release_flag
 
     def upsert(self, **kwargs):
-        time.sleep(self._hold)
+        open(self._inside, "w").close()
+        deadline = time.monotonic() + 60
+        while not os.path.exists(self._release) and time.monotonic() < deadline:
+            time.sleep(0.01)
         super().upsert(**kwargs)
 
 
-def _slow_writer_target(palace_path, tmp_path_str, pid, result_q):
-    """Subprocess target: try a slow upsert, report ok/busy."""
+def _writer_target(palace_path, tmp_path_str, pid, result_q, inside_flag=None, release_flag=None):
+    """Subprocess target: try an upsert, report ok/busy.
+
+    With both flags the upsert holds the lock until ``release_flag`` exists.
+    """
     os.environ["HOME"] = tmp_path_str
     # Fresh import inside child so HOME monkeypatch routes the lock dir.
     from mempalace.backends.chroma import ChromaCollection as _CC
     from mempalace.palace import MineAlreadyRunning as _MAR
 
-    fake = _SlowFakeChromaCollection(hold_seconds=0.3)
+    if inside_flag and release_flag:
+        fake = _GatedFakeChromaCollection(inside_flag, release_flag)
+    else:
+        fake = _FakeChromaCollection()
     col = _CC(fake, palace_path=palace_path)
     try:
         col.upsert(documents=[f"d{pid}"], ids=[f"i{pid}"])
@@ -250,29 +262,44 @@ def test_concurrent_writers_serialize(tmp_path, monkeypatch):
     writer reaches chromadb and the rest fail loudly instead of corrupting
     the index.
 
-    The slow fake holds the lock for 0.3s per writer, large enough for the
-    second process to contend even on slow CI runners.
+    The first writer signals once it is inside the lock and holds it until
+    the second has answered, so the overlap does not depend on how quickly
+    either ``spawn`` child starts.
     """
     monkeypatch.setenv("HOME", str(tmp_path))
     palace = str(tmp_path / "palace")
+    inside = str(tmp_path / "inside")
+    release = str(tmp_path / "release")
 
     ctx = _get_mp_context()
     result_q = ctx.Queue()
 
-    p1 = ctx.Process(target=_slow_writer_target, args=(palace, str(tmp_path), 1, result_q))
-    p2 = ctx.Process(target=_slow_writer_target, args=(palace, str(tmp_path), 2, result_q))
+    p1 = ctx.Process(
+        target=_writer_target, args=(palace, str(tmp_path), 1, result_q, inside, release)
+    )
+    p2 = ctx.Process(target=_writer_target, args=(palace, str(tmp_path), 2, result_q))
     p1.start()
-    # Tiny stagger so p1 wins the race deterministically; without it the
-    # OS scheduler can pick either, which is also a valid outcome but
-    # makes the assertion brittle on slow CI.
-    time.sleep(0.05)
-    p2.start()
-    p1.join(timeout=5)
-    p2.join(timeout=5)
+    try:
+        deadline = time.monotonic() + 60
+        while not os.path.exists(inside) and time.monotonic() < deadline:
+            assert p1.is_alive() or os.path.exists(inside), "first writer exited before the lock"
+            time.sleep(0.01)
+        assert os.path.exists(inside), "first writer never reached the write inside the lock"
 
-    outcomes = [result_q.get(timeout=1) for _ in range(2)]
-    statuses = sorted(o[0] for o in outcomes)
-    assert statuses == ["busy", "ok"], f"expected one ok + one busy, got {outcomes}"
+        p2.start()
+        p2.join(timeout=60)
+        second = result_q.get(timeout=5)
+    finally:
+        open(release, "w").close()
+        p1.join(timeout=60)
+        if p2.is_alive():
+            p2.terminate()
+    first = result_q.get(timeout=5)
+
+    assert second == ("busy", 2), (
+        f"a second writer must be refused while the first holds the lock, got {second}"
+    )
+    assert first == ("ok", 1), f"the first writer must complete, got {first}"
 
 
 def test_read_path_does_not_acquire_lock(tmp_path, monkeypatch):

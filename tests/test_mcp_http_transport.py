@@ -1820,3 +1820,24 @@ def test_extra_allowed_hosts_default_empty(monkeypatch):
     monkeypatch.delenv("MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS", raising=False)
     allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
     assert not any("ts.net" in v for v in allowed)
+
+
+def test_bind_does_not_resolve_the_address_back_to_a_name(monkeypatch):
+    """``http.server.HTTPServer.server_bind`` names the server through
+    ``socket.getfqdn``, a reverse lookup that waits out the resolver on a host
+    without reverse DNS for the bind address (35 s on one hosted runner).
+    Nothing reads the name, so the server binds as ``TCPServer`` does."""
+    import http.server
+
+    def _through_the_resolver(*args, **kwargs):
+        raise AssertionError("server_bind resolved the bind address through DNS")
+
+    monkeypatch.setattr(socket, "getfqdn", _through_the_resolver)
+    monkeypatch.setattr(http.server.HTTPServer, "server_bind", _through_the_resolver)
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    try:
+        assert httpd.server_name == "127.0.0.1"
+        assert httpd.server_port == httpd.server_address[1]
+        assert httpd.server_port != 0
+    finally:
+        httpd.server_close()

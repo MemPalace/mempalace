@@ -8,11 +8,15 @@ peer, an LLM or embedding endpoint, a Qdrant server or a hub that answered
 for it to ``elsewhere``. Nothing MemPalace talks to legitimately redirects a
 credentialed call, so this opener follows none: a 3xx is raised as the
 ``HTTPError`` it is, naming the target that was not followed.
+
+Also the bind step the HTTP servers share, which skips the reverse DNS lookup
+``http.server`` would do on the bind address.
 """
 
 from __future__ import annotations
 
 import socket
+import socketserver
 import urllib.request
 from urllib.error import HTTPError
 
@@ -42,3 +46,20 @@ def urlopen(url, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
     Same arguments and return value; a 3xx reply raises ``HTTPError``.
     """
     return _OPENER.open(url, data, timeout)
+
+
+def bind_without_reverse_dns(server: socketserver.TCPServer) -> None:
+    """``server_bind`` for an ``HTTPServer`` that keeps the literal host.
+
+    ``http.server.HTTPServer.server_bind`` sets ``server_name`` through
+    ``socket.getfqdn(host)``, a reverse DNS lookup of the bind address. On a
+    host with slow or absent reverse DNS for that address the lookup blocks
+    until the resolver gives up (35 s on one hosted CI runner), which looks
+    exactly like the server never coming up. Nothing reads the name except
+    CGI handling, so bind as ``TCPServer`` does and name the server after the
+    literal host.
+    """
+    socketserver.TCPServer.server_bind(server)
+    host, port = server.server_address[:2]
+    server.server_name = host
+    server.server_port = port

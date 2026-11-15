@@ -266,3 +266,119 @@ def test_peer_writer_finishes_while_embedding_owner_reclaims_lease(monkeypatch, 
     assert set(completed) == {"peer", "original"}
     assert not lifecycle.locked()
     assert not request._writer and request._readers == 0
+
+
+@pytest.mark.parametrize("pause_phase", ["query", "document"])
+def test_overlapping_checkpoints_keep_the_duplicate_decision_valid(
+    monkeypatch, tmp_path, pause_phase
+):
+    import mempalace.backends.embedding_wrapper as wrapper
+    import mempalace.embedding as embedding
+    from mempalace import mcp_server as mcp
+    from mempalace.backends import PalaceRef
+    from mempalace.backends.embedding_wrapper import EmbeddingCollection
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+    backend = SQLiteExactBackend()
+    ref = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    col = backend.get_collection(palace=ref, collection_name="mempalace_drawers", create=True)
+    monkeypatch.setattr(
+        mcp,
+        "_config",
+        SimpleNamespace(
+            palace_path=str(tmp_path),
+            collection_name="mempalace_drawers",
+            chunk_size=1800,
+            backend="sqlite_exact",
+        ),
+    )
+    request_lock = mcp._RWLock()
+    monkeypatch.setattr(mcp, "_HTTP_REQUEST_LOCK", request_lock)
+    monkeypatch.setattr(mcp, "_HTTP_EMBEDDING_LIFECYCLE_LOCK", threading.Lock())
+    monkeypatch.setattr(mcp, "_is_chroma_backend", lambda: False)
+    monkeypatch.setattr(mcp, "_get_collection", lambda create=False: EmbeddingCollection(col))
+    monkeypatch.setattr(wrapper, "_embed_texts", production_embed_texts)
+    paused, resume, peer_done = threading.Event(), threading.Event(), threading.Event()
+    results, errors = {}, []
+
+    class Embedder:
+        def _embed(self, input, phase):
+            if threading.current_thread().name == "first" and phase == pause_phase:
+                paused.set()
+                assert resume.wait(10), "the embedding was never resumed"
+            return [[1.0, 0.0] for _ in input]
+
+        def embed_query(self, input):
+            return self._embed(input, "query")
+
+        def embed_documents(self, input):
+            return self._embed(input, "document")
+
+    monkeypatch.setattr(embedding, "get_embedding_function", lambda: Embedder())
+    # A writable HTTP hub holds this process-level lease across its requests.
+    acquired, reason = mcp._acquire_mcp_writer_lock()
+    assert acquired, reason
+
+    def run(room):
+        try:
+            results[room] = mcp._http_dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": room,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "mempalace_checkpoint",
+                        "arguments": {
+                            "items": [
+                                {
+                                    "wing": "project",
+                                    "room": room,
+                                    "content": "The launch date is Tuesday.",
+                                }
+                            ],
+                        },
+                    },
+                }
+            )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            if room == "second":
+                peer_done.set()
+
+    first = threading.Thread(target=run, args=("first",), name="first", daemon=True)
+    second = threading.Thread(target=run, args=("second",), name="second", daemon=True)
+    try:
+        first.start()
+        assert paused.wait(5), results
+        second.start()
+        deadline = time.monotonic() + 5
+        while not peer_done.is_set():
+            with request_lock._cond:
+                queued = request_lock._waiting_writers > 0
+            if queued:
+                break
+            assert time.monotonic() < deadline, "the competing checkpoint made no progress"
+            time.sleep(0.001)
+        if pause_phase == "query":
+            assert peer_done.wait(5), "query embedding must continue to yield to other requests"
+    finally:
+        resume.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    try:
+        assert not first.is_alive() and not second.is_alive(), "checkpoints deadlocked"
+        assert not errors, errors
+        payloads = []
+        for reply in results.values():
+            assert "error" not in reply, reply
+            payload = json.loads(reply["result"]["content"][0]["text"])
+            assert not payload["errors"], payload
+            payloads.append(payload)
+        assert sum(len(p["added"]) for p in payloads) == 1
+        assert sum(len(p["duplicates"]) for p in payloads) == 1
+        assert col.get(include=["documents"]).documents == ["The launch date is Tuesday."]
+    finally:
+        mcp._release_mcp_writer_lock()
+        backend.close()

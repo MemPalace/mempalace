@@ -103,6 +103,21 @@ def _kg_import_legacy(args, config):
             f"  {verb} {numbers['added']} {table} from {source}; "
             f"{numbers['present']} already in {target} were kept as they are."
         )
+    entity_conflicts = counts["entities"]["conflicts"]
+    if entity_conflicts:
+        print(f"\n  {len(entity_conflicts)} entity conflict(s) require review:")
+        for conflict in entity_conflicts:
+            print(
+                f"    {conflict['name']!r} ({conflict['id']}), "
+                f"target names: {conflict['target_names']!r}"
+            )
+    skipped = counts["triples"]["entity_conflicts"]
+    if skipped:
+        print(
+            f"\n  {len(skipped)} fact(s) not copied because their entities could not be resolved:"
+        )
+        for triple_id in skipped:
+            print(f"    {triple_id}")
     conflicts = counts["triples"]["conflicts"]
     if conflicts:
         print(

@@ -166,6 +166,29 @@ def encode_where(where):
     return out
 
 
+def document_filter_candidate(where_document):
+    """A native substring predicate covering plain and escaped document text.
+
+    Escaping changes backslashes, NUL and surrogates. Any unchanged portion
+    of a required substring remains a necessary condition in stored form.
+    An empty portion provides no native restriction. Callers must evaluate
+    the original predicate on decoded candidates before ranking or paging.
+    """
+    if "$contains" in where_document:
+        text = max(_ESCAPE.split(where_document["$contains"]), key=len)
+        return {"$contains": text} if text else None
+    operator, clauses = next(iter(where_document.items()))
+    candidates = [document_filter_candidate(clause) for clause in clauses]
+    if operator == "$or" and None in candidates:
+        return None
+    candidates = [clause for clause in candidates if clause is not None]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return {operator: candidates}
+
+
 def decode_record(document, metadata):
     """Reverse :func:`encode_record` and drop the flag."""
     if not metadata or FLAG not in metadata:
