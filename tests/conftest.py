@@ -308,9 +308,6 @@ def _reset_mcp_cache(monkeypatch):
                         except Exception:
                             pass
 
-                if hasattr(mcp_server, "_kg_by_path"):
-                    mcp_server._kg_by_path.clear()
-
                 for ls in list(getattr(mcp_server, "_logstream_by_path", {}).values()):
                     close = getattr(ls, "close", None)
                     if close is not None:
@@ -318,9 +315,6 @@ def _reset_mcp_cache(monkeypatch):
                             close()
                         except Exception:
                             pass
-
-                if hasattr(mcp_server, "_logstream_by_path"):
-                    mcp_server._logstream_by_path.clear()
 
                 # Close (not just dereference) the cached chromadb client so its
                 # rust-side file handles are released; on Windows a bare deref
@@ -335,12 +329,23 @@ def _reset_mcp_cache(monkeypatch):
                             pass
                 mcp_server._client_cache = None
                 mcp_server._collection_cache = None
-                if hasattr(mcp_server, "_collection_cache_backend"):
-                    mcp_server._collection_cache_backend = None
-                if hasattr(mcp_server, "_collection_cache_palace"):
-                    mcp_server._collection_cache_palace = None
-                if hasattr(mcp_server, "_collection_open_error"):
-                    mcp_server._collection_open_error = None
+                for _attr in (
+                    "_collection_cache_backend",
+                    "_collection_cache_palace",
+                    "_collection_open_error",
+                ):
+                    if hasattr(mcp_server, _attr):
+                        setattr(mcp_server, _attr, None)
+                for _cache_attr in (
+                    "_kg_by_path",
+                    "_logstream_by_path",
+                    "_overview_payload_cache",
+                    "_overview_stale_payloads",
+                    "_overview_refreshing",
+                ):
+                    _cache = getattr(mcp_server, _cache_attr, None)
+                    if _cache is not None:
+                        _cache.clear()
         except AttributeError:
             pass
 
