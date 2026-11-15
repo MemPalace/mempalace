@@ -1384,6 +1384,14 @@ def tool_list_drawers(
                         d.get("metadata", {}).get("filed_at"), since_dt, before_dt
                     )
                 ]
+            # Newest-first: storage order follows content-hash drawer-id
+            # order — arbitrary with respect to recency. recency_key is the
+            # repo's documented newest-first key (parsed instants first,
+            # unparseable strings in text order, missing values last).
+            drawers.sort(
+                key=lambda d: recency_key(d.get("metadata", {}).get("filed_at")),
+                reverse=True,
+            )
             page = drawers[offset : offset + limit]
             return {
                 "drawers": page,

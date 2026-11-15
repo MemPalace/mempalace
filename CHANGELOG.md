@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+- **`list_drawers` pages newest-first.** The natural row order was storage
+  order — arbitrary with respect to recency (it follows content-hash
+  drawer-id order), so a "read the most recent checkpoint" query read stale
+  handoffs while fresh records sat pages deep. Drawers now sort with the
+  existing `recency_key` primitive (parsed timestamps order by instant;
+  unparseable strings follow in text order; missing values last) before
+  pagination.
+
 ---
 
 ## [3.12.0] — 2026-11-09
