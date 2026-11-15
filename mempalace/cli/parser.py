@@ -1209,4 +1209,25 @@ def main():
         "status": cmd_status,
         "update": cmd_update,
     }
-    dispatch[args.command](args)
+    exit_code = 0
+    try:
+        dispatch[args.command](args)
+    except SystemExit as exc:
+        if exc.code is None:
+            exit_code = 0
+        elif isinstance(exc.code, int) and not isinstance(exc.code, bool):
+            exit_code = exc.code
+        else:
+            exit_code = 1
+        raise
+    except KeyboardInterrupt:
+        exit_code = 130
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        if args.command == "mine" and os.environ.get("MEMPALACE_MINE_PID_FILE"):
+            from ..miner import _arm_hook_mine_exit_watchdog
+
+            _arm_hook_mine_exit_watchdog(exit_code=exit_code)

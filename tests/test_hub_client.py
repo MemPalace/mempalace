@@ -8,7 +8,7 @@ import urllib.request
 
 import pytest
 
-from mempalace import hub_client, server_registry
+from mempalace import _net, hub_client, server_registry
 from mempalace.hub_client import HubClient
 
 
@@ -57,7 +57,7 @@ def _capture_urlopen(monkeypatch, answer=b'{"jsonrpc": "2.0", "id": 1, "result":
             return answer(request)
         return _Response(answer)
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(_net, "urlopen", fake_urlopen)
     return seen
 
 

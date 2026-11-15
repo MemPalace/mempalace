@@ -127,8 +127,9 @@ def wing_aliases(wing: str, known=()) -> list:
         for name in sorted(known):
             if name in names or not isinstance(name, str):
                 continue
-            stored = name[len("wing_") :] if name.startswith("wing_") else name
-            if normalize_wing_name(stored) == slug:
+            # Slug first: `wing-c++` only shows its prefix once slugged.
+            stored = normalize_wing_name(name)
+            if stored.removeprefix("wing_") == slug:
                 names.append(name)
     return names
 

@@ -6,7 +6,7 @@ import urllib.request
 
 import pytest
 
-from mempalace import server_registry
+from mempalace import _net, server_registry
 from mempalace.hub_client import HubClient
 
 
@@ -83,7 +83,7 @@ def test_hub_retries_the_second_token_only_after_401(isolated_home, monkeypatch)
             )
         return _Response(b'{"ok": true}')
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(_net, "urlopen", fake_urlopen)
 
     hub = HubClient(palace, {"host": "127.0.0.1", "port": 8765})
     assert hub.post({}, timeout=5) == {"ok": True}
@@ -117,7 +117,7 @@ def test_hub_does_not_retry_non_401_or_transport_failures(isolated_home, monkeyp
         attempted.append(request.get_header("Authorization"))
         raise error
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(_net, "urlopen", fake_urlopen)
 
     with pytest.raises(type(error)):
         HubClient(palace, {"host": "127.0.0.1", "port": 8765}).post({}, timeout=5)

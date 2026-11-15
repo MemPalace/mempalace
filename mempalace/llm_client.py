@@ -33,9 +33,12 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 from ._env import env_bool
+
+# Follows no redirect: an API key would travel to wherever a reply pointed.
+from ._net import urlopen
 
 logger = logging.getLogger(__name__)
 
@@ -520,6 +523,7 @@ class OpenAICompatProvider(LLMProvider):
             timeout=timeout,
             api_key_source=source,
         )
+        self._send_temperature = True
 
     def _resolve_url(self) -> str:
         if not self.endpoint:
@@ -592,6 +596,10 @@ class OpenAICompatProvider(LLMProvider):
         exactly that at 8192 reasoning tokens. ``reasoning_effort`` is the
         OpenAI field for this and the servers above honor it; a server that
         rejects unknown fields with HTTP 400 gets one retry without it.
+
+        OpenAI's reasoning models accept only the default ``temperature``. An
+        HTTP 400 that names the field drops it and later calls on this provider
+        skip it, so they do not repeat a request that would fail.
         """
         body: dict = {
             "model": self.model,
@@ -599,8 +607,9 @@ class OpenAICompatProvider(LLMProvider):
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0.1,
         }
+        if self._send_temperature:
+            body["temperature"] = 0.1
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         if think is False:
@@ -610,13 +619,20 @@ class OpenAICompatProvider(LLMProvider):
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         url = self._resolve_url()
-        try:
-            data = post_json(url, body, headers=headers, timeout=self.timeout)
-        except LLMError as e:
-            if "reasoning_effort" not in body or "HTTP 400" not in str(e):
-                raise
-            body.pop("reasoning_effort")
-            data = post_json(url, body, headers=headers, timeout=self.timeout)
+        while True:
+            try:
+                data = post_json(url, body, headers=headers, timeout=self.timeout)
+                break
+            except LLMError as e:
+                if "HTTP 400" not in str(e):
+                    raise
+                if "temperature" in body and "temperature" in str(e):
+                    body.pop("temperature")
+                    self._send_temperature = False
+                elif "reasoning_effort" in body:
+                    body.pop("reasoning_effort")
+                else:
+                    raise
         try:
             choice = data["choices"][0]
             text = choice["message"]["content"]
@@ -638,9 +654,21 @@ class OpenAICompatProvider(LLMProvider):
 
 
 class AnthropicProvider(LLMProvider):
+    """Anthropic Messages API.
+
+    ``temperature`` is sent only when the caller sets it, because current
+    Claude models reject the field with HTTP 400; older models that still
+    accept it use the API default unless one is passed. ``max_tokens`` is the
+    output budget; a room
+    proposal over a large sample can need several thousand tokens of JSON,
+    and an answer cut off at the budget raises instead of failing later as
+    a JSON parse error.
+    """
+
     name = "anthropic"
     DEFAULT_ENDPOINT = "https://api.anthropic.com"
     API_VERSION = "2023-06-01"
+    DEFAULT_MAX_TOKENS = 8192
 
     def __init__(
         self,
@@ -648,6 +676,8 @@ class AnthropicProvider(LLMProvider):
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         timeout: int = 120,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
         **_: object,
     ):
         if api_key:
@@ -664,6 +694,8 @@ class AnthropicProvider(LLMProvider):
             timeout=timeout,
             api_key_source=source,
         )
+        self.max_tokens = int(max_tokens) if max_tokens else self.DEFAULT_MAX_TOKENS
+        self.temperature = temperature
 
     def check_available(self) -> tuple[bool, str]:
         if not self.api_key:
@@ -685,13 +717,14 @@ class AnthropicProvider(LLMProvider):
         sys_prompt = system
         if json_mode:
             sys_prompt += "\n\nRespond with valid JSON only, no prose."
-        body = {
+        body: dict = {
             "model": self.model,
-            "max_tokens": 2048,
-            "temperature": 0.1,
+            "max_tokens": self.max_tokens,
             "system": sys_prompt,
             "messages": [{"role": "user", "content": user}],
         }
+        if self.temperature is not None:
+            body["temperature"] = self.temperature
         headers = {
             "X-API-Key": self.api_key,
             "anthropic-version": self.API_VERSION,
@@ -705,6 +738,11 @@ class AnthropicProvider(LLMProvider):
             )
         except (AttributeError, TypeError) as e:
             raise LLMError(f"Unexpected response shape: {e}") from e
+        if isinstance(data, dict) and data.get("stop_reason") == "max_tokens":
+            raise LLMError(
+                f"Anthropic response was cut off at max_tokens={self.max_tokens} "
+                f"(model={self.model}); raise max_tokens or send a smaller request"
+            )
         if not text:
             raise LLMError(f"Empty response from Anthropic (model={self.model})")
         return LLMResponse(text=text, model=self.model, provider=self.name, raw=data)

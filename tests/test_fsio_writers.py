@@ -130,6 +130,32 @@ def test_private_files_stay_0600_and_the_rest_follow_the_umask(tmp_path, home):
     assert stat.S_IMODE(os.stat(mesh).st_mode) == 0o600
 
 
+@posix_only
+@pytest.mark.parametrize("mode", [0o600, 0o640])
+def test_a_replaced_file_keeps_the_mode_it_had(tmp_path, mode):
+    """A non-private publish is a new inode, but the user's chmod survives it."""
+    from mempalace import fsio
+
+    kept = tmp_path / "settings.yaml"
+    kept.write_text("old", encoding="utf-8")
+    kept.chmod(mode)
+    fresh = tmp_path / "fresh.yaml"
+    loose = tmp_path / "loose.json"
+    loose.write_text("{}", encoding="utf-8")
+    loose.chmod(0o644)
+    old = os.umask(0o022)
+    try:
+        fsio.atomic_write_text(kept, "new", private=False)
+        fsio.atomic_write_text(fresh, "new", private=False)
+        fsio.atomic_write_json(loose, {"a": 1}, private=True)
+    finally:
+        os.umask(old)
+    assert kept.read_text(encoding="utf-8") == "new"
+    assert stat.S_IMODE(kept.stat().st_mode) == mode
+    assert stat.S_IMODE(fresh.stat().st_mode) == 0o644
+    assert stat.S_IMODE(loose.stat().st_mode) == 0o600
+
+
 def _write_while_a_reader_holds(path, write):
     """Hold ``path`` open for reading, release it shortly, and write meanwhile."""
     handle = open(path, encoding="utf-8")

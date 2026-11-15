@@ -127,6 +127,9 @@ _SOURCE_FILE_INDEX = "idx_documents_coll_source_file"
 # so the ordering reads never touch the rows.
 _FILED_AT_INDEX = "idx_documents_coll_filed_at"
 _WING_FILED_AT_INDEX = "idx_documents_coll_wing_filed_at"
+# Both current drawer chunks and legacy diary chunks resolve through these
+# high-cardinality metadata keys. Indexes are additive, like source_file.
+_PARENT_ID_KEYS = ("parent_drawer_id", "parent_entry_id")
 
 
 def _json_field_sql(key: str, *, locus_columns: bool = True) -> str:
@@ -195,8 +198,14 @@ def _equality_where_sql(
     for key, expected in where.items():
         if key.startswith("$") or not _FACET_FIELD_RE.match(key):
             return None
-        expr = _json_field_sql(key, locus_columns=locus_columns)
+        # Generated locus columns have TEXT affinity. Numeric predicates
+        # must inspect the original JSON type, not coerce 1 into "1".
+        expr = _json_field_sql(
+            key, locus_columns=locus_columns and _text_equality_operand(expected)
+        )
         if not isinstance(expected, dict):
+            if not _pushable_scalar(expected):
+                return None
             clauses.append(f"{expr} = ?")
             params.append(encode_filter(expected))
             continue
@@ -227,10 +236,48 @@ def _equality_where_sql(
 _MAX_PUSHED_IN = 500
 
 
+def _text_equality_operand(value) -> bool:
+    if isinstance(value, dict):
+        if list(value) == ["$eq"]:
+            value = value["$eq"]
+        elif list(value) == ["$in"]:
+            values = value["$in"]
+            return isinstance(values, (list, tuple)) and all(isinstance(v, str) for v in values)
+    return isinstance(value, str)
+
+
 def _pushable_scalar(value) -> bool:
     return isinstance(value, (str, int, float)) and not (
         isinstance(value, float) and value != value
     )
+
+
+def _get_where_sql(where, *, collection_id, locus_columns):
+    """Push equality disjunctions as a union of collection-scoped row lookups.
+
+    A plain ``collection_id = ? AND (a = ? OR b = ?)`` can make SQLite
+    scan every row in the collection despite indexes on both fields. Each
+    UNION arm instead seeks its own index; UNION deduplicates rows carrying
+    both parent keys. The caller orders and paginates the combined result.
+    Unsupported predicates retain the decoded Python filter path.
+    """
+    if not isinstance(where, dict) or list(where) != ["$or"]:
+        return _equality_where_sql(where, locus_columns=locus_columns)
+    children = where["$or"] or []
+    if not isinstance(children, list) or len(children) > 100:
+        return None  # stay below SQLite's compound SELECT limit
+    arms = []
+    params = []
+    for child in children:
+        part = _equality_where_sql(child, locus_columns=locus_columns)
+        if part is None:
+            return None
+        sql, values = part
+        arms.append(f"SELECT rowid FROM documents WHERE collection_id = ? AND ({sql})")
+        params.extend([collection_id, *values])
+    if not arms:
+        return "0=1", []
+    return "rowid IN (" + " UNION ".join(arms) + ")", params
 
 
 def _cosine_distances(
@@ -861,10 +908,10 @@ class SQLiteExactCollection(BaseCollection):
         validate_where(where_document)
         spec = spec or _IncludeSpec.resolve(None, default_distances=False)
         collection_id = self._collection_id(cur)
-        push = (
-            None
-            if where_document
-            else _equality_where_sql(where, locus_columns=self._handle.has_locus_columns)
+        push = _get_where_sql(
+            where,
+            collection_id=collection_id,
+            locus_columns=self._handle.has_locus_columns,
         )
         python_where = where is not None and push is None
         need_doc = spec.documents or bool(where_document)
@@ -1257,17 +1304,19 @@ class SQLiteExactCollection(BaseCollection):
         # Unfiltered (or SQL-pushable equality) pages: LIMIT/OFFSET in SQL.
         # Negative bounds stay on the Python slice path — SQLite does not
         # honor a negative LIMIT/OFFSET the way a Python slice does.
-        python_where = bool(where_document) or (
-            where is not None
-            and _equality_where_sql(where, locus_columns=self._handle.has_locus_columns) is None
-        )
-        push_page = (
-            not python_where
-            and (limit is None or limit >= 0)
-            and (offset is None or offset >= 0)
-            and (limit is not None or offset)
-        )
         with self._cursor() as cur:
+            push = _get_where_sql(
+                where,
+                collection_id=self._collection_id(cur),
+                locus_columns=self._handle.has_locus_columns,
+            )
+            python_where = bool(where_document) or (where is not None and push is None)
+            push_page = (
+                not python_where
+                and (limit is None or limit >= 0)
+                and (offset is None or offset >= 0)
+                and (limit is not None or offset)
+            )
             if push_page:
                 rows = self._rows(
                     cur,
@@ -1954,6 +2003,11 @@ class SQLiteExactBackend(BaseBackend):
         if "dimension" not in columns:
             conn.execute("ALTER TABLE collections ADD COLUMN dimension INTEGER")
         self._ensure_locus_columns(conn)
+        for key in _PARENT_ID_KEYS:
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_documents_coll_{key} "
+                f"ON documents(collection_id, json_extract(metadata_json, '$.{key}'))"
+            )
         try:
             conn.execute(
                 """
