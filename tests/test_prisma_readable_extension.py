@@ -28,6 +28,15 @@ def test_prisma_is_a_readable_extension():
     assert ".prisma" in READABLE_EXTENSIONS
 
 
+def test_prisma_is_a_readable_extension_for_entity_detection():
+    # ``entity_detector.READABLE_EXTENSIONS`` mirrors ``miner.READABLE_EXTENSIONS``
+    # (see its own comment); if the two lists drift, a Prisma schema is still
+    # silently excluded from entity-detection sampling. Pin both.
+    from mempalace.entity_detector import READABLE_EXTENSIONS as ED_EXTENSIONS
+
+    assert ".prisma" in ED_EXTENSIONS
+
+
 def test_scan_project_includes_prisma_schema_but_not_generated_client(tmp_path):
     schema_dir = tmp_path / "prisma"
     schema_dir.mkdir(parents=True, exist_ok=True)

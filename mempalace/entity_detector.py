@@ -239,6 +239,9 @@ READABLE_EXTENSIONS = {
     # PowerShell, so an AL-only repo still has files to sample.
     ".al",
     ".ps1",
+    # Mirrors miner.READABLE_EXTENSIONS: Prisma schema files (ORM database
+    # models) are plain text and a good entity-detection source.
+    ".prisma",
 }
 
 SKIP_DIRS = {
