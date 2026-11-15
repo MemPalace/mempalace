@@ -82,6 +82,12 @@ def test_aliases_of_a_plain_wing_are_only_its_prefixed_twin():
     assert wing_aliases("backend") == ["backend", "wing_backend"]
 
 
+def test_aliases_find_a_stored_wing_prefix_only_the_slug_reveals():
+    assert "wing-c++" in wing_aliases("wing_c", {"wing-c++"})
+    assert "wing_c++" in wing_aliases("c", {"wing_c++"})
+    assert "wings-c++" not in wing_aliases("c", {"wings-c++"})
+
+
 def test_aliases_cover_the_old_cursor_bytes_rule():
     # The Cursor hooks turned each non-ASCII byte into `_` and squeezed runs.
     assert "caf_notes" in wing_aliases("café_notes")

@@ -21,6 +21,7 @@ from urllib import error as urlerror, parse as urlparse, request as urlrequest
 
 import numpy as np
 
+from .. import _net
 from ..lexical import bm25_scores, tokenize
 from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
 from ..timeutil import utc_now_iso as _utcnow
@@ -212,7 +213,8 @@ class _QdrantRESTClient:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         req = urlrequest.Request(url, data=data, method=method, headers=headers)
         try:
-            with urlrequest.urlopen(req, timeout=self._config.timeout) as resp:
+            # Never follows a redirect: the api-key header would travel with it.
+            with _net.urlopen(req, timeout=self._config.timeout) as resp:
                 raw = resp.read()
         except urlerror.HTTPError as exc:
             raw = exc.read()

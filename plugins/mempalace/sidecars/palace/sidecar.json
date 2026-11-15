@@ -1,0 +1,18 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "MemPalace",
+  "description": "Explore your memory palace: semantic recall, wings & rooms, temporal knowledge graph, and live multi-agent logstream coordination.",
+  "has_web_ui": true,
+  "ui_config": {
+    "display_name": "MemPalace",
+    "views": [
+      {
+        "title": "MemPalace",
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE"
+      }
+    ]
+  }
+}

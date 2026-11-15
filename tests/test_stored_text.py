@@ -287,3 +287,212 @@ def test_bm25_fallback_decodes(tmp_path):
     assert sorted(r["text"] for r in out["results"]) == sorted(
         [ORIGINAL + " kubernetes rollout", LOOKALIKE + " kubernetes notes"]
     )
+
+
+@pytest.fixture
+def filtered_chroma(tmp_path):
+    col = _chroma(tmp_path)
+    documents = [
+        "plain path C:" + BS + "notes",
+        PREFIX + "path C:" + BS + "notes",
+        "NUL\x00 path C:" + BS + "notes",
+        "byte" + chr(0xDCFF) + " path C:" + BS + "notes",
+        "literal " + BS + "0",
+        "unrelated",
+    ]
+    ids = [f"filter-{i}" for i in range(len(documents))]
+    col.add(
+        ids=ids,
+        documents=documents,
+        metadatas=[{"wing": "keep" if i < 5 else "drop"} for i in range(len(ids))],
+        embeddings=[[float(i + 1), 1.0, 0.0, 0.0] for i in range(len(ids))],
+    )
+    return col, dict(zip(ids, documents))
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        {"$contains": "C:" + BS + "notes"},
+        {"$contains": BS + "0"},
+        {"$contains": PREFIX},
+        {"$contains": "NUL\x00"},
+        {"$contains": chr(0xDCFF)},
+        {"$and": [{"$contains": "path"}, {"$contains": BS + "notes"}]},
+        {"$or": [{"$contains": BS + "notes"}, {"$contains": "literal"}]},
+        {"$contains": "absent"},
+    ],
+)
+def test_chroma_document_filters_match_restored_text_before_pagination_and_ranking(
+    filtered_chroma, predicate
+):
+    from mempalace.backends._filters import matches_where_document
+
+    col, documents = filtered_chroma
+    expected = [
+        i for i in col.get(include=[]).ids if matches_where_document(documents[i], predicate)
+    ]
+    assert col.get(include=["documents"]).documents == list(documents.values())
+    assert col.get(where_document=predicate, include=[]).ids == expected
+
+    assert col.get(where_document=predicate, offset=1, limit=1, include=[]).ids == expected[1:2]
+    assert col.get(ids=list(documents)[1:4], where_document=predicate, include=[]).ids == [
+        i for i in expected if i in list(documents)[1:4]
+    ]
+
+    # The best eligible vector must survive even when an ineligible row ranks ahead of it.
+    unfiltered = col.query(query_embeddings=[[1.0, 0.0, 0.0, 0.0]], n_results=len(documents))
+    ranked = [i for i in unfiltered.ids[0] if i in expected]
+    result = col.query(
+        query_embeddings=[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+        where_document=predicate,
+        n_results=1,
+        include=["documents", "metadatas", "distances", "embeddings"],
+    )
+    assert result.ids == [ranked[:1], ranked[:1]]
+    assert result.documents == [[documents[i] for i in ranked[:1]]] * 2
+    assert result.embeddings is not None and len(result.embeddings) == 2
+
+
+def test_chroma_document_filter_combines_metadata_and_include_projection(filtered_chroma):
+    col, _ = filtered_chroma
+    predicate = {"$contains": "C:" + BS + "notes"}
+    expected = ["filter-1", "filter-2", "filter-3"]
+    where = {"$and": [{"wing": "keep"}, {"last_modified": {"$ne": "missing"}}]}
+    result = col.get(
+        ids=expected,
+        where=where,
+        where_document=predicate,
+        include=["embeddings"],
+        limit=2,
+    )
+    assert result.ids == expected[:2]
+    assert result.documents == [] and result.metadatas == []
+    assert result.embeddings is not None and len(result.embeddings) == 2
+    empty = col.query(
+        query_embeddings=[[1.0, 0.0, 0.0, 0.0]],
+        where={"wing": "drop"},
+        where_document=predicate,
+        n_results=1,
+        include=["embeddings"],
+    )
+    assert empty.ids == [[]] and empty.embeddings == [[]]
+
+
+def test_chroma_filter_candidate_scan_pages_before_returning_logical_results(tmp_path):
+    col = _chroma(tmp_path)
+    documents = [PREFIX + "C:" + BS + "other notes" for _ in range(513)]
+    documents += ["nul\x00 C:" + BS + "notes", "plain C:" + BS + "notes"]
+    ids = [f"page-{i}" for i in range(len(documents))]
+    col.add(
+        ids=ids,
+        documents=documents,
+        embeddings=[[1.0, 0.0, 0.0, 0.0]] * len(documents),
+    )
+    result = col.get(
+        where_document={"$contains": "C:" + BS + "notes"},
+        limit=1,
+        offset=1,
+        include=[],
+    )
+    assert result.ids == [ids[-1]]
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        {"$contains": BS},
+        {"$and": [{"$contains": "path"}, {"$contains": "\x00"}]},
+        {"$or": [{"$contains": chr(0xDCFF)}, {"$contains": "literal"}]},
+    ],
+)
+def test_chroma_document_predicates_with_unrestricted_native_candidates(filtered_chroma, predicate):
+    from mempalace.backends._filters import matches_where_document
+
+    col, documents = filtered_chroma
+    expected = [
+        i for i, document in documents.items() if matches_where_document(document, predicate)
+    ]
+    assert col.get(where_document=predicate, include=[]).ids == expected
+
+
+@pytest.mark.parametrize("method", ["get", "query"])
+def test_chroma_document_filter_returns_payloads_from_the_filtered_read(
+    tmp_path, monkeypatch, method
+):
+    import threading
+
+    from mempalace.backends.chroma import ChromaCollection
+
+    reader = _chroma(tmp_path)
+    writer = ChromaCollection(reader._collection, palace_path=str(tmp_path))
+    reader.add(ids=["sample"], documents=["alpha needle"], embeddings=[[1.0, 0.0, 0.0, 0.0]])
+    completed = threading.Event()
+    errors = []
+    worker = None
+
+    def update():
+        try:
+            writer.upsert(
+                ids=["sample"], documents=["beta absent"], embeddings=[[1.0, 0.0, 0.0, 0.0]]
+            )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    def update_after_read(native):
+        def read(**kwargs):
+            nonlocal worker
+            raw = native(**kwargs)
+            if worker is None:
+                worker = threading.Thread(target=update, daemon=True)
+                worker.start()
+                assert completed.wait(5), "filtered reads must coexist with a writer"
+            return raw
+
+        return read
+
+    # An intervening writer changes storage after the native response. A
+    # second retrieval by selected ID would now return nonmatching text.
+    monkeypatch.setattr(reader._collection, "get", update_after_read(reader._collection.get))
+    monkeypatch.setattr(reader._collection, "query", update_after_read(reader._collection.query))
+    try:
+        if method == "query":
+            result = reader.query(
+                query_embeddings=[[1.0, 0.0, 0.0, 0.0]],
+                where_document={"$contains": "needle"},
+                n_results=1,
+                include=["documents"],
+            )
+            assert result.documents == [["alpha needle"]]
+        else:
+            result = reader.get(where_document={"$contains": "needle"}, include=["documents"])
+            assert result.documents == ["alpha needle"]
+    finally:
+        if worker is not None:
+            worker.join(5)
+    assert worker is not None and not worker.is_alive()
+    assert not errors, errors
+    assert reader.get(ids=["sample"], include=["documents"]).documents == ["beta absent"]
+
+
+def test_chroma_document_filters_allow_reads_beside_a_writer_lease(filtered_chroma, monkeypatch):
+    import mempalace.palace as palace
+
+    col, _ = filtered_chroma
+
+    def writer_owned(_path):
+        raise palace.MineAlreadyRunning("a hub holds the lifetime writer lease")
+
+    monkeypatch.setattr(palace, "mine_palace_lock", writer_owned)
+    predicate = {"$contains": "C:" + BS + "notes"}
+    assert col.get(where_document=predicate, include=[]).ids == [
+        "filter-0",
+        "filter-1",
+        "filter-2",
+        "filter-3",
+    ]
+    assert col.query(
+        query_embeddings=[[1.0, 0.0, 0.0, 0.0]], where_document=predicate, n_results=1
+    ).ids == [["filter-3"]]

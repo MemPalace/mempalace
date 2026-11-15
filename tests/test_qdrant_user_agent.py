@@ -24,7 +24,7 @@ def test_qdrant_rest_client_sends_versioned_user_agent(monkeypatch):
         captured["timeout"] = timeout
         return _FakeResponse()
 
-    monkeypatch.setattr(qdrant.urlrequest, "urlopen", fake_urlopen)
+    monkeypatch.setattr(qdrant._net, "urlopen", fake_urlopen)
 
     client = _QdrantRESTClient(_QdrantConfig(url="https://qdrant.example.invalid", timeout=7.5))
 

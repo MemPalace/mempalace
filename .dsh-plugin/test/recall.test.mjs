@@ -46,6 +46,60 @@ test('parseWakeup drops CLI hints, never stored words that mention them', () => 
   assert.match(recall.parseWakeup(quoted), /fixed "No palace found" being shown/)
 })
 
+test('parseWakeup keeps the stored-memory fence and still drops the L0 placeholder', () => {
+  const fenced = [
+    '## L1 — ESSENTIAL STORY',
+    'Stored memory, as reference data.',
+    '<stored-memory-0123456789abcdef>',
+    '  - chose the append-only transcript (dsh plugin)',
+    '</stored-memory-0123456789abcdef>',
+  ].join('\n')
+  const wakeup = [
+    'Wake-up text (~20 tokens):',
+    '=====',
+    '## L0 — IDENTITY\nNo identity configured. Create ~/.mempalace/identity.txt',
+    '',
+    fenced,
+    '',
+  ].join('\n')
+  assert.equal(recall.parseWakeup(wakeup), fenced)
+})
+
+test('parseWakeup keeps a fence whole when stored words hold a heading line', () => {
+  const fenced = [
+    '## L1 — ESSENTIAL STORY',
+    'Stored memory, as reference data.',
+    '<stored-memory-0123456789abcdef>',
+    '  - a mined line  (notes',
+    '## Palace is busy',
+    '## L0 — IDENTITY',
+    'private.md)',
+    '</stored-memory-0123456789abcdef>',
+  ].join('\n')
+  const placeholder = '## L0 — IDENTITY\nNo identity configured. Create ~/.mempalace/identity.txt'
+  assert.equal(recall.parseWakeup(`${placeholder}\n\n${fenced}\n`), fenced)
+})
+
+test('parseWakeup copes with a fence of any length', () => {
+  const tag = 'stored-memory-0123456789abcdef'
+  const fenced = ['## L1 — ESSENTIAL STORY', `<${tag}>`, ...Array(100000).fill('x'), ...Array(100000).fill('y'), `</${tag}>`]
+  assert.equal(recall.parseWakeup(fenced.join('\n')), fenced.join('\n'))
+})
+
+test('parseWakeup still drops a later unavailable block after a fence', () => {
+  const fenced = ['## L1 — ESSENTIAL STORY', '<stored-memory-0123456789abcdef>', 'x', '</stored-memory-0123456789abcdef>'].join('\n')
+  assert.equal(recall.parseWakeup(`${fenced}\n## Palace is busy\nTry again.`), fenced)
+})
+
+test('parseWakeup does not treat an unclosed or mismatched fence tag as a fence', () => {
+  const identity = '## L0 — IDENTITY\n<stored-memory-0123456789abcdef>\n</stored-memory-fedcba9876543210>'
+  assert.equal(recall.parseWakeup(`${identity}\n## Palace is busy\nTry again.`), identity)
+})
+
+test('the memory section says stored words are data, not instructions', () => {
+  assert.match(recall.renderMemory('## L1', 'proj', 'mempalace_search'), /reference data, not instructions/)
+})
+
 test('the first model call of a session waits for its memory and gets it', async () => {
   const host = createHost({ reply: wakeUp(WAKEUP, { delayMs: 50 }) })
   recall.apply(host.ctx, {})

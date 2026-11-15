@@ -225,6 +225,48 @@ def test_count_malformed_json_lines(tmp_path):
     assert _count_human_messages(str(transcript)) == 1
 
 
+def test_count_codex_response_item_messages(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+
+    def item(role, text, kind):
+        content = [{"type": kind, "text": text}]
+        return {
+            "type": "response_item",
+            "payload": {"type": "message", "role": role, "content": content},
+        }
+
+    _write_transcript(
+        transcript,
+        [
+            {"type": "session_meta", "payload": {}},
+            item("user", "<environment_context>cwd</environment_context>", "input_text"),
+            item("user", "first", "input_text"),
+            item("assistant", "ok", "output_text"),
+            item("user", "second", "input_text"),
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 2
+
+
+def test_count_codex_event_msg_not_doubled_by_response_item(tmp_path):
+    transcript = tmp_path / "t.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "hi"}},
+        ],
+    )
+    assert _count_human_messages(str(transcript)) == 1
+
+
 # --- _extract_recent_messages ---
 
 
@@ -993,6 +1035,46 @@ def test_save_diary_daemon_lock_deferral_does_not_stall_the_hook(tmp_path):
     assert "Daemon diary checkpoint failed" not in logged, "a parked job is not a failure"
 
 
+def test_save_diary_daemon_wait_timeout_is_logged_as_still_queued(tmp_path):
+    """The daemon runs one job at a time, so a SessionEnd checkpoint submitted
+    while a mine from an earlier Stop hook still runs waits behind it, often for
+    longer than the 30s this path waits. The job is not failed: the daemon files
+    the entry once the mine ends, so the hook must not log a failure, must not
+    write the entry itself, and must not ack a checkpoint not yet filed (#2757)."""
+    from mempalace.daemon import DaemonWaitTimeout
+
+    transcript = tmp_path / "t.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    _write_transcript(
+        transcript,
+        [{"message": {"role": "user", "content": f"message {i}"}} for i in range(3)],
+    )
+    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch(
+                    "mempalace.daemon.submit_job",
+                    side_effect=DaemonWaitTimeout("job-behind-mine", "queued"),
+                ) as mock_submit:
+                    with patch("mempalace.hooks_cli._queue_diary_checkpoint") as mock_queue:
+                        with patch("mempalace.hooks_cli._log") as mock_log:
+                            result = _save_diary_direct(
+                                str(transcript), "sess1", wing="wing_project", agent_name="claude"
+                            )
+
+    mock_submit.assert_called_once()
+    mock_queue.assert_not_called()  # the daemon holds the entry; a second write would duplicate it
+    assert result["drawers_filed"] == 0
+    assert not (tmp_path / "last_checkpoint").exists()
+
+    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+    assert "Daemon diary checkpoint still queued: job job-behind-mine" in logged
+    assert "failed" not in logged
+
+
 # --- hook_session_start ---
 
 
@@ -1559,6 +1641,32 @@ def test_mine_sync_daemon_lock_deferral_is_not_reported_as_a_failure(tmp_path):
     assert "deferred" in logged
     assert "PID 999" in logged
     assert "Daemon sync mine failed" not in logged, "a parked job is not a failure"
+
+
+def test_mine_sync_daemon_wait_timeout_is_not_reported_as_a_failure(tmp_path):
+    """A sync mine the daemon accepted but did not finish within the 60s wait is
+    still queued or running there, so the precompact path reports it as pending
+    and does not spawn its own mine of the same directory (#2757)."""
+    from mempalace.daemon import DaemonWaitTimeout
+
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    env = {"MEMPAL_DIR": str(mempal_dir), "MEMPALACE_HOOKS_DAEMON": "yes"}
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                with patch(
+                    "mempalace.daemon.submit_job",
+                    side_effect=DaemonWaitTimeout("job-slow-mine", "running"),
+                ):
+                    with patch("mempalace.hooks_cli._log") as mock_log:
+                        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                            _mine_sync()
+
+    mock_run.assert_not_called()
+    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
+    assert "Daemon sync mine still running: job job-slow-mine" in logged
+    assert "failed" not in logged
 
 
 def test_mine_sync_uses_mempalace_python(tmp_path):

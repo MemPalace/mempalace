@@ -11,14 +11,33 @@ format and STDOUT contract are Antigravity-specific (see
 
 ## Quick start
 
+### Option A — Official `agy plugin` CLI / Marketplace bundle (Windows, macOS, Linux)
+
+From the repo root:
+
+```bash
+agy plugin validate --strict ./plugins/mempalace
+agy plugin install ./plugins/mempalace
+```
+
+`plugins/mempalace/` is a self-contained Marketplace bundle shipping cross-platform Node.js lifecycle hooks (`node ./scripts/save-hook.mjs` and `node ./scripts/wake-hook.mjs`), the Aux Pane UI Extension (`sidecars/palace/`), skills, recall rule, and `mcp_config.json`.
+
+To export a standalone lightweight Git repository or release zip:
+
+```bash
+python hooks/antigravity/export_standalone.py --output dist/mempalace-antigravity --init-git
+```
+
+### Option B — POSIX `install.sh` installer (macOS / Linux)
+
 From the repo root:
 
 ```bash
 bash hooks/antigravity/install.sh
 ```
 
-This installs the plugin to `~/.gemini/config/plugins/mempalace/`.
-Restart Antigravity and the MCP server, skill, and hooks all register
+This installs the plugin to `~/.gemini/config/plugins/mempalace/` and renders `hooks/antigravity/hooks.json.tmpl` for the POSIX bash hooks.
+Restart Antigravity and the MCP server, UI extension, skills, rule, and hooks all register
 automatically.
 
 To dry-run first:
@@ -133,13 +152,14 @@ canonical UX and what we recommend.
    `antigravity_hook.log` — `count` and `interval` should both be
    visible. Mining only triggers when `count % interval == 0`.
 2. Ensure a Python that can import `mempalace` is reachable. The hook
-   runs `"$MEMPAL_PYTHON_BIN" -m mempalace`, where `MEMPAL_PYTHON_BIN`
-   is resolved (in order) from `$MEMPAL_PYTHON`, the
+   runs mempalace through `"$MEMPAL_PYTHON_BIN"` (with `PYTHONSAFEPATH=1`
+   and a launcher that never imports from the workspace), where
+   `MEMPAL_PYTHON_BIN` is resolved (in order) from `$MEMPAL_PYTHON`, the
    `mempalace-mcp` / `mempalace` console-script shebang on `$PATH`,
    then `python3`. A failed probe logs:
 
    ```
-   ERROR: mempalace is not runnable via <python> -m mempalace; install mempalace or set MEMPAL_PYTHON
+   ERROR: mempalace is not runnable via <python>; install mempalace or set MEMPAL_PYTHON
    ```
 
    On a GUI-launched Antigravity the harness `PATH` may differ from
