@@ -771,6 +771,20 @@ class BaseCollection(ABC):
         """Return counts for each distinct value of a metadata field."""
         raise UnsupportedCapabilityError("backend does not support facet_counts")
 
+    def joint_facet_counts(
+        self,
+        field_a: str,
+        field_b: str,
+        where: Optional[dict] = None,
+    ) -> dict[tuple[str, str], int]:
+        """Return counts grouped by a metadata field pair.
+
+        Backends that can express the two-level grouping server-side should
+        override; the default raises so callers fall back to per-key
+        ``facet_counts`` fan-out.
+        """
+        raise UnsupportedCapabilityError("backend does not support joint_facet_counts")
+
     def maintenance_state(self) -> dict:
         """Return a structured snapshot of this collection's maintenance state.
 

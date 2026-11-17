@@ -5,6 +5,8 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -15,6 +17,16 @@ from _mcp_server_helpers import (
     _patch_mcp_server,
     _unexpected_client_read,
 )
+
+
+def _wait_for_overview_refreshes(mcp_server, timeout=10.0):
+    """Block until no overview refresh threads are in flight."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not mcp_server._overview_refreshing:
+            return True
+        time.sleep(0.01)
+    return False
 
 
 class TestReadTools:
@@ -412,6 +424,244 @@ with mine_palace_lock(sys.argv[1]):
         assert result["total_drawers"] == 2
         assert result["wings"].get("proj") == 1
         assert result["wings"].get("unknown") == 1
+
+    def test_status_payload_cached_within_ttl(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """tool_status must not recompute the O(collection) overview on every
+        call — the wake-up protocol calls it per session and on a large
+        pgvector palace each compute is tens of seconds of SQL."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = []
+        real = mcp_server._tool_status_uncached
+
+        def counting():
+            calls.append(1)
+            return real()
+
+        monkeypatch.setattr(mcp_server, "_tool_status_uncached", counting)
+        first = mcp_server.tool_status()
+        second = mcp_server.tool_status()
+        assert first == second
+        assert len(calls) == 1
+
+    def test_status_cache_dropped_by_invalidate(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Writes invalidate the fresh status payload; the next read serves
+        the last good copy while a background refresh recomputes."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        # Post-write reads wait briefly for the refresh; keep it short so
+        # the parked refresh below does not stall the test.
+        monkeypatch.setattr(mcp_server, "_OVERVIEW_POST_WRITE_WAIT", 0.2)
+
+        calls = []
+        real = mcp_server._tool_status_uncached
+        release = threading.Event()
+        refresh_started = threading.Event()
+
+        def counting():
+            calls.append(1)
+            if len(calls) > 1:
+                refresh_started.set()
+                release.wait(timeout=10)
+            return real()
+
+        monkeypatch.setattr(mcp_server, "_tool_status_uncached", counting)
+        first = mcp_server.tool_status()
+        assert len(calls) == 1
+        mcp_server._invalidate_overview_caches()
+        second = mcp_server.tool_status()
+        # Stale-while-revalidate: the post-write read waits only
+        # _OVERVIEW_POST_WRITE_WAIT for the refresh (parked on `release`),
+        # then returns the pre-write payload instead of blocking on the
+        # cold scan.
+        assert second == first
+        assert refresh_started.wait(timeout=5)
+        assert len(calls) == 2
+        release.set()
+        assert _wait_for_overview_refreshes(mcp_server)
+        third = mcp_server.tool_status()
+        assert third == first
+        assert len(calls) == 2
+
+    def test_status_stale_payload_served_during_refresh(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """Past the TTL, tool_status returns the last good payload at once
+        and refreshes in the background instead of blocking on a cold scan
+        that can exceed proxy/client timeouts under load."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = []
+        real = mcp_server._tool_status_uncached
+        release = threading.Event()
+        refresh_started = threading.Event()
+
+        def counting():
+            calls.append(1)
+            if len(calls) > 1:
+                refresh_started.set()
+                release.wait(timeout=10)
+            return real()
+
+        monkeypatch.setattr(mcp_server, "_tool_status_uncached", counting)
+        first = mcp_server.tool_status()
+        assert len(calls) == 1
+
+        # Expire the fresh entry without invalidating: the stale path must
+        # serve the cached payload and refresh off the request thread.
+        mcp_server._overview_payload_cache["status"] = (0.0, first)
+
+        second = mcp_server.tool_status()
+        assert second == first
+        assert refresh_started.wait(timeout=5)
+        assert "status" in mcp_server._overview_refreshing
+        release.set()
+        assert _wait_for_overview_refreshes(mcp_server)
+        assert len(calls) == 2
+        third = mcp_server.tool_status()
+        assert third == first
+        assert len(calls) == 2
+
+    def test_overview_refresh_dropped_when_write_lands_mid_flight(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A background refresh that raced a write must not pin pre-write
+        data as fresh — the generation check drops its result."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        first = mcp_server.tool_status()
+        assert "status" in mcp_server._overview_payload_cache
+
+        mcp_server._overview_payload_cache["status"] = (0.0, first)
+
+        def invalidate_then_compute():
+            mcp_server._invalidate_overview_caches()
+            return {"total_drawers": 9999, "wings": {}, "rooms": {}}
+
+        monkeypatch.setattr(mcp_server, "_tool_status_uncached", invalidate_then_compute)
+        served = mcp_server.tool_status()
+        assert served == first
+
+        assert _wait_for_overview_refreshes(mcp_server)
+        # Generation guard dropped the post-invalidate compute: nothing fresh.
+        assert mcp_server._cached_overview_payload("status") is None
+        # The graveyard still serves the last good payload.
+        assert mcp_server._stale_overview_payload("status") == first
+
+    def test_status_post_write_read_returns_fresh_after_refresh(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A post-write overview read waits for the in-flight refresh and
+        returns the fresh payload when it lands inside the wait window —
+        callers verifying a write must not see pre-write counts."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_OVERVIEW_POST_WRITE_WAIT", 5.0)
+        n = [0]
+
+        def compute():
+            n[0] += 1
+            return {"total_drawers": n[0], "marker": n[0]}
+
+        monkeypatch.setattr(mcp_server, "_tool_status_uncached", compute)
+        first = mcp_server.tool_status()
+        assert first["marker"] == 1
+        mcp_server._invalidate_overview_caches()
+        second = mcp_server.tool_status()
+        assert second["marker"] == 2
+        assert n[0] == 2
+
+    def test_status_post_write_read_falls_back_to_stale_on_timeout(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """When the refresh cannot finish inside the wait window, the
+        post-write read still returns the last good payload rather than
+        blocking on the full cold scan."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        monkeypatch.setattr(mcp_server, "_OVERVIEW_POST_WRITE_WAIT", 0.2)
+        n = [0]
+        release = threading.Event()
+
+        def compute():
+            n[0] += 1
+            if n[0] > 1:
+                release.wait(timeout=10)
+            return {"total_drawers": n[0], "marker": n[0]}
+
+        monkeypatch.setattr(mcp_server, "_tool_status_uncached", compute)
+        first = mcp_server.tool_status()
+        assert first["marker"] == 1
+        mcp_server._invalidate_overview_caches()
+        second = mcp_server.tool_status()
+        assert second["marker"] == 1
+        release.set()
+        assert _wait_for_overview_refreshes(mcp_server)
+        assert n[0] == 2
+
+    def test_status_error_payload_not_cached(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """A failing status must be retried promptly, not pinned for the TTL."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        calls = []
+
+        def failing():
+            calls.append(1)
+            return {"error": "backend down"}
+
+        monkeypatch.setattr(mcp_server, "_tool_status_uncached", failing)
+        mcp_server.tool_status()
+        mcp_server.tool_status()
+        assert len(calls) == 2
+
+    def test_overview_tools_share_cache_map(
+        self, monkeypatch, config, palace_path, seeded_collection, kg
+    ):
+        """list_wings/list_rooms/get_taxonomy pay the same O(collection) SQL
+        as status on non-chroma backends — each caches under its own key and
+        list_rooms keys by wing argument."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        wings_calls = []
+        real_wings = mcp_server._tool_list_wings_uncached
+
+        def counting_wings():
+            wings_calls.append(1)
+            return real_wings()
+
+        monkeypatch.setattr(mcp_server, "_tool_list_wings_uncached", counting_wings)
+        mcp_server.tool_list_wings()
+        mcp_server.tool_list_wings()
+        assert len(wings_calls) == 1
+
+        rooms_calls = []
+        real_rooms = mcp_server._tool_list_rooms_uncached
+
+        def counting_rooms(wing=None):
+            rooms_calls.append(wing)
+            return real_rooms(wing)
+
+        monkeypatch.setattr(mcp_server, "_tool_list_rooms_uncached", counting_rooms)
+        mcp_server.tool_list_rooms()
+        mcp_server.tool_list_rooms()
+        mcp_server.tool_list_rooms(wing="project")
+        mcp_server.tool_list_rooms(wing="project")
+        # unfiltered cached once, "project" cached once — two computes total
+        assert len(rooms_calls) == 2
 
     def test_list_wings(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)

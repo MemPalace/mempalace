@@ -321,7 +321,45 @@ def _tally_wings_rooms(all_meta, wings=None, rooms=None, taxonomy=None) -> int:
     return total
 
 
+def _overview_tool(key, compute):
+    """Serve an overview tool from the TTL cache, computing on miss.
+
+    TTL-expired entries are served stale-while-revalidate: the last good
+    payload returns at once and a background thread refreshes it, because a
+    cold scan can exceed proxy/client timeouts under load. Write-invalidated
+    entries get a bounded wait (_OVERVIEW_POST_WRITE_WAIT) for the refresh
+    so post-write verification reads still see fresh counts, falling back
+    to stale rather than blocking on the full scan. Only a first-ever call
+    — nothing ever computed — pays the synchronous cost. Error/partial
+    payloads are never cached.
+    """
+    cached = _cached_overview_payload(key)
+    if cached is not None:
+        return cached
+    entry = _overview_payload_cache.get(key)
+    if entry is not None:
+        _schedule_overview_refresh(key, compute)
+        return entry[1]
+    stale = _stale_overview_payload(key)
+    if stale is not None:
+        event = _schedule_overview_refresh(key, compute)
+        if event is not None and _OVERVIEW_POST_WRITE_WAIT > 0:
+            event.wait(timeout=_OVERVIEW_POST_WRITE_WAIT)
+            fresh = _cached_overview_payload(key)
+            if fresh is not None:
+                return fresh
+        return stale
+    payload = compute()
+    if isinstance(payload, dict) and not payload.get("error"):
+        _store_overview_payload(key, payload)
+    return payload
+
+
 def tool_status():
+    return _overview_tool("status", _tool_status_uncached)
+
+
+def _tool_status_uncached():
     _ensure_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = _tool_status_via_sqlite()
@@ -459,6 +497,10 @@ When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 
 
 def tool_list_wings():
+    return _overview_tool("list_wings", _tool_list_wings_uncached)
+
+
+def _tool_list_wings_uncached():
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
@@ -499,6 +541,10 @@ def tool_list_wings():
 
 
 def tool_list_rooms(wing: str = None):
+    return _overview_tool(f"list_rooms:{wing or ''}", lambda: _tool_list_rooms_uncached(wing))
+
+
+def _tool_list_rooms_uncached(wing: str = None):
     try:
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
@@ -554,6 +600,10 @@ def tool_list_rooms(wing: str = None):
 
 
 def tool_get_taxonomy():
+    return _overview_tool("get_taxonomy", _tool_get_taxonomy_uncached)
+
+
+def _tool_get_taxonomy_uncached():
     fast = _sqlite_taxonomy()
     if fast is not None:
         _total, wing_rooms = fast
@@ -567,26 +617,36 @@ def tool_get_taxonomy():
         try:
             if not _supports_metadata_facets(col):
                 raise ValueError("facets not supported")
-            from concurrent.futures import ThreadPoolExecutor
-
             wing_counts = col.facet_counts("wing")
-            wings = list(wing_counts.keys())
             temp_taxonomy = {}
-            with ThreadPoolExecutor(max_workers=max(1, min(8, len(wings)))) as executor:
-                futures = {
-                    wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
-                    for wing in wings
-                }
-                for wing, future in futures.items():
-                    room_counts = future.result()
-                    try:
-                        unknown_rooms = wing_counts[wing] - sum(room_counts.values())
-                        if unknown_rooms > 0:
-                            room_counts["unknown"] = room_counts.get("unknown", 0) + unknown_rooms
-                    except (TypeError, ValueError):
-                        pass
-                    temp_taxonomy[wing] = room_counts
-                taxonomy.update(temp_taxonomy)
+            if _supports_joint_facets(col):
+                # One grouped scan for the whole wing→room matrix instead of
+                # a room-facet query per wing — on large pgvector palaces the
+                # fan-out is what made this tool take minutes.
+                pairs = col.joint_facet_counts("wing", "room")
+                for (wing, room), n in pairs.items():
+                    temp_taxonomy.setdefault(wing, {})[room] = n
+                for wing in wing_counts:
+                    temp_taxonomy.setdefault(wing, {})
+            else:
+                from concurrent.futures import ThreadPoolExecutor
+
+                wings = list(wing_counts.keys())
+                with ThreadPoolExecutor(max_workers=max(1, min(8, len(wings)))) as executor:
+                    futures = {
+                        wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
+                        for wing in wings
+                    }
+                    for wing, future in futures.items():
+                        temp_taxonomy[wing] = future.result()
+            for wing, room_counts in temp_taxonomy.items():
+                try:
+                    unknown_rooms = wing_counts.get(wing, 0) - sum(room_counts.values())
+                    if unknown_rooms > 0:
+                        room_counts["unknown"] = room_counts.get("unknown", 0) + unknown_rooms
+                except (TypeError, ValueError):
+                    pass
+            taxonomy.update(temp_taxonomy)
             _drop_bookkeeping_facets(col, taxonomy=taxonomy)
         except Exception as e:
             if _supports_metadata_facets(col):
