@@ -123,9 +123,13 @@ def test_flagged_light_session_skips_hub_discovery(monkeypatch) -> None:
 def test_light_hub_proxy_rewrites_pql_and_enriches_tunnels_without_loading_server(
     tmp_path, monkeypatch
 ) -> None:
+    from mempalace.config import MempalaceConfig
+
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
-    (palace_dir / "tunnels.json").write_text(
+    tunnel_path = Path(MempalaceConfig(palace_path=str(palace_dir)).tunnel_file)
+    assert tunnel_path == tmp_path / "tunnels.json"
+    tunnel_path.write_text(
         json.dumps(
             [
                 {
@@ -145,9 +149,9 @@ def test_light_hub_proxy_rewrites_pql_and_enriches_tunnels_without_loading_serve
         lambda: False,
     )
     monkeypatch.setattr(
-        mcp_light_server._LazyMcpServer,
-        "_load",
-        lambda self: pytest.fail("hub proxy must not load mcp_server"),
+        mcp_light_server,
+        "_get_mcp_server",
+        lambda: pytest.fail("hub proxy must not load mcp_server"),
     )
 
     hub = HubClient(str(palace_dir), {"host": "127.0.0.1", "port": 8765, "pid": 9999})
@@ -178,7 +182,9 @@ def test_light_hub_proxy_rewrites_pql_and_enriches_tunnels_without_loading_serve
                 "jsonrpc": "2.0",
                 "id": request["id"],
                 "result": {
-                    "content": [{"type": "text", "text": json.dumps({"wings": ["patient_1042"]})}]
+                    "content": [
+                        {"type": "text", "text": json.dumps({"wings": {"patient_1042": 5}})}
+                    ]
                 },
             }
         return {
@@ -208,17 +214,18 @@ def test_light_hub_proxy_rewrites_pql_and_enriches_tunnels_without_loading_serve
 
     proxy._forward = fake_forward
 
-    resp = proxy.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "palace_query",
-                "arguments": {"query": 'FIND "potassium" IN 1042 LIMIT 5'},
-            },
-        }
-    )
+    req = {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/call",
+        "params": {
+            "name": "palace_query",
+            "arguments": {"query": 'FIND "potassium" IN 1042 LIMIT 5'},
+        },
+    }
+    resp = proxy.handle(req)
+    proxy.handle(req)
+
     payload = json.loads(resp["result"]["content"][0]["text"])
     assert payload["relevance_confidence"] == "high"
     assert payload["connected_tunnels"] == [
@@ -231,10 +238,15 @@ def test_light_hub_proxy_rewrites_pql_and_enriches_tunnels_without_loading_serve
             "tunnel_id": "t1",
         }
     ]
-    search_req = next(
-        req for req in forwarded if (req.get("params") or {}).get("name") == "mempalace_search"
-    )
-    assert search_req["params"]["arguments"]["wing"] == "patient_1042"
+    search_reqs = [
+        r for r in forwarded if (r.get("params") or {}).get("name") == "mempalace_search"
+    ]
+    wing_reqs = [
+        r for r in forwarded if (r.get("params") or {}).get("name") == "mempalace_list_wings"
+    ]
+    assert len(search_reqs) == 2
+    assert search_reqs[0]["params"]["arguments"]["wing"] == "patient_1042"
+    assert len(wing_reqs) == 1
 
 
 def test_light_hub_proxy_does_not_replay_mutating_errors() -> None:
@@ -382,3 +394,95 @@ def test_light_server_subprocess_hub_proxy_stays_light(tmp_path) -> None:
             os.environ["MEMPALACE_PALACE_PATH"] = old_palace
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_mcp_light_server_exposes_real_module_for_pytest_static_monkeypatch() -> None:
+    """Accessing mcp_light_server.mcp_server returns the real ModuleType so pytest 9.2+ keeps attributes."""
+    import inspect
+    import types
+
+    resolved = mcp_light_server.mcp_server
+    assert isinstance(resolved, types.ModuleType)
+    sentinel = object()
+    assert inspect.getattr_static(resolved, "_mcp_tool_preflight_refusal", sentinel) is not sentinel
+
+    mp_ctx = pytest.MonkeyPatch()
+    mp_ctx.setattr(mcp_light_server.mcp_server, "_mcp_tool_preflight_refusal", lambda *a, **k: None)
+    assert mcp_light_server.mcp_server._mcp_tool_preflight_refusal(1, "x") is None
+    mp_ctx.undo()
+    assert hasattr(resolved, "_mcp_tool_preflight_refusal")
+    assert callable(resolved._mcp_tool_preflight_refusal)
+
+
+def test_light_hub_proxy_degrades_once_and_reconnects_when_hub_restarts(
+    tmp_path, monkeypatch
+) -> None:
+    """Dead hub fails once (not twice on wing lookup), annotates degraded mode, and reconnects on restart."""
+    palace_dir = str(tmp_path / "palace")
+    hub1 = HubClient(palace_dir, {"host": "127.0.0.1", "port": 8765, "pid": 9999})
+    proxy = mcp_light_server._LightHubProxy(hub1, palace_dir)
+
+    attempts = []
+
+    def dead_forward(_req):
+        attempts.append("dead")
+        raise urllib.error.URLError("connection refused")
+
+    proxy._forward = dead_forward
+    discovered = {"hub": None}
+    monkeypatch.setattr(HubClient, "discover", classmethod(lambda cls, _p: discovered["hub"]))
+    local_calls = []
+    monkeypatch.setattr(
+        proxy,
+        "_fallback_local",
+        lambda req, *, degraded=False: (
+            local_calls.append(degraded)
+            or {
+                "jsonrpc": "2.0",
+                "id": req["id"],
+                "result": {
+                    "content": [
+                        {"type": "text", "text": "[mempalace] degraded" if degraded else "ok"}
+                    ]
+                },
+            }
+        ),
+    )
+
+    req = {
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "palace_query", "arguments": {"query": 'FIND "x" IN proj LIMIT 3'}},
+    }
+    first = proxy.handle(req)
+    assert len(attempts) == 1
+    assert proxy.hub is None
+    assert local_calls == [True]
+    assert "degraded" in first["result"]["content"][0]["text"]
+
+    # Second call while hub is still down must not touch dead socket again
+    proxy.handle(req)
+    assert len(attempts) == 1
+    assert local_calls == [True, True]
+
+    # When a restarted hub appears on a new port, proxy reconnects automatically
+    hub2 = HubClient(palace_dir, {"host": "127.0.0.1", "port": 8766, "pid": 10001})
+    discovered["hub"] = hub2
+    live_calls = []
+
+    def live_forward(r):
+        live_calls.append(r)
+        if r.get("method") == "tools/list":
+            return {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}}
+        return {
+            "jsonrpc": "2.0",
+            "id": r["id"],
+            "result": {"content": [{"type": "text", "text": json.dumps({"results": []})}]},
+        }
+
+    proxy._forward = live_forward
+    resumed = proxy.handle(req)
+    assert proxy.hub is hub2
+    assert len(live_calls) >= 2
+    assert "error" not in resumed
