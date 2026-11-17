@@ -609,3 +609,188 @@ def test_bridge_subprocess_startup_without_hub_keeps_heavy_modules_unloaded(tmp_
     assert info["heavy"] == []
     assert info["mp_loaded"] is False
     assert info["vector_warm"] is False
+
+
+def test_bridge_mp_exposes_real_module_for_pytest_static_monkeypatch() -> None:
+    """Accessing bridge.mp must return the real ModuleType so pytest 9.2+ getattr_static keeps attributes."""
+    import inspect
+
+    mod = _load_bridge("test_agy_bridge_real_mp_mod")
+    assert not mod._mp_loaded()
+
+    resolved_mp = mod.mp
+    assert isinstance(resolved_mp, types.ModuleType)
+    assert mod._mp_loaded()
+    sentinel = object()
+    assert inspect.getattr_static(resolved_mp, "_get_collection", sentinel) is not sentinel
+
+    mp_ctx = pytest.MonkeyPatch()
+    mp_ctx.setattr(mod.mp, "_get_collection", lambda: "patched")
+    assert mod.mp._get_collection() == "patched"
+    mp_ctx.undo()
+    assert hasattr(resolved_mp, "_get_collection")
+    assert callable(resolved_mp._get_collection)
+
+
+def test_overview_force_refresh_does_not_reconnect_shared_hub_and_skips_caching_errors(
+    tmp_path, monkeypatch
+) -> None:
+    """UI force_refresh refreshes structure without evicting hub vectors; errors are not cached."""
+    mod = _load_bridge("test_agy_bridge_refresh_vs_reconnect")
+    cache_path = tmp_path / "cache.json"
+    monkeypatch.setattr(mod, "_disk_cache_path", lambda: str(cache_path))
+    monkeypatch.setattr(mod, "_palace_path", lambda: str(tmp_path / "palace"))
+    monkeypatch.setattr(mod, "_collection_name", lambda: "mempalace_drawers")
+
+    err_hub = _FakeHub(
+        {
+            "mempalace_reconnect": {"success": True},
+            "mempalace_status": {"error": "transient failure"},
+            "mempalace_get_taxonomy": {"taxonomy": {}},
+            "mempalace_list_tunnels": {"tunnels": []},
+            "mempalace_kg_stats": {"current_facts": 0},
+            "mempalace_event_list": {"events": []},
+        },
+        capabilities=["search_lexical", "list_drawers_recent"],
+    )
+    monkeypatch.setattr(mod, "_discover_hub", lambda palace_path=None: err_hub)
+    mod._handle_overview({"forceRefresh": True})
+    assert ("mempalace_reconnect", {}) not in err_hub.calls
+    assert not cache_path.exists()
+
+    ok_hub = _FakeHub(
+        {
+            "mempalace_reconnect": {"success": True},
+            "mempalace_status": {"total_drawers": 12, "backend": "sqlite_exact"},
+            "mempalace_get_taxonomy": {"taxonomy": {"proj": {"notes": 12}}},
+            "mempalace_list_tunnels": {"tunnels": []},
+            "mempalace_kg_stats": {"current_facts": 0},
+            "mempalace_event_list": {"events": []},
+        },
+        capabilities=["search_lexical", "list_drawers_recent"],
+    )
+    monkeypatch.setattr(mod, "_discover_hub", lambda palace_path=None: ok_hub)
+    mod._handle_overview({"force_refresh": True})
+    assert ("mempalace_reconnect", {}) not in ok_hub.calls
+    assert cache_path.exists()
+
+    mod._handle_overview({"reconnect": True})
+    assert ("mempalace_reconnect", {}) in ok_hub.calls
+
+
+def test_hub_drawers_and_diary_preserve_recent_sort_and_verbatim_content(
+    tmp_path, monkeypatch
+) -> None:
+    """New hubs receive sort='recent' + include_content=True; older hubs hydrate via get_drawers."""
+    mod = _load_bridge("test_agy_bridge_hub_drawers_verbatim")
+    monkeypatch.setattr(mod, "_palace_path", lambda: str(tmp_path / "palace"))
+    long_diary = "Verbatim diary entry line. " * 20  # > 500 chars (well past 200-char preview)
+
+    new_hub = _FakeHub(
+        {
+            "mempalace_list_drawers": lambda args: {
+                "drawers": [
+                    {
+                        "drawer_id": "d-new",
+                        "wing": "proj",
+                        "room": "diary",
+                        "content_preview": long_diary[:200] + "...",
+                        "content": long_diary,
+                        "total_chars": len(long_diary),
+                        "metadata": {"filed_at": "2026-11-16T12:00:00Z", "hall": "diary"},
+                    }
+                ],
+                "total": 1,
+            }
+        },
+        capabilities=["search_lexical", "list_drawers_recent"],
+    )
+    monkeypatch.setattr(mod, "_discover_hub", lambda palace_path=None: new_hub)
+
+    res_new = mod._handle_drawers({"wing": "proj", "sort": "recent", "limit": 10, "offset": 0})
+    assert res_new["drawers"][0]["content"] == long_diary
+    assert res_new["drawers"][0]["is_truncated"] is False
+    assert (
+        "mempalace_list_drawers",
+        {"limit": 10, "offset": 0, "wing": "proj", "sort": "recent", "include_content": True},
+    ) in new_hub.calls
+
+    old_hub = _FakeHub(
+        {
+            "mempalace_list_drawers": {
+                "drawers": [
+                    {
+                        "drawer_id": "d-old",
+                        "wing": "proj",
+                        "room": "diary",
+                        "content_preview": long_diary[:200] + "...",
+                        "metadata": {"filed_at": "2026-11-16T12:00:00Z", "hall": "diary"},
+                    }
+                ],
+                "total": 1,
+            },
+            "mempalace_get_drawers": {
+                "results": [
+                    {
+                        "drawer_id": "d-old",
+                        "content": long_diary,
+                        "total_chars": len(long_diary),
+                    }
+                ],
+                "count": 1,
+                "errors": 0,
+            },
+        },
+        capabilities=["search_cli_compatible"],
+    )
+    monkeypatch.setattr(mod, "_discover_hub", lambda palace_path=None: old_hub)
+
+    diary_all = mod._handle_diary({"wing": "proj", "last_n": 5})
+    assert diary_all["mode"] == "all"
+    assert diary_all["result"]["entries"][0]["content"] == long_diary
+    assert ("mempalace_get_drawers", {"drawer_ids": ["d-old"]}) in old_hub.calls
+
+
+def test_tool_list_drawers_supports_recent_sort_and_include_content(tmp_path, monkeypatch) -> None:
+    """mempalace_list_drawers supports sort='recent' and include_content=True."""
+    from mempalace import mcp_server
+    from mempalace.config import MempalaceConfig
+    from mempalace.palace import get_collection
+
+    palace = str(tmp_path / "palace")
+    col = get_collection(palace, create=True, backend="sqlite_exact")
+    full_a = "Older verbatim memory " * 15
+    full_b = "Newer verbatim memory " * 15
+    col.add(
+        ids=["old-1", "new-2"],
+        documents=[full_a, full_b],
+        metadatas=[
+            {"wing": "proj", "room": "notes", "filed_at": "2026-01-01T00:00:00+00:00"},
+            {"wing": "proj", "room": "notes", "filed_at": "2026-06-01T00:00:00+00:00"},
+        ],
+        embeddings=[[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]],
+    )
+    monkeypatch.setattr(mcp_server, "_config", MempalaceConfig(palace_path=palace))
+    monkeypatch.setattr(mcp_server, "_is_chroma_backend", lambda: False)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda: col)
+
+    listed = mcp_server.tool_list_drawers(
+        wing="proj", sort="recent", include_content=True, limit=10
+    )
+    assert [d["drawer_id"] for d in listed["drawers"]] == ["new-2", "old-1"]
+    assert listed["drawers"][0]["content"] == full_b
+    assert listed["drawers"][1]["content"] == full_a
+
+
+def test_lexical_strategy_rejects_media_or_code_task(tmp_path) -> None:
+    """candidate_strategy='lexical' returns a clean error when combined with media/task search."""
+    from mempalace.searcher import search_memories
+
+    err = search_memories(
+        "query",
+        str(tmp_path / "palace"),
+        candidate_strategy="lexical",
+        include_media=True,
+    )
+    assert "error" in err
+    assert "lexical" in err["error"]

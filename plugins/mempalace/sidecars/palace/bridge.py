@@ -46,34 +46,11 @@ from mempalace.hub_client import (  # noqa: E402
 )
 from mempalace.version import __version__  # noqa: E402
 
-
-class _LazyMcpServer:
-    """Lazy proxy for ``mempalace.mcp_server`` so hub-proxied runs never import it."""
-
-    def __init__(self) -> None:
-        object.__setattr__(self, "_mod", None)
-
-    def _load(self):
-        mod = object.__getattribute__(self, "_mod")
-        if mod is None:
-            mod = _import_mcp_server()
-            object.__setattr__(self, "_mod", mod)
-        return mod
-
-    def __getattr__(self, name: str):
-        return getattr(self._load(), name)
-
-    def __setattr__(self, name: str, value: Any) -> None:
-        setattr(self._load(), name, value)
-
-    def __delattr__(self, name: str) -> None:
-        delattr(self._load(), name)
-
-
-# Lazily imported `mempalace.mcp_server` proxy when local fallback is needed.
-# Kept unloaded while proxying to a hub so this process never loads chromadb,
-# onnxruntime, tokenizers, or a duplicate vector matrix.
-mp: Any = _LazyMcpServer()
+# `mempalace.mcp_server` is imported lazily on demand (and exposed as `bridge.mp`
+# via PEP 562 module `__getattr__`) so hub-proxied runs never load chromadb,
+# onnxruntime, tokenizers, or a duplicate vector matrix, while callers/tests
+# accessing `bridge.mp` receive the real module object.
+_MP_MOD: Any = None
 
 _OUT: Any = sys.__stdout__ if sys.__stdout__ is not None else sys.stdout
 _STDIO_PROTECTED: bool = False
@@ -150,24 +127,34 @@ def _import_mcp_server():
 
 
 def _mp_loaded() -> bool:
-    return mp is not None and (
-        not isinstance(mp, _LazyMcpServer) or object.__getattribute__(mp, "_mod") is not None
-    )
+    if "mp" in globals():
+        return globals()["mp"] is not None
+    return _MP_MOD is not None
 
 
 def _get_mp():
     """Import `mempalace.mcp_server` on demand for local fallback."""
-    if isinstance(mp, _LazyMcpServer):
-        return mp._load()
-    if mp is not None:
-        return mp
-    return _import_mcp_server()
+    global _MP_MOD
+    if "mp" in globals() and globals()["mp"] is not None:
+        return globals()["mp"]
+    if _MP_MOD is None:
+        _MP_MOD = _import_mcp_server()
+        globals()["mp"] = _MP_MOD
+    return _MP_MOD
+
+
+def __getattr__(name: str):
+    if name == "mp":
+        return _get_mp()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _get_config() -> MempalaceConfig:
     global _CONFIG_CACHE
-    if _mp_loaded() and getattr(mp, "_config", None) is not None:
-        return mp._config
+    if _mp_loaded():
+        local_mp = _get_mp()
+        if getattr(local_mp, "_config", None) is not None:
+            return local_mp._config
     if _CONFIG_CACHE is None:
         _CONFIG_CACHE = MempalaceConfig()
     return _CONFIG_CACHE
@@ -186,11 +173,13 @@ def _config_dir() -> str:
 
 
 def _configured_backend_name() -> str:
-    if _mp_loaded() and hasattr(mp, "_selected_backend_name"):
-        try:
-            return str(mp._selected_backend_name())
-        except Exception:
-            pass
+    if _mp_loaded():
+        local_mp = _get_mp()
+        if hasattr(local_mp, "_selected_backend_name"):
+            try:
+                return str(local_mp._selected_backend_name())
+            except Exception:
+                pass
     cfg = _get_config()
     return str(getattr(cfg, "backend", "") or "sqlite_exact")
 
@@ -289,11 +278,13 @@ def _unload_vector_stack(*, force: bool = False) -> bool:
 
         _cancel_idle_unload_timer()
 
-        if _mp_loaded() and hasattr(mp, "tool_reconnect"):
-            try:
-                mp.tool_reconnect()
-            except Exception:
-                pass
+        if _mp_loaded():
+            local_mp = _get_mp()
+            if hasattr(local_mp, "tool_reconnect"):
+                try:
+                    local_mp.tool_reconnect()
+                except Exception:
+                    pass
 
         emb_mod = sys.modules.get("mempalace.embedding")
         if emb_mod is not None and hasattr(emb_mod, "clear_embedding_cache"):
@@ -367,6 +358,12 @@ def _write_cached_structure(payload: dict[str, Any]) -> None:
         pass
 
 
+def _structure_has_error(status: Any, taxonomy: Any) -> bool:
+    return (isinstance(status, dict) and "error" in status) or (
+        isinstance(taxonomy, dict) and "error" in taxonomy
+    )
+
+
 def _derive_graph_stats_from_taxonomy(
     taxonomy_map: dict[str, dict[str, int]], *, explicit_count: int | None = None
 ) -> dict[str, Any]:
@@ -409,8 +406,9 @@ def _derive_graph_stats_from_taxonomy(
 
     if explicit_count is None:
         if _mp_loaded():
+            local_mp = _get_mp()
             try:
-                explicit_count = len(mp._load_graph_tunnels(mp._config))
+                explicit_count = len(local_mp._load_graph_tunnels(local_mp._config))
             except Exception:
                 explicit_count = 0
         else:
@@ -448,7 +446,8 @@ def _get_palace_structure(force_refresh: bool = False) -> dict[str, Any]:
         "taxonomy": taxonomy,
         "graph_stats": graph_stats,
     }
-    _write_cached_structure(payload)
+    if not _structure_has_error(status, taxonomy):
+        _write_cached_structure(payload)
     return payload
 
 
@@ -477,7 +476,8 @@ def _get_palace_structure_via_hub(hub: HubClient, force_refresh: bool = False) -
         "taxonomy": taxonomy,
         "graph_stats": graph_stats,
     }
-    _write_cached_structure(payload)
+    if not _structure_has_error(status, taxonomy):
+        _write_cached_structure(payload)
     return payload
 
 
@@ -562,7 +562,8 @@ def _build_overview_response(
 
 
 def _handle_overview(params: dict[str, Any]) -> dict[str, Any]:
-    reconnect = bool(params.get("reconnect") or params.get("force_refresh"))
+    reconnect = bool(params.get("reconnect"))
+    force_refresh = reconnect or bool(params.get("force_refresh") or params.get("forceRefresh"))
     workspace_path = str(params.get("workspace_path") or params.get("workspacePath") or "").strip()
 
     hub = _discover_hub()
@@ -570,7 +571,7 @@ def _handle_overview(params: dict[str, Any]) -> dict[str, Any]:
         try:
             if reconnect:
                 _hub_call(hub, "mempalace_reconnect")
-            structure = _get_palace_structure_via_hub(hub, force_refresh=reconnect)
+            structure = _get_palace_structure_via_hub(hub, force_refresh=force_refresh)
             kg_stats = _hub_call(hub, "mempalace_kg_stats")
             events_res = _hub_call(hub, "mempalace_event_list", {"limit": 15, "preview": True})
             status_obj = structure.get("status") or {}
@@ -592,7 +593,7 @@ def _handle_overview(params: dict[str, Any]) -> dict[str, Any]:
     with _BRIDGE_LOCK:
         if reconnect:
             local_mp.tool_reconnect()
-        structure = _get_palace_structure(force_refresh=reconnect)
+        structure = _get_palace_structure(force_refresh=force_refresh)
         kg_stats = local_mp.tool_kg_stats()
         events_res = local_mp.tool_event_list(limit=15, preview=True)
         backend_name = local_mp._selected_backend_name()
@@ -774,9 +775,10 @@ def _recent_drawer_page(col, *, where, limit: int, offset: int) -> Any:
     )
 
 
-def _normalize_hub_drawer(item: dict[str, Any]) -> dict[str, Any]:
+def _normalize_hub_drawer(item: dict[str, Any], *, fast_path: bool = False) -> dict[str, Any]:
     """Normalize `mempalace_list_drawers` payload to the sidecar card shape."""
     meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    has_full_content = item.get("content") is not None or item.get("text") is not None
     content = item.get("content")
     if content is None:
         content = item.get("text")
@@ -787,9 +789,13 @@ def _normalize_hub_drawer(item: dict[str, Any]) -> dict[str, Any]:
     chunk_count = int(item.get("chunk_count") or item.get("chunks") or meta.get("chunks") or 1)
     is_truncated = item.get("is_truncated")
     if is_truncated is None:
-        is_truncated = chunk_count > 1 or (
-            bool(item.get("content_preview")) and (text_val.endswith("...") or len(text_val) >= 195)
-        )
+        if has_full_content:
+            is_truncated = fast_path and (chunk_count > 1 or len(text_val) >= 790)
+        else:
+            is_truncated = chunk_count > 1 or (
+                bool(item.get("content_preview"))
+                and (text_val.endswith("...") or len(text_val) >= 195)
+            )
     return {
         "id": doc_id,
         "drawer_id": doc_id,
@@ -799,10 +805,41 @@ def _normalize_hub_drawer(item: dict[str, Any]) -> dict[str, Any]:
         "source_file": item.get("source_file") or meta.get("source_file") or "",
         "filed_at": item.get("filed_at") or meta.get("filed_at") or "",
         "chunk_count": chunk_count,
-        "total_chars": len(text_val),
+        "total_chars": int(item.get("total_chars") or len(text_val)),
         "is_truncated": bool(is_truncated),
         "content": text_val,
     }
+
+
+def _hydrate_missing_hub_contents(hub: HubClient, raw_drawers: list[Any]) -> None:
+    """Batch-fetch full verbatim text from older hubs lacking `include_content`."""
+    missing_ids = [
+        str(d.get("id") or d.get("drawer_id") or "")
+        for d in raw_drawers
+        if isinstance(d, dict) and d.get("content") is None and d.get("text") is None
+    ]
+    missing_ids = [did for did in missing_ids if did]
+    if not missing_ids:
+        return
+    try:
+        bulk = _hub_call(hub, "mempalace_get_drawers", {"drawer_ids": missing_ids})
+    except _HubFallback:
+        return
+    full_by_id: dict[str, dict[str, Any]] = {}
+    for entry in (bulk.get("results") or []) if isinstance(bulk, dict) else []:
+        if isinstance(entry, dict) and entry.get("drawer_id") and entry.get("content") is not None:
+            full_by_id[str(entry["drawer_id"])] = entry
+    if not full_by_id:
+        return
+    for d in raw_drawers:
+        if not isinstance(d, dict):
+            continue
+        did = str(d.get("id") or d.get("drawer_id") or "")
+        hit = full_by_id.get(did)
+        if hit is not None:
+            d["content"] = hit["content"]
+            if hit.get("total_chars") is not None:
+                d["total_chars"] = hit["total_chars"]
 
 
 def _handle_drawers(params: dict[str, Any]) -> dict[str, Any]:
@@ -811,6 +848,7 @@ def _handle_drawers(params: dict[str, Any]) -> dict[str, Any]:
     since = str(params.get("since") or "").strip() or None
     before = str(params.get("before") or "").strip() or None
     sort_order = str(params.get("sort") or "recent").strip()
+    sort_norm = "storage" if sort_order.lower() == "storage" else "recent"
     limit = max(1, min(int(params.get("limit") or 30), 200))
     offset = max(0, int(params.get("offset") or 0))
 
@@ -827,13 +865,19 @@ def _handle_drawers(params: dict[str, Any]) -> dict[str, Any]:
                 args["since"] = since
             if before:
                 args["before"] = before
+            if "list_drawers_recent" in hub.capabilities:
+                args["sort"] = sort_norm
+                args["include_content"] = True
             res = _hub_call(hub, "mempalace_list_drawers", args)
             if "error" in res and "drawers" not in res:
                 return res
-            raw_drawers = res.get("drawers") or []
-            drawers = [_normalize_hub_drawer(d) for d in raw_drawers if isinstance(d, dict)]
+            raw_drawers = [dict(d) for d in (res.get("drawers") or []) if isinstance(d, dict)]
+            if "list_drawers_recent" not in hub.capabilities:
+                _hydrate_missing_hub_contents(hub, raw_drawers)
+            is_fast = bool(res.get("fast_path"))
+            drawers = [_normalize_hub_drawer(d, fast_path=is_fast) for d in raw_drawers]
             total = int(res.get("total") if res.get("total") is not None else len(drawers))
-            return {
+            out: dict[str, Any] = {
                 "drawers": drawers,
                 "total": total,
                 "count": len(drawers),
@@ -842,6 +886,9 @@ def _handle_drawers(params: dict[str, Any]) -> dict[str, Any]:
                 "has_more": (offset + len(drawers)) < total,
                 "hub_connected": True,
             }
+            if is_fast:
+                out["fast_path"] = True
+            return out
         except _HubFallback:
             pass
 

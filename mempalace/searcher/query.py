@@ -3,10 +3,16 @@ if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
 
-def _open_search_collection(palace_path: str, collection_name: str):
+def _open_search_collection(
+    palace_path: str, collection_name: str, *, skip_identity_check: bool = False
+):
     try:
         return get_collection(
-            palace_path, collection_name=collection_name, create=False, read_only=True
+            palace_path,
+            collection_name=collection_name,
+            create=False,
+            read_only=True,
+            _skip_identity_check=skip_identity_check,
         ), None
     except BackendMismatchError as e:
         return None, _backend_mismatch_result(e)
@@ -347,6 +353,10 @@ def search_memories(
     _validate_candidate_strategy(candidate_strategy)
 
     if include_media or query_task != "search":
+        if candidate_strategy == "lexical":
+            return _search_error_result(
+                "candidate_strategy='lexical' cannot be combined with media/code task search"
+            )
         if vector_disabled:
             return _search_error_result(
                 "Media/code vector search is disabled until the index is repaired"
@@ -389,7 +399,11 @@ def search_memories(
     if short_circuit is not None:
         return short_circuit
 
-    drawers_col, open_error = _open_search_collection(palace_path, collection_name)
+    drawers_col, open_error = _open_search_collection(
+        palace_path,
+        collection_name,
+        skip_identity_check=(candidate_strategy == "lexical"),
+    )
     if open_error:
         return open_error
 

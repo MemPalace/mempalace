@@ -683,6 +683,15 @@ TOOLS = {
                     "description": "Offset for pagination (default 0)",
                     "minimum": 0,
                 },
+                "sort": {
+                    "type": "string",
+                    "enum": ["storage", "recent"],
+                    "description": "Ordering: 'storage' (default) or 'recent' (newest filed_at first).",
+                },
+                "include_content": {
+                    "type": "boolean",
+                    "description": "Include full verbatim drawer content for each item on the returned page (default false).",
+                },
             },
         },
         "handler": tool_list_drawers,

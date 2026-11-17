@@ -350,8 +350,8 @@ def _page_physical_ids(page: list) -> list:
     return physical_ids
 
 
-def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
-    """Set ``content_preview`` from an already-fetched ``{id: document}`` map."""
+def _apply_drawer_previews(page: list, docs_by_id: dict, *, include_content: bool = False) -> None:
+    """Set ``content_preview`` (and optionally full ``content``) from ``{id: document}``."""
     for drawer in page:
         chunk_ids = drawer.get("chunk_ids") or (drawer.get("metadata") or {}).get("chunk_ids")
         if chunk_ids:
@@ -359,9 +359,12 @@ def _apply_drawer_previews(page: list, docs_by_id: dict) -> None:
         else:
             content = docs_by_id.get(drawer["drawer_id"], "")
         drawer["content_preview"] = _content_preview(content)
+        if include_content:
+            drawer["content"] = content
+            drawer["total_chars"] = len(content)
 
 
-def _fill_drawer_previews(col, page: list) -> None:
+def _fill_drawer_previews(col, page: list, *, include_content: bool = False) -> None:
     """Hydrate ``content_preview`` for a page of logical drawers only."""
     physical_ids = _page_physical_ids(page)
     if not physical_ids:
@@ -370,10 +373,12 @@ def _fill_drawer_previews(col, page: list) -> None:
     ids = _chroma_field(result, "ids", []) or []
     docs = _chroma_field(result, "documents", []) or []
     docs_by_id = {doc_id: (docs[i] if i < len(docs) else "") or "" for i, doc_id in enumerate(ids)}
-    _apply_drawer_previews(page, docs_by_id)
+    _apply_drawer_previews(page, docs_by_id, include_content=include_content)
 
 
-def _fill_drawer_previews_from_sqlite(page: list, *, connection=None) -> bool:
+def _fill_drawer_previews_from_sqlite(
+    page: list, *, connection=None, include_content: bool = False
+) -> bool:
     """Same, reading the page's documents straight from ``chroma.sqlite3``.
 
     The list itself is answered from metadata only — joining documents into
@@ -390,7 +395,7 @@ def _fill_drawer_previews_from_sqlite(page: list, *, connection=None) -> bool:
     )
     if docs_by_id is None:
         return False
-    _apply_drawer_previews(page, docs_by_id)
+    _apply_drawer_previews(page, docs_by_id, include_content=include_content)
     return True
 
 
@@ -1338,6 +1343,51 @@ def tool_get_drawers(drawer_ids: list):
     }
 
 
+_LARGE_LIST_LOCUS_THRESHOLD = 1500
+
+
+def _recent_collection_page(col, *, where, limit: int, offset: int):
+    """Slice one newest-first ordering on indexed backends, hydrating only the page."""
+    from ..backends.base import GetResult
+
+    capabilities = getattr(getattr(col, "_backend", None), "capabilities", ())
+    exact_recency = "supports_recency_order" in (capabilities or ())
+    if exact_recency and offset == 0:
+        return col.get_recent(limit=limit, where=where)
+
+    scan_limit = offset + limit if exact_recency else col.count()
+    ordered = col.get_recent(limit=scan_limit, where=where, include=[])
+    page_ids = ordered.ids[offset : offset + limit]
+    if not page_ids:
+        return GetResult.empty()
+
+    page = col.get(ids=page_ids, where=where, include=["documents", "metadatas"])
+    positions = {doc_id: i for i, doc_id in enumerate(page.ids)}
+    order = [positions[doc_id] for doc_id in page_ids if doc_id in positions]
+    return GetResult(
+        ids=[page.ids[i] for i in order],
+        documents=[page.documents[i] for i in order],
+        metadatas=[page.metadatas[i] for i in order],
+    )
+
+
+def _estimate_locus_total(wing: str = None, room: str = None) -> int | None:
+    fast = _sqlite_taxonomy()
+    if fast is None:
+        return None
+    total_all, tax_map = fast
+    if wing and room:
+        return sum(int((tax_map.get(w) or {}).get(room) or 0) for w in wing_aliases(wing, tax_map))
+    if wing:
+        return sum(
+            sum(int(n or 0) for n in (tax_map.get(w) or {}).values())
+            for w in wing_aliases(wing, tax_map)
+        )
+    if room:
+        return sum(int((rooms or {}).get(room) or 0) for rooms in tax_map.values())
+    return int(total_all or 0)
+
+
 def tool_list_drawers(
     wing: str = None,
     room: str = None,
@@ -1345,6 +1395,8 @@ def tool_list_drawers(
     before: str = None,
     limit: int = 20,
     offset: int = 0,
+    sort: str = "storage",
+    include_content: bool = False,
 ):
     """List logical drawers with pagination.
 
@@ -1358,6 +1410,10 @@ def tool_list_drawers(
     """
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
+    sort_order = str(sort or "storage").strip().lower()
+    if sort_order not in ("storage", "recent"):
+        return {"error": f"sort must be 'storage' or 'recent', got {sort!r}"}
+    include_content = bool(include_content)
 
     try:
         wing = _sanitize_optional_name(wing, "wing")
@@ -1384,6 +1440,13 @@ def tool_list_drawers(
                         d.get("metadata", {}).get("filed_at"), since_dt, before_dt
                     )
                 ]
+            if sort_order == "recent":
+                from ..timeutil import recency_key
+
+                drawers.sort(
+                    key=lambda d: recency_key((d.get("metadata") or {}).get("filed_at") or ""),
+                    reverse=True,
+                )
             page = drawers[offset : offset + limit]
             return {
                 "drawers": page,
@@ -1405,15 +1468,72 @@ def tool_list_drawers(
                     )
                     if listed is not None:
                         result = make_page(*listed)
-                        if _fill_drawer_previews_from_sqlite(result["drawers"], connection=conn):
+                        if _fill_drawer_previews_from_sqlite(
+                            result["drawers"],
+                            connection=conn,
+                            include_content=include_content,
+                        ):
                             return result
 
         col = _get_collection()
         if not col:
             return _collection_error_or_no_palace()
+
+        # On large loci (>1,500 rows) without date bounds, use indexed reads when
+        # sort='recent' (or include_content=True) so 400k+ palaces never scan all
+        # metadata rows in Python under the hub lock.
+        if since_dt is None and before_dt is None and (sort_order == "recent" or include_content):
+            est_total = _estimate_locus_total(wing=wing, room=room)
+            if est_total is not None and est_total > _LARGE_LIST_LOCUS_THRESHOLD:
+                try:
+                    if sort_order == "recent" and hasattr(col, "get_recent"):
+                        raw = _recent_collection_page(col, where=where, limit=limit, offset=offset)
+                    else:
+                        raw = col.get(
+                            where=where,
+                            limit=limit,
+                            offset=offset,
+                            include=["documents", "metadatas"],
+                        )
+                    r_ids = _chroma_field(raw, "ids", []) or []
+                    r_docs = _chroma_field(raw, "documents", []) or []
+                    r_metas = _chroma_field(raw, "metadatas", []) or []
+                    page_items = []
+                    for i, doc_id in enumerate(r_ids):
+                        meta = _safe_meta(r_metas[i] if i < len(r_metas) else None)
+                        if is_bookkeeping(meta, doc_id):
+                            continue
+                        doc = (r_docs[i] if i < len(r_docs) else "") or ""
+                        pub_meta = _public_drawer_metadata(meta)
+                        chunk_count = int(meta.get("chunk_count") or meta.get("total_chunks") or 1)
+                        item = {
+                            "drawer_id": doc_id,
+                            "wing": meta.get("wing", "unknown"),
+                            "room": meta.get("room", "general"),
+                            "chunks": chunk_count,
+                            "content_preview": _content_preview(doc),
+                            "metadata": pub_meta,
+                        }
+                        if include_content:
+                            item["content"] = doc
+                            item["total_chars"] = len(doc)
+                        page_items.append(item)
+                    return {
+                        "drawers": page_items,
+                        "total": est_total,
+                        "count": len(page_items),
+                        "offset": offset,
+                        "limit": limit,
+                        "fast_path": True,
+                    }
+                except Exception:
+                    logger.debug(
+                        "Indexed drawer page read failed; falling back to full scan", exc_info=True
+                    )
+
         ids, _documents, metadatas = _fetch_drawer_rows(col, where=where, include=["metadatas"])
         result = make_page(ids, metadatas)
-        _fill_drawer_previews(col, result["drawers"])
+        _fill_drawer_previews(col, result["drawers"], include_content=include_content)
         return result
     except Exception as e:
         logger.exception("tool_list_drawers failed")
