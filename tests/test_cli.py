@@ -1340,6 +1340,32 @@ def test_main_init_dispatches():
         mock_cmd.assert_called_once()
 
 
+def test_main_init_defaults_dir_to_current_directory():
+    """``mempalace init`` with no path uses the current directory.
+
+    Flags after the subcommand must not be consumed as the directory.
+    """
+    captured = {}
+    with (
+        patch("sys.argv", ["mempalace", "init", "--yes"]),
+        patch("mempalace.cli.cmd_init", side_effect=lambda args: captured.update(args.__dict__)),
+    ):
+        main()
+    assert captured["dir"] == "."
+    assert captured["yes"] is True
+
+
+def test_main_init_accepts_explicit_dir():
+    """An explicit path is still passed through unchanged."""
+    captured = {}
+    with (
+        patch("sys.argv", ["mempalace", "init", "/tmp/test"]),
+        patch("mempalace.cli.cmd_init", side_effect=lambda args: captured.update(args.__dict__)),
+    ):
+        main()
+    assert captured["dir"] == "/tmp/test"
+
+
 def test_main_init_accepts_palace_after_subcommand():
     """Regression for #2366: ``mempalace init <dir> --palace <path>`` must
     parse, not raise ``unrecognized arguments: --palace``.

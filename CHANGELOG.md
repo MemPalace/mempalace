@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **`mempalace init` defaults to the current directory.** The project directory was a required positional argument, so `mempalace init` exited with `the following arguments are required: dir`. Omitting it now uses `.`; `mempalace init <dir>` is unchanged. (#220)
+
 ---
 
 ## [3.12.0] — 2026-11-09
