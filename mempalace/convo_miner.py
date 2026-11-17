@@ -900,9 +900,10 @@ def _normalize_convo_conversations(
     except UnparsedCodexTranscriptError as exc:
         logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
         return None
-    except (OSError, ValueError):
-        if not dry_run:
-            _register_file(collection, source_file, wing, agent, extract_mode)
+    except (OSError, ValueError) as exc:
+        # A transient read/parse failure is not a successfully empty source.
+        # Do not mark it complete: the next mine must be allowed to retry.
+        logger.warning("Skipping %s: normalize error: %s; retryable", filepath, exc)
         return None
 
     if not any(c.strip() for c in conversations):

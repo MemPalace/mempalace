@@ -83,6 +83,120 @@ def test_normalize_whitespace_only(tmp_path):
     assert result.strip() == ""
 
 
+def test_known_jsonl_streams_preserve_current_parsers_and_mtime(tmp_path):
+    """Both public entry points stream known formats without full-file reads."""
+    from mempalace.normalize import normalize_conversations_with_mtime
+
+    cases = {
+        "claude": [
+            {"type": "human", "message": {"content": "Q"}},
+            {"type": "assistant", "message": {"content": "A"}},
+        ],
+        "codex": [
+            {"type": "session_meta", "payload": {}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}},
+        ],
+        "gemini": [
+            {"type": "session_metadata", "sessionId": "s"},
+            {"type": "user", "content": [{"text": "Q"}]},
+            {"type": "gemini", "content": [{"text": "A"}]},
+        ],
+        "pi": [
+            {"type": "session", "version": 1},
+            {"type": "message", "message": {"role": "user", "content": "Q"}},
+            {"type": "message", "message": {"role": "assistant", "content": "A"}},
+        ],
+    }
+    for name, entries in cases.items():
+        source = tmp_path / f"{name}.jsonl"
+        raw = "\n".join(json.dumps(entry) for entry in entries)
+        source.write_text(raw, encoding="utf-8")
+        expected = _try_normalize_json(raw)
+        with (
+            patch("mempalace.normalize._read_transcript_file", side_effect=AssertionError()),
+            patch(
+                "mempalace.normalize._read_transcript_file_with_mtime",
+                side_effect=AssertionError(),
+            ),
+        ):
+            assert normalize(str(source)) == expected
+            got, captured_mtime = normalize_conversations_with_mtime(str(source))
+            assert got == [expected]
+            assert captured_mtime == source.stat().st_mtime
+
+
+def test_jsonl_stream_falls_back_to_lossless_legacy_encoding(tmp_path):
+    """Invalid UTF-8 must not bypass the established Windows-1252 decoder."""
+    from mempalace.normalize import normalize_conversations_with_mtime
+
+    source = tmp_path / "legacy.jsonl"
+    source.write_bytes(
+        b'{"type":"session_meta","payload":{}}\n'
+        b'{"type":"event_msg","payload":{"type":"user_message","message":"caf'
+        + bytes([0xE9])
+        + b'"}}\n'
+        + b'{"type":"event_msg","payload":{"type":"agent_message","message":"A"}}\n'
+    )
+    conversations, captured_mtime = normalize_conversations_with_mtime(str(source))
+    assert "café" in conversations[0]
+    assert captured_mtime == source.stat().st_mtime
+
+
+def test_known_jsonl_stream_avoids_full_source_memory_copies(tmp_path):
+    """Ignored large metadata should not allocate source-sized strings."""
+    import tracemalloc
+
+    source = tmp_path / "long-codex.jsonl"
+    ignored = (
+        json.dumps({"type": "response_item", "payload": {"type": "reasoning", "text": "x" * 2048}})
+        + "\n"
+    )
+    with source.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps({"type": "session_meta", "payload": {}}) + "\n")
+        for _ in range(6144):
+            stream.write(ignored)
+        stream.write(
+            json.dumps({"type": "event_msg", "payload": {"type": "user_message", "message": "Q"}})
+            + "\n"
+        )
+        stream.write(
+            json.dumps({"type": "event_msg", "payload": {"type": "agent_message", "message": "A"}})
+            + "\n"
+        )
+    assert source.stat().st_size >= 12 * 1024 * 1024
+    tracemalloc.start()
+    try:
+        output = normalize(str(source))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert output == "> Q\nA\n"
+    assert peak < source.stat().st_size // 3
+
+
+def test_known_jsonl_size_cap_applies_before_stream_read(tmp_path):
+    """Oversized fstat results must block the known-schema streaming path."""
+    from types import SimpleNamespace
+
+    from mempalace.fsio import open_source_file
+    from mempalace.normalize import normalize_conversations_with_mtime
+
+    source = tmp_path / "oversized.jsonl"
+    source.write_text('{"type":"session_meta","payload":{}}\n', encoding="utf-8")
+
+    def oversized_open(path):
+        fd, stat_result = open_source_file(path)
+        return fd, SimpleNamespace(
+            st_size=500 * 1024 * 1024 + 1,
+            st_mtime=stat_result.st_mtime,
+        )
+
+    with patch("mempalace.normalize.open_source_file", side_effect=oversized_open):
+        with pytest.raises(IOError, match="too large"):
+            normalize_conversations_with_mtime(str(source))
+
+
 # ── _extract_content ───────────────────────────────────────────────────
 
 
