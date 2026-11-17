@@ -1044,6 +1044,11 @@ def handle_request(request):
                 "protocolVersion": negotiated,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "mempalace", "version": __version__},
+                # Served to clients that support MCP instructions; they inject it
+                # into the system prompt before the first tool call. Defined in
+                # instructions.py so the text can be edited without touching
+                # protocol handling.
+                "instructions": INITIAL_INSTRUCTIONS,
             },
         }
     if method == "ping":
