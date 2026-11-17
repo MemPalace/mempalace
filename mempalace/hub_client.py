@@ -39,6 +39,11 @@ SEARCH_SETTINGS = (
     ("embedding_api_model", ("MEMPALACE_EMBEDDING_API_MODEL",), ("embedding", "openai-compat")),
     ("embedding_api_url", ("MEMPALACE_EMBEDDING_API_URL",), ("embedding", "openai-compat")),
     (
+        "embeddinggemma_variant",
+        ("MEMPALACE_EMBEDDINGGEMMA_VARIANT",),
+        ("embedding", "embeddinggemma"),
+    ),
+    (
         "embeddinggemma2_dimension",
         ("MEMPALACE_EMBEDDINGGEMMA2_DIMENSION",),
         ("embedding", "embeddinggemma2"),

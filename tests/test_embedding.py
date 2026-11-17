@@ -551,8 +551,15 @@ def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch
     captured = {}
 
     class DummyGemma:
-        def __init__(self, preferred_providers=None, intra_op_num_threads=0, batch_size=32):
+        def __init__(
+            self,
+            preferred_providers=None,
+            intra_op_num_threads=0,
+            batch_size=32,
+            variant="q8",
+        ):
             captured["threads"] = intra_op_num_threads
+            captured["variant"] = variant
 
     monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
     monkeypatch.setattr(
@@ -565,6 +572,7 @@ def test_get_embedding_function_threads_cap_passed_to_embeddinggemma(monkeypatch
     embedding.get_embedding_function("cpu", "embeddinggemma")
 
     assert captured["threads"] == 4
+    assert captured["variant"] == "q8"
 
 
 def test_get_embedding_function_batch_size_passed_to_embeddinggemma(monkeypatch):
@@ -573,7 +581,13 @@ def test_get_embedding_function_batch_size_passed_to_embeddinggemma(monkeypatch)
     captured = {}
 
     class DummyGemma:
-        def __init__(self, preferred_providers=None, intra_op_num_threads=0, batch_size=32):
+        def __init__(
+            self,
+            preferred_providers=None,
+            intra_op_num_threads=0,
+            batch_size=32,
+            variant="q8",
+        ):
             captured["batch_size"] = batch_size
 
     monkeypatch.setattr(embedding, "EmbeddinggemmaONNX", DummyGemma)
@@ -813,6 +827,26 @@ def test_device_label_observes_a_loaded_session_cpu_fallback(monkeypatch, thread
     assert embedding.describe_device("cuda", "minilm") == "cuda"
     assert ef.model.get_providers() == ["CPUExecutionProvider"]
     assert embedding.describe_device("cuda", "minilm") == "cpu"
+
+
+def test_device_label_uses_the_loaded_embeddinggemma_variant(monkeypatch):
+    monkeypatch.setattr(
+        embedding,
+        "_resolve_providers",
+        lambda device, model=None: (["CUDAExecutionProvider", "CPUExecutionProvider"], "cuda"),
+    )
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "q8")
+    q8 = embedding.get_embedding_function("cuda", "embeddinggemma")
+    assert embedding.describe_device("cuda", "embeddinggemma") == "cuda"
+    q8._session = SimpleNamespace(get_providers=lambda: ["CPUExecutionProvider"])
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "fp16")
+    fp16 = embedding.get_embedding_function("cuda", "embeddinggemma")
+    fp16._session = SimpleNamespace(get_providers=lambda: ["CUDAExecutionProvider"])
+    assert embedding.describe_device("cuda", "embeddinggemma") == "cuda"
+
+    monkeypatch.setenv("MEMPALACE_EMBEDDINGGEMMA_VARIANT", "q8")
+    assert embedding.describe_device("cuda", "embeddinggemma") == "cpu"
 
 
 def test_describe_device_uses_the_configured_model_with_an_explicit_device(monkeypatch):
