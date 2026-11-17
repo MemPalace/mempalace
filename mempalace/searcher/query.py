@@ -7,13 +7,20 @@ def _open_search_collection(
     palace_path: str, collection_name: str, *, skip_identity_check: bool = False
 ):
     try:
-        return get_collection(
-            palace_path,
-            collection_name=collection_name,
-            create=False,
-            read_only=True,
-            _skip_identity_check=skip_identity_check,
-        ), None
+        kwargs = {
+            "collection_name": collection_name,
+            "create": False,
+            "read_only": True,
+        }
+        if skip_identity_check:
+            kwargs["_skip_identity_check"] = True
+        try:
+            return get_collection(palace_path, **kwargs), None
+        except TypeError as te:
+            if not skip_identity_check or "_skip_identity_check" not in str(te):
+                raise
+            kwargs.pop("_skip_identity_check", None)
+            return get_collection(palace_path, **kwargs), None
     except BackendMismatchError as e:
         return None, _backend_mismatch_result(e)
     except KeyError as e:
