@@ -348,8 +348,12 @@ TOOLS = {
                 },
                 "candidate_strategy": {
                     "type": "string",
-                    "enum": ["vector", "union"],
-                    "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
+                    "enum": ["vector", "union", "lexical"],
+                    "description": (
+                        "Candidate source strategy. 'vector' preserves default semantic search; "
+                        "'union' also merges backend BM25 lexical candidates before reranking; "
+                        "'lexical' runs FTS5/BM25 lexical search only without loading embeddings."
+                    ),
                 },
                 "cli_compatible": {
                     "type": "boolean",
@@ -678,6 +682,15 @@ TOOLS = {
                     "type": "integer",
                     "description": "Offset for pagination (default 0)",
                     "minimum": 0,
+                },
+                "sort": {
+                    "type": "string",
+                    "enum": ["storage", "recent"],
+                    "description": "Ordering: 'storage' (default) or 'recent' (newest filed_at first).",
+                },
+                "include_content": {
+                    "type": "boolean",
+                    "description": "Include full verbatim drawer content for each item on the returned page (default false).",
                 },
             },
         },
