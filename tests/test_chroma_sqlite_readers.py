@@ -8,7 +8,7 @@ the database, build their SQL or decode stored text shows up here.
 
 import pytest
 
-from mempalace.backends import PalaceRef, chroma, chroma_sqlite
+from mempalace.backends import DrawerCount, PalaceRef, chroma, chroma_sqlite
 
 _NAME = "mempalace_drawers"
 
@@ -185,6 +185,15 @@ def _bm25_hits(palace_path, **filters):
 def test_every_sqlite_reader_returns_what_it_did(palace):
     palace_path, col = palace
     assert _outputs(palace_path, col) == EXPECTED
+
+
+def test_client_tally_matches_the_sqlite_tally(palace):
+    """The client fallback and the raw-SQLite path agree on one real palace."""
+    from mempalace import mcp_server
+
+    palace_path, col = palace
+    _total, wing_rooms = chroma_sqlite._sqlite_wing_room_counts(palace_path, _NAME)
+    assert mcp_server._client_taxonomy(col) == dict(wing_rooms)
 
 
 def test_missing_database_reads_as_none(tmp_path):
@@ -610,12 +619,24 @@ EXPECTED = {
     ],
     "wing_names": ["my-app", "my_app", "other", "wing_my_app"],
     "wing_rooms": (
-        8,
+        DrawerCount(drawers=7, chunks=2, rows=8),
         [
-            ("my-app", [("notes", 1)]),
-            ("my_app", [("diary", 1), ("notes", 1)]),
-            ("other", [("code", 3)]),
-            ("wing_my_app", [("diary", 1), ("ideas", 1)]),
+            ("my-app", [("notes", DrawerCount(drawers=1, chunks=0, rows=1))]),
+            (
+                "my_app",
+                [
+                    ("diary", DrawerCount(drawers=1, chunks=0, rows=1)),
+                    ("notes", DrawerCount(drawers=1, chunks=0, rows=1)),
+                ],
+            ),
+            ("other", [("code", DrawerCount(drawers=2, chunks=2, rows=3))]),
+            (
+                "wing_my_app",
+                [
+                    ("diary", DrawerCount(drawers=1, chunks=0, rows=1)),
+                    ("ideas", DrawerCount(drawers=1, chunks=0, rows=1)),
+                ],
+            ),
         ],
     ),
 }

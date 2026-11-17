@@ -860,7 +860,14 @@ def _drawer_count_for_profile():
         return _last_profile_drawer_count
     try:
         col = _get_collection(create=False)
-        _last_profile_drawer_count = None if col is None else col.count()
+        if col is None:
+            _last_profile_drawer_count = None
+        else:
+            # Logical drawers: the profile is read as "how many drawers does
+            # this replica hold", so a physical row count overstates it.
+            count = logical_drawer_count(col)
+            if count is not None:
+                _last_profile_drawer_count = count.drawers
     finally:
         if not owned:
             lock.release_read()

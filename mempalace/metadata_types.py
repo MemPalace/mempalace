@@ -125,8 +125,3 @@ def is_bookkeeping(metadata, drawer_id=None):
     if is_sentinel(meta) or meta.get("ingest_mode") == "registry":
         return True
     return isinstance(drawer_id, str) and drawer_id.startswith(("_reg_", "sentinel_"))
-
-
-# A ``where`` filter matching the bookkeeping rows ``is_bookkeeping`` names by
-# metadata, for readers that can only subtract them after counting.
-BOOKKEEPING_WHERE = {"$or": [{"ingest_mode": "registry"}, {"is_sentinel": True}]}

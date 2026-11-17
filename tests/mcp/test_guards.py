@@ -1446,10 +1446,14 @@ def test_node_profile_does_not_wait_behind_a_writer(monkeypatch):
     from mempalace import mcp_server
 
     class _Collection:
-        def count(self):
-            return 7
+        pass
 
     monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _Collection())
+    monkeypatch.setattr(
+        mcp_server,
+        "logical_drawer_count",
+        lambda col: mcp_server.DrawerCount(drawers=7, chunks=3, rows=10),
+    )
     monkeypatch.setattr(mcp_server, "_last_profile_drawer_count", None)
     assert mcp_server._drawer_count_for_profile() == 7
 
@@ -1470,6 +1474,16 @@ def test_node_profile_does_not_wait_behind_a_writer(monkeypatch):
     finally:
         release.set()
         writer.join(5)
+
+
+def test_node_profile_keeps_the_last_count_when_counting_fails(monkeypatch):
+    """An unavailable logical count never drops a replica's role for a row count."""
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: object())
+    monkeypatch.setattr(mcp_server, "logical_drawer_count", lambda col: None)
+    monkeypatch.setattr(mcp_server, "_last_profile_drawer_count", 7)
+    assert mcp_server._drawer_count_for_profile() == 7
 
 
 def test_peer_sync_mutation_waits_for_the_mesh_lock():
