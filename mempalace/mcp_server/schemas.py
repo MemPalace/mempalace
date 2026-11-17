@@ -348,8 +348,12 @@ TOOLS = {
                 },
                 "candidate_strategy": {
                     "type": "string",
-                    "enum": ["vector", "union"],
-                    "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
+                    "enum": ["vector", "union", "lexical"],
+                    "description": (
+                        "Candidate source strategy. 'vector' preserves default semantic search; "
+                        "'union' also merges backend BM25 lexical candidates before reranking; "
+                        "'lexical' runs FTS5/BM25 lexical search only without loading embeddings."
+                    ),
                 },
                 "cli_compatible": {
                     "type": "boolean",

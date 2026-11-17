@@ -495,7 +495,14 @@ registerApi('/api/diary', async (data = {}) => {
   });
 });
 
-// Warm the Python bridge in the background on startup
-bridge.ensureStarted().catch(() => {});
+function isEnvTruthy(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+// Spawn the Python bridge lazily on first API request so unused IDE windows
+// consume zero Python/embedder memory. Opt in to eager spawn when requested.
+if (isEnvTruthy(process.env.MEMPALACE_SIDECAR_WARMUP) || isEnvTruthy(process.env.MEMPALACE_EAGER_WARMUP)) {
+  bridge.ensureStarted().catch(() => {});
+}
 
 app.run();
