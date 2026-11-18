@@ -158,6 +158,7 @@ _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 _HTTP_ACTIVE_CLIENT_WINDOW_S = 120.0
 
 _HTTP_PROTOCOL_METHODS = frozenset({"initialize", "ping", "tools/list"})
+_HTTP_LIGHT_MCP_PATH = "/mcp/light"
 
 # SSE stream limits (GET /logstream/stream). Each connected client holds one
 # handler thread, so the cap is a thread-exhaustion guard, not a rate limit.
@@ -730,6 +731,13 @@ def _http_dispatch(request):
         return handle_request(request)
 
 
+def _http_dispatch_light(request):
+    """Dispatch the lightweight catalog through the same locks and guards as /mcp."""
+    from ..mcp_light_server import _dispatch_light_request
+
+    return _dispatch_light_request(request, _http_dispatch, read_lock=_HTTP_REQUEST_LOCK.read_lock)
+
+
 def _http_handle_get(handler) -> None:
     """Route GET requests. Module-level (like the other _http_* helpers) to
     keep _build_http_server under the C901 complexity ceiling.
@@ -745,6 +753,16 @@ def _http_handle_get(handler) -> None:
     if path == "/statusz":
         if not handler._request_rejected(require_auth=True):
             handler._send_json(200, handler._status_payload())
+        return
+    if path == _HTTP_LIGHT_MCP_PATH:
+        # The endpoint supports JSON replies to POST requests and no MCP SSE stream.
+        if not handler._request_rejected(require_auth=True):
+            handler._record_request(405)
+            handler.send_response(405)
+            handler.send_header("Allow", "POST")
+            handler.send_header("Content-Length", "0")
+            handler.end_headers()
+            handler.close_connection = True
         return
     if path == "/logstream/stream":
         # Events and artifacts expose work metadata and patch contents;
@@ -1468,14 +1486,16 @@ def _build_http_server(host: str, port: int):
             if self._request_rejected(require_auth=True):
                 return
             path = urlparse(self.path).path
-            if path != "/mcp":
+            if path not in ("/mcp", _HTTP_LIGHT_MCP_PATH):
                 self.send_error(404, "Not Found")
                 return
             # A browser can send text/plain cross-origin without a CORS preflight;
             # it cannot send application/json, so only JSON reaches the dispatcher.
             media_type = (self.headers.get("Content-Type") or "").split(";", 1)[0]
             if media_type.strip().lower() != "application/json":
-                self.send_error(415, "Unsupported Media Type", "POST /mcp needs application/json")
+                self.send_error(
+                    415, "Unsupported Media Type", f"POST {path} needs application/json"
+                )
                 return
 
             try:
@@ -1505,7 +1525,8 @@ def _build_http_server(host: str, port: int):
             # Locking policy lives in _http_dispatch: global lock for
             # Chroma-touching tools, lock-free for logstream tools.
             try:
-                response = _http_dispatch(request)
+                dispatch = _http_dispatch_light if path == _HTTP_LIGHT_MCP_PATH else _http_dispatch
+                response = dispatch(request)
             except Exception:
                 # Without this the exception escaped into BaseHTTPRequestHandler,
                 # which closes the connection with no reply at all -- the client
