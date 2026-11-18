@@ -1770,19 +1770,8 @@ def _label_map_collisions(id_to_label: dict, label_to_id: dict) -> Optional[tupl
 
 def _repair_label_map_collisions(persisted: object, id_to_label: dict, seg_dir: str) -> bool:
     """Drop a handful of colliding label-map pairs in place; True when repaired."""
-    try:
-        from chromadb.segment.impl.vector.local_persistent_hnsw import PersistentData
-    except ImportError:
-        # No hnswlib: chroma cannot load this segment anyway, so leave the
-        # existing quarantine path alone.
-        return False
-
     label_to_id = _persisted_metadata_value(persisted, "label_to_id")
     if not _hnsw_label_map_payload_ok(persisted, label_to_id, seg_dir):
-        return False
-    if isinstance(persisted, dict):
-        # chroma only ever pickles a PersistentData instance; a dict payload is
-        # a hand-made fixture and not worth rewriting.
         return False
 
     collisions = _label_map_collisions(id_to_label, label_to_id)
@@ -1809,6 +1798,13 @@ def _repair_label_map_collisions(persisted: object, id_to_label: dict, seg_dir: 
     if any(kept_labels.get(label) != item_id for item_id, label in kept_ids.items()):
         return False
 
+    # total_elements_added is monotonic and must stay >= the live label count;
+    # copying a counter that is already too small would only move the segment
+    # from this gate to the next quarantine pass.
+    total = _persisted_metadata_value(persisted, "total_elements_added")
+    if not isinstance(total, Integral) or isinstance(total, bool) or int(total) < len(kept_ids):
+        return False
+
     seq_ids = _persisted_metadata_value(persisted, "id_to_seq_id")
     if isinstance(seq_ids, dict):
         seq_ids = {k: v for k, v in seq_ids.items() if k not in ids_to_drop}
@@ -1818,9 +1814,14 @@ def _repair_label_map_collisions(persisted: object, id_to_label: dict, seg_dir: 
     if _segment_is_held(seg_dir):
         return False
 
-    repaired = PersistentData.__new__(PersistentData)
-    repaired.__dict__.update(getattr(persisted, "__dict__", {}))
-    repaired.__dict__.update(
+    # Supported chromadb writers persist this metadata as a plain dict of the
+    # IdMap fields; older builds pickled a PersistentData instance. Rewrite in
+    # the dict shape either way: importing the instance class drags in the
+    # optional ``hnswlib`` dependency, which the Rust-backed client never needs.
+    repaired = (
+        dict(persisted) if isinstance(persisted, dict) else dict(getattr(persisted, "__dict__", {}))
+    )
+    repaired.update(
         {
             "id_to_label": kept_ids,
             "label_to_id": kept_labels,
@@ -1842,7 +1843,8 @@ def _repair_label_map_collisions(persisted: object, id_to_label: dict, seg_dir: 
 
     logger.warning(
         "Repaired %d colliding HNSW label(s) in %s by dropping %d drawer id(s): %s. "
-        "Their vectors stay unindexed until the next mine re-adds them.",
+        "Their vectors stay unindexed; rebuild with `mempalace repair --mode "
+        "from-sqlite` to index them again.",
         len(labels_to_drop),
         seg_dir,
         len(ids_to_drop),

@@ -2329,7 +2329,8 @@ def test_quarantine_invalid_hnsw_metadata_repairs_tiny_label_collisions(tmp_path
     assert moved == []
     assert seg.exists()
     persisted = _SafePersistentDataUnpickler.load(str(seg / "index_metadata.pickle"))
-    labels, by_label = persisted.id_to_label, persisted.label_to_id
+    labels = persisted["id_to_label"] if isinstance(persisted, dict) else persisted.id_to_label
+    by_label = persisted["label_to_id"] if isinstance(persisted, dict) else persisted.label_to_id
     assert len(labels) == len(by_label) == 39997
     assert not any(label in by_label for label in (39354, 39355, 39356))
     assert all(by_label[label] == item_id for item_id, label in labels.items())
@@ -2338,6 +2339,54 @@ def test_quarantine_invalid_hnsw_metadata_repairs_tiny_label_collisions(tmp_path
 def test_quarantine_invalid_hnsw_metadata_quarantines_large_label_mismatches(tmp_path):
     """A map that disagrees well beyond a handful of labels is still corruption."""
     palace, seg = _write_colliding_segment(tmp_path, 40, range(1, 21))
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_repairs_dict_payload_collisions(tmp_path):
+    """Supported writers persist a plain dict; that shape repairs the same way."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+
+    id_to_label = {f"drawer-{label}": label for label in range(1, 40001)}
+    label_to_id = {label: item_id for item_id, label in id_to_label.items()}
+    id_to_label["drawer-dup-39354"] = 39354
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 40000,
+                "id_to_label": id_to_label,
+                "label_to_id": label_to_id,
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    persisted = _SafePersistentDataUnpickler.load(str(seg / "index_metadata.pickle"))
+    assert isinstance(persisted, dict)
+    assert 39354 not in persisted["label_to_id"]
+    assert len(persisted["id_to_label"]) == len(persisted["label_to_id"]) == 39999
+
+
+def test_quarantine_invalid_hnsw_metadata_rejects_repair_with_stale_counter(tmp_path):
+    """A repair must not carry a counter below the surviving label count."""
+    palace, seg = _write_colliding_segment(tmp_path, 40000, (39354,))
+    meta = seg / "index_metadata.pickle"
+    persisted = _SafePersistentDataUnpickler.load(str(meta))
+    persisted.total_elements_added = 0
+    with open(meta, "wb") as f:
+        pickle.dump(persisted, f)
 
     moved = quarantine_invalid_hnsw_metadata(str(palace))
 
