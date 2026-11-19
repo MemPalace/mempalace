@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -3146,3 +3147,246 @@ def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch
     )
     hooks_cli._ingest_transcript(path)
     assert jobs and jobs[0]["wing"] == "mempalace"
+
+
+# --- _project_wing: linked git worktrees file under the main checkout ---
+
+
+def _make_main_repo(root):
+    """A normal checkout at ``root`` with a ``.git`` directory."""
+    (root / ".git" / "worktrees").mkdir(parents=True)
+    return root / ".git"
+
+
+def _add_linked_worktree(common_dir, wt_dir, name, relative=False, backslashes=False):
+    """A linked worktree at ``wt_dir`` whose ``.git`` file points into ``common_dir``.
+
+    Mirrors what ``git worktree add`` writes: ``<wt>/.git`` holds
+    ``gitdir: <common>/worktrees/<name>``, and that gitdir holds a
+    ``commondir`` file pointing back at the common dir (``../..``).
+    """
+    gitdir = common_dir / "worktrees" / name
+    gitdir.mkdir(parents=True)
+    (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    wt_dir.mkdir(parents=True, exist_ok=True)
+    target = os.path.relpath(gitdir, wt_dir) if relative else str(gitdir)
+    if backslashes:
+        target = target.replace("/", "\\")
+    (wt_dir / ".git").write_text(f"gitdir: {target}\n", encoding="utf-8")
+    return wt_dir
+
+
+def test_project_wing_external_worktree_files_under_the_main_checkout(tmp_path):
+    # T3 Code / Conductor style: worktrees live outside the project.
+    from mempalace.hooks_cli import _project_wing
+
+    common = _make_main_repo(tmp_path / "dev" / "acme-app")
+    wt = _add_linked_worktree(
+        common, tmp_path / "t3" / "worktrees" / "acme-app" / "t3-1a2b3c", "t3"
+    )
+    path = _write_transcript_with_cwd(tmp_path, str(wt))
+    assert _project_wing(path) == "acme_app"
+
+
+def test_project_wing_same_branch_name_in_two_repos_stays_apart(tmp_path):
+    # Herdr style: <root>/<repo>/<branch>, where the leaf is a branch name.
+    from mempalace.hooks_cli import _project_wing
+
+    for repo in ("alpha", "beta"):
+        common = _make_main_repo(tmp_path / "src" / repo)
+        _add_linked_worktree(common, tmp_path / "herdr" / repo / "dev", "dev")
+    alpha = _write_transcript_with_cwd(
+        tmp_path, str(tmp_path / "herdr" / "alpha" / "dev"), "a.jsonl"
+    )
+    beta = _write_transcript_with_cwd(tmp_path, str(tmp_path / "herdr" / "beta" / "dev"), "b.jsonl")
+    assert _project_wing(alpha) == "alpha"
+    assert _project_wing(beta) == "beta"
+
+
+def test_project_wing_sibling_worktree_files_under_the_repo(tmp_path):
+    # Plain `git worktree add ../<repo>-<branch>`, with a relative gitdir.
+    from mempalace.hooks_cli import _project_wing
+
+    common = _make_main_repo(tmp_path / "repo")
+    wt = _add_linked_worktree(common, tmp_path / "repo-feature", "repo-feature", relative=True)
+    path = _write_transcript_with_cwd(tmp_path, str(wt))
+    assert _project_wing(path) == "repo"
+
+
+def test_project_wing_subdirectory_of_a_worktree_files_under_the_repo(tmp_path):
+    from mempalace.hooks_cli import _project_wing
+
+    common = _make_main_repo(tmp_path / "repo")
+    wt = _add_linked_worktree(common, tmp_path / "wts" / "wt1", "wt1")
+    sub = wt / "packages" / "api"
+    sub.mkdir(parents=True)
+    path = _write_transcript_with_cwd(tmp_path, str(sub))
+    assert _project_wing(path) == "repo"
+
+
+def test_project_wing_worktree_of_a_bare_repo_drops_the_git_suffix(tmp_path):
+    from mempalace.hooks_cli import _project_wing
+
+    common = tmp_path / "repos" / "my-app.git"
+    (common / "worktrees").mkdir(parents=True)
+    wt = _add_linked_worktree(common, tmp_path / "wts" / "main", "main")
+    path = _write_transcript_with_cwd(tmp_path, str(wt))
+    assert _project_wing(path) == "my_app"
+
+
+def test_project_wing_bare_repo_in_a_dot_folder_uses_the_enclosing_project(tmp_path):
+    # "<proj>/.bare" holds the bare repo, "<proj>/.git" points at it, and the
+    # worktrees sit beside it: the project is <proj>, not ".bare".
+    from mempalace.hooks_cli import _project_wing
+
+    proj = tmp_path / "code" / "acme-app"
+    common = proj / ".bare"
+    (common / "worktrees").mkdir(parents=True)
+    (proj / ".git").write_text("gitdir: ./.bare\n", encoding="utf-8")
+    wt = _add_linked_worktree(common, proj / "feature-x", "feature-x", relative=True)
+    path = _write_transcript_with_cwd(tmp_path, str(wt))
+    assert _project_wing(path) == "acme_app"
+
+
+def test_project_wing_windows_style_paths_in_a_worktree(tmp_path):
+    # Backslashes in both the recorded cwd and the gitdir pointer.
+    from mempalace.hooks_cli import _project_wing
+
+    common = _make_main_repo(tmp_path / "repo")
+    wt = _add_linked_worktree(
+        common, tmp_path / "wts" / "wt1", "wt1", relative=True, backslashes=True
+    )
+    path = _write_transcript_with_cwd(tmp_path, str(wt).replace("/", "\\"))
+    assert _project_wing(path) == "repo"
+
+
+def test_project_wing_codex_rollout_in_a_worktree(tmp_path):
+    from mempalace.hooks_cli import _project_wing
+
+    common = _make_main_repo(tmp_path / "repo")
+    wt = _add_linked_worktree(common, tmp_path / "wts" / "wt1", "wt1")
+    path = tmp_path / "rollout.jsonl"
+    meta = {"type": "session_meta", "payload": {"cwd": str(wt)}}
+    path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+    assert _project_wing(str(path)) == "repo"
+
+
+def test_project_wing_normal_checkout_and_its_subdirectory_are_unchanged(tmp_path):
+    # Wing stability (#2057): only linked worktrees change behaviour.
+    from mempalace.hooks_cli import _project_wing
+
+    repo = tmp_path / "acme-app"
+    _make_main_repo(repo)
+    sub = repo / "packages" / "api"
+    sub.mkdir(parents=True)
+    assert _project_wing(_write_transcript_with_cwd(tmp_path, str(repo), "a.jsonl")) == "acme_app"
+    assert _project_wing(_write_transcript_with_cwd(tmp_path, str(sub), "b.jsonl")) == "api"
+
+
+def test_project_wing_non_git_and_deleted_folders_keep_the_leaf(tmp_path):
+    from mempalace.hooks_cli import _project_wing
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    gone = tmp_path / "t3" / "worktrees" / "acme-app" / "t3-gone"
+    assert _project_wing(_write_transcript_with_cwd(tmp_path, str(notes), "a.jsonl")) == "notes"
+    assert _project_wing(_write_transcript_with_cwd(tmp_path, str(gone), "b.jsonl")) == "t3_gone"
+
+
+def test_project_wing_deleted_in_project_worktree_still_collapses(tmp_path):
+    # The marker-based collapse stays as the fallback once the folder is gone.
+    from mempalace.hooks_cli import _project_wing
+
+    repo = tmp_path / "acme-app"
+    _make_main_repo(repo)
+    gone = repo / ".claude" / "worktrees" / "gone"
+    assert _project_wing(_write_transcript_with_cwd(tmp_path, str(gone))) == "acme_app"
+
+
+@pytest.mark.parametrize(
+    "setup",
+    ["garbage", "missing_gitdir", "missing_commondir", "binary"],
+)
+def test_project_wing_broken_worktree_pointers_fall_back(tmp_path, setup):
+    from mempalace.hooks_cli import _project_wing
+
+    wt = tmp_path / "wts" / "wt-leaf"
+    wt.mkdir(parents=True)
+    common = _make_main_repo(tmp_path / "repo")
+    if setup == "garbage":
+        (wt / ".git").write_text("this is not a git pointer\n", encoding="utf-8")
+    elif setup == "missing_gitdir":
+        (wt / ".git").write_text(f"gitdir: {tmp_path / 'nowhere'}\n", encoding="utf-8")
+    elif setup == "missing_commondir":
+        # A submodule-style pointer: a gitdir with no commondir file.
+        gitdir = common / "modules" / "sub"
+        gitdir.mkdir(parents=True)
+        (wt / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    else:
+        (wt / ".git").write_bytes(b"\xff\xfe\x00gitdir: \x00\x80")
+    path = _write_transcript_with_cwd(tmp_path, str(wt))
+    assert _project_wing(path) == "wt_leaf"
+
+
+def test_project_wing_home_directory_wins_even_inside_a_worktree(tmp_path, monkeypatch):
+    from mempalace import hooks_cli
+
+    common = _make_main_repo(tmp_path / "dotfiles")
+    home = _add_linked_worktree(common, tmp_path / "home" / "me", "me")
+    monkeypatch.setattr(hooks_cli.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(hooks_cli.sys, "platform", "linux")
+    path = _write_transcript_with_cwd(tmp_path, str(home))
+    assert hooks_cli._project_wing(path) == "linux_workstation"
+
+
+def test_ingest_transcript_files_a_worktree_session_under_the_main_project(tmp_path, monkeypatch):
+    # The diary checkpoint and the ingest share _project_wing; check ingest end to end.
+    from mempalace import hooks_cli
+
+    common = _make_main_repo(tmp_path / "acme-app")
+    wt = _add_linked_worktree(common, tmp_path / "t3" / "acme-app" / "t3-9f8e", "t3-9f8e")
+    path = _write_transcript_with_cwd(tmp_path, str(wt))
+    Path(path).write_text(Path(path).read_text() + "x" * 200, encoding="utf-8")
+    monkeypatch.setattr(hooks_cli, "_validate_transcript_path", lambda p: Path(p))
+    monkeypatch.setattr(hooks_cli, "MempalaceConfig", lambda: None)
+
+    class Routing:
+        blocked = False
+        use_daemon = False
+
+    monkeypatch.setattr(hooks_cli, "_current_hook_write_routing", lambda: Routing())
+    spawned = []
+    monkeypatch.setattr(hooks_cli, "_spawn_mine", lambda cmd: spawned.append(cmd))
+    hooks_cli._ingest_transcript(path)
+    assert spawned and spawned[0][-2:] == ["--wing", "acme_app"]
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
+def test_project_wing_real_git_worktree(tmp_path):
+    from mempalace.hooks_cli import _project_wing
+
+    repo = tmp_path / "real-repo"
+    repo.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+
+    def git(*args):
+        subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", *args],
+            cwd=repo,
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+
+    git("init", "-q")
+    git("commit", "-q", "--allow-empty", "-m", "init")
+    wt = tmp_path / "elsewhere" / "feature-x"
+    git("worktree", "add", "-q", "-b", "feature-x", str(wt))
+    path = _write_transcript_with_cwd(tmp_path, str(wt))
+    assert _project_wing(path) == "real_repo"
