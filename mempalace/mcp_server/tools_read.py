@@ -601,6 +601,24 @@ def tool_get_taxonomy():
     return result
 
 
+def _touch_search_hits(result) -> None:
+    """Count one read of each drawer a search returned.
+
+    A hit's ``drawer_id`` is already the logical id, so counts land on the
+    logical drawer, not the chunk row. One batched upsert beside the palace;
+    the drawer store is not touched.
+    """
+    logical_ids = []
+    for hit in result.get("results", []) if isinstance(result.get("results"), list) else []:
+        if not isinstance(hit, dict):
+            continue
+        logical_id = hit.get("drawer_id")
+        if logical_id:
+            logical_ids.append(logical_id)
+    if logical_ids:
+        _record_drawer_reads(logical_ids)
+
+
 # The cosine distance ``min_similarity >= 1.0`` maps to: float error on an
 # identical vector stays below it.
 _EXACT_MATCH_DISTANCE = 1e-5
@@ -764,6 +782,8 @@ def tool_search(
     if _vector_disabled:
         result["vector_disabled"] = True
         result["vector_disabled_reason"] = _vector_disabled_reason
+
+    _touch_search_hits(result)
     # Attach sanitizer metadata for transparency
     report = sanitizer_report(sanitized)
     if report:

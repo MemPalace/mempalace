@@ -33,6 +33,17 @@ def _patch_mcp_server(monkeypatch, config, kg):
     monkeypatch.setattr(mcp_server, "_get_kg", lambda: kg)
 
 
+def _assert_same_drawer(actual: dict, expected: dict) -> None:
+    """Compare verbatim payloads while validating independently changing access counters."""
+    for payload in (actual, expected):
+        assert set(payload["access"]) == {"retrieval_count", "last_retrieved"}
+        assert payload["access"]["retrieval_count"] >= 1
+        assert isinstance(payload["access"]["last_retrieved"], str)
+    assert {k: v for k, v in actual.items() if k != "access"} == {
+        k: v for k, v in expected.items() if k != "access"
+    }
+
+
 # ── Registration ──────────────────────────────────────────────────────────
 
 
@@ -127,7 +138,9 @@ class TestGetDrawers:
 
         # Uniform shape: always a list, even for one id.
         assert bulk["count"] == 1
-        assert bulk["results"][0] == single
+        _assert_same_drawer(bulk["results"][0], single)
+        assert single["access"]["retrieval_count"] == 1
+        assert bulk["results"][0]["access"]["retrieval_count"] == 2
 
     def test_resolves_chunk_groups_like_singular_tool(self, monkeypatch, config, collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -145,7 +158,7 @@ class TestGetDrawers:
         assert payload["drawer_id"] == added["drawer_id"]
         assert payload["content"] == content
         assert payload["chunks"] == added["chunks"]
-        assert payload == mcp_server.tool_get_drawer(added["drawer_id"])
+        _assert_same_drawer(payload, mcp_server.tool_get_drawer(added["drawer_id"]))
 
         # A physical chunk id resolves exactly the way the singular tool
         # resolves it (the chunk row itself — reassembly is only via the
@@ -153,7 +166,39 @@ class TestGetDrawers:
         # one.
         chunk_id = added["chunk_ids"][0]
         bulk = mcp_server.tool_get_drawers([chunk_id])
-        assert bulk["results"][0] == mcp_server.tool_get_drawer(chunk_id)
+        _assert_same_drawer(bulk["results"][0], mcp_server.tool_get_drawer(chunk_id))
+
+    @pytest.mark.parametrize("read_only", [False, True])
+    def test_access_counts_only_successful_unique_ids(
+        self, monkeypatch, config, collection, kg, read_only
+    ):
+        from mempalace import access_stats
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        added = mcp_server.tool_add_drawer(wing="test", room="bulk_get", content="access counted")
+        drawer_id = added["drawer_id"]
+        writes = []
+        record_access = access_stats.record_access
+
+        def record(palace, ids):
+            writes.append(list(ids))
+            return record_access(palace, ids)
+
+        monkeypatch.setattr(access_stats, "record_access", record)
+        monkeypatch.setattr(mcp_server, "_READ_ONLY", read_only)
+        result = mcp_server.tool_get_drawers([drawer_id, drawer_id, "missing-counter"])
+        assert result["errors"] == 1
+        expected = 0 if read_only else 1
+        assert [r["access"]["retrieval_count"] for r in result["results"][:2]] == [expected] * 2
+        assert "access" not in result["results"][2]
+        stored = access_stats.access_for(config.palace_path, [drawer_id, "missing-counter"])
+        assert "missing-counter" not in stored
+        if read_only:
+            assert writes == []
+            assert stored == {}
+        else:
+            assert len(writes) == 1, "a bulk read records access in a single batch"
+            assert stored[drawer_id]["retrieval_count"] == 1
 
     def test_missing_ids_reported_per_item_not_batch(self, monkeypatch, config, collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
@@ -219,9 +264,9 @@ class TestGetDrawers:
 
         assert counter.gets == 2
         assert result["errors"] == 1
-        assert result["results"][0] == single_payload
-        assert result["results"][1] == logical_payload
-        assert result["results"][2] == chunk_payload
+        _assert_same_drawer(result["results"][0], single_payload)
+        _assert_same_drawer(result["results"][1], logical_payload)
+        _assert_same_drawer(result["results"][2], chunk_payload)
         assert result["results"][3]["drawer_id"] == "drawer_missing_none"
 
     def test_payload_error_stays_on_that_item(self, monkeypatch, config, collection, kg):
