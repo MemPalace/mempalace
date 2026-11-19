@@ -1434,6 +1434,75 @@ def _wing_slug(name: str) -> str:
     return normalize_wing_name(name) or "sessions"
 
 
+# Bounds for the linked-worktree lookup: how far up from the cwd to look for
+# ``.git``, and how much of each pointer file to read. Both keep the Stop hook
+# to a handful of small reads, with no ``git`` subprocess.
+_WORKTREE_MAX_DEPTH = 64
+_WORKTREE_POINTER_MAX_BYTES = 4096
+
+
+def _read_git_pointer(path: str) -> Optional[str]:
+    """The first line of a small git pointer file, stripped, or ``None``."""
+    with open(path, "r", encoding="utf-8", errors="strict") as f:
+        line = f.read(_WORKTREE_POINTER_MAX_BYTES).splitlines()
+    return line[0].strip() if line and line[0].strip() else None
+
+
+def _linked_worktree_project(cwd_norm: str) -> Optional[str]:
+    """The main checkout's directory when ``cwd_norm`` is in a linked git worktree.
+
+    Walks up from ``cwd_norm`` to the nearest ``.git``. A ``.git`` *file* marks
+    a linked worktree: its ``gitdir:`` line names ``<common>/worktrees/<name>``,
+    whose ``commondir`` file points back at the main repository's git dir. The
+    project is that dir's parent when it is a dot folder (``<project>/.git``,
+    or a bare ``<project>/.bare``), or else the dir itself minus a trailing
+    ``.git`` (a bare ``<project>.git``). Returns ``None`` (keep today's
+    derivation) for a normal checkout (``.git`` is a directory), a non-git or
+    deleted folder, a submodule (no ``commondir``), the home directory, or any
+    read error -- so the hook never fails because of this.
+    """
+    try:
+        if not os.path.isdir(cwd_norm):
+            return None
+        home = os.path.normcase(os.path.normpath(str(Path.home())))
+        current = os.path.normpath(cwd_norm)
+        for _ in range(_WORKTREE_MAX_DEPTH):
+            if os.path.normcase(current) == home:
+                return None
+            dot_git = os.path.join(current, ".git")
+            if os.path.isdir(dot_git):
+                return None
+            if os.path.isfile(dot_git):
+                pointer = _read_git_pointer(dot_git)
+                if not pointer or not pointer.startswith("gitdir:"):
+                    return None
+                gitdir = pointer[len("gitdir:") :].strip().replace("\\", "/")
+                gitdir = os.path.normpath(os.path.join(current, gitdir))
+                commondir = _read_git_pointer(os.path.join(gitdir, "commondir"))
+                if not commondir:
+                    return None
+                common = os.path.normpath(os.path.join(gitdir, commondir.replace("\\", "/")))
+                if not os.path.isdir(common):
+                    return None
+                name = os.path.basename(common)
+                if name.startswith("."):
+                    # "<project>/.git", or a bare repo kept in a dot folder
+                    # such as "<project>/.bare".
+                    project = os.path.dirname(common)
+                elif name.lower().endswith(".git"):
+                    project = os.path.join(os.path.dirname(common), name[: -len(".git")])
+                else:
+                    project = common
+                return project.replace("\\", "/").rstrip("/") or None
+            parent = os.path.dirname(current)
+            if parent == current:
+                return None
+            current = parent
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
     """The session's working directory, from the first JSONL line that has one.
 
@@ -1441,9 +1510,10 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
     types (tool_use, tool_result, user/assistant turns), but not all
     (e.g. queue-operation lines lack it). Codex rollouts store it as
     ``payload.cwd`` on their ``session_meta`` line. Scans up to 200 lines. Returns
-    the path with forward slashes and no trailing slash, with a git
-    worktree under ``<project>/.claude/worktrees/`` or
-    ``<project>/.worktrees/`` collapsed to ``<project>``, or ``None`` if
+    the path with forward slashes and no trailing slash, with a linked git
+    worktree resolved to its main checkout (or, when the worktree folder is
+    gone, one under ``<project>/.claude/worktrees/`` or
+    ``<project>/.worktrees/`` collapsed to ``<project>``), or ``None`` if
     the file is unreadable, empty, or records no cwd.
     """
     try:
@@ -1471,10 +1541,17 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
-                # A cwd inside "<project>/.claude/worktrees/<wt>" or
-                # "<project>/.worktrees/<wt>" (a git worktree) belongs to
-                # <project>, not the ephemeral worktree directory --
-                # otherwise every worktree spawns its own wing.
+                # A cwd inside a linked git worktree belongs to the main
+                # checkout's project, wherever the worktree lives (T3 Code,
+                # Herdr, Conductor, `git worktree add ../repo-branch`), not
+                # to the ephemeral worktree directory -- otherwise every
+                # worktree spawns its own wing.
+                main_project = _linked_worktree_project(cwd_norm)
+                if main_project:
+                    return main_project
+                # Once the worktree folder is gone, fall back to collapsing
+                # "<project>/.claude/worktrees/<wt>" and
+                # "<project>/.worktrees/<wt>" by name.
                 for _wt_marker in _WORKTREE_CWD_MARKERS:
                     if _wt_marker in cwd_norm:
                         cwd_norm = cwd_norm.split(_wt_marker, 1)[0]

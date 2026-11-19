@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- The hooks now file a session run from any linked git worktree under the
+  main checkout's project wing, wherever the worktree lives (for example
+  `~/.t3/worktrees/<project>/<wt>`, `~/.herdr/worktrees/<repo>/<branch>` or
+  a sibling `../<repo>-<branch>`). Before, only `<project>/.claude/worktrees/`
+  and `<project>/.worktrees/` collapsed, and every other worktree spawned its
+  own wing. The main checkout is found by reading the worktree's `.git` and
+  `commondir` pointer files, with no `git` subprocess; a bare main repo is
+  named without its `.git` suffix. Normal checkouts, non-git folders and
+  worktrees that no longer exist keep the wing they got before. Refs #2939.
 - Re-mining a conversation transcript or a diary that was rewritten,
   compacted or shortened no longer destroys the text mined from the earlier
   version. Drawer ids are positional, so a re-mine wrote the new text over
