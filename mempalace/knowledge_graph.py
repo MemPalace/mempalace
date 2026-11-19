@@ -926,6 +926,7 @@ class KnowledgeGraph:
                 for row in conn.execute(query, params).fetchall():
                     results.append(
                         {
+                            "id": row["id"],
                             "direction": "outgoing",
                             "subject": name,
                             "predicate": row["predicate"],
@@ -934,6 +935,7 @@ class KnowledgeGraph:
                             "valid_to": row["valid_to"],
                             "confidence": row["confidence"],
                             "source_closet": row["source_closet"],
+                            "source_file": row["source_file"],
                             "current": row["valid_to"] is None,
                         }
                     )
@@ -948,6 +950,7 @@ class KnowledgeGraph:
                 for row in conn.execute(query, params).fetchall():
                     results.append(
                         {
+                            "id": row["id"],
                             "direction": "incoming",
                             "subject": row["sub_name"],
                             "predicate": row["predicate"],
@@ -956,6 +959,7 @@ class KnowledgeGraph:
                             "valid_to": row["valid_to"],
                             "confidence": row["confidence"],
                             "source_closet": row["source_closet"],
+                            "source_file": row["source_file"],
                             "current": row["valid_to"] is None,
                         }
                     )
@@ -1033,6 +1037,7 @@ class KnowledgeGraph:
             for row in conn.execute(query, [eid] + temporal_params).fetchall():
                 results.append(
                     {
+                        "id": row["id"],
                         "direction": "outgoing",
                         "subject": name,
                         "predicate": row["predicate"],
@@ -1041,6 +1046,7 @@ class KnowledgeGraph:
                         "valid_to": row["valid_to"],
                         "confidence": row["confidence"],
                         "source_closet": row["source_closet"],
+                        "source_file": row["source_file"],
                         "current": row["valid_to"] is None,
                     }
                 )
@@ -1052,6 +1058,7 @@ class KnowledgeGraph:
             for row in conn.execute(query, [eid] + temporal_params).fetchall():
                 results.append(
                     {
+                        "id": row["id"],
                         "direction": "incoming",
                         "subject": row["sub_name"],
                         "predicate": row["predicate"],
@@ -1060,6 +1067,7 @@ class KnowledgeGraph:
                         "valid_to": row["valid_to"],
                         "confidence": row["confidence"],
                         "source_closet": row["source_closet"],
+                        "source_file": row["source_file"],
                         "current": row["valid_to"] is None,
                     }
                 )
@@ -1090,6 +1098,7 @@ class KnowledgeGraph:
             for row in conn.execute(query, params).fetchall():
                 results.append(
                     {
+                        "id": row["id"],
                         "subject": row["sub_name"],
                         "predicate": pred,
                         "object": row["obj_name"],
@@ -1141,6 +1150,7 @@ class KnowledgeGraph:
 
         return [
             {
+                "id": r["id"],
                 "subject": r["sub_name"],
                 "predicate": r["predicate"],
                 "object": r["obj_name"],
