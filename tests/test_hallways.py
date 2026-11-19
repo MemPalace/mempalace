@@ -427,6 +427,78 @@ class TestHallwayMinCountProperty:
         assert MempalaceConfig(config_dir=cfgdir).hallway_min_count == 6
 
 
+class TestEntityTunnelsProperty:
+    """Unit tests for MempalaceConfig.entity_tunnels — the resolution
+    contract (env > file > default True, invalid values fall through to
+    the default) that mirrors ``hooks_auto_save``. Regression for #2950:
+    entity tunnels previously had no off-switch at all.
+    """
+
+    def _write_cfg(self, tmp_path, value):
+        cfgdir = tmp_path / "cfg"
+        cfgdir.mkdir(exist_ok=True)
+        (cfgdir / "config.json").write_text(json.dumps({"entity_tunnels": value}), encoding="utf-8")
+        return cfgdir
+
+    def test_default_is_true(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_ENTITY_TUNNELS", raising=False)
+        assert MempalaceConfig(config_dir=tmp_path).entity_tunnels is True
+
+    def test_file_false_honoured(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_ENTITY_TUNNELS", raising=False)
+        cfgdir = self._write_cfg(tmp_path, False)
+        assert MempalaceConfig(config_dir=cfgdir).entity_tunnels is False
+
+    def test_file_true_honoured(self, tmp_path, monkeypatch):
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_ENTITY_TUNNELS", raising=False)
+        cfgdir = self._write_cfg(tmp_path, True)
+        assert MempalaceConfig(config_dir=cfgdir).entity_tunnels is True
+
+    def test_env_precedes_file(self, tmp_path, monkeypatch):
+        """Env ``0`` disables even when the file says true, and env ``1``
+        re-enables even when the file says false."""
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = self._write_cfg(tmp_path, True)
+        monkeypatch.setenv("MEMPALACE_ENTITY_TUNNELS", "0")
+        assert MempalaceConfig(config_dir=cfgdir).entity_tunnels is False
+
+        cfgdir = self._write_cfg(tmp_path, False)
+        monkeypatch.setenv("MEMPALACE_ENTITY_TUNNELS", "1")
+        assert MempalaceConfig(config_dir=cfgdir).entity_tunnels is True
+
+    def test_invalid_env_falls_through_to_file(self, tmp_path, monkeypatch):
+        """An unrecognised env value is ignored; file value returned."""
+        from mempalace.config import MempalaceConfig
+
+        cfgdir = self._write_cfg(tmp_path, False)
+        monkeypatch.setenv("MEMPALACE_ENTITY_TUNNELS", "bogus")
+        assert MempalaceConfig(config_dir=cfgdir).entity_tunnels is False
+
+    def test_invalid_env_falls_through_to_default(self, tmp_path, monkeypatch):
+        """An unrecognised env value with no file value returns the
+        default True rather than raising."""
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.setenv("MEMPALACE_ENTITY_TUNNELS", "bogus")
+        assert MempalaceConfig(config_dir=tmp_path).entity_tunnels is True
+
+    def test_invalid_file_value_falls_through_to_default(self, tmp_path, monkeypatch):
+        """A non-boolean file value returns the default True rather than
+        raising (or silently disabling the feature)."""
+        from mempalace.config import MempalaceConfig
+
+        monkeypatch.delenv("MEMPALACE_ENTITY_TUNNELS", raising=False)
+        cfgdir = self._write_cfg(tmp_path, "maybe")
+        assert MempalaceConfig(config_dir=cfgdir).entity_tunnels is True
+
+
 class TestHallwayQuery:
     def test_list_hallways_returns_all_when_no_filter(self, tmp_path, monkeypatch):
         _use_tmp_hallway_file(monkeypatch, tmp_path)
