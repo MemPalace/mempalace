@@ -16,17 +16,19 @@ import logging
 import os
 import sys
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
-# stdio protection before heavy imports
+# Only the stdio entry point owns stdout. The HTTP hub imports this module.
 _REAL_STDOUT = sys.stdout
 _REAL_STDOUT_FD = None
-try:
-    _REAL_STDOUT_FD = os.dup(1)
-    os.dup2(2, 1)
-except (OSError, AttributeError):
-    pass
-sys.stdout = sys.stderr
+if __name__ == "__main__":
+    try:
+        _REAL_STDOUT_FD = os.dup(1)
+        os.dup2(2, 1)
+    except (OSError, AttributeError):
+        pass
+    sys.stdout = sys.stderr
 
 import inspect  # noqa: E402
 import urllib.error  # noqa: E402
@@ -823,10 +825,14 @@ def _query_arguments(name: str, params: Dict[str, Any]) -> Dict[str, Any]:
     return {} if name == "mempalace_hook_settings" else params
 
 
-def _resolve_wing_params(params: Dict[str, Any]) -> None:
-    for key in ("wing", "source_wing", "target_wing"):
-        if isinstance(params.get(key), str):
-            params[key] = _resolve_fuzzy_wing(params[key])
+def _resolve_wing_params(params: Dict[str, Any], *, read_lock=nullcontext) -> None:
+    keys = [
+        key for key in ("wing", "source_wing", "target_wing") if isinstance(params.get(key), str)
+    ]
+    if keys:
+        with read_lock():
+            for key in keys:
+                params[key] = _resolve_fuzzy_wing(params[key])
 
 
 def _classify_underlying_tool(tool_name: str, arguments: Any) -> Optional[str]:
@@ -896,8 +902,12 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "error": {"code": -32600, "message": "Invalid Request"},
         }
 
-    method = request.get("method") or ""
-    params = request.get("params") or {}
+    method = request.get("method")
+    if not isinstance(method, str):
+        method = ""
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
     req_id = request.get("id")
 
     if method == "initialize":
@@ -937,7 +947,7 @@ def handle_light_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "result": {"tools": tools_list},
         }
     if method == "tools/call":
-        if not isinstance(params, dict) or "name" not in params:
+        if not isinstance(params.get("name"), str):
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -1042,10 +1052,10 @@ def _alias_args_for_handler(handler, params: Dict[str, Any]) -> Dict[str, Any]:
     return _alias_args_for_names(names, params, has_var_keyword=has_var_keyword)
 
 
-def _rewrite_tools_call_for_hub(request: Dict[str, Any]):
+def _rewrite_tools_call_for_hub(request: Dict[str, Any], *, read_lock=nullcontext):
     """Translate palace_* tools/call into the underlying mempalace_* JSON-RPC."""
     params = request.get("params") or {}
-    if not isinstance(params, dict) or "name" not in params:
+    if not isinstance(params, dict) or not isinstance(params.get("name"), str):
         return None
     tool_name = params["name"]
     if tool_name not in LIGHT_TOOLS:
@@ -1065,7 +1075,7 @@ def _rewrite_tools_call_for_hub(request: Dict[str, Any]):
 
     taxonomy_wing = None
     if tool_name in ("palace_query", "palace_exec"):
-        _resolve_wing_params(parsed)
+        _resolve_wing_params(parsed, read_lock=read_lock)
         if tool_name == "palace_query" and query_target in ("taxonomy", "get_taxonomy"):
             taxonomy_wing = parsed.get("wing")
 
@@ -1100,6 +1110,7 @@ def _postprocess_light_response(
     resp: Optional[Dict[str, Any]],
     *,
     palace_path: Optional[str] = None,
+    read_lock=nullcontext,
 ):
     if not resp or "result" not in resp:
         return resp
@@ -1122,7 +1133,8 @@ def _postprocess_light_response(
     if not isinstance(payload, dict):
         return resp
     if underlying == "mempalace_search":
-        payload = _enrich_search_results(payload, palace_path=palace_path)
+        with read_lock():
+            payload = _enrich_search_results(payload, palace_path=palace_path)
     elif underlying == "mempalace_get_taxonomy":
         payload = _filter_taxonomy_payload(payload, taxonomy_wing)
     content[0]["text"] = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -1403,10 +1415,35 @@ class _LightHubProxy:
 
 
 def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Hub-first stdio dispatch: translate palace_* calls, keep the 3-tool handshake local."""
-    method = request.get("method") if isinstance(request, dict) else None
-    if method == "tools/call":
-        rewritten = _rewrite_tools_call_for_hub(request)
+    """Translate palace_* calls and dispatch them through the stdio transport."""
+    return _dispatch_light_request(request, _dispatch_light_stdio_tool)
+
+
+def _dispatch_light_stdio_tool(request):
+    srv = _get_mcp_server()
+    req_id = request.get("id")
+    tool_name = request["params"]["name"]
+    # The destination owns the lease. Check local restrictions before forwarding
+    # without competing for the hub's writer lock.
+    refusal = srv._mcp_tool_preflight_refusal(req_id, tool_name, check_writer=False)
+    if refusal is not None:
+        return refusal
+    try:
+        return srv._dispatch_stdio_request(request)
+    except Exception as exc:
+        return srv._internal_tool_error(
+            req_id, tool_name, exc, include_message=isinstance(exc, ValueError)
+        )
+
+
+def _dispatch_light_request(request, dispatch, *, read_lock=nullcontext):
+    """Translate the light catalog to core tools before dispatching through a transport."""
+    if (
+        isinstance(request, dict)
+        and request.get("jsonrpc") == "2.0"
+        and request.get("method") == "tools/call"
+    ):
+        rewritten = _rewrite_tools_call_for_hub(request, read_lock=read_lock)
         if isinstance(rewritten, dict) and rewritten.get("_unknown_target"):
             return _unknown_target_error(request.get("id"))
         if isinstance(rewritten, dict) and rewritten.get("_parse_error"):
@@ -1425,24 +1462,8 @@ def dispatch_light_stdio_request(request: Dict[str, Any]) -> Optional[Dict[str, 
                 },
             }
         if rewritten is not None:
-            srv = _get_mcp_server()
             forwarded = {k: v for k, v in rewritten.items() if not k.startswith("_")}
-            underlying = ((forwarded.get("params") or {}).get("name")) or ""
-            # The destination owns the lease: hub forwarding must not first
-            # compete for the hub's local writer lock. Local dispatch still
-            # runs the full gate inside handle_request, as does the hub.
-            refusal = srv._mcp_tool_preflight_refusal(
-                request.get("id"), underlying, check_writer=False
-            )
-            if refusal is not None:
-                return refusal
-            try:
-                resp = srv._dispatch_stdio_request(forwarded)
-            except Exception as exc:
-                return srv._internal_tool_error(
-                    request.get("id"), underlying, exc, include_message=isinstance(exc, ValueError)
-                )
-            return _postprocess_light_response(rewritten, resp)
+            return _postprocess_light_response(rewritten, dispatch(forwarded), read_lock=read_lock)
     return handle_light_request(request)
 
 
