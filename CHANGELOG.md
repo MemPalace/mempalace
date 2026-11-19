@@ -8,6 +8,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- Re-mining a conversation transcript or a diary that was rewritten,
+  compacted or shortened no longer destroys the text mined from the earlier
+  version. Drawer ids are positional, so a re-mine wrote the new text over
+  the old drawers and pruned the rest, and nothing kept what they held.
+  Before a conversation or diary re-mine overwrites or removes a drawer, its
+  exact text and metadata are now appended to `drawer_revisions.jsonl` in the
+  palace directory (one locked, fsynced append per batch; the file is `0600`
+  and the palace directory `0700`). The journal is not searchable yet. If the
+  append fails, the drawers it covered are left as they were, the file is
+  reported as failed and stays unfinished, and the next mine retries;
+  drawers an earlier batch already replaced are journaled first and are not
+  journaled again. Project-file drawers index the file as it is now and are
+  still replaced without a journal entry.
+- A miner now prunes only the drawers it filed. Mining a project over a
+  path that also holds a mined transcript (or the reverse) used to prune the
+  other miner's drawers under that `source_file`; the producer is now read
+  from each drawer's metadata, and conversation, diary, manual and other
+  producers' drawers are kept.
+- `mempalace sync --apply` keeps conversation, diary and manual drawers whose
+  source file is gone or ignored, and reports them as `Preserved` instead of
+  removing them. `mempalace_delete_by_source` reports how many matching
+  drawers are preserved memory and how many journaled revisions it would
+  erase; deleting a source erases its re-mine history in
+  `drawer_revisions.jsonl` too. Deleting a single drawer keeps the re-mine
+  history of its position until its source is deleted.
+
 ---
 
 ## [3.12.0] — 2026-11-09

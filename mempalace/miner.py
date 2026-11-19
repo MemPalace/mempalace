@@ -1782,7 +1782,7 @@ def process_file(
     source_file = str(filepath)
     if not dry_run and (
         _prefetched_as_mined(source_file, mined_mtimes)
-        or file_already_mined(collection, source_file, check_mtime=True)
+        or file_already_mined(collection, source_file, check_mtime=True, owner="project")
     ):
         return 0, "general", None
 
@@ -1828,7 +1828,7 @@ def process_file(
     # and both file the file — creating duplicates or losing data.
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
-        if file_already_mined(collection, source_file, check_mtime=True):
+        if file_already_mined(collection, source_file, check_mtime=True, owner="project"):
             return 0, room, None
 
         # source_mtime is the mtime paired with the content actually read
@@ -1877,10 +1877,13 @@ def process_file(
             )
             for chunk in chunks
         ]
-        # Every drawer for this path is replaced, whichever miner filed it.
+        # The project miner's own drawers for this path are replaced; a
+        # conversation, diary or manual drawer filed under the same path stays.
         # A failed stale-drawer purge is an error the mine counts, not a skip.
         try:
-            drawers_added = write_file_drawers(collection, source_file, drawers, aaak_col=aaak_col)
+            drawers_added = write_file_drawers(
+                collection, source_file, drawers, aaak_col=aaak_col, owner="project"
+            )
         except StaleDrawerPurgeFailed as exc:
             print(f"  ! [error] {filepath.name[:50]:50} {exc}", file=sys.stderr)
             return 0, room, "purge_failed"
