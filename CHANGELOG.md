@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- Every `mempalace` command starts faster. `mempalace.cli`, `mempalace.palace`,
+  `mempalace.searcher` and `mempalace.mcp_server` execute their source files
+  into one namespace, and compiled those files from source on every start:
+  no bytecode cache applied to them. They now load through the import
+  system's cache, like any module. The HTTP opener that refuses redirects is
+  built on first use instead of at import. `mempalace --version` went from
+  about 340 ms to 180 ms on a busy machine, which every hook run pays.
 - Re-mining a conversation transcript or a diary that was rewritten,
   compacted or shortened no longer destroys the text mined from the earlier
   version. Drawer ids are positional, so a re-mine wrote the new text over
