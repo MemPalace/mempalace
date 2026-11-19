@@ -1,6 +1,7 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
 import contextlib
+import json
 import sys
 
 import pytest
@@ -969,6 +970,40 @@ class TestExtractAuthoredAt:
     """authored_at = max per-line ``timestamp`` in a transcript (real authored date,
     independent of mine time). Both Claude Code and Codex JSONL carry a top-level
     ISO-8601 ``timestamp`` per line."""
+
+    @pytest.mark.parametrize(
+        ("timestamps", "expected"),
+        [
+            (
+                ["2026-09-09T10:00:00+09:00", "2026-09-09T02:00:00Z"],
+                "2026-09-09T02:00:00Z",
+            ),
+            (
+                ["2026-09-09T02:00:00Z", "2026-09-09T10:00:00+09:00"],
+                "2026-09-09T02:00:00Z",
+            ),
+            (
+                ["2026-09-09T02:00:00Z", "2026-09-09T02:00:00.500Z"],
+                "2026-09-09T02:00:00.500Z",
+            ),
+            (
+                ["not-a-date", "2026-09-09T02:00:00Z", "2026-99-99T00:00:00Z"],
+                "2026-09-09T02:00:00Z",
+            ),
+            (["not-a-date", "2026-99-99T00:00:00Z", ""], None),
+        ],
+        ids=["offsets", "reversed-offsets", "fractional-seconds", "invalid-mixed", "invalid-only"],
+    )
+    def test_selects_latest_valid_instant(self, tmp_path, timestamps, expected):
+        transcript = tmp_path / "session.jsonl"
+        transcript.write_text(
+            "\n".join(json.dumps({"timestamp": value}) for value in timestamps),
+            encoding="utf-8",
+        )
+
+        authored_at = _extract_authored_at(transcript)
+
+        assert authored_at == expected
 
     def test_returns_latest_timestamp(self, tmp_path):
         f = tmp_path / "session.jsonl"

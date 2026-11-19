@@ -20,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [3.12.0] — 2026-10-18
+## [3.12.0] — 2026-11-09
 
 Mining keeps every byte of your sources, never leaves a file without its
 drawers when a write fails part-way, and stores your messages as written.
@@ -291,6 +291,20 @@ requires Python 3.10.
   lists existing entities whose old id may hold facts for more than one
   spelling.
 
+- Existing conversation drawers keep their metadata when an unchanged source is
+  skipped. For Chroma palaces with retained JSONL transcripts, run the
+  [authored-time backfill](docs/authored-at.md#backfilling-existing-memory) from
+  this checkout to correct previously selected timestamps without re-embedding.
+  Preview with the default dry run before adding `--apply`.
+
+- **In a PQL `FIND` or `SEARCH` query only upper-case keywords are filters.**
+  A lower-case `in`, `limit`, `source`, `strategy`, `context`, `since` or
+  `before`, and any quoted keyword, is now search text. `find auth in backend`
+  searches for those three words in every wing, where it used to search `auth`
+  in wing `backend`; write `FIND auth IN backend` for the filter. Before, an
+  ordinary sentence such as `notes in the auth service` silently became a
+  search of wing `the`. The structured form of `palace_query` is unchanged.
+
 ### Added
 
 - **`mempalace export <dir>` writes the palace out as markdown.** One folder
@@ -308,8 +322,77 @@ requires Python 3.10.
   commits; each delete result reports
   `revisions_deleted`. A re-mine and `sync` leave revisions alone.
 
+- **Opt-in MCP file logging records UTC timestamps and per-call HTTP lock
+  timing.** Setting `MEMPALACE_LOG_FILE` now prefixes every line with an ISO
+  UTC timestamp, and locked HTTP hub tool calls log `CALL` / `SLOW CALL` lines
+  with `wait=` and `run=` durations in milliseconds.
+- **GPU and Apple Silicon embedding documentation and updated OpenClaw skill
+  bundle.** Added hardware acceleration guidance across CUDA, ROCm, CoreML,
+  DirectML and CPU-only Intel Mac / Windows ARM64 runtimes, and updated
+  `integrations/openclaw/` for the `3.12.0` light/full MCP recall workflow.
+
 ### Security
 
+- **The Antigravity hooks, the daemon and `mempalace serve` no longer import
+  from the working directory.** They started Python with `-m mempalace` (or
+  `-c`) in the user's workspace, where Python looks first, so a cloned
+  repository holding a `mempalace/` package or a `sqlite3.py` ran instead of
+  the installed one, as the user, on every hook fire. Every child interpreter
+  now runs with `PYTHONSAFEPATH=1` and through the launcher the Claude Code and
+  Codex hooks already used, which drops the working directory from `sys.path`
+  on Python 3.10 too. The small `-c` helpers around the launcher (the
+  kill-switch config reader, the wake-up JSON encoder, the state-file
+  timestamps) carry the same two lines, since Python 3.10 ignores
+  `PYTHONSAFEPATH` and the config reader runs before the launcher does. The
+  working directory itself is unchanged.
+- **A hostile `.gitignore` can no longer hang the miner.** The `**` matcher
+  branched on every `**` segment, so one line of a dozen of them in a cloned
+  repository kept `mempalace mine` and `mempalace init` busy for minutes
+  (`exclude_patterns` in `mempalace.yaml` reached the same code). Matching is
+  now a table over path and pattern positions, and adjacent `**` segments are
+  folded, so the cost is the product of the two lengths. Results are unchanged.
+- **`mempalace init` refuses to write through a symbolic link.**
+  `mempalace.yaml`, `entities.json` and `.gitignore` were guarded with
+  `exists()` and `is_file()`, which follow links, so a checkout that shipped
+  one of them as a link at a file in the user's home had that file replaced or
+  appended to, and a dangling link had its target created. The three writers
+  now decide by `lstat`, refuse anything that is not a regular file or absent,
+  and publish through a fresh temporary file that never follows a link. The
+  replacement keeps the mode of the file it replaces, so a `mempalace.yaml` or
+  `entities.json` the user had set to 0600 stays 0600 instead of coming back
+  at the umask default; this holds for every non-private `fsio` publish.
+- **A sync peer's events and artifacts pass the same checks as local ones.**
+  `apply_remote_event` only checked that required fields were present, so a
+  configured peer (or whoever held its token) could store a body of any size,
+  an id with line breaks that broke the `/logstream/stream` frames, a
+  non-numeric `origin_seq` that made every other replica's pull fail, or an
+  op stamped with a third replica's name and a huge sequence number, which
+  told this node it already had everything from that replica. Remote events
+  and artifacts now go through the routing, type, status, body-size,
+  artifact-size and sha256-shape checks `append_event` and `put_artifact`
+  apply, an event must carry the origin it was served for, its `hlc` stamp
+  must parse (a stamp that did not sorted above every real one, and the next
+  open of that replica's log failed seeding the clock from it; a log that
+  already holds such a row now opens, skips it with a warning and seeds from
+  the newest stamp that parses), and the sync round
+  refuses a page that does not advance the cursor it asked from (a peer could
+  otherwise hold the round, and every peer behind it, for ever), pulls a
+  bounded number of pages per origin per round, and reports any failure a peer
+  provokes instead of letting it stop the loop. Event ids are also written to
+  the SSE stream as a single field. A peer is still trusted for the origins it
+  relays; signing them is the RFC 004 MeshGuard step.
+- **Credentials no longer follow a redirect.** The peer transport, the hub
+  client, the LLM and embedding client, the Qdrant backend and the daemon
+  client used `urllib`'s default opener, whose redirect handler copies
+  `Authorization` and API-key headers onto the redirected request whatever
+  host it names, so an endpoint answering `302 Location: http://elsewhere/`
+  received the token or key meant for it. Those requests now go through one
+  opener that follows no redirect and raises the 3xx, naming the target it did
+  not follow.
+- Wake-up text and Hermes prefetch results now mark stored memory as reference
+  data inside a fence that stored words cannot close, so a mined file or
+  transcript cannot pose as instructions in the system prompt. The stored words
+  themselves are unchanged. The memory protocol says the same to agents.
 - **A credential in an LLM or embedding endpoint URL no longer shows up in
   errors and logs.** An endpoint configured as
   `https://user:pass@host/v1?key=...` had its password and key repeated
@@ -355,6 +438,23 @@ requires Python 3.10.
   `SO_EXCLUSIVEADDRUSE`, so a later server on its port fails to start, and
   the hub itself refuses to start on a port another server holds. POSIX
   binds are unchanged.
+
+- **A writer with a different `HOME` no longer bypasses the palace's writer
+  lock.** The lock that keeps one writer per palace lived only under
+  `~/.mempalace/locks`, so a process started with another `HOME` on the same
+  palace (a service account, a container, a profile manager) took its own lock
+  and wrote beside the holder. Writers now also lock
+  `.<palace-name>.mempalace.lock` next to the palace directory, which every
+  process that can write the palace contends for, and a different-`HOME`
+  writer is refused like any other second writer. The `~` lock is still taken
+  too, so an older and a newer version that share a `HOME` keep excluding each
+  other. When the palace's parent directory cannot hold the file, the file
+  there cannot be opened, or the name there is a link or anything but a
+  regular file, a warning is logged and only the `~` lock is used, as before.
+- Mesh peer-sync error payloads mask URL userinfo and credential query
+  parameters, Antigravity and Cursor shell hooks run Python helper snippets
+  with `PYTHONSAFEPATH=1`, and the PyPI release workflow uses
+  `pypa/gh-action-pypi-publish` `1.14.3`.
 
 ### Performance
 
@@ -405,8 +505,114 @@ requires Python 3.10.
   chromadb (about 0.6 s down to under 0.1 s); the palace opens on the first
   read.
 
+- **Stdio MCP servers hold the peer-writer lease per mutating call instead of
+  for the lifetime of the process.** Once a mutating stdio call finishes, it
+  closes its storage handles and releases the lease so peer sessions can write
+  without restarting. Contended mutating calls wait up to 10 s for an in-flight
+  call to finish; writable HTTP hubs keep a lifetime lease.
+- **Embedder CPU arena and freed heap memory are released after `mempalace_mine`.**
+  ONNX Runtime sessions disable the non-shrinking CPU memory arena, and
+  `mempalace_mine` trims freed allocator pages after unloading the embedder.
+- **`mempalace_checkpoint` releases the HTTP request lock during embedding
+  inference**, keeping hub read tools responsive while holding the embedding
+  lifecycle lock, and the HTTP hub raises its socket listen backlog above
+  `socketserver`'s default of `5`.
+- **`sqlite_exact` and `qdrant` stream metadata without $O(N^2)$ offset scans.**
+  Both backends now implement `iter_metadata` (using cursor-based Qdrant
+  `scroll` pagination and index-friendly `ORDER BY rowid ASC` on
+  `sqlite_exact`), while preserving unpushable `$and` child clauses on Qdrant.
+
 ### Bug Fixes
 
+- `mempalace serve` binds its HTTP server without resolving the bind address
+  back to a name. `http.server` does that lookup on every bind, and on a host
+  with slow or absent reverse DNS for the address it blocked startup until the
+  resolver gave up (35 s on one hosted CI runner), which looked like the server
+  never coming up. The daemon's server already skipped the lookup; both now
+  share one bind step.
+- Codex CLI 0.166 rollouts that record the conversation only as
+  `response_item` messages are mined again; the Stop and PreCompact hooks
+  logged "0 exchanges" and saved nothing for them. A user message keeps only
+  the blocks Codex marks `user.text`, so injected environment, AGENTS.md and
+  app context is not filed as something the user said; rollouts without that
+  metadata skip messages that open with a known context tag. Sub-agent
+  rollouts are not read this way: their user messages are written by another
+  agent, and Codex's reviewer is handed whole transcripts of other sessions.
+- The Anthropic provider no longer sends `temperature`, which current Claude
+  models reject with HTTP 400, so `rooms propose` and `kg normalize` failed on
+  them; a caller can still pass one. The output budget is 8192 tokens instead
+  of 2048 and can be set with `max_tokens`, and an answer cut off at the budget
+  now says so instead of failing as a JSON parse error.
+- Stop and PreCompact diary checkpoints are filed through a running
+  `mempalace serve` hub. The hub holds the palace writer lease for its whole
+  lifetime, so the checkpoint's own write was refused for as long as a hub
+  ran, the save marker never advanced, and every later Stop re-mined the whole
+  transcript. The checkpoint now goes to the hub's `mempalace_diary_write`, the
+  same way the hook's transcript mine is forwarded, and is written in-process
+  only when no writable hub answers. A hub that took the request but gave no
+  readable answer may already have filed it, so the entry is not written a
+  second time.
+- A torn `index_metadata.pickle` read no longer quarantines a live HNSW
+  segment. When a metadata load fails with an error outside the
+  known-transient set, the guard now re-checks the file up to six times
+  50 ms apart and only quarantines it when the bytes stay identical and
+  the load keeps failing; a file that is still being rewritten is left
+  alone for the next open to re-check once it has settled.
+- The `wing` in `mempalace.yaml` is validated when a project is mined, so a
+  cloned repository's config cannot hang the miner with a yaml alias structure
+  or file drawers under unsafe text, a number or a list. A rejected name becomes
+  its wing slug, with a warning, and a config with no usable wing, including one
+  with no `wing` key, uses the directory's wing instead of failing. Valid names
+  and `--wing` are unchanged. Drawers already filed under the old spelling stay
+  there, and a wing filter finds both by slug. A wing with no slug, such as
+  `+++`, stays reachable by that name or an unfiltered search.
+- Room names in `mempalace.yaml` are validated when the miner loads them, so a
+  cloned repository's config cannot put newlines or other unsafe text into
+  drawer metadata and wake-up output. A rejected name such as `c++` becomes its
+  slug, with a warning. A room with no usable name is skipped, and its files go
+  to the other rooms or `general`. Every file is still mined, and stored drawers
+  are not changed.
+- The L1 size cap now holds for room lines. A room name already in a palace
+  stays on one line in wake-up and Hermes output, and a long one is shortened
+  instead of crowding out the story.
+- **`repair --mode from-sqlite` no longer reports success on a palace the
+  server refuses.** Its final check used `PRAGMA quick_check`, which on some
+  SQLite builds does not read the FTS5 index tables, so a rebuild could print
+  `Rebuild complete` while the full-text index was still malformed, and the
+  MCP server then refused the palace. The check now also runs FTS5's own
+  `integrity-check`, on a connection opened after the last write so a warm
+  page cache cannot pass stale pages as clean, and a check that cannot run
+  counts as a failure.
+- **A diary checkpoint queued behind a running mine is logged as queued, not
+  failed.** With hook writes routed through the daemon, a checkpoint sent while
+  an earlier Stop hook's mine was still running outlasted the hook's 30 s wait
+  and was logged as `Daemon diary checkpoint failed: timed out`, although the
+  daemon filed it afterwards. The hook now logs that it is still queued, and
+  the PreCompact mine's wait is reported the same way. Neither writes the
+  entry a second time.
+- **A hook-started conversation mine no longer lingers after `Done.`** It
+  releases its PID slot when it finishes or fails, and a small supervisor ends
+  a miner stuck in interpreter shutdown after a grace period (60 s, set with
+  `MEMPALACE_HOOK_MINE_EXIT_GRACE_SECONDS`), so a finished mine no longer
+  holds off the next hook's. Mines run by hand are unaffected.
+- **OpenAI reasoning models work through the OpenAI-compatible provider and
+  closet generation.** They reject `temperature` and `max_tokens` with HTTP
+  400. A 400 that names `temperature` now drops it, and later calls on that
+  provider skip it; closet generation switches to `max_completion_tokens` when
+  a 400 asks for it, with a budget of 25000 instead of 1500 because that field
+  also counts reasoning tokens. Other models get the same request as before.
+- `~/.mempalace/identity.txt` is read as UTF-8, with a byte-order mark
+  stripped, on every locale, so wake-up no longer garbles it or fails under
+  `cp1252`, `cp950` or `C`.
+- `mempalace wings split` and `mempalace rooms` handle wing names stored
+  before 3.12.0, such as `c++_engine`, instead of failing with `ValueError`.
+- Interactive `mempalace repair` no longer fails with `ChromaBackend has been
+  closed` after its confirmation prompt.
+- `mempalace repair rebuild-index` keeps `logstream.sqlite3` and
+  `replica.json`; the event log is copied with SQLite's online backup so a
+  live write cannot tear it.
+- MCP `add_drawer`, `update_drawer` and `diary_write` file under the same wing
+  slug the miners use, after the name passes the usual safety checks.
 - **Bookkeeping rows stay out of what you see.** The convo miner files a
   registry row (`ingest_mode="registry"`) for a transcript with no chunks, and
   the format miner a sentinel for a document that extracted to nothing. Search
@@ -677,9 +883,69 @@ requires Python 3.10.
   when the mine runs through the daemon. The daemon job dropped both, so the
   assets were filed with no project and no related drawer.
 
+- **Replaying an identical closed historical assertion through `add_triple`
+  returns the original row instead of storing a duplicate.** The dedup check
+  matched only open triples (`valid_to IS NULL`), so a historical insert with
+  `valid_to` set was never recognized as a replay. A replay must match subject,
+  predicate, object, both bounds, confidence and all provenance columns; a
+  recurring interval or an independently sourced assertion of the same interval
+  stays two separate facts.
+- **Stop and PreCompact diary checkpoints acquire the per-palace writer lease
+  in-process.** Detached hook checkpoint children called `tool_diary_write`
+  without promoting the process to writer, failing on `sqlite_exact` and
+  `rust_exact` with `attempt to write a readonly database`; they now take and
+  release the per-call lease and retry across lock contention.
+- **`mempalace sync` forwards single-root syncs to a live HTTP hub.** When
+  `mempalace serve` owns the palace writer lease, CLI `sync` hands the dry-run
+  or `--apply` prune to the hub over HTTP instead of failing with
+  `MineAlreadyRunning`.
+- **Pre-open Chroma HNSW quarantine skips segments held by a live writer**, and
+  `repair.status()` distinguishes healthy unflushed Chroma WAL queues
+  (`embeddings_queue`) from true HNSW index loss. On Linux, in-process SQLite
+  locks fall back to `F_OFD_SETLK = 37` when older Python builds omit the
+  constant from `fcntl`.
+- Knowledge graph read, invalidate and supersede lookups no longer apply the
+  128-character write cap, so legacy facts with longer names or objects remain
+  queryable and removable.
+- Registered Chinese, Japanese, and Korean entities are tagged when adjacent to
+  other words or particles while mixed-script names retain word boundaries on
+  their non-CJK edges; entity extraction gates English frequency filtering on
+  `entity_languages`, adds `pt-br` and generic code-term stopwords, and honors
+  `entity_stopwords.json`.
+- Conversation mining and hybrid search tie-breaking compare transcript
+  timestamps by UTC instant rather than text order across mixed offsets, and
+  `mined.py` normalizes JSON-`null` version metadata without raising `TypeError`.
+- Project mining honors `<common-git-dir>/info/exclude` (including linked
+  worktrees) and skips `.worktrees` and `.claude/worktrees`; hook wing
+  derivation reads Codex `payload.cwd`, collapses `<project>/.worktrees/<wt>`
+  into `<project>`, and preserves spaces, drive colons and Unicode in
+  Antigravity and Cursor shell stdin parsers.
+- Embedding device reporting reflects effective post-load ONNX providers
+  (reporting silent CPU fallback and MiniLM CoreML absence accurately),
+  foreground/launchd daemon logs route `< ERROR` to `stdout` and `>= ERROR` to
+  `stderr`, DeepSeek Harness `0.2.x` recall listens on `agent/created` with
+  bounded wake-up retries, and LongMemEval `ndcg()` normalizes IDCG against the
+  full corpus.
+
+### Dependencies
+
+- `uv.lock` moves packages with published advisories to fixed releases,
+  among them urllib3 2.8.0, Pillow 13.0.0 (12.3.0 stays on Python 3.10),
+  pydantic-settings and virtualenv. Package requirements are unchanged.
+
 ### Pull requests merged since 3.11.0
 
+- [#518](https://github.com/MemPalace/mempalace/pull/518) fix(entity): add generic code terms to English stopwords
+- [#2237](https://github.com/MemPalace/mempalace/pull/2237) docs(openclaw): update OpenClaw skill and references for 3.12.0
+- [#2525](https://github.com/MemPalace/mempalace/pull/2525) fix(repair-status): tell a healthy unflushed palace from one that lost its index
+- [#2586](https://github.com/MemPalace/mempalace/pull/2586) fix(hooks): collapse <project>/.worktrees/<wt> into the project wing
+- [#2605](https://github.com/MemPalace/mempalace/pull/2605) fix(kg): dedupe identical closed-interval add_triple replays
+- [#2607](https://github.com/MemPalace/mempalace/pull/2607) fix(daemon): emit lifecycle and HTTP access lines to stdout/stderr
+- [#2625](https://github.com/MemPalace/mempalace/pull/2625) fix(hooks): file the save-hook diary checkpoint through a live hub
+- [#2725](https://github.com/MemPalace/mempalace/pull/2725) fix(mcp): treat only upper-case PQL clause keywords as keywords
+- [#2738](https://github.com/MemPalace/mempalace/pull/2738) fix(repair): gate the from-sqlite rebuild on FTS5's own integrity check (#2707)
 - [#2744](https://github.com/MemPalace/mempalace/pull/2744) perf(sqlite-exact): synchronize docs_fts.rowid with documents.rowid for O(log N) writes
+- [#2745](https://github.com/MemPalace/mempalace/pull/2745) perf(backends): add iter_metadata to sqlite_exact/qdrant and Qdrant scroll pagination
 - [#2753](https://github.com/MemPalace/mempalace/pull/2753) fix(sqlite_exact): retire immutable readers after every commit
 - [#2754](https://github.com/MemPalace/mempalace/pull/2754) ci: single-source the coverage threshold
 - [#2758](https://github.com/MemPalace/mempalace/pull/2758) fix(cli): serve keeps the global --palace flag
@@ -708,11 +974,14 @@ requires Python 3.10.
 - [#2781](https://github.com/MemPalace/mempalace/pull/2781) perf(pgvector): look up ids with the primary key
 - [#2782](https://github.com/MemPalace/mempalace/pull/2782) fix: refuse to overwrite a state file that did not parse
 - [#2783](https://github.com/MemPalace/mempalace/pull/2783) fix(backends): keep serializable metadata and publish markers atomically
+- [#2785](https://github.com/MemPalace/mempalace/pull/2785) chore(deps): bump actions/upload-artifact from 7.0.1 to 7.0.2
+- [#2786](https://github.com/MemPalace/mempalace/pull/2786) chore(deps): bump actions/download-artifact from 8.0.1 to 8.0.2
 - [#2788](https://github.com/MemPalace/mempalace/pull/2788) ci: run the test workflow on every pull request
 - [#2789](https://github.com/MemPalace/mempalace/pull/2789) test(format_miner): compare the stored mtime with the miner's 1 ms tolerance
 - [#2790](https://github.com/MemPalace/mempalace/pull/2790) fix(convo): keep user turns as written; ChatGPT active branch; Slack null user
 - [#2791](https://github.com/MemPalace/mempalace/pull/2791) fix(mine): stop the mine when the mined set cannot be read
 - [#2792](https://github.com/MemPalace/mempalace/pull/2792) fix(search): no default distance cutoff, one cosine scale, keep unscored BM25 hits
+- [#2794](https://github.com/MemPalace/mempalace/pull/2794) fix(mine): honour .git/info/exclude and skip .worktrees/.claude worktrees
 - [#2795](https://github.com/MemPalace/mempalace/pull/2795) fix(search): keep the closet boost through the hybrid rank and on the cosine scale
 - [#2796](https://github.com/MemPalace/mempalace/pull/2796) fix(convo): stamp lossy parsing steps on every drawer of the file
 - [#2797](https://github.com/MemPalace/mempalace/pull/2797) fix(hub): derive search forwarding and the hub fingerprint from one settings table
@@ -740,6 +1009,7 @@ requires Python 3.10.
 - [#2823](https://github.com/MemPalace/mempalace/pull/2823) fix: keep bookkeeping rows out of user-facing readers, and keep chat whitespace and Gemini parts as written
 - [#2824](https://github.com/MemPalace/mempalace/pull/2824) fix(mine): read stored vectors only for unchanged drawers, and re-embed if the read fails
 - [#2825](https://github.com/MemPalace/mempalace/pull/2825) chore(lint): sort imports and drop unused noqa marks (ruff stage 0)
+- [#2826](https://github.com/MemPalace/mempalace/pull/2826) fix(hooks): report a checkpoint queued behind a running mine as queued, not failed
 - [#2828](https://github.com/MemPalace/mempalace/pull/2828) ci: fail the Rust job on clippy warnings
 - [#2829](https://github.com/MemPalace/mempalace/pull/2829) refactor: remove dedup.py and clean the backend and palace comments
 - [#2830](https://github.com/MemPalace/mempalace/pull/2830) chore(search): drop dead closet helpers and PR-history comments
@@ -772,7 +1042,53 @@ requires Python 3.10.
 - [#2858](https://github.com/MemPalace/mempalace/pull/2858) fix(security): mask endpoint credentials in embedding and LLM errors
 - [#2859](https://github.com/MemPalace/mempalace/pull/2859) chore(release): 3.12.0
 - [#2861](https://github.com/MemPalace/mempalace/pull/2861) fix(mine): keep --palace and media options on daemon-routed adapter mines
-
+- [#2864](https://github.com/MemPalace/mempalace/pull/2864) fix(hooks): preserve valid filesystem path chars in shell stdin parsers
+- [#2866](https://github.com/MemPalace/mempalace/pull/2866) fix: preserve revisions and report graph imports accurately
+- [#2867](https://github.com/MemPalace/mempalace/pull/2867) fix(palace): lock the palace for writers with a different HOME
+- [#2869](https://github.com/MemPalace/mempalace/pull/2869) fix(convo): select authored time by instant across UTC offsets
+- [#2870](https://github.com/MemPalace/mempalace/pull/2870) fix(miner): recognize registered entities in continuous CJK text
+- [#2872](https://github.com/MemPalace/mempalace/pull/2872) fix: report effective embedding devices and document GPU support
+- [#2873](https://github.com/MemPalace/mempalace/pull/2873) docs: clarify Mac embedding compatibility and test CPU-only runtimes
+- [#2874](https://github.com/MemPalace/mempalace/pull/2874) fix(benchmarks): normalize LongMemEval NDCG against the full corpus
+- [#2876](https://github.com/MemPalace/mempalace/pull/2876) fix(recall): also listen on agent/created, so memory reaches DSH 0.2.x sessions
+- [#2878](https://github.com/MemPalace/mempalace/pull/2878) chore(deps): bump pypa/gh-action-pypi-publish from 1.14.2 to 1.14.3
+- [#2881](https://github.com/MemPalace/mempalace/pull/2881) fix(entities): honor entity_languages in extraction filters
+- [#2882](https://github.com/MemPalace/mempalace/pull/2882) feat(http): timestamp MCP log file and time every locked HTTP palace call
+- [#2883](https://github.com/MemPalace/mempalace/pull/2883) test(mcp): pin coexisting case-variant wing rename
+- [#2889](https://github.com/MemPalace/mempalace/pull/2889) fix(http): raise the MCP HTTP listen backlog above socketserver's default of 5
+- [#2890](https://github.com/MemPalace/mempalace/pull/2890) fix(mcp): release the request lock around a checkpoint's embedding phases
+- [#2892](https://github.com/MemPalace/mempalace/pull/2892) test(repair): the pathname2url surrogate boundary is 3.12, not 3.13
+- [#2893](https://github.com/MemPalace/mempalace/pull/2893) fix(mcp): release embedder arena and freed heap after a mine
+- [#2894](https://github.com/MemPalace/mempalace/pull/2894) fix(http): keep the hub's port exclusive on Windows
+- [#2895](https://github.com/MemPalace/mempalace/pull/2895) perf(hallways): store hallways in SQLite so a mine touches only its wing
+- [#2896](https://github.com/MemPalace/mempalace/pull/2896) test(daemon): lock module-level retention contract
+- [#2898](https://github.com/MemPalace/mempalace/pull/2898) fix(hooks): hold the writer lease for Stop-hook diary checkpoints on sqlite_exact
+- [#2901](https://github.com/MemPalace/mempalace/pull/2901) test(embeddinggemma2): skip scipy-dependent audio tests when scipy is absent
+- [#2906](https://github.com/MemPalace/mempalace/pull/2906) fix(chroma): don't quarantine HNSW segments under a live writer
+- [#2908](https://github.com/MemPalace/mempalace/pull/2908) fix(hooks): derive the Codex wing from the rollout's payload.cwd
+- [#2909](https://github.com/MemPalace/mempalace/pull/2909) fix(mcp): hold the peer-writer lease per call, not per process
+- [#2911](https://github.com/MemPalace/mempalace/pull/2911) fix(kg): don't cap the length of values the KG tools only look up
+- [#2912](https://github.com/MemPalace/mempalace/pull/2912) test: clear the developer's own MemPalace env for the test session
+- [#2918](https://github.com/MemPalace/mempalace/pull/2918) fix(storage): use OFD locks on Linux even when fcntl lacks F_OFD_SETLK
+- [#2919](https://github.com/MemPalace/mempalace/pull/2919) fix(cli): forward mempalace sync to the live hub
+- [#2920](https://github.com/MemPalace/mempalace/pull/2920) docs(changelog): finalize 3.12.0 release notes after triage merges
+- [#2924](https://github.com/MemPalace/mempalace/pull/2924) fix(llm): retry reasoning models without the parameters they reject (#2914)
+- [#2938](https://github.com/MemPalace/mempalace/pull/2938) fix: land Tier 1 release-blocker fixes before v3.12.0 (#2860)
+- [#2943](https://github.com/MemPalace/mempalace/pull/2943) fix(hooks): clean up convos mine PID slot and bound shutdown (#2917)
+- [#2946](https://github.com/MemPalace/mempalace/pull/2946) fix(layers): fence stored memory in wake-up and Hermes prompts
+- [#2947](https://github.com/MemPalace/mempalace/pull/2947) fix(codex): read response_item messages from newer Codex rollouts
+- [#2951](https://github.com/MemPalace/mempalace/pull/2951) fix(miner): validate room names from mempalace.yaml
+- [#2952](https://github.com/MemPalace/mempalace/pull/2952) fix(miner): validate the wing from mempalace.yaml
+- [#2954](https://github.com/MemPalace/mempalace/pull/2954) chore(deps): bump docker/login-action from 4.6.0 to 4.7.0
+- [#2957](https://github.com/MemPalace/mempalace/pull/2957) fix(chroma): quarantine HNSW metadata only after stability checks (#2897)
+- [#2959](https://github.com/MemPalace/mempalace/pull/2959) fix: close five pre-release security gaps found in the 3.12 audit
+- [#2960](https://github.com/MemPalace/mempalace/pull/2960) chore(deps): bump locked packages with published advisories
+- [#2962](https://github.com/MemPalace/mempalace/pull/2962) test: keep the suite off the resolver (first item from #2961)
+- [#2963](https://github.com/MemPalace/mempalace/pull/2963) ci: run the suite in parallel and cancel superseded PR runs (items A and B from #2961)
+- [#2964](https://github.com/MemPalace/mempalace/pull/2964) fix(llm): stop sending temperature to Anthropic and raise its token budget
+- [#2965](https://github.com/MemPalace/mempalace/pull/2965) test: stop the suite waiting on the kernel and the resolver
+- [#2966](https://github.com/MemPalace/mempalace/pull/2966) fix(mcp): bind the HTTP server without a reverse DNS lookup
+- [#2968](https://github.com/MemPalace/mempalace/pull/2968) test(dsh): wait on the hook queue instead of fixed ticks
 ---
 
 ## [3.11.0] — 2026-10-12

@@ -52,7 +52,7 @@ TOOL_CAPABILITIES = {
     "mempalace_search": ("read", "embedding_release"),
     "mempalace_check_duplicate": ("read", "embedding_release"),
     "mempalace_add_drawer": ("write", "mutating vector_write"),
-    "mempalace_checkpoint": ("write", "mutating vector_write"),
+    "mempalace_checkpoint": ("write", "mutating vector_write embedding_release"),
     "mempalace_delete_drawer": ("write", "mutating vector_write"),
     "mempalace_delete_drawers": ("write", "mutating vector_write"),
     "mempalace_mine": ("maintenance", "mutating vector_write yielding"),

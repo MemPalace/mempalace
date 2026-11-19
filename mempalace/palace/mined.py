@@ -34,11 +34,15 @@ def _meta_is_current(meta: dict, extract_mode: Optional[str]) -> bool:
     is stale too, so a chunker fix re-mines conversation files without
     touching project files.
     """
-    if meta.get("normalize_version", 1) < NORMALIZE_VERSION:
+    # An explicit null (or any non-number) is stale, never a TypeError that
+    # aborts the whole prefetch: file_already_mined treats it as stale too.
+    version = meta.get("normalize_version", 1)
+    if not _is_plain_number(version) or version < NORMALIZE_VERSION:
         return False
     if extract_mode in CHUNKER_VERSIONS:
         key, current = CHUNKER_VERSIONS[extract_mode]
-        return meta.get(key, 1) >= current
+        chunker = meta.get(key, 1)
+        return _is_plain_number(chunker) and chunker >= current
     return True
 
 
@@ -88,17 +92,17 @@ MINE_ABORTS = (BackendError, CollisionError, MineAlreadyRunning, MinedSetUnavail
 
 
 def _fast_collection_metadata(collection, keys, require_key=None, equals=None):
-    """Chroma's one-pass sqlite metadata stream, or ``None`` for other backends.
+    """One-pass metadata stream from backends that implement ``iter_metadata``.
 
-    Paging ``get(limit, offset)`` costs a SQL ``OFFSET`` per page, which
-    re-walks every skipped row, and ``count()`` on a fresh client loads the
-    whole HNSW index first: on a 360k-drawer palace one such scan took 138 s,
-    and it grows with the square of the palace.
+    Paging ``get(limit, offset)`` costs a SQL ``OFFSET`` (or repeated scroll
+    from offset 0) per page, which re-walks every skipped row, and ``count()``
+    on a fresh Chroma client loads the whole HNSW index first: on a 360k-drawer
+    palace one such scan took 138 s, and it grows with the square of the palace.
     """
-    from ..backends.chroma import ChromaCollection
+    from ..backends.base import BaseCollection
 
     inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
-    if isinstance(inner, ChromaCollection):
+    if isinstance(inner, BaseCollection) and hasattr(inner, "iter_metadata"):
         if equals is None:
             return inner.iter_metadata(keys, require_key=require_key)
         return inner.iter_metadata(keys, require_key=require_key, equals=equals)
@@ -129,6 +133,10 @@ def _scan_collection_metadata(collection, keys, absorb, reset) -> None:
                 exc_info=True,
             )
             reset()
+        finally:
+            close = getattr(fast, "close", None)
+            if close is not None:
+                close()
     try:
         for meta in _paged_metadata(collection):
             absorb(meta)
@@ -398,10 +406,22 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
     Chroma's sqlite stream, or when the stream fails, so the caller keeps
     the per-file check for every file.
     """
-    rows = _fast_collection_metadata(collection, _PROJECT_MINED_KEYS, require_key="source_file")
+    wanted = set(source_files)
+    from ..backends.sqlite_exact import SQLiteExactCollection
+
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    scope = (
+        {"source_file": wanted}
+        if isinstance(inner, SQLiteExactCollection)
+        and 1 <= len(wanted) <= 5000
+        and all(isinstance(x, str) for x in wanted)
+        else None
+    )
+    rows = _fast_collection_metadata(
+        collection, _PROJECT_MINED_KEYS, require_key="source_file", equals=scope
+    )
     if rows is None:
         return None
-    wanted = set(source_files)
     # Per source_file: stored mtime -> [drawer count, largest chunk_total,
     # whether some drawer has no chunk_total].
     groups: dict[str, dict] = {}
@@ -414,7 +434,7 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
             src = meta.get("source_file")
             if src not in wanted or src in unprovable:
                 continue
-            if not _is_comparable(meta):
+            if not _is_comparable(meta) or not _is_plain_number(meta.get("normalize_version", 1)):
                 unprovable.add(src)
                 groups.pop(src, None)
                 continue
@@ -436,6 +456,10 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
     except Exception:
         logger.warning("sqlite metadata scan failed; checking each file on its own", exc_info=True)
         return None
+    finally:
+        close = getattr(rows, "close", None)
+        if close is not None:
+            close()
     complete: dict[str, tuple] = {}
     for src, by_mtime in groups.items():
         mtimes = tuple(

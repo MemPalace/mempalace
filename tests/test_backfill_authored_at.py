@@ -49,6 +49,27 @@ def test_backfill_sets_latest_timestamp(tmp_path):
     assert got["authored_at"] == "2026-06-12T09:00:00.000Z"
 
 
+def test_backfill_corrects_existing_offset_timestamp_without_reembedding(tmp_path):
+    sessions = tmp_path / "claude"
+    older = "2026-09-09T10:00:00+09:00"
+    newer = "2026-09-09T02:00:00Z"
+    _transcript(sessions, "abc.jsonl", older, newer)
+    col = _collection()
+    _add(col, "d1", "/old/mount/abc.jsonl", authored_at=older)
+    before = col.get(ids=["d1"], include=["documents", "embeddings"])
+
+    preview = backfill_mod.backfill_authored_at(col, [str(sessions)], apply=False)
+    assert preview["updated"] == 1
+    assert col.get(ids=["d1"])["metadatas"][0]["authored_at"] == older
+    applied = backfill_mod.backfill_authored_at(col, [str(sessions)], apply=True)
+    assert applied["updated"] == 1
+    after = col.get(ids=["d1"], include=["documents", "embeddings", "metadatas"])
+    assert after["metadatas"][0]["authored_at"] == newer
+    assert after["documents"] == before["documents"]
+    assert (after["embeddings"] == before["embeddings"]).all()
+    assert backfill_mod.backfill_authored_at(col, [str(sessions)], apply=True)["updated"] == 0
+
+
 def test_dry_run_writes_nothing(tmp_path):
     sessions = tmp_path / "claude"
     _transcript(sessions, "abc.jsonl", "2026-06-12T09:00:00.000Z")

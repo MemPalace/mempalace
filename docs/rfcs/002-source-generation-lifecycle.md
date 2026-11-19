@@ -65,7 +65,10 @@ hydration batches and retain the snapshot until iterator close. Chroma ANN refil
 uses increasing candidate windows capped at `max(requested, min(4096,
 requested*16))`, preserves candidate order and warns when truncating. Returned
 metadata/documents are hydrated from the pinned logical SQL snapshot, not a later
-ANN response. Exact queries rank the logical SQL view. The Rust native loader
+ANN response. Document-filtered reads instead apply the restored-text and visibility
+predicates to the same native response used for the returned payload, retrying
+if the registry epoch changes. They do not hold a Chroma SQL reader across the
+SDK call, so a concurrent writer can finish. Exact queries rank the logical SQL view. The Rust native loader
 opens an independent physical database, so managed logical queries deliberately
 use the Python exact fallback rather than claiming native snapshot participation.
 

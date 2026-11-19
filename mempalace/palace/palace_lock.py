@@ -224,13 +224,16 @@ def _format_lock_holder(content: str) -> str:
 # the identity without colliding with byte 0 (Windows msvcrt.locking
 # blocks both reads and writes on the locked byte).
 _LOCK_SENTINEL_BYTES = 1
+# A holder record is a PID and a short command line. The read is capped
+# because the lock beside the palace can be any file someone left there.
+_LOCK_HOLDER_MAX_BYTES = 4096
 
 
 def _read_lock_holder(lock_file) -> str:
     """Read the prior holder's identity from the lock-file body, best-effort."""
     try:
         lock_file.seek(_LOCK_SENTINEL_BYTES)
-        content = lock_file.read()
+        content = lock_file.read(_LOCK_HOLDER_MAX_BYTES)
         if isinstance(content, bytes):
             content = content.decode("utf-8", errors="replace")
         content = content.strip()
@@ -253,10 +256,174 @@ def _write_lock_holder(lock_file) -> None:
         ident_bytes = ident.encode("utf-8")
         lock_file.seek(_LOCK_SENTINEL_BYTES)
         lock_file.truncate(_LOCK_SENTINEL_BYTES + len(ident_bytes))
-        lock_file.write(ident_bytes)
+        # The lock file is unbuffered, so write until every byte is out.
+        view = memoryview(ident_bytes)
+        while view:
+            written = lock_file.write(view)
+            if not written:
+                break
+            view = view[written:]
         lock_file.flush()
     except (OSError, UnicodeError):
         pass
+
+
+def _palace_side_lock_path(palace_path: str) -> Optional[str]:
+    """Path of the writer lock kept beside the palace, or None if it has none.
+
+    The lock sits next to the palace directory, not inside it. ``migrate``
+    swaps the palace directory and ``repair --mode rebuild --in-place``
+    renames it, both while holding this lock. A lock file inside would leave
+    with the old directory on POSIX, so the new palace at the same path would
+    be unguarded, and on Windows its open handle would make the rename fail.
+    """
+    resolved = paths.canonical_palace_path(palace_path)
+    parent, name = os.path.split(resolved)
+    if not name:
+        return None
+    return os.path.join(parent, f".{name}.mempalace.lock")
+
+
+def _open_lock_file(lock_path: str, mode: int, *, refuse_links: bool = False):
+    """Open ``lock_path`` for locking, creating it with ``mode`` if missing.
+
+    The file is opened r+ so the prior holder's identity can be read for
+    failure diagnostics and our own written. "w" truncates and erases the
+    prior holder. "a+" puts the position at EOF, which on Windows breaks
+    ``msvcrt.locking`` (it locks 1 byte at the *current* position, so two
+    contenders end up locking different bytes and silently both acquire —
+    observed as Windows-CI lock test failures).
+
+    On POSIX a lock beside the palace that this process cannot write (one
+    created by another user) is opened read-only instead: ``flock`` locks any open file, so that
+    process still contends for the lock, it just records no identity.
+
+    ``refuse_links`` is for the lock beside the palace, which sits in a
+    directory MemPalace does not own: the open never follows a symlink and
+    refuses anything but a regular file with one link. Otherwise the holder
+    record written after locking would overwrite whatever file the name
+    pointed at.
+    """
+    import io
+    import stat
+
+    flags = getattr(os, "O_BINARY", 0)
+    if refuse_links:
+        if os.path.islink(lock_path):
+            # Windows has no O_NOFOLLOW; on POSIX the flag below is the guard.
+            raise OSError(f"lock file {lock_path} is a symlink")
+        # O_NONBLOCK so a FIFO at the name cannot hang the open before the
+        # regular-file check below rejects it.
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    # Each os.open is the last statement before the try that closes its fd.
+    file_mode = "r+"
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | flags, mode)
+    except PermissionError:
+        # Only the lock beside the palace can belong to another user.
+        if os.name == "nt" or not refuse_links:
+            raise
+        file_mode = "r"
+        fd = os.open(lock_path, os.O_RDONLY | flags)
+    try:
+        if refuse_links:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise OSError(f"lock file {lock_path} is not a regular file with one link")
+        # Unbuffered FileIO: it never closes a descriptor it was handed when
+        # it fails, so the close below cannot hit a reused descriptor.
+        return io.FileIO(fd, file_mode)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _lock_or_raise(lock_file, resolved: str) -> None:
+    """Take the non-blocking lock on byte 0, or raise MineAlreadyRunning."""
+    # Lock byte 0 explicitly. msvcrt.locking is byte-position dependent;
+    # fcntl.flock is whole-file but the seek is harmless there.
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as exc:
+            holder = _read_lock_holder(lock_file)
+            raise MineAlreadyRunning(
+                f"palace {resolved} is held by {holder}; "
+                "wait for it to finish or stop the holder before retrying"
+            ) from exc
+    import fcntl
+
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        holder = _read_lock_holder(lock_file)
+        raise MineAlreadyRunning(
+            f"palace {resolved} is held by {holder}; "
+            "wait for it to finish or stop the holder before retrying"
+        ) from exc
+
+
+def _unlock(lock_file) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            # Match the lock region: byte 0.
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+    except Exception:
+        pass
+
+
+def _hold_lock_file(
+    stack, lock_path: str, resolved: str, mode: int, *, refuse_links: bool = False
+) -> None:
+    """Open, lock and record ourselves in ``lock_path``; release via ``stack``."""
+    lock_file = _open_lock_file(lock_path, mode, refuse_links=refuse_links)
+    stack.callback(lock_file.close)
+    _lock_or_raise(lock_file, resolved)
+    stack.callback(_unlock, lock_file)
+    # Record our own identity for any later contender's diagnostic message.
+    _write_lock_holder(lock_file)
+
+
+def _hold_palace_side_lock(stack, palace_path: str, resolved: str) -> None:
+    """Hold the lock beside the palace, or warn once and hold nothing.
+
+    Raises MineAlreadyRunning when another writer holds it. Any other failure
+    (a read-only parent, a palace at a filesystem root) leaves only the lock
+    under ``~/.mempalace/locks``, which is what every writer used before.
+    """
+    lock_path = _palace_side_lock_path(palace_path)
+    try:
+        if lock_path is None:
+            raise OSError(f"palace {resolved} has no parent directory")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        # 0644, not 0600: another user that can write this palace must be
+        # able to open the lock to contend for it.
+        _hold_lock_file(stack, lock_path, resolved, 0o644, refuse_links=True)
+    except MineAlreadyRunning:
+        raise
+    except OSError as exc:
+        from .._once import first_time
+
+        # Once per palace, not on every write.
+        if first_time("palace-lock", "palace-side-unusable", resolved):
+            logger.warning(
+                "Cannot use the writer lock beside palace %s (%s); falling back to "
+                "the lock under ~/.mempalace/locks, which only excludes writers "
+                "that share this HOME",
+                resolved,
+                exc,
+            )
 
 
 @contextlib.contextmanager
@@ -270,7 +437,18 @@ def mine_palace_lock(palace_path: str):
     which (combined with chromadb's multi-threaded ParallelFor) can
     corrupt the HNSW graph and produce sparse link_lists.bin blowups.
 
-    The lock file is keyed by sha256(palace_path) so mines against
+    Two lock files are held, in this order:
+
+    1. ``<parent>/.<name>.mempalace.lock``, beside the palace directory.
+       Every process that writes the palace contends for it, whatever its
+       ``HOME``, so a writer with a different ``HOME`` is refused instead of
+       becoming a second writer. If it cannot be used, a warning is logged
+       and only the second lock is held.
+    2. ``~/.mempalace/locks/mine_palace_<key>.lock``, which is all that
+       versions before the palace-side lock take. Holding it as well keeps
+       old and new versions on one machine excluding each other.
+
+    The ``~`` lock file is keyed by sha256(palace_path) so mines against
     *different* palaces can still run in parallel — we only serialize
     writes into the same palace, which is the correctness boundary.
 
@@ -303,80 +481,22 @@ def mine_palace_lock(palace_path: str):
         yield
         return
 
-    # Ensure the file exists, then open r+ so we can both read the prior
-    # holder's identity (for failure diagnostics) and write our own. "w"
-    # truncates and erases the prior holder. "a+" puts the position at EOF,
-    # which on Windows breaks ``msvcrt.locking`` (it locks 1 byte at the
-    # *current* position, so two contenders end up locking different bytes
-    # and silently both acquire — observed as Windows-CI lock test
-    # failures).
-    if not os.path.exists(lock_path):
-        # Touch atomically: O_CREAT|O_EXCL would fail if a concurrent
-        # contender just created it, which is fine — we proceed to open.
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_WRONLY, 0o600)
-            os.close(fd)
-        except FileExistsError:
-            pass
-    lf = open(lock_path, "r+b")
-    acquired = False
-    try:
-        # Lock byte 0 explicitly. msvcrt.locking is byte-position dependent;
-        # fcntl.flock is whole-file but the seek is harmless there.
-        lf.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            try:
-                msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
-            except OSError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    "wait for it to finish or stop the holder before retrying"
-                ) from exc
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except BlockingIOError as exc:
-                holder = _read_lock_holder(lf)
-                raise MineAlreadyRunning(
-                    f"palace {resolved} is held by {holder}; "
-                    "wait for it to finish or stop the holder before retrying"
-                ) from exc
-        # Record our own identity for any later contender's diagnostic message.
-        _write_lock_holder(lf)
+    # The stack unlocks and closes both files on every exit, including a
+    # refusal of the second lock after the first was taken.
+    with contextlib.ExitStack() as stack:
+        _hold_palace_side_lock(stack, palace_path, resolved)
+        _hold_lock_file(stack, lock_path, resolved, 0o600)
         # Mark the hold from inside the try so it always pairs with
         # _mark_released. If it sat before the try, an async exception
         # (a SIGINT/KeyboardInterrupt) landing in the gap would orphan
-        # palace_key in the holder set while the outer finally frees the
-        # flock, so the in-memory hold would outlive the OS lock and a later
-        # re-entrant acquire would pass through and write without the flock.
+        # palace_key in the holder set while the stack frees the
+        # flocks, so the in-memory hold would outlive the OS locks and a later
+        # re-entrant acquire would pass through and write without the flocks.
         try:
             _mark_held(palace_key)
             yield
         finally:
             _mark_released(palace_key)
-    finally:
-        if acquired:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    # Match the lock region: byte 0.
-                    lf.seek(0)
-                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(lf, fcntl.LOCK_UN)
-            except Exception:
-                pass
-        lf.close()
 
 
 # Backward-compatible alias (previous patch iteration used a single global

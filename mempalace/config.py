@@ -66,6 +66,18 @@ def normalize_wing_name(name: str) -> str:
     return slug[:120].strip("_.'")
 
 
+def canonical_wing(value: str, field_name: str = "wing") -> str:
+    """Validate and canonicalize a wing to the canonical miner/graph slug.
+
+    Validates input through ``sanitize_name`` first so path traversal,
+    null bytes, overlong names, and illegal characters raise the standard
+    ``ValueError``, then normalizes valid names via ``normalize_wing_name``
+    (lower-casing and collapsing spaces and hyphens to ``_``).
+    """
+    validated = sanitize_name(value, field_name)
+    return sanitize_name(normalize_wing_name(validated), field_name)
+
+
 # Where a session started in the home directory files (see hooks_cli).
 WORKSTATION_WINGS = frozenset({"mac_workstation", "windows_workstation", "linux_workstation"})
 
@@ -115,8 +127,9 @@ def wing_aliases(wing: str, known=()) -> list:
         for name in sorted(known):
             if name in names or not isinstance(name, str):
                 continue
-            stored = name[len("wing_") :] if name.startswith("wing_") else name
-            if normalize_wing_name(stored) == slug:
+            # Slug first: `wing-c++` only shows its prefix once slugged.
+            stored = normalize_wing_name(name)
+            if stored.removeprefix("wing_") == slug:
                 names.append(name)
     return names
 
@@ -166,6 +179,26 @@ def sanitize_kg_value(value: str, field_name: str = "value") -> str:
 
     if len(value) > MAX_NAME_LENGTH:
         raise ValueError(f"{field_name} exceeds maximum length of {MAX_NAME_LENGTH} characters")
+
+    if "\x00" in value:
+        raise ValueError(f"{field_name} contains null bytes")
+
+    return strip_lone_surrogates(value)
+
+
+def sanitize_kg_lookup(value: str, field_name: str = "value") -> str:
+    """Validate a knowledge-graph value that is only looked up, not created.
+
+    For arguments that name an already-stored subject or object (query,
+    invalidate, supersede's old value, timeline). Such a value may predate
+    the length cap or have been written by a path that skips it, so it must
+    stay addressable: same checks as sanitize_kg_value but with no length
+    limit. Names that are being written still go through sanitize_kg_value.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+
+    value = value.strip()
 
     if "\x00" in value:
         raise ValueError(f"{field_name} contains null bytes")

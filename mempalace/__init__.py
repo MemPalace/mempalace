@@ -69,6 +69,13 @@ logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICA
 # so an operator who deliberately exports the variable still wins. (GHSA-8h77)
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
+# Cap BLAS/OpenMP thread pools before numpy or chromadb loads. OpenBLAS
+# allocates one worker + buffer per logical core at import time (~800 MB
+# private commit on a 32-thread Windows host) even in processes that do no
+# multi-threaded BLAS work. setdefault preserves any operator-configured value.
+for _blas_env in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_blas_env, "1")
+
 # Don't set ``ORT_DISABLE_COREML`` here for macOS arm64 crashes: ONNX Runtime
 # ignores that variable, and those crashes come from the chromadb 0.x hnswlib
 # binding, not from ONNX.

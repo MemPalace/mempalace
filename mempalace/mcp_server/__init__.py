@@ -108,9 +108,11 @@ from ..backends.chroma import (  # noqa: E402
 from ..collision_scan import assert_no_collisions  # noqa: E402
 from ..config import (  # noqa: E402
     MempalaceConfig,
+    canonical_wing,
     normalize_wing_name,
     sanitize_content,
     sanitize_iso_temporal,
+    sanitize_kg_lookup,
     sanitize_kg_value,
     sanitize_name,
     sqlite_read_uri,

@@ -7,6 +7,14 @@ description: MemPalace — mine projects and conversations into a searchable mem
 
 A searchable memory palace for AI — mine projects and conversations, then search them semantically. Verbatim storage, local-first, zero external API by default.
 
+## Aux Pane UI Extension (`MemPalace`)
+
+This plugin includes an interactive **MemPalace** Aux Pane UI Extension (`sidecars/palace/`) that appears under the Aux Pane `+` menu (`Extensions > MemPalace`).
+
+When the user asks to browse their palace visually, inspect wings/rooms/drawers, explore the temporal knowledge graph, or monitor the live multi-agent logstream, surface a clickable pill in chat so they can open the panel in one click:
+
+- Open panel: `[MemPalace](sidecar://mempalace/palace/)`
+
 ## Prerequisites
 
 Ensure `mempalace` is installed:

@@ -64,7 +64,7 @@ from ..search_util import (
     palace_wing_aliases,
 )
 from ..stored_text import decode_record, encode_filter
-from ..timeutil import localize
+from ..timeutil import localize, recency_key
 
 logger = logging.getLogger(__name__)
 

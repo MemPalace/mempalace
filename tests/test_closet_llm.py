@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 
 from mempalace.closet_llm import (
+    MAX_OUTPUT_TOKENS,
     LLMConfig,
     _call_llm,
     _parsed_to_closet_lines,
@@ -226,6 +227,40 @@ class TestCallLLM:
         ):
             assert _call_llm(cfg, "/tmp/x", "w", "r", "c") == (None, None)
         assert len(calls) == 1
+
+    def test_switches_to_max_completion_tokens_when_a_400_asks_and_keeps_it(self):
+        from urllib.error import HTTPError
+
+        cfg = self._make_cfg()
+        bodies = []
+
+        def fake_urlopen(req, timeout=None):
+            body = json.loads(req.data)
+            bodies.append(body)
+            if "max_tokens" in body:
+                raise HTTPError(
+                    req.full_url,
+                    400,
+                    "Bad Request",
+                    {},
+                    io.BytesIO(b"Use 'max_completion_tokens' instead."),
+                )
+            return _FakeResp(
+                {
+                    "choices": [{"message": {"content": '{"topics":[],"quotes":[],"summary":""}'}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }
+            )
+
+        with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+            parsed, _ = _call_llm(cfg, "/tmp/x", "w", "r", "c")
+            assert parsed is not None
+            assert len(bodies) == 2 and "max_tokens" not in bodies[1]
+            # It also counts reasoning tokens, so the visible-output cap is too small.
+            assert bodies[1]["max_completion_tokens"] > MAX_OUTPUT_TOKENS
+            # The next file in the run skips the request that is known to fail.
+            assert _call_llm(cfg, "/tmp/y", "w", "r", "c")[0] is not None
+        assert len(bodies) == 3 and "max_tokens" not in bodies[2]
 
     def test_returns_none_on_invalid_json(self):
         cfg = self._make_cfg()

@@ -51,7 +51,7 @@ from .palace import (
     write_file_drawers,
 )
 from .source_identity import identity_metadata, source_directory_identity
-from .timeutil import utc_now_iso
+from .timeutil import parse_timestamp, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -609,6 +609,7 @@ def _extract_authored_at(filepath):
     if path.suffix != ".jsonl":
         return None
     latest = None
+    latest_instant = None
     try:
         with path.open(encoding="utf-8", errors="ignore") as fh:
             for line in fh:
@@ -619,10 +620,10 @@ def _extract_authored_at(filepath):
                     ts = json.loads(line).get("timestamp")
                 except (ValueError, TypeError, AttributeError):
                     continue
-                # ISO-8601 timestamps are strings; guard against a non-string
-                # ``timestamp`` so a malformed line can't raise TypeError on compare.
-                if isinstance(ts, str) and (latest is None or ts > latest):
+                instant = parse_timestamp(ts)
+                if instant is not None and (latest_instant is None or instant > latest_instant):
                     latest = ts
+                    latest_instant = instant
     except OSError:
         return None
     return latest
@@ -829,29 +830,34 @@ def mine_convos(
     MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
     governs both this path and the project-file miner in `miner.py`.
     """
-    if dry_run:
-        return _mine_convos_impl(
-            convo_dir,
-            palace_path,
-            wing=wing,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            extract_mode=extract_mode,
-            include_subagents=include_subagents,
-        )
+    from .miner import _cleanup_mine_pid_file
 
-    with mine_palace_lock(palace_path):
-        return _mine_convos_impl(
-            convo_dir,
-            palace_path,
-            wing=wing,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            extract_mode=extract_mode,
-            include_subagents=include_subagents,
-        )
+    try:
+        if dry_run:
+            return _mine_convos_impl(
+                convo_dir,
+                palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                extract_mode=extract_mode,
+                include_subagents=include_subagents,
+            )
+
+        with mine_palace_lock(palace_path):
+            return _mine_convos_impl(
+                convo_dir,
+                palace_path,
+                wing=wing,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                extract_mode=extract_mode,
+                include_subagents=include_subagents,
+            )
+    finally:
+        _cleanup_mine_pid_file()
 
 
 def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None):

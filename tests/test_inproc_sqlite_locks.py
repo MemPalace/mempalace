@@ -534,3 +534,15 @@ def test_idle_holder_detects_delete_to_wal_and_retains_sidecar_guard(tmp_path, m
     assert key not in _inproc_sqlite._holders
     after = json.loads(_run(_EXTERNAL_SQLITE_WRITE, db, 2, "checkpoint"))
     assert after == {"journal_mode": "wal", "rows": 3, "checkpoint_busy": 0}
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="OFD locks are Linux-only")
+def test_linux_uses_ofd_locks_even_when_fcntl_does_not_export_the_constant():
+    """Some CPython builds (uv's 3.12.14) have no fcntl.F_OFD_SETLK, but Linux still has the lock (37 on every
+    architecture). Without a fallback such an interpreter takes the helper path, and Chroma's next write hangs."""
+    import fcntl
+
+    from mempalace.backends import _inproc_sqlite as M
+
+    assert M._F_OFD_SETLK == getattr(fcntl, "F_OFD_SETLK", 37) == 37
+    assert M._ANCHORED is True and M._HOLD_LOCKS is False

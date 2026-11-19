@@ -1,6 +1,7 @@
 """ChromaDB-backed MemPalace storage backend (RFC 001 reference implementation)."""
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -17,13 +18,20 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
 import chromadb
+from chromadb.api.types import validate_where_document
 from chromadb.config import Settings as _ChromaSettings
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from ..lexical import bm25_scores
-from ..stored_text import encode_filter, encode_where, prepare_stored_write, restore_rows
+from ..stored_text import (
+    document_filter_candidate,
+    encode_filter,
+    encode_where,
+    prepare_stored_write,
+    restore_rows,
+)
 from ..timeutil import filename_stamp
-from ._filters import validate_where
+from ._filters import matches_where_document, validate_where
 from ._inproc_sqlite import (
     open_reader as open_palace_reader,
     open_writer as open_palace_writer,
@@ -48,11 +56,14 @@ from .base import (
     validate_write_batch,
 )
 from .chroma_sqlite import (
+    _SEARCHABLE_COVERAGE_MAX_IDS,
     CandidateRows as CandidateRows,
     MetadataRecoveryPending as MetadataRecoveryPending,
     _sqlite_embedding_count,
+    _sqlite_embedding_ids,
     _sqlite_recent_records,
     _string_equalities,
+    _wal_pending_ids,
     not_bookkeeping_sql as not_bookkeeping_sql,
     sqlite_diary_rows as sqlite_diary_rows,
     sqlite_documents_for_ids as sqlite_documents_for_ids,
@@ -67,6 +78,9 @@ from .chroma_sqlite import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DRIFT_SUFFIX = ".drift-"
+_CORRUPT_SUFFIX = ".corrupt-"
 
 
 # chromadb persists EmbeddingGemma 2's EF config on the collection and, on
@@ -628,6 +642,77 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     return _hnsw_metadata_marker_intact(seg_dir)
 
 
+def _is_segment_dir_name(name: str) -> bool:
+    return "-" in name and not name.startswith(".")
+
+
+def _is_quarantined_name(name: str) -> bool:
+    return _DRIFT_SUFFIX in name or _CORRUPT_SUFFIX in name
+
+
+def _process_has_open_segment_file(proc_dir: str, segment_prefix: str) -> bool:
+    fd_dir = os.path.join(proc_dir, "fd")
+    try:
+        descriptors = os.listdir(fd_dir)
+    except OSError:
+        return False
+
+    for descriptor in descriptors:
+        descriptor_path = os.path.join(fd_dir, descriptor)
+        try:
+            open_file = os.readlink(descriptor_path)
+        except OSError:
+            continue
+
+        if open_file.startswith(segment_prefix):
+            return True
+    return False
+
+
+def _process_has_mapped_segment_file(proc_dir: str, segment_prefix: str) -> bool:
+    maps_path = os.path.join(proc_dir, "maps")
+    try:
+        with open(maps_path, encoding="utf-8", errors="replace") as memory_maps:
+            return any(segment_prefix in mapped_region for mapped_region in memory_maps)
+    except OSError:
+        return False
+
+
+def _segment_holder_pid(seg_dir: str) -> Optional[int]:
+    """Return a holder PID from /proc, or None if no holder is visible."""
+    resolved_seg_dir = os.path.realpath(seg_dir)
+    segment_prefix = f"{resolved_seg_dir}{os.sep}"
+    try:
+        process_names = os.listdir("/proc")
+    except OSError:
+        return None
+
+    for process_name in process_names:
+        if not process_name.isdigit():
+            continue
+
+        proc_dir = os.path.join("/proc", process_name)
+        if _process_has_open_segment_file(proc_dir, segment_prefix):
+            return int(process_name)
+        if _process_has_mapped_segment_file(proc_dir, segment_prefix):
+            return int(process_name)
+    return None
+
+
+def _segment_is_held(seg_dir: str) -> bool:
+    # A process with open or mapped files can keep writing into the renamed directory.
+    holder_pid = _segment_holder_pid(seg_dir)
+    if holder_pid is None:
+        return False
+
+    logger.warning(
+        "Skipped HNSW quarantine for %s: process %d holds its files.",
+        seg_dir,
+        holder_pid,
+    )
+    return True
+
+
 def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
@@ -664,7 +749,10 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
         return []
 
     for name in entries:
-        if "-" not in name or name.startswith(".") or ".drift-" in name:
+        if not _is_segment_dir_name(name):
+            continue
+
+        if _is_quarantined_name(name):
             continue
 
         seg_dir = os.path.join(palace_path, name)
@@ -703,8 +791,11 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
             )
             continue
 
+        if _segment_is_held(seg_dir):
+            continue
+
         stamp = filename_stamp()
-        target = f"{seg_dir}.drift-{stamp}"
+        target = f"{seg_dir}{_DRIFT_SUFFIX}{stamp}"
 
         if header_corrupt:
             reason = (
@@ -855,6 +946,18 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
     pickle_path = os.path.join(palace_path, segment_id, "index_metadata.pickle")
     if not os.path.isfile(pickle_path):
         return None
+    id_to_label = _hnsw_id_to_label(pickle_path)
+    return None if id_to_label is None else len(id_to_label)
+
+
+def _hnsw_id_to_label(pickle_path: str) -> Optional[dict]:
+    """Return the ``id_to_label`` mapping inside a segment metadata pickle.
+
+    ``None`` when the file cannot be unpickled or does not carry the
+    mapping. Shared by :func:`_hnsw_element_count`, which needs only its
+    size, and :func:`_hnsw_indexed_ids`, which needs the drawer ids
+    themselves, so both read the pickle the same guarded way.
+    """
     try:
         pd = _SafePersistentDataUnpickler.load(pickle_path)
         # ChromaDB serializes PersistentData differently across versions:
@@ -865,12 +968,31 @@ def _hnsw_element_count(palace_path: str, segment_id: str) -> Optional[int]:
             id_to_label = pd.get("id_to_label")
         else:
             id_to_label = getattr(pd, "id_to_label", None)
-        if isinstance(id_to_label, dict):
-            return len(id_to_label)
-        return None
+        return id_to_label if isinstance(id_to_label, dict) else None
     except Exception:
-        logger.debug("_hnsw_element_count failed for %s", pickle_path, exc_info=True)
+        logger.debug("_hnsw_id_to_label failed for %s", pickle_path, exc_info=True)
         return None
+
+
+def _hnsw_indexed_ids(palace_path: str, segment_id: str) -> Optional[set]:
+    """Drawer ids the flushed HNSW metadata holds, for coverage accounting.
+
+    An absent pickle returns the **empty set**, not ``None``: a segment
+    that has never flushed holds zero indexed ids, and that is a measured
+    zero rather than an unknown. :func:`searchable_coverage` needs the two
+    apart, because "nothing flushed yet" is the ordinary state of every
+    palace below its ``hnsw:sync_threshold`` and must not stop the
+    measurement.
+
+    ``None`` is reserved for a pickle that is there but unreadable, where
+    counting zero flushed ids would understate coverage and raise a false
+    alarm on a palace that is fine.
+    """
+    pickle_path = os.path.join(palace_path, segment_id, "index_metadata.pickle")
+    if not os.path.isfile(pickle_path):
+        return set()
+    id_to_label = _hnsw_id_to_label(pickle_path)
+    return None if id_to_label is None else set(id_to_label)
 
 
 # Divergence threshold: chromadb's HNSW flushes asynchronously, so HNSW
@@ -1401,6 +1523,118 @@ def _hnsw_capacity_status_uncached(
     return out
 
 
+#: Coverage at or above this reads as "every drawer accounted for". The
+#: remaining margin absorbs a drawer written or deleted while the three
+#: reads below run, which is a one-row discrepancy, not a lost corpus.
+_SEARCHABLE_COVERAGE_ALERT = 0.99
+
+
+def searchable_coverage(
+    palace_path: str, collection_name: str = "mempalace_drawers"
+) -> dict[str, Any]:
+    """Share of live drawers that vector search can actually reach.
+
+    :func:`hnsw_capacity_status` measures the flushed index against sqlite,
+    which leaves it with nothing to say whenever ``index_metadata.pickle``
+    is absent — the ordinary state of every palace holding fewer records
+    than its ``hnsw:sync_threshold``, since chroma writes that pickle only
+    when a compaction fires. A healthy sub-threshold palace and one that
+    lost its index therefore report the identical ``status: unknown``.
+
+    This measures the thing the pickle was standing in for. A drawer is
+    searchable when its vector is **either** flushed into HNSW **or** still
+    pending in the write-ahead log, so::
+
+        coverage = |live ids ∩ (flushed ids ∪ pending ids)| / |live ids|
+
+    The union matters: chroma purges the queue as it compacts, so after a
+    flush the vectors are split across the two sets and neither alone
+    describes a healthy palace. So does the *set* union rather than the sum
+    of the two counts — a re-upserted drawer sits in both sets, and a sum
+    lets that overlap paper over a genuine gap, which would leave the
+    meter unable to go red.
+
+    Returns a dict with ``coverage`` (``None`` when it could not be
+    measured), ``live_count``, ``covered_count``, ``flushed_count``,
+    ``pending_count``, ``unsearchable_count``, ``degraded`` and
+    ``message``. Never raises. ``flushed_count`` and ``pending_count``
+    partition ``covered_count``: a drawer in both sets counts as flushed,
+    so the two always add up to the drawers search can reach.
+
+    Not called from :func:`hnsw_capacity_status`: that probe runs ahead of
+    every search, duplicate check and status call, and reading three id
+    sets is far past its budget. This is for ``repair-status``, where an
+    operator has asked a question and the answer is worth the read.
+
+    Reads live ids first, then the queue, then the pickle. A drawer written
+    during the measurement lands outside the live set and is ignored; one
+    flushed and purged mid-run was in the pickle before its queue row went,
+    so the later read still sees it. Only a drawer *deleted* mid-run can
+    show as uncovered, by one row, which is what the
+    :data:`_SEARCHABLE_COVERAGE_ALERT` margin is for.
+    """
+    out: dict[str, Any] = {
+        "coverage": None,
+        "live_count": None,
+        "covered_count": None,
+        "flushed_count": None,
+        "pending_count": None,
+        "unsearchable_count": None,
+        "degraded": False,
+        "message": "",
+    }
+    try:
+        live_ids = _sqlite_embedding_ids(palace_path, collection_name)
+        if live_ids is None:
+            # Only now worth a second query: the caller needs to know whether
+            # the read failed or the palace is simply past the id ceiling.
+            live_count = _sqlite_embedding_count(palace_path, collection_name)
+            if live_count is not None and live_count > _SEARCHABLE_COVERAGE_MAX_IDS:
+                out["live_count"] = live_count
+                out["message"] = (
+                    f"searchable coverage not measured: {live_count:,} drawers is past the "
+                    f"{_SEARCHABLE_COVERAGE_MAX_IDS:,}-id ceiling this check holds in memory"
+                )
+            else:
+                out["message"] = "searchable coverage unavailable: could not read the drawer ids"
+            return out
+        out["live_count"] = len(live_ids)
+        if not live_ids:
+            return out
+
+        pending_ids = _wal_pending_ids(palace_path, collection_name)
+        if pending_ids is None:
+            out["message"] = "searchable coverage unavailable: could not read the write log"
+            return out
+
+        segment_id = _vector_segment_id(palace_path, collection_name)
+        flushed_ids = None if segment_id is None else _hnsw_indexed_ids(palace_path, segment_id)
+        if flushed_ids is None:
+            out["message"] = "searchable coverage unavailable: could not read the flushed index"
+            return out
+
+        flushed_live = live_ids & flushed_ids
+        searchable = flushed_live | (live_ids & pending_ids)
+        # A re-upserted drawer sits in both sets; counting it under flushed
+        # only keeps the two buckets a partition of ``covered_count``.
+        out["flushed_count"] = len(flushed_live)
+        out["pending_count"] = len(searchable) - len(flushed_live)
+        out["covered_count"] = len(searchable)
+        out["unsearchable_count"] = len(live_ids) - len(searchable)
+        out["coverage"] = len(searchable) / len(live_ids)
+        if out["coverage"] < _SEARCHABLE_COVERAGE_ALERT:
+            out["degraded"] = True
+            out["message"] = (
+                f"{out['unsearchable_count']:,} of {out['live_count']:,} drawers are in "
+                "neither the flushed HNSW index nor the pending write log, so vector "
+                "search cannot return them"
+            )
+    except Exception:
+        logger.debug("searchable_coverage failed", exc_info=True)
+        out["message"] = "searchable coverage probe raised; skipping"
+    return out
+
+
 def _pin_hnsw_threads(collection) -> None:
     """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
 
@@ -1488,6 +1722,110 @@ def _missing_dimensionality_appears_recoverable(
         return False
 
 
+# Stability gate for the invalid-metadata quarantine. A torn read of
+# ``index_metadata.pickle`` fails with whatever the half-written opcodes
+# happen to produce (``AttributeError`` in the reported reproduction, a
+# different class at the next torn offset), so no exception allowlist can
+# tell "corrupt file" from "file being rewritten right now". Only a file
+# that stays byte-identical across every check below may be quarantined
+# for a load failure; a file that moves is left alone for the next open
+# to re-check once it has settled.
+_HNSW_METADATA_STABILITY_ATTEMPTS = 6
+_HNSW_METADATA_STABILITY_DELAY_SECONDS = 0.05
+
+
+def _is_transient_hnsw_metadata_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` is a known-transient metadata-read failure.
+
+    ``EOFError``/``OSError`` and truncated-pickle ``UnpicklingError``s mean
+    the read itself was cut short, not that the settled bytes are bad, so
+    they skip quarantine immediately with no stability delay.
+    """
+    if isinstance(exc, (EOFError, OSError)):
+        return True
+    return isinstance(exc, pickle.UnpicklingError) and (
+        "truncated" in str(exc).lower() or "ran out of input" in str(exc).lower()
+    )
+
+
+def _hnsw_metadata_snapshot(meta_path: str) -> tuple[tuple[int, int, int], str]:
+    """Return ``(_stat_signature, sha256 hexdigest)`` for ``meta_path``.
+
+    The hash is the stronger half of the snapshot: a rewrite can land with
+    the same size and a coarse mtime, but the bytes still differ. A file
+    that vanished mid-read yields the "absent" signature with an empty
+    digest, which never equals a snapshot of present bytes.
+    """
+    try:
+        with open(meta_path, "rb") as handle:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError:
+        return _stat_signature(meta_path), ""
+    return _stat_signature(meta_path), digest.hexdigest()
+
+
+def _load_hnsw_metadata_stable(meta_path: str, *, sleep=time.sleep) -> tuple[str, object]:
+    """Load ``index_metadata.pickle`` once it has proved stable, or explain why not.
+
+    Returns ``(outcome, value)`` where ``outcome`` is one of:
+
+    ``"loaded"`` — value is the unpickled payload. The caller still
+        validates its shape; a settled file that loads is not evidence of
+        corruption either way.
+    ``"transient"`` — the read failed with a known-transient error; value
+        is None and the caller must skip quarantine, with no delay spent.
+    ``"uncertain"`` — the file changed during the stability checks, so a
+        rewrite is in progress; value is None and the caller must NOT
+        quarantine this pass. This is an explicit result, never an
+        exception the guard could misread as corruption.
+    ``"corrupt"`` — value is the quarantine reason: the file stayed
+        byte-identical across every stability check and still failed to
+        load. Identical bytes load deterministically, so the repeated
+        failure is the same failure, not a fresh torn read.
+
+    The ``sleep`` parameter exists so tests can drive the retry loop
+    without waiting out the real delay; production callers leave it alone.
+    """
+    try:
+        return "loaded", _SafePersistentDataUnpickler.load(meta_path)
+    except Exception as exc:
+        if _is_transient_hnsw_metadata_error(exc):
+            logger.debug(
+                "Skipping invalid-HNSW quarantine for transient metadata read in %s",
+                meta_path,
+                exc_info=True,
+            )
+            return "transient", None
+        failure = exc
+
+    snapshot = _hnsw_metadata_snapshot(meta_path)
+    for _ in range(_HNSW_METADATA_STABILITY_ATTEMPTS):
+        sleep(_HNSW_METADATA_STABILITY_DELAY_SECONDS)
+        next_snapshot = _hnsw_metadata_snapshot(meta_path)
+        if next_snapshot != snapshot:
+            logger.debug(
+                "Skipping invalid-HNSW quarantine for changing metadata in %s: "
+                "index_metadata.pickle changed during the stability checks",
+                meta_path,
+            )
+            return "uncertain", None
+        try:
+            return "loaded", _SafePersistentDataUnpickler.load(meta_path)
+        except Exception as exc:
+            if _is_transient_hnsw_metadata_error(exc):
+                logger.debug(
+                    "Skipping invalid-HNSW quarantine for transient metadata read in %s",
+                    meta_path,
+                    exc_info=True,
+                )
+                return "transient", None
+            failure = exc
+            snapshot = next_snapshot
+    return "corrupt", f"invalid index_metadata.pickle: {failure}"
+
+
 def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     """Quarantine segment dirs whose ``index_metadata.pickle`` is unreadable or invalid.
 
@@ -1504,7 +1842,10 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
 
     moved: list[str] = []
     for name in entries:
-        if "-" not in name or name.startswith(".") or ".drift-" in name or ".corrupt-" in name:
+        if not _is_segment_dir_name(name):
+            continue
+
+        if _is_quarantined_name(name):
             continue
         seg_dir = os.path.join(palace_path, name)
         if not os.path.isdir(seg_dir):
@@ -1515,27 +1856,13 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
             continue
 
         reason = None
-        try:
-            persisted = _SafePersistentDataUnpickler.load(meta_path)
-        except (EOFError, OSError):
-            logger.debug(
-                "Skipping invalid-HNSW quarantine for transient metadata read in %s",
-                meta_path,
-                exc_info=True,
-            )
+        outcome, value = _load_hnsw_metadata_stable(meta_path)
+        if outcome in ("transient", "uncertain"):
             continue
-        except pickle.UnpicklingError as exc:
-            if "truncated" in str(exc).lower() or "ran out of input" in str(exc).lower():
-                logger.debug(
-                    "Skipping invalid-HNSW quarantine for transient metadata read in %s",
-                    meta_path,
-                    exc_info=True,
-                )
-                continue
-            reason = f"invalid index_metadata.pickle: {exc}"
-        except Exception as exc:
-            reason = f"invalid index_metadata.pickle: {exc}"
+        if outcome == "corrupt":
+            reason = value
         else:
+            persisted = value
             if not isinstance(persisted, dict) and not (
                 hasattr(persisted, "dimensionality") or hasattr(persisted, "id_to_label")
             ):
@@ -1572,8 +1899,11 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
         if reason is None:
             continue
 
+        if _segment_is_held(seg_dir):
+            continue
+
         stamp = filename_stamp()
-        target = f"{seg_dir}.corrupt-{stamp}"
+        target = f"{seg_dir}{_CORRUPT_SUFFIX}{stamp}"
         try:
             os.rename(seg_dir, target)
             moved.append(target)
@@ -1582,6 +1912,29 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
             logger.exception("Failed to quarantine invalid HNSW metadata in %s", seg_dir)
 
     return moved
+
+
+def _quarantine_hnsw_under_palace_lock(palace_path: str) -> bool:
+    # Avoid the palace -> backends import cycle.
+    from ..palace import MineAlreadyRunning, mine_palace_lock
+
+    try:
+        with mine_palace_lock(palace_path):
+            quarantine_invalid_hnsw_metadata(palace_path)
+            quarantine_stale_hnsw(palace_path)
+    except MineAlreadyRunning:
+        logger.info("Deferred HNSW quarantine for %s: its palace lock is held.", palace_path)
+        # Leave it out of _quarantined_paths so a later open retries.
+        return False
+    except OSError as exc:
+        logger.warning(
+            "Skipped pre-open HNSW quarantine for %s: palace lock unavailable (%s).",
+            palace_path,
+            exc,
+        )
+        return False
+
+    return True
 
 
 def _fix_blob_seq_ids(palace_path: str) -> None:
@@ -2078,6 +2431,82 @@ class ChromaCollection(BaseCollection):
     # Reads
     # ------------------------------------------------------------------
 
+    def _get_document_filtered(self, where_document, *, visible=None, **kwargs):
+        """Refill one native response before logical pagination and projection."""
+        validate_where_document(where_document)
+        candidate = document_filter_candidate(where_document)
+        fields = ["ids", *kwargs["include"]]
+        offset = kwargs.pop("offset", 0) or 0
+        limit = kwargs.pop("limit", None)
+        if offset < 0 or (limit is not None and limit < 0):
+            raise ValueError("offset and limit must be nonnegative")
+        if limit == 0:
+            return {field: [] for field in fields}
+        needed = offset + limit if limit is not None else None
+        kwargs["include"] = list(dict.fromkeys([*kwargs["include"], "documents", "metadatas"]))
+        if needed is not None:
+            kwargs["limit"] = needed
+        if candidate is not None:
+            kwargs["where_document"] = candidate
+        while True:
+            raw = self._collection.get(**kwargs)
+            documents, metadatas = restore_rows(raw["documents"] or [], raw["metadatas"] or [])
+            matches = [
+                index
+                for index, document in enumerate(documents)
+                if matches_where_document(document or "", where_document)
+                and (visible is None or visible(metadatas[index]))
+            ]
+            if needed is not None and len(matches) < needed and len(raw["ids"]) == kwargs["limit"]:
+                kwargs["limit"] *= 2
+                continue
+            matches = matches[offset:needed]
+            return {field: [raw[field][index] for index in matches] for field in fields}
+
+    def _query_document_filtered(self, where_document, *, visible=None, **kwargs):
+        """Refill native ranking until the original-text predicate fills top-k."""
+        validate_where_document(where_document)
+        candidate = document_filter_candidate(where_document)
+        fields = ["ids", *kwargs["include"]]
+        requested = kwargs["n_results"]
+        visibility_cap = max(requested, min(4096, requested * 16))
+        kwargs["include"] = list(dict.fromkeys([*kwargs["include"], "documents", "metadatas"]))
+        if candidate is not None:
+            kwargs["where_document"] = candidate
+        while True:
+            raw = self._collection.query(**kwargs)
+            selections = []
+            refill = truncated = False
+            for ids, documents, metadatas in zip(raw["ids"], raw["documents"], raw["metadatas"]):
+                documents, metadatas = restore_rows(documents or [], metadatas or [])
+                matches = [
+                    index
+                    for index, document in enumerate(documents)
+                    if matches_where_document(document or "", where_document)
+                ]
+                at_cap = visible is not None and len(matches) >= visibility_cap
+                if visible is not None:
+                    matches = [i for i in matches[:visibility_cap] if visible(metadatas[i])]
+                selections.append(matches[:requested])
+                if len(matches) < requested and at_cap:
+                    truncated = True
+                elif len(matches) < requested and len(ids) == kwargs["n_results"]:
+                    refill = True
+            if not refill:
+                if truncated:
+                    warnings.warn(
+                        "source visibility ANN candidate budget exhausted; results truncated",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                result = {field: [] for field in fields}
+                for query_index, matches in enumerate(selections):
+                    for field in fields:
+                        values = raw[field][query_index]
+                        result[field].append([values[index] for index in matches])
+                return result
+            kwargs["n_results"] *= 2
+
     def _logical_drawers(self):
         from ..config import get_configured_collection_name
 
@@ -2086,8 +2515,35 @@ class ChromaCollection(BaseCollection):
             and self._collection.name == get_configured_collection_name()
         )
 
+    def _read_filtered_drawers(self, read, kwargs):
+        """Use one native response for the predicate, visibility and returned payload.
+
+        Pin only the registry: holding a Chroma SQLite reader across the SDK
+        call prevents a concurrent writer from finishing. Retry an activation
+        race instead of mixing the native response with a later hydration.
+        """
+        from ..sources.lifecycle import (
+            SourceLifecycleSnapshot,
+            StaleLifecycleSnapshot,
+            visibility_epoch,
+        )
+
+        for attempt in range(3):
+            epoch = visibility_epoch(self._palace_path)
+            try:
+                with SourceLifecycleSnapshot(self._palace_path) as snapshot:
+                    result = read(**kwargs, _visible=snapshot.visible)
+                    if visibility_epoch(self._palace_path) != epoch:
+                        raise StaleLifecycleSnapshot("registry changed during filtered drawer read")
+                    return result
+            except StaleLifecycleSnapshot:
+                if attempt == 2:
+                    raise
+
     def query(self, **kwargs):
         if self._logical_drawers():
+            if kwargs.get("where_document") is not None:
+                return self._read_filtered_drawers(self._query_physical, kwargs)
             from ..sources.read_visibility import chroma_query
 
             return chroma_query(self, **kwargs)
@@ -2102,6 +2558,7 @@ class ChromaCollection(BaseCollection):
         where=None,
         where_document=None,
         include=None,
+        _visible=None,
     ) -> QueryResult:
         if getattr(self, "_require_embeddings", False) and query_texts is not None:
             raise ValueError("caller-vector collection requires query_embeddings")
@@ -2137,9 +2594,9 @@ class ChromaCollection(BaseCollection):
         if where is not None:
             kwargs["where"] = encode_where(where)
         if where_document is not None:
-            kwargs["where_document"] = where_document
-
-        raw = self._collection.query(**kwargs)
+            raw = self._query_document_filtered(where_document, visible=_visible, **kwargs)
+        else:
+            raw = self._collection.query(**kwargs)
 
         num_queries = (
             len(query_texts)
@@ -2179,6 +2636,8 @@ class ChromaCollection(BaseCollection):
 
     def get(self, **kwargs):
         if self._logical_drawers():
+            if kwargs.get("where_document") is not None:
+                return self._read_filtered_drawers(self._get_physical, kwargs)
             from ..sources.read_visibility import chroma_get
 
             return chroma_get(self, **kwargs)
@@ -2196,6 +2655,7 @@ class ChromaCollection(BaseCollection):
         limit=None,
         offset=None,
         include=None,
+        _visible=None,
     ) -> GetResult:
         validate_where(where)
         validate_where(where_document)
@@ -2214,14 +2674,15 @@ class ChromaCollection(BaseCollection):
             kwargs["ids"] = ids
         if where is not None:
             kwargs["where"] = encode_where(where)
-        if where_document is not None:
-            kwargs["where_document"] = where_document
         if limit is not None:
             kwargs["limit"] = limit
         if offset is not None:
             kwargs["offset"] = offset
 
-        raw = self._collection.get(**kwargs)
+        if where_document is not None:
+            raw = self._get_document_filtered(where_document, visible=_visible, **kwargs)
+        else:
+            raw = self._collection.get(**kwargs)
         out_ids = list(raw.get("ids") or [])
         out_docs, out_metas = restore_rows(
             list(raw.get("documents") or []), list(raw.get("metadatas") or [])
@@ -2312,6 +2773,25 @@ class ChromaCollection(BaseCollection):
                     logger.debug("sqlite metadata scan failed; paging instead", exc_info=True)
         return self.get_all_rows(where=where).metadatas
 
+    def _recent_from_metadata(self, *, limit, where, order_field, include, spec):
+        """Keep recency exact when the indexed SQLite ordering is unavailable."""
+        ordered = super().get_recent(
+            limit=self.count(), where=where, order_field=order_field, include=[]
+        )
+        selected_ids = ordered.ids[:limit]
+        if not (spec.documents or spec.metadatas) or not selected_ids:
+            return GetResult(ids=selected_ids, documents=[], metadatas=[], embeddings=None)
+
+        page = self.get(ids=selected_ids, where=where, include=include)
+        positions = {drawer_id: index for index, drawer_id in enumerate(page.ids)}
+        order = [positions[drawer_id] for drawer_id in selected_ids if drawer_id in positions]
+        return GetResult(
+            ids=[page.ids[index] for index in order],
+            documents=[page.documents[index] for index in order] if spec.documents else [],
+            metadatas=[page.metadatas[index] for index in order] if spec.metadatas else [],
+            embeddings=None,
+        )
+
     def get_recent(
         self,
         *,
@@ -2329,8 +2809,9 @@ class ChromaCollection(BaseCollection):
         This reads the ordered window from the metadata tables instead, which
         also makes the window exact rather than whatever ``get`` paged first.
         ``where`` made of string equalities (what Layer 1 passes) is evaluated
-        in sqlite; any other filter, or a database the read cannot reach, goes
-        through the base implementation.
+        in sqlite. If that read is unavailable, the fallback orders all matching
+        metadata before hydrating the selected records. Other filters retain
+        the base implementation's bounded scan.
 
         String equalities and an unfiltered read are the true top ``limit``
         at any collection size, which is why :class:`ChromaBackend` advertises
@@ -2340,12 +2821,13 @@ class ChromaCollection(BaseCollection):
         equalities = _string_equalities(where)
         spec = _IncludeSpec.resolve(include, default_distances=False)
         records = None
-        if (
+        sqlite_ordering = (
             limit > 0
             and self._palace_path is not None
             and equalities is not None
             and not spec.embeddings
-        ):
+        )
+        if sqlite_ordering:
             validate_where(where)
             records = _sqlite_recent_records(
                 self._palace_path,
@@ -2356,8 +2838,13 @@ class ChromaCollection(BaseCollection):
                     for key, values in equalities
                 ],
                 order_field=order_field,
+                ids_only=not (spec.documents or spec.metadatas),
             )
         if records is None:
+            if sqlite_ordering:
+                return self._recent_from_metadata(
+                    limit=limit, where=where, order_field=order_field, include=include, spec=spec
+                )
             return super().get_recent(
                 limit=limit, where=where, order_field=order_field, include=include
             )
@@ -2884,9 +3371,9 @@ class ChromaBackend(BaseBackend):
         """
         _fix_missing_collection_type(palace_path)
         _fix_blob_seq_ids(palace_path)
-        if palace_path not in ChromaBackend._quarantined_paths:
-            quarantine_invalid_hnsw_metadata(palace_path)
-            quarantine_stale_hnsw(palace_path)
+
+        needs_quarantine = palace_path not in ChromaBackend._quarantined_paths
+        if needs_quarantine and _quarantine_hnsw_under_palace_lock(palace_path):
             ChromaBackend._quarantined_paths.add(palace_path)
 
     @staticmethod

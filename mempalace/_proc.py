@@ -79,3 +79,45 @@ def pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Child interpreters
+# ---------------------------------------------------------------------------
+#
+# A child started with ``python -m <module>`` puts its working directory first
+# on sys.path, and ``python -c`` adds an empty entry that means the same. The
+# daemon, the HTTP hub and the hook mines are started from whatever directory
+# the user happens to be in, which can be a repository they have only just
+# cloned, so a ``mempalace/`` package or a ``sqlite3.py`` planted there would
+# run instead of the installed one. PYTHONSAFEPATH stops that on Python 3.11+;
+# the launcher below also drops the empty entry, which covers 3.10. The
+# working directory itself is left alone so relative paths keep working.
+
+_SAFE_MODULE_LAUNCHER = (
+    "import sys\n"
+    "if sys.path and sys.path[0] == '': del sys.path[0]\n"
+    "import runpy\n"
+    "runpy.run_module({module!r}, run_name='__main__', alter_sys=True)\n"
+)
+
+
+def safe_module_argv(module: str, *args: str, python: str | None = None) -> list[str]:
+    """argv that runs ``python -m module args...`` without importing from the cwd.
+
+    ``module`` may be a module or a package with a ``__main__``; ``args`` land
+    in its ``sys.argv[1:]`` unchanged.
+    """
+    import sys
+
+    launcher = _SAFE_MODULE_LAUNCHER.format(module=module)
+    return [python or sys.executable, "-c", launcher, *args]
+
+
+def safe_child_env(env: dict | None = None) -> dict:
+    """A copy of ``env`` (default: this process's) with the cwd kept off sys.path."""
+    import os
+
+    child = dict(os.environ if env is None else env)
+    child["PYTHONSAFEPATH"] = "1"
+    return child

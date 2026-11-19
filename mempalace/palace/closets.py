@@ -131,11 +131,15 @@ def build_closet_lines(source_file, drawer_ids, content, wing, room, drawer_meta
     # below doesn't decompose them.
     working_window, compound_counts = _apply_known_systems_prepass(window)
 
-    coca_filter = _get_coca_filter()
+    from ..config import MempalaceConfig
+
+    entity_langs = MempalaceConfig().entity_languages
+    entity_stoplist = {w.lower() for w in _ENTITY_STOPLIST} | _entity_blocklist(entity_langs)
+    coca_filter = _get_coca_filter() if _use_english_filters(entity_langs) else frozenset()
     words = _candidate_entity_words(working_window)
     word_freq: dict = dict(compound_counts)
     for w in words:
-        if w in _ENTITY_STOPLIST:
+        if w.lower() in entity_stoplist:
             continue
         # Tier 2 linguistics cleanup — drop common English content words
         # ("Code", "Line", "Note", "Phase", …) so they don't appear in

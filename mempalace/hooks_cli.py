@@ -31,6 +31,7 @@ from mempalace._env import env_float, env_str, parse_bool
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.config import MempalaceConfig, normalize_wing_name
 from mempalace.fsio import decode_source
+from mempalace.normalize import codex_response_message
 from mempalace.timeutil import utc_now_iso
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
@@ -200,6 +201,8 @@ def _count_human_messages(transcript_path: str) -> int:
     if not path.is_file():
         return 0
     count = 0
+    codex_events = 0
+    codex_items = 0
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -225,12 +228,20 @@ def _count_human_messages(transcript_path: str) -> int:
                         if isinstance(payload, dict) and payload.get("type") == "user_message":
                             msg_text = payload.get("message", "")
                             if isinstance(msg_text, str) and "<command-message>" not in msg_text:
-                                count += 1
+                                codex_events += 1
+                    # Newer Codex rollouts may only record the turn as a
+                    # response_item message.
+                    elif entry.get("type") == "response_item":
+                        payload = entry.get("payload", {})
+                        if isinstance(payload, dict):
+                            turn = codex_response_message(payload)
+                            if turn and turn[0] == "user":
+                                codex_items += 1
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
         return 0
-    return count
+    return count + (codex_events or codex_items)
 
 
 _state_dir_initialized = False
@@ -810,6 +821,8 @@ def _mine_sync():
     for mine_dir, mode in targets:
         try:
             if routing.use_daemon:
+                from .daemon import DaemonWaitTimeout
+
                 try:
                     job = _submit_daemon_job(
                         "mine",
@@ -826,6 +839,9 @@ def _mine_sync():
                         _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
                     elif job.get("state") != "succeeded" or not result.get("success", True):
                         _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
+                except DaemonWaitTimeout as exc:
+                    # Accepted, and the daemon still runs it: not a failure.
+                    _log(f"Daemon sync mine still {exc.state}: job {exc.job_id}")
                 except Exception as exc:
                     # Daemon accepted context — don't fall back (would double-mine).
                     _log(f"Daemon sync mine submission failed: {exc}")
@@ -1021,53 +1037,124 @@ def run_detached_diary_checkpoint(payload_path: str) -> None:
     The mines start only after the diary write, so they never hold the palace
     lock that write needs.
     """
-    from .miner import _cleanup_mine_pid_file
+    from .miner import _arm_hook_mine_exit_watchdog, _cleanup_mine_pid_file
 
-    path = Path(payload_path)
+    exit_code = 0
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        _log(f"Diary checkpoint payload unreadable: {type(exc).__name__}")
-        payload = None
-    try:
-        if payload is not None:
-            _apply_diary_checkpoint(payload)
-    finally:
+        path = Path(payload_path)
         try:
-            path.unlink()
-        except OSError:
-            pass
-        _cleanup_mine_pid_file()
-    if payload is None:
-        return
-    with _hook_write_routing_context():
-        transcript = payload.get("ingest_transcript")
-        if isinstance(transcript, str) and transcript:
-            _ingest_transcript(transcript)
-        _maybe_auto_ingest()
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _log(f"Diary checkpoint payload unreadable: {type(exc).__name__}")
+            payload = None
+        try:
+            if payload is not None:
+                _apply_diary_checkpoint(payload)
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            _cleanup_mine_pid_file()
+        if payload is None:
+            return
+        with _hook_write_routing_context():
+            transcript = payload.get("ingest_transcript")
+            if isinstance(transcript, str) and transcript:
+                _ingest_transcript(transcript)
+            _maybe_auto_ingest()
+    except SystemExit as exc:
+        exit_code = (
+            exc.code
+            if isinstance(exc.code, int) and not isinstance(exc.code, bool)
+            else (0 if exc.code is None else 1)
+        )
+        raise
+    except BaseException:
+        exit_code = 1
+        raise
+    finally:
+        _arm_hook_mine_exit_watchdog(exit_code=exit_code)
 
 
-def _apply_diary_checkpoint(payload: dict) -> bool:
-    """File the checkpoint and write its ack. Only the child imports mcp_server."""
+def _diary_write_locked(tool_diary_write, **kwargs) -> dict:
+    """File a diary entry while holding the MCP writer lease.
+
+    ``_apply_diary_checkpoint`` calls ``tool_diary_write`` in-process, not
+    through an MCP round trip, so nothing has promoted this process to writer.
+    On ``sqlite_exact``/``rust_exact`` ``_get_collection`` then opens the
+    palace read-only and the write fails with "attempt to write a readonly
+    database". Taking the same per-palace writer lease a real stdio MCP
+    server takes before mutating lets the collection open read/write.
+    """
+    from . import mcp_server as mcp
+    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+
+    already_owned = mcp._MCP_WRITER_LOCK_CM is not None
+    acquired, reason = mcp._acquire_mcp_writer_lock()
+    if not acquired:
+        if not mcp._MCP_WRITER_LOCK_FAILED:
+            return {
+                "success": False,
+                "error": reason,
+                "error_class": LOCK_REFUSAL_ERROR_CLASS,
+            }
+        return {"success": False, "error": reason}
+    try:
+        result = tool_diary_write(**kwargs)
+    finally:
+        if not already_owned:
+            mcp._release_mcp_writer_lock()
+    return result if isinstance(result, dict) else {}
+
+
+def _diary_write_in_process(arguments: dict) -> dict:
+    """File a diary entry in this process, waiting out a briefly held lock."""
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .mcp_server import tool_diary_write
 
-    entry = payload.get("entry")
-    if not isinstance(entry, str) or not entry:
-        return False
     for delay in _DIARY_LOCK_RETRY_DELAYS + (None,):
-        result = tool_diary_write(
-            agent_name=str(payload.get("agent_name") or "claude"),
-            entry=entry,
-            topic=str(payload.get("topic") or "checkpoint"),
-            wing=str(payload.get("wing") or ""),
-        )
-        if not isinstance(result, dict):
-            result = {}
+        result = _diary_write_locked(tool_diary_write, **arguments)
         if result.get("success") or result.get("error_class") != LOCK_REFUSAL_ERROR_CLASS:
             break
         if delay is not None:
             time.sleep(delay)
+    return result
+
+
+def _apply_diary_checkpoint(payload: dict) -> bool:
+    """File the checkpoint and write its ack.
+
+    A running ``mempalace serve`` hub holds the palace writer lease for its
+    whole lifetime, so an in-process write would be refused for as long as it
+    runs. The entry therefore goes to the hub when a writable one is serving
+    this palace, the same way the hook's transcript mine is forwarded, and is
+    written here only when none answers. Only that fallback imports mcp_server.
+    """
+    from .hub_client import forward_tool_call
+
+    entry = payload.get("entry")
+    if not isinstance(entry, str) or not entry:
+        return False
+    arguments = {
+        "agent_name": str(payload.get("agent_name") or "claude"),
+        "entry": entry,
+        "topic": str(payload.get("topic") or "checkpoint"),
+        "wing": str(payload.get("wing") or ""),
+    }
+    handled, result = forward_tool_call(
+        MempalaceConfig().palace_path, "mempalace_diary_write", arguments
+    )
+    if handled and result is None:
+        # The hub took the request but gave no readable answer. The entry may
+        # already be filed, so it is not written again here; the save marker
+        # stays put and the next Stop files a fresh checkpoint.
+        _log("Diary checkpoint sent to the palace hub, which did not report back")
+        return False
+    if handled:
+        _log("Diary checkpoint forwarded to the palace hub")
+    else:
+        result = _diary_write_in_process(arguments)
     if not result.get("success"):
         # The save marker stays put, so the next Stop files a fresh checkpoint.
         _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
@@ -1157,6 +1244,8 @@ def _save_diary_direct(
 
     try:
         if routing.use_daemon:
+            from .daemon import DaemonWaitTimeout
+
             try:
                 job = _submit_daemon_job(
                     "diary_write",
@@ -1170,6 +1259,13 @@ def _save_diary_direct(
                     wait=True,
                     timeout=30,
                 )
+            except DaemonWaitTimeout as exc:
+                # The daemon runs one job at a time, so a checkpoint submitted
+                # while a mine from an earlier Stop hook still runs waits behind
+                # it. It is filed once that mine ends: not a failure, and not a
+                # reason to write it here as well.
+                _log(f"Daemon diary checkpoint still {exc.state}: job {exc.job_id}")
+                return {"drawers_filed": 0, "messages_folded": 0}
             except Exception as exc:
                 # Daemon accepted context — don't fall back (would double-write).
                 _log(f"Daemon diary checkpoint failed: {exc}")
@@ -1325,6 +1421,13 @@ _ENCODED_PARENT_PREFIXES = (
     "Documents-",
 )
 
+# Git worktree parents that belong to the enclosing project, not to the
+# ephemeral worktree: Claude Code's own ``.claude/worktrees/`` plus the common
+# hand-rolled ``<project>/.worktrees/`` layout. Encoded forms are how the same
+# paths look once Claude Code flattens ``/`` and ``.`` to ``-``.
+_WORKTREE_CWD_MARKERS = ("/.claude/worktrees/", "/.worktrees/")
+_WORKTREE_ENCODED_MARKERS = ("-claude-worktrees-", "--worktrees-")
+
 
 def _wing_slug(name: str) -> str:
     """The project wing for a directory name; ``sessions`` when nothing is left."""
@@ -1336,11 +1439,12 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
 
     Claude Code stores the absolute working directory on most message
     types (tool_use, tool_result, user/assistant turns), but not all
-    (e.g. queue-operation lines lack it). Scans up to 200 lines. Returns
+    (e.g. queue-operation lines lack it). Codex rollouts store it as
+    ``payload.cwd`` on their ``session_meta`` line. Scans up to 200 lines. Returns
     the path with forward slashes and no trailing slash, with a git
-    worktree under ``<project>/.claude/worktrees/`` collapsed to
-    ``<project>``, or ``None`` if the file is unreadable, empty, or
-    records no cwd.
+    worktree under ``<project>/.claude/worktrees/`` or
+    ``<project>/.worktrees/`` collapsed to ``<project>``, or ``None`` if
+    the file is unreadable, empty, or records no cwd.
     """
     try:
         path = Path(transcript_path).expanduser()
@@ -1358,17 +1462,23 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
                 except (json.JSONDecodeError, ValueError):
                     continue
                 cwd = data.get("cwd")
+                # Codex rollouts record it one level down, on the
+                # session_meta / turn_context payload.
+                if not cwd and isinstance(data.get("payload"), dict):
+                    cwd = data["payload"].get("cwd")
                 if not cwd or not isinstance(cwd, str):
                     continue
                 cwd_norm = cwd.replace("\\", "/").rstrip("/")
                 if not cwd_norm:
                     continue
-                # A cwd inside "<project>/.claude/worktrees/<wt>" (a git
-                # worktree) belongs to <project>, not the ephemeral worktree
-                # directory -- otherwise every worktree spawns its own wing.
-                _wt_marker = "/.claude/worktrees/"
-                if _wt_marker in cwd_norm:
-                    cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
+                # A cwd inside "<project>/.claude/worktrees/<wt>" or
+                # "<project>/.worktrees/<wt>" (a git worktree) belongs to
+                # <project>, not the ephemeral worktree directory --
+                # otherwise every worktree spawns its own wing.
+                for _wt_marker in _WORKTREE_CWD_MARKERS:
+                    if _wt_marker in cwd_norm:
+                        cwd_norm = cwd_norm.split(_wt_marker, 1)[0]
+                        break
                 return cwd_norm
     except OSError:
         pass
@@ -1451,11 +1561,13 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     if match:
         encoded = match.group(1)
         # "<project>/.claude/worktrees/<wt>" flattens to "-<project>--claude-worktrees-<wt>"
-        # here; collapse it to <project> like _wing_from_jsonl_cwd already does for cwd,
-        # or every worktree spawns its own wing.
-        _wt_marker = "-claude-worktrees-"
-        if _wt_marker in encoded:
-            encoded = encoded.split(_wt_marker, 1)[0]
+        # and "<project>/.worktrees/<wt>" to "-<project>--worktrees-<wt>" here; collapse
+        # both to <project> like _wing_from_jsonl_cwd already does for cwd, or every
+        # worktree spawns its own wing.
+        for _wt_marker in _WORKTREE_ENCODED_MARKERS:
+            if _wt_marker in encoded:
+                encoded = encoded.split(_wt_marker, 1)[0]
+                break
         # Strip platform user-home prefix so the wing isn't dominated by
         # /Users/<user>/ or /home/<user>/.
         m = re.match(r"(?:Users|home)-[^-]+-(.+)", encoded)

@@ -19,6 +19,13 @@ export MEMPALACE_EMBEDDINGGEMMA2_MODALITIES=all
 
 Use `.[embeddinggemma2]` for text/image inference, or `.[multimodal]` for audio/video decoding too. TorchCodec needs compatible FFmpeg libraries. Install FFmpeg using your platform's package manager before using audio/video file inputs.
 
+On macOS, the required `torch>=2.14.0` has official wheels for Apple Silicon,
+not Intel Macs. PyTorch [ended official Intel Mac support after 2.2.x](https://pytorch.org/blog/pytorch2-2/).
+Choosing `embedding_device=cpu` cannot bypass this installation limit. Intel
+Macs can use the ONNX backends with compatible dependencies or an
+`openai-compat` endpoint. On Apple Silicon, the installed packages must support
+the macOS/Python versions; `auto` uses MPS only when PyTorch reports it available.
+
 The extras pull `torch` from PyPI. On Windows that wheel is CPU-only. To run on an NVIDIA GPU (Windows or Linux), install torch from the PyTorch CUDA index first, choosing the CUDA build for your driver at [pytorch.org](https://pytorch.org/get-started/locally/). For a smaller CPU-only install on Linux, use the CPU index:
 
 ```bash
@@ -45,6 +52,15 @@ Environment values override the corresponding `config.json` values:
 The default revision is [`914f7f89142e33e77833254d9c9b90c3cef7303b`](https://huggingface.co/google/embeddinggemma-2/tree/914f7f89142e33e77833254d9c9b90c3cef7303b). Model, dimension, modalities, revision and prompt version identify the vector space. Changing these values on a populated palace requires rebuilding, not relabelling old vectors.
 
 `auto` uses CUDA when PyTorch reports a GPU, then Apple MPS, then CPU; `mempalace mine` prints the device it resolved. Weights and inference use float32. An explicit `cuda` or `mps` that PyTorch cannot use warns and runs on CPU, as the ONNX models do for an unavailable accelerator. `embedding_device` is shared with the ONNX models, so the ONNX-only `dml` and `coreml` read as `auto` here, with a warning. The device is not part of the vector space: a palace mined on CUDA opens and searches on a CPU-only machine. MPS runs a repeatability witness on first use; initialization, MPS/Metal inference and invalid-vector failures warn and retry on CPU. Unrelated decoder errors fail the item without moving a healthy model to CPU. Inputs are truncated at the model's 8,192-token context. A CUDA out-of-memory error halves the batch and retries (freeing PyTorch's CUDA cache between attempts) down to batch size 1, for that call only; the next call starts at the configured size again. If batch size 1 still runs out of memory, the error names `MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE`.
+
+On Apple Silicon, use `MEMPALACE_EMBEDDING_DEVICE=mps` to request Metal explicitly
+in the isolated environment above, or leave it at `auto`. This requires the
+`embeddinggemma2` backend: setting `mps` for MiniLM or EmbeddingGemma ONNX does
+not move those models to PyTorch. See the [model/device support
+table](../website/guide/configuration.md#embedding-models-and-devices) for the
+ONNX/CoreML restrictions. Check inference warnings for CPU fallback; a device
+label shown before model loading is the planned device, and later status calls
+in the same process reflect the loaded backend.
 
 Documents use `Document`, with a real title or source filename when present. Queries use `SearchQuery`, or `CodeRetrieval` for explicit code search. All output vectors are dimension-checked, finite and L2-normalized.
 

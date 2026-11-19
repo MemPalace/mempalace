@@ -32,6 +32,7 @@ from typing import Iterable, Optional
 
 from .config import MempalaceConfig, normalize_wing_name, sanitize_name
 from .fsio import atomic_write_json, atomic_write_text
+from .maintenance_paths import wing_artifact_path
 from .timeutil import utc_now_iso
 
 SPLIT_SCHEMA_VERSION = 1
@@ -197,7 +198,7 @@ def plan_split(col, wing: str, existing_wings: Iterable[str]) -> dict:
 
 
 def split_plan_path(config: MempalaceConfig, wing: str) -> str:
-    return os.path.join(config.palace_path, "wings", f"split-{sanitize_name(wing, 'wing')}.json")
+    return wing_artifact_path(config, wing, "split", ".json")
 
 
 def save_split_plan(config: MempalaceConfig, plan: dict) -> str:
@@ -280,7 +281,7 @@ def _rekey_collection(col, wing: str, targets: dict[str, str], stamp: str, progr
 
 def split_pending_path(config: MempalaceConfig, wing: str) -> str:
     """Marker that a split of ``wing`` started and has not finished every phase."""
-    return os.path.join(config.palace_path, "wings", f"split-{sanitize_name(wing, 'wing')}.pending")
+    return wing_artifact_path(config, wing, "split", ".pending")
 
 
 def split_plan_fingerprint(plan: dict) -> str:

@@ -22,7 +22,12 @@ from typing import Optional
 
 from . import paths
 from ._env import env_str, parse_number
-from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
+from .entity_detector import (
+    _apply_known_systems_prepass,
+    _entity_blocklist,
+    _get_coca_filter,
+    _use_english_filters,
+)
 from .fsio import atomic_write_json, encoding_metadata, move_aside, read_source_text
 
 # Module-level import so tests can patch it as
@@ -374,25 +379,41 @@ class GitignoreMatcher:
         return any(fnmatch.fnmatch(part, pattern) for part in parts)
 
     def _match_from_root(self, target_parts: list, pattern_parts: list) -> bool:
-        def matches(path_index: int, pattern_index: int) -> bool:
-            if pattern_index == len(pattern_parts):
-                return True
+        """Whether ``pattern_parts`` matches a prefix of ``target_parts``.
 
-            if path_index == len(target_parts):
-                return all(part == "**" for part in pattern_parts[pattern_index:])
+        ``**`` spans zero or more path segments. A pattern that is consumed
+        before the path is matches (an ignored directory covers everything
+        under it); a path that is consumed first matches only if what is
+        left of the pattern is all ``**``.
 
-            pattern_part = pattern_parts[pattern_index]
-            if pattern_part == "**":
-                return matches(path_index, pattern_index + 1) or matches(
-                    path_index + 1, pattern_index
-                )
-
-            if not fnmatch.fnmatch(target_parts[path_index], pattern_part):
-                return False
-
-            return matches(path_index + 1, pattern_index + 1)
-
-        return matches(0, 0)
+        Solved as a table over (path index, pattern index), so the cost is
+        the product of the two lengths. The obvious recursion branches on
+        every ``**`` and is exponential in the number of ``**`` segments: a
+        ``.gitignore`` line of a dozen of them, in a repository the user
+        only cloned, kept ``mempalace mine`` busy for minutes.
+        """
+        # Adjacent ``**`` segments mean the same as one.
+        pattern = [
+            part
+            for index, part in enumerate(pattern_parts)
+            if not (part == "**" and index and pattern_parts[index - 1] == "**")
+        ]
+        n, m = len(target_parts), len(pattern)
+        # match[i][j]: target_parts[i:] is matched by pattern[j:].
+        match = [[False] * (m + 1) for _ in range(n + 1)]
+        for i in range(n + 1):
+            match[i][m] = True
+        for j in range(m - 1, -1, -1):
+            match[n][j] = pattern[j] == "**" and match[n][j + 1]
+        for i in range(n - 1, -1, -1):
+            segment = target_parts[i]
+            for j in range(m - 1, -1, -1):
+                part = pattern[j]
+                if part == "**":
+                    match[i][j] = match[i][j + 1] or match[i + 1][j]
+                else:
+                    match[i][j] = fnmatch.fnmatch(segment, part) and match[i + 1][j + 1]
+        return match[0][0]
 
 
 def load_gitignore_matcher(dir_path: Path, cache: dict):
@@ -400,6 +421,49 @@ def load_gitignore_matcher(dir_path: Path, cache: dict):
     if dir_path not in cache:
         cache[dir_path] = GitignoreMatcher.from_dir(dir_path)
     return cache[dir_path]
+
+
+def _repo_common_dir(project_path: Path) -> Optional[Path]:
+    """Resolve the Git directory holding a checkout's shared exclude file."""
+    git_dir = project_path / ".git"
+    if git_dir.is_file():
+        marker = git_dir.read_text(encoding="utf-8", errors="surrogateescape").strip()
+        if not marker.startswith("gitdir:") or not marker[7:].strip():
+            return None
+        git_dir = project_path / marker[7:].strip()
+    elif not git_dir.is_dir():
+        return None
+    try:
+        common = (
+            (git_dir / "commondir").read_text(encoding="utf-8", errors="surrogateescape").strip()
+        )
+    except FileNotFoundError:
+        return git_dir
+    return git_dir / common if common else None
+
+
+def load_repo_exclude_matcher(project_path: Path, cache: dict):
+    """Cache common Git excludes, anchored at the checkout's project root.
+
+    Linked worktrees point to their administration directory through a
+    ``.git`` file, then to the shared Git directory through ``commondir``.
+    Its exclude patterns have lower precedence than per-directory gitignores.
+    The tuple cache key keeps these rules separate from directory matchers.
+    """
+    cache_key = (project_path, "git_info_exclude")
+    if cache_key not in cache:
+        try:
+            common = _repo_common_dir(project_path)
+            lines = (
+                (common / "info" / "exclude").read_text(encoding="utf-8", errors="surrogateescape")
+                if common is not None
+                else ""
+            )
+        except OSError:
+            cache[cache_key] = None
+        else:
+            cache[cache_key] = GitignoreMatcher.from_patterns(project_path, lines.splitlines())
+    return cache[cache_key]
 
 
 def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
@@ -412,9 +476,25 @@ def is_gitignored(path: Path, matchers: list, is_dir: bool = False) -> bool:
     return ignored
 
 
-def should_skip_dir(dirname: str) -> bool:
-    """Skip known generated/cache directories before gitignore matching."""
-    return dirname in SKIP_DIRS or dirname.endswith(".egg-info")
+def should_skip_dir(dir_path: Path) -> bool:
+    """Skip known generated/cache directories before gitignore matching.
+
+    Takes the full directory path so layout-dependent cases can be detected:
+
+    - Any directory whose basename is in ``SKIP_DIRS`` (e.g. ``.worktrees``),
+      or ends in ``.egg-info``, is skipped outright.
+    - A ``worktrees`` directory is skipped ONLY when it sits directly under a
+      ``.claude`` directory (``<project>/.claude/worktrees/``). That is the
+      Claude Code worktree layout containing duplicate checkouts. A
+      genuine ``src/worktrees`` Python package is NOT under ``.claude`` and
+      still mines.
+    """
+    dirname = dir_path.name
+    if dirname in SKIP_DIRS or dirname.endswith(".egg-info"):
+        return True
+    if dirname == "worktrees" and dir_path.parent.name == ".claude":
+        return True
+    return False
 
 
 def normalize_include_paths(include_ignored: list) -> set:
@@ -492,6 +572,47 @@ def _apply_exclude_patterns_to_prescanned_files(
 # =============================================================================
 
 
+def _valid_room_name(value) -> str | None:
+    """``value`` as ``sanitize_name`` returns it, or None when it is rejected."""
+    from .config import sanitize_name
+
+    try:
+        return sanitize_name(value, "room")
+    except ValueError:
+        return None
+
+
+def _clean_room_names(rooms: list, source: str) -> list:
+    """``rooms`` with names that are safe to store on drawers and print.
+
+    A project config can arrive with a cloned repository, and room names reach
+    wake-up text. A rejected name becomes its slug, as ``rooms.py`` does for
+    proposed names, and keeps its config spelling as ``match_name``, so files
+    route exactly as before and only the stored name changes. With no usable slug
+    the room is dropped and its files fall through to the other rooms or
+    ``general``. Either way the file is still mined. Only scalars are turned into
+    text, because yaml aliases can build a small value whose text form is
+    exponentially large.
+    """
+    clean = []
+    for room in rooms:
+        raw = room.get("name") if isinstance(room, dict) else None
+        name = _valid_room_name(raw)
+        if name is None:
+            from .rooms import slugify_room
+
+            text = str(raw) if isinstance(raw, (str, int, float)) else ""
+            name = _valid_room_name(slugify_room(text)) if text else None
+            outcome = f"using '{name}'" if name else "skipping that room"
+            shown = ascii(text[:80]) if text else f"of type {type(raw).__name__}"
+            print(f"  Invalid room name {shown} in {source}: {outcome}.", file=sys.stderr)
+            if name:
+                clean.append({**room, "name": name, "match_name": text})
+        else:
+            clean.append({**room, "name": name})
+    return clean
+
+
 def load_config(project_dir: str) -> dict:
     """Load the project config from ``project_dir``.
 
@@ -530,7 +651,10 @@ def load_config(project_dir: str) -> dict:
             ],
         }
     with open(config_path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    if isinstance(config, dict) and isinstance(config.get("rooms"), list):
+        config["rooms"] = _clean_room_names(config["rooms"], config_path.name)
+    return config
 
 
 # =============================================================================
@@ -560,6 +684,14 @@ def _name_matches(a: str, b: str) -> bool:
     return b in _tokens(a) or a in _tokens(b)
 
 
+def _match_name(room: dict) -> str:
+    """The spelling ``room`` routes by, which is never a slug made from it.
+
+    A slug can be as short as ``c``, and content scoring would count that letter.
+    """
+    return room.get("match_name", room["name"])
+
+
 def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -> str:
     """
     Route a file to the right room.
@@ -577,19 +709,19 @@ def detect_room(filepath: Path, content: str, rooms: list, project_path: Path) -
     path_parts = relative.replace("\\", "/").split("/")
     for part in path_parts[:-1]:  # skip filename itself
         for room in rooms:
-            candidates = [room["name"].lower()] + [k.lower() for k in room.get("keywords", [])]
+            candidates = [_match_name(room).lower()] + [k.lower() for k in room.get("keywords", [])]
             if any(_name_matches(part, c) for c in candidates):
                 return room["name"]
 
     # Priority 2: filename matches room name
     for room in rooms:
-        if _name_matches(filename, room["name"]):
+        if _name_matches(filename, _match_name(room)):
             return room["name"]
 
     # Priority 3: keyword scoring from room keywords + name
     scores = defaultdict(int)
     for room in rooms:
-        keywords = room.get("keywords", []) + [room["name"]]
+        keywords = room.get("keywords", []) + [_match_name(room)]
         for kw in keywords:
             count = content_lower.count(kw.lower())
             scores[room["name"]] += count
@@ -1077,6 +1209,39 @@ def detect_hall(content: str) -> str:
     return "general"
 
 
+def _is_cjk_entity_char(char: str) -> bool:
+    # Unicode 17 blocks keep newer Han characters recognized on older Python runtimes.
+    codepoint = ord(char)
+    return char in "々〆〇〻" or any(
+        start <= codepoint <= end
+        for start, end in (
+            (0x1100, 0x11FF),
+            (0x2E80, 0x2EFF),
+            (0x302E, 0x302F),
+            (0x3040, 0x30FF),
+            (0x3130, 0x318F),
+            (0x31C0, 0x31FF),
+            (0x3400, 0x4DBF),
+            (0x4E00, 0x9FFF),
+            (0xA960, 0xA97F),
+            (0xAC00, 0xD7FF),
+            (0xF900, 0xFAFF),
+            (0xFF65, 0xFF9F),
+            (0xFFA0, 0xFFDC),
+            (0x1AFF0, 0x1AFFF),
+            (0x1B000, 0x1B16F),
+            (0x20000, 0x2A6DF),
+            (0x2A700, 0x2EE5F),
+            (0x2F800, 0x2FA1F),
+            (0x30000, 0x3347F),
+        )
+    )
+
+
+def _is_variation_selector(char: str) -> bool:
+    return 0xFE00 <= ord(char) <= 0xFE0F or 0xE0100 <= ord(char) <= 0xE01EF
+
+
 def _extract_entities_for_metadata(content: str) -> str:
     """Extract entity names from content for metadata tagging.
 
@@ -1101,10 +1266,21 @@ def _extract_entities_for_metadata(content: str) -> str:
         # behavior so a known entity like "Aya" tags drawers that mention
         # "aya" / "AYA" / "Aya". Without re.IGNORECASE, lowercase mentions
         # in chat transcripts and voice-typed content get silently untagged.
-        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content, re.IGNORECASE):
+        # CJK text can join names directly to adjacent words or particles.
+        # Keep the guard on each non-CJK edge of a mixed-script name.
+        left = "" if _is_cjk_entity_char(name[0]) else r"(?<!\w)"
+        end = len(name) - 1
+        while end > 0 and _is_variation_selector(name[end]):
+            end -= 1
+        right = "" if _is_cjk_entity_char(name[end]) else r"(?!\w)"
+        if re.search(left + re.escape(name) + right, content, re.IGNORECASE):
             matched.add(name)
 
-    coca_filter = _get_coca_filter()
+    from .config import MempalaceConfig
+
+    entity_langs = MempalaceConfig().entity_languages
+    entity_stoplist = {w.lower() for w in _ENTITY_STOPLIST} | _entity_blocklist(entity_langs)
+    coca_filter = _get_coca_filter() if _use_english_filters(entity_langs) else frozenset()
     window = content[:_ENTITY_EXTRACT_WINDOW]
     # Known-systems compound pre-pass. Detects
     # multi-word product names atomically and masks them from the window so
@@ -1115,7 +1291,7 @@ def _extract_entities_for_metadata(content: str) -> str:
     words = _candidate_entity_words(working_window)
     freq: dict = dict(compound_counts)
     for w in words:
-        if w in _ENTITY_STOPLIST:
+        if w.lower() in entity_stoplist:
             continue
         # Drop common English content words
         # ("Code", "Line", "Note", "Phase", …) from per-drawer entity
@@ -1768,6 +1944,16 @@ def scan_project(
     Skips symlinks and oversized files. Each skipped symlink is logged to
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why a directory looks empty after walking.
+
+    When ``respect_gitignore`` is set, both per-directory ``.gitignore``
+    files AND the repository-level ``<project>/.git/info/exclude`` are
+    honoured (see :func:`load_repo_exclude_matcher`). The repo-level file is
+    anchored at the project root so its patterns prune the entire tree —
+    this is what keeps a git-worktree that a user excluded locally from being
+    double-mined as a duplicate wing (MemPalace/mempalace#2599).
+    In addition to gitignore, known build/cache directories and Claude Code
+    worktree locations (``.worktrees/``, ``.claude/worktrees/``) are always
+    pruned via :func:`should_skip_dir`, independent of ``respect_gitignore``.
     """
     project_path = Path(project_dir).expanduser().resolve()
     files = []
@@ -1775,6 +1961,16 @@ def scan_project(
     matcher_cache = {}
     include_paths = normalize_include_paths(include_ignored)
     exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns or [])
+
+    # Honour the repo-level ``.git/info/exclude`` across the whole tree. It is
+    # anchored at the project root, so it survives the per-directory pruning
+    # of per-directory matchers below (those are dropped as we descend past
+    # their directory, but the root matcher stays because the root is always
+    # an ancestor). Only applies under gitignore, matching ``.gitignore``.
+    if respect_gitignore:
+        repo_exclude_matcher = load_repo_exclude_matcher(project_path, matcher_cache)
+        if repo_exclude_matcher is not None:
+            active_matchers.append(repo_exclude_matcher)
 
     for root, dirs, filenames in os.walk(project_path):
         root_path = Path(root)
@@ -1793,7 +1989,7 @@ def scan_project(
             d
             for d in dirs
             if is_force_included(root_path / d, project_path, include_paths)
-            or not should_skip_dir(d)
+            or not should_skip_dir(root_path / d)
         ]
         if respect_gitignore and active_matchers:
             dirs[:] = [
@@ -1910,36 +2106,63 @@ def mine(
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
     """
-    if dry_run:
-        return _mine_impl(
-            project_dir,
-            palace_path,
-            wing_override=wing_override,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            files=files,
-            max_chunks_per_file=max_chunks_per_file,
-        )
+    try:
+        if dry_run:
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+                max_chunks_per_file=max_chunks_per_file,
+            )
 
-    # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
-    # message and exit non-zero. In-process callers (tests, library users) that
-    # expect to coexist with another writer should handle the exception.
-    with mine_palace_lock(palace_path):
-        return _mine_impl(
-            project_dir,
-            palace_path,
-            wing_override=wing_override,
-            agent=agent,
-            limit=limit,
-            dry_run=dry_run,
-            respect_gitignore=respect_gitignore,
-            include_ignored=include_ignored,
-            files=files,
-            max_chunks_per_file=max_chunks_per_file,
-        )
+        # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
+        # message and exit non-zero. In-process callers (tests, library users) that
+        # expect to coexist with another writer should handle the exception.
+        with mine_palace_lock(palace_path):
+            return _mine_impl(
+                project_dir,
+                palace_path,
+                wing_override=wing_override,
+                agent=agent,
+                limit=limit,
+                dry_run=dry_run,
+                respect_gitignore=respect_gitignore,
+                include_ignored=include_ignored,
+                files=files,
+                max_chunks_per_file=max_chunks_per_file,
+            )
+    finally:
+        _cleanup_mine_pid_file()
+
+
+def _project_wing(raw, project_path: Path) -> str:
+    """The wing a project config names, safe to store on drawers and print.
+
+    The config can arrive with a cloned repository. A valid name is kept as
+    written. A rejected one becomes the one wing slug, and with nothing usable
+    the project falls back to the wing it has without a config. Drawers already
+    filed under the old spelling stay there. ``wing_aliases`` links the two by
+    slug, so a name with no slug (``+++``) stays reachable only by that name or an
+    unfiltered search. Only scalars are turned into text, because yaml aliases can
+    build a small value whose text form is exponentially large.
+    """
+    from .config import normalize_wing_name, sanitize_name
+
+    try:
+        return sanitize_name(raw, "wing")
+    except ValueError:
+        pass
+    text = str(raw) if isinstance(raw, (str, int, float)) else ""
+    wing = normalize_wing_name(text) or normalize_wing_name(project_path.name) or "project"
+    shown = ascii(text[:80]) if text else f"of type {type(raw).__name__}"
+    print(f"  Invalid wing {shown} in project config: using {ascii(wing)}.", file=sys.stderr)
+    return wing
 
 
 def _mine_impl(
@@ -1965,7 +2188,7 @@ def _mine_impl(
     cfg_chunk_overlap = palace_config.chunk_overlap
     cfg_min_chunk_size = palace_config.min_chunk_size
 
-    wing = wing_override or config["wing"]
+    wing = wing_override or _project_wing(config.get("wing"), project_path)
     rooms = config.get("rooms", [{"name": "general", "description": "All project files"}])
     exclude_patterns = config.get("exclude_patterns", [])
 
@@ -2265,6 +2488,87 @@ def _cleanup_mine_pid_file() -> None:
     except OSError:
         # Best-effort cleanup; never fail the mine over PID bookkeeping.
         pass
+
+
+_HOOK_MINE_EXIT_GRACE_SECONDS = 60.0
+_HOOK_MINE_EXIT_GRACE_ENV = "MEMPALACE_HOOK_MINE_EXIT_GRACE_SECONDS"
+_ACTIVE_EXIT_WATCHDOG = None
+
+
+class _HookMineExitWatchdog:
+    """Handle for an independent process waiting on interpreter shutdown."""
+
+    def __init__(self, process) -> None:
+        self.process = process
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        try:
+            # Unbuffered, one-byte pipe write: no stdout/stderr locks or flush.
+            os.write(self.process.stdin.fileno(), b"S")
+        except (OSError, ValueError):
+            pass
+
+    def cancel(self) -> None:
+        if self.process.poll() is None:
+            self.process.terminate()
+            self.process.wait(timeout=5)
+        self.process.stdin.close()
+
+
+def _hook_mine_exit_grace_seconds() -> float:
+    import math
+
+    raw = os.environ.get(_HOOK_MINE_EXIT_GRACE_ENV, "").strip()
+    if raw:
+        try:
+            value = float(raw)
+            if math.isfinite(value) and value > 0:
+                return value
+        except ValueError:
+            pass
+    return float(_HOOK_MINE_EXIT_GRACE_SECONDS)
+
+
+def _arm_hook_mine_exit_watchdog(exit_code: int = 0) -> Optional[_HookMineExitWatchdog]:
+    """Bound hook-mine shutdown with supervision outside this interpreter.
+
+    The helper starts its grace period at interpreter shutdown, before Python
+    joins worker threads. It survives native finalization and never writes or
+    flushes diagnostic streams. Windows preserves ``exit_code`` on forced
+    termination; POSIX reports SIGKILL (a nonzero failure status).
+
+    Manual mines without ``MEMPALACE_MINE_PID_FILE`` remain unaffected.
+    """
+    global _ACTIVE_EXIT_WATCHDOG
+
+    if not os.environ.get("MEMPALACE_MINE_PID_FILE"):
+        return None
+
+    _cleanup_mine_pid_file()
+
+    if _ACTIVE_EXIT_WATCHDOG is not None:
+        _ACTIVE_EXIT_WATCHDOG.cancel()
+
+    import atexit
+    import threading
+
+    from ._mine_exit_watchdog import start_watchdog
+
+    code = exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else 1
+    handle = _HookMineExitWatchdog(start_watchdog(_hook_mine_exit_grace_seconds(), code))
+    register_threading_atexit = getattr(threading, "_register_atexit", None)
+    if callable(register_threading_atexit):
+        try:
+            register_threading_atexit(handle.start)
+        except RuntimeError:
+            handle.start()
+    atexit.register(handle.start)
+    _ACTIVE_EXIT_WATCHDOG = handle
+    return handle
 
 
 def _compute_topic_tunnels_for_wing(wing: str, config=None) -> int:

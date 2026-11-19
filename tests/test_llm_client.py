@@ -474,6 +474,69 @@ def test_openai_compat_retries_without_reasoning_effort_on_400():
     assert len(bodies) == 2 and "reasoning_effort" not in bodies[1]
 
 
+def test_openai_compat_drops_temperature_a_400_names_and_remembers_it():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "temperature" in body:
+            raise HTTPError(
+                req.full_url,
+                400,
+                "'temperature' does not support 0.1 with this model",
+                hdrs=None,
+                fp=None,
+            )
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="gpt-5-mini", endpoint="http://localhost")
+        assert p.classify("s", "u").text == '{"ok": true}'
+        assert len(bodies) == 2 and "temperature" not in bodies[1]
+        # The next call skips the request that is known to fail.
+        assert p.classify("s", "u").text == '{"ok": true}'
+    assert len(bodies) == 3 and "temperature" not in bodies[2]
+
+
+def test_openai_compat_think_false_survives_rejecting_both_fields():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "reasoning_effort" in body:
+            raise HTTPError(req.full_url, 400, "unknown field", hdrs=None, fp=None)
+        if "temperature" in body:
+            raise HTTPError(req.full_url, 400, "'temperature' unsupported", hdrs=None, fp=None)
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="gpt-5-mini", endpoint="http://localhost")
+        assert p.classify("s", "u", think=False).text == '{"ok": true}'
+    assert len(bodies) == 3
+
+
+def test_openai_compat_keeps_temperature_when_a_400_does_not_name_it():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        bodies.append(json.loads(req.data))
+        raise HTTPError(req.full_url, 400, "context length exceeded", hdrs=None, fp=None)
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="x", endpoint="http://localhost")
+        with pytest.raises(LLMError, match="context length"):
+            p.classify("s", "u")
+    assert len(bodies) == 1 and bodies[0]["temperature"] == 0.1
+
+
 def test_openai_compat_empty_content_after_length_cutoff_names_the_cause():
     mock = MagicMock()
     payload = {"choices": [{"finish_reason": "length", "message": {"content": ""}}]}
@@ -626,6 +689,52 @@ def test_anthropic_joins_multiple_text_blocks():
     assert resp.text == "part one. part two."
 
 
+def _anthropic_body(**provider_kwargs):
+    """Send one classify call and return the JSON body that went on the wire."""
+    captured = {}
+
+    def fake_urlopen(req, *, timeout):
+        captured["body"] = json.loads(req.data)
+        return _mock_anthropic_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = AnthropicProvider(model="claude-sonnet-5-5", api_key="sk-ant", **provider_kwargs)
+        p.external_use_accepted = True
+        p.classify("s", "u")
+    return captured["body"]
+
+
+def test_anthropic_omits_temperature_by_default():
+    body = _anthropic_body()
+    assert "temperature" not in body
+    assert body["max_tokens"] == AnthropicProvider.DEFAULT_MAX_TOKENS
+
+
+def test_anthropic_sends_temperature_and_max_tokens_when_set():
+    body = _anthropic_body(temperature=0.1, max_tokens=16000)
+    assert body["temperature"] == 0.1
+    assert body["max_tokens"] == 16000
+
+
+def test_get_provider_forwards_anthropic_budget():
+    p = get_provider("anthropic", "claude-sonnet-5-5", api_key="sk-ant", max_tokens=12000)
+    assert p.max_tokens == 12000
+    assert p.temperature is None
+
+
+def test_anthropic_truncated_response_raises():
+    mock = MagicMock()
+    payload = {"content": [{"type": "text", "text": '{"rooms": ['}], "stop_reason": "max_tokens"}
+    mock.read.return_value = json.dumps(payload).encode()
+    mock.__enter__.return_value = mock
+    mock.__exit__.return_value = False
+    with patch("mempalace.llm_client.urlopen", return_value=mock):
+        p = AnthropicProvider(model="claude-sonnet-5-5", api_key="sk-ant", max_tokens=100)
+        p.external_use_accepted = True
+        with pytest.raises(LLMError, match="cut off at max_tokens=100"):
+            p.classify("s", "u")
+
+
 def test_anthropic_no_key_raises_on_classify(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     p = AnthropicProvider(model="claude-haiku")
@@ -654,6 +763,7 @@ def test_ollama_provider_defaultendpoint_is_local():
     )
 
 
+@pytest.mark.resolves_dns
 def test_single_label_hostname_is_local_only_when_it_resolves_privately(monkeypatch):
     import socket
 
@@ -857,6 +967,7 @@ def test_private_ip_literals_stay_local_and_neighbours_do_not():
         assert not endpoint_is_local(url), url
 
 
+@pytest.mark.resolves_dns
 def test_dot_local_names_are_resolved_not_trusted(monkeypatch):
     """Office networks reuse .local for unicast DNS; the suffix proves nothing."""
     import socket
@@ -968,6 +1079,7 @@ def test_trailing_dot_localhost_is_local_and_backslash_netloc_is_not():
     assert not endpoint_is_local("http://evil.com\\@localhost:11434/v1")
 
 
+@pytest.mark.resolves_dns
 def test_docker_host_is_resolved_not_trusted(monkeypatch):
     import socket
 
@@ -985,6 +1097,7 @@ def test_docker_host_is_resolved_not_trusted(monkeypatch):
     assert not endpoint_is_local("http://host.docker.internal:11434")
 
 
+@pytest.mark.resolves_dns
 def test_resolution_uses_the_hostname_with_its_trailing_dot(monkeypatch):
     import socket
 

@@ -1881,6 +1881,104 @@ def test_sqlite_wing_source_counts_is_scoped_to_the_collection(tmp_path):
     assert sqlite_wing_source_counts(str(tmp_path / "missing"), "mempalace_drawers") is None
 
 
+@pytest.mark.parametrize("backend_name", ["sqlite_exact", "rust_exact"])
+def test_sqlite_and_rust_exact_iter_metadata_avoids_offset_paging(
+    tmp_path, monkeypatch, backend_name
+):
+    from mempalace.backends import get_backend
+    from mempalace.palace import (
+        CONVO_CHUNKER_VERSION,
+        NORMALIZE_VERSION,
+        _fast_collection_metadata,
+        prefetch_complete_mtimes,
+        prefetch_mined_set,
+    )
+
+    backend = type(get_backend(backend_name))()
+    palace = PalaceRef(id=str(tmp_path), local_path=str(tmp_path))
+    try:
+        col = backend.get_collection(
+            palace=palace, collection_name="mempalace_drawers", create=True
+        )
+        col.add(
+            ids=["d1", "d2", "d3"],
+            documents=["doc1", "doc2", "doc3"],
+            metadatas=[
+                {
+                    "wing": "w1",
+                    "room": "r1",
+                    "entities": "Alice;Bob",
+                    "source_file": "/f1.md",
+                    "source_mtime": 100.0,
+                    "chunk_total": 1,
+                    "normalize_version": NORMALIZE_VERSION,
+                    "convo_chunker_version": CONVO_CHUNKER_VERSION,
+                    "extract_mode": "exchange",
+                    "content_hash": "h1",
+                },
+                {
+                    "wing": "w1",
+                    "room": "r2",
+                    "source_file": "/f2.md",
+                    "source_mtime": 200.0,
+                    "chunk_total": 1,
+                    "normalize_version": NORMALIZE_VERSION,
+                },
+                {},
+            ],
+            embeddings=[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        )
+
+        # Ensure none of the fast metadata readers fall back to col.get()
+        monkeypatch.setattr(
+            col,
+            "get",
+            lambda *_a, **_kw: (_ for _ in ()).throw(
+                AssertionError("should use iter_metadata instead of get()")
+            ),
+        )
+
+        stream = _fast_collection_metadata(
+            col,
+            ("wing", "entities"),
+            require_key="entities",
+            equals={"wing": "w1"},
+        )
+        assert stream is not None
+        assert list(stream) == [{"wing": "w1", "entities": "Alice;Bob"}]
+
+        assert col.get_all_metadata() == [
+            {
+                "wing": "w1",
+                "room": "r1",
+                "entities": "Alice;Bob",
+                "source_file": "/f1.md",
+                "source_mtime": 100.0,
+                "chunk_total": 1,
+                "normalize_version": NORMALIZE_VERSION,
+                "convo_chunker_version": CONVO_CHUNKER_VERSION,
+                "extract_mode": "exchange",
+                "content_hash": "h1",
+            },
+            {
+                "wing": "w1",
+                "room": "r2",
+                "source_file": "/f2.md",
+                "source_mtime": 200.0,
+                "chunk_total": 1,
+                "normalize_version": NORMALIZE_VERSION,
+            },
+            {},
+        ]
+        assert prefetch_mined_set(col, extract_mode="exchange") == {"/f1.md": 100.0}
+        assert prefetch_complete_mtimes(col, ["/f1.md", "/f2.md"]) == {
+            "/f1.md": (100.0,),
+            "/f2.md": (200.0,),
+        }
+    finally:
+        backend.close()
+
+
 def test_sqlite_exact_fts_rowid_sync_and_no_unindexed_delete(tmp_path):
     """Ensure docs_fts.rowid == documents.rowid and writes never scan UNINDEXED FTS columns."""
     backend, col = _collection(tmp_path)

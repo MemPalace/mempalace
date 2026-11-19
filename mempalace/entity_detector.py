@@ -189,6 +189,62 @@ def _get_stopwords(languages: tuple) -> frozenset:
     return frozenset(patterns["stopwords"])
 
 
+def _use_english_filters(languages) -> bool:
+    """Whether the COCA English content-word filter applies.
+
+    The COCA list is English-only; for configurations without English
+    (e.g. ``["pt-br"]``) it would silently drop legitimate entities whose
+    spellings collide with common English words.
+    """
+    return "en" in _normalize_langs(languages)
+
+
+def _user_entity_stopwords() -> frozenset:
+    """User-supplied entity stopwords from ``entity_stopwords.json`` files.
+
+    Both locations are merged when present:
+
+    - ``<config_dir>/entity_stopwords.json`` (global)
+    - ``<palace_path>/config/entity_stopwords.json`` (per-palace)
+
+    Each file accepts a JSON array of words or a mapping with a ``"words"``
+    array (same shape as ``coca_content_words.json``).
+    """
+    from .config import MempalaceConfig
+
+    cfg = MempalaceConfig()
+    return _load_user_entity_stopwords(str(cfg.config_dir), str(cfg.palace_path))
+
+
+@functools.lru_cache(maxsize=8)
+def _load_user_entity_stopwords(config_dir: str, palace_path: str) -> frozenset:
+    words: set = set()
+    for base in (Path(config_dir), Path(palace_path) / "config"):
+        path = base / "entity_stopwords.json"
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            data = data.get("words", [])
+        if isinstance(data, list):
+            words.update(w.strip().lower() for w in data if isinstance(w, str) and w.strip())
+    return frozenset(words)
+
+
+def _entity_blocklist(languages) -> frozenset:
+    """Lowercased words that must never surface as entities.
+
+    Union of the configured languages' i18n stopwords and any
+    user-provided ``entity_stopwords.json`` entries — the language-aware
+    replacement for the English-only closet stoplist in the extraction
+    paths, so ``entity_languages`` actually governs filtering.
+    """
+    return _get_stopwords(_normalize_langs(languages)) | _user_entity_stopwords()
+
+
 # ==================== BACKWARD-COMPAT MODULE CONSTANTS ====================
 #
 # These mirror the old module-level constants so existing imports keep working.
@@ -315,8 +371,8 @@ def extract_candidates(text: str, languages=("en",)) -> dict:
     """
     langs = _normalize_langs(languages)
     patterns = get_entity_patterns(langs)
-    stopwords = _get_stopwords(langs)
-    coca_filter = _get_coca_filter()
+    stopwords = _entity_blocklist(langs)
+    coca_filter = _get_coca_filter() if _use_english_filters(langs) else frozenset()
 
     counts: defaultdict = defaultdict(int)
 

@@ -71,15 +71,41 @@ entry, proving the shape matches and the binary is on PATH.
 >     └── <rule-name>.md
 > ```
 
-Manifest schema (verified):
+Manifest schema (verified against `https://antigravity.google/docs/build-plugins/` and `agy plugin validate --strict`):
 
 ```json
 {
-  "name": "my-custom-plugin"
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "mempalace",
+  "displayName": "MemPalace",
+  "version": "3.12.0",
+  "description": "Local-first verbatim AI memory palace: semantic recall, temporal knowledge graph, auto-save hooks, and multi-agent logstream coordination.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Search my memory palace for recent architectural decisions",
+    "Show my palace status, wings, rooms, and knowledge graph stats",
+    "Check my MemPalace logstream inbox for open agent tasks"
+  ],
+  "author": {
+    "name": "MemPalace",
+    "url": "https://github.com/MemPalace/mempalace"
+  },
+  "homepage": "https://github.com/MemPalace/mempalace",
+  "repository": "https://github.com/MemPalace/mempalace",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "palace",
+    "recall",
+    "knowledge-graph",
+    "mcp",
+    "chromadb",
+    "coordination"
+  ]
 }
 ```
 
-> The name field is optional and defaults to the directory name if omitted.
+We also ship an Aux Pane UI Extension under `sidecars/palace/` (`sidecar.json` with `SIDECAR_UI_ENTRYPOINT_AUX_PANE` and `sidecar_sdk`), which registers `Extensions > MemPalace` in the Aux Pane `+` menu (`sidecar://mempalace/palace/`).
 
 Install locations (verified):
 
@@ -231,15 +257,16 @@ We ship a minimal `plugin.json` of `{"name": "mempalace"}`.
 
 | Surface                   | What we ship                                                              |
 |---------------------------|---------------------------------------------------------------------------|
-| Plugin manifest           | `.antigravity-plugin/plugin.json` — minimal, verified shape               |
-| MCP auto-registration     | `.antigravity-plugin/mcp_config.json` — registers `mempalace-mcp` stdio    |
-| Skill                     | `.antigravity-plugin/skills/mempalace/SKILL.md` — real file, frontmatter   |
-| `Stop` hook               | `hooks/antigravity/mempal_save_hook_antigravity.sh` — counter + auto-mine |
-| `PreInvocation` hook      | `hooks/antigravity/mempal_wake_hook_antigravity.sh` — wake injection       |
-| Installer                 | `hooks/antigravity/install.sh` — idempotent, basename-match uninstall      |
+| Plugin manifest           | `plugins/mempalace/plugin.json` — full `v1/plugin.json` Marketplace schema |
+| Aux Pane UI Extension     | `plugins/mempalace/sidecars/palace/` — 4-view visual Palace Explorer      |
+| MCP auto-registration     | `plugins/mempalace/mcp_config.json` — registers `mempalace-mcp` stdio     |
+| Skills & rule             | `plugins/mempalace/skills/*` & `rules/mempalace-recall.md`                |
+| Cross-platform hooks      | `plugins/mempalace/hooks.json` + `scripts/{save,wake}-hook.mjs`           |
+| POSIX bash hooks          | `hooks/antigravity/mempal_{save,wake}_hook_antigravity.sh`                |
+| Installer & exporter      | `hooks/antigravity/install.sh` & `hooks/antigravity/export_standalone.py` |
 | User-facing docs          | `website/guide/antigravity.md` + sidebar wiring                            |
 | Examples                  | `examples/antigravity/{hooks.json,mcp_config.json,README.md}`              |
-| Tests                     | 3 test files mirroring the cursor blueprint                                |
+| Tests                     | 4 test files covering manifest, Node hooks, POSIX shell hooks & installer |
 
 ---
 
@@ -283,7 +310,7 @@ directory; we do not impose them.
 The installer writes to the global location at
 `~/.gemini/config/plugins/mempalace/`. Workspace-scoped installs are
 documented in `hooks/antigravity/README.md` for users who want to
-limit MemPalace to one workspace; they can `cp -r .antigravity-plugin
+limit MemPalace to one workspace; they can `cp -r plugins/mempalace
 <workspace>/.agents/plugins/mempalace`. We do not install there
 automatically because the canonical UX is global.
 

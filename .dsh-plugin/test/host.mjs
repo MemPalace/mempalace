@@ -57,13 +57,16 @@ export function createHost({ reply } = {}) {
   }
 }
 
-function fakeHandle(spec, { exitCode = 0, stdout = '', stderr = '', delayMs = 0, hang = false }) {
+// `until` is a promise the process waits on before it exits, so a test can hold
+// a hook running for exactly as long as it needs instead of guessing a delay.
+function fakeHandle(spec, { exitCode = 0, stdout = '', stderr = '', delayMs = 0, hang = false, until }) {
   const reader = (text) => ({ readFrom: (from) => ({ text: text.slice(from), nextOffset: text.length, lossy: false }) })
   const done = new Promise((resolve) => {
     const aborted = () => resolve({ exitCode: null, signal: 'SIGTERM' })
     if (spec.signal?.aborted) return aborted()
     spec.signal?.addEventListener('abort', aborted, { once: true })
-    if (!hang) setTimeout(() => resolve({ exitCode, signal: null }), delayMs)
+    if (until) until.then(() => resolve({ exitCode, signal: null }))
+    else if (!hang) setTimeout(() => resolve({ exitCode, signal: null }), delayMs)
   })
   return {
     stdin: undefined,
@@ -140,3 +143,12 @@ export function render(assembly) {
 }
 
 export const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Wait until `check()` is true; a slow machine only makes this take longer, never fail early. */
+export async function waitFor(check, { timeoutMs = 5000, what = 'condition' } = {}) {
+  const deadline = Date.now() + timeoutMs
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs} ms waiting for ${what}`)
+    await tick(5)
+  }
+}

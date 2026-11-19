@@ -50,7 +50,12 @@ from .backends._inproc_sqlite import (
     open_writer as open_palace_writer,
     release as release_palace_anchor,
 )
-from .backends.chroma import ChromaBackend, _clear_chroma_system_cache, hnsw_capacity_status
+from .backends.chroma import (
+    ChromaBackend,
+    _clear_chroma_system_cache,
+    hnsw_capacity_status,
+    searchable_coverage,
+)
 
 # sqlite_read_uri stays in this module's namespace: callers and tests reach the
 # read-only URI through repair. Connections to chroma.sqlite3 go through
@@ -1278,6 +1283,43 @@ _FTS5_REBUILD_SQL = (
     "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) VALUES('rebuild')"
 )
 
+# FTS5's own consistency check, and the only one that answers for this index on
+# every SQLite build. ``PRAGMA quick_check``/``integrity_check`` walk the FTS5
+# shadow tables only where the amalgamation was built to do so: measured on
+# 3.43.2 a malformed inverted index passes both, while 3.53.1 reports it. A
+# gate that used one of them would hand back a palace the server refuses
+# whenever repair ran under the blind build, and an FTS5 autoheal that is
+# unreachable because of interpreter-SQLite differences is the same split seen
+# from the other side. This statement is FTS5's own, so its verdict does not
+# depend on the build.
+#
+# It raises on a malformed index and returns a row (``integrity-check`` is a
+# no-op SELECT-shaped command) when the index agrees with its content table.
+# Naming a table that does not exist raises ``OperationalError`` too, which is
+# why every caller checks for the table first: a palace without an FTS5 index
+# has nothing to verify and must not be failed for it.
+_FTS5_INTEGRITY_CHECK_SQL = (
+    "INSERT INTO embedding_fulltext_search(embedding_fulltext_search) VALUES('integrity-check')"
+)
+
+
+def _fts5_integrity_check_errors(conn: sqlite3.Connection) -> list[str]:
+    """Return what FTS5's own integrity check says about the inverted index.
+
+    Empty means the index is consistent with ``embedding_fulltext_search``'s
+    content table. A non-empty list carries the exception FTS5 raised.
+
+    The table's existence must be established by the caller — see
+    ``_FTS5_INTEGRITY_CHECK_SQL``. This function does not test for it, because
+    the two callers already hold the table census they need and a second probe
+    would be a second thing to keep in step.
+    """
+    try:
+        conn.execute(_FTS5_INTEGRITY_CHECK_SQL)
+    except sqlite3.DatabaseError as exc:
+        return [str(exc)]
+    return []
+
 
 def _errors_are_isolated_fts5(errors: list[str]) -> bool:
     """True when every quick_check error is a malformed FTS5 inverted index.
@@ -1671,7 +1713,17 @@ def _vacuum_and_rebuild_fts5(
     warning and return because their primary rebuild has already succeeded.
     SQLite recovery passes ``strict=True`` because its bulk upserts can leave
     this derived index malformed; that path must not report success until the
-    rebuild, VACUUM, and a final quick_check all complete.
+    rebuild, VACUUM, and a final FTS5 integrity check all complete.
+
+    The strict gate finishes with FTS5's own ``integrity-check`` rather than
+    ``PRAGMA quick_check``. quick_check only covers the FTS5 shadow tables on
+    some SQLite builds (see ``_FTS5_INTEGRITY_CHECK_SQL``), so gating on it let
+    a malformed index pass here and reach the caller's "Rebuild complete";
+    the palace was then refused by the server's own preflight, which
+    is the one pair of outcomes that must not both be possible. quick_check is
+    still run, after the FTS5 check, because it covers the rest of the file and
+    the rebuild/VACUUM in this function are perfectly capable of leaving
+    page-level damage behind.
     """
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
@@ -1685,7 +1737,11 @@ def _vacuum_and_rebuild_fts5(
             tables = {
                 r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }
-            if "embedding_fulltext_search" in tables:
+            # Bound once and reused: the strict gate below must not re-test for
+            # the table, or a palace could be failed for an absence the earlier
+            # census already answered.
+            has_fts5 = "embedding_fulltext_search" in tables
+            if has_fts5:
                 conn.execute(
                     "INSERT INTO embedding_fulltext_search"
                     "(embedding_fulltext_search) VALUES('rebuild')"
@@ -1694,15 +1750,6 @@ def _vacuum_and_rebuild_fts5(
                 progress("  FTS5 index rebuilt.")
             conn.execute("VACUUM")
             progress("  SQLite VACUUM complete.")
-            if strict:
-                rows = conn.execute("PRAGMA quick_check").fetchall()
-                errors = [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
-                if errors:
-                    raise sqlite3.DatabaseError(
-                        f"post-recovery quick_check failed (SQLite {sqlite3.sqlite_version}): "
-                        + "; ".join(errors[:3])
-                    )
-                progress(f"  quick_check is clean (SQLite {sqlite3.sqlite_version}).")
     except Exception as exc:
         if strict:
             # Preserve the concrete SQLite/filesystem exception for callers
@@ -1711,6 +1758,54 @@ def _vacuum_and_rebuild_fts5(
             # print the same failure twice.
             raise
         progress(f"  Warning: post-repair cleanup failed (non-fatal): {exc}")
+        return
+
+    if not strict:
+        return
+
+    # The verdict is taken on a connection opened AFTER the last write, on
+    # purpose. SQLite keeps a warm page cache for pages a connection has
+    # touched, so the writer that just rebuilt the index can sit on stale
+    # pages and report "clean" for damage that is already on disk -- measured
+    # directly, with the same corruption reported clean by the writer and
+    # malformed by a fresh handle. Reading cold is what makes this a statement
+    # about the bytes the caller is handed back rather than about one
+    # connection's view of them. It also covers damage that predates the call
+    # for free, since nothing here has cached the file.
+    #
+    # Nothing writes to ``chroma.sqlite3`` after this point: the caller's
+    # success message is printed only once this function returns.
+    #
+    # FTS5's ``integrity-check`` is issued as an INSERT into the virtual table,
+    # so it needs a writable connection even though it changes no row. It is
+    # opened fresh all the same: what must be fresh is the page cache, not the
+    # write permission.
+    try:
+        with closing(open_palace_writer(sqlite_path, isolation_level=None)) as conn:
+            fts5_errors = _fts5_integrity_check_errors(conn) if has_fts5 else []
+            rows = conn.execute("PRAGMA quick_check").fetchall()
+            errors = [str(row[0]) for row in rows if row and str(row[0]).lower() != "ok"]
+    except sqlite3.Error as exc:
+        # A check that could not run is not a clean verdict, and must not read
+        # as one: a vanished file or a denied read reaches here.
+        raise sqlite3.DatabaseError(
+            f"post-recovery integrity check could not run (SQLite {sqlite3.sqlite_version}): {exc}"
+        ) from exc
+
+    if has_fts5:
+        if fts5_errors:
+            raise sqlite3.DatabaseError(
+                "post-recovery FTS5 integrity-check failed "
+                f"(SQLite {sqlite3.sqlite_version}): " + "; ".join(fts5_errors[:3])
+            )
+        progress(f"  FTS5 integrity-check is clean (SQLite {sqlite3.sqlite_version}).")
+
+    if errors:
+        raise sqlite3.DatabaseError(
+            f"post-recovery quick_check failed (SQLite {sqlite3.sqlite_version}): "
+            + "; ".join(errors[:3])
+        )
+    progress(f"  quick_check is clean (SQLite {sqlite3.sqlite_version}).")
 
 
 def _post_rebuild_cleanup(palace_path: str, backend: "ChromaBackend", progress=print) -> None:
@@ -2268,6 +2363,41 @@ def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> li
     return [filename]
 
 
+def _preserve_logstream_and_replica(source_palace: str, dest_palace: str) -> list[str]:
+    """Copy the logstream database and replica identity into a rebuilt palace.
+
+    Neither file is derived from chroma.sqlite3, so a rebuild cannot
+    reconstruct them. Left behind, the rebuilt palace starts with an empty
+    coordination log and mints a new replica id on next use.
+    """
+    from .logstream import LOGSTREAM_DB_FILENAME
+    from .replica import REPLICA_FILENAME
+
+    if os.path.abspath(source_palace) == os.path.abspath(dest_palace):
+        return []
+
+    copied: list[str] = []
+
+    ls_src = os.path.join(source_palace, LOGSTREAM_DB_FILENAME)
+    ls_dst = os.path.join(dest_palace, LOGSTREAM_DB_FILENAME)
+    if not os.path.islink(ls_src) and os.path.isfile(ls_src):
+        os.makedirs(dest_palace, exist_ok=True)
+        _copy_sqlite_db(ls_src, ls_dst)
+        copied.append(LOGSTREAM_DB_FILENAME)
+
+    rep_src = os.path.join(source_palace, REPLICA_FILENAME)
+    rep_dst = os.path.join(dest_palace, REPLICA_FILENAME)
+    if not os.path.islink(rep_src) and os.path.isfile(rep_src):
+        os.makedirs(dest_palace, exist_ok=True)
+        _copy_file_no_follow(rep_src, rep_dst, replace=True)
+        copied.append(REPLICA_FILENAME)
+
+    if copied:
+        print(" Preserved logstream and replica identity: " + ", ".join(copied))
+
+    return copied
+
+
 def rebuild_from_sqlite(
     source_palace: str,
     dest_palace: str,
@@ -2679,6 +2809,7 @@ def _rebuild_from_sqlite_locked(
 
     os.makedirs(dest_palace, exist_ok=True)
     _preserve_knowledge_graph_sqlite(source_palace, dest_palace)
+    _preserve_logstream_and_replica(source_palace, dest_palace)
 
     # Backend lifetime is wrapped in try/finally so the dest palace's
     # PersistentClient handle (opened lazily inside ``create_collection``
@@ -2743,6 +2874,22 @@ def _rebuild_from_sqlite_locked(
     return counts
 
 
+def _capacity_with_coverage(palace_path: str, collection_name: str) -> dict:
+    """Capacity verdict for one collection, plus its searchable coverage.
+
+    The two probes answer different questions and neither subsumes the
+    other. ``hnsw_capacity_status`` compares the flushed index against
+    sqlite and goes quiet when there is no flushed index to compare;
+    ``searchable_coverage`` counts the drawers a query can actually reach,
+    which it can do whether or not a flush has ever happened.
+
+    Merged into one dict rather than mutating the capacity verdict, which
+    is cached and shared with every other caller of that probe.
+    """
+    capacity = hnsw_capacity_status(palace_path, collection_name)
+    return dict(capacity, searchable=searchable_coverage(palace_path, collection_name))
+
+
 def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     """Read-only health check: compare sqlite vs HNSW element counts.
 
@@ -2756,6 +2903,21 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     The check itself never opens a chromadb client and never imports
     hnswlib — it reads ``chroma.sqlite3`` and ``index_metadata.pickle``
     directly via :func:`mempalace.backends.chroma.hnsw_capacity_status`.
+
+    That comparison has nothing to say about a palace whose index has
+    never been flushed, which is every palace holding fewer records than
+    its ``hnsw:sync_threshold``. Each collection therefore also carries a
+    ``searchable`` sub-dict from
+    :func:`mempalace.backends.chroma.searchable_coverage`, counting the
+    live drawers that are either flushed or pending replay — the number
+    that separates a healthy unflushed palace from one that has lost its
+    index, which ``status`` alone reports identically as ``unknown``.
+    ``flush_unreachable`` reaches the operator as its own line
+    for the same reason.
+
+    ``status`` itself is deliberately unchanged: MCP gates vector search
+    on it globally, so widening what it can say is a behaviour change for
+    every consumer, not a diagnostic addition.
 
     Returns the capacity-status dict (also printed), or a one-key dict in its
     place: ``status="unknown"`` when no palace directory is reachable at the
@@ -2818,10 +2980,11 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
         print("  Palace is initialized but empty (no drawers yet).\n")
         return {"status": "empty", "message": "palace has no drawers yet"}
 
-    drawers = hnsw_capacity_status(palace_path, collection_name)
-    closets = hnsw_capacity_status(palace_path, CLOSETS_COLLECTION_NAME)
+    drawers = _capacity_with_coverage(palace_path, collection_name)
+    closets = _capacity_with_coverage(palace_path, CLOSETS_COLLECTION_NAME)
 
     for label, info in (("drawers", drawers), ("closets", closets)):
+        coverage = info["searchable"]
         print(f"\n  [{label}]")
         if info["sqlite_count"] is None:
             print("    sqlite count:   (unreadable)")
@@ -2833,10 +2996,40 @@ def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
             print(f"    hnsw count:     {info['hnsw_count']:,}")
         if info["divergence"] is not None:
             print(f"    divergence:     {info['divergence']:,}")
+        if coverage["coverage"] is not None:
+            print(
+                f"    searchable:     {coverage['covered_count']:,} / "
+                f"{coverage['live_count']:,} drawers ({coverage['coverage'] * 100:.1f}%) - "
+                f"{coverage['flushed_count']:,} flushed + "
+                f"{coverage['pending_count']:,} pending replay"
+            )
         marker = "DIVERGED" if info["diverged"] else info["status"].upper()
         print(f"    status:         {marker}")
+        # The flag says the index can never be built at this collection size,
+        # which is benign on its own — the write log still answers queries.
+        # It reaches the operator as its own line rather than only as prose
+        # inside note:, so a health check can tell it from a real fault
+        # without parsing English.
+        if info.get("flush_unreachable"):
+            print("    flush:          unreachable at this collection size")
         if info["message"]:
             print(f"    note:           {info['message']}")
+        if coverage["message"]:
+            # Hangs under the searchable line when there is one, and stands in
+            # for it when the coverage could not be measured at all.
+            gutter = "                " if coverage["coverage"] is not None else "searchable:     "
+            print(f"    {gutter}{coverage['message']}")
+
+    for label, info in (("drawers", drawers), ("closets", closets)):
+        if info["searchable"]["degraded"]:
+            print(
+                f"\n  {info['searchable']['unsearchable_count']:,} {label} are in neither the "
+                "flushed HNSW index nor the\n"
+                "  pending write log. Vector search cannot return them, and no amount of\n"
+                "  waiting will flush them in. Rebuild the index from SQLite, which still\n"
+                "  holds every drawer:\n"
+                "\n      mempalace repair --mode from-sqlite --archive-existing"
+            )
 
     if drawers["diverged"] or closets["diverged"]:
         print(

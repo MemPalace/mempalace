@@ -80,6 +80,42 @@ def test_public_vector_query_hides_staging_and_retired(generated_palace):
     assert set(col.query(query_texts=["quartz"], n_results=6).ids[0]) == _VISIBLE
 
 
+@pytest.mark.parametrize("method", ["get", "query"])
+def test_chroma_filtered_native_response_retries_activation(tmp_path, monkeypatch, method):
+    col = get_collection(str(tmp_path), backend="chroma")
+    store = SourceLifecycleStore(str(tmp_path))
+    predicate = {"$contains": "quartz\x00"}
+    for version in ("old", "new"):
+        generation = store.begin("alpha", "shared", version)
+        col.upsert(
+            ids=[version], documents=["quartz\x00 " + version], metadatas=[generation.metadata]
+        )
+        if version == "old":
+            store.activate(generation)
+
+    native = col._inner._collection
+    read = getattr(native, method)
+    activated = False
+
+    def activate_after_read(**kwargs):
+        nonlocal activated
+        result = read(**kwargs)
+        if not activated:
+            activated = True
+            store.activate(generation)
+        return result
+
+    monkeypatch.setattr(native, method, activate_after_read)
+    if method == "get":
+        result = col.get(where_document=predicate, limit=1, include=["documents"])
+        assert result.ids == ["new"] and result.documents == ["quartz\x00 new"]
+    else:
+        result = col.query(
+            query_texts=["quartz"], where_document=predicate, n_results=1, include=["documents"]
+        )
+        assert result.ids == [["new"]] and result.documents == [["quartz\x00 new"]]
+
+
 def test_public_lexical_query_hides_staging_and_retired(generated_palace):
     _path, col, _store, _backend = generated_palace
     assert {hit.id for hit in col.lexical_search(query="quartz", n_results=6).hits} == _VISIBLE

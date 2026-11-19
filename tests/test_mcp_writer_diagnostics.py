@@ -21,6 +21,7 @@ def isolated_writer(monkeypatch, tmp_path):
     ):
         monkeypatch.setattr(mcp, name, value)
     monkeypatch.setattr(mcp, "_discard_mcp_storage_handles", lambda: None)
+    monkeypatch.setattr(mcp, "_MCP_WRITER_CALL_WAIT_SECONDS", 0)
     monkeypatch.delenv(mcp._MCP_ALLOW_PEER_WRITER_ENV, raising=False)
     monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
     monkeypatch.delenv(palace._EXPLICIT_BACKEND_ENV, raising=False)

@@ -150,7 +150,9 @@
       "context", "bridge", "batch", "local", "global", "native", "cloud",
       "before", "after", "during", "often", "always", "never",
       "project", "contributor", "software",
-      "backend", "frontend", "server", "client", "service", "app", "api"
+      "backend", "frontend", "server", "client", "service", "app", "api",
+      "handler", "node", "manager", "plugin", "module", "interface",
+      "builder", "factory", "config"
     ]
   }
 }

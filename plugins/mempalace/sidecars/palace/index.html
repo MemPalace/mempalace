@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MemPalace</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <!-- Unified Compact Navigation & Status Header -->
+    <header class="topbar">
+      <nav class="tab-bar" role="tablist" aria-label="MemPalace Views">
+        <button id="tab-btn-recall" class="tab-btn active" role="tab" aria-selected="true" aria-controls="panel-recall" data-tab="recall" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          <span>Recall</span>
+        </button>
+        <button id="tab-btn-palace" class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-palace" data-tab="palace" tabindex="-1" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18"/><path d="M5 21V7l7-4 7 4v14"/><path d="M9 21v-8h6v8"/></svg>
+          <span>Palace</span>
+          <span id="metric-drawers" class="tab-count">—</span>
+        </button>
+        <button id="tab-btn-kg" class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-kg" data-tab="kg" tabindex="-1" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M8.5 7.5 10.8 15.3"/><path d="M15.5 7.5 13.2 15.3"/><path d="M9 6h6"/></svg>
+          <span>Graph</span>
+          <span id="metric-kg-facts" class="tab-count">—</span>
+        </button>
+        <button id="tab-btn-logstream" class="tab-btn" role="tab" aria-selected="false" aria-controls="panel-logstream" data-tab="logstream" tabindex="-1" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+          <span>Logstream</span>
+          <span id="metric-events" class="tab-count">—</span>
+        </button>
+      </nav>
+
+      <div class="topbar-actions">
+        <button id="workspace-wing-pill" class="badge badge-workspace hidden" type="button" aria-pressed="false" title="Toggle scope to active workspace wing"></button>
+        <span id="engine-badge" class="badge badge-engine" title="Storage backend and vector engine status">sqlite · warming…</span>
+        <span id="version-badge" class="badge badge-subtle">v3.12.0</span>
+        <button id="btn-refresh" class="icon-btn" type="button" title="Refresh &amp; Reconnect Palace (j/k navigate cards, / search)" aria-label="Refresh Palace">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+            <path d="M3 3v5h5"/>
+            <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
+            <path d="M16 16h5v5"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Diagnostic / Setup Fallback Banner -->
+    <section id="setup-banner" class="setup-banner hidden" role="alert">
+      <div class="setup-banner-header">
+        <strong>MemPalace Bridge Diagnostic</strong>
+        <div class="setup-banner-actions">
+          <button id="btn-retry-bridge" class="btn btn-secondary btn-xs" type="button">Retry Bridge</button>
+          <button id="btn-ask-agent-setup" class="btn btn-primary btn-xs" type="button">Ask Agent to Configure</button>
+        </div>
+      </div>
+      <p id="setup-banner-msg" class="setup-banner-msg"></p>
+    </section>
+
+    <!-- Main Viewport -->
+    <main class="panels-viewport">
+      <!-- TAB 1: RECALL (SEARCH) -->
+      <section id="panel-recall" class="tab-panel active" role="tabpanel" aria-labelledby="tab-btn-recall">
+        <form id="search-form" class="toolbar-form" autocomplete="off">
+          <div class="search-input-wrap">
+            <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+            <input id="search-query" class="input search-input" type="search" placeholder="Search verbatim memories… (type for instant FTS5, Enter for Hybrid)" aria-label="Search memory palace" />
+            <button type="submit" class="btn btn-primary btn-sm">Find</button>
+          </div>
+          <div class="filter-row">
+            <select id="search-wing" class="select" aria-label="Filter by Wing">
+              <option value="">All Wings</option>
+            </select>
+            <select id="search-room" class="select" aria-label="Filter by Room">
+              <option value="">All Rooms</option>
+            </select>
+            <select id="search-strategy" class="select" aria-label="Search strategy" title="Instant FTS5 runs in ~7ms; Hybrid combines Vector similarity with BM25">
+              <option value="union">Hybrid (Vector + BM25)</option>
+              <option value="lexical">Instant FTS5 (~7ms)</option>
+              <option value="vector">Vector Semantic Only</option>
+            </select>
+          </div>
+          <!-- Quick Top Wings Scroller -->
+          <div id="search-wings-bar" class="wing-quick-bar" aria-label="Quick Wing Filter"></div>
+        </form>
+
+        <div id="search-meta-bar" class="meta-bar hidden"></div>
+        <div id="search-results" class="card-list">
+          <div class="empty-state">
+            <p class="empty-title">Search your memory palace</p>
+            <p class="empty-sub">Start typing for sub-10ms FTS5 lexical recall, or press Enter for full Hybrid (Vector + BM25) semantic recall. Use j/k to navigate cards and Enter to inspect.</p>
+            <div class="quick-chips">
+              <button class="chip" type="button" data-quick-search="architectural decisions">architectural decisions</button>
+              <button class="chip" type="button" data-quick-search="antigravity plugin">antigravity plugin</button>
+              <button class="chip" type="button" data-quick-search="coordination protocol">coordination protocol</button>
+              <button class="chip" type="button" data-quick-search="performance optimization">performance optimization</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: PALACE BROWSER (WINGS -> ROOMS -> DRAWERS) -->
+      <section id="panel-palace" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-palace" hidden>
+        <div class="palace-controls">
+          <div class="filter-row">
+            <select id="palace-wing-select" class="select" aria-label="Select Wing">
+              <option value="">All Wings</option>
+            </select>
+            <select id="palace-room-select" class="select" aria-label="Select Room">
+              <option value="">All Rooms</option>
+            </select>
+            <select id="palace-sort-select" class="select" aria-label="Sort order">
+              <option value="recent">Newest First</option>
+              <option value="storage">Fast Storage Order (1ms)</option>
+            </select>
+            <button id="palace-reset-filters-btn" class="btn btn-secondary btn-xs hidden" type="button" title="Clear active Wing and Room filters">Clear</button>
+          </div>
+          <!-- Distilled Single-Row Quick Wings + Disclosure Toggles -->
+          <div class="palace-quick-row">
+            <div id="palace-wings-bar" class="wing-quick-bar" aria-label="Wings Navigator"></div>
+            <div class="disclosure-actions">
+              <button id="btn-toggle-rooms" class="chip chip-toggle" type="button" aria-expanded="false" aria-controls="palace-rooms-strip" title="Show or hide top Room filters">
+                <span>Rooms</span>
+                <span id="metric-rooms" class="chip-count">—</span>
+              </button>
+              <button id="btn-toggle-tunnels" class="chip chip-toggle" type="button" aria-expanded="false" aria-controls="palace-tunnels-strip" title="Cross-wing rooms that connect 2 or more wings">
+                <span>⇄ Tunnels</span>
+                <span id="metric-tunnels-sub" class="chip-count">—</span>
+              </button>
+            </div>
+          </div>
+          <!-- Progressively Disclosed Rooms & Tunnels Strips -->
+          <div id="palace-rooms-strip" class="chip-strip hidden" aria-label="Rooms in selected wing"></div>
+          <div id="palace-tunnels-strip" class="tunnels-strip hidden" aria-label="Cross-wing tunnels"></div>
+        </div>
+
+        <div class="meta-bar">
+          <span id="palace-drawers-summary">Loading drawers…</span>
+          <div class="pagination-group">
+            <button id="palace-prev-btn" class="btn btn-secondary btn-xs" type="button" disabled>← Prev</button>
+            <label class="page-jump-label" for="palace-page-input">
+              <span>Page</span>
+              <input id="palace-page-input" class="page-input" type="number" min="1" value="1" aria-label="Page number" />
+              <span id="palace-page-total">of 1</span>
+            </label>
+            <button id="palace-next-btn" class="btn btn-secondary btn-xs" type="button" disabled>Next →</button>
+          </div>
+        </div>
+
+        <div id="palace-drawers-list" class="card-list"></div>
+      </section>
+
+      <!-- TAB 3: KNOWLEDGE GRAPH -->
+      <section id="panel-kg" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-kg" hidden>
+        <form id="kg-form" class="toolbar-form" autocomplete="off">
+          <div class="search-input-wrap">
+            <svg class="search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><path d="M8.5 7.5 10.8 15.3"/><path d="M15.5 7.5 13.2 15.3"/></svg>
+            <input id="kg-entity-input" class="input search-input" type="search" placeholder="Filter entity (e.g. mempalace, chromadb, antigravity)…" aria-label="Entity name" />
+            <button type="submit" class="btn btn-primary btn-sm">Query</button>
+          </div>
+          <div class="filter-row">
+            <select id="kg-direction" class="select" aria-label="Relationship direction">
+              <option value="both">Both Directions</option>
+              <option value="outgoing">Outgoing (Subject →)</option>
+              <option value="incoming">Incoming (→ Object)</option>
+            </select>
+            <input id="kg-as-of" class="input input-sm" type="date" aria-label="Valid as of date" title="Time-travel query: view facts valid on this date" />
+            <button id="kg-clear-btn" class="btn btn-secondary btn-xs" type="button">Reset</button>
+          </div>
+        </form>
+
+        <!-- Entity Quick Chips -->
+        <div id="kg-entity-chips" class="chip-strip" aria-label="Sampled Knowledge Graph Entities"></div>
+
+        <!-- Interactive SVG Neighborhood Graph -->
+        <div id="kg-graph-box" class="kg-graph-box">
+          <div class="kg-graph-header">
+            <span id="kg-graph-title" class="kg-graph-title">Entity Neighborhood</span>
+            <span class="kg-graph-hint">Click or press Enter on any node to pivot</span>
+          </div>
+          <svg id="kg-svg" class="kg-svg" viewBox="0 0 560 220" role="img" aria-label="Entity relationship graph"></svg>
+        </div>
+
+        <div id="kg-meta-bar" class="meta-bar"></div>
+        <div id="kg-triples-list" class="card-list"></div>
+      </section>
+
+      <!-- TAB 4: LOGSTREAM & DIARIES -->
+      <section id="panel-logstream" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-logstream" hidden>
+        <div class="subtab-bar">
+          <div class="subtab-group" role="tablist" aria-label="Coordination Views">
+            <button id="subtab-events" class="subtab-btn active" role="tab" aria-selected="true" data-subtab="events" type="button">Logstream Events</button>
+            <button id="subtab-diary" class="subtab-btn" role="tab" aria-selected="false" data-subtab="diary" type="button">Agent Diaries</button>
+          </div>
+          <label class="live-toggle" title="Auto-poll logstream every 5s">
+            <input id="events-live-checkbox" class="sr-only" type="checkbox" />
+            <span class="live-dot"></span>
+            <span>Live (5s)</span>
+          </label>
+        </div>
+
+        <!-- Subview A: Logstream Events -->
+        <div id="subview-events">
+          <!-- Quick Preset Filter Pills -->
+          <div id="events-preset-bar" class="chip-strip preset-strip" aria-label="Logstream Quick Presets">
+            <button class="chip active" type="button" aria-pressed="true" data-event-preset="all">All Recent</button>
+            <button class="chip" type="button" aria-pressed="false" data-event-preset="open_tasks">Open Tasks</button>
+            <button class="chip" type="button" aria-pressed="false" data-event-preset="claimed">Claimed</button>
+            <button class="chip" type="button" aria-pressed="false" data-event-preset="patches">Patches Ready</button>
+            <button class="chip" type="button" aria-pressed="false" data-event-preset="inbox">My Antigravity Inbox</button>
+          </div>
+          <div class="toolbar-form">
+            <div class="filter-row">
+              <select id="events-room" class="select" aria-label="Filter by Room">
+                <option value="">All Rooms</option>
+                <option value="delegation">delegation</option>
+                <option value="reviews">reviews</option>
+                <option value="status">status</option>
+              </select>
+              <select id="events-type" class="select" aria-label="Filter by Event Type">
+                <option value="">All Event Types</option>
+                <option value="task.request">task.request</option>
+                <option value="task.reply">task.reply</option>
+                <option value="patch.ready">patch.ready</option>
+                <option value="event.ack">event.ack</option>
+                <option value="status">status</option>
+                <option value="note">note</option>
+              </select>
+              <select id="events-status" class="select" aria-label="Filter by Status">
+                <option value="">Any Status</option>
+                <option value="open">open</option>
+                <option value="claimed">claimed</option>
+                <option value="applied">applied</option>
+                <option value="blocked">blocked</option>
+                <option value="failed">failed</option>
+              </select>
+            </div>
+            <div class="filter-row">
+              <input id="events-to-agent" class="input input-sm" type="text" placeholder="to_agent (e.g. windows:antigravity:mempalace)" aria-label="Filter by recipient agent" />
+              <input id="events-correlation" class="input input-sm" type="text" placeholder="correlation_id (task_…)" aria-label="Filter by correlation ID" />
+              <button id="events-filter-btn" class="btn btn-primary btn-xs" type="button">Filter</button>
+              <button id="events-clear-btn" class="btn btn-secondary btn-xs" type="button">Clear</button>
+            </div>
+          </div>
+
+          <div id="events-meta-bar" class="meta-bar"></div>
+          <div id="events-list" class="card-list"></div>
+        </div>
+
+        <!-- Subview B: Agent Diaries -->
+        <div id="subview-diary" class="hidden">
+          <form id="diary-form" class="toolbar-form" autocomplete="off">
+            <div class="filter-row">
+              <input id="diary-agent" class="input input-sm" type="text" placeholder="Agent identity (leave empty for all diary drawers)…" aria-label="Agent identity" />
+              <select id="diary-wing" class="select" aria-label="Filter diary by Wing">
+                <option value="">All Wings</option>
+              </select>
+              <button type="submit" class="btn btn-primary btn-xs">Load</button>
+            </div>
+          </form>
+          <div id="diary-meta-bar" class="meta-bar"></div>
+          <div id="diary-list" class="card-list"></div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Modal Drawer / Artifact Inspector -->
+    <aside id="inspector-modal" class="inspector-modal hidden" role="dialog" aria-modal="true" aria-labelledby="inspector-title">
+      <div class="inspector-backdrop" data-close-inspector></div>
+      <div class="inspector-sheet">
+        <header class="inspector-header">
+          <h2 id="inspector-title" class="inspector-title">Drawer Inspector</h2>
+          <div class="inspector-actions">
+            <button id="inspector-cite-btn" class="btn btn-primary btn-xs" type="button">Cite in Chat</button>
+            <button id="inspector-copy-btn" class="btn btn-secondary btn-xs" type="button">Copy Verbatim</button>
+            <button id="inspector-close-btn" class="icon-btn" type="button" aria-label="Close inspector" data-close-inspector>✕</button>
+          </div>
+        </header>
+        <div id="inspector-meta" class="inspector-meta"></div>
+        <pre id="inspector-body" class="inspector-body"></pre>
+      </div>
+    </aside>
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

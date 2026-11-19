@@ -11,10 +11,11 @@ a DSH bundle plugin with three rows:
 | `mempalace-mcp` | Serves the palace through DSH's own MCP client with MemPalace's light server: three PQL tools, `mcp__mempalace__palace_query` and friends |
 
 Sister plugins for other harnesses live alongside it: `.claude-plugin/`,
-`.codex-plugin/`, `.cursor-plugin/`, `.antigravity-plugin/`.
+`.codex-plugin/`, `.cursor-plugin/`, `plugins/mempalace/`.
 
 Built against DSH `0.1.5` (its `dsh-agent`, `dsh-session`, `dsh-system-prompt`
-and `dsh-subprocess` extension points).
+and `dsh-subprocess` extension points). Also works on `0.2.x`, where
+`agent/session-start` was renamed to `agent/created`.
 
 ## Requirements
 

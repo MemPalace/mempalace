@@ -40,6 +40,16 @@ def _ready_provider(monkeypatch, model=None):
     return provider, fake
 
 
+def _require_scipy():
+    """Skip audio tests that need scipy (part of the ``mempalace[multimodal]`` extra).
+
+    These tests decode a real sample array and pass it to ``_mono_float32``,
+    which imports ``scipy.signal.resample_poly`` unconditionally — so they
+    require scipy even when the input already sits at 16 kHz.
+    """
+    pytest.importorskip("scipy")
+
+
 @pytest.mark.parametrize("dimension", [768, 512, 256, 128])
 def test_dimension_and_unit_norm(dimension, monkeypatch):
     provider = EmbeddingGemma2EmbeddingFunction(dimension=dimension, device="cpu")
@@ -396,6 +406,7 @@ def test_image_embedding_accepts_local_path_and_pil_image(tmp_path, monkeypatch)
 
 
 def test_audio_dict_is_downmixed_and_resampled_before_embedding(monkeypatch):
+    _require_scipy()
     provider, model = _ready_provider(monkeypatch, _FakeModel())
     provider.modalities = "text+audio"
     stereo = np.ones((8, 2), dtype=np.float32)
@@ -412,6 +423,7 @@ def test_audio_dict_is_downmixed_and_resampled_before_embedding(monkeypatch):
 
 
 def test_audio_path_is_decoded_to_mono_16khz(tmp_path, monkeypatch):
+    _require_scipy()
     from scipy.io import wavfile
 
     provider, model = _ready_provider(monkeypatch, _FakeModel())
@@ -428,6 +440,7 @@ def test_audio_path_is_decoded_to_mono_16khz(tmp_path, monkeypatch):
 
 
 def test_m4a_uses_torchcodec_when_soundfile_cannot_decode(tmp_path, monkeypatch):
+    _require_scipy()
     import types
 
     provider, model = _ready_provider(monkeypatch, _FakeModel())
@@ -469,6 +482,7 @@ def test_m4a_uses_torchcodec_when_soundfile_cannot_decode(tmp_path, monkeypatch)
 
 
 def test_audio_path_keeps_soundfile_samples_when_decode_succeeds(tmp_path, monkeypatch):
+    _require_scipy()
     import types
 
     provider, model = _ready_provider(monkeypatch, _FakeModel())
@@ -498,6 +512,7 @@ def test_m4a_without_soundfile_or_torchcodec_has_actionable_error(tmp_path, monk
 
 
 def test_m4a_uses_torchcodec_when_soundfile_is_unavailable(tmp_path, monkeypatch):
+    _require_scipy()
     import types
 
     audio_path = tmp_path / "clip.m4a"

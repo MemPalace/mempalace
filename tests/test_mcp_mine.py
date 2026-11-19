@@ -654,3 +654,41 @@ def test_generic_exception_carries_error_class(monkeypatch, config, tmp_dir):
     assert result["success"] is False
     assert "mine failed" in result["error"]
     assert result.get("error_class") == "RuntimeError"
+
+
+# ── Memory handed back after a mine (#2685) ──────────────────────────────
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_mine_returns_freed_heap_only_after_a_real_mine(monkeypatch, config, tmp_dir, dry_run):
+    """#2685: a long-lived server must trim the heap a mine freed, or its
+    resident size stays near the mine's peak. A dry run writes nothing and
+    skips it."""
+    from mempalace import mcp_server
+
+    trims = []
+    monkeypatch.setattr(mcp_server, "_return_freed_heap_to_os", lambda: trims.append(1))
+
+    _patch(monkeypatch, config)
+    src = os.path.join(tmp_dir, "convos")
+    os.makedirs(src)
+    _write(os.path.join(src, "chat.txt"), "> What is memory?\nMemory is persistence.\n")
+
+    result = mcp_server.tool_mine(source=src, mode="convos", wing="test_convos", dry_run=dry_run)
+
+    assert result["success"] is True
+    assert trims == ([] if dry_run else [1])
+
+
+def test_return_freed_heap_never_raises(monkeypatch):
+    """Platforms without ``malloc_trim`` must not turn a finished mine into an error."""
+    import ctypes
+
+    from mempalace import mcp_server
+
+    def no_libc(*_args, **_kwargs):
+        raise OSError("no libc")
+
+    monkeypatch.setattr(ctypes, "CDLL", no_libc)
+
+    mcp_server._return_freed_heap_to_os()
