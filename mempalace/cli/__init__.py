@@ -88,6 +88,7 @@ _FRAGMENTS = (
     "cmd_sync.py",
     "cmd_query.py",
     "cmd_audit.py",
+    "cmd_room_suggestions.py",
     "cmd_rooms.py",
     "cmd_wings.py",
     "cmd_kg.py",
