@@ -15,7 +15,7 @@ conformance suite land in follow-up PRs.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import ClassVar, Optional, Protocol, runtime_checkable
+from typing import ClassVar, Iterable, Optional, Protocol, runtime_checkable
 
 from ..timeutil import recency_key
 
@@ -867,6 +867,31 @@ class BaseCollection(ABC):
 # ---------------------------------------------------------------------------
 
 
+@runtime_checkable
+class RecentReader(Protocol):
+    """Reads the newest records of a collection without opening it.
+
+    What :meth:`BaseBackend.recent_reader` returns. Both methods follow the
+    :class:`BaseCollection` contract of the same name, with one addition:
+    ``metadata_keys`` limits ``get_recent`` to those metadata keys (no
+    documents), so a caller can rank a wide window cheaply and then ``get``
+    the few records it keeps. A read the reader cannot answer raises; the
+    caller falls back to the collection.
+    """
+
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+        metadata_keys: Optional[Iterable[str]] = None,
+    ) -> GetResult: ...
+
+    def get(self, *, ids: list[str], include: Optional[list[str]] = None) -> GetResult: ...
+
+
 class BaseBackend(ABC):
     """Long-lived factory serving many palaces (RFC 001 §2).
 
@@ -926,6 +951,20 @@ class BaseBackend(ABC):
         create: bool = False,
         options: Optional[dict] = None,
     ) -> BaseCollection: ...
+
+    def recent_reader(self, *, palace: PalaceRef, collection_name: str) -> "Optional[RecentReader]":
+        """A :class:`RecentReader` over ``collection_name``, or ``None``.
+
+        For a backend whose collection open costs far more than a read of the
+        newest records (Chroma: importing chromadb and building a client). A
+        short-lived caller that needs nothing else, such as wake-up, reads
+        through it and never opens the collection. ``None``, the default,
+        means there is no cheaper way in than :meth:`get_collection`.
+
+        Raises as ``get_collection(create=False)`` does for a palace or
+        collection that is not there.
+        """
+        return None
 
     def close_palace(self, palace: PalaceRef) -> None:
         """Evict cached handles for a single palace. Default: no-op."""

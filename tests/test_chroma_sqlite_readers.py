@@ -724,3 +724,142 @@ def test_wing_names_are_read_off_the_string_index(palace, monkeypatch):
         for statement in selects:
             plan = " ".join(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + statement))
             assert "embedding_metadata_string_value" in plan, (statement, plan)
+
+
+def _reader(palace_path):
+    return chroma.ChromaBackend().recent_reader(
+        palace=PalaceRef(id=palace_path, local_path=palace_path), collection_name=_NAME
+    )
+
+
+def test_recent_reader_matches_the_collection(palace):
+    """The reader that skips the Chroma open returns what the collection does."""
+    palace_path, col = palace
+    reader = _reader(palace_path)
+    wings = {"wing": {"$in": ["my_app", "my-app", "wing_my_app"]}}
+    for where in (None, wings, {"$and": [wings, {"room": "notes"}]}):
+        assert _records(reader.get_recent(limit=20, where=where)) == _records(
+            col.get_recent(limit=20, where=where)
+        )
+    assert reader.get_recent(limit=0).ids == []
+    ids_only = reader.get_recent(limit=3, include=[])
+    assert (ids_only.ids, ids_only.documents, ids_only.metadatas) == (
+        col.get_recent(limit=3).ids,
+        [],
+        [],
+    )
+
+
+def test_recent_reader_reads_chosen_metadata_keys_only(palace, monkeypatch):
+    """``metadata_keys`` is the whole of what stage one loads: no documents and
+    no other cells, so picking a few drawers out of a 2000-drawer window costs
+    a few cells per drawer instead of every cell and every document."""
+    palace_path, col = palace
+    reader = _reader(palace_path)
+    full = col.get_recent(limit=20)
+    keys = ("filed_at", "ingest_mode", "is_sentinel", "n")
+
+    cells = []
+    opener = chroma_sqlite.open_palace_reader
+
+    class Conn(_CountingConn):
+        def execute(self, sql, *args):
+            if "FROM embedding_metadata WHERE id IN" in " ".join(sql.split()):
+                rows = self._conn.execute(sql, *args).fetchall()
+                cells.extend(row[1] for row in rows)
+                return iter(rows)
+            return self._conn.execute(sql, *args)
+
+    monkeypatch.setattr(chroma_sqlite, "open_palace_reader", lambda db: Conn(opener(db), {}))
+    narrow = reader.get_recent(limit=20, include=["metadatas"], metadata_keys=keys)
+    monkeypatch.undo()
+
+    assert narrow.ids == full.ids
+    assert narrow.documents == []
+    # A drawer holding none of the keys reads as one with no metadata.
+    assert narrow.metadatas == [
+        {k: v for k, v in (meta or {}).items() if k in keys} or None for meta in full.metadatas
+    ]
+    assert set(cells) <= set(keys) | {chroma_sqlite.FLAG}, sorted(set(cells))
+
+
+def test_recent_reader_gets_drawers_by_id(palace):
+    """Stage two: the chosen drawers, whole and decoded, by drawer id."""
+    palace_path, col = palace
+    reader = _reader(palace_path)
+    wanted = ["drawer_c", "missing", "drawer_b", "diary_2"]
+    got = reader.get(ids=wanted)
+    expected = col.get(ids=wanted, include=["documents", "metadatas"])
+    assert sorted(_records(got)) == sorted(_records(expected))
+    assert sorted(got.ids) == ["diary_2", "drawer_b", "drawer_c"]
+    assert reader.get(ids=[]).ids == []
+
+
+def test_recent_reader_refuses_what_sqlite_cannot_answer(palace, tmp_path):
+    palace_path, _ = palace
+    reader = _reader(palace_path)
+    with pytest.raises(chroma_sqlite.RecentReadUnavailable):
+        reader.get_recent(limit=5, where={"n": {"$gt": 1}})
+    with pytest.raises(chroma_sqlite.RecentReadUnavailable):
+        reader.get_recent(limit=5, include=["embeddings"])
+
+    backend = chroma.ChromaBackend()
+    missing = str(tmp_path / "nowhere")
+    with pytest.raises(chroma.PalaceNotFoundError):
+        backend.recent_reader(
+            palace=PalaceRef(id=missing, local_path=missing), collection_name=_NAME
+        )
+    with pytest.raises(chroma.CollectionNotInitializedError):
+        backend.recent_reader(
+            palace=PalaceRef(id=palace_path, local_path=palace_path), collection_name="nope"
+        )
+
+
+@pytest.mark.parametrize("naive_at, passes", [(None, 1), (45, 2), (58, 3)])
+def test_recent_read_reads_a_timestamp_form_only_when_it_must(
+    tmp_path, monkeypatch, naive_at, passes
+):
+    """Text order is instant order only within one timestamp form, so the
+    read takes each form's newest rows. When the newest ``limit`` by text all
+    carry one form they already are that form's newest, and the other form is
+    read only if a value from the floor up carries it."""
+    path = tmp_path / "palace"
+    col = chroma.ChromaBackend().get_collection(
+        palace=PalaceRef(id=str(path), local_path=str(path)),
+        collection_name=_NAME,
+        create=True,
+    )
+    total = 60
+    # Six drawers to a timestamp, the way a mined file stamps its drawers.
+    stamps = [f"2026-03-01T00:00:{i // 6:02d}+00:00" for i in range(total)]
+    if naive_at is not None:
+        stamps[naive_at] = stamps[naive_at][:-6]  # naive local (UTC in tests)
+    col.add(
+        ids=[f"d{i:02d}" for i in range(total)],
+        documents=[f"doc {i}" for i in range(total)],
+        metadatas=[{"wing": "w", "filed_at": stamp} for stamp in stamps],
+        embeddings=[[float(i), 1.0, 0.5] for i in range(total)],
+    )
+    statements = []
+    opener = chroma_sqlite.open_palace_reader
+
+    def traced(db_path):
+        conn = opener(db_path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(chroma_sqlite, "open_palace_reader", traced)
+    newest = col.get_recent(limit=10, include=[]).ids
+    monkeypatch.undo()
+
+    assert sorted(newest) == [f"d{i:02d}" for i in (48, 49, 50, 51, 54, 55, 56, 57, 58, 59)]
+    ordered = [s for s in statements if "ORDER BY o.string_value DESC" in s]
+    assert len(ordered) == passes, ordered
+
+
+def test_form_probe_gives_up_on_too_many_distinct_timestamps(palace):
+    palace_path, _ = palace
+    with closing(sqlite3.connect(os.path.join(palace_path, "chroma.sqlite3"))) as conn:
+        assert chroma_sqlite._forms_from(conn, "filed_at", "") == {False}
+        assert chroma_sqlite._forms_from(conn, "filed_at", "2027") == set()
+        assert chroma_sqlite._forms_from(conn, "filed_at", "", most=3) is None

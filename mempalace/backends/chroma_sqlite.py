@@ -26,6 +26,10 @@ class MetadataRecoveryPending(sqlite3.OperationalError):
     """The persisted metadata projection needs the normal Chroma recovery path."""
 
 
+class RecentReadUnavailable(sqlite3.OperationalError):
+    """``chroma.sqlite3`` alone cannot answer this recent read; open the collection."""
+
+
 # Embeddings of one collection. A VECTOR-segment row (HNSW bookkeeping, or a
 # future chroma that stores one) is not a drawer; joining it returns a ghost
 # with empty document and metadata.
@@ -68,6 +72,11 @@ def _has_collection(conn, collection_name: str) -> bool:
         conn.execute("SELECT 1 FROM collections WHERE name = ?", (collection_name,)).fetchone()
         is not None
     )
+
+
+def _sqlite_has_collection(palace_path: str, collection_name: str) -> Optional[bool]:
+    """Whether the palace database holds ``collection_name``; ``None`` if unreadable."""
+    return _read_db(palace_path, lambda conn: _has_collection(conn, collection_name))
 
 
 def _marks(values) -> str:
@@ -163,16 +172,26 @@ def _metadata_value_columns(conn) -> list[str]:
     return [c for c in ("string_value", "int_value", "float_value", "bool_value") if c in present]
 
 
-def _decoded_rows(conn, row_ids, where: Optional[dict] = None) -> list[tuple]:
+def _decoded_rows(
+    conn, row_ids, where: Optional[dict] = None, keys: Optional[Iterable[str]] = None
+) -> list[tuple]:
     """``(drawer_id, document, metadata)`` for ``row_ids``, in that order, decoded.
 
     The shape Chroma's ``get`` returns: a missing document is ``None``, as is
     the metadata of a drawer that has none. A key whose value cells are all
     NULL reads as ``None`` (see :func:`_scalar_rows`). ``where`` is tested
     against the stored metadata first, the way Chroma evaluates it.
+
+    ``keys`` reads those metadata keys and nothing else: no document, and one
+    primary-key seek per drawer and key instead of every cell of the drawer.
     """
     if not row_ids:
         return []
+    only_sql, only = "", []
+    if keys is not None:
+        # The escape flag says how to decode the values that are read.
+        only = list(dict.fromkeys([*keys, FLAG]))
+        only_sql = f" AND key IN ({_marks(only)})"
     columns = _metadata_value_columns(conn)
     cells_at = [
         columns.index(c) if c in columns else None
@@ -187,8 +206,8 @@ def _decoded_rows(conn, row_ids, where: Optional[dict] = None) -> list[tuple]:
             records[row_id] = [drawer_id, None, None]
         for row_id, key, *cells in conn.execute(
             f"SELECT id, key, {', '.join(columns)} FROM embedding_metadata"
-            f" WHERE id IN ({_marks(chunk)})",
-            chunk,
+            f" WHERE id IN ({_marks(chunk)}){only_sql}",
+            [*chunk, *only],
         ):
             record = records.get(row_id)
             if record is None:
@@ -640,6 +659,50 @@ _UTC_FORM_SQL = (
 )
 
 
+def _is_utc_form(value) -> bool:
+    """:data:`_UTC_FORM_SQL` for one value."""
+    return isinstance(value, str) and (value.endswith("+00:00") or value[-1:] in ("Z", "z"))
+
+
+# Most distinct timestamps :func:`_forms_from` steps through before it gives
+# up; a read of fewer rows than this stops at its own ``limit``.
+_FORM_PROBE_MAX = 512
+
+
+def _forms_from(conn, order_field: str, floor: str, most: int = _FORM_PROBE_MAX) -> Optional[set]:
+    """Which forms (UTC: ``True``, any other: ``False``) the stored
+    ``order_field`` values from ``floor`` up take, or ``None`` if unknown.
+
+    One index seek per distinct value, where reading a form's rows walks every
+    row from the floor up: a mined file stamps all its drawers alike, so
+    thousands of rows often share a handful of values. Gives up after
+    ``most`` values, when stepping costs more than walking.
+    Counts every collection in the database, so a form it does not report is
+    absent from this one too.
+    """
+    values = [
+        row[0]
+        for row in conn.execute(
+            """
+            WITH RECURSIVE step(value, n) AS (
+                SELECT (SELECT MAX(string_value) FROM embedding_metadata
+                    WHERE key = :key AND string_value >= :floor AND string_value > ''), 1
+                UNION ALL
+                SELECT (SELECT MAX(string_value) FROM embedding_metadata
+                    WHERE key = :key AND string_value >= :floor AND string_value > ''
+                    AND string_value < step.value), n + 1
+                FROM step WHERE step.value IS NOT NULL AND n <= :most
+            )
+            SELECT value FROM step WHERE value IS NOT NULL
+            """,
+            {"key": order_field, "floor": floor, "most": most},
+        )
+    ]
+    if len(values) > most:
+        return None
+    return {_is_utc_form(value) for value in values}
+
+
 def _newest_first(rows: list) -> list:
     """``(id, timestamp, ...)`` rows by instant, newest first; ties and undated by id."""
     # Drawers filed in one batch share a timestamp (a mined file stamps all
@@ -667,6 +730,7 @@ def _sqlite_recent_records(
     equalities: list[tuple[str, tuple]],
     order_field: str,
     ids_only: bool = False,
+    metadata_keys: Optional[Iterable[str]] = None,
 ) -> Optional[list[tuple[str, str, Optional[dict]]]]:
     """Decoded ``(id, document, metadata)`` for the newest ``limit`` records.
 
@@ -676,6 +740,7 @@ def _sqlite_recent_records(
     its values. A missing document reads as ``""``. ``None`` when the database
     is missing or the read fails, so the caller can fall back to Chroma.
     ``ids_only`` skips document/metadata hydration and returns empty placeholders.
+    ``metadata_keys`` hydrates those metadata keys alone, with no documents.
     """
     filter_sql, filter_params = _match_sql(equalities, "e.id")
 
@@ -734,7 +799,16 @@ def _sqlite_recent_records(
             rows = newest()
             if len(rows) == limit:
                 floor = recency_floor(r[1] for r in rows)
-                for form in (_UTC_FORM_SQL, f"NOT ({_UTC_FORM_SQL})"):
+                # When every row so far carries one form, they already are
+                # that form's newest, and the other form is read only if some
+                # value from the floor up carries it.
+                seen = {_is_utc_form(r[1]) for r in rows}
+                stored = None
+                if len(seen) == 1:
+                    stored = _forms_from(conn, order_field, floor, min(limit, _FORM_PROBE_MAX))
+                for utc, form in ((True, _UTC_FORM_SQL), (False, f"NOT ({_UTC_FORM_SQL})")):
+                    if seen == {utc} or (stored is not None and utc not in stored):
+                        continue
                     rows += newest(f" AND o.string_value >= ? AND {form}", (floor,))
             row_ids = list(dict.fromkeys(r[0] for r in _newest_first(rows)))[:limit]
         # The filter-driven branch already ordered the undated rows.
@@ -765,7 +839,43 @@ def _sqlite_recent_records(
                     )
                 )
             return [(drawer_ids[i], "", None) for i in row_ids if i in drawer_ids]
-        return [(i, doc or "", meta) for i, doc, meta in _decoded_rows(conn, row_ids)]
+        return [
+            (i, doc or "", meta)
+            for i, doc, meta in _decoded_rows(conn, row_ids, keys=metadata_keys)
+        ]
+
+    return _read_db(palace_path, read)
+
+
+def sqlite_records_for_ids(
+    palace_path: str, collection_name: str, ids: Iterable[str]
+) -> Optional[list[tuple[str, Optional[str], Optional[dict]]]]:
+    """Decoded ``(id, document, metadata)`` for the drawers ``ids`` names.
+
+    In storage order; an id the collection does not hold is left out. Each id
+    is one seek on ``UNIQUE (segment_id, embedding_id)``. ``None`` when the
+    database is missing or the read fails.
+    """
+    wanted = list(dict.fromkeys(ids))
+
+    def read(conn):
+        row_ids: list[int] = []
+        for start in range(0, len(wanted), 500):
+            chunk = wanted[start : start + 500]
+            row_ids += [
+                r[0]
+                for r in conn.execute(
+                    f"""
+                    SELECT e.id
+                    FROM collections c
+                    JOIN segments s ON s.collection = c.id AND s.scope = 'METADATA'
+                    CROSS JOIN embeddings e ON e.segment_id = s.id
+                    WHERE c.name = ? AND e.embedding_id IN ({_marks(chunk)})
+                    """,
+                    (collection_name, *chunk),
+                )
+            ]
+        return _decoded_rows(conn, sorted(row_ids))
 
     return _read_db(palace_path, read)
 

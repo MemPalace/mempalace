@@ -411,6 +411,32 @@ def get_collection(
     return collection
 
 
+def get_recent_reader(
+    palace_path: str,
+    collection_name: Optional[str] = None,
+    backend: Optional[str] = None,
+):
+    """A handle whose ``get_recent`` reads the drawers, or ``None``.
+
+    The backend's :meth:`~mempalace.backends.base.BaseBackend.recent_reader`:
+    the newest-drawers read without the collection open, for callers that need
+    nothing else (wake-up). ``None`` when the backend has no such reader; use
+    :func:`get_collection` then. Raises as a read-only :func:`get_collection`
+    does for a palace or collection that is not there.
+    """
+    if collection_name is None:
+        from ..config import get_configured_collection_name
+
+        collection_name = get_configured_collection_name()
+    opener = getattr(get_backend_for_palace(palace_path, explicit=backend), "recent_reader", None)
+    if opener is None:
+        return None
+    return opener(
+        palace=PalaceRef(id=palace_path, local_path=palace_path),
+        collection_name=collection_name,
+    )
+
+
 def _backend_has_server_embedder(palace_path, backend) -> bool:
     """Whether the palace's backend advertises ``server_embedder``."""
     try:
