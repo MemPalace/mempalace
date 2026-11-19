@@ -8,8 +8,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
+  HTTP-capable clients connect to the running hub (`mempalace serve`)
+  directly instead of starting a `mempalace-light-mcp` stdio process per
+  chat; the full catalog stays at `/mcp`. The endpoint uses the same bearer
+  token policy, Host/Origin checks and request size limit as `/mcp`, follows
+  the hub's `--read-only`, and goes through the same writer guards and palace
+  locking. It takes JSON-RPC as `POST` with JSON replies only; `GET` answers
+  `405` because there is no SSE stream. For Codex, set
+  `url = "http://127.0.0.1:8765/mcp/light"` under
+  `[mcp_servers.mempalace-light]` (add `bearer_token_env_var` when the hub
+  has a token). ([#3025](https://github.com/MemPalace/mempalace/pull/3025))
+- **`mempalace_search` takes `candidate_strategy="lexical"`.** It runs the
+  backend's FTS5/BM25 search only, without loading the embedding model, and
+  the hub advertises it as the `search_lexical` capability. The light
+  `palace_query` passes it through.
+  ([#3021](https://github.com/MemPalace/mempalace/pull/3021))
+
+### Performance
+
+- **The Antigravity sidecar no longer loads a second copy of the palace.**
+  Its Python bridge starts on first use instead of with every IDE window
+  (set `MEMPALACE_SIDECAR_WARMUP=1` or `MEMPALACE_EAGER_WARMUP=1` to start
+  it eagerly). When a hub is running, overview, search, drawer, knowledge
+  graph, tunnel, diary, event and artifact requests are proxied to it, so the
+  bridge never imports `mempalace.mcp_server`, chromadb, onnxruntime or a
+  vector matrix; type-ahead search uses the hub's lexical search and falls
+  back to `union` on a hub without `search_lexical`. Without a hub, vectors
+  load on the first vector search and are unloaded after
+  `MEMPALACE_SIDECAR_IDLE_UNLOAD_SECONDS` of no use (default 300).
+  ([#3021](https://github.com/MemPalace/mempalace/pull/3021))
+- **`mempalace-light-mcp` stays light.** Starting it, `--help`, the
+  handshake and `tools/list` no longer import `mempalace.mcp_server`,
+  chromadb or numpy. With a hub running, `palace_query`, `palace_exec` and
+  `palace_coordinate` are forwarded to the hub and search results are
+  enriched from `tunnels.json` directly; the full server is imported only for
+  local operation, or when the hub goes away during a read.
+  ([#3022](https://github.com/MemPalace/mempalace/pull/3022))
+- **Long-lived server processes cap BLAS/OpenMP pools at one thread.**
+  OpenBLAS starts a worker and buffer per logical core when numpy loads, about
+  800 MB of commit charge on a 28-thread Windows host for an MCP server that
+  mostly waits; capped, the server's import costs about 61 MB.
+  `mempalace-mcp`, `mempalace-light-mcp`, `python -m mempalace.mcp_server`,
+  the `mempalace serve` hub and the Antigravity sidecar bridge default
+  `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to `1`;
+  a value you export wins.
+  ([#3022](https://github.com/MemPalace/mempalace/pull/3022))
+- **Looking up a drawer by an ID that is not stored no longer scans a
+  `sqlite_exact` palace.** The fallback filter on `parent_drawer_id` or the
+  legacy `parent_entry_id` decoded the whole collection; both fields are now
+  indexed and the lookup is a union of index seeks. On a 584,289-drawer
+  palace a missing-parent lookup went from 8.6 s to under 1 ms, and the same
+  request to a live hub from 9.0 s to 44 ms. The indexes are added
+  on the first writable open of an existing palace (6.4 s on that palace); a
+  read-only open leaves the schema alone.
+  ([#2998](https://github.com/MemPalace/mempalace/pull/2998))
+
 ### Bug Fixes
 
+- **Importing `mempalace` no longer caps the thread pools of the process.**
+  The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
+  set at package import, so CPU embedding (EmbeddingGemma through torch) ran
+  on one thread, `sqlite_exact` exact scans ran on one BLAS thread, and any
+  application that imports mempalace as a library (Hermes, notebooks) lost
+  its threads as well. The cap now lives only in the server entry points
+  listed above; `mempalace mine` and other CLI commands use every core again.
 - Re-mining a conversation transcript or a diary that was rewritten,
   compacted or shortened no longer destroys the text mined from the earlier
   version. Drawer ids are positional, so a re-mine wrote the new text over
@@ -38,7 +103,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [3.12.0] — 2026-11-09
+## [3.12.0] — 2026-11-12
 
 Mining keeps every byte of your sources, never leaves a file without its
 drawers when a write fails part-way, and stores your messages as written.
