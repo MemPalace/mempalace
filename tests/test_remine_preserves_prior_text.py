@@ -416,3 +416,46 @@ def test_a_batch_of_revisions_is_one_append_and_one_fsync(tmp_path, monkeypatch)
 def test_an_empty_batch_writes_nothing(tmp_path):
     assert append_drawer_revisions(str(tmp_path / "palace"), []) == []
     assert not (tmp_path / "palace").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
+@pytest.mark.parametrize("exists", [False, True])
+def test_the_journal_directory_is_private_to_its_owner(tmp_path, exists):
+    import stat
+
+    palace = tmp_path / "palace"
+    old_umask = os.umask(0o022)
+    try:
+        if exists:
+            palace.mkdir()
+            palace.chmod(0o755)
+        append_drawer_revisions(str(palace), [("a", "verbatim words", None)])
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(palace.stat().st_mode) == 0o700
+    assert stat.S_IMODE((palace / "drawer_revisions.jsonl").stat().st_mode) == 0o600
+
+
+def test_make_private_dir_skips_chmod_on_windows(tmp_path, monkeypatch):
+    from mempalace import fsio
+
+    def no_chmod(*args, **kwargs):
+        raise AssertionError("chmod called on Windows")
+
+    monkeypatch.setattr(fsio, "_WINDOWS", True)
+    monkeypatch.setattr(fsio.os, "chmod", no_chmod)
+    target = tmp_path / "a" / "b"
+    assert fsio.make_private_dir(target) == target
+    assert target.is_dir()
+
+
+def test_make_private_dir_tolerates_a_refused_chmod(tmp_path, monkeypatch):
+    from mempalace import fsio
+
+    def refused(*args, **kwargs):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(fsio, "_WINDOWS", False)
+    monkeypatch.setattr(fsio.os, "chmod", refused)
+    assert fsio.make_private_dir(tmp_path / "c").is_dir()

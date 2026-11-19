@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 from uuid import uuid4
 
-from .fsio import atomic_write_bytes
+from .fsio import atomic_write_bytes, make_private_dir
 from .stored_text import dumps_internal
 from .timeutil import utc_now_iso
 
@@ -57,8 +57,9 @@ def append_drawer_revisions(palace_path: str, revisions) -> list[str]:
     if not revisions:
         return []
     path = revisions_path(palace_path)
-    # A remote backend keeps no drawers on disk, so the directory may not exist yet.
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # A remote backend keeps no drawers on disk, so the directory may not exist
+    # yet. It holds verbatim text either way, so it is private to its owner.
+    make_private_dir(path.parent)
     revision_ids = []
     lines = []
     recorded_at = utc_now_iso()
