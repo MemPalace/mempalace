@@ -10,6 +10,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- `mempalace wake-up --wing <wing>` no longer skips its recent memories
+  ("Palace could not be read right now (TimeoutError)") when the wing holds
+  most of a large palace. Three reads on the way to the newest drawers were
+  slower than they needed to be. Listing the palace's wings to resolve a
+  wing's spellings scanned every metadata row on its first step, because the
+  statement did not rule out NULL and so could not use Chroma's partial
+  `(key, string_value)` index; every wing-scoped search and wake-up paid for
+  that scan. A wing matching at least half the dated drawers was read whole
+  and ordered in Python, where walking the `filed_at` index finds the newest
+  ones after a few thousand rows. And ordering a wing parsed every drawer's
+  timestamp, though the drawers of one mined file share one. In an
+  80,000-drawer palace the read for a 27,000-drawer wing took about a third
+  of the time it did, and the wing listing went from 120 ms to under 1 ms.
 - Re-mining a conversation transcript or a diary that was rewritten,
   compacted or shortened no longer destroys the text mined from the earlier
   version. Drawer ids are positional, so a re-mine wrote the new text over

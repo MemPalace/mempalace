@@ -6,6 +6,10 @@ drawer, a registry row and a sentinel, so a change to how these readers open
 the database, build their SQL or decode stored text shows up here.
 """
 
+import os
+import sqlite3
+from contextlib import closing
+
 import pytest
 
 from mempalace.backends import PalaceRef, chroma, chroma_sqlite
@@ -619,3 +623,104 @@ EXPECTED = {
         ],
     ),
 }
+
+
+class _CountingCursor:
+    """A cursor that counts the rows Python pulls out of SQLite."""
+
+    def __init__(self, cursor, counter):
+        self._cursor, self._counter = cursor, counter
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        self._counter["rows"] += len(rows)
+        return rows
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        self._counter["rows"] += row is not None
+        return row
+
+    def __iter__(self):
+        for row in self._cursor:
+            self._counter["rows"] += 1
+            yield row
+
+
+class _CountingConn:
+    def __init__(self, conn, counter):
+        self._conn, self._counter = conn, counter
+
+    def execute(self, *args):
+        return _CountingCursor(self._conn.execute(*args), self._counter)
+
+    def close(self):
+        self._conn.close()
+
+
+def test_recent_read_of_a_dense_wing_does_not_load_the_whole_wing(tmp_path, monkeypatch):
+    """A wing holding most of the palace is read newest-first off the
+    ``filed_at`` index. Loading every row of the wing to order it in Python
+    grows with the wing and overran the wake-up budget on a 50k-drawer wing."""
+    path = tmp_path / "palace"
+    col = chroma.ChromaBackend().get_collection(
+        palace=PalaceRef(id=str(path), local_path=str(path)),
+        collection_name=_NAME,
+        create=True,
+    )
+    total = 400
+    wings = ["big" if i % 10 else "small" for i in range(total)]
+    col.add(
+        ids=[f"d{i:03d}" for i in range(total)],
+        documents=[f"doc {i}" for i in range(total)],
+        metadatas=[
+            {"wing": wing, "filed_at": f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}+00:00"}
+            for i, wing in enumerate(wings)
+        ],
+        embeddings=[[float(i), 1.0, 0.5] for i in range(total)],
+    )
+    newest_big = [f"d{i:03d}" for i in reversed(range(total)) if wings[i] == "big"]
+    newest_small = [f"d{i:03d}" for i in reversed(range(total)) if wings[i] == "small"]
+
+    counter = {"rows": 0}
+    opener = chroma_sqlite.open_palace_reader
+    monkeypatch.setattr(
+        chroma_sqlite, "open_palace_reader", lambda db: _CountingConn(opener(db), counter)
+    )
+
+    assert col.get_recent(limit=5, where={"wing": "big"}).ids == newest_big[:5]
+    assert counter["rows"] < 100, counter  # the wing has 360 drawers
+
+    # Wing aliases (old spellings) arrive as $in and are still one dense filter.
+    counter["rows"] = 0
+    aliased = {"wing": {"$in": ["big", "wing_big", "Big"]}}
+    assert col.get_recent(limit=5, where=aliased).ids == newest_big[:5]
+    assert counter["rows"] < 100, counter
+
+    # A sparse wing is still read whole: the index walk would visit everything.
+    assert col.get_recent(limit=5, where={"wing": "small"}).ids == newest_small[:5]
+
+
+def test_wing_names_are_read_off_the_string_index(palace, monkeypatch):
+    """Every step of the wing listing seeks the ``(key, string_value)`` index.
+    That index is partial (``string_value IS NOT NULL``), so a statement that
+    does not rule NULL out scans every metadata row of the palace instead."""
+    palace_path, _ = palace
+    statements = []
+    opener = chroma_sqlite.open_palace_reader
+
+    def traced(db_path):
+        conn = opener(db_path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(chroma_sqlite, "open_palace_reader", traced)
+    assert chroma_sqlite.sqlite_wing_names(palace_path) == EXPECTED["wing_names"]
+    monkeypatch.undo()
+
+    selects = [s for s in statements if s.lstrip().upper().startswith("SELECT")]
+    assert selects
+    with closing(sqlite3.connect(os.path.join(palace_path, "chroma.sqlite3"))) as conn:
+        for statement in selects:
+            plan = " ".join(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + statement))
+            assert "embedding_metadata_string_value" in plan, (statement, plan)

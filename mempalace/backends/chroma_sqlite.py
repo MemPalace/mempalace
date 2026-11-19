@@ -619,6 +619,21 @@ def _sqlite_collection_has_rows(palace_path: str, collection_name: str) -> Optio
 # (see _sqlite_recent_records); larger ones walk the order_field index.
 _RECENT_FILTER_DRIVEN_MAX = 200_000
 
+
+def _filter_is_dense(conn, order_field: str, size: int) -> bool:
+    """Whether a filter matching ``size`` rows covers at least half the dated rows.
+
+    Counts dated rows off the index and stops at ``2 * size``, so the check
+    never reads more than twice what the filter itself matches.
+    """
+    dated = conn.execute(
+        "SELECT COUNT(*) FROM (SELECT 1 FROM embedding_metadata"
+        " WHERE key = ? AND string_value > '' LIMIT ?)",
+        (order_field, 2 * size + 1),
+    ).fetchone()[0]
+    return dated <= 2 * size
+
+
 # Timestamps carrying a UTC suffix; the rest are naive local or other forms.
 _UTC_FORM_SQL = (
     "(substr(o.string_value, -6) = '+00:00' OR substr(o.string_value, -1) IN ('Z', 'z'))"
@@ -627,8 +642,21 @@ _UTC_FORM_SQL = (
 
 def _newest_first(rows: list) -> list:
     """``(id, timestamp, ...)`` rows by instant, newest first; ties and undated by id."""
+    # Drawers filed in one batch share a timestamp (a mined file stamps all
+    # its drawers alike), so each distinct value is parsed once.
+    keys: dict = {}
+
+    def instant(row):
+        try:
+            return keys[row[1]]
+        except KeyError:
+            key = keys[row[1]] = recency_key(row[1])
+            return key
+        except TypeError:  # an unhashable value: not a timestamp
+            return recency_key(row[1])
+
     rows = sorted(rows, key=lambda r: r[0])
-    return sorted(rows, key=lambda r: recency_key(r[1]), reverse=True)
+    return sorted(rows, key=instant, reverse=True)
 
 
 def _sqlite_recent_records(
@@ -659,6 +687,13 @@ def _sqlite_recent_records(
         # matching rows and order them here.
         sizes = _equality_sizes(conn, equalities)
         filter_driven = bool(sizes) and min(sizes) <= _RECENT_FILTER_DRIVEN_MAX
+        # A single filter holding at least half the dated rows (one project
+        # wing that is most of the palace) is not sparse: reading it whole
+        # grows with the wing, while the index walk passes at most the other
+        # half before it has `limit` matches. With several filters the rows
+        # matching all of them may still be few, so those stay filter-driven.
+        if filter_driven and len(sizes) == 1 and sizes[0] > limit:
+            filter_driven = not _filter_is_dense(conn, order_field, sizes[0])
         if filter_driven:
             drive = sizes.index(min(sizes))
             drive_key, drive_values = equalities[drive]
@@ -748,7 +783,9 @@ def sqlite_wing_names(palace_path: str, limit: int = 10_000) -> Optional[list[st
 
     def read(conn):
         names: list[str] = []
-        row = conn.execute(sql).fetchone()
+        # The (key, string_value) index is partial on string_value IS NOT
+        # NULL: without that term the first step scans every metadata row.
+        row = conn.execute(sql + " AND string_value IS NOT NULL").fetchone()
         while row and row[0] is not None and len(names) < limit:
             names.append(row[0])
             row = conn.execute(sql + " AND string_value > ?", (row[0],)).fetchone()
