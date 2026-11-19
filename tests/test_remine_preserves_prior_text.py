@@ -165,6 +165,89 @@ def test_a_failed_journal_append_replaces_nothing_and_the_next_mine_converges(
     assert sorted(r["content"] for r in load_drawer_revisions(convo.palace)) == before
 
 
+def test_a_journal_failing_on_the_second_batch_keeps_that_batch_and_the_next_mine_converges(
+    tmp_path, monkeypatch
+):
+    """A rewrite spanning two upsert batches whose journal fails on the second.
+
+    Each batch is journaled before it is written, so the first batch's prior
+    text is in the journal and its drawers carry the new text, still marked
+    unfinished; the second batch and the prune never ran, so their prior text
+    is still stored. Nothing is lost, the file reads as not mined, and the
+    next mine journals the rest once without journaling the first batch again.
+    """
+    from mempalace import palace, revisions
+    from mempalace.palace import MineFileErrors, file_already_mined
+
+    # The palace fragments run in one namespace, so this is the size
+    # write_file_drawers batches by.
+    monkeypatch.setattr(palace, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    convo = _Convo(tmp_path)
+    convo.write(_answer("alpha"), _answer("bravo"), _answer("charlie"), _answer("delta"))
+    convo.mine()
+    rows = sorted(convo.rows(), key=lambda r: r[2]["chunk_index"])
+    before = {drawer_id: doc for drawer_id, doc, _ in rows}
+    assert len(before) == 4
+    order = [drawer_id for drawer_id, _, _ in rows]
+    first_batch, second_batch, pruned = order[:2], order[2:3], order[3:]
+
+    real_append = revisions.append_drawer_revisions
+    calls = []
+
+    def fails_second(palace_path, rows):
+        rows = list(rows)
+        calls.append([drawer_id for drawer_id, _, _ in rows])
+        if len(calls) == 2:
+            raise OSError(28, "No space left on device")
+        return real_append(palace_path, rows)
+
+    monkeypatch.setattr(revisions, "append_drawer_revisions", fails_second)
+    convo.write(_answer("echo"), _answer("foxtrot"), _answer("golf"))
+    _touch(convo.doc)
+    with pytest.raises(MineFileErrors):
+        convo.mine()
+
+    assert calls == [first_batch, second_batch]
+    journal = load_drawer_revisions(convo.palace)
+    assert {r["drawer_id"]: r["content"] for r in journal} == {d: before[d] for d in first_batch}
+    assert {r["metadata"]["revision_reason"] for r in journal} == {"remine_overwrite"}
+    stored = {drawer_id: (doc, meta) for drawer_id, doc, meta in convo.rows()}
+    assert set(stored) == set(before)
+    assert [w in stored[d][0] for d, w in zip(first_batch, ["echo", "foxtrot"])] == [True, True]
+    assert all(stored[d][1]["chunk_total"] == 4 for d in first_batch)  # 3 written + 1: unfinished
+    for drawer_id in second_batch + pruned:
+        assert stored[drawer_id][0] == before[drawer_id]
+    # Every prior body is either still stored or journaled.
+    kept = {doc for doc, _ in stored.values()} | {r["content"] for r in journal}
+    assert set(before.values()) <= kept
+    col = get_collection(convo.palace)
+    assert not file_already_mined(
+        col, str(convo.doc), check_mtime=True, extract_mode="exchange", owner="convo"
+    )
+
+    monkeypatch.setattr(revisions, "append_drawer_revisions", real_append)
+    convo.mine()
+
+    after = sorted(convo.rows(), key=lambda r: r[2]["chunk_index"])
+    assert [w in r[1] for r, w in zip(after, ["echo", "foxtrot", "golf"])] == [True] * 3
+    assert len(after) == 3 and all(r[2]["chunk_total"] == 3 for r in after)
+    journal = load_drawer_revisions(convo.palace)
+    assert sorted(r["drawer_id"] for r in journal) == sorted(before)  # each prior body once
+    assert {r["drawer_id"]: r["content"] for r in journal} == before
+    reasons = {r["drawer_id"]: r["metadata"]["revision_reason"] for r in journal}
+    assert reasons == {
+        **dict.fromkeys(first_batch + second_batch, "remine_overwrite"),
+        **dict.fromkeys(pruned, "remine_prune"),
+    }
+    assert file_already_mined(
+        get_collection(convo.palace),
+        str(convo.doc),
+        check_mtime=True,
+        extract_mode="exchange",
+        owner="convo",
+    )
+
+
 def test_a_preserving_refile_without_a_palace_path_refuses_to_overwrite(tmp_path):
     palace = str(tmp_path / "palace")
     col = get_collection(palace)
