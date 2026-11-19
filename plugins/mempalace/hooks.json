@@ -1,0 +1,22 @@
+{
+  "mempalace-save": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./scripts/save-hook.mjs",
+        "timeout": 30
+      }
+    ]
+  },
+  "mempalace-wake": {
+    "enabled": true,
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./scripts/wake-hook.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}

@@ -14,6 +14,25 @@ codex mcp add mempalace-light -- mempalace-light-mcp
 
 Side-by-side with the existing 47-tool server: keep `mempalace` pointing at `mempalace-mcp`, and register the 3-tool server as `mempalace-light`.
 
+### Connect directly to a running hub
+
+HTTP-capable clients can share the hub's three-tool endpoint at `/mcp/light`.
+This serves the lightweight catalog from the running MemPalace process and avoids
+starting a local stdio proxy for every chat. The full catalog remains at `/mcp`.
+
+For a local hub on port 8765, use this in Codex's `config.toml`.
+
+```toml
+[mcp_servers.mempalace-light]
+url = "http://127.0.0.1:8765/mcp/light"
+```
+
+If the hub uses a bearer token, add `bearer_token_env_var = "MEMPALACE_MCP_HTTP_TOKEN"`
+to that entry and set the variable in Codex's environment to the hub's token.
+For a hub reached over the network, use its HTTPS address. The endpoint follows
+the hub's read-only settings and requires the hub to be running. The stdio client
+supports local operation when a hub is unavailable.
+
 ### With Custom Palace Path
 ```bash
 claude mcp add mempalace-light -- mempalace-light-mcp --palace /path/to/palace

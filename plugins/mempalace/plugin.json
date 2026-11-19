@@ -1,0 +1,29 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "mempalace",
+  "displayName": "MemPalace",
+  "version": "3.12.0",
+  "description": "Local-first verbatim AI memory palace: visual Aux Pane explorer, hybrid recall, temporal knowledge graph, auto-save hooks, and agent coordination.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Search my memory palace for recent architectural decisions",
+    "Show my palace status, wings, rooms, and knowledge graph stats",
+    "Check my MemPalace logstream inbox for open agent tasks"
+  ],
+  "author": {
+    "name": "MemPalace",
+    "url": "https://github.com/MemPalace/mempalace"
+  },
+  "homepage": "https://github.com/MemPalace/mempalace",
+  "repository": "https://github.com/MemPalace/mempalace",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "palace",
+    "recall",
+    "knowledge-graph",
+    "mcp",
+    "chromadb",
+    "coordination"
+  ]
+}
