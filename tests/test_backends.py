@@ -2290,15 +2290,18 @@ def test_quarantine_invalid_hnsw_metadata_allows_uninitialized_segment(tmp_path)
 
 
 def _persistent_data(labels: dict, label_to_id: dict, total: int):
-    from chromadb.segment.impl.vector.local_persistent_hnsw import PersistentData
+    """Plain dict payload, the shape a supported chromadb writer persists.
 
-    return PersistentData(
-        dimensionality=None,
-        total_elements_added=total,
-        id_to_label=labels,
-        label_to_id=label_to_id,
-        id_to_seq_id={},
-    )
+    Building ``PersistentData`` instead needs the optional ``hnswlib`` import,
+    which a normal install (and CI) does not have.
+    """
+    return {
+        "dimensionality": None,
+        "total_elements_added": total,
+        "id_to_label": labels,
+        "label_to_id": label_to_id,
+        "id_to_seq_id": {},
+    }
 
 
 def _write_colliding_segment(tmp_path, label_count, colliding_labels):
@@ -2331,9 +2334,12 @@ def test_quarantine_invalid_hnsw_metadata_repairs_tiny_label_collisions(tmp_path
     persisted = _SafePersistentDataUnpickler.load(str(seg / "index_metadata.pickle"))
     labels = persisted["id_to_label"] if isinstance(persisted, dict) else persisted.id_to_label
     by_label = persisted["label_to_id"] if isinstance(persisted, dict) else persisted.label_to_id
-    assert len(labels) == len(by_label) == 39997
-    assert not any(label in by_label for label in (39354, 39355, 39356))
+    # The shared labels keep the id label_to_id already held; only the extra
+    # drawer ids go, so the labels stay in the graph and remain queryable.
+    assert len(labels) == len(by_label) == 40000
+    assert not any(key.startswith("drawer-dup-") for key in labels)
     assert all(by_label[label] == item_id for item_id, label in labels.items())
+    assert by_label[39354] == "drawer-39354"
 
 
 def test_quarantine_invalid_hnsw_metadata_quarantines_large_label_mismatches(tmp_path):
@@ -2375,8 +2381,9 @@ def test_quarantine_invalid_hnsw_metadata_repairs_dict_payload_collisions(tmp_pa
     assert moved == []
     persisted = _SafePersistentDataUnpickler.load(str(seg / "index_metadata.pickle"))
     assert isinstance(persisted, dict)
-    assert 39354 not in persisted["label_to_id"]
-    assert len(persisted["id_to_label"]) == len(persisted["label_to_id"]) == 39999
+    assert persisted["label_to_id"][39354] == "drawer-39354"
+    assert "drawer-dup-39354" not in persisted["id_to_label"]
+    assert len(persisted["id_to_label"]) == len(persisted["label_to_id"]) == 40000
 
 
 def test_quarantine_invalid_hnsw_metadata_rejects_repair_with_stale_counter(tmp_path):
@@ -2384,7 +2391,7 @@ def test_quarantine_invalid_hnsw_metadata_rejects_repair_with_stale_counter(tmp_
     palace, seg = _write_colliding_segment(tmp_path, 40000, (39354,))
     meta = seg / "index_metadata.pickle"
     persisted = _SafePersistentDataUnpickler.load(str(meta))
-    persisted.total_elements_added = 0
+    persisted["total_elements_added"] = 0
     with open(meta, "wb") as f:
         pickle.dump(persisted, f)
 
