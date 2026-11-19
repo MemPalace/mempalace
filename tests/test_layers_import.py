@@ -62,7 +62,7 @@ text = MemoryStack(palace_path=sys.argv[1], identity_path=sys.argv[1] + "/none.t
     wing=sys.argv[2] or None
 )
 heavy = sorted(
-    name for name in ("chromadb", "onnxruntime", "mempalace.searcher")
+    name for name in ("chromadb", "onnxruntime", "numpy", "mempalace.searcher")
     if name in sys.modules
 )
 assert not heavy, heavy
@@ -76,13 +76,14 @@ print(text)
     assert "Rotate the API keys monthly." not in one_wing
 
 
-def test_importing_the_chroma_backend_does_not_import_chromadb():
+def test_importing_the_backends_does_not_import_chromadb_or_numpy():
     _run(
         """
 import sys
 import mempalace.backends
 import mempalace.palace
 assert "chromadb" not in sys.modules
+assert "numpy" not in sys.modules
 from mempalace.backends import chroma
 assert chroma.chromadb.__name__ == "chromadb"
 """

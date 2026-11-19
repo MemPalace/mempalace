@@ -20,7 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `recent_reader` that serves `get_recent` without opening the collection;
   Chroma's reads `chroma.sqlite3` directly, and wake-up falls back to the
   collection when that reader cannot answer. `mempalace.backends.chroma`
-  imports chromadb on first use, so other backends no longer load it at all.
+  imports chromadb on first use, so other backends no longer load it at all,
+  and the backends import numpy on first use, so a command that touches no
+  vector does not load it.
   The read itself is narrower too:
   - Layer 1 ranks its 2,000-drawer window on six metadata keys and then
     fetches the 15 drawers it prints, where it used to load every document
