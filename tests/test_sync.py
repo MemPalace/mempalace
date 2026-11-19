@@ -707,6 +707,8 @@ class TestSyncPalace:
             "dry_run",
             "by_source",
             "unresolved_by_source",
+            "preserved",
+            "preserved_by_source",
         }
         assert set(report.keys()) == expected
 

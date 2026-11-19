@@ -318,18 +318,24 @@
     document.getElementById('setup-banner').classList.add('hidden');
   }
 
-  function updateEngineBadge(backend, totalDrawers, vectorWarm) {
+  function updateEngineBadge(backend, totalDrawers, vectorWarm, hubConnected = false, vectorWarming = false) {
     const badge = document.getElementById('engine-badge');
     if (!badge) return;
     const shortBackend = String(backend || 'sqlite').replace('sqlite_exact', 'sqlite_exact');
-    if (vectorWarm) {
+    if (hubConnected) {
+      badge.textContent = `${shortBackend} · ${formatCompact(totalDrawers)} (hub)`;
+      badge.classList.add('warm');
+      badge.title = `Backend: ${shortBackend} (${formatNumber(totalDrawers)} drawers). Connected to live MemPalace hub (shared vectors, zero duplicate RAM).`;
+    } else if (vectorWarm) {
       badge.textContent = `${shortBackend} · ${formatCompact(totalDrawers)} warm`;
       badge.classList.add('warm');
       badge.title = `Backend: ${shortBackend} (${formatNumber(totalDrawers)} drawers). Vector matrix & FTS5 lexical engine are warm in RAM.`;
     } else {
       badge.textContent = `${shortBackend} · FTS5 ready`;
       badge.classList.remove('warm');
-      badge.title = `Backend: ${shortBackend}. Instant FTS5 search is ready; pre-warming ${formatNumber(totalDrawers)} vectors in background…`;
+      badge.title = vectorWarming
+        ? `Backend: ${shortBackend}. Instant FTS5 search is ready; pre-warming ${formatNumber(totalDrawers)} vectors in background…`
+        : `Backend: ${shortBackend}. Instant FTS5 lexical search is ready; vector search loads lazily on demand.`;
     }
   }
 
@@ -404,18 +410,26 @@
     document.getElementById('metric-kg-facts').textContent = formatCompact(currentFacts);
     document.getElementById('metric-events').textContent = tipSeq;
 
-    updateEngineBadge(status.backend || 'sqlite_exact', totalDrawers, Boolean(data.vector_warm));
+    updateEngineBadge(
+      status.backend || 'sqlite_exact',
+      totalDrawers,
+      Boolean(data.vector_warm),
+      Boolean(data.hub_connected),
+      Boolean(data.vector_warming)
+    );
 
-    // Poll once or twice if background vector warmup is still running
+    // Poll once if opt-in background vector warmup is running
     clearTimeout(state.warmupPollTimer);
-    if (!data.vector_warm) {
+    if (!data.vector_warm && !data.hub_connected && data.vector_warming) {
       state.warmupPollTimer = setTimeout(async () => {
         const health = await apiPost('/api/overview', { workspacePath });
         if (health && health.ok && health.data) {
           updateEngineBadge(
             (health.data.status && health.data.status.backend) || 'sqlite_exact',
             totalDrawers,
-            Boolean(health.data.vector_warm)
+            Boolean(health.data.vector_warm),
+            Boolean(health.data.hub_connected),
+            Boolean(health.data.vector_warming)
           );
         }
       }, 3500);
@@ -607,8 +621,13 @@
     }
 
     const data = res.data || {};
-    if (data.vector_warm && state.overview && state.overview.status) {
-      updateEngineBadge(state.overview.status.backend, state.overview.status.total_drawers, true);
+    if ((data.vector_warm || data.hub_connected) && state.overview && state.overview.status) {
+      updateEngineBadge(
+        state.overview.status.backend,
+        state.overview.status.total_drawers,
+        Boolean(data.vector_warm),
+        Boolean(data.hub_connected)
+      );
     }
 
     const results = Array.isArray(data.results) ? data.results : [];

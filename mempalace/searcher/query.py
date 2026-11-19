@@ -3,11 +3,24 @@ if __name__ != "mempalace.searcher":
     raise ImportError(f"{__name__} is an implementation fragment; import mempalace.searcher")
 
 
-def _open_search_collection(palace_path: str, collection_name: str):
+def _open_search_collection(
+    palace_path: str, collection_name: str, *, skip_identity_check: bool = False
+):
     try:
-        return get_collection(
-            palace_path, collection_name=collection_name, create=False, read_only=True
-        ), None
+        kwargs = {
+            "collection_name": collection_name,
+            "create": False,
+            "read_only": True,
+        }
+        if skip_identity_check:
+            kwargs["_skip_identity_check"] = True
+        try:
+            return get_collection(palace_path, **kwargs), None
+        except TypeError as te:
+            if not skip_identity_check or "_skip_identity_check" not in str(te):
+                raise
+            kwargs.pop("_skip_identity_check", None)
+            return get_collection(palace_path, **kwargs), None
     except BackendMismatchError as e:
         return None, _backend_mismatch_result(e)
     except KeyError as e:
@@ -186,6 +199,81 @@ def _pool_left_results_short(
     )
 
 
+def _lexical_only_search(
+    drawers_col,
+    *,
+    query: str,
+    wing: str,
+    room: str,
+    source_file: str,
+    since: str,
+    before: str,
+    since_dt,
+    before_dt,
+    date_window_active: bool,
+    n_results: int,
+) -> dict:
+    """Run FTS5/BM25 lexical search directly without loading the embedder or vector matrix."""
+    where = build_where_filter(wing, room, source_file, col=drawers_col)
+    pool_size = max(n_results * 3, n_results) if date_window_active else n_results
+    try:
+        lex = drawers_col.lexical_search(
+            query=query,
+            n_results=pool_size,
+            where=where or None,
+        )
+    except UnsupportedCapabilityError:
+        return _search_error_result(
+            "candidate_strategy='lexical' requires a backend with lexical_search support",
+            unsupported_capability="supports_lexical_search",
+            hint=(
+                "Use candidate_strategy='vector' or select a backend that supports lexical search."
+            ),
+        )
+    raw_hits = getattr(lex, "hits", []) or []
+    hits = []
+    for hit in raw_hits:
+        meta = hit.metadata if isinstance(getattr(hit, "metadata", None), dict) else {}
+        doc_id = getattr(hit, "id", "")
+        if is_bookkeeping(meta, doc_id):
+            continue
+        if date_window_active and not filed_at_in_window(meta.get("filed_at"), since_dt, before_dt):
+            continue
+        full_source = meta.get("source_file", "") or ""
+        hits.append(
+            {
+                "drawer_id": _result_drawer_id(meta, doc_id),
+                "text": getattr(hit, "document", "") or "",
+                "wing": meta.get("wing", "unknown"),
+                "room": meta.get("room", "general"),
+                "hall": meta.get("hall", ""),
+                "source_file": Path(full_source).name if full_source else "?",
+                "source_path": full_source,
+                **_result_date_fields(meta),
+                "bm25_score": round(float(getattr(hit, "score", 0.0) or 0.0), 3),
+                "similarity": None,
+                "match_type": "fts5",
+            }
+        )
+        if len(hits) >= n_results:
+            break
+
+    envelope = _search_result_envelope(
+        query=query,
+        wing=wing,
+        room=room,
+        source_file=source_file,
+        since=since,
+        before=before,
+        hits=hits,
+        candidates_fetched=len(raw_hits),
+        pool_size=pool_size,
+        date_window_active=date_window_active,
+    )
+    envelope["strategy"] = "lexical"
+    return envelope
+
+
 def search_memories(
     query: str,
     palace_path: str,
@@ -272,6 +360,10 @@ def search_memories(
     _validate_candidate_strategy(candidate_strategy)
 
     if include_media or query_task != "search":
+        if candidate_strategy == "lexical":
+            return _search_error_result(
+                "candidate_strategy='lexical' cannot be combined with media/code task search"
+            )
         if vector_disabled:
             return _search_error_result(
                 "Media/code vector search is disabled until the index is repaired"
@@ -314,9 +406,28 @@ def search_memories(
     if short_circuit is not None:
         return short_circuit
 
-    drawers_col, open_error = _open_search_collection(palace_path, collection_name)
+    drawers_col, open_error = _open_search_collection(
+        palace_path,
+        collection_name,
+        skip_identity_check=(candidate_strategy == "lexical"),
+    )
     if open_error:
         return open_error
+
+    if candidate_strategy == "lexical":
+        return _lexical_only_search(
+            drawers_col,
+            query=query,
+            wing=wing,
+            room=room,
+            source_file=source_file,
+            since=since,
+            before=before,
+            since_dt=since_dt,
+            before_dt=before_dt,
+            date_window_active=date_window_active,
+            n_results=n_results,
+        )
 
     metric = _metric_for_collection(drawers_col)
     where = build_where_filter(wing, room, source_file, col=drawers_col)

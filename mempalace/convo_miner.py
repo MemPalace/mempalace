@@ -256,6 +256,7 @@ def _register_file(
         [(sentinel_id, f"[registry] {source_file}", meta)],
         extract_mode=extract_mode,
         prune=False,
+        owner="convo",
     )
 
 
@@ -643,6 +644,7 @@ def _file_chunks_locked(
     transforms: str = "",
     source_encoding: str = "utf-8",
     aaak_col=None,
+    palace_path: Optional[str] = None,
 ):
     """Lock the source file and replace its drawers in this extraction mode.
 
@@ -654,9 +656,14 @@ def _file_chunks_locked(
     appending to its own file while active and /compact or /clear can rewrite
     one in place.
 
+    A conversation is preserved memory: the text a rebuild overwrites or
+    drops is journaled to ``palace_path``'s ``drawer_revisions.jsonl`` first,
+    and the prune leaves drawers other producers filed for the same path.
+
     Returns (drawers_added, room_counts_delta, skipped). Raises
     ``StaleDrawerPurgeFailed`` when the stale drawers could not be removed,
-    which the mine counts as an error.
+    or its ``PriorTextArchiveFailed`` subclass when the prior text could not be
+    journaled; the mine counts either as an error.
     """
     room_counts_delta: dict = defaultdict(int)
     with mine_lock(source_file):
@@ -714,7 +721,13 @@ def _file_chunks_locked(
             )
             drawers.append((drawer_id, chunk["content"], meta))
         drawers_added = write_file_drawers(
-            collection, source_file, drawers, extract_mode=extract_mode, aaak_col=aaak_col
+            collection,
+            source_file,
+            drawers,
+            extract_mode=extract_mode,
+            aaak_col=aaak_col,
+            owner="convo",
+            palace_path=palace_path,
         )
     return drawers_added, room_counts_delta, False
 
@@ -1137,6 +1150,7 @@ def _mine_convos_impl(
                 transforms=normalize_run.transforms,
                 source_encoding=normalize_run.encoding,
                 aaak_col=aaak_col,
+                palace_path=palace_path,
             )
             if skipped:
                 files_skipped += 1

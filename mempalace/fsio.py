@@ -129,6 +129,23 @@ def _chmod_quiet(path: PathLike, mode: int) -> None:
         pass
 
 
+def make_private_dir(path: PathLike) -> Path:
+    """Create ``path`` (and its parents) and restrict it to its owner.
+
+    ``mkdir(mode=0o700)`` is masked by the umask, so the mode is set with an
+    unconditional ``chmod`` after the directory exists, whether this call
+    created it or not, the same as the WAL, tunnel, server-token and export
+    directories. Windows has no POSIX modes, so the ``chmod`` is skipped
+    there; a filesystem that refuses it is tolerated. Raises ``OSError`` only
+    when the directory cannot be created.
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if not _WINDOWS:
+        _chmod_quiet(path, 0o700)
+    return path
+
+
 def _open_body(target, mode: str, binary: bool):
     opener = os.fdopen if isinstance(target, int) else open
     if binary:

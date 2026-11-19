@@ -213,8 +213,11 @@ def ingest_diaries(
 
             # A full rebuild writes the new drawers, then drops the file's
             # others: legacy file-level drawers, trailing entries the file no
-            # longer has, and their AAAK summaries. A failed prune leaves the
-            # state untouched, so the next ingest rebuilds the file again.
+            # longer has, and their AAAK summaries. A diary is preserved
+            # memory, so every entry text the rebuild overwrites or drops is
+            # journaled first, and drawers other producers filed for the same
+            # path stay. A failed prune or journal append leaves the state
+            # untouched, so the next ingest rebuilds the file again.
             try:
                 write_file_drawers(
                     drawers_col,
@@ -222,6 +225,8 @@ def ingest_diaries(
                     drawers,
                     prune=full_rebuild,
                     aaak_col=aaak_col,
+                    owner="diary",
+                    palace_path=palace_path,
                 )
             except StaleDrawerPurgeFailed as exc:
                 logger.warning("%s", exc)

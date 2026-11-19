@@ -225,6 +225,8 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
                     "source_file": resolved,
                     "chunk_index": 999,
                     "normalize_version": 1,
+                    "ingest_mode": "convos",
+                    "extract_mode": "exchange",
                 }
             ],
         )
@@ -249,6 +251,12 @@ def test_mine_convos_rebuilds_stale_drawers_after_schema_bump(capsys):
         for meta in rebuilt["metadatas"]:
             assert meta.get("normalize_version") == NORMALIZE_VERSION
         del col, client
+        # The rebuild replaced conversation text, so it journaled every word first.
+        from mempalace.revisions import load_drawer_revisions
+
+        journaled = load_drawer_revisions(palace_path)
+        assert {r["drawer_id"] for r in journaled} == first_ids | {"orphan_drawer"}
+        assert {r["content"] for r in journaled} == {"STALE NOISE", "OLD ORPHAN"}
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
