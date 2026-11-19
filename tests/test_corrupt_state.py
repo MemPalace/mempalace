@@ -1,6 +1,7 @@
 """A corrupt state file is not replaced by an empty or one-entry document."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -17,20 +18,29 @@ def _palace_config(tmp_path):
     return MempalaceConfig(config_dir=str(tmp_path / "cfg"), palace_path=str(palace))
 
 
+def _hallway_config(tmp_path):
+    """Hallway state now lives in a per-palace-keyed sibling; tests that
+    pre-seed a corrupt file must point at the exact path the code will read.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    return MempalaceConfig(config_dir=str(tmp_path / "cfg"), palace_path=str(palace))
+
+
 def _kept(directory, name):
     return sorted(directory.glob(name + ".corrupt-*"))
 
 
 def test_corrupt_tunnels_are_not_replaced_by_one_entry(tmp_path):
     cfg = _palace_config(tmp_path)
-    path = tmp_path / "tunnels.json"
+    path = Path(cfg.tunnel_file)
     original = b'[{"id": "aaa"}, {"id": "bbb"}, {"id": "ccc"},'
     path.write_bytes(original)
 
     with pytest.raises(CorruptStateError):
         create_tunnel("wing_a", "room", "wing_b", "other", kind="topic", config=cfg)
 
-    kept = _kept(tmp_path, "tunnels.json")
+    kept = _kept(path.parent, path.name)
     assert len(kept) == 1
     assert kept[0].read_bytes() == original
     assert not path.exists()
@@ -40,37 +50,37 @@ def test_corrupt_tunnel_read_does_not_move_the_file(tmp_path):
     from mempalace.palace_graph import _load_tunnels
 
     cfg = _palace_config(tmp_path)
-    path = tmp_path / "tunnels.json"
+    path = Path(cfg.tunnel_file)
     original = b'[{"id": "aaa"},'
     path.write_bytes(original)
 
     assert _load_tunnels(cfg) == []
     assert path.read_bytes() == original
-    assert _kept(tmp_path, "tunnels.json") == []
+    assert _kept(path.parent, path.name) == []
 
 
 def test_recording_a_traversal_leaves_a_corrupt_file_alone(tmp_path):
     """Following a tunnel is a read; it must not move the file aside."""
     cfg = _palace_config(tmp_path)
-    path = tmp_path / "tunnels.json"
+    path = Path(cfg.tunnel_file)
     original = b'[{"id": "aaa"},'
     path.write_bytes(original)
 
     assert record_tunnel_traversal(["aaa"], config=cfg) == 0
     assert path.read_bytes() == original
-    assert _kept(tmp_path, "tunnels.json") == []
+    assert _kept(path.parent, path.name) == []
 
 
 def test_corrupt_hallways_are_not_replaced_by_one_wing(tmp_path):
-    cfg = _palace_config(tmp_path)
-    path = tmp_path / "hallways.json"
+    cfg = _hallway_config(tmp_path)
+    path = Path(cfg.hallway_file)
     original = b'{"hallways": [{"wing": "alpha", "id": "h1"}, {"wing": "beta",'
     path.write_bytes(original)
 
     with pytest.raises(CorruptStateError):
         delete_hallway("h1", config=cfg)
 
-    kept = _kept(tmp_path, "hallways.json")
+    kept = _kept(path.parent, path.name)
     assert len(kept) == 1
     assert kept[0].read_bytes() == original
     assert not path.exists()
