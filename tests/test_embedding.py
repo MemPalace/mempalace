@@ -653,18 +653,16 @@ def test_minilm_ef_model_override_leaves_threads_at_default_when_uncapped(monkey
 def _max_concurrent_forwards(monkeypatch, providers, n_threads):
     """Run ``_forward`` from ``n_threads`` threads and return peak overlap.
 
-    The upstream ``_forward`` is replaced by a stub that only counts how many
+    The forward pass is replaced by a stub that only counts how many
     calls are inside it at once, so no model is downloaded or loaded.
     """
     import threading
     import time
 
-    from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
-
     state = {"in_flight": 0, "max": 0}
     lock = threading.Lock()
 
-    def counting_forward(self, documents, batch_size=32):
+    def counting_forward(ef, documents, batch_size=32):
         with lock:
             state["in_flight"] += 1
             state["max"] = max(state["max"], state["in_flight"])
@@ -673,7 +671,7 @@ def _max_concurrent_forwards(monkeypatch, providers, n_threads):
             state["in_flight"] -= 1
         return [[0.0]] * len(documents)
 
-    monkeypatch.setattr(ONNXMiniLM_L6_V2, "_forward", counting_forward)
+    monkeypatch.setattr(embedding, "_minilm_forward", counting_forward)
     ef = embedding._build_ef_class()(preferred_providers=providers)
     start = threading.Barrier(n_threads)
 
@@ -700,6 +698,63 @@ def test_minilm_ef_serializes_runs_on_dml(monkeypatch):
 def test_minilm_ef_does_not_serialize_cpu_runs(monkeypatch):
     """The DirectML guard must leave concurrent-safe providers parallel."""
     assert _max_concurrent_forwards(monkeypatch, ["CPUExecutionProvider"], 4) > 1
+
+
+class _PaddedMiniLMTokenizer:
+    """Encodes like ChromaDB's MiniLM tokenizer: ``[CLS] words [SEP]``, padded to 256."""
+
+    def encode(self, text):
+        ids = [101] + [1000 + len(word) for word in text.split()] + [102]
+        pad = 256 - len(ids)
+        return SimpleNamespace(ids=ids + [0] * pad, attention_mask=[1] * len(ids) + [0] * pad)
+
+
+class _RecordingMiniLMSession:
+    """Records each run's sequence width and returns a hidden state built from
+    token ids and positions. Padded positions get non-zero values too, so they
+    would change the pooled vector if they were not masked out."""
+
+    def __init__(self):
+        self.widths = []
+
+    def run(self, output_names, feeds):
+        import numpy as np
+
+        ids = feeds["input_ids"]
+        self.widths.append(ids.shape[1])
+        positions = np.broadcast_to(np.arange(ids.shape[1]), ids.shape)
+        return [np.stack([ids, positions, ids * positions + 1], axis=-1).astype(np.float32)]
+
+
+def _minilm_with(session):
+    ef = embedding._build_ef_class()(preferred_providers=["CPUExecutionProvider"])
+    ef.__dict__["tokenizer"] = _PaddedMiniLMTokenizer()
+    ef.__dict__["model"] = session
+    return ef
+
+
+def test_minilm_forward_runs_each_sub_batch_at_its_longest_document():
+    """ChromaDB's tokenizer pads every document to 256 tokens, so a one-word
+    search query ran a full 256-token pass. Each sub-batch now runs only as
+    wide as its longest document."""
+    session = _RecordingMiniLMSession()
+    docs = ["a b c d e"] + ["query"] * 32
+    _minilm_with(session)._forward(docs, batch_size=32)
+    assert session.widths == [7, 3]
+
+
+def test_minilm_forward_matches_the_padded_upstream_vectors():
+    import numpy as np
+    from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+    docs = ["a b c d e"] + ["query"] * 32 + ["", "two words"]
+    padded_session = _RecordingMiniLMSession()
+    upstream = ONNXMiniLM_L6_V2._forward(_minilm_with(padded_session), docs)
+    ours = _minilm_with(_RecordingMiniLMSession())._forward(docs)
+
+    assert padded_session.widths == [256, 256]
+    assert ours.dtype == upstream.dtype
+    np.testing.assert_allclose(ours, upstream, rtol=1e-6, atol=0)
 
 
 @pytest.mark.parametrize("threads", [0, 2])
