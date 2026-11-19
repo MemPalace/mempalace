@@ -64,6 +64,26 @@ def _open_for_read(palace_path: str):
     return _get_collection(palace_path, create=False, read_only=True)
 
 
+def _open_recent_reader(palace_path: str):
+    """The backend's reader for recent drawers alone, or ``None``.
+
+    Opening a Chroma collection imports chromadb and builds its client: about
+    a second, several times what a session-start hook allows, for a wake-up
+    that reads ``chroma.sqlite3`` and nothing else. A backend that can serve
+    ``get_recent`` without that open hands back a reader here. ``None`` (no
+    such reader, or the palace would not open this way) sends the caller to
+    :func:`_open_for_read`, which also reports what is wrong with the palace.
+    """
+    from .palace import get_recent_reader
+
+    try:
+        return get_recent_reader(palace_path)
+    except ImportError:
+        raise
+    except Exception:
+        return None
+
+
 def _read_open_failure(exc: Exception) -> str:
     """Explain a failed read-open honestly instead of blaming a missing palace.
 
@@ -357,6 +377,51 @@ class Layer0:
 # ---------------------------------------------------------------------------
 
 
+# Metadata keys that may carry a drawer's weight, in the order they are tried.
+_IMPORTANCE_KEYS = ("importance", "emotional_weight", "weight")
+
+# Everything Layer 1 reads of a drawer to decide whether to show it.
+_SCORING_KEYS = (*_IMPORTANCE_KEYS, "filed_at", "is_sentinel", "ingest_mode")
+
+
+def _top_moments(metas, n: int) -> list:
+    """Indexes into ``metas`` of the ``n`` drawers Layer 1 shows, best first.
+
+    Prefers high importance, then most-recent filing; ties keep their order.
+
+    NOTE: the ingest pipeline (miner, convo_miner, diary, add_drawer)
+    records provenance metadata — wing/room/source/chunk/filed_at — but
+    never an evaluative importance/weight field. So `importance` is
+    absent on virtually every drawer and ties at the default, which used
+    to collapse the sort to insertion order (oldest first). `filed_at`
+    is present on every drawer, so it is the *effective* ordering signal:
+    newest first. This keeps importance as the primary key for the day a
+    scoring pass populates it, while making the "recent filing" half of
+    the promise true today with data we already have.
+    The candidate window this sorts is the MAX_SCAN *most recently
+    filed* drawers rather than the first MAX_SCAN the backend happened to
+    hand back, so on a palace larger than MAX_SCAN the newest drawers are
+    actually in the running.
+    """
+    scored = []
+    for index, meta in enumerate(metas):
+        meta = meta or {}
+        importance = 3.0
+        for key in _IMPORTANCE_KEYS:
+            val = meta.get(key)
+            if val is not None:
+                try:
+                    importance = float(val)
+                except (ValueError, TypeError):
+                    pass
+                break
+        # By instant: naive local and UTC filed_at do not sort as text.
+        # A missing or odd value sorts oldest.
+        scored.append((importance, recency_key(meta.get("filed_at")), index))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return [index for _, _, index in scored[:n]]
+
+
 class Layer1:
     """
     ~500-800 tokens. Always loaded.
@@ -377,70 +442,84 @@ class Layer1:
         """The L1 candidate window: the MAX_SCAN most recently filed drawers."""
         return fetch_recent_window(col, wing=self.wing, max_scan=self.MAX_SCAN)
 
+    def _fetch_top(self, reader) -> list:
+        """``(metadata, document)`` of the drawers L1 shows, best first.
+
+        The same choice :func:`_top_moments` makes over the whole window, read
+        in two steps: the scoring keys of the ``MAX_SCAN`` newest drawers,
+        then the ``MAX_DRAWERS`` chosen ones in full. The window's other
+        documents and metadata, nearly all of what a whole-window read
+        loads, are never read. Both steps share one read budget.
+        """
+        no_retry = _capability_missing() + (_palace_missing(),)
+        where = build_where_filter(self.wing, col=reader) or None
+        deadline = time.monotonic() + _RECENT_READ_BUDGET
+        window = _read_with_retry(
+            lambda: reader.get_recent(
+                limit=self.MAX_SCAN,
+                where=where,
+                order_field="filed_at",
+                include=["metadatas"],
+                metadata_keys=_SCORING_KEYS,
+            ),
+            deadline,
+            no_retry,
+        )
+        kept = [(i, m) for i, m in zip(window.ids, window.metadatas) if not is_bookkeeping(m)]
+        chosen = [kept[at][0] for at in _top_moments([m for _, m in kept], self.MAX_DRAWERS)]
+        if not chosen:
+            return []
+        full = _read_with_retry(
+            lambda: reader.get(ids=chosen, include=["documents", "metadatas"]),
+            deadline,
+            no_retry,
+        )
+        found = {i: (m or {}, d or "") for i, d, m in zip(full.ids, full.documents, full.metadatas)}
+        return [found[i] for i in chosen if i in found]
+
     def generate(self) -> str:
         """Pull top drawers from the palace and format as compact L1 text."""
-        # The open runs on this thread, outside the read budget, so a broken
+        # Both opens run on this thread, outside the read budget, so a broken
         # install (an ImportError while loading the backend) fails wake-up
         # here whatever the timing.
-        try:
-            col = _open_for_read(self.palace_path)
-        except ImportError:
-            raise
-        except Exception as exc:
-            message = _read_open_failure(exc)
-            return message if message.startswith("## ") else f"## L1 — {message}"
+        top = None
+        reader = _open_recent_reader(self.palace_path)
+        if reader is not None:
+            try:
+                top = self._fetch_top(reader)
+            except ImportError:
+                raise
+            except TimeoutError as exc:
+                # The budget is spent; a second read would only overrun it.
+                return f"## L1 — {recent_read_failure(exc)}"
+            except Exception:
+                pass  # the reader could not answer: open the collection
 
-        try:
-            docs, metas = self._fetch_candidates(col)
-        except ImportError:
-            raise  # a broken install, not a palace read: fail like develop did
-        except Exception as exc:
-            return f"## L1 — {recent_read_failure(exc)}"
+        if top is None:
+            try:
+                col = _open_for_read(self.palace_path)
+            except ImportError:
+                raise
+            except Exception as exc:
+                message = _read_open_failure(exc)
+                return message if message.startswith("## ") else f"## L1 — {message}"
 
-        if not docs:
+            try:
+                docs, metas = self._fetch_candidates(col)
+            except ImportError:
+                raise  # a broken install, not a palace read: fail like develop did
+            except Exception as exc:
+                return f"## L1 — {recent_read_failure(exc)}"
+            top = [(metas[i] or {}, docs[i] or "") for i in _top_moments(metas, self.MAX_DRAWERS)]
+
+        if not top:
             return "## L1 — No memories yet."
-
-        # Score each drawer: prefer high importance, then most-recent filing.
-        # NOTE: the ingest pipeline (miner, convo_miner, diary, add_drawer)
-        # records provenance metadata — wing/room/source/chunk/filed_at — but
-        # never an evaluative importance/weight field. So `importance` is
-        # absent on virtually every drawer and ties at the default, which used
-        # to collapse the sort to insertion order (oldest first). `filed_at`
-        # is present on every drawer, so it is the *effective* ordering signal:
-        # newest first. This keeps importance as the primary key for the day a
-        # scoring pass populates it, while making the "recent filing" half of
-        # the promise true today with data we already have.
-        # The candidate window this sorts is now the MAX_SCAN *most recently
-        # filed* drawers rather than the first MAX_SCAN the backend happened to
-        # hand back, so on a palace larger than MAX_SCAN the newest drawers are
-        # actually in the running.
-        scored = []
-        for doc, meta in zip(docs, metas):
-            meta = meta or {}
-            doc = doc or ""
-            importance = 3.0
-            # Try multiple metadata keys that might carry weight info
-            for key in ("importance", "emotional_weight", "weight"):
-                val = meta.get(key)
-                if val is not None:
-                    try:
-                        importance = float(val)
-                    except (ValueError, TypeError):
-                        pass
-                    break
-            # By instant: naive local and UTC filed_at do not sort as text.
-            # A missing or odd value sorts oldest.
-            scored.append((importance, recency_key(meta.get("filed_at")), meta, doc))
-
-        # Sort by importance desc, then recency (filed_at) desc; take top N.
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        top = [(imp, meta, doc) for imp, _recency, meta, doc in scored[: self.MAX_DRAWERS]]
 
         # Group by room for readability
         by_room = defaultdict(list)
-        for imp, meta, doc in top:
+        for meta, doc in top:
             room = meta.get("room", "general")
-            by_room[room].append((imp, meta, doc))
+            by_room[room].append((meta, doc))
 
         # Build compact text
         heading = "## L1 — ESSENTIAL STORY"
@@ -458,7 +537,7 @@ class Layer1:
             lines.append(room_line)
             total_len += len(room_line)
 
-            for _imp, meta, doc in entries:
+            for meta, doc in entries:
                 source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
 
                 # Truncate doc to keep L1 compact

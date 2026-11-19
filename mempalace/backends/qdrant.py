@@ -19,14 +19,13 @@ from hashlib import sha256
 from typing import Any, Optional
 from urllib import error as urlerror, parse as urlparse, request as urlrequest
 
-import numpy as np
-
 from .. import _net
 from ..lexical import bm25_scores, tokenize
 from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
 from ..timeutil import utc_now_iso as _utcnow
 from ..version import __version__
 from ._filters import matches_where, matches_where_document, validate_where
+from ._numpy import np
 from ._remote_common import (
     RemoteMarkerMixin,
     as_vector_array,

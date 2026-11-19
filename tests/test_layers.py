@@ -2,6 +2,7 @@
 
 import os
 import re
+import sqlite3
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1402,3 +1403,123 @@ def test_layer3_lock_conflict_is_not_reported_as_missing_palace():
         result = layer.search("q")
 
     assert "write lock" in result
+
+
+# ── Layer1 on the backend's recent reader ───────────────────────────────
+
+
+def _real_palace(tmp_path, total=40):
+    """A Chroma palace with more drawers than L1 shows, plus bookkeeping rows."""
+    from mempalace.backends import PalaceRef, chroma
+
+    path = str(tmp_path / "palace")
+    col = chroma.ChromaBackend().get_collection(
+        palace=PalaceRef(id=path, local_path=path),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    metas = []
+    for i in range(total):
+        meta = {
+            "wing": "acme_app" if i % 4 else "other",
+            "room": f"room{i % 3}",
+            "source_file": f"/src/acme-app/file{i}.py",
+            "filed_at": f"2026-02-01T00:00:{i:02d}+00:00",
+        }
+        if i == 3:
+            meta["importance"] = 5
+        if i == 7:
+            meta["emotional_weight"] = "4.5"
+        if i == 38:
+            meta["ingest_mode"] = "registry"
+        if i == 39:
+            meta["is_sentinel"] = True
+        metas.append(meta)
+    col.add(
+        ids=[f"d{i:02d}" for i in range(total)],
+        documents=[f"memory number {i} \x00 with a nul" for i in range(total)],
+        metadatas=metas,
+        embeddings=[[float(i), 1.0, 0.5] for i in range(total)],
+    )
+    return path
+
+
+@pytest.mark.parametrize("wing", [None, "acme_app", "acme-app", "nobody"])
+def test_layer1_reader_text_equals_the_collection_text(tmp_path, wing):
+    """The two-stage read through the recent reader picks and prints exactly
+    the drawers the whole-window read through the collection does."""
+    path = _real_palace(tmp_path)
+    with patch("mempalace.layers._open_recent_reader", return_value=None):
+        through_collection = Layer1(palace_path=path, wing=wing).generate()
+    with patch("mempalace.layers._get_collection", side_effect=AssertionError("opened")):
+        through_reader = Layer1(palace_path=path, wing=wing).generate()
+    assert through_reader == through_collection
+    if wing != "nobody":
+        assert "memory number 3 " in through_reader  # importance outranks recency
+        assert "memory number 39" not in through_reader  # sentinel
+        assert "memory number 38" not in through_reader  # registry row
+
+
+def test_layer1_reader_hydrates_only_the_drawers_it_shows(tmp_path):
+    """Stage one asks for the scoring keys of the window and no documents;
+    stage two fetches the chosen drawers, at most MAX_DRAWERS of them."""
+    path = _real_palace(tmp_path)
+    from mempalace import layers
+
+    real = layers._open_recent_reader(path)
+    calls = []
+
+    class Spy:
+        _palace_path = real._palace_path
+
+        def get_recent(self, **kwargs):
+            calls.append(("get_recent", kwargs))
+            return real.get_recent(**kwargs)
+
+        def get(self, **kwargs):
+            calls.append(("get", kwargs))
+            return real.get(**kwargs)
+
+    with patch("mempalace.layers._open_recent_reader", return_value=Spy()):
+        text = Layer1(palace_path=path).generate()
+
+    assert "memory number 37" in text
+    (first, window), (second, chosen) = calls
+    assert (first, second) == ("get_recent", "get")
+    assert window["include"] == ["metadatas"]
+    assert set(window["metadata_keys"]) >= {"filed_at", "importance", "is_sentinel", "ingest_mode"}
+    assert window["limit"] == Layer1.MAX_SCAN
+    assert len(chosen["ids"]) == Layer1.MAX_DRAWERS
+
+
+def test_layer1_falls_back_to_the_collection_when_the_reader_cannot_answer(tmp_path):
+    path = _real_palace(tmp_path)
+
+    class Broken:
+        _palace_path = path
+
+        def get_recent(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+    with patch("mempalace.layers._open_recent_reader", return_value=None):
+        expected = Layer1(palace_path=path).generate()
+    with patch("mempalace.layers._open_recent_reader", return_value=Broken()):
+        assert Layer1(palace_path=path).generate() == expected
+
+
+def test_layer1_does_not_read_twice_when_the_reader_times_out(tmp_path):
+    path = _real_palace(tmp_path)
+
+    class Slow:
+        _palace_path = path
+
+        def get_recent(self, **kwargs):
+            raise TimeoutError("the palace read did not finish within the wake-up budget")
+
+    with (
+        patch("mempalace.layers._open_recent_reader", return_value=Slow()),
+        patch("mempalace.layers._get_collection", side_effect=AssertionError("opened")),
+    ):
+        text = Layer1(palace_path=path).generate()
+    assert text.startswith("## L1 — ")
+    assert "memory number" not in text

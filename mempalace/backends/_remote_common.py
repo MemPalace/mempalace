@@ -12,10 +12,9 @@ import logging
 import os
 from typing import Any, ClassVar, Optional
 
-import numpy as np
-
 from ..fsio import atomic_write_json
 from ..timeutil import utc_now_iso
+from ._numpy import np
 from .base import BackendMismatchError, DimensionMismatchError, PalaceRef
 
 logger = logging.getLogger(__name__)
@@ -47,7 +46,7 @@ def jsonable_metadata(meta: Optional[dict], *, reserved: frozenset = frozenset()
     return cleaned
 
 
-def as_vector_array(vector: list) -> np.ndarray:
+def as_vector_array(vector: list) -> "np.ndarray":
     arr = np.asarray(vector, dtype=np.float32)
     if arr.ndim != 1 or arr.size == 0:
         raise ValueError("embedding must be a non-empty 1D vector")
