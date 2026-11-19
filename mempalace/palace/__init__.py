@@ -93,7 +93,11 @@ _EXPLICIT_BACKEND_ENV = "MEMPALACE_BACKEND_EXPLICIT"
 #               file that holds it, and non-UTF-8 sources decode losslessly.
 #               Text that comes out the same keeps its stored embedding, so
 #               the re-mine embeds only what changed.
-NORMALIZE_VERSION = 3
+# v4 (2026-11): Claude Code JSONL drops injected skill bodies (isMeta plus
+#               sourceToolUseID or the skill-preamble header); previous drawers
+#               filed every loaded SKILL.md as a user message, once per session
+#               or per /loop tick.
+NORMALIZE_VERSION = 4
 
 # Revision of the conversation exchange chunker (``convo_miner.chunk_exchanges``),
 # stamped on exchange-mode convo rows as ``convo_chunker_version``. The

@@ -321,6 +321,47 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
     return None
 
 
+# Header Claude Code puts at the top of every injected SKILL.md body.
+_SKILL_BODY_HEADER = "Base directory for this skill:"
+
+
+def _first_text(content) -> str:
+    """Text of a message's string content, or of its first text block."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                return block.get("text") or ""
+    return ""
+
+
+def _is_injected_skill_body(entry: dict) -> bool:
+    """True when a Claude Code entry is a SKILL.md the harness injected.
+
+    Running a skill makes Claude Code inject its SKILL.md as a user message
+    flagged isMeta. That is tool chrome, not something the user said, and
+    every session (or every /loop tick) that loads the skill would file
+    another identical copy. isMeta alone is not enough: it also tags
+    peer-session messages, pasted images and /loop tick prompts, which are
+    conversation. So it must come with one of two markers:
+
+    - sourceToolUseID, set when the Skill tool loaded the skill;
+    - the skill-preamble header opening the text, the only marker left when
+      the skill ran as a slash command, which carries no sourceToolUseID.
+
+    A user typing the header is not isMeta, so their message stays.
+    """
+    if entry.get("isMeta") is not True:
+        return False
+    if entry.get("sourceToolUseID"):
+        return True
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return False
+    return _first_text(message.get("content")).lstrip().startswith(_SKILL_BODY_HEADER)
+
+
 def _try_claude_code_jsonl(content: str) -> Optional[str]:
     """Claude Code JSONL sessions."""
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
@@ -333,6 +374,8 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
         except json.JSONDecodeError:
             continue
         if not isinstance(entry, dict):
+            continue
+        if _is_injected_skill_body(entry):
             continue
         msg_type = entry.get("type", "")
         # system, summary and other entries carry session bookkeeping and UI
