@@ -10,10 +10,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import queue
 import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -35,6 +37,107 @@ NODE_BIN = shutil.which("node")
 pytestmark = pytest.mark.skipif(NODE_BIN is None, reason="Node.js runtime not found on PATH")
 
 
+# The first Node launch on a fresh CI runner pays a one-time cold start (the
+# node binary is read from disk and scanned before V8 boots). On the Windows
+# runner under `-n auto` that has taken 2 to 15+ s, while every later launch
+# takes well under a second. NODE_READY_TIMEOUT only bounds that bring-up in
+# the module fixture below, so it never lands inside a test's own timeout.
+NODE_READY_TIMEOUT = 120.0
+NODE_CALL_TIMEOUT = 15.0
+
+_PROBE_SERVER = """
+import * as hookCommon from {module};
+import readline from 'node:readline';
+const rl = readline.createInterface({{ input: process.stdin, terminal: false }});
+rl.on('line', (line) => {{
+  const {{ fn, args }} = JSON.parse(line);
+  let reply;
+  try {{
+    reply = {{ ok: hookCommon[fn](...args) }};
+  }} catch (err) {{
+    reply = {{ error: String(err && err.stack ? err.stack : err) }};
+  }}
+  process.stdout.write(JSON.stringify(reply) + '\\n');
+}});
+process.stdout.write(JSON.stringify({{ ready: true }}) + '\\n');
+"""
+
+
+class _NodeProbe:
+    """One long-lived Node process that imports hook-common.mjs once.
+
+    Each call sends one JSON line `{fn, args}` and reads one JSON reply line,
+    so every hook-common probe in this module shares a single Node start.
+    """
+
+    def __init__(self) -> None:
+        self._lines: queue.Queue[str | None] = queue.Queue()
+        self.proc = subprocess.Popen(
+            [
+                str(NODE_BIN),
+                "--input-type=module",
+                "-e",
+                _PROBE_SERVER.format(module=json.dumps(HOOK_COMMON.as_uri())),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(PLUGIN_DIR),
+        )
+        # Pipes cannot be polled with a timeout on Windows; a reader thread can.
+        self._reader = threading.Thread(target=self._pump, daemon=True)
+        self._reader.start()
+        assert self._read(NODE_READY_TIMEOUT) == {"ready": True}
+
+    def _pump(self) -> None:
+        for line in self.proc.stdout:
+            self._lines.put(line)
+        self._lines.put(None)
+
+    def _read(self, timeout: float):
+        try:
+            line = self._lines.get(timeout=timeout)
+        except queue.Empty:
+            raise AssertionError(f"Node probe gave no reply within {timeout} s") from None
+        if line is None:
+            raise AssertionError(f"Node probe exited: {self.proc.stderr.read()}")
+        return json.loads(line)
+
+    def call(self, fn: str, *args):
+        self.proc.stdin.write(json.dumps({"fn": fn, "args": list(args)}) + "\n")
+        self.proc.stdin.flush()
+        reply = self._read(NODE_CALL_TIMEOUT)
+        assert "error" not in reply, reply["error"]
+        return reply.get("ok")
+
+    def close(self) -> None:
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=NODE_CALL_TIMEOUT)
+        finally:
+            if self.proc.poll() is None:
+                self.proc.kill()
+                self.proc.wait()
+            self.proc.stdout.close()
+            self.proc.stderr.close()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def node_probe():
+    """Start Node once per module, before any test spawns a hook script.
+
+    Autouse so the one-time cold start is paid here, under NODE_READY_TIMEOUT,
+    and the per-test hook launches below only measure warm Node starts.
+    """
+    probe = _NodeProbe()
+    try:
+        yield probe
+    finally:
+        probe.close()
+
+
 def _load_exporter():
     spec = importlib.util.spec_from_file_location("export_standalone", EXPORTER_PATH)
     assert spec and spec.loader
@@ -50,7 +153,7 @@ def _run_node_hook(
     home: Path,
     state_dir: Path,
     extra_env: dict[str, str] | None = None,
-    timeout: float = 15.0,
+    timeout: float = NODE_CALL_TIMEOUT,
 ) -> subprocess.CompletedProcess[str]:
     stdin_text = (
         json.dumps(stdin_payload) if isinstance(stdin_payload, dict) else str(stdin_payload)
@@ -96,28 +199,16 @@ def _poll_log(log_path: Path, needle: str, timeout: float = 8.0) -> bool:
 # ── Wing slug parity across full SHELL_CORPUS + Windows paths ─────────
 
 
-def test_node_infer_wing_matches_python_corpus() -> None:
+def test_node_infer_wing_matches_python_corpus(node_probe: _NodeProbe) -> None:
     """`inferWing` in hook-common.mjs must match `normalize_wing_name` on every corpus name."""
-    probe_code = (
-        f"import {{ inferWing }} from {json.dumps(HOOK_COMMON.as_uri())};"
-        "const names = JSON.parse(process.argv[1]);"
-        "const out = names.map((n) => inferWing('/work/' + n, 'sessions'));"
-        "process.stdout.write(JSON.stringify(out));"
-    )
-    proc = subprocess.run(
-        [str(NODE_BIN), "--input-type=module", "-e", probe_code, json.dumps(SHELL_CORPUS)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=15,
-    )
-    assert proc.returncode == 0, proc.stderr
-    actual = json.loads(proc.stdout)
+    actual = [node_probe.call("inferWing", "/work/" + name, "sessions") for name in SHELL_CORPUS]
     expected = [normalize_wing_name(name) or "sessions" for name in SHELL_CORPUS]
     assert actual == expected
 
 
-def test_node_parse_stdin_preserves_windows_drive_colons(tmp_path: Path) -> None:
+def test_node_parse_stdin_preserves_windows_drive_colons(
+    tmp_path: Path, node_probe: _NodeProbe
+) -> None:
     """Windows paths like `C:\\Users\\me\\transcript.jsonl` and `p:/MemPalace/mempalace`
     must keep their drive colons intact (regression test for bash colon-stripping bug).
     """
@@ -128,27 +219,8 @@ def test_node_parse_stdin_preserves_windows_drive_colons(tmp_path: Path) -> None
         "fullyIdle": True,
         "invocationNum": 1,
     }
-    probe_code = (
-        f"import {{ parseHookStdin, inferWing }} from {json.dumps(HOOK_COMMON.as_uri())};"
-        "const p = parseHookStdin(process.argv[1], process.argv[2]);"
-        "process.stdout.write(JSON.stringify({ ...p, wing: inferWing(p.workspacePath) }));"
-    )
-    proc = subprocess.run(
-        [
-            str(NODE_BIN),
-            "--input-type=module",
-            "-e",
-            probe_code,
-            json.dumps(payload),
-            str(tmp_path),
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        timeout=10,
-    )
-    assert proc.returncode == 0, proc.stderr
-    res = json.loads(proc.stdout)
+    parsed = node_probe.call("parseHookStdin", json.dumps(payload), str(tmp_path))
+    res = {**parsed, "wing": node_probe.call("inferWing", parsed["workspacePath"])}
     assert res["transcriptPath"] == r"C:\Users\me\brain\conv-42\transcript_full.jsonl"
     assert res["workspacePath"] == r"p:\MemPalace\mempalace\\"
     assert res["wing"] == "mempalace"
