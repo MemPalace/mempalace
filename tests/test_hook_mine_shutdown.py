@@ -8,12 +8,35 @@ import textwrap
 import psutil
 import pytest
 
+# The forced-hang fixtures use a tiny grace so a missed deadline fails fast.
+# Normal interpreter teardown of a child that imported mempalace.miner takes
+# 0.1 to 0.5 s on a loaded runner, so a tiny grace must never bound a clean
+# shutdown; tests that expect a clean exit use CLEAN_EXIT_GRACE instead.
+FORCED_HANG_GRACE = "0.2"
+CLEAN_EXIT_GRACE = "60"
+# Hang guard for the whole child, including a cold import under xdist load.
+# It is not what any assertion measures.
+CHILD_TIMEOUT = 60
 
-def _run_shutdown(tmp_path, body, exit_code=0, after_arm=""):
+
+def _shutdown_env(tmp_path, grace):
     pid_file = tmp_path / "mine.pid"
     env = os.environ.copy()
     env["MEMPALACE_MINE_PID_FILE"] = str(pid_file)
-    env["MEMPALACE_HOOK_MINE_EXIT_GRACE_SECONDS"] = "0.2"
+    env["MEMPALACE_HOOK_MINE_EXIT_GRACE_SECONDS"] = grace
+    return pid_file, env
+
+
+def _wait_helper_exit(pid_file):
+    helper_pid = int(pid_file.with_suffix(".pid.helper").read_text())
+    try:
+        psutil.Process(helper_pid).wait(timeout=CHILD_TIMEOUT)
+    except psutil.NoSuchProcess:
+        pass
+
+
+def _run_shutdown(tmp_path, body, exit_code=0, after_arm="", grace=FORCED_HANG_GRACE):
+    pid_file, env = _shutdown_env(tmp_path, grace)
     script = (
         "import os, pathlib, sys, threading, time\n"
         "from mempalace.miner import _arm_hook_mine_exit_watchdog\n"
@@ -24,13 +47,11 @@ def _run_shutdown(tmp_path, body, exit_code=0, after_arm=""):
         + textwrap.dedent(after_arm)
         + f"sys.exit({exit_code})\n"
     )
-    proc = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, timeout=5)
+    proc = subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, timeout=CHILD_TIMEOUT
+    )
     assert not pid_file.exists()
-    helper_pid = int(pid_file.with_suffix(".pid.helper").read_text())
-    try:
-        psutil.Process(helper_pid).wait(timeout=5)
-    except psutil.NoSuchProcess:
-        pass
+    _wait_helper_exit(pid_file)
     return proc
 
 
@@ -89,8 +110,77 @@ def test_shutdown_deadline_survives_native_finalizer(tmp_path):
 
 
 def test_armed_watchdog_waits_for_interpreter_shutdown(tmp_path):
-    proc = _run_shutdown(tmp_path, "", after_arm="time.sleep(0.6)\n")
-    assert proc.returncode == 0
+    """While the owner is alive, the helper never starts its grace period.
+
+    The child arms a FORCED_HANG_GRACE watchdog, reports that it is armed and
+    whether the shutdown trigger was sent, then blocks until the test releases
+    it. The test holds the child live for many grace periods: a trigger sent at
+    arming time would kill it. Load can only make this check pass late, never
+    fail it. The child then cancels the helper before exiting, so the tiny
+    grace never races normal interpreter teardown (see the clean-exit test).
+    """
+    pid_file, env = _shutdown_env(tmp_path, FORCED_HANG_GRACE)
+    script = (
+        "import os, pathlib, sys\n"
+        "from mempalace.miner import _arm_hook_mine_exit_watchdog\n"
+        "handle = _arm_hook_mine_exit_watchdog(0)\n"
+        "pathlib.Path(os.environ['MEMPALACE_MINE_PID_FILE'] + '.helper')"
+        ".write_text(str(handle.process.pid))\n"
+        "os.write(1, b'T' if handle._started else b'A')\n"
+        "if os.read(0, 1) != b'G':\n"
+        "    sys.exit(3)\n"
+        "os.write(1, b'T' if handle._started else b'L')\n"
+        "handle.cancel()\n"
+        "sys.exit(0)\n"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        assert child.stdout.read(1) == b"A", "trigger sent at arming time"
+        helper = psutil.Process(int(pid_file.with_suffix(".pid.helper").read_text()))
+        live_for = 10 * float(FORCED_HANG_GRACE)
+        try:
+            child.wait(timeout=live_for)
+        except subprocess.TimeoutExpired:
+            pass
+        assert child.poll() is None, "watchdog killed the owner during its live period"
+        assert helper.is_running() and helper.status() != psutil.STATUS_ZOMBIE
+        child.stdin.write(b"G")
+        child.stdin.flush()
+        assert child.stdout.read(1) == b"L", "trigger sent during the live period"
+        _out, err = child.communicate(timeout=CHILD_TIMEOUT)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+    assert child.returncode == 0, err
+    assert not pid_file.exists()
+    _wait_helper_exit(pid_file)
+
+
+def test_armed_watchdog_lets_clean_shutdown_finish(tmp_path):
+    """A normal exit sends the trigger at shutdown and is not killed.
+
+    An atexit handler registered before arming runs after the helper was
+    triggered (threading atexits run first, then atexit in LIFO order) and
+    reports whether the trigger was sent. The grace is CLEAN_EXIT_GRACE so the
+    assertion does not depend on how long finalization takes under load.
+    """
+    proc = _run_shutdown(
+        tmp_path,
+        """
+        import atexit
+        atexit.register(lambda: os.write(1, b'S' if handle._started else b'N'))
+        """,
+        grace=CLEAN_EXIT_GRACE,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == b"S"
 
 
 def test_watchdog_rearming_reaps_old_helper(tmp_path):
