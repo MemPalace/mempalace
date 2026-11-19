@@ -49,7 +49,33 @@ def _tool_status_via_sqlite() -> dict:
             "hnsw_count": _vector_capacity_status.get("hnsw_count"),
             "divergence": _vector_capacity_status.get("divergence"),
         }
+    structure = _storage_structure()
+    if structure is not None:
+        result["storage_structure"] = structure
     return result
+
+
+def _storage_structure():
+    """Chunk-parent accounting for ``tool_status``, or ``None`` to omit it.
+
+    Chroma-only: other backends have no ``chroma.sqlite3`` to probe. The
+    numbers come from
+    :func:`mempalace.backends.chroma_sqlite.get_parentless_chunk_group_stats`
+    (pure sqlite, read-only); ``None`` — missing database, unbootstrapped
+    collection, or any probe failure — means the key is left out of status
+    rather than reported wrong. A chunked drawer intentionally has no parent
+    embedding row, so ``parentless_chunk_groups`` is expected storage
+    structure, not corruption; see that probe's docstring.
+    """
+    if not _is_chroma_backend():
+        return None
+    try:
+        from ..backends.chroma_sqlite import get_parentless_chunk_group_stats
+
+        return get_parentless_chunk_group_stats(_config.palace_path, _config.collection_name)
+    except Exception:
+        logger.debug("chunk parent diagnostics failed; omitting", exc_info=True)
+        return None
 
 
 def _sqlite_taxonomy():
@@ -322,6 +348,15 @@ def _tally_wings_rooms(all_meta, wings=None, rooms=None, taxonomy=None) -> int:
 
 
 def tool_status():
+    """Palace overview: totals, wing/room breakdown, storage structure.
+
+    On the Chroma backend the response also carries ``storage_structure``
+    (logical drawers vs physical rows vs parentless chunk groups, from
+    :func:`mempalace.backends.chroma_sqlite.get_parentless_chunk_group_stats`).
+    Chunked drawers intentionally have no parent embedding row, so a nonzero
+    ``parentless_chunk_groups`` is expected storage structure, not
+    corruption. The key is omitted when the probe cannot run.
+    """
     _ensure_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = _tool_status_via_sqlite()
@@ -356,7 +391,7 @@ def tool_status():
             wings[w] = wings.get(w, 0) + sum(room_counts.values())
             for r, n in room_counts.items():
                 rooms[r] = rooms.get(r, 0) + n
-        return {
+        result = {
             "total_drawers": total,
             "wings": wings,
             "rooms": rooms,
@@ -365,6 +400,10 @@ def tool_status():
             "backend": _selected_backend_name(),
             "embedding_device": _describe_device_safe(),
         }
+        structure = _storage_structure()
+        if structure is not None:
+            result["storage_structure"] = structure
+        return result
 
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
@@ -421,6 +460,9 @@ def tool_status():
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
         result["partial"] = True
+    structure = _storage_structure()
+    if structure is not None:
+        result["storage_structure"] = structure
     return result
 
 
