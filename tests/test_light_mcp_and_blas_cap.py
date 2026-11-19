@@ -19,61 +19,255 @@ from mempalace.hub_client import HubClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_importing_mempalace_caps_blas_and_omp_threads_by_default() -> None:
-    """Importing mempalace sets OPENBLAS/OMP/MKL_NUM_THREADS=1 before numpy loads."""
+_CAP_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+_UNSET = dict.fromkeys(_CAP_VARS)
+_CAPPED = dict.fromkeys(_CAP_VARS, "1")
+
+# Loaded through PYTHONPATH as ``sitecustomize`` in each probed interpreter:
+# records the thread variables at the moment numpy is first imported (the
+# point OpenBLAS reads them) and again at exit.
+_PROBE_SITECUSTOMIZE = """
+import atexit, json, os, sys
+_OUT = os.environ["MEMPALACE_BLAS_PROBE_OUT"]
+_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+_STATE = {"at_numpy": None}
+
+
+class _NumpyImportProbe:
+    def find_spec(self, name, path=None, target=None):
+        if name == "numpy" and _STATE["at_numpy"] is None:
+            _STATE["at_numpy"] = {v: os.environ.get(v) for v in _VARS}
+        return None
+
+
+sys.meta_path.insert(0, _NumpyImportProbe())
+
+
+def _dump():
+    with open(_OUT, "w", encoding="utf-8") as fh:
+        json.dump(
+            {"at_numpy": _STATE["at_numpy"], "at_exit": {v: os.environ.get(v) for v in _VARS}},
+            fh,
+        )
+
+
+atexit.register(_dump)
+"""
+
+
+def _probe_thread_env(tmp_path, argv, *, preset=None, stdin=subprocess.DEVNULL):
+    """Run ``argv`` with the probe loaded; return its recorded thread variables."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir(exist_ok=True)
+    (probe_dir / "sitecustomize.py").write_text(_PROBE_SITECUSTOMIZE, encoding="utf-8")
+    out = tmp_path / "probe.json"
     env = os.environ.copy()
-    for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    for var in _CAP_VARS:
         env.pop(var, None)
-
-    probe = (
-        "import json, os, sys; "
-        "import mempalace; "
-        "print(json.dumps({"
-        "'openblas': os.environ.get('OPENBLAS_NUM_THREADS'), "
-        "'omp': os.environ.get('OMP_NUM_THREADS'), "
-        "'mkl': os.environ.get('MKL_NUM_THREADS'), "
-        "'numpy_loaded': 'numpy' in sys.modules"
-        "}))"
-    )
+    env.update(preset or {})
+    env["PYTHONPATH"] = os.pathsep.join([str(probe_dir), str(REPO_ROOT)])
+    env["MEMPALACE_BLAS_PROBE_OUT"] = str(out)
     proc = subprocess.run(
-        [sys.executable, "-c", probe],
+        argv,
         capture_output=True,
         text=True,
-        timeout=15,
-        cwd=str(REPO_ROOT),
+        timeout=120,
+        cwd=str(tmp_path),
         env=env,
+        stdin=stdin,
+    )
+    assert out.exists(), f"probe did not run (rc={proc.returncode}): {proc.stderr[-2000:]}"
+    return json.loads(out.read_text(encoding="utf-8")), proc
+
+
+def _entry(code: str) -> list[str]:
+    return [sys.executable, "-c", "import sys\n" + code]
+
+
+def test_importing_mempalace_leaves_blas_and_omp_threads_alone(tmp_path) -> None:
+    """A library import must not cap the host application's thread pools."""
+    data, proc = _probe_thread_env(
+        tmp_path,
+        _entry("import mempalace, mempalace.searcher, mempalace.mcp_server, numpy"),
     )
     assert proc.returncode == 0, proc.stderr
-    data = json.loads(proc.stdout.strip())
-    assert data == {"openblas": "1", "omp": "1", "mkl": "1", "numpy_loaded": False}
+    assert data == {"at_numpy": _UNSET, "at_exit": _UNSET}
 
 
-def test_importing_mempalace_preserves_explicit_thread_env_vars() -> None:
-    """User-configured OPENBLAS/OMP/MKL thread counts are preserved via setdefault."""
+def test_cli_compute_command_leaves_blas_and_omp_threads_alone(tmp_path) -> None:
+    """``mempalace mine`` keeps every core for embedding and exact scans."""
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "notes.md").write_text("# Notes\n\nThread caps belong to servers.\n")
+    data, proc = _probe_thread_env(
+        tmp_path,
+        _entry(
+            "sys.argv = ['mempalace', '--palace', sys.argv[1], 'mine', sys.argv[2], '--dry-run']\n"
+            "from mempalace.cli import main\n"
+            "main()"
+        )
+        + [str(tmp_path / "palace"), str(project)],
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert data["at_exit"] == _UNSET
+    assert data["at_numpy"] in (None, _UNSET)
+
+
+_SERVER_ENTRY_POINTS = {
+    # mempalace-light-mcp console script
+    "light-console": _entry(
+        "sys.argv = ['mempalace-light-mcp', '--help']\n"
+        "from mempalace.mcp_light_server import main\n"
+        "main()"
+    ),
+    "light-module": [sys.executable, "-m", "mempalace.mcp_light_server", "--help"],
+    # mempalace-mcp console script; --help falls through to the full server
+    "mcp-console": _entry(
+        "sys.argv = ['mempalace-mcp', '--help']\nfrom mempalace.mcp_proxy import main\nmain()"
+    ),
+    "mcp-module": [sys.executable, "-m", "mempalace.mcp_server", "--help"],
+}
+
+
+@pytest.mark.parametrize("name", sorted(_SERVER_ENTRY_POINTS))
+def test_server_entry_points_cap_blas_threads_before_numpy(tmp_path, name) -> None:
+    data, proc = _probe_thread_env(tmp_path, _SERVER_ENTRY_POINTS[name])
+    assert proc.returncode == 0, proc.stderr
+    assert data["at_exit"] == _CAPPED
+    if name.startswith("light"):
+        # The light server stays light: numpy never loads for --help.
+        assert data["at_numpy"] is None
+    else:
+        assert data["at_numpy"] == _CAPPED
+
+
+def test_hub_launcher_caps_blas_threads_before_numpy(tmp_path) -> None:
+    """``mempalace serve`` starts the hub through the cwd-safe module launcher."""
+    from mempalace._proc import safe_module_argv
+
+    data, proc = _probe_thread_env(tmp_path, safe_module_argv("mempalace.mcp_server", "--help"))
+    assert proc.returncode == 0, proc.stderr
+    assert data == {"at_numpy": _CAPPED, "at_exit": _CAPPED}
+
+
+def test_sidecar_bridge_caps_blas_threads(tmp_path) -> None:
+    bridge = REPO_ROOT / "plugins" / "mempalace" / "sidecars" / "palace" / "bridge.py"
+    data, proc = _probe_thread_env(tmp_path, [sys.executable, "-u", str(bridge)])
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout.splitlines()[0])["type"] == "ready"
+    assert data["at_exit"] == _CAPPED
+    assert data["at_numpy"] is None
+
+
+@pytest.mark.parametrize("name", ["light-console", "mcp-console", "mcp-module"])
+def test_server_entry_points_preserve_explicit_thread_env_vars(tmp_path, name) -> None:
+    """Operator-configured thread counts win over the server default."""
+    preset = {"OPENBLAS_NUM_THREADS": "4", "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "3"}
+    data, proc = _probe_thread_env(tmp_path, _SERVER_ENTRY_POINTS[name], preset=preset)
+    assert proc.returncode == 0, proc.stderr
+    assert data["at_exit"] == preset
+    assert data["at_numpy"] in (None, preset)
+
+
+def test_serve_passes_blas_cap_to_hub_child(tmp_path, monkeypatch) -> None:
+    import argparse
+    import subprocess as _subprocess
+
+    from mempalace import cli
+
+    captured = {}
+
+    class _Exec(Exception):
+        pass
+
+    def _capture(argv, env):
+        captured["env"] = env
+        raise _Exec
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    monkeypatch.setenv("OMP_NUM_THREADS", "6")
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    monkeypatch.setattr(cli.os, "execve", lambda path, argv, env: _capture(argv, env))
+    monkeypatch.setattr(_subprocess, "run", lambda argv, env=None, **kw: _capture(argv, env))
+    args = argparse.Namespace(
+        host="127.0.0.1",
+        port=8765,
+        backend=None,
+        global_backend=None,
+        palace=str(tmp_path / "palace"),
+        token=None,
+        tls_cert=None,
+        tls_key=None,
+        read_only=False,
+        allow_insecure=False,
+        no_token=False,
+    )
+    with pytest.raises(_Exec):
+        cli.cmd_serve(args)
+    env = captured["env"]
+    assert (env["OPENBLAS_NUM_THREADS"], env["OMP_NUM_THREADS"], env["MKL_NUM_THREADS"]) == (
+        "1",
+        "6",
+        "1",
+    )
+    # The serving CLI process itself is not capped.
+    assert "OPENBLAS_NUM_THREADS" not in os.environ
+
+
+@pytest.mark.parametrize(
+    ("orig_argv", "expected"),
+    [
+        (["python", "-m", "mempalace.mcp_server", "--transport", "http"], True),
+        (["python", "-u", "-X", "utf8", "-m", "mempalace.mcp_server"], True),
+        (["python", "-mmempalace.mcp_server"], True),
+        (["python", "-m", "mempalace.mcp_server.runtime"], False),
+        (["python", "-m", "pytest", "-m", "mempalace.mcp_server"], False),
+        (["python", "-c", "import mempalace.mcp_server"], False),
+        (["python", "script.py", "-m", "mempalace.mcp_server"], False),
+        (["mempalace"], False),
+        ([], False),
+    ],
+)
+def test_launched_as_module_reads_interpreter_argv(monkeypatch, orig_argv, expected) -> None:
+    from mempalace import _blas_threads
+
+    monkeypatch.setattr(sys, "orig_argv", orig_argv, raising=False)
+    assert _blas_threads.launched_as_module("mempalace.mcp_server") is expected
+
+
+def test_launched_as_module_recognises_the_safe_launcher(monkeypatch) -> None:
+    from mempalace import _blas_threads
+    from mempalace._proc import safe_module_argv
+
+    monkeypatch.setattr(
+        sys, "orig_argv", safe_module_argv("mempalace.mcp_server", "--port", "1"), raising=False
+    )
+    assert _blas_threads.launched_as_module("mempalace.mcp_server") is True
+    assert _blas_threads.launched_as_module("mempalace.daemon") is False
+
+
+def _torch_threads(code: str) -> int:
     env = os.environ.copy()
-    env["OPENBLAS_NUM_THREADS"] = "4"
-    env["OMP_NUM_THREADS"] = "2"
-    env["MKL_NUM_THREADS"] = "3"
-
-    probe = (
-        "import json, os, mempalace; "
-        "print(json.dumps({"
-        "'openblas': os.environ.get('OPENBLAS_NUM_THREADS'), "
-        "'omp': os.environ.get('OMP_NUM_THREADS'), "
-        "'mkl': os.environ.get('MKL_NUM_THREADS')"
-        "}))"
-    )
+    for var in _CAP_VARS:
+        env.pop(var, None)
     proc = subprocess.run(
-        [sys.executable, "-c", probe],
+        [sys.executable, "-c", code + "; print(torch.get_num_threads())"],
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=120,
         cwd=str(REPO_ROOT),
         env=env,
     )
     assert proc.returncode == 0, proc.stderr
-    data = json.loads(proc.stdout.strip())
-    assert data == {"openblas": "4", "omp": "2", "mkl": "3"}
+    return int(proc.stdout.strip().splitlines()[-1])
+
+
+def test_importing_mempalace_keeps_torch_threads() -> None:
+    """CPU embedding (EmbeddingGemma via torch) keeps the default intra-op pool."""
+    pytest.importorskip("torch")
+    assert _torch_threads("import mempalace, torch") == _torch_threads("import torch")
 
 
 def test_importing_mcp_light_server_keeps_chromadb_and_numpy_unloaded() -> None:
