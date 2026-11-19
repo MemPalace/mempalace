@@ -37,7 +37,9 @@ def _chroma_stamp(palace_path):
             stamps.append(None)
         else:
             stamps.append((st.st_mtime_ns, st.st_size))
-    return tuple(stamps)
+    from .sources.lifecycle import visibility_epoch
+
+    return (*stamps, visibility_epoch(palace_path))
 
 
 def _cached_wings(key, stamp, read) -> frozenset:
@@ -89,7 +91,11 @@ def known_wings(col) -> frozenset:
     if "supports_metadata_facets" not in capabilities:
         return frozenset()
     key = (type(inner).__name__, palace_path if isinstance(palace_path, str) else id(inner))
-    return _cached_wings(key, None, lambda: inner.facet_counts("wing", limit=10_000))
+    from .sources.lifecycle import visibility_epoch
+
+    path = getattr(getattr(inner, "_handle", None), "palace_path", None)
+    epoch = visibility_epoch(path) if isinstance(path, str) else None
+    return _cached_wings(key, epoch, lambda: inner.facet_counts("wing", limit=10_000))
 
 
 def palace_wing_aliases(wing: str, col=None, known=None) -> list:

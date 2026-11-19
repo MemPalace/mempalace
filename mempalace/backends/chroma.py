@@ -2431,7 +2431,7 @@ class ChromaCollection(BaseCollection):
     # Reads
     # ------------------------------------------------------------------
 
-    def _get_document_filtered(self, where_document, **kwargs):
+    def _get_document_filtered(self, where_document, *, visible=None, **kwargs):
         """Refill one native response before logical pagination and projection."""
         validate_where_document(where_document)
         candidate = document_filter_candidate(where_document)
@@ -2450,11 +2450,12 @@ class ChromaCollection(BaseCollection):
             kwargs["where_document"] = candidate
         while True:
             raw = self._collection.get(**kwargs)
-            documents, _ = restore_rows(raw["documents"] or [], raw["metadatas"] or [])
+            documents, metadatas = restore_rows(raw["documents"] or [], raw["metadatas"] or [])
             matches = [
                 index
                 for index, document in enumerate(documents)
                 if matches_where_document(document or "", where_document)
+                and (visible is None or visible(metadatas[index]))
             ]
             if needed is not None and len(matches) < needed and len(raw["ids"]) == kwargs["limit"]:
                 kwargs["limit"] *= 2
@@ -2462,30 +2463,42 @@ class ChromaCollection(BaseCollection):
             matches = matches[offset:needed]
             return {field: [raw[field][index] for index in matches] for field in fields}
 
-    def _query_document_filtered(self, where_document, **kwargs):
+    def _query_document_filtered(self, where_document, *, visible=None, **kwargs):
         """Refill native ranking until the original-text predicate fills top-k."""
         validate_where_document(where_document)
         candidate = document_filter_candidate(where_document)
         fields = ["ids", *kwargs["include"]]
         requested = kwargs["n_results"]
+        visibility_cap = max(requested, min(4096, requested * 16))
         kwargs["include"] = list(dict.fromkeys([*kwargs["include"], "documents", "metadatas"]))
         if candidate is not None:
             kwargs["where_document"] = candidate
         while True:
             raw = self._collection.query(**kwargs)
             selections = []
-            refill = False
+            refill = truncated = False
             for ids, documents, metadatas in zip(raw["ids"], raw["documents"], raw["metadatas"]):
-                documents, _ = restore_rows(documents or [], metadatas or [])
+                documents, metadatas = restore_rows(documents or [], metadatas or [])
                 matches = [
                     index
                     for index, document in enumerate(documents)
                     if matches_where_document(document or "", where_document)
                 ]
+                at_cap = visible is not None and len(matches) >= visibility_cap
+                if visible is not None:
+                    matches = [i for i in matches[:visibility_cap] if visible(metadatas[i])]
                 selections.append(matches[:requested])
-                if len(matches) < requested and len(ids) == kwargs["n_results"]:
+                if len(matches) < requested and at_cap:
+                    truncated = True
+                elif len(matches) < requested and len(ids) == kwargs["n_results"]:
                     refill = True
             if not refill:
+                if truncated:
+                    warnings.warn(
+                        "source visibility ANN candidate budget exhausted; results truncated",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
                 result = {field: [] for field in fields}
                 for query_index, matches in enumerate(selections):
                     for field in fields:
@@ -2494,7 +2507,49 @@ class ChromaCollection(BaseCollection):
                 return result
             kwargs["n_results"] *= 2
 
-    def query(
+    def _logical_drawers(self):
+        from ..config import get_configured_collection_name
+
+        return (
+            self._palace_path is not None
+            and self._collection.name == get_configured_collection_name()
+        )
+
+    def _read_filtered_drawers(self, read, kwargs):
+        """Use one native response for the predicate, visibility and returned payload.
+
+        Pin only the registry: holding a Chroma SQLite reader across the SDK
+        call prevents a concurrent writer from finishing. Retry an activation
+        race instead of mixing the native response with a later hydration.
+        """
+        from ..sources.lifecycle import (
+            SourceLifecycleSnapshot,
+            StaleLifecycleSnapshot,
+            visibility_epoch,
+        )
+
+        for attempt in range(3):
+            epoch = visibility_epoch(self._palace_path)
+            try:
+                with SourceLifecycleSnapshot(self._palace_path) as snapshot:
+                    result = read(**kwargs, _visible=snapshot.visible)
+                    if visibility_epoch(self._palace_path) != epoch:
+                        raise StaleLifecycleSnapshot("registry changed during filtered drawer read")
+                    return result
+            except StaleLifecycleSnapshot:
+                if attempt == 2:
+                    raise
+
+    def query(self, **kwargs):
+        if self._logical_drawers():
+            if kwargs.get("where_document") is not None:
+                return self._read_filtered_drawers(self._query_physical, kwargs)
+            from ..sources.read_visibility import chroma_query
+
+            return chroma_query(self, **kwargs)
+        return self._query_physical(**kwargs)
+
+    def _query_physical(
         self,
         *,
         query_texts=None,
@@ -2503,6 +2558,7 @@ class ChromaCollection(BaseCollection):
         where=None,
         where_document=None,
         include=None,
+        _visible=None,
     ) -> QueryResult:
         if getattr(self, "_require_embeddings", False) and query_texts is not None:
             raise ValueError("caller-vector collection requires query_embeddings")
@@ -2538,7 +2594,7 @@ class ChromaCollection(BaseCollection):
         if where is not None:
             kwargs["where"] = encode_where(where)
         if where_document is not None:
-            raw = self._query_document_filtered(where_document, **kwargs)
+            raw = self._query_document_filtered(where_document, visible=_visible, **kwargs)
         else:
             raw = self._collection.query(**kwargs)
 
@@ -2578,7 +2634,19 @@ class ChromaCollection(BaseCollection):
             ),
         )
 
-    def get(
+    def get(self, **kwargs):
+        if self._logical_drawers():
+            if kwargs.get("where_document") is not None:
+                return self._read_filtered_drawers(self._get_physical, kwargs)
+            from ..sources.read_visibility import chroma_get
+
+            return chroma_get(self, **kwargs)
+        return self._get_physical(**kwargs)
+
+    def get_all_rows(self, where=None, include=None):
+        return self.get(where=where, include=include or ["metadatas"])
+
+    def _get_physical(
         self,
         *,
         ids=None,
@@ -2587,6 +2655,7 @@ class ChromaCollection(BaseCollection):
         limit=None,
         offset=None,
         include=None,
+        _visible=None,
     ) -> GetResult:
         validate_where(where)
         validate_where(where_document)
@@ -2611,7 +2680,7 @@ class ChromaCollection(BaseCollection):
             kwargs["offset"] = offset
 
         if where_document is not None:
-            raw = self._get_document_filtered(where_document, **kwargs)
+            raw = self._get_document_filtered(where_document, visible=_visible, **kwargs)
         else:
             raw = self._collection.get(**kwargs)
         out_ids = list(raw.get("ids") or [])
@@ -2645,8 +2714,26 @@ class ChromaCollection(BaseCollection):
         with self._write_lock():
             self._collection.delete(**kwargs)
 
-    def count(self):
+    def physical_count(self):
         return self._collection.count()
+
+    def count(self):
+        if self._logical_drawers():
+            from ..sources.read_visibility import open_ready_chroma_reader
+            from .chroma_sqlite import _DRAWERS_SQL
+
+            with open_ready_chroma_reader(self) as conn:
+                return conn.execute(
+                    f"SELECT COUNT(*) {_DRAWERS_SQL} WHERE c.name=?", (self._collection.name,)
+                ).fetchone()[0]
+        return self.physical_count()
+
+    def facet_counts(self, field, where=None, limit=1000):
+        from collections import Counter
+
+        rows = self.get_all_metadata(where=where)
+        counts = Counter(str(meta[field]) for meta in rows if meta and field in meta)
+        return dict(sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:limit])
 
     def iter_metadata(
         self,
@@ -2684,7 +2771,7 @@ class ChromaCollection(BaseCollection):
                     return list(rows)
                 except sqlite3.Error:
                     logger.debug("sqlite metadata scan failed; paging instead", exc_info=True)
-        return super().get_all_metadata(where=where)
+        return self.get_all_rows(where=where).metadatas
 
     def _recent_from_metadata(self, *, limit, where, order_field, include, spec):
         """Keep recency exact when the indexed SQLite ordering is unavailable."""
