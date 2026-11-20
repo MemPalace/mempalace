@@ -198,6 +198,48 @@ A shared hub also gives your agents a coordination channel: the
 (`mempalace_patch_submit` / `mempalace_artifact_get`) — no human relaying
 messages between machines.
 
+## 5. Save hooks on client machines
+
+The MCP client connection above does not cover the save hooks. By default a
+hook writes to the palace on its own machine. To send hook writes to the
+server, set this in the environment the hooks run in:
+
+```bash
+export MEMPALACE_HOOK_REMOTE_URL=https://memory.example.com/mcp
+export MEMPALACE_HOOK_REMOTE_TOKEN=your-bearer-token
+```
+
+The keys `hooks.remote_url` and `hooks.remote_token` in `config.json` do the
+same job. The environment wins. Prefer the environment on a client: a
+`config.json` that cannot be parsed loses its remote URL along with its other
+settings.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MEMPALACE_HOOK_REMOTE_URL` | _(none)_ | Server URL. Without it the hooks stay local. `/mcp` is added when the URL has no path |
+| `MEMPALACE_HOOK_REMOTE_TOKEN` | _(none)_ | Bearer token. Required unless the host is loopback |
+| `MEMPALACE_HOOK_REMOTE_TIMEOUT` | `30` | Seconds the detached save waits for the server |
+
+With a remote URL set:
+
+- Stop, SessionEnd and PreCompact send a diary checkpoint with
+  `mempalace_diary_write`. The call runs in a detached process, so a slow or
+  stopped server does not hold up your session.
+- **Nothing is written to the local palace**, on failure included. A URL that
+  is not usable (plain `http` to a non-loopback host, a missing token) blocks
+  the save and says so. Hook write-routing settings are ignored.
+- A failed save is written to `hook.log` in the hook state directory, and the
+  next Stop or PreCompact reports it once in the session. The Stop save point
+  does not advance, so a later Stop saves again. A failed SessionEnd save is not
+  retried.
+
+**Limits.** Transcript and project mining are skipped in this mode, because
+`mempalace_mine` reads paths on the server and the server cannot read files on
+your machine. The checkpoint is a short summary, and the verbatim transcript
+is not stored. To store transcripts, mine them on a host that can reach both
+the files and the backend. The Cursor and Antigravity hook scripts call
+`mempalace mine` directly and do not read these settings.
+
 ## Operating notes
 
 - **Mining** still happens via the CLI (`mempalace mine …`) on the server host
