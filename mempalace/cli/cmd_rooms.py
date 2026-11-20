@@ -72,7 +72,6 @@ def _open_closets_collection(palace_path):
 def cmd_rooms(args):
     from ..rooms import (
         DEFAULT_THRESHOLD,
-        GENERIC_ROOMS,
         EmbeddingRoomDecider,
         apply_inputs,
         apply_plan,
@@ -158,7 +157,10 @@ def cmd_rooms(args):
     elif scope:
         from_rooms = frozenset(r.strip() for r in scope.split(",") if r.strip())
     else:
-        from_rooms = GENERIC_ROOMS
+        # Reclassify every drawer by default: limiting the default scope to the
+        # generic rooms made drawers parked in a project room unrecoverable once
+        # the right room existed (issue #2953). --from still narrows the scope.
+        from_rooms = None
 
     def report(plan):
         s = plan.summary()

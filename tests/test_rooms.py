@@ -8,6 +8,7 @@ import pytest
 
 from mempalace.config import MempalaceConfig
 from mempalace.rooms import (
+    GENERIC_ROOMS,
     EmbeddingRoomDecider,
     RoomSet,
     RoomSpec,
@@ -269,17 +270,31 @@ def _room_set():
     )
 
 
-def test_plan_rooms_only_touches_generic_rooms_by_default():
+def test_plan_rooms_reclassifies_every_room_by_default_and_narrows_with_from_rooms():
     rows = _rows()
-    rows[0]["meta"]["room"] = "decisions"  # r1 filed by hand: must stay put
+    rows[0]["meta"]["room"] = "decisions"  # r1 was filed by an earlier apply into a project room
     col = FakeCollection(rows)
-    plan = plan_rooms(col, "w", EmbeddingRoomDecider(_room_set(), FakeEmbed()), threshold=0.75)
-    assert sorted(plan.changes) == [("r3", "technical", "bug-fixes")]
-    assert plan.per_room["decisions"] == 1
-    everything = plan_rooms(
-        col, "w", EmbeddingRoomDecider(_room_set(), FakeEmbed()), threshold=0.75, from_rooms=None
+
+    # The default must reconsider project rooms too: a room created after that
+    # earlier apply has to be able to claim the misfiled drawer (issue #2953).
+    default_plan = plan_rooms(
+        col, "w", EmbeddingRoomDecider(_room_set(), FakeEmbed()), threshold=0.75
     )
-    assert ("r1", "decisions", "releases") in everything.changes
+    assert sorted(default_plan.changes) == [
+        ("r1", "decisions", "releases"),
+        ("r3", "technical", "bug-fixes"),
+    ]
+
+    # --from still narrows the scope explicitly.
+    narrowed = plan_rooms(
+        col,
+        "w",
+        EmbeddingRoomDecider(_room_set(), FakeEmbed()),
+        threshold=0.75,
+        from_rooms=GENERIC_ROOMS,
+    )
+    assert sorted(narrowed.changes) == [("r3", "technical", "bug-fixes")]
+    assert narrowed.per_room["decisions"] == 1
 
 
 def test_plan_rooms_moves_kept_threshold_and_missing():
@@ -1073,7 +1088,7 @@ def test_cmd_rooms_apply_resume_keeps_drawer_and_closet_aligned(tmp_path, monkey
             },
         ]
     )
-    from mempalace.rooms import GENERIC_ROOMS, apply_inputs, save_pending_apply
+    from mempalace.rooms import apply_inputs, save_pending_apply
 
     marker = pending_apply_path(cfg, "w")
     save_pending_apply(
@@ -1084,7 +1099,7 @@ def test_cmd_rooms_apply_resume_keeps_drawer_and_closet_aligned(tmp_path, monkey
             ("session.jsonl", "technical"): "releases",
         },
         0,
-        apply_inputs(cfg, "w", 0.75, GENERIC_ROOMS),
+        apply_inputs(cfg, "w", 0.75, None),
         moves={
             "a-first": ["session.jsonl", "general", "technical"],
             "b-second": ["session.jsonl", "technical", "releases"],

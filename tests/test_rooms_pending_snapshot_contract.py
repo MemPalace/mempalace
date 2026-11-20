@@ -14,7 +14,6 @@ import pytest
 from mempalace.backends.sqlite_exact import SQLiteExactBackend
 from mempalace.config import MempalaceConfig
 from mempalace.rooms import (
-    GENERIC_ROOMS,
     RoomSet,
     RoomSpec,
     apply_inputs,
@@ -68,7 +67,7 @@ def _seed(tmp_path):
                 ("source", "technical"): "releases",
             },
             0,
-            apply_inputs(cfg, "w", 0.75, GENERIC_ROOMS),
+            apply_inputs(cfg, "w", 0.75, None),
             moves={
                 "a": ["source", "general", "technical"],
                 "b": ["source", "technical", "releases"],

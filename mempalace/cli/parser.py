@@ -728,8 +728,9 @@ def main():
         dest="from_rooms",
         default=None,
         metavar="ROOMS",
-        help="Comma-separated rooms whose drawers may move (default: the miner's generic rooms "
-        "general,technical,architecture,planning,problems); 'all' reclassifies every drawer",
+        help="Comma-separated rooms whose drawers may move (default: every room, so a room "
+        "created after an earlier apply can still claim misfiled drawers); 'all' is equivalent "
+        "to the default",
     )
     p_rooms_apply.add_argument(
         "--show",
