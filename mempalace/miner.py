@@ -171,6 +171,13 @@ READABLE_EXTENSIONS = {
     ".al",
     # PowerShell scripts, the Windows counterpart of ``.sh`` above.
     ".ps1",
+    # Infrastructure as code: Terraform/HCL and Bicep are plain text. Without
+    # these an IaC repository files only the docs/YAML around the code (#2990).
+    ".tf",
+    ".tfvars",
+    ".hcl",
+    ".bicep",
+    ".bicepparam",
 } | PHP_EXTENSIONS
 
 SKIP_FILENAMES = {
