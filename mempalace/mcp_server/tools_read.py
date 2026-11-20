@@ -977,6 +977,26 @@ def tool_delete_hallway(hallway_id: str):
     return {"deleted": delete_hallway(hallway_id)}
 
 
+def _tunnel_room_name(value: str) -> str:
+    """Validate a tunnel endpoint room the way ``create_tunnel`` writes it.
+
+    ``create_tunnel`` stores rooms verbatim (``_require_name``): entity tunnels
+    use ``entity:<entity>`` with paths and URLs, and topic tunnels use
+    ``topic:<name>``. ``sanitize_name`` rejects ``:``, ``/`` and ``\\``, so the
+    read path could not follow any endpoint the writer accepts (issue #3027).
+    The value is only compared with tunnel-file endpoints, never used as a
+    path or metadata value.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("room must be a non-empty string")
+    room = value.strip()
+    if len(room) > 200:
+        raise ValueError("room must be at most 200 characters")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in room):
+        raise ValueError("room must not contain control characters")
+    return room
+
+
 def tool_follow_tunnels(wing: str, room: str, record: bool = True):
     """Follow explicit tunnels from a room to see connected drawers in other wings.
 
@@ -989,7 +1009,7 @@ def tool_follow_tunnels(wing: str, room: str, record: bool = True):
     """
     try:
         wing = sanitize_name(wing, "wing")
-        room = sanitize_name(room, "room")
+        room = _tunnel_room_name(room)
     except ValueError as e:
         return {"error": str(e)}
     col = _get_collection()
