@@ -930,16 +930,29 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
     Harness-injected messages are skipped (see
     :data:`_HARNESS_BOILERPLATE_MARKERS`) so the checkpoint summarizes the
     conversation rather than the tooling around it.
+
+    Like the normalizer, prefer Codex's canonical event_msg turns and fall
+    back to response_item user text only when no canonical turn exists.
+    Subagent response items contain the parent agent's prompts, not the
+    user's words, and are never used as that fallback.
     """
     path = Path(transcript_path).expanduser()
     if not path.is_file():
         return []
     messages = []
+    codex_items = []
+    has_codex_events = False
+    is_subagent = False
     try:
         with open(path, "rb") as f:
             for raw_line in f:
                 try:
                     entry = json.loads(decode_source(raw_line)[0])
+                    if entry.get("type") == "session_meta":
+                        meta = entry.get("payload")
+                        source = meta.get("source") if isinstance(meta, dict) else None
+                        if isinstance(source, dict) and "subagent" in source:
+                            is_subagent = True
                     # Claude Code format
                     msg = entry.get("message") or entry.get("event_message") or {}
                     if isinstance(msg, dict) and msg.get("role") == "user":
@@ -956,15 +969,29 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
                     # Codex CLI format
                     elif entry.get("type") == "event_msg":
                         payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
+                        if isinstance(payload, dict):
                             text = payload.get("message", "")
-                            if isinstance(text, str) and text.strip():
-                                if not _is_harness_boilerplate(text):
+                            role = payload.get("type")
+                            if (
+                                role in ("user_message", "agent_message")
+                                and isinstance(text, str)
+                                and text.strip()
+                            ):
+                                has_codex_events = True
+                                if role == "user_message" and not _is_harness_boilerplate(text):
                                     messages.append(text.strip()[:200])
+                    elif entry.get("type") == "response_item":
+                        payload = entry.get("payload", {})
+                        if isinstance(payload, dict):
+                            turn = codex_response_message(payload)
+                            if turn and turn[0] == "user" and not _is_harness_boilerplate(turn[1]):
+                                codex_items.append(turn[1][:200])
                 except (json.JSONDecodeError, AttributeError):
                     pass
     except OSError:
         return []
+    if not has_codex_events and not is_subagent:
+        messages.extend(codex_items)
     return messages[-count:]
 
 
