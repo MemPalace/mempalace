@@ -22,6 +22,21 @@ except MineAlreadyRunning:
     raise SystemExit(23)
 """
 
+_LOCK_WAIT_RELEASE = """
+import sys, time
+from mempalace.palace import MineAlreadyRunning, mine_palace_lock
+
+deadline = time.monotonic() + 5.0
+while True:
+    try:
+        with mine_palace_lock(sys.argv[1]):
+            raise SystemExit(0)
+    except MineAlreadyRunning:
+        if time.monotonic() >= deadline:
+            raise SystemExit(23)
+        time.sleep(0.02)
+"""
+
 # POSIX file-mode bits (0600/0700) are not representable on Windows: os.chmod
 # can only toggle the read-only attribute, so a "private" file still reports
 # 0o666. The daemon relies on the user-profile directory ACLs for privacy
@@ -582,17 +597,12 @@ def test_shutdown_cancels_active_job(tmp_path, monkeypatch):
 
     # Release the blocked worker so it (and the daemon thread) can exit.
     block.set()
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        released = subprocess.run(
-            [sys.executable, "-c", _LOCK_CONTENDER, str(palace)],
-            check=False,
-            env=os.environ.copy(),
-            timeout=10,
-        )
-        if released.returncode == 0:
-            break
-        time.sleep(0.02)
+    released = subprocess.run(
+        [sys.executable, "-c", _LOCK_WAIT_RELEASE, str(palace)],
+        check=False,
+        env=os.environ.copy(),
+        timeout=10,
+    )
     assert released.returncode == 0
 
 
