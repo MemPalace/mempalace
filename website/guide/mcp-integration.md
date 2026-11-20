@@ -43,6 +43,12 @@ MemPalace works with any tool that supports MCP:
 - **Cursor** — native MCP support
 - **Gemini CLI** — see [Gemini CLI guide](/guide/gemini-cli)
 
+### Community example: local read-only recall for ChatGPT Work
+
+[KHL MemPalace Recall](https://github.com/KeilerHirschLabs/mempalace-chatgpt-recall) is a **third-party, community-maintained** local stdio MCP plugin for source-grounded lexical searches of existing MemPalace Chroma and sqlite_exact/rust_exact SQLite indices. It exposes only status and bounded read-only FTS5 search; the user configures an explicit wing allowlist. It does **not** replace MemPalace's own MCP server, semantic search, or automatic memory ingestion.
+
+The predecessor was smoke-tested with synthetic data on **one** Windows 11 / ChatGPT Plus installation in Work's local and cloud execution modes (November 2026). This does not establish compatibility with ordinary ChatGPT chats or all subscriptions. Search results are returned to the invoking AI host and may leave the local machine according to that host's data controls. See the community repository for setup and privacy/security notes.
+
 ## Memory Protocol
 
 When the AI first calls `mempalace_status`, it receives the **Memory Protocol** — a behavior guide that teaches it to:
