@@ -243,6 +243,83 @@ class TestFilters:
         assert logstream.latest_event_id() == newest["id"]
 
 
+class TestPagingAccessPath:
+    """The rowid-ordered page read must be a scan with early termination,
+    and it must return exactly the rows the indexed plan returns."""
+
+    @pytest.fixture
+    def seeded(self, logstream):
+        for index in range(40):
+            _append(
+                logstream,
+                room="presence" if index % 3 else "chat",
+                correlation_id=f"chat_{index % 5}",
+                status="ready" if index % 2 else None,
+                body=f"event {index}",
+            )
+        return logstream
+
+    def _reference_ids(self, db_path, sql, params):
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return [row["id"] for row in conn.execute(sql, params)]
+
+    def test_unfiltered_pages_match_the_indexed_reference(self, seeded):
+        ls_path = seeded.db_path
+        for kwargs, sql, params in (
+            (
+                {"stream": "project/mempalace", "room": "presence", "order": "asc", "limit": 12},
+                "SELECT id FROM events WHERE stream = ? AND room = ? ORDER BY rowid ASC LIMIT ?",
+                ("project/mempalace", "presence", 12),
+            ),
+            (
+                {"stream": "project/mempalace", "room": "presence", "order": "desc", "limit": 12},
+                "SELECT id FROM events WHERE stream = ? AND room = ? ORDER BY rowid DESC LIMIT ?",
+                ("project/mempalace", "presence", 12),
+            ),
+        ):
+            events = seeded.list_events(**kwargs)
+            assert [e["id"] for e in events] == self._reference_ids(ls_path, sql, params)
+            assert len(events) == 12
+
+    def test_anchored_pages_match_the_indexed_reference(self, seeded):
+        anchor = seeded.list_events(room="presence")[3]["id"]
+        events = seeded.list_events(room="presence", since_event_id=anchor, limit=7)
+        anchor_rowid = seeded.list_events(room="presence")[3]["seq"]
+        reference = self._reference_ids(
+            seeded.db_path,
+            "SELECT id FROM events WHERE room = ? AND rowid > ? ORDER BY rowid ASC LIMIT ?",
+            ("presence", anchor_rowid, 7),
+        )
+        assert [e["id"] for e in events] == reference
+        assert len(events) == 7
+
+    def test_unfiltered_page_is_a_scan_not_a_room_wide_sort(self, seeded):
+        conn = sqlite3.connect(seeded.db_path)
+        plan = "\n".join(
+            row[3]
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT rowid, * FROM events NOT INDEXED "
+                "WHERE stream = ? AND room = ? ORDER BY rowid ASC LIMIT ?",
+                ("project/mempalace", "presence", 500),
+            )
+        )
+        assert "SCAN events" in plan
+        assert "TEMP B-TREE" not in plan
+
+    def test_selective_filters_keep_the_index_path(self, seeded):
+        conn = sqlite3.connect(seeded.db_path)
+        plan = "\n".join(
+            row[3]
+            for row in conn.execute(
+                "EXPLAIN QUERY PLAN SELECT rowid, * FROM events "
+                "WHERE correlation_id = ? ORDER BY rowid ASC LIMIT ?",
+                ("chat_1", 500),
+            )
+        )
+        assert "SEARCH" in plan
+
+
 # ── Wait ──────────────────────────────────────────────────────────────────
 
 
