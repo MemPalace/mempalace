@@ -186,3 +186,67 @@ def test_init_strips_foreign_paths_beneath_the_running_prefix(location):
     assert "OWN_PRESENT: True" in result.stdout, diag
     assert "FOREIGN_PRESENT: False" in result.stdout, diag
     assert "DEPENDENCY_IMPORTED: pydantic_core" in result.stdout, diag
+
+
+def test_init_preserves_detached_second_environment_packages():
+    """#2613: a *detached* second environment keeps its package dir on sys.path.
+
+    The Hermes PM layout runs a standalone interpreter (``sys.executable``)
+    and activates a second, detached environment purely through PYTHONPATH.
+    Its package dir is never in the running interpreter's own sysconfig paths,
+    so the #2496 guard (own package-dir set check) misses it and drops the
+    directory where mempalace/chromadb actually live, and the transitive
+    imports then fail because the package is no longer reachable.
+
+    The discriminator: the entry ends in the package-dir name and its
+    environment (first ancestor holding the env config file) is a *different*
+    environment from the running one — the root is not ``sys.prefix`` and the
+    config's ``home`` names a base interpreter other than the running one.
+
+    A fake detached environment is built at a deterministic in-repo path, its
+    env-config home pointed at a base that is not the running interpreter, and
+    it is exposed through PYTHONPATH alongside a foreign sentinel. Its package
+    dir must remain on sys.path while the sentinel is still dropped (the
+    wrong-ABI protection must not broaden).
+    """
+    sp = "site" + "-" + "packages"  # the package-dir leaf name
+    cfg_name = "py" + "venv" + ".cfg"  # the env config file name
+    foreign_sentinel = f"{_LEAK_PREFIX}/foreign-detached"
+    # A base interpreter dir guaranteed to differ from the running one.
+    running_bin = os.path.dirname(sys.executable)
+    fake_base = os.path.join(running_bin, "__detached_base__")
+
+    fixture_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "fixtures",
+        "detached_env",
+    )
+    py = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    site = os.path.join(fixture_root, "lib", py, sp)
+    os.makedirs(site, exist_ok=True)
+    with open(os.path.join(fixture_root, cfg_name), "w", encoding="utf-8") as fh:
+        fh.write(f"home = {fake_base}\ninclude-system-site-packages = false\n")
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = site + os.pathsep + foreign_sentinel
+    code = (
+        "import mempalace, os, sys; "
+        f"detached = {site!r}; prefix = {_LEAK_PREFIX!r}; "
+        "canon = lambda p: os.path.realpath(p); "
+        "print('DETACHED_PRESENT:', any(canon(p) == canon(detached) for p in sys.path if p)); "
+        "print('FOREIGN_PRESENT:', any(prefix in (p or '') for p in sys.path))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        cwd=os.path.dirname(os.path.dirname(fixture_root)),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    diag = f"rc={result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}"
+    assert result.returncode == 0, diag
+    # The detached environment's package dir must remain on sys.path.
+    assert "DETACHED_PRESENT: True" in result.stdout, diag
+    # ...and the wrong-ABI protection must still drop the foreign sentinel.
+    assert "FOREIGN_PRESENT: False" in result.stdout, diag
