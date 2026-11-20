@@ -34,6 +34,16 @@ Tools (maintenance):
 import os
 import sys
 
+from .._blas_threads import cap_server_blas_threads, launched_as_module
+
+# ``python -m mempalace.mcp_server`` (and ``mempalace serve``, which starts
+# it that way) is a long-lived server: cap its BLAS/OpenMP pools before the
+# imports below load numpy. ``main()`` cannot do it, because this package is
+# imported before ``__main__`` runs. A plain ``import mempalace.mcp_server``
+# from a library or a test leaves the pools alone.
+if launched_as_module(__name__):
+    cap_server_blas_threads()
+
 # --- MCP stdio protection ---------------------------------------------------
 # The MCP protocol multiplexes JSON-RPC over stdio: stdout MUST carry only
 # valid JSON-RPC messages, stderr is for human-readable logs. Some
