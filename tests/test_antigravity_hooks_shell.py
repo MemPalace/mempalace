@@ -643,6 +643,7 @@ def test_save_hook_returns_before_slow_version_probe(tmp_path: Path) -> None:
     would block ~3s; with the probe backgrounded it returns in well
     under a second.
     """
+    import signal
     import time
 
     state = tmp_path / "state"
@@ -651,12 +652,13 @@ def test_save_hook_returns_before_slow_version_probe(tmp_path: Path) -> None:
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text("{}\n", encoding="utf-8")
     stub = tmp_path / "slow_python"
+    pids = tmp_path / "stall.pids"
     stub.write_text(
         "#!/bin/sh\n"
         "# Stub python: any mempalace launch sleeps 3s, simulating a\n"
         "# heavy cold-start import. Everything else proxies to python3.\n"
         'case "$*" in\n'
-        '    *"run_module(\\"mempalace\\""*) sleep 3; exit 0 ;;\n'
+        f'    *"run_module(\\"mempalace\\""*) echo $$ >> "{pids}"; exec sleep 3 ;;\n'
         '    *) exec /usr/bin/env python3 "$@" ;;\n'
         "esac\n",
         encoding="utf-8",
@@ -672,12 +674,34 @@ def test_save_hook_returns_before_slow_version_probe(tmp_path: Path) -> None:
         timeout=10.0,
     )
     elapsed = time.monotonic() - start
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "{}"
-    assert elapsed < 2.0, (
-        f"save hook took {elapsed:.2f}s with a 3s --version probe; the probe "
-        f"is still running in the foreground instead of the background subshell."
-    )
+    try:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "{}"
+        assert elapsed < 2.0, (
+            f"save hook took {elapsed:.2f}s with a 3s --version probe; the probe "
+            f"is still running in the foreground instead of the background subshell."
+        )
+    finally:
+        # Reap the slow stand-in this test planted, then let the abandoned
+        # subshell take its not-runnable branch and exit (issue #2921). The
+        # killed probe exits non-zero, so `mine` is skipped and the pending
+        # marker is removed; once that marker is gone the background shell is
+        # fully done and nothing is left running in the test's tmp_path.
+        deadline = time.monotonic() + 5.0
+        while not pids.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        planted = pids.read_text(encoding="utf-8").split() if pids.exists() else []
+        for pid in planted:
+            try:
+                # Guard against pid reuse: only signal a pid whose comm is
+                # still our sleep stand-in. Linux reads /proc; macOS would use ps.
+                comm_file = Path(f"/proc/{pid}/comm")
+                if comm_file.exists() and comm_file.read_text().strip() == "sleep":
+                    os.kill(int(pid), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+        while list(state.glob("antigravity_pending_*")) and time.monotonic() < deadline:
+            time.sleep(0.05)
 
 
 def test_save_hook_counter_write_is_atomic(tmp_path: Path) -> None:
