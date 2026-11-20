@@ -237,6 +237,7 @@ def _search_hit_ref(hit: dict) -> dict:
 _CANDIDATE_MERGERS = {
     "vector": None,  # default no-op
     "union": _merge_bm25_union_candidates,
+    "lexical": None,  # FTS5/BM25 lexical-only path; handled before vector query
 }
 
 

@@ -12,7 +12,8 @@ mempalace/ @milla-jovovich @igorls
 .github/ @igorls
 
 # Plugins and integrations
-.antigravity-plugin/ @igorls
+plugins/mempalace/ @igorls
+hooks/antigravity/ @igorls
 .claude-plugin/ @igorls
 .codex-plugin/ @igorls
 .cursor-plugin/ @igorls

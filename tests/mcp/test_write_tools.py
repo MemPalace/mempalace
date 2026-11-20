@@ -1689,6 +1689,25 @@ class TestDeleteBySource:
             source_file="notes/clients.md",
         )
 
+    def test_dry_run_counts_preserved_memory_separately(self, monkeypatch, config, palace_path, kg):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
+        assert result["by_class"] == {"preserve": 2, "index_current": 0, "unknown": 0}
+        assert "manual memory" in result["hint"]
+        assert result["revision_match_count"] == 0
+
+        from mempalace.revisions import append_drawer_revisions
+
+        append_drawer_revisions(
+            palace_path,
+            [("x", "earlier text", {"source_file": "results_mempal_hybrid_v4_session_1.jsonl"})],
+        )
+        result = tool_delete_by_source("results_mempal_hybrid_v4_session_1.jsonl")
+        assert result["revision_match_count"] == 1
+        assert "1 earlier text revision" in result["hint"]
+
     def _seed_closets(self, palace_path):
         """Seed the AAAK index (closets) directly.
 
@@ -1782,6 +1801,32 @@ class TestDeleteBySource:
         assert result["success"] is True
         assert result["deleted"] == 0
         assert tool_status()["total_drawers"] == 3
+
+    def test_a_source_with_no_drawers_left_still_loses_its_remine_history(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """Deleting drawers one by one keeps re-mine history; deleting the source erases it."""
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.revisions import append_drawer_revisions, load_drawer_revisions
+
+        append_drawer_revisions(
+            palace_path,
+            [
+                (
+                    "gone_slot",
+                    "earlier exchange text",
+                    {"source_file": "gone.jsonl", "revision_reason": "remine_overwrite"},
+                )
+            ],
+        )
+        preview = tool_delete_by_source("gone.jsonl")
+        assert preview["match_count"] == 0 and preview["revision_match_count"] == 1
+        assert "1 earlier text revision" in preview["hint"]
+
+        result = tool_delete_by_source("gone.jsonl", dry_run=False)
+        assert result["deleted"] == 0 and result["revisions_deleted"] == 1
+        assert load_drawer_revisions(palace_path) == []
 
     def test_empty_source_file_rejected(self, monkeypatch, config, palace_path, kg):
         self._seed(monkeypatch, config, palace_path, kg)

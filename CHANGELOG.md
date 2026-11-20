@@ -8,8 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Fixed
+### Bug Fixes
 
+- Re-mining a conversation transcript or a diary that was rewritten,
+  compacted or shortened no longer destroys the text mined from the earlier
+  version. Drawer ids are positional, so a re-mine wrote the new text over
+  the old drawers and pruned the rest, and nothing kept what they held.
+  Before a conversation or diary re-mine overwrites or removes a drawer, its
+  exact text and metadata are now appended to `drawer_revisions.jsonl` in the
+  palace directory (one locked, fsynced append per batch; the file is `0600`
+  and the palace directory `0700`). The journal is not searchable yet. If the
+  append fails, the drawers it covered are left as they were, the file is
+  reported as failed and stays unfinished, and the next mine retries;
+  drawers an earlier batch already replaced are journaled first and are not
+  journaled again. Project-file drawers index the file as it is now and are
+  still replaced without a journal entry.
+- A miner now prunes only the drawers it filed. Mining a project over a
+  path that also holds a mined transcript (or the reverse) used to prune the
+  other miner's drawers under that `source_file`; the producer is now read
+  from each drawer's metadata, and conversation, diary, manual and other
+  producers' drawers are kept.
+- `mempalace sync --apply` keeps conversation, diary and manual drawers whose
+  source file is gone or ignored, and reports them as `Preserved` instead of
+  removing them. `mempalace_delete_by_source` reports how many matching
+  drawers are preserved memory and how many journaled revisions it would
+  erase; deleting a source erases its re-mine history in
+  `drawer_revisions.jsonl` too. Deleting a single drawer keeps the re-mine
+  history of its position until its source is deleted.
 - **`hooks.mine_transcript` now turns off the hooks' transcript mine.** A config file could set the key, but nothing read it, so the only way to stop archiving every session verbatim was to turn off `hooks.auto_save` and lose the diary checkpoints with it. The Stop, SessionEnd and PreCompact hooks now skip the transcript mine when it is false and keep filing checkpoints; PreCompact files a checkpoint in place of the mine. (#2403)
 - **A failed diary checkpoint no longer re-fires the transcript mine on every Stop.** The Stop hook's save marker advanced only when the diary filed, while the transcript mine ran either way, inline or in the queued checkpoint child. When the diary kept failing (no writable hub and the local lock refused), every Stop started another full mine. Transcript-mine progress now has its own per-session marker: the mine is put in flight at most once per save interval of new exchanges, including when one is already running. The save marker moves only once the diary checkpoint is confirmed written, so a failed diary is retried at the next Stop. A daemon retry for the same mark joins the pending checkpoint instead of filing a duplicate, while a newer mark files its own content. The Stop hook and a late checkpoint child claim the mine for a mark under one lock, so it is dispatched once. Both markers only move forward. (#2403)
 

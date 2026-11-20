@@ -113,6 +113,17 @@ def embedding_section():
         yield
 
 
+@contextlib.contextmanager
+def suspend_embedding_section_hook():
+    """Keep the caller's request lease while publishing a compound write."""
+    hook = getattr(_embedding_section_hook_local, "hook", None)
+    set_embedding_section_hook(None)
+    try:
+        yield
+    finally:
+        set_embedding_section_hook(hook)
+
+
 _PROVIDER_MAP = {
     "cpu": ["CPUExecutionProvider"],
     "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
@@ -1526,3 +1537,50 @@ def get_embedder_identity(device: Optional[str] = None, model: Optional[str] = N
         model_name=current_model_name(model),
         dimension=probe_dimension(device=device, model=model),
     )
+
+
+def clear_embedding_cache() -> int:
+    """Drop cached embedding functions and release any loaded model/tokenizer state.
+
+    Intended for long-lived processes (such as IDE sidecars) that unload the
+    embedder after an idle period to reclaim RAM/commit charge. Returns the
+    number of cached entries evicted.
+    """
+    import gc
+    import sys
+
+    with _EF_CACHE_LOCK:
+        evicted = list(_EF_CACHE.values())
+        _EF_CACHE.clear()
+
+    for ef in evicted:
+        load_lock = getattr(ef, "_load_lock", None)
+        ctx = load_lock if load_lock is not None else contextlib.nullcontext()
+        with ctx:
+            ef_dict = getattr(ef, "__dict__", None)
+            if isinstance(ef_dict, dict):
+                # Drop @cached_property sessions (ONNXMiniLM_L6_V2.model / tokenizer)
+                ef_dict.pop("model", None)
+                ef_dict.pop("tokenizer", None)
+            for attr in ("_session", "_tokenizer", "_np", "_output_idx", "_model"):
+                if hasattr(ef, attr):
+                    try:
+                        setattr(ef, attr, None)
+                    except Exception:
+                        pass
+            if hasattr(ef, "_resolved_device"):
+                try:
+                    ef._resolved_device = None
+                except Exception:
+                    pass
+
+    gc.collect()
+    torch_mod = sys.modules.get("torch")
+    if torch_mod is not None:
+        cuda = getattr(torch_mod, "cuda", None)
+        try:
+            if cuda is not None and cuda.is_available():
+                cuda.empty_cache()
+        except Exception:
+            pass
+    return len(evicted)

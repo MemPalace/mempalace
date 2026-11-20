@@ -18,13 +18,20 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
 import chromadb
+from chromadb.api.types import validate_where_document
 from chromadb.config import Settings as _ChromaSettings
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
 from ..lexical import bm25_scores
-from ..stored_text import encode_filter, encode_where, prepare_stored_write, restore_rows
+from ..stored_text import (
+    document_filter_candidate,
+    encode_filter,
+    encode_where,
+    prepare_stored_write,
+    restore_rows,
+)
 from ..timeutil import filename_stamp
-from ._filters import validate_where
+from ._filters import matches_where_document, validate_where
 from ._inproc_sqlite import (
     open_reader as open_palace_reader,
     open_writer as open_palace_writer,
@@ -2424,6 +2431,69 @@ class ChromaCollection(BaseCollection):
     # Reads
     # ------------------------------------------------------------------
 
+    def _get_document_filtered(self, where_document, **kwargs):
+        """Refill one native response before logical pagination and projection."""
+        validate_where_document(where_document)
+        candidate = document_filter_candidate(where_document)
+        fields = ["ids", *kwargs["include"]]
+        offset = kwargs.pop("offset", 0) or 0
+        limit = kwargs.pop("limit", None)
+        if offset < 0 or (limit is not None and limit < 0):
+            raise ValueError("offset and limit must be nonnegative")
+        if limit == 0:
+            return {field: [] for field in fields}
+        needed = offset + limit if limit is not None else None
+        kwargs["include"] = list(dict.fromkeys([*kwargs["include"], "documents", "metadatas"]))
+        if needed is not None:
+            kwargs["limit"] = needed
+        if candidate is not None:
+            kwargs["where_document"] = candidate
+        while True:
+            raw = self._collection.get(**kwargs)
+            documents, _ = restore_rows(raw["documents"] or [], raw["metadatas"] or [])
+            matches = [
+                index
+                for index, document in enumerate(documents)
+                if matches_where_document(document or "", where_document)
+            ]
+            if needed is not None and len(matches) < needed and len(raw["ids"]) == kwargs["limit"]:
+                kwargs["limit"] *= 2
+                continue
+            matches = matches[offset:needed]
+            return {field: [raw[field][index] for index in matches] for field in fields}
+
+    def _query_document_filtered(self, where_document, **kwargs):
+        """Refill native ranking until the original-text predicate fills top-k."""
+        validate_where_document(where_document)
+        candidate = document_filter_candidate(where_document)
+        fields = ["ids", *kwargs["include"]]
+        requested = kwargs["n_results"]
+        kwargs["include"] = list(dict.fromkeys([*kwargs["include"], "documents", "metadatas"]))
+        if candidate is not None:
+            kwargs["where_document"] = candidate
+        while True:
+            raw = self._collection.query(**kwargs)
+            selections = []
+            refill = False
+            for ids, documents, metadatas in zip(raw["ids"], raw["documents"], raw["metadatas"]):
+                documents, _ = restore_rows(documents or [], metadatas or [])
+                matches = [
+                    index
+                    for index, document in enumerate(documents)
+                    if matches_where_document(document or "", where_document)
+                ]
+                selections.append(matches[:requested])
+                if len(matches) < requested and len(ids) == kwargs["n_results"]:
+                    refill = True
+            if not refill:
+                result = {field: [] for field in fields}
+                for query_index, matches in enumerate(selections):
+                    for field in fields:
+                        values = raw[field][query_index]
+                        result[field].append([values[index] for index in matches])
+                return result
+            kwargs["n_results"] *= 2
+
     def query(
         self,
         *,
@@ -2468,9 +2538,9 @@ class ChromaCollection(BaseCollection):
         if where is not None:
             kwargs["where"] = encode_where(where)
         if where_document is not None:
-            kwargs["where_document"] = where_document
-
-        raw = self._collection.query(**kwargs)
+            raw = self._query_document_filtered(where_document, **kwargs)
+        else:
+            raw = self._collection.query(**kwargs)
 
         num_queries = (
             len(query_texts)
@@ -2535,14 +2605,15 @@ class ChromaCollection(BaseCollection):
             kwargs["ids"] = ids
         if where is not None:
             kwargs["where"] = encode_where(where)
-        if where_document is not None:
-            kwargs["where_document"] = where_document
         if limit is not None:
             kwargs["limit"] = limit
         if offset is not None:
             kwargs["offset"] = offset
 
-        raw = self._collection.get(**kwargs)
+        if where_document is not None:
+            raw = self._get_document_filtered(where_document, **kwargs)
+        else:
+            raw = self._collection.get(**kwargs)
         out_ids = list(raw.get("ids") or [])
         out_docs, out_metas = restore_rows(
             list(raw.get("documents") or []), list(raw.get("metadatas") or [])
@@ -2615,6 +2686,25 @@ class ChromaCollection(BaseCollection):
                     logger.debug("sqlite metadata scan failed; paging instead", exc_info=True)
         return super().get_all_metadata(where=where)
 
+    def _recent_from_metadata(self, *, limit, where, order_field, include, spec):
+        """Keep recency exact when the indexed SQLite ordering is unavailable."""
+        ordered = super().get_recent(
+            limit=self.count(), where=where, order_field=order_field, include=[]
+        )
+        selected_ids = ordered.ids[:limit]
+        if not (spec.documents or spec.metadatas) or not selected_ids:
+            return GetResult(ids=selected_ids, documents=[], metadatas=[], embeddings=None)
+
+        page = self.get(ids=selected_ids, where=where, include=include)
+        positions = {drawer_id: index for index, drawer_id in enumerate(page.ids)}
+        order = [positions[drawer_id] for drawer_id in selected_ids if drawer_id in positions]
+        return GetResult(
+            ids=[page.ids[index] for index in order],
+            documents=[page.documents[index] for index in order] if spec.documents else [],
+            metadatas=[page.metadatas[index] for index in order] if spec.metadatas else [],
+            embeddings=None,
+        )
+
     def get_recent(
         self,
         *,
@@ -2632,8 +2722,9 @@ class ChromaCollection(BaseCollection):
         This reads the ordered window from the metadata tables instead, which
         also makes the window exact rather than whatever ``get`` paged first.
         ``where`` made of string equalities (what Layer 1 passes) is evaluated
-        in sqlite; any other filter, or a database the read cannot reach, goes
-        through the base implementation.
+        in sqlite. If that read is unavailable, the fallback orders all matching
+        metadata before hydrating the selected records. Other filters retain
+        the base implementation's bounded scan.
 
         String equalities and an unfiltered read are the true top ``limit``
         at any collection size, which is why :class:`ChromaBackend` advertises
@@ -2643,12 +2734,13 @@ class ChromaCollection(BaseCollection):
         equalities = _string_equalities(where)
         spec = _IncludeSpec.resolve(include, default_distances=False)
         records = None
-        if (
+        sqlite_ordering = (
             limit > 0
             and self._palace_path is not None
             and equalities is not None
             and not spec.embeddings
-        ):
+        )
+        if sqlite_ordering:
             validate_where(where)
             records = _sqlite_recent_records(
                 self._palace_path,
@@ -2659,8 +2751,13 @@ class ChromaCollection(BaseCollection):
                     for key, values in equalities
                 ],
                 order_field=order_field,
+                ids_only=not (spec.documents or spec.metadatas),
             )
         if records is None:
+            if sqlite_ordering:
+                return self._recent_from_metadata(
+                    limit=limit, where=where, order_field=order_field, include=include, spec=spec
+                )
             return super().get_recent(
                 limit=limit, where=where, order_field=order_field, include=include
             )
