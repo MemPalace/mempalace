@@ -81,3 +81,23 @@ def test_mcp_server_no_stdout_noise_on_clean_exit():
     assert proc.stdout == b"", (
         f"stdout must be empty before the first JSON-RPC response, but got: {proc.stdout!r}"
     )
+
+
+def test_importing_light_dispatcher_preserves_hub_stdout():
+    code = textwrap.dedent(
+        """
+        import os
+        import sys
+        from mempalace import mcp_server
+
+        mcp_server._restore_stdout()
+        original_stdout = sys.stdout
+        from mempalace import mcp_light_server
+
+        assert sys.stdout is original_stdout
+        os.write(1, b"hub stdout is intact")
+        """
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.endswith(b"hub stdout is intact")

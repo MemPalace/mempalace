@@ -6,7 +6,7 @@ import { afterEach, beforeEach, test } from 'node:test'
 
 import * as autosave from '../lib/autosave.js'
 import { TranscriptLog, recordFor, transcriptFileName } from '../lib/transcript.js'
-import { createAgent, createHost, tick } from './host.mjs'
+import { createAgent, createHost, tick, waitFor } from './host.mjs'
 
 let dir
 beforeEach(async () => {
@@ -135,18 +135,27 @@ test('a disposed session gets its session-end hook', async () => {
 })
 
 test('hooks run one at a time per session, and repeats already queued collapse', async () => {
-  const host = createHost({ reply: () => ({ delayMs: 40, stdout: '{}' }) })
+  // The first hook runs until the test releases it, so no timing guess decides
+  // whether the second has had a chance to start.
+  let release
+  const firstExits = new Promise((resolve) => {
+    release = resolve
+  })
+  let calls = 0
+  const host = createHost({ reply: () => (++calls === 1 ? { until: firstExits, stdout: '{}' } : { stdout: '{}' }) })
   autosave.apply(host.ctx, { transcriptDir: dir })
   const { agent, session } = createAgent()
   host.emit('session/event', session, userSaid(1, 'hello'))
 
   host.emit('agent/turn-stopping', { agent, turn: 1 })
-  await tick(10)
+  await waitFor(() => hookCalls(host).length === 1, { what: 'the first stop hook' })
   for (let turn = 2; turn <= 5; turn += 1) host.emit('agent/turn-stopping', { agent, turn })
-  await tick(10)
+  await settle(host)
   assert.equal(hookCalls(host).length, 1, 'the second run waits for the first')
 
-  await tick(150)
+  release()
+  await waitFor(() => hookCalls(host).length === 2, { what: 'the queued stop hook' })
+  await settle(host)
   assert.equal(hookCalls(host).length, 2, 'four queued stops ran as one')
 })
 

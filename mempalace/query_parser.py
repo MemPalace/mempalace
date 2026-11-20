@@ -46,6 +46,19 @@ class QuotedToken(Token):
 
 
 _BARE_FLAGS = frozenset({"APPLY", "COMMIT", "PREVIEW", "DRY_RUN"})
+_SEARCH_KEYWORDS = frozenset(
+    {
+        "IN",
+        "LIMIT",
+        "SINCE",
+        "BEFORE",
+        "MAX_DIST",
+        "MAX_DISTANCE",
+        "STRATEGY",
+        "SOURCE",
+        "CONTEXT",
+    }
+)
 _EVENT_LIST_ORDER_FLAGS = frozenset(
     {
         "DESC",
@@ -396,6 +409,21 @@ def _split_object_and_flags(tokens: List[str], flag_keys: frozenset) -> Tuple[Li
 # ==============================================================================
 
 
+def _search_keyword(tok: str) -> str | None:
+    """Return the PQL keyword a token spells, or ``None`` when it is search text.
+
+    The default SEARCH/FIND clause receives natural language, so a keyword is the
+    written upper-case, unquoted spelling of a word in :data:`_SEARCH_KEYWORDS`.
+    Matching case-insensitively instead turned ordinary English words such as
+    ``in``, ``limit`` or ``source`` into filters: the word and the token after it
+    both left the search text, and a value like ``wing="the"`` narrowed the recall
+    to a wing that does not exist.
+    """
+    if isinstance(tok, QuotedToken) or not tok.isupper():
+        return None
+    return tok if tok in _SEARCH_KEYWORDS else None
+
+
 def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C901
     """
     Parse input to `palace_query`.
@@ -732,8 +760,8 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
     n = len(tokens)
     while i < n:
         tok = tokens[i]
-        tok_upper = tok.upper()
-        if tok_upper == "IN" and i + 1 < n:
+        keyword = _search_keyword(tok)
+        if keyword == "IN" and i + 1 < n:
             loc = tokens[i + 1]
             if "/" in loc:
                 w, r = loc.split("/", 1)
@@ -742,25 +770,25 @@ def parse_query_input(input_data: Any) -> Tuple[str, Dict[str, Any]]:  # noqa: C
             else:
                 params["wing"] = loc
             i += 2
-        elif tok_upper == "LIMIT" and i + 1 < n:
+        elif keyword == "LIMIT" and i + 1 < n:
             params["limit"] = int(tokens[i + 1])
             i += 2
-        elif tok_upper == "SINCE" and i + 1 < n:
+        elif keyword == "SINCE" and i + 1 < n:
             params["since"] = tokens[i + 1]
             i += 2
-        elif tok_upper == "BEFORE" and i + 1 < n:
+        elif keyword == "BEFORE" and i + 1 < n:
             params["before"] = tokens[i + 1]
             i += 2
-        elif tok_upper in ("MAX_DIST", "MAX_DISTANCE") and i + 1 < n:
+        elif keyword in ("MAX_DIST", "MAX_DISTANCE") and i + 1 < n:
             params["max_distance"] = float(tokens[i + 1])
             i += 2
-        elif tok_upper == "STRATEGY" and i + 1 < n:
+        elif keyword == "STRATEGY" and i + 1 < n:
             params["candidate_strategy"] = tokens[i + 1].lower()
             i += 2
-        elif tok_upper == "SOURCE" and i + 1 < n:
+        elif keyword == "SOURCE" and i + 1 < n:
             params["source_file"] = tokens[i + 1]
             i += 2
-        elif tok_upper == "CONTEXT" and i + 1 < n:
+        elif keyword == "CONTEXT" and i + 1 < n:
             params["context"] = tokens[i + 1]
             i += 2
         elif ":" in tok and not tok.startswith("http") and not isinstance(tok, QuotedToken):

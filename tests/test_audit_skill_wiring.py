@@ -49,7 +49,7 @@ def test_every_harness_points_at_the_audit_instructions():
     for rel in (
         "skills/mempalace/SKILL.md",
         ".claude-plugin/skills/mempalace/SKILL.md",
-        ".antigravity-plugin/skills/mempalace/SKILL.md",
+        "plugins/mempalace/skills/mempalace/SKILL.md",
         ".codex-plugin/skills/audit/SKILL.md",
         ".claude-plugin/commands/audit.md",
         "commands/mempalace-audit.md",

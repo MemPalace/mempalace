@@ -40,6 +40,7 @@ from typing import Iterable, Optional, Protocol
 from .config import MempalaceConfig, sanitize_name
 from .fsio import atomic_write_json
 from .llm_client import parse_json_reply
+from .maintenance_paths import wing_artifact_path
 from .metadata_types import is_bookkeeping
 from .timeutil import utc_now_iso
 
@@ -150,7 +151,7 @@ def slugify_room(name: str) -> str:
 
 def room_set_path(config: MempalaceConfig, wing: str) -> str:
     """``<palace>/rooms/<wing>.json`` — one approved room set per wing."""
-    return os.path.join(config.palace_path, "rooms", f"{sanitize_name(wing, 'wing')}.json")
+    return wing_artifact_path(config, wing, "rooms", ".json")
 
 
 def save_room_set(config: MempalaceConfig, room_set: RoomSet) -> str:
@@ -723,9 +724,7 @@ def rekey_closets_by_ids(closets_col, wing: str, moves: dict) -> int:
 
 
 def pending_apply_path(config: MempalaceConfig, wing: str) -> str:
-    return os.path.join(
-        config.palace_path, "rooms", f"{sanitize_name(wing, 'wing')}.apply-pending.json"
-    )
+    return wing_artifact_path(config, wing, "rooms", ".apply-pending.json")
 
 
 def apply_inputs(

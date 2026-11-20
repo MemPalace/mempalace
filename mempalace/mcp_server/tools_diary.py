@@ -25,13 +25,13 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
         topic = sanitize_name(topic, "topic")
+        if wing:
+            wing = canonical_wing(wing, "wing")
+        else:
+            wing = f"wing_{normalize_wing_name(agent_name) or agent_name}"
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    if wing:
-        wing = sanitize_name(wing)
-    else:
-        wing = f"wing_{normalize_wing_name(agent_name) or agent_name}"
     room = "diary"
     col = _get_collection(create=True)
     if not col:
@@ -564,6 +564,8 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
     Reuses the existing single-item handlers so dedup/idempotency/WAL
     behaviour is identical to calling them directly.
     """
+    from ..embedding import suspend_embedding_section_hook
+
     # Inputs come from MCP clients and handle_request does not validate
     # nested schemas, so guard every field here. A single malformed item
     # must record an error and be skipped, never raise and abort the whole
@@ -613,7 +615,11 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
+        # The duplicate decision stays valid until publication. Query embedding
+        # above can yield before that decision, and the diary below can yield
+        # independently after the item has committed.
+        with suspend_embedding_section_hook():
+            res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
         if res.get("success"):
             out["added"].append(res)
         else:

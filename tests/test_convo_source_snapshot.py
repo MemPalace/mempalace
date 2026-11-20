@@ -322,6 +322,36 @@ def test_scoped_prefetch_preserves_fingerprints_and_legacy_metadata(collection, 
     assert file_already_mined(collection, str(legacy), extract_mode="exchange", check_mtime=True)
 
 
+def test_fingerprint_recheck_respects_producer_ownership(collection, tmp_path):
+    source = tmp_path / "shared.txt"
+    source.write_text("verified conversation", encoding="utf-8")
+    before = source.stat()
+    meta = {
+        "source_file": str(source),
+        "source_mtime": before.st_mtime,
+        "source_fingerprint": source_fingerprint(before),
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+        "ingest_mode": "convos",
+        "extract_mode": "exchange",
+    }
+    collection.add(ids=["convo"], documents=["verified conversation"], metadatas=[meta])
+
+    # Preserve upstream's positional owner argument as well as the PR's
+    # keyword fingerprint check. Another producer cannot prove completion.
+    assert file_already_mined(
+        collection, str(source), True, "exchange", "convo", check_source_fingerprint=True
+    )
+    assert not file_already_mined(
+        collection, str(source), True, "exchange", "project", check_source_fingerprint=True
+    )
+    source.write_text("verified conversation with a new turn", encoding="utf-8")
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert not file_already_mined(
+        collection, str(source), True, "exchange", "convo", check_source_fingerprint=True
+    )
+
+
 def test_scoped_prefetch_keeps_paginated_snapshot_groups_separate(collection, tmp_path):
     source = tmp_path / "session.txt"
     source.write_text("first source snapshot", encoding="utf-8")

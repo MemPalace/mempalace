@@ -73,6 +73,9 @@ rust_exact = "mempalace.backends.rust_exact:RustExactBackend"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    # CI runs the suite with ``-n auto --dist loadfile`` (see ci.yml); one
+    # module's tests stay on one worker.
+    "pytest-xdist>=3.0",
     # Offline media tests exercise real image objects and audio resampling
     # without installing the optional model or its PyTorch dependencies.
     "pillow>=10.0",
@@ -166,6 +169,7 @@ extract = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "pytest-xdist>=3.0",
     "pillow>=10.0",
     "scipy>=1.10",
     # Retries known-transient ChromaDB-on-Windows HNSW compaction failures in CI
@@ -258,6 +262,7 @@ markers = [
     "benchmark: scale/performance benchmark tests",
     "slow: tests that take more than 30 seconds",
     "stress: destructive scale tests (100K+ drawers)",
+    "resolves_dns: the test drives llm_client's hostname resolution itself (conftest otherwise refuses DNS)",
 ]
 filterwarnings = [
     # Many tests build raw-chromadb palaces directly (no recorded embedder

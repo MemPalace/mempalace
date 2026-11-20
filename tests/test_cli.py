@@ -32,6 +32,25 @@ from mempalace.cli import (
 )
 from mempalace.palace import MineAlreadyRunning
 
+
+@pytest.fixture(autouse=True)
+def _no_llm_probe(monkeypatch):
+    """Answer ``cmd_init``'s Ollama probe in process.
+
+    Init probes the default Ollama port unless ``--no-llm`` is given, and most
+    ``Namespace`` objects here leave that out. With nothing listening, the
+    probe is a refused connection, which Windows reports only after about
+    1.3 s of SYN retransmits per address: each init test cost 4 s on the
+    Windows runner. The stub also keeps the tests on one path whether or not
+    a developer's machine happens to run Ollama.
+    """
+    from mempalace.llm_client import OllamaProvider
+
+    monkeypatch.setattr(
+        OllamaProvider, "check_available", lambda self: (False, "no LLM provider in tests")
+    )
+
+
 # ── CLI entry point: PYTHONPATH stripping ────────────────────────────────
 
 
@@ -1659,6 +1678,51 @@ def test_cmd_repair_success(mock_config_cls, tmp_path, capsys):
     mock_temp_col.upsert.assert_called_once()
     mock_new_col.upsert.assert_called_once()
     mock_new_col.add.assert_not_called()
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_interactive_uses_fresh_backend_after_prompt(mock_config_cls, tmp_path, capsys):
+    """#2923: interactive repair failed with "ChromaBackend has been closed".
+
+    The interactive branch closes its client before releasing the lease (so the
+    unbounded confirmation prompt never runs with a live client outside the
+    lock). The post-prompt repair then reused that closed instance, so every
+    confirmed repair printed the closed-backend error and exited 0 without
+    repairing anything. A fresh backend must be opened after the prompt and
+    closed before releasing the lease.
+    """
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None)  # no --yes -> interactive path
+
+    first_col = MagicMock()
+    first_col.count.return_value = 2
+    first_backend = _mock_backend_for(col=first_col)
+
+    reopened_col = MagicMock()
+    reopened_col.count.return_value = 2
+    reopened_backend = _mock_backend_for(col=reopened_col)
+
+    backup_path = str(palace_dir) + ".backup"
+    with (
+        patch(
+            "mempalace.backends.chroma.ChromaBackend",
+            side_effect=[first_backend, reopened_backend],
+        ),
+        patch("mempalace.migrate.confirm_destructive_action", return_value=True),
+        patch("mempalace.cli._finish_legacy_repair", return_value=(2, backup_path)),
+    ):
+        cmd_repair(args)
+
+    out = capsys.readouterr().out
+    assert "ChromaBackend has been closed" not in out
+    assert "Repair complete" in out
+    first_backend.close.assert_called_once()
+    reopened_backend.get_collection.assert_called_once_with(str(palace_dir), "mempalace_drawers")
+    reopened_backend.close.assert_called_once()
 
 
 @pytest.mark.skipif(

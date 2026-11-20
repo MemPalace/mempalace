@@ -137,6 +137,108 @@ def test_initialize_reports_server_info(http_server):
     assert json.loads(body)["result"]["serverInfo"]["name"] == "mempalace"
 
 
+def test_light_endpoint_reuses_http_auth_and_exposes_three_tools(http_server):
+    port, hub = http_server
+    hub.auth_token = "test-light-token"
+    headers = {"Authorization": "Bearer test-light-token"}
+    path = "/mcp/light"
+    request = {"jsonrpc": "2.0", "id": 1, "method": "initialize"}
+    assert _post(port, path, request)[0] == 401
+    assert _post(port, path, request, headers, host_header="wrong.example")[0] == 403
+    assert _post(port, path, request, {**headers, "Origin": "https://wrong.example"})[0] == 403
+    status, body = _post(port, path, request, headers)
+    assert status == 200
+    assert json.loads(body)["result"]["serverInfo"]["name"] == "mempalace-light"
+    list_request = {**request, "method": "tools/list"}
+    status, body = _post(port, path, list_request, headers)
+    assert status == 200
+    assert {tool["name"] for tool in json.loads(body)["result"]["tools"]} == {
+        "palace_coordinate",
+        "palace_exec",
+        "palace_query",
+    }
+    assert _get(port, path, headers)[0] == 405
+    status, body = _post(port, "/mcp", list_request, headers)
+    assert status == 200
+    full_names = {tool["name"] for tool in json.loads(body)["result"]["tools"]}
+    assert "mempalace_search" in full_names
+    assert "palace_query" not in full_names
+
+
+def _light_call(port, name, arguments):
+    status, body = _post(
+        port,
+        "/mcp/light",
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+    )
+    assert status == 200
+    return json.loads(body)
+
+
+def test_light_http_coordination_preserves_author_and_body(http_server, monkeypatch, config):
+    port, _ = http_server
+    monkeypatch.setattr(mcp, "_config", config)
+    author = "test:codex:mempalace"
+    body = "First line.\n  Second line."
+    event = {
+        "action": "event_append",
+        "type": "status",
+        "from_agent": author,
+        "stream": "project/example",
+        "room": "status",
+        "body": body,
+    }
+    status, body_bytes = _post(
+        port,
+        "/mcp/light",
+        {
+            "jsonrpc": "1.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "palace_coordinate", "arguments": event},
+        },
+    )
+    assert status == 200
+    assert json.loads(body_bytes)["error"]["code"] == -32600
+    appended = _light_call(port, "palace_coordinate", event)
+    assert json.loads(appended["result"]["content"][0]["text"])["success"]
+    response = _light_call(port, "palace_coordinate", "EVENT LIST stream:project/example")
+    (item,) = json.loads(response["result"]["content"][0]["text"])["events"]
+    assert (item["from_agent"], item["body"]) == (author, body)
+
+
+def test_light_http_read_only_hides_and_refuses_writes(http_server, monkeypatch):
+    port, _ = http_server
+    monkeypatch.setattr(mcp, "_READ_ONLY", True)
+    status, body = _post(port, "/mcp/light", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert status == 200
+    assert [tool["name"] for tool in json.loads(body)["result"]["tools"]] == ["palace_query"]
+    response = _light_call(port, "palace_exec", 'ADD IN example/test "Never saved"')
+    assert "read-only" in json.dumps(response).lower()
+    assert "error" in _light_call(port, "mempalace_add_drawer", {})
+
+
+def test_light_http_search_resolves_wings_and_enriches_core_results(http_server, monkeypatch):
+    port, _ = http_server
+    original = "keep this  spacing\nand line break"
+
+    def search(query, wing):
+        assert (query, wing) == ("example", "project_demo")
+        return {"results": [{"distance": 0.2, "content": original}]}
+
+    monkeypatch.setattr(mcp, "tool_list_wings", lambda: {"wings": ["project_demo"]})
+    monkeypatch.setitem(mcp.TOOLS["mempalace_search"], "handler", search)
+    result = _light_call(port, "palace_query", "FIND example IN demo")
+    payload = json.loads(result["result"]["content"][0]["text"])
+    assert payload["results"][0]["content"] == original
+    assert payload["results"][0]["recency_rank"] == 1
+
+
 class TestPalaceReadsDoNotStarveTheHub:
     """Slow palace reads must not block protocol traffic or other reads."""
 
@@ -1820,3 +1922,24 @@ def test_extra_allowed_hosts_default_empty(monkeypatch):
     monkeypatch.delenv("MEMPALACE_MCP_EXTRA_ALLOWED_HOSTS", raising=False)
     allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
     assert not any("ts.net" in v for v in allowed)
+
+
+def test_bind_does_not_resolve_the_address_back_to_a_name(monkeypatch):
+    """``http.server.HTTPServer.server_bind`` names the server through
+    ``socket.getfqdn``, a reverse lookup that waits out the resolver on a host
+    without reverse DNS for the bind address (35 s on one hosted runner).
+    Nothing reads the name, so the server binds as ``TCPServer`` does."""
+    import http.server
+
+    def _through_the_resolver(*args, **kwargs):
+        raise AssertionError("server_bind resolved the bind address through DNS")
+
+    monkeypatch.setattr(socket, "getfqdn", _through_the_resolver)
+    monkeypatch.setattr(http.server.HTTPServer, "server_bind", _through_the_resolver)
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    try:
+        assert httpd.server_name == "127.0.0.1"
+        assert httpd.server_port == httpd.server_address[1]
+        assert httpd.server_port != 0
+    finally:
+        httpd.server_close()

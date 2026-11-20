@@ -66,6 +66,18 @@ def normalize_wing_name(name: str) -> str:
     return slug[:120].strip("_.'")
 
 
+def canonical_wing(value: str, field_name: str = "wing") -> str:
+    """Validate and canonicalize a wing to the canonical miner/graph slug.
+
+    Validates input through ``sanitize_name`` first so path traversal,
+    null bytes, overlong names, and illegal characters raise the standard
+    ``ValueError``, then normalizes valid names via ``normalize_wing_name``
+    (lower-casing and collapsing spaces and hyphens to ``_``).
+    """
+    validated = sanitize_name(value, field_name)
+    return sanitize_name(normalize_wing_name(validated), field_name)
+
+
 # Where a session started in the home directory files (see hooks_cli).
 WORKSTATION_WINGS = frozenset({"mac_workstation", "windows_workstation", "linux_workstation"})
 
@@ -115,8 +127,9 @@ def wing_aliases(wing: str, known=()) -> list:
         for name in sorted(known):
             if name in names or not isinstance(name, str):
                 continue
-            stored = name[len("wing_") :] if name.startswith("wing_") else name
-            if normalize_wing_name(stored) == slug:
+            # Slug first: `wing-c++` only shows its prefix once slugged.
+            stored = normalize_wing_name(name)
+            if stored.removeprefix("wing_") == slug:
                 names.append(name)
     return names
 
