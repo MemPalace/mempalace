@@ -9,6 +9,7 @@ import pickle
 import shlex
 import sqlite3
 import struct
+import sys
 import threading
 import time
 import warnings
@@ -701,6 +702,17 @@ def _segment_holder_pid(seg_dir: str) -> Optional[int]:
 
 def _segment_is_held(seg_dir: str) -> bool:
     # A process with open or mapped files can keep writing into the renamed directory.
+    if sys.platform == "darwin":
+        # There is no /proc, and Apple's lsof can miss descriptor-free mmap
+        # holders. No matches cannot establish that a rename is safe. Until
+        # readers participate in an exclusive recovery lease, preserve the
+        # segment and make the pre-open pass refuse the unsafe native load.
+        logger.warning(
+            "Deferred HNSW quarantine for %s: macOS cannot establish that no "
+            "mapped holders remain; automatic quarantine is unavailable.",
+            seg_dir,
+        )
+        return True
     holder_pid = _segment_holder_pid(seg_dir)
     if holder_pid is None:
         return False
@@ -713,7 +725,31 @@ def _segment_is_held(seg_dir: str) -> bool:
     return True
 
 
-def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> list[str]:
+class HNSWQuarantineDeferredError(RuntimeError):
+    """An unsafe native index cannot be quarantined safely."""
+
+
+def _quarantine_blocked_by_holder(seg_dir: str, fail_if_held: bool) -> bool:
+    if not _segment_is_held(seg_dir):
+        return False
+    if fail_if_held:
+        if sys.platform == "darwin":
+            raise HNSWQuarantineDeferredError(
+                f"Cannot safely open HNSW segment {seg_dir}: macOS holder inspection "
+                "cannot establish safe automatic quarantine. Original files were preserved. "
+                "Close all palace clients and recover into a separate palace using "
+                "repair --mode from-sqlite --source <original-palace>."
+            )
+        raise HNSWQuarantineDeferredError(
+            f"Cannot safely open HNSW segment {seg_dir}: its files are held or holder "
+            "inspection is unavailable. Close other palace clients and retry."
+        )
+    return True
+
+
+def quarantine_stale_hnsw(
+    palace_path: str, stale_seconds: float = 300.0, *, fail_if_held: bool = False
+) -> list[str]:
     """Rename HNSW segment dirs that look unsafe to open.
 
     This catches three classes of HNSW corruption before ChromaDB opens the
@@ -730,6 +766,9 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
 
     The original directory is renamed, not deleted, so recovery remains
     possible if the heuristic ever misfires.
+
+    ``fail_if_held`` refuses a pre-open pass rather than loading a known
+    unsafe index that cannot be quarantined safely.
     """
 
     db_path = os.path.join(palace_path, "chroma.sqlite3")
@@ -791,7 +830,7 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 300.0) -> lis
             )
             continue
 
-        if _segment_is_held(seg_dir):
+        if _quarantine_blocked_by_holder(seg_dir, fail_if_held):
             continue
 
         stamp = filename_stamp()
@@ -1826,7 +1865,7 @@ def _load_hnsw_metadata_stable(meta_path: str, *, sleep=time.sleep) -> tuple[str
     return "corrupt", f"invalid index_metadata.pickle: {failure}"
 
 
-def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
+def quarantine_invalid_hnsw_metadata(palace_path: str, *, fail_if_held: bool = False) -> list[str]:
     """Quarantine segment dirs whose ``index_metadata.pickle`` is unreadable or invalid.
 
     Chroma's persisted HNSW metadata is untrusted disk state. If a segment has
@@ -1834,6 +1873,8 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
     the pickle and crash later in the Rust loader. We rename the entire segment
     out of the way before ``PersistentClient`` opens so Chroma can rebuild
     cleanly instead of touching known-bad metadata.
+
+    ``fail_if_held`` refuses a pre-open pass when safe quarantine is blocked.
     """
     try:
         entries = os.listdir(palace_path)
@@ -1899,7 +1940,7 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
         if reason is None:
             continue
 
-        if _segment_is_held(seg_dir):
+        if _quarantine_blocked_by_holder(seg_dir, fail_if_held):
             continue
 
         stamp = filename_stamp()
@@ -1915,13 +1956,21 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
 
 
 def _quarantine_hnsw_under_palace_lock(palace_path: str) -> bool:
+    if sys.platform == "darwin":
+        # Darwin's policy never renames a candidate. These read-only checks
+        # must also run when another client holds the writer lease, otherwise
+        # lock contention would bypass refusal and load the unsafe index.
+        quarantine_invalid_hnsw_metadata(palace_path, fail_if_held=True)
+        quarantine_stale_hnsw(palace_path, fail_if_held=True)
+        return True
+
     # Avoid the palace -> backends import cycle.
     from ..palace import MineAlreadyRunning, mine_palace_lock
 
     try:
         with mine_palace_lock(palace_path):
-            quarantine_invalid_hnsw_metadata(palace_path)
-            quarantine_stale_hnsw(palace_path)
+            quarantine_invalid_hnsw_metadata(palace_path, fail_if_held=True)
+            quarantine_stale_hnsw(palace_path, fail_if_held=True)
     except MineAlreadyRunning:
         logger.info("Deferred HNSW quarantine for %s: its palace lock is held.", palace_path)
         # Leave it out of _quarantined_paths so a later open retries.

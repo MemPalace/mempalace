@@ -76,6 +76,19 @@ import pytest  # noqa: E402
 from mempalace.config import MempalaceConfig  # noqa: E402
 from mempalace.knowledge_graph import KnowledgeGraph  # noqa: E402
 
+
+@pytest.fixture
+def synthetic_hnsw_without_holders(monkeypatch):
+    """Isolate corruption-format tests from platform ownership policy.
+
+    Their fabricated segment files test which formats require quarantine.
+    Real open/mapped holders and Darwin refusal have dedicated native tests.
+    """
+    import mempalace.backends.chroma as chroma
+
+    monkeypatch.setattr(chroma, "_segment_is_held", lambda _segment: False)
+
+
 _TEST_EMBED_DIM = 384
 _TEST_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _REAL_EMBEDDING_TEST_MODULES = {

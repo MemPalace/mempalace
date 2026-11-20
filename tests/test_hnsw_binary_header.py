@@ -7,10 +7,13 @@ import pytest
 
 import mempalace.backends.chroma as chroma
 
-pytestmark = pytest.mark.skipif(
-    struct.calcsize("P") != 8,
-    reason="chroma-hnswlib v1 header counts use 64-bit size_t fields",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        struct.calcsize("P") != 8,
+        reason="chroma-hnswlib v1 header counts use 64-bit size_t fields",
+    ),
+    pytest.mark.usefixtures("synthetic_hnsw_without_holders"),
+]
 
 
 def _write_header(
