@@ -899,6 +899,44 @@ class TestDiaryIngest:
         assert state_path.parent.name == "state"
         assert state_path.parent.parent.name == ".mempalace"
 
+    def test_state_file_is_never_left_partial(self, tmp_path, monkeypatch):
+        # The state file is replaced atomically: if the swap fails, the
+        # previous state file is still complete and valid JSON.
+        diary_dir = tmp_path / "diaries"
+        diary_dir.mkdir()
+        (diary_dir / "2026-04-13.md").write_text(
+            "# 2026-04-13\n\n## 10:00 — Test\n\nBody content here long enough.\n"
+        )
+        palace_dir = tmp_path / "palace"
+
+        from mempalace import diary_ingest
+        from mempalace.diary_ingest import _state_file_for, ingest_diaries
+
+        ingest_diaries(str(diary_dir), str(palace_dir), force=True)
+        state_file = _state_file_for(str(palace_dir), diary_dir.resolve())
+        before = state_file.read_bytes()
+        assert json.loads(before)
+        # A clean run leaves no temporary sibling behind.
+        assert not list(state_file.parent.glob("*.tmp"))
+
+        (diary_dir / "2026-04-14.md").write_text(
+            "# 2026-04-14\n\n## 11:00 — Next\n\nAnother entry long enough to ingest.\n"
+        )
+        real_replace = os.replace
+
+        def failing_replace(src, dst, *args, **kwargs):
+            if os.fspath(dst) == os.fspath(state_file):
+                raise OSError("simulated crash before the swap")
+            return real_replace(src, dst, *args, **kwargs)
+
+        monkeypatch.setattr(diary_ingest.os, "replace", failing_replace)
+        with pytest.raises(OSError, match="simulated crash"):
+            ingest_diaries(str(diary_dir), str(palace_dir))
+        monkeypatch.undo()
+
+        assert state_file.read_bytes() == before
+        assert json.loads(state_file.read_bytes())
+
     def test_wing_prefixed_drawer_id_prevents_cross_diary_collision(self, tmp_path):
         # Regression: the original implementation used
         # ``drawer_diary_{date_str}`` regardless of wing — two diaries with
