@@ -100,6 +100,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   erase; deleting a source erases its re-mine history in
   `drawer_revisions.jsonl` too. Deleting a single drawer keeps the re-mine
   history of its position until its source is deleted.
+- A handful of colliding HNSW label-map pairs no longer quarantines the whole
+  segment. Each shared label keeps the drawer id `label_to_id` already holds and
+  only the extra ids leave the map, so the label stays in the graph and a query
+  that reaches it still resolves instead of failing with `Error finding id`.
+  The dropped drawers come back with `mempalace repair --mode from-sqlite`; the
+  next mine skips them as unchanged.
 
 ---
 

@@ -1689,6 +1689,26 @@ def _missing_dimensionality_appears_recoverable(
 ) -> bool:
     total = _persisted_metadata_value(persisted, "total_elements_added")
     label_to_id = _persisted_metadata_value(persisted, "label_to_id")
+    if not _hnsw_label_map_payload_ok(persisted, label_to_id, seg_dir):
+        return False
+
+    label_count = len(id_to_label)
+    # total_elements_added is monotonic across every add, while id_to_label and
+    # label_to_id hold only live elements, so a segment that has had deletions
+    # carries total_elements_added > label_count. Require >= (not ==), otherwise
+    # every post-deletion dim-None segment is wrongly quarantined; the
+    # label-map size and bijection checks still reject inconsistent label maps.
+    if int(total) < label_count or len(label_to_id) != label_count:
+        return False
+    try:
+        return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
+    except TypeError:
+        return False
+
+
+def _hnsw_label_map_payload_ok(persisted: object, label_to_id: object, seg_dir: str) -> bool:
+    """Return True when the segment carries counters and payload a load can use."""
+    total = _persisted_metadata_value(persisted, "total_elements_added")
     data_path = os.path.join(seg_dir, "data_level0.bin")
     link_path = os.path.join(seg_dir, "link_lists.bin")
 
@@ -1705,21 +1725,146 @@ def _missing_dimensionality_appears_recoverable(
             return False
     except OSError:
         return False
-    if not _hnsw_payload_appears_sane(seg_dir):
+    return _hnsw_payload_appears_sane(seg_dir)
+
+
+# Two mines writing one palace at once (one per wing) can hand the same labels
+# to different drawer ids. Chroma then persists a label map where a few labels
+# carry two ids, and the all-or-nothing bijection gate above quarantined the
+# entire segment for it: 330k vectors left search for a week, recovered only by
+# a 47-minute rebuild. Repair drops only the extra ids for those labels, keeping
+# each label mapped to the id label_to_id already holds: the label stays in the
+# HNSW graph, so a query that reaches it still resolves instead of failing with
+# "Error finding id". The dropped drawers fall back to the unindexed rows; their
+# vectors come back with `mempalace repair --mode from-sqlite`, since the next
+# mine skips unchanged sources. Real corruption is bigger than this or breaks
+# the payload, so it still quarantines.
+_HNSW_LABEL_MAP_REPAIR_MAX_FRACTION = 0.0001  # 0.01% of the live labels
+_HNSW_LABEL_MAP_REPAIR_MAX_LABELS = 8
+
+
+def _label_map_collisions(id_to_label: dict, label_to_id: dict) -> Optional[tuple[set, set]]:
+    """Return ``(ids, labels)`` to drop so the maps become a bijection.
+
+    A label that two ids share keeps the id ``label_to_id`` already holds; only
+    the extra ids leave ``id_to_label``, so the label stays in the graph and a
+    query reaching it still resolves. A label no one can keep (``label_to_id``
+    points at an id that is not in ``id_to_label``) loses both halves.
+
+    Returns None when an entry is not a usable ``label -> id`` pair at all —
+    that is corruption, not a concurrent-writer collision.
+    """
+    label_ids: dict[object, list] = {}
+    for item_id, label in id_to_label.items():
+        if not isinstance(label, Integral) or isinstance(label, bool):
+            return None
+        label_ids.setdefault(label, []).append(item_id)
+
+    ids_to_drop: set = set()
+    labels_to_drop: set = set()
+    for label, ids in label_ids.items():
+        if len(ids) == 1 and label_to_id.get(label) == ids[0]:
+            continue
+        keeper = label_to_id.get(label)
+        if keeper not in ids:
+            labels_to_drop.add(label)
+            ids_to_drop.update(ids)
+            continue
+        ids_to_drop.update(item_id for item_id in ids if item_id != keeper)
+    # A label_to_id entry whose label has no id_to_label partner is the same
+    # kind of half-pair: dropping the label clears both halves.
+    for label, item_id in label_to_id.items():
+        if label not in label_ids:
+            labels_to_drop.add(label)
+            ids_to_drop.add(item_id)
+    return ids_to_drop, labels_to_drop
+
+
+def _repair_label_map_collisions(persisted: object, id_to_label: dict, seg_dir: str) -> bool:
+    """Drop a handful of colliding label-map pairs in place; True when repaired."""
+    label_to_id = _persisted_metadata_value(persisted, "label_to_id")
+    if not _hnsw_label_map_payload_ok(persisted, label_to_id, seg_dir):
         return False
 
-    label_count = len(id_to_label)
-    # total_elements_added is monotonic across every add, while id_to_label and
-    # label_to_id hold only live elements, so a segment that has had deletions
-    # carries total_elements_added > label_count. Require >= (not ==), otherwise
-    # every post-deletion dim-None segment is wrongly quarantined; the
-    # label-map size and bijection checks still reject inconsistent label maps.
-    if int(total) < label_count or len(label_to_id) != label_count:
+    collisions = _label_map_collisions(id_to_label, label_to_id)
+    if collisions is None:
         return False
+    ids_to_drop, labels_to_drop = collisions
+    if not ids_to_drop:
+        return False
+    # The cap counts dropped drawer ids: a label whose keeper survives costs
+    # only the extra ids, and that is what the segment actually loses.
+    if len(ids_to_drop) > _HNSW_LABEL_MAP_REPAIR_MAX_LABELS:
+        return False
+    if len(ids_to_drop) > len(id_to_label) * _HNSW_LABEL_MAP_REPAIR_MAX_FRACTION:
+        return False
+
+    kept_labels = {
+        label: item_id for label, item_id in label_to_id.items() if label not in labels_to_drop
+    }
+    kept_ids = {
+        item_id: label for item_id, label in id_to_label.items() if item_id not in ids_to_drop
+    }
+    # Whatever survives must already be a bijection, otherwise this is not a
+    # collision-only map and a partial rewrite would hide the real damage.
+    if not kept_ids or len(kept_ids) != len(kept_labels):
+        return False
+    if any(kept_labels.get(label) != item_id for item_id, label in kept_ids.items()):
+        return False
+
+    # total_elements_added is monotonic and must stay >= the live label count;
+    # copying a counter that is already too small would only move the segment
+    # from this gate to the next quarantine pass.
+    total = _persisted_metadata_value(persisted, "total_elements_added")
+    if not isinstance(total, Integral) or isinstance(total, bool) or int(total) < len(kept_ids):
+        return False
+
+    seq_ids = _persisted_metadata_value(persisted, "id_to_seq_id")
+    if isinstance(seq_ids, dict):
+        seq_ids = {k: v for k, v in seq_ids.items() if k not in ids_to_drop}
+    else:
+        seq_ids = {}
+
+    if _segment_is_held(seg_dir):
+        return False
+
+    # Supported chromadb writers persist this metadata as a plain dict of the
+    # IdMap fields; older builds pickled a PersistentData instance. Rewrite in
+    # the dict shape either way: importing the instance class drags in the
+    # optional ``hnswlib`` dependency, which the Rust-backed client never needs.
+    repaired = (
+        dict(persisted) if isinstance(persisted, dict) else dict(getattr(persisted, "__dict__", {}))
+    )
+    repaired.update(
+        {
+            "id_to_label": kept_ids,
+            "label_to_id": kept_labels,
+            "id_to_seq_id": seq_ids,
+        }
+    )
+
+    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+    tmp_path = f"{meta_path}.repair-{filename_stamp()}"
     try:
-        return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
-    except TypeError:
+        with open(tmp_path, "wb") as handle:
+            pickle.dump(repaired, handle, pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, meta_path)
+    except OSError:
+        logger.exception("Failed to repair colliding HNSW labels in %s", meta_path)
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
         return False
+
+    logger.warning(
+        "Repaired %d colliding HNSW label(s) in %s by dropping %d drawer id(s): %s. "
+        "Their vectors stay unindexed; the next mine skips them as unchanged, so "
+        "run `mempalace repair --mode from-sqlite` to index them again.",
+        len(labels_to_drop),
+        seg_dir,
+        len(ids_to_drop),
+        ", ".join(sorted(str(item_id) for item_id in ids_to_drop)),
+    )
+    return True
 
 
 # Stability gate for the invalid-metadata quarantine. A torn read of
@@ -1880,10 +2025,11 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                             persisted, id_to_label, seg_dir
                         )
                     ):
-                        reason = (
-                            "labels present but dimensionality is missing or invalid "
-                            f"({dimensionality!r})"
-                        )
+                        if not _repair_label_map_collisions(persisted, id_to_label, seg_dir):
+                            reason = (
+                                "labels present but dimensionality is missing or invalid "
+                                f"({dimensionality!r})"
+                            )
                     elif (
                         has_labels
                         and dimensionality is not None
