@@ -910,6 +910,9 @@ def _normalize_convo_conversations(
         )
         conversations = [c for c in conversations if c]
     except (OSError, UnparsedCodexTranscriptError) as exc:
+        # No verified snapshot was read. Keep retrying, including size-limit
+        # failures: a later pass can succeed after permissions or limits change
+        # even when the source metadata has not changed. Never mark it as filed.
         logger.warning("Skipping %s: %s; source remains eligible for retry", filepath, exc)
         return None
     except ValueError:

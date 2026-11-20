@@ -1,6 +1,7 @@
 """Conversation freshness must describe the source bytes actually mined."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -223,7 +224,8 @@ def test_atomic_replacement_with_same_size_and_mtime_is_remined(tmp_path):
     )
 
 
-def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch):
+@pytest.mark.parametrize("rewrite", [False, True], ids=["unchanged", "same-size-rewrite"])
+def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch, rewrite):
     source = tmp_path / "session.txt"
     source.write_text(_INITIAL, encoding="utf-8")
     palace = tmp_path / "palace"
@@ -238,6 +240,11 @@ def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch):
     legacy_rows = collection.get(include=["metadatas"])
     assert all("source_fingerprint" not in meta for meta in legacy_rows["metadatas"])
     assert all("source_mtime" in meta for meta in legacy_rows["metadatas"])
+    if rewrite:
+        before = source.stat()
+        source.write_text(_INITIAL.replace("schema", "design"), encoding="utf-8")
+        os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert source.stat().st_size == before.st_size
 
     original_normalize = convo_miner.normalize_conversations_with_mtime
     normalizations = 0
@@ -252,6 +259,8 @@ def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch):
     assert normalizations == 1, "legacy mtime-only rows must be verified once"
     upgraded = get_collection(str(palace)).get(include=["metadatas"])
     assert all(meta.get("source_fingerprint") for meta in upgraded["metadatas"])
+    if rewrite:
+        assert any("design" in doc for doc in _documents(palace))
 
     _mine(source, palace)
     assert normalizations == 1, "an unchanged verified source should skip subsequent normalization"
@@ -848,3 +857,87 @@ def test_lossless_decoding_keeps_snapshot_freshness(
         meta["source_fingerprint"] == source_fingerprint(source.stat())
         for meta in rows["metadatas"]
     )
+
+
+@pytest.mark.parametrize("field", ["st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"])
+def test_fingerprint_ignores_device_changes_but_tracks_file_changes(tmp_path, field):
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    before = source.stat()
+    fields = {
+        name: getattr(before, name)
+        for name in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    }
+    fields[field] += 1
+    after = SimpleNamespace(**fields)
+    same = field == "st_dev" or (field == "st_ctime_ns" and os.name != "posix")
+    assert (source_fingerprint(before) == source_fingerprint(after)) == same
+
+
+def test_remount_device_change_does_not_invalidate_stored_snapshot(tmp_path, monkeypatch):
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    before = source.stat()
+    fingerprint = source_fingerprint(before)
+    after = SimpleNamespace(
+        **{
+            name: getattr(before, name)
+            for name in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        }
+    )
+    after.st_dev += 1
+    original_stat = os.stat
+
+    def remounted_stat(path, *args, **kwargs):
+        if path == str(source):
+            return after
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", remounted_stat)
+    assert convo_miner._is_unchanged_since_last_mine(str(source), {str(source): fingerprint})
+
+
+@pytest.mark.parametrize("already_mined", [False, True], ids=["new", "existing"])
+@pytest.mark.parametrize("failure", ["size-limit", "permission"])
+def test_failed_source_retries_each_pass_and_recovers_without_source_change(
+    tmp_path, monkeypatch, caplog, already_mined, failure
+):
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    palace = tmp_path / "palace"
+    if already_mined:
+        _mine(source, palace)
+        source.write_text(_INITIAL + _APPEND, encoding="utf-8")
+    before = _rows(palace)
+    snapshot = source.stat()
+    original_read = normalize_module.read_source_text
+    attempts = []
+
+    def failed_read(*args, **kwargs):
+        attempts.append(args[0])
+        if failure == "permission":
+            raise PermissionError("injected read permission failure")
+        kwargs["max_bytes"] = 16
+        return original_read(*args, **kwargs)
+
+    with monkeypatch.context() as blocked:
+        blocked.setattr(normalize_module, "read_source_text", failed_read)
+        for _ in range(2):
+            caplog.clear()
+            _mine(source, palace)
+            assert "source remains eligible for retry" in caplog.text
+            assert _rows(palace) == before
+    assert len(attempts) == 2
+    assert source_fingerprint(source.stat()) == source_fingerprint(snapshot)
+    _mine(source, palace)
+    rows = _rows(palace)
+    assert rows
+    assert all(
+        meta["source_fingerprint"] == source_fingerprint(snapshot) for _, meta in rows.values()
+    )
+    if already_mined:
+        assert any("APPENDED_TURN_MARKER" in doc for doc, _ in rows.values())
+    with monkeypatch.context() as unchanged:
+        unchanged.setattr(normalize_module, "read_source_text", failed_read)
+        _mine(source, palace)
+    assert len(attempts) == 2, "the recovered snapshot must skip subsequent reads"

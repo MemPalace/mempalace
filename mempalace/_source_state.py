@@ -12,10 +12,12 @@ def source_fingerprint(file_stat: os.stat_result) -> str:
 
     POSIX ctime detects in-place rewrites that preserve size and restore mtime.
     Windows exposes creation time in that field, so retain the other checks
-    there. Reading a file changes neither fingerprint.
+    there. Device numbers are deliberately excluded: remounting the same
+    volume can change st_dev without changing its files. Inode, size and
+    timestamps still detect replacements and edits. Reading a file changes
+    neither fingerprint.
     """
     values: tuple[int, ...] = (
-        file_stat.st_dev,
         file_stat.st_ino,
         file_stat.st_size,
         file_stat.st_mtime_ns,
