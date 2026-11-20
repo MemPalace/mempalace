@@ -1145,15 +1145,22 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
         real_prefetch_mined_set = convo_miner_module.prefetch_mined_set
 
         def _spy_mined_set(
-            collection, extract_mode=None, source_files=None, *, source_fingerprints=False
+            collection,
+            extract_mode=None,
+            source_files=None,
+            *,
+            source_fingerprints=False,
+            wing=None,
         ):
             seen["mined_set_source_files"] = source_files
             seen["mined_set_source_fingerprints"] = source_fingerprints
+            seen["mined_set_wing"] = wing
             return real_prefetch_mined_set(
                 collection,
                 extract_mode=extract_mode,
                 source_files=source_files,
                 source_fingerprints=source_fingerprints,
+                wing=wing,
             )
 
         monkeypatch.setattr(convo_miner_module, "prefetch_mined_set", _spy_mined_set)
@@ -1163,6 +1170,7 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
         resolved = str(convo_path.resolve())
         assert seen["mined_set_source_files"] == [resolved]
         assert seen["mined_set_source_fingerprints"] is True
+        assert seen["mined_set_wing"] == "test"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1263,10 +1271,12 @@ def _write_dry_run_transcript(path: Path) -> None:
     )
 
 
-def test_mine_convos_dry_run_skips_unchanged_mined_file(
+@pytest.mark.parametrize("wing", ["original", "target"])
+def test_mine_convos_dry_run_skips_only_the_unchanged_destination(
     tmp_path,
     capsys,
     monkeypatch,
+    wing,
 ):
     monkeypatch.setenv("HOME", str(tmp_path))
 
@@ -1286,15 +1296,19 @@ def test_mine_convos_dry_run_skips_unchanged_mined_file(
     mine_convos(
         str(convo_dir),
         palace_path,
-        wing="target",
+        wing=wing,
         dry_run=True,
     )
     output = capsys.readouterr().out
 
-    assert "[DRY RUN] session.txt" not in output
-    assert "Files processed: 0" in output
-    assert "Files skipped (already filed): 1" in output
-    assert "Drawers filed: 0" in output
+    skipped = wing == "original"
+    assert ("[DRY RUN] session.txt" not in output) == skipped
+    assert f"Files processed: {0 if skipped else 1}" in output
+    assert f"Files skipped (already filed): {1 if skipped else 0}" in output
+    assert f"Drawers filed: {0 if skipped else 3}" in output
+    rows = palace.get_collection(palace_path).get(include=["metadatas"])
+    assert rows["ids"]
+    assert all(meta["wing"] == "original" for meta in rows["metadatas"])
 
 
 def test_mine_convos_dry_run_keeps_modified_file_as_work(

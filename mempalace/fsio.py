@@ -591,11 +591,21 @@ def read_source_text(
     with os.fdopen(fd, "rb") as handle:
         if st.st_size > max_bytes:
             raise OSError(f"file too large ({st.st_size // (1024 * 1024)} MB)")
-        # The file can grow after fstat. Bound the actual read as well, with
-        # one extra byte to distinguish an exact-limit file from overflow.
-        raw = handle.read(max_bytes + 1)
-        if len(raw) > max_bytes:
+        # A sized read may allocate its entire request even for a tiny file.
+        # Bound each allocation and the total, including growth after fstat.
+        # One extra byte distinguishes an exact-limit file from overflow.
+        chunks = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = handle.read(min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if not remaining:
             raise OSError(f"file too large (exceeds {max_bytes} bytes)")
+        raw = b"".join(chunks)
+        del chunks, chunk
         if source_metadata is not None:
             fingerprint = source_fingerprint(st)
             if source_fingerprint(os.fstat(handle.fileno())) != fingerprint:

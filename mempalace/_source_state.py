@@ -11,11 +11,12 @@ def source_fingerprint(file_stat: os.stat_result) -> str:
     """Encode the source's identity and change state as backend-safe metadata.
 
     POSIX ctime detects in-place rewrites that preserve size and restore mtime.
-    Windows exposes creation time in that field, so retain the other checks
-    there. Device numbers are deliberately excluded: remounting the same
-    volume can change st_dev without changing its files. Inode, size and
-    timestamps still detect replacements and edits. Reading a file changes
-    neither fingerprint.
+    This guarantee is POSIX-only: Windows exposes creation time in that field
+    and an in-place same-size rewrite with restored mtime is not detected
+    there. Windows still tracks inode, size and mtime changes; this is a stat
+    fingerprint, not a content hash. Device numbers are deliberately excluded:
+    remounting the same volume can change st_dev without changing its files.
+    Reading a file changes neither fingerprint.
     """
     values: tuple[int, ...] = (
         file_stat.st_ino,

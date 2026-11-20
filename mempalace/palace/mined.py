@@ -166,6 +166,8 @@ def file_already_mined(
     extract_mode: Optional[str] = None,
     owner: Optional[str] = None,
     check_source_fingerprint: bool = False,
+    *,
+    wing: Optional[str] = None,
 ) -> bool:
     """Check if a file has already been filed in the palace.
 
@@ -195,6 +197,10 @@ def file_already_mined(
     that extraction mode so exchange-mode and general-mode drawers can coexist
     for the same source transcript. Legacy drawers without extract_mode are
     treated as exchange-mode drawers.
+
+    When ``wing`` is supplied, only that wing's drawers establish freshness
+    and completion. Copies retained in other wings cannot complete a partial
+    destination generation or prevent its legacy upgrade.
 
     A drawer whose metadata carries ``chunk_total`` is only
     counted toward a match once its stored_mtime group has accumulated at
@@ -246,6 +252,8 @@ def file_already_mined(
         ids = results.get("ids") or []
         for meta in results.get("metadatas") or []:
             meta = coerce_metadata_types(meta or {})
+            if wing is not None and meta.get("wing") != wing:
+                continue
             if extract_mode is not None and not _metadata_matches_extract_mode(meta, extract_mode):
                 continue
             if owner is not None and not owns(owner, meta):
@@ -291,6 +299,7 @@ def prefetch_mined_set(
     source_files: Optional[list] = None,
     *,
     source_fingerprints: bool = False,
+    wing: Optional[str] = None,
 ) -> dict[str, Optional[Union[float, str]]]:
     """Pre-fetch source_file -> stored source state for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -306,6 +315,8 @@ def prefetch_mined_set(
 
     When extract_mode is set, mirrors file_already_mined(..., extract_mode=...)
     so conversation mines skip per extraction mode rather than per source file.
+    ``wing`` additionally limits freshness and completion to that wing, like
+    the lock-held check, so preserved copies in other wings stay independent.
 
     Completeness mirrors :func:`file_already_mined`'s ``chunk_total`` rule:
     a source that only has a mid-file partial (surviving drawers
@@ -341,6 +352,8 @@ def prefetch_mined_set(
 
     def _absorb(meta):
         meta = coerce_metadata_types(meta or {})
+        if wing is not None and meta.get("wing") != wing:
+            return
         src = meta.get("source_file")
         if not src:
             return

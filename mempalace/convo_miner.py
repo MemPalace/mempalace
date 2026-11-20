@@ -674,6 +674,7 @@ def _file_chunks_locked(
             check_mtime=True,
             extract_mode=extract_mode,
             check_source_fingerprint=True,
+            wing=wing,
         ):
             return 0, room_counts_delta, True
 
@@ -729,6 +730,7 @@ def _file_chunks_locked(
             aaak_col=aaak_col,
             owner="convo",
             palace_path=palace_path,
+            prune_wing=wing,
         )
     return drawers_added, room_counts_delta, False
 
@@ -763,7 +765,7 @@ def _is_ai_tool_path(path: Path) -> bool:
 
 
 def _is_unchanged_since_last_mine(source_file: str, mined_fingerprints: dict) -> bool:
-    """Skip only a complete, verified snapshot matching the source exactly.
+    """Skip a complete snapshot matching the source's tracked stat fields.
 
     Legacy rows without a fingerprint need one re-mine. A failed stat also
     leaves the source eligible rather than trusting stale content.
@@ -1041,6 +1043,7 @@ def _mine_convos_impl(
             extract_mode=extract_mode,
             source_files=candidate_source_files,
             source_fingerprints=True,
+            wing=wing,
         )
         if collection is not None
         else {}

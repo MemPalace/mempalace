@@ -266,6 +266,110 @@ def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch, re
     assert normalizations == 1, "an unchanged verified source should skip subsequent normalization"
 
 
+@pytest.mark.parametrize("rewrite", [False, True], ids=["unchanged", "edited"])
+def test_legacy_upgrade_in_another_wing_keeps_original_drawers(tmp_path, monkeypatch, rewrite):
+    from mempalace.revisions import load_drawer_revisions
+
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    palace = tmp_path / "palace"
+    convo_miner.mine_convos(str(source), str(palace), wing="alpha")
+    collection = get_collection(str(palace))
+    rows = collection.get(include=["metadatas"])
+    collection.update(
+        ids=rows["ids"], metadatas=[{"source_fingerprint": None} for _ in rows["ids"]]
+    )
+    before = collection.get(where={"wing": "alpha"}, include=["documents", "metadatas"])
+    assert before["ids"]
+    if rewrite:
+        source.write_text(_INITIAL + _APPEND, encoding="utf-8")
+
+    convo_miner.mine_convos(str(source), str(palace), wing="beta")
+    collection = get_collection(str(palace))
+    after = collection.get(where={"wing": "alpha"}, include=["documents", "metadatas"])
+    assert after == before, "migration must retain active drawers in the original wing"
+    beta = collection.get(where={"wing": "beta"}, include=["documents", "metadatas"])
+    assert beta["ids"]
+    assert all(meta.get("source_fingerprint") for meta in beta["metadatas"])
+    assert load_drawer_revisions(str(palace)) == []
+
+    with monkeypatch.context() as unchanged:
+
+        def unexpected_read(*args, **kwargs):
+            pytest.fail("legacy drawers in alpha must not trigger another beta re-mine")
+
+        unchanged.setattr(convo_miner, "normalize_conversations_with_mtime", unexpected_read)
+        convo_miner.mine_convos(str(source), str(palace), wing="beta")
+
+    # A later shrinking re-mine still prunes beta's stale chunks and journals
+    # its prior text, without touching alpha's active memory.
+    source.write_text(
+        "> Which plan?\nA shorter replacement answer with enough text to keep.\n",
+        encoding="utf-8",
+    )
+    convo_miner.mine_convos(str(source), str(palace), wing="beta")
+    collection = get_collection(str(palace))
+    assert collection.get(where={"wing": "alpha"}, include=["documents", "metadatas"]) == before
+    beta_after = collection.get(where={"wing": "beta"}, include=["documents", "metadatas"])
+    assert len(beta_after["ids"]) == 1
+    assert "shorter replacement" in beta_after["documents"][0]
+    journal = load_drawer_revisions(str(palace))
+    assert {row["drawer_id"] for row in journal} == set(beta["ids"])
+    assert all(row["metadata"]["wing"] == "beta" for row in journal)
+
+
+@pytest.mark.parametrize("scan", ["scoped", "fast", "paged"])
+@pytest.mark.parametrize("mode", ["exchange", "general"])
+def test_other_wings_cannot_complete_a_partial_snapshot(
+    collection, tmp_path, monkeypatch, scan, mode
+):
+    from mempalace import palace
+
+    source = tmp_path / "session.txt"
+    source.write_text(_INITIAL, encoding="utf-8")
+    fingerprint = source_fingerprint(source.stat())
+    key, version = CHUNKER_VERSIONS[mode]
+    common = {
+        "source_file": str(source),
+        "source_fingerprint": fingerprint,
+        "normalize_version": NORMALIZE_VERSION,
+        "extract_mode": mode,
+        key: version,
+        "chunk_total": 2,
+    }
+    collection.add(
+        ids=["alpha-0", "alpha-1", "beta-0"],
+        documents=["stored conversation"] * 3,
+        metadatas=[{**common, "wing": wing} for wing in ["alpha", "alpha", "beta"]],
+    )
+    if scan == "paged":
+        monkeypatch.setattr(palace, "_fast_collection_metadata", lambda *a, **kw: None)
+
+    def prefetched():
+        return prefetch_mined_set(
+            collection,
+            extract_mode=mode,
+            source_files=[str(source)] if scan == "scoped" else None,
+            source_fingerprints=True,
+            wing="beta",
+        )
+
+    def complete():
+        return file_already_mined(
+            collection, str(source), extract_mode=mode, check_source_fingerprint=True, wing="beta"
+        )
+
+    assert prefetched() == {}
+    assert not complete()
+    collection.add(
+        ids=["beta-1"],
+        documents=["last conversation chunk"],
+        metadatas=[{**common, "wing": "beta"}],
+    )
+    assert prefetched() == {str(source): fingerprint}
+    assert complete()
+
+
 def test_scoped_prefetch_preserves_fingerprints_and_legacy_metadata(collection, tmp_path):
     source = tmp_path / "verified.txt"
     legacy = tmp_path / "legacy.txt"
