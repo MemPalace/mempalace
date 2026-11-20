@@ -27,10 +27,11 @@
      mempalace executable. `which mempalace` in a normal terminal prints it
      (pipx installs to ~/.local/bin, Homebrew to /opt/homebrew/bin).
 
-  Defaults to loopback, which needs no token. To serve other machines, add
-  --host 0.0.0.0 and set MEMPALACE_MCP_HTTP_TOKEN below; serve refuses a
-  non-loopback bind with no token. See deploy/server.env.example for the
-  full set of environment variables.
+  Defaults to loopback, which needs no token. To serve other machines, change
+  the host value in ProgramArguments from 127.0.0.1 to 0.0.0.0 and set
+  MEMPALACE_MCP_HTTP_TOKEN below; serve refuses a non-loopback bind with no
+  token. See deploy/server.env.example for the full set of environment
+  variables.
 -->
 <plist version="1.0">
 <dict>
