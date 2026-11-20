@@ -230,6 +230,56 @@ For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/a
 MCP-compatible tools, and local models, see
 [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html).
 
+### Which file extensions get mined
+
+`mempalace mine` reads a built-in whitelist of text extensions
+(`READABLE_EXTENSIONS` in `mempalace/miner.py`). Two symmetric keys
+adjust it — `include_extensions` adds suffixes, `exclude_extensions`
+removes them — and both work at three layers:
+
+```bash
+# Per run (repeat the flag, or pass comma-separated suffixes)
+mempalace mine . --include-extension .mdx
+mempalace mine . --exclude-extension .md
+```
+
+Machine-wide, in `config.json` in the config dir (`~/.config/mempalace`
+on Linux; `MEMPALACE_CONFIG_DIR` and `XDG_CONFIG_HOME` are honoured):
+
+```json
+{"include_extensions": [".mdx"]}
+```
+
+Per project, in `mempalace.yaml` — checked into the repo, shared with the
+team:
+
+```yaml
+include_extensions: [".mdx"]
+```
+
+The lists are additive, never a replacement. The built-in list always
+forms the base: include adds to it, exclude removes from it. There is
+deliberately no key that replaces the whole list — a pinned copy goes
+stale and silently narrows what gets mined.
+
+When layers disagree about one suffix, the most specific layer that
+mentions it decides: command line over `mempalace.yaml` over `config.json`
+over the built-in default. A suffix no layer mentions falls through to
+the built-in default. Within one layer, exclude wins over include for the
+same suffix.
+
+Values are normalized — lowercased, leading dot optional (`mdx` and
+`.MDX` are both `.mdx`). Invalid values (filenames, path separators,
+whitespace) are reported on stderr, never silently ignored. When any
+layer changed the list, the mine header prints an `Ext:` line showing
+additions (`+`) and removals (`-`) relative to the built-in list.
+
+Configured extensions are for text formats. Binary and office documents
+(PDF, DOCX, etc.) belong to the extraction mode: `mempalace mine --mode
+extract`. All existing guards still apply to newly included extensions:
+the `MAX_FILE_SIZE` limit, skip directories, gitignore handling, and the
+symlink and regular-file checks.
+
 ---
 
 ## Benchmarks
