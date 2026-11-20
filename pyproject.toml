@@ -122,6 +122,12 @@ pgvector = ["psycopg[binary]>=3.1"]
 #   pip install mempalace[dml]       — DirectML (Windows AMD/Intel/NVIDIA)
 #   pip install mempalace[coreml]    — macOS Neural Engine
 # After install, set MEMPALACE_EMBEDDING_DEVICE=cuda|dml|coreml (or "auto").
+# NOTE: onnxruntime-gpu / onnxruntime-directml install into the same
+# onnxruntime/ package directory as chromadb's CPU onnxruntime, so an upgrade
+# (or `uv tool upgrade`) that reinstalls onnxruntime last can silently drop the
+# accelerator provider — the extra is installed but the device falls back to
+# CPU (issue #2981). Reinstall the accelerator wheel last, e.g.
+#   uv pip install --reinstall-package onnxruntime-directml onnxruntime-directml
 gpu = ["onnxruntime-gpu>=1.16"]
 dml = ["onnxruntime-directml>=1.16"]
 coreml = ["onnxruntime>=1.16"]

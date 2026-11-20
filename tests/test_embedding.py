@@ -474,6 +474,38 @@ def test_dml_missing_warns_with_dml_extra(monkeypatch, caplog):
     assert "mempalace[dml]" in caplog.text
 
 
+def test_dml_missing_with_wheel_installed_explains_the_overlap(monkeypatch, caplog):
+    """#2981: 'Install mempalace[dml]' cannot help when the DirectML wheel is
+    already installed -- chromadb's CPU onnxruntime overwrites it."""
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+    monkeypatch.setattr(
+        embedding,
+        "_distribution_installed",
+        lambda name: name == "onnxruntime-directml",
+    )
+
+    assert embedding._resolve_providers("dml") == (["CPUExecutionProvider"], "cpu")
+    assert (
+        "onnxruntime-directml is installed but its execution provider is not active" in caplog.text
+    )
+    assert "same onnxruntime/ package directory" in caplog.text
+    assert (
+        "uv pip install --reinstall-package onnxruntime-directml onnxruntime-directml"
+        in caplog.text
+    )
+    assert "pip install --force-reinstall --no-deps onnxruntime-directml" in caplog.text
+
+
+def test_cuda_missing_without_gpu_wheel_keeps_the_extra_hint_only(monkeypatch, caplog):
+    """No extra guidance when the accelerator wheel is simply not installed."""
+    monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
+    monkeypatch.setattr(embedding, "_distribution_installed", lambda name: False)
+
+    assert embedding._resolve_providers("cuda") == (["CPUExecutionProvider"], "cpu")
+    assert "mempalace[gpu]" in caplog.text
+    assert "overwrite" not in caplog.text
+
+
 def test_unknown_device_warns_once(monkeypatch, caplog):
     monkeypatch.setattr("onnxruntime.get_available_providers", lambda: ["CPUExecutionProvider"])
 
