@@ -123,6 +123,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   archive is left intact. Thanks to [Lautaro Antúnez](https://github.com/Staberman).
   ([#3059](https://github.com/MemPalace/mempalace/pull/3059),
   [#3053](https://github.com/MemPalace/mempalace/issues/3053))
+- `mempalace wings split` resolves a Claude Code transcript from a
+  `<project>/.worktrees/<wt>` checkout to `<project>`, as the hooks have
+  done since [#2586](https://github.com/MemPalace/mempalace/pull/2586),
+  instead of planning one wing per worktree. `mempalace audit` uses the
+  same resolution.
 - **Importing `mempalace` no longer caps the thread pools of the process.**
   The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
   set at package import, so CPU embedding (EmbeddingGemma through torch) ran

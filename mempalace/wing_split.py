@@ -108,11 +108,13 @@ def resolve_target(key: str, existing_wings: Iterable[str]) -> tuple[str, str]:
     after the leading drive and user segments.
     """
     lowered = key.lower().strip("-")
-    # A Claude Code worktree (``<project>--claude-worktrees-<agent>``) belongs
-    # to the project it was branched from.
-    marker = lowered.find("-claude-worktrees-")
-    if marker > 0:
-        return resolve_target(key[:marker].rstrip("-"), existing_wings)
+    # A worktree belongs to the project it was branched from: Claude Code's
+    # ``<project>--claude-worktrees-<agent>`` and a ``<project>/.worktrees/<wt>``
+    # checkout (``<project>--worktrees-<wt>``), as the hooks file them.
+    for worktree_marker in ("-claude-worktrees-", "--worktrees-"):
+        marker = key.lower().find(worktree_marker)
+        if marker > 0:
+            return resolve_target(key[:marker].rstrip("-"), existing_wings)
     # A Codex worktree (``-Users-x--codex-worktrees-<id>-<project>``) names
     # the project after the worktree id.
     codex = re.search(r"-codex-worktrees-[0-9a-f]+-(.+)$", lowered)
