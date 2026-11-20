@@ -71,6 +71,9 @@ _NOT_SEARCH_SETTINGS = {
     # Embedding batch size changes throughput, not the vectors.
     "MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE",
     "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE",
+    # Operator-supplied status-protocol text shown in protocol output; it is
+    # display text only and has no bearing on what a search returns.
+    "MEMPALACE_STATUS_PROTOCOL",
 }
 
 _SETTING_SOURCES = (
