@@ -274,6 +274,7 @@ def _bm25_only_via_sqlite(
                 "similarity": None,
                 "distance": None,
                 "matched_via": "bm25_sqlite",
+                "salience": drawer_salience(meta),
                 # Internal: full path + chunk_index let callers (notably
                 # candidate_strategy="union") dedupe at chunk granularity
                 # rather than basename — two files in different directories
@@ -417,6 +418,7 @@ def _merge_bm25_union_candidates(
             "closet_boost": 0.0,
             "matched_via": "bm25_backend",
             "bm25_score": round(float(hit.score), 3),
+            "salience": drawer_salience(meta),
             "_source_file_full": full_source,
             "_chunk_index": meta.get("chunk_index"),
         }
