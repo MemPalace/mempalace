@@ -499,6 +499,23 @@ def test_resolve_wing_explicit_wins_over_auto_detection(tmp_path):
     assert _resolve_wing(target, wing="my_custom_wing") == "my_custom_wing"
 
 
+@pytest.mark.parametrize("explicit", ["A B", "a-b"])
+def test_resolve_wing_canonicalizes_explicit_name(tmp_path, explicit):
+    assert _resolve_wing(tmp_path, wing=explicit) == "a_b"
+
+
+@pytest.mark.parametrize("invalid", ["../other", "a/b", "a\\b", "bad\x00wing", "x" * 129])
+def test_resolve_wing_rejects_invalid_explicit_name(tmp_path, invalid):
+    with pytest.raises(ValueError, match="wing"):
+        _resolve_wing(tmp_path, wing=invalid)
+
+
+def test_resolve_wing_canonical_explicit_name_precedes_ai_tool_default(tmp_path):
+    target = tmp_path / ".claude" / "projects" / "project"
+    target.mkdir(parents=True)
+    assert _resolve_wing(target, wing="A B") == "a_b"
+
+
 def test_resolve_wing_claude_projects_auto_routes_to_wing_api(tmp_path):
     target = tmp_path / ".claude" / "projects" / "-Users-test-myapp"
     target.mkdir(parents=True)
@@ -1247,6 +1264,52 @@ def _write_dry_run_transcript(path: Path) -> None:
         "Run focused tests before the full suite.\n",
         encoding="utf-8",
     )
+
+
+@pytest.mark.parametrize("explicit", ["A B", "a-b"])
+def test_mine_convos_files_explicit_wing_under_canonical_name(tmp_path, explicit, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = tmp_path / "session.txt"
+    _write_dry_run_transcript(source)
+    palace_path = str(tmp_path / "palace")
+
+    mine_convos(str(source), palace_path, wing=explicit)
+
+    col = chromadb.PersistentClient(path=palace_path).get_collection("mempalace_drawers")
+    stored = col.get(include=["metadatas"])
+    assert stored["ids"]
+    assert {meta["wing"] for meta in stored["metadatas"]} == {"a_b"}
+
+
+@pytest.mark.parametrize("invalid", ["../other", "a/b", "a\\b", "bad\x00wing", "x" * 129])
+def test_mine_convos_invalid_explicit_wing_does_not_write_drawers(tmp_path, invalid, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = tmp_path / "session.txt"
+    _write_dry_run_transcript(source)
+    palace_path = str(tmp_path / "palace")
+    mine_convos(str(source), palace_path, wing="original")
+    col = chromadb.PersistentClient(path=palace_path).get_collection("mempalace_drawers")
+    before = col.get(include=["metadatas"])
+
+    with pytest.raises(ValueError, match="wing"):
+        mine_convos(str(source), palace_path, wing=invalid)
+
+    after = col.get(include=["metadatas"])
+    assert after == before
+
+
+def test_mine_convos_dry_run_prints_canonical_explicit_wing(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = tmp_path / "session.txt"
+    _write_dry_run_transcript(source)
+    palace_path = tmp_path / "palace"
+
+    mine_convos(str(source), str(palace_path), wing="A B", dry_run=True)
+
+    output = capsys.readouterr().out
+    assert "Wing:    a_b" in output
+    assert "[DRY RUN] session.txt" in output
+    assert not palace_path.exists()
 
 
 def test_mine_convos_dry_run_skips_unchanged_mined_file(
