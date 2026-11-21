@@ -329,6 +329,45 @@ class TestWALMode:
         conn = kg._conn()
         assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60000
 
+    def test_init_retry_after_locked_wal_pragma_starts_clean(self, tmp_path, monkeypatch):
+        """A lock on the first ``PRAGMA journal_mode=WAL`` must not leave a
+        half-configured connection behind. The ``_init_db`` retry used to
+        reuse it, without ``row_factory``, and ``_migrate_schema`` then failed
+        on ``row["name"]`` with a tuple-index TypeError."""
+        failed = []
+        opened = []
+
+        class LockedOnce(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == "PRAGMA journal_mode=WAL" and not failed:
+                    failed.append(self)
+                    raise sqlite3.OperationalError("database is locked")
+                return super().execute(sql, *args)
+
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            conn = real_connect(*args, factory=LockedOnce, **kwargs)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(sqlite3, "connect", connect)
+        kg = KnowledgeGraph(db_path=str(tmp_path / "locked_once.sqlite3"))
+        try:
+            assert len(failed) == 1
+            assert len(opened) == 2
+            with pytest.raises(sqlite3.ProgrammingError):
+                failed[0].execute("SELECT 1")
+            conn = kg._conn()
+            assert conn is opened[1]
+            assert conn.row_factory is sqlite3.Row
+            assert conn.isolation_level is None
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            kg.add_triple("alice", "knows", "bob")
+            assert kg.stats()["triples"] == 1
+        finally:
+            kg.close()
+
     def test_wal_growth_is_bounded(self, kg):
         """An unbounded WAL forces peer readers to walk every uncheckpointed
         frame, so both the checkpoint threshold and the -wal size cap must be

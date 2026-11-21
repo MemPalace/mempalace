@@ -506,20 +506,30 @@ class KnowledgeGraph:
             # a peer process to release the write lock before raising
             # "database is locked". 10s is not enough under a concurrent CLI
             # mine; 60s absorbs a long WAL checkpoint.
-            self._connection = sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
-            # Take transaction control away from sqlite3: it opens a
-            # transaction only on the first DML statement, which leaves a
-            # read-then-write block (invalidate, supersede) reading OUTSIDE the
-            # write lock. ``_write_txn`` issues BEGIN IMMEDIATE explicitly so
-            # the whole read-modify-write is serialized against peer processes.
-            self._connection.isolation_level = None
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            # Bound WAL growth so readers in other processes never have to walk
-            # an unbounded WAL, and so the -wal file is truncated back down
-            # after a checkpoint instead of staying at its high-water mark.
-            self._connection.execute("PRAGMA wal_autocheckpoint=1000")
-            self._connection.execute("PRAGMA journal_size_limit=67108864")
-            self._connection.row_factory = sqlite3.Row
+            conn = sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
+            # Publish only a fully configured connection. The pragmas below
+            # can raise "database is locked"; a connection cached before that
+            # would be reused by the _sqlite_retry attempt without row_factory.
+            try:
+                # Take transaction control away from sqlite3: it opens a
+                # transaction only on the first DML statement, which leaves a
+                # read-then-write block (invalidate, supersede) reading OUTSIDE
+                # the write lock. ``_write_txn`` issues BEGIN IMMEDIATE
+                # explicitly so the whole read-modify-write is serialized
+                # against peer processes.
+                conn.isolation_level = None
+                conn.execute("PRAGMA journal_mode=WAL")
+                # Bound WAL growth so readers in other processes never have to
+                # walk an unbounded WAL, and so the -wal file is truncated back
+                # down after a checkpoint instead of staying at its high-water
+                # mark.
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
+                conn.execute("PRAGMA journal_size_limit=67108864")
+                conn.row_factory = sqlite3.Row
+            except BaseException:
+                conn.close()
+                raise
+            self._connection = conn
         return self._connection
 
     def close(self):
