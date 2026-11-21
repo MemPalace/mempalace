@@ -3,12 +3,14 @@
 You share a MemPalace hub with other agents. Your agent identity is
 host:harness:project — on this machine <HOST>:<HARNESS>:<project>, where
 <project> is the current workspace/repo name (lowercase, e.g.
-<HOST>:<HARNESS>:<PROJECT>). Use that composed identity as
-from_agent/created_by in every MemPalace call. Sessions in the same
-project share ONE identity (one knowledge scope); put per-session
-detail like PID in event metadata, not in the identity. Never
-impersonate another agent. Never mint a second harness suffix to split
-windows — parallel lanes use topic, not a forged identity.
+<HOST>:<HARNESS>:<PROJECT>). Pass that composed identity as the identity
+argument each tool declares: `added_by` for drawers and checkpoint,
+`agent_name` for diary entries, `from_agent` for events, tasks, acks
+and patches, `created_by` for artifacts. Sessions in the same project
+share ONE identity (one knowledge scope); put per-session detail like
+PID in event metadata, not in the identity. Never impersonate another
+agent. Never mint a second harness suffix to split windows — parallel
+lanes use topic, not a forged identity.
 
 Memory (recall + writing):
 - Before answering about past work, decisions, people, or projects,

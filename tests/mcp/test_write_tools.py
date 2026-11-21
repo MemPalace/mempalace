@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock
 
+import pytest
 from _mcp_server_helpers import (
     _get_collection,
     _patch_mcp_server,
@@ -2005,3 +2006,71 @@ class TestDeletePurgesRevisions:
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────
+
+
+class TestIdentityAliasAttribution:
+    """An agent that follows the old shared-brain wording files a drawer with
+    the identity it was told to send ('created_by', 'from_agent'), and the
+    stored metadata names that agent instead of falling back to 'mcp' — the
+    silent loss of writer attribution the alias exists to prevent.
+    """
+
+    @pytest.mark.parametrize("alias", ["created_by", "from_agent"])
+    def test_alias_reaches_stored_metadata(self, monkeypatch, config, palace_path, kg, alias):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 1,
+                "params": {
+                    "name": "mempalace_add_drawer",
+                    "arguments": {
+                        "wing": "alias_wing",
+                        "room": "attribution",
+                        "content": f"A drawer filed with the {alias} spelling.",
+                        alias: "host:harness:proj",
+                    },
+                },
+            }
+        )
+
+        assert "result" in resp, resp
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        assert payload["success"] is True
+        stored = col.get(ids=[payload["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"], stored
+        assert stored["metadatas"][0].get("added_by") == "host:harness:proj"
+
+    def test_explicit_added_by_still_wins(self, monkeypatch, config, palace_path, kg):
+        from mempalace import mcp_server
+
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, col = _get_collection(palace_path, create=True)
+        del _client
+
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_add_drawer",
+                    "arguments": {
+                        "wing": "alias_wing",
+                        "room": "attribution",
+                        "content": "A drawer that names its writer twice.",
+                        "added_by": "explicit-agent",
+                        "created_by": "alias-agent",
+                    },
+                },
+            }
+        )
+
+        assert "result" in resp, resp
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        stored = col.get(ids=[payload["drawer_id"]], include=["metadatas"])
+        assert stored["metadatas"][0].get("added_by") == "explicit-agent"

@@ -467,6 +467,47 @@ class TestLightMcpPreflightAndGates:
         assert mapped["ended"] == "2020-01-01"
         assert "valid_to" not in mapped
 
+    def test_identity_alias_maps_to_added_by(self):
+        """The old shared-brain wording sends 'created_by'/'from_agent' on
+        every call; the light server must land them on the drawer tools'
+        'added_by' instead of passing an unknown kwarg to the handler."""
+        for alias in ("created_by", "from_agent"):
+            mapped = mcp_light_server._alias_args_for_handler(
+                mcp_server.tool_add_drawer,
+                {"wing": "w", "room": "r", "content": "c", alias: "host:harness:proj"},
+            )
+            assert mapped["added_by"] == "host:harness:proj"
+            assert alias not in mapped
+
+    def test_explicit_added_by_wins_over_identity_alias(self):
+        mapped = mcp_light_server._alias_args_for_handler(
+            mcp_server.tool_add_drawer,
+            {
+                "wing": "w",
+                "room": "r",
+                "content": "c",
+                "added_by": "explicit",
+                "created_by": "alias",
+                "from_agent": "other-alias",
+            },
+        )
+        assert mapped["added_by"] == "explicit"
+        assert "created_by" not in mapped
+        assert "from_agent" not in mapped
+
+    def test_identity_alias_maps_to_added_by_on_checkpoint(self):
+        mapped = mcp_light_server._alias_args_for_handler(
+            mcp_server.tool_checkpoint,
+            {"items": [], "created_by": "host:harness:proj"},
+        )
+        assert mapped["added_by"] == "host:harness:proj"
+
+    def test_palace_exec_declares_added_by(self):
+        """The rules now tell an agent to pass 'added_by' to `palace_exec ADD`;
+        a schema-driven caller only sends what the advertised schema names."""
+        props = mcp_light_server.LIGHT_TOOLS["palace_exec"]["input_schema"]["properties"]
+        assert props["added_by"]["type"] == "string"
+
 
 class TestUnwrapAndStructuredMerge:
     def test_unwrap_keeps_sibling_limit(self):
