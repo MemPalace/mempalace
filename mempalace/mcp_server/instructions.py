@@ -61,7 +61,9 @@ record a durable procedure, or correct an outdated conclusion. Non-negotiables:
 - New fact or decision: `mempalace_kg_add` with `valid_from` and a
   `source_drawer_id` / `source_file`, so later sessions can judge it.
 - Corrected conclusion: annotate with `mempalace_update_drawer`
-  (`⚠ superseded (date): ...`); do not delete the trace.
+  (`⚠ superseded (date): ...`); do not delete the trace. When you record a new
+  conclusion that contradicts an old one, annotate the OLD drawer in the same
+  pass — a new drawer alone leaves the old claim retrievable with no warning.
 - Durable procedure ("when X happens, do Y"): file a drawer with
   room="playbook" and sections `## 场景` / `## 适用条件` / `## 做法`, plus a
   `source_file`. Project-specific ones go to wing `proj-<slug>`; cross-project
