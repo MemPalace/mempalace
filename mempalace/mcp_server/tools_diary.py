@@ -474,13 +474,7 @@ def _tool_reconnect_locked():
     _vector_disabled_reason = ""
     # Drain the per-path KnowledgeGraph cache so a replaced sqlite file is
     # reopened on the next tool call rather than served from a stale handle.
-    with _kg_cache_lock:
-        for kg in _kg_by_path.values():
-            try:
-                kg.close()
-            except Exception:
-                pass
-        _kg_by_path.clear()
+    _close_cached_kgs()
     with _logstream_cache_lock:
         for ls in _logstream_by_path.values():
             try:

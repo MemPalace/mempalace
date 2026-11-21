@@ -73,6 +73,7 @@ if _REAL_STDOUT_FD is None:
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
+import atexit  # noqa: E402
 import contextlib  # noqa: E402
 import hashlib  # noqa: E402
 import hmac  # noqa: E402
