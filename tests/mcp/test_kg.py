@@ -281,6 +281,26 @@ class TestKGTools:
         assert fact["valid_from"] == "2026-05-06T14:00:00Z"
         assert fact["valid_to"] == "2026-05-06T15:00:00Z"
 
+    def test_kg_query_cap_reports_in_its_own_field(self, monkeypatch, config, palace_path, kg):
+        """Over KG_RESULT_CAP, every view is capped and the graph ``notice`` survives."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        for i in range(5):
+            kg.add_triple("Hub", "links", f"Node{i}", valid_from="2026-01-01")
+        monkeypatch.setattr(mcp_server, "KG_RESULT_CAP", 2)
+        monkeypatch.setattr(mcp_server, "knowledge_graph_notice", lambda *a, **k: "graph notice")
+
+        result = mcp_server.tool_kg_query("Hub", direction="outgoing")
+
+        assert result["count"] == 2
+        assert result["total"] == 5
+        assert result["truncated"] is True
+        assert "3 more fact(s) omitted" in result["truncation_notice"]
+        assert result["notice"] == "graph notice"
+        buckets = result["active_facts"] + result["historical_facts"] + result["future_facts"]
+        assert len(buckets) == len(result["facts"]) == 2
+
     def test_kg_query_accepts_datetime_as_of(self, monkeypatch, config, palace_path, kg):
         _patch_mcp_server(monkeypatch, config, kg)
 
