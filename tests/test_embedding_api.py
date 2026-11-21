@@ -150,6 +150,20 @@ def test_embed_query_delegates_to_call(monkeypatch):
     assert ef.embed_query(["q"]) == ef(["q"])
 
 
+def test_query_and_document_prefixes_are_sent_in_their_respective_roles(monkeypatch):
+    captured = []
+    monkeypatch.setattr("mempalace.llm_client.urlopen", _fake_urlopen(captured=captured))
+    ef = embedding.OpenAICompatEmbeddingFunction(
+        "http://127.0.0.1", "nemotron", query_prefix="query: ", document_prefix="passage: "
+    )
+    ef(["first", "second"])
+    ef.embed_query(["question"])
+    assert [json.loads(req.data)["input"] for req in captured] == [
+        ["passage: first", "passage: second"],
+        ["query: question"],
+    ]
+
+
 def test_raises_on_count_mismatch(monkeypatch):
     def short(req, timeout=None):
         return _FakeResp(json.dumps({"data": [{"index": 0, "embedding": [1.0]}]}).encode())
@@ -176,6 +190,9 @@ def test_raises_on_transport_error(monkeypatch):
 
 
 class _FakeCfg:
+    embedding_api_prefixes = ("", "")
+    embedding_device = "cpu"
+
     def __init__(self, url=None, model=None, key=None, embedding_model="openai-compat"):
         self.embedding_api_url = url
         self.embedding_api_model = model
@@ -222,6 +239,38 @@ def test_config_api_env_overrides_file(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text(json.dumps({"embedding_api_url": "http://from-config"}))
     monkeypatch.setenv("MEMPALACE_EMBEDDING_API_URL", "  http://from-env  ")
     assert MempalaceConfig(config_dir=str(tmp_path)).embedding_api_url == "http://from-env"
+
+
+def test_config_api_prefixes_preserve_spaces_and_allow_empty_overrides(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"embedding_api_query_prefix": "query: ", "embedding_api_document_prefix": "passage: "}
+        )
+    )
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_QUERY_PREFIX", raising=False)
+    monkeypatch.delenv("MEMPALACE_EMBEDDING_API_DOCUMENT_PREFIX", raising=False)
+    assert MempalaceConfig(config_dir=str(tmp_path)).embedding_api_prefixes == (
+        "query: ",
+        "passage: ",
+    )
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_API_QUERY_PREFIX", "")
+    assert MempalaceConfig(config_dir=str(tmp_path)).embedding_api_prefixes == ("", "passage: ")
+
+
+def test_role_prefixes_change_cached_adapter_and_palace_identity(monkeypatch):
+    cfg = _FakeCfg("http://127.0.0.1", "nemotron")
+    monkeypatch.setattr("mempalace.config.MempalaceConfig", lambda: cfg)
+    assert embedding.current_model_name() == "openai-compat"
+    original = embedding.get_embedding_function(device="cpu")
+    cfg.embedding_api_prefixes = ("query: ", "passage: ")
+    prefixed = embedding.get_embedding_function(device="cpu")
+    assert prefixed is not original
+    assert embedding.get_embedding_function(device="cpu") is prefixed
+    identity = embedding.current_model_name()
+    assert identity.startswith("openai-compat:")
+    assert embedding._normalize_stored_model_name(identity) == identity
+    cfg.embedding_api_model = "another-model"
+    assert embedding.current_model_name() != identity
 
 
 def test_config_api_unset_is_none(tmp_path, monkeypatch):

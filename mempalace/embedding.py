@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -831,22 +832,26 @@ class OpenAICompatEmbeddingFunction:
     endpoint (LM Studio, llama.cpp, vLLM, Ollama's OpenAI shim, etc.).
 
     Selected via ``embedding_model == "openai-compat"``. Vectors are produced
-    server-side and fetched over HTTP, which changes the vector space.
-    ``name()`` encodes the model id, but this does **not** guard a model or
-    endpoint change: chromadb 1.5.x persists this class as a legacy EF
-    (``{"type": "legacy"}``, no name), so it never compares names on open,
-    and the recorded palace identity is the bare ``openai-compat`` for every
-    endpoint model. Switching ``embedding_api_model`` to another model with
-    the same dimension is therefore accepted silently; run ``mempalace
-    repair rebuild-index`` yourself after changing the model or endpoint.
-    (Recording the endpoint model in the identity is follow-up item D.)
-    stdlib ``urllib`` only, no new dependency.
+    server-side and fetched over HTTP. Models that expect different formats
+    for queries and documents can configure a literal prefix for each role.
+    MemPalace records the model ID and prefixes by fingerprint when at least
+    one prefix is enabled. Unprefixed palaces retain their legacy identity.
     """
 
-    def __init__(self, base_url: str, model: str, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: Optional[str] = None,
+        *,
+        query_prefix: str = "",
+        document_prefix: str = "",
+    ):
         self._url = self._resolve_url(base_url)
         self._model = model
         self._api_key = api_key
+        self.query_prefix = query_prefix
+        self.document_prefix = document_prefix
         _warn_if_external_embedding(base_url)
 
     @staticmethod
@@ -857,17 +862,24 @@ class OpenAICompatEmbeddingFunction:
         return resolve_openai_url(base_url, "embeddings")
 
     def name(self) -> str:
-        # Encode the model so switching it changes the persisted EF identity
-        # and forces a rebuild_index (vectors from a different model/space are
-        # not interchangeable). ChromaDB compares this on every read.
         return f"openai_compat_emb_{self._model}".replace("/", "_")
 
+    @property
+    def identity(self) -> str:
+        """Return the identity MemPalace records for this vector space."""
+        if not (self.query_prefix or self.document_prefix):
+            return "openai-compat"
+        fields = (self._model, self.query_prefix, self.document_prefix)
+        fingerprint = hashlib.sha256(json.dumps(fields).encode("ascii")).hexdigest()
+        return f"openai-compat:{fingerprint}"
+
     def embed_query(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
-        # ChromaDB 1.5 dispatches query embedding through embed_query (add uses
-        # __call__). Mirror the EmbeddingFunction protocol default: same path.
-        return self(input)
+        return self._embed(input, self.query_prefix)
 
     def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
+        return self._embed(input, self.document_prefix)
+
+    def _embed(self, input, prefix):  # noqa: A002
         from mempalace.llm_client import LLMError, post_json
 
         # Some hosted (Cloudflare-fronted) endpoints 403 the default
@@ -879,7 +891,7 @@ class OpenAICompatEmbeddingFunction:
         out: list = []
         texts = as_text_batch(input)
         for start in range(0, len(texts), _EF_API_BATCH):
-            batch = texts[start : start + _EF_API_BATCH]
+            batch = [prefix + text for text in texts[start : start + _EF_API_BATCH]]
             # encoding_format=float is explicit so a server that defaults to
             # base64 doesn't hand back strings we'd mis-parse as vectors.
             payload = {"model": self._model, "input": batch, "encoding_format": "float"}
@@ -1232,7 +1244,7 @@ def _normalize_stored_model_name(name) -> str:
     here.
     """
     stored = str(name or "").strip().lower()
-    if stored.startswith("embeddinggemma2:"):
+    if stored.startswith(("embeddinggemma2:", "openai-compat:")):
         return stored
     if stored in _KNOWN_EMBEDDING_MODELS and stored != "embeddinggemma2":
         return stored
@@ -1380,16 +1392,23 @@ def get_embedding_function(device: Optional[str] = None, model: Optional[str] = 
                 "MEMPALACE_EMBEDDING_API_MODEL env var"
             )
         api_key = cfg.embedding_api_key
+        query_prefix, document_prefix = cfg.embedding_api_prefixes
         # Include a fingerprint of the key (never the raw secret) so a token
         # rotation busts the cache in long-lived processes (e.g. MCP server).
         key_fp = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
-        cache_key = ("openai-compat", url, api_model, key_fp)
+        cache_key = ("openai-compat", url, api_model, key_fp, query_prefix, document_prefix)
         cached = _EF_CACHE.get(cache_key)
         if cached is not None:
             return cached
         # Return the concrete function. Chroma accepts only ``__call__(self, input)``,
         # and callers distinguish backends by type. A proxy breaks both.
-        ef = OpenAICompatEmbeddingFunction(base_url=url, model=api_model, api_key=api_key)
+        ef = OpenAICompatEmbeddingFunction(
+            base_url=url,
+            model=api_model,
+            api_key=api_key,
+            query_prefix=query_prefix,
+            document_prefix=document_prefix,
+        )
         _EF_CACHE[cache_key] = ef
         logger.info(
             "Embedding function initialized (openai-compat url=%s model=%s)", url, api_model
@@ -1486,7 +1505,9 @@ def current_model_name(model: Optional[str] = None) -> str:
         name = MempalaceConfig().embedding_model  # already resolved
     else:
         name = _resolve_embedding_model(model)
-    if name == "embeddinggemma2":
+    if name == "embeddinggemma2" or (
+        name == "openai-compat" and any(MempalaceConfig().embedding_api_prefixes)
+    ):
         return get_embedding_function(model=name).identity
     return name
 
