@@ -641,16 +641,17 @@ def test_two_sequential_writable_mutations_over_http_both_succeed(
     server's own PID.
 
     The fix (PR #1859, landed in 3.9.0): the re-entrance credit is
-    PROCESS-scoped (module-global ``_MCP_WRITER_LOCK_CM`` checked at the top of
-    ``_acquire_mcp_writer_lock``), so handler thread identity is irrelevant.
+    PROCESS-scoped — any thread in the holding process short-circuits via a
+    PID-keyed guard rather than re-acquiring the flock. Each request gets its
+    own lease scope and releases it when done.
 
     This test drives two real ``tools/call`` POSTs to the production
     ``_build_http_server`` server in writable mode and asserts BOTH succeed.
     It exercises the full dispatch path:
         _http_dispatch → (exclusive lock) → handle_request
           → _mcp_peer_writer_refusal → _acquire_mcp_writer_lock
-              1st call: lease acquired, _MCP_WRITER_LOCK_CM set (process-scoped)
-              2nd call: _MCP_WRITER_LOCK_CM present → (True, "") short-circuit
+              1st call: lease acquired (mine_palace_lock → flock), PID registered
+              2nd call: same-process credit → short-circuits (no flock re-acquire)
           → tool_diary_write → _get_collection → col.add(...)
     """
     port, _ = http_server
@@ -719,7 +720,7 @@ def test_two_sequential_writable_mutations_over_http_both_succeed(
     # Second call: lands on a DIFFERENT thread (ThreadingHTTPServer).
     # With the old thread-local bug, THIS call would see no credit,
     # re-acquire, and get MineAlreadyRunning naming the server's own PID.
-    # Process-scoped fix: _MCP_WRITER_LOCK_CM is set → short-circuits.
+    # Process-scoped fix: same-process PID credit → short-circuits (no flock re-acquire).
     status, body = _post(port, "/mcp", _diary_call(2, "second write entry"))
     assert status == 200, f"second call: status={status} body={body[:200]}"
     second = json.loads(body)
@@ -732,13 +733,11 @@ def test_two_sequential_writable_mutations_over_http_both_succeed(
     # --- both writes landed in the collection ---
     assert len(writes) == 2, f"expected 2 recorded writes, got {len(writes)}"
 
-    # --- lease held by this process (process-scoped, not thread-local) ---
-    assert mcp._MCP_WRITER_LOCK_CM is not None, (
-        "writer lease should be held after mutations (process-scoped credit)"
-    )
-    # Release it cleanly for teardown (canonical order: discard handles,
-    # clear globals, then __exit__ the context manager).
-    mcp._release_mcp_writer_lock()
+    # --- lease scope released after each request (per-request lifecycle) ---
+    # The writer lease is now scoped to individual requests and released on
+    # completion. The test above proves both calls succeeded independently
+    # via the process-wide short-circuit; no stale-state assertion needed.
+    mcp._discard_mcp_storage_handles()
 
 
 def _hook_settings_call(req_id):
