@@ -67,5 +67,7 @@ record a durable procedure, or correct an outdated conclusion. Non-negotiables:
 - Durable procedure ("when X happens, do Y"): file a drawer with
   room="playbook" and sections `## 场景` / `## 适用条件` / `## 做法`, plus a
   `source_file`. Project-specific ones go to wing `proj-<slug>`; cross-project
-  ones to wing `playbook-global`.
+  ones to wing `playbook-global`. Scope must name every kind of object the rule
+  covers (video AND images AND logs) and list exceptions explicitly: the model
+  obeys the boundary you wrote, not the one you meant.
 """
