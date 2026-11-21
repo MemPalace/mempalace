@@ -65,6 +65,21 @@ class TestSharedBrainRulesTemplate:
         assert "<PROJECT>" in content
         assert "<AGENT_ID>" not in content
 
+    def test_identity_parameter_is_named_per_tool_class(self):
+        """The writer argument is not the same on every tool: drawers and
+        checkpoint take 'added_by', diary 'agent_name', events/tasks/acks and
+        patches 'from_agent', artifacts 'created_by'. The old universal
+        'from_agent/created_by in every call' claim was literally unusable and
+        cost agents their writer attribution, so it must not come back."""
+        content = SHARED_BRAIN_RULES_FILE.read_text(encoding="utf-8")
+        collapsed = " ".join(content.split())
+        assert "in every MemPalace call" not in collapsed
+        assert "from_agent/created_by" not in collapsed
+        assert "`added_by` for drawers and checkpoint" in collapsed
+        assert "`agent_name` for diary entries" in collapsed
+        assert "`from_agent` for events, tasks, acks" in collapsed
+        assert "`created_by` for artifacts" in collapsed
+
     def test_watcher_triggers_are_imperative_and_enumerated(self):
         """A capability-conditional watcher rule ('if your harness can...')
         reads as optional and agents skip it. Declared-idle chat plus an
@@ -101,6 +116,7 @@ class TestRenderSharedBrainRules:
         assert "mempalace_event_list" not in light
         assert "mempalace logstream watch" in light
         assert "mempalace logstream watch" in full
+        assert "`added_by` for drawers and checkpoint" in light
         assert _strip_tool_tokens(full) == _strip_tool_tokens(light)
 
     def test_apply_mcp_shape_rejects_unknown(self):

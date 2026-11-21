@@ -68,6 +68,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- **The shared-brain rules name each tool's identity parameter.** The block
+  rendered by `mempalace rules` told every agent to pass its identity as
+  `from_agent/created_by` "in every MemPalace call", but drawers and
+  checkpoints spell the writer `added_by` and diary entries use
+  `agent_name`. Following the text literally returned `-32602 Unknown
+  parameter 'created_by'`, and dropping the argument filed drawers as
+  `added_by: "mcp"`; the light server's `palace_exec` dropped the key
+  silently. The canonical protocol doc, the packaged template and the website
+  guide now name the argument per tool class (byte-identical, test-pinned),
+  `mempalace_add_drawer` and `mempalace_checkpoint` accept `created_by` and
+  `from_agent` as aliases for `added_by` (an explicit `added_by` wins), and
+  the light `palace_exec` schema declares `added_by`.
 - **Importing `mempalace` no longer caps the thread pools of the process.**
   The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
   set at package import, so CPU embedding (EmbeddingGemma through torch) ran

@@ -843,6 +843,14 @@ _STRICT_TYPES = {
 }
 
 
+# Tools that file drawers call the writer 'added_by', but the shared-brain
+# rules used to name it 'from_agent/created_by' (the event and artifact
+# spellings). Both are accepted as aliases on these tools so already-rendered
+# instruction files work; 'added_by' wins when it is supplied too.
+IDENTITY_ALIAS_TOOLS = ("mempalace_add_drawer", "mempalace_checkpoint")
+IDENTITY_ALIAS_KEYS = ("created_by", "from_agent")
+
+
 def _check_strict(value, schema, where):
     expected = schema.get("type")
     wanted = _STRICT_TYPES.get(expected)
@@ -983,6 +991,20 @@ def call_tool(req_id, params: dict, internal: bool = False):
         # all (or passed it as null). An explicit entry — even "" — wins.
         if "entry" not in tool_args or tool_args["entry"] is None:
             tool_args["entry"] = content_val
+
+    # The shared-brain rules block used to tell every agent to pass its identity
+    # as 'from_agent/created_by' on every call, but the memory tools spell the
+    # writer 'added_by'. Instruction files rendered from that wording are still
+    # in the wild, so accept both names on the tools that file drawers. An
+    # explicit added_by — even "" — wins, and the alias never reaches a handler.
+    if tool_name in IDENTITY_ALIAS_TOOLS:
+        if "added_by" not in tool_args or tool_args["added_by"] is None:
+            for alias in IDENTITY_ALIAS_KEYS:
+                if alias in tool_args:
+                    tool_args["added_by"] = tool_args[alias]
+                    break
+        for alias in IDENTITY_ALIAS_KEYS:
+            tool_args.pop(alias, None)
     try:
         with _write_stall_watch(tool_name):
             return None, _decorate_mcp_tool_result(

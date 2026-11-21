@@ -58,6 +58,11 @@ from .tool_capabilities import (  # noqa: E402
 )
 from .version import __version__  # noqa: E402
 
+# Drawer tools name the writer 'added_by'; the shared-brain rules used to say
+# 'from_agent/created_by' (the event and artifact spellings). Declared here
+# rather than imported from mcp_server so the light server stays light.
+_IDENTITY_ALIAS_KEYS = ("created_by", "from_agent")
+
 _SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 _STDOUT_RESTORED = False
 _READ_ONLY = False
@@ -550,6 +555,13 @@ LIGHT_TOOLS = {
                     "type": "string",
                     "description": "Verbatim content to store/update (optional; also accepted for diary_write)",
                 },
+                "added_by": {
+                    "type": "string",
+                    "description": (
+                        "Who is filing the drawers or checkpoint items (optional). "
+                        "Defaults to the diary agent_name, else 'mcp'/'checkpoint'."
+                    ),
+                },
                 "agent_name": {
                     "type": "string",
                     "description": "Agent name for diary_write (required when action is diary_write)",
@@ -1033,6 +1045,14 @@ def _alias_args_for_names(
         mapped["project_dir"] = mapped.pop("project")
     if "valid_to" in mapped and "ended" in names and "ended" not in mapped:
         mapped["ended"] = mapped.pop("valid_to")
+    # Drawer tools name the writer 'added_by'; the shared-brain rules used to
+    # say 'from_agent/created_by'. Accept both the same way tools/call does.
+    if "added_by" in names:
+        for alias in _IDENTITY_ALIAS_KEYS:
+            if alias in mapped:
+                value = mapped.pop(alias)
+                if "added_by" not in mapped or mapped["added_by"] is None:
+                    mapped["added_by"] = value
     if "old" in mapped and "old_object" in names and "old_object" not in mapped:
         mapped["old_object"] = mapped.pop("old")
     if "new" in mapped and "new_object" in names and "new_object" not in mapped:
