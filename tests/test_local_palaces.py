@@ -111,6 +111,37 @@ def test_stdio_mcp_reports_the_same_named_palace(local_cli):
     assert not ambient.exists()
 
 
+def test_named_mcp_does_not_leave_a_separate_server_process(local_cli):
+    psutil = pytest.importorskip("psutil")
+    workspace, _, invoke = local_cli
+    assert invoke("create", "handbook", "--source", "projects=docs").returncode == 0
+    args = ["-m", "mempalace", "local", "mcp", "handbook"]
+    request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode() + b"\n"
+    with subprocess.Popen(
+        [sys.executable, *args],
+        cwd=workspace,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    ) as proc:
+        try:
+            proc.stdin.write(request)
+            proc.stdin.flush()
+            response = json.loads(proc.stdout.readline())
+            assert response["id"] == 1
+            # A Windows venv launcher may delegate to base Python with the same argv.
+            # The named launcher must not spawn an additional actual MCP process.
+            children = psutil.Process(proc.pid).children(recursive=True)
+            assert all(child.cmdline()[1:] == args for child in children)
+        finally:
+            proc.stdin.close()
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
 @pytest.mark.parametrize(
     ("source", "mode"),
     [("chats", "projects"), ("docs", "convos"), (".mempalace/palaces", "projects")],
@@ -225,6 +256,97 @@ def test_source_replaced_by_symlink_is_not_mined(local_cli):
     result = invoke("run", "handbook", "--", "mine", "docs", "--dry-run")
     assert result.returncode == 2
     assert "outside the local palace scope" in result.stderr
+
+
+def test_force_include_cannot_index_managed_state(local_cli):
+    workspace, _, invoke = local_cli
+    assert invoke("create", "wide", "--source", "projects=.").returncode == 0
+    private = workspace / ".mempalace" / "palaces" / "wide" / "state" / "synthetic.md"
+    private.write_text("Synthetic palace state which must not become a drawer.", encoding="utf-8")
+    result = invoke(
+        "run",
+        "wide",
+        "--",
+        "mine",
+        ".",
+        "--dry-run",
+        "--include-ignored",
+        ".mempalace/palaces/wide/state/synthetic.md",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Files:   0" in result.stdout
+
+
+def _symlink_or_skip(link, target):
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+
+def test_local_origin_sampling_does_not_read_a_link_outside_the_corpus(local_cli):
+    workspace, _, invoke = local_cli
+    assert invoke("create", "handbook", "--source", "projects=docs").returncode == 0
+    outside = workspace / "chats" / "synthetic.md"
+    outside.write_text("Synthetic text outside the authorized documents.", encoding="utf-8")
+    _symlink_or_skip(workspace / "docs" / "outside.md", outside)
+    result = invoke("run", "handbook", "--", "mine", "docs", "--redetect-origin", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert not (
+        workspace / ".mempalace" / "palaces" / "handbook" / "palace" / ".mempalace" / "origin.json"
+    ).exists()
+
+
+def test_local_office_scan_prunes_windows_junctions(local_cli):
+    if os.name != "nt":
+        pytest.skip("Windows junction")
+    workspace, _, invoke = local_cli
+    assert invoke("create", "handbook", "--source", "extract=docs").returncode == 0
+    (workspace / "chats" / "outside.rtf").write_text(
+        r"{\rtf1 Synthetic excluded office document.}", encoding="ascii"
+    )
+    junction = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "mklink",
+            "/J",
+            str(workspace / "docs" / "alias"),
+            str(workspace / "chats"),
+        ],
+        capture_output=True,
+        check=False,
+    )
+    if junction.returncode:
+        pytest.skip("cannot create a Windows junction")
+    result = invoke("run", "handbook", "--", "mine", "docs", "--mode", "extract", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "outside.rtf" not in result.stdout + result.stderr
+
+
+def test_named_store_with_aliased_config_cannot_start(local_cli):
+    workspace, _, invoke = local_cli
+    assert invoke("create", "handbook", "--source", "projects=docs").returncode == 0
+    outside = workspace / "chats" / "other-config.json"
+    outside.write_text("{}", encoding="utf-8")
+    link = workspace / ".mempalace" / "palaces" / "handbook" / "config" / "config.json"
+    _symlink_or_skip(link, outside)
+    result = invoke("run", "handbook", "--", "status")
+    assert result.returncode == 2
+    assert "redirected" in result.stderr
+
+
+def test_named_mine_refuses_daemon_routing_before_creating_a_job(tmp_path, monkeypatch):
+    from argparse import Namespace
+
+    from mempalace import paths
+    from mempalace.cli_write_routing import resolve_cli_write_routing
+    from mempalace.write_routing import WriteRoutingError
+
+    monkeypatch.setenv(paths.LOCAL_ROOT_ENV, str(tmp_path / ".mempalace" / "palaces" / "docs"))
+    with pytest.raises(WriteRoutingError, match="daemon routing is not available"):
+        resolve_cli_write_routing(Namespace(daemon=True), operation="mine")
 
 
 def test_document_and_conversation_drawers_stay_in_distinct_real_indexes(tmp_path, monkeypatch):

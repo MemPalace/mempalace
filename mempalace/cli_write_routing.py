@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 
+from . import paths
 from .config import MempalaceConfig
 from .write_routing import (
     ResolvedWriteRoutingPolicy,
@@ -116,6 +117,11 @@ def resolve_cli_write_routing(
         daemon_available=False,
         daemon_can_start=True,
     )
+
+    if decision.use_daemon and paths.local_root() is not None:
+        raise WriteRoutingError(
+            "daemon routing is not available for named local palaces; use --direct"
+        )
 
     if background and not decision.use_daemon:
         raise WriteRoutingError(

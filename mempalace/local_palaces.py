@@ -6,7 +6,10 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
+import sys
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -161,6 +164,22 @@ class LocalPalace:
         env["MEMPALACE_HUB_FORWARD"] = "0"
         return safe_child_env(env)
 
+    def verify_storage(self) -> None:
+        """Reject existing file/directory aliases before opening named storage."""
+        pending = [self.root]
+        while pending:
+            directory = pending.pop()
+            for entry in directory.iterdir():
+                info = entry.lstat()
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or (getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                    or (stat.S_ISREG(info.st_mode) and info.st_nlink > 1)
+                ):
+                    raise ValueError(f"local palace state must not be redirected: {entry}")
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(entry)
+
 
 def enforce_source(source: str, palace_path: str, *modes: str) -> str:
     """Resolve a selected local source before any file scanning or DB writes."""
@@ -187,6 +206,34 @@ def enforce_source(source: str, palace_path: str, *modes: str) -> str:
     )
 
 
+def source_guard(root: Path) -> Callable[[Path], bool] | None:
+    """Bind a scan to its selected root, excluding managed state even when forced."""
+    local = paths.local_root()
+    if local is None:
+        return None
+    selected = root.resolve()
+    managed = local.parent
+
+    def allowed(candidate: Path) -> bool:
+        candidate = Path(candidate)
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            return False
+        return (
+            resolved == candidate
+            and resolved.is_relative_to(selected)
+            and not resolved.is_relative_to(managed)
+        )
+
+    return allowed
+
+
+def filter_source_candidates(root: Path, candidates: Iterable[Path]) -> Iterable[Path]:
+    allowed = source_guard(root)
+    return filter(allowed, candidates) if allowed is not None else candidates
+
+
 def add_local_parser(subparsers) -> argparse.ArgumentParser:
     parser = subparsers.add_parser("local", help="Create and use named workspace palaces")
     local = parser.add_subparsers(dest="local_action", required=True)
@@ -195,7 +242,9 @@ def add_local_parser(subparsers) -> argparse.ArgumentParser:
     run = local.add_parser("run", help="Run a MemPalace command inside a named palace")
     mcp = local.add_parser("mcp", help="Serve a named palace over stdio MCP")
     for command in (create, listing, run, mcp):
-        command.add_argument("--workspace", type=Path, default=Path.cwd(), help="Workspace root")
+        command.add_argument(
+            "--workspace", type=Path, help="Workspace root (default: current directory)"
+        )
     for command in (create, run, mcp):
         command.add_argument("name", help="Name of the local palace")
     create.add_argument(
@@ -236,7 +285,7 @@ def parse_local_args(parser: argparse.ArgumentParser, argv: list[str]) -> argpar
 
 
 def run_local(args, command: list[str]) -> int:
-    workspace = args.workspace.expanduser().resolve(strict=True)
+    workspace = (args.workspace or Path.cwd()).expanduser().resolve(strict=True)
     if not workspace.is_dir():
         raise ValueError(f"workspace is not a directory: {workspace}")
     action = args.local_action
@@ -256,16 +305,33 @@ def run_local(args, command: list[str]) -> int:
         return 0
 
     profile = LocalPalace.load(workspace, args.name)
-    if action == "run":
-        if not command or command[0] not in _RUN_COMMANDS:
-            raise ValueError(
-                f"use '-- COMMAND'; supported commands: {', '.join(sorted(_RUN_COMMANDS))}"
-            )
-        module = "mempalace"
-    else:
-        module = "mempalace.mcp_light_server" if args.light else "mempalace.mcp_server"
-        command = ["--read-only"] if args.read_only else []
+    profile.verify_storage()
+    if action == "mcp":
+        return _run_mcp(profile, args)
+    if not command or command[0] not in _RUN_COMMANDS:
+        raise ValueError(
+            f"use '-- COMMAND'; supported commands: {', '.join(sorted(_RUN_COMMANDS))}"
+        )
     code = subprocess.call(
-        safe_module_argv(module, *command), env=profile.environment(), cwd=workspace
+        safe_module_argv("mempalace", *command), env=profile.environment(), cwd=workspace
     )
     return code if code >= 0 else 128 - code
+
+
+def _run_mcp(profile: LocalPalace, args: argparse.Namespace) -> int:
+    """Serve in the launched process so the MCP host owns the real server PID."""
+    env = profile.environment()
+    os.environ.clear()
+    os.environ.update(env)
+    # Imports must not consult the new cwd for dependencies. As with serve,
+    # resolve the server from the installed package, not the selected corpus.
+    sys.path[:] = [entry for entry in sys.path if Path(entry).is_absolute()]
+    os.chdir(profile.workspace)
+    sys.argv[1:] = ["--read-only"] if args.read_only else []
+    if args.light:
+        from .mcp_light_server import main
+    else:
+        from .mcp_proxy import main
+
+    main()
+    return 0

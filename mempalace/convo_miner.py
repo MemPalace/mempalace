@@ -524,26 +524,34 @@ def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
     or ``Subagents``), so directories like ``mysubagents`` or
     ``subagentsbackup`` are not affected.
     """
+    from .local_palaces import source_guard
+
     # A direct conversation file is a valid source. For a file, feed only
     # its basename through the existing directory validation loop.
     requested_path = Path(convo_dir).expanduser()
     single_file = requested_path.is_file()
     convo_path = (requested_path.parent if single_file else requested_path).resolve()
+    allowed = source_guard(convo_path)
     scan_entries = (
         [(str(convo_path), [], [requested_path.name])] if single_file else os.walk(convo_path)
     )
     files = []
     for root, dirs, filenames in scan_entries:
+        current = Path(root)
         dirs[:] = [
             d
             for d in dirs
-            if d not in CONVO_SKIP_DIRS and (include_subagents or d.lower() != "subagents")
+            if d not in CONVO_SKIP_DIRS
+            and (include_subagents or d.lower() != "subagents")
+            and (allowed is None or allowed(current / d))
         ]
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
-            filepath = Path(root) / filename
+            filepath = current / filename
             if filepath.suffix.lower() in CONVO_EXTENSIONS:
+                if allowed is not None and not allowed(filepath):
+                    continue
                 # Skip symlinks and oversized files
                 if filepath.is_symlink():
                     rel = filepath.relative_to(convo_path).as_posix()
