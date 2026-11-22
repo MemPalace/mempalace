@@ -62,6 +62,9 @@ def main():
     )
 
     sub = parser.add_subparsers(dest="command")
+    from ..local_palaces import add_local_parser, parse_local_args
+
+    add_local_parser(sub)
 
     # init
     p_init = sub.add_parser("init", help="Detect rooms from your folder structure")
@@ -1124,7 +1127,7 @@ def main():
         help="Storage backend (default: config/env/detected/chroma)",
     )
 
-    args = parser.parse_args()
+    args = parse_local_args(parser, sys.argv[1:])
     _apply_backend_arg(args)
 
     if not args.command:

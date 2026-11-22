@@ -25,6 +25,23 @@ from pathlib import Path
 from typing import Optional
 
 DIRNAME = ".mempalace"
+LOCAL_ROOT_ENV = "MEMPALACE_LOCAL_ROOT"
+
+
+def local_root() -> Optional[Path]:
+    """Absolute root chosen by the named-palace launcher, or no local context."""
+    value = os.environ.get(LOCAL_ROOT_ENV)
+    if value is None:
+        return None
+    root = Path(value)
+    if (
+        not root.is_absolute()
+        or root.parent.name != "palaces"
+        or root.parent.parent.name != DIRNAME
+    ):
+        raise ValueError(f"invalid {LOCAL_ROOT_ENV}: expected an absolute named palace root")
+    return root
+
 
 # Files that mark ~/.mempalace as a real legacy install rather than an
 # empty or leftover directory. Any one is enough.
@@ -33,6 +50,9 @@ _LEGACY_MARKERS = ("config.json", "people_map.json")
 
 def state_home(home: Optional[str] = None) -> Path:
     """``~/.mempalace`` (or ``<home>/.mempalace`` when ``home`` is given)."""
+    local = local_root()
+    if local is not None and home is None:
+        return local / "state"
     base = Path(home) if home is not None else Path.home()
     return base / DIRNAME
 
@@ -48,6 +68,8 @@ def state_str(*parts: str) -> str:
     Some long-standing defaults were built that way (forward slashes kept on
     Windows); this keeps their strings identical.
     """
+    if local_root() is not None:
+        return str(state_path(*parts))
     return os.path.expanduser("/".join(("~", DIRNAME) + parts))
 
 
@@ -58,6 +80,9 @@ def display_state_path(*parts: str) -> str:
 
 def default_palace_path() -> str:
     """The legacy default palace location, ``~/.mempalace/palace``."""
+    local = local_root()
+    if local is not None:
+        return str(local / "palace")
     return state_str("palace")
 
 
@@ -163,6 +188,9 @@ def _has_legacy_install(legacy: Path) -> bool:
 
 def config_dir() -> Path:
     """The config directory; see the module docstring for the order."""
+    local = local_root()
+    if local is not None:
+        return local / "config"
     env_dir = os.environ.get("MEMPALACE_CONFIG_DIR")
     if env_dir and env_dir.strip():
         return Path(env_dir).expanduser()
