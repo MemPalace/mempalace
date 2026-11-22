@@ -2,6 +2,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -21,11 +23,11 @@ def local_cli(tmp_path):
         "MEMPALACE_BACKEND": "unexpected-ambient-backend",
     }
 
-    def invoke(*args, input=None):
+    def invoke(*args, input=None, local=True, extra_env=None):
         return subprocess.run(
-            [sys.executable, "-m", "mempalace", "local", *args],
+            [sys.executable, "-m", "mempalace", *(["local"] if local else []), *args],
             cwd=workspace,
-            env=env,
+            env={**env, **(extra_env or {})},
             input=input,
             text=True,
             encoding="utf-8",
@@ -389,3 +391,121 @@ def test_document_and_conversation_drawers_stay_in_distinct_real_indexes(tmp_pat
     monkeypatch.delenv(paths.LOCAL_ROOT_ENV)
     assert MempalaceConfig().palace_path == str(global_palace)
     assert not global_palace.exists()
+
+
+@pytest.fixture
+def local_embedding_endpoint():
+    """Exercise the real embedding client without network access or model downloads."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            assert self.path == "/v1/embeddings"
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert payload["model"] == "synthetic-labels"
+            data = []
+            for index, text in enumerate(payload["input"]):
+                words = text.casefold()
+                vector = [1.0] + [float(word in words) for word in ("topaz", "jasper", "quartz")]
+                data.append({"index": index, "embedding": vector})
+            body = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            yield {
+                "embedding_model": "openai-compat",
+                "embedding_api_url": f"http://127.0.0.1:{server.server_port}",
+                "embedding_api_model": "synthetic-labels",
+            }
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def test_cli_and_mcp_round_trip_in_separate_processes(local_cli, local_embedding_endpoint):
+    workspace, ambient, invoke = local_cli
+    environment = {
+        "NO_PROXY": "127.0.0.1",
+        "HF_HUB_OFFLINE": "1",
+        "ANONYMIZED_TELEMETRY": "False",
+    }
+    config = local_embedding_endpoint
+    documents = "Topaz orchard"
+    discussions = "Jasper harbor"
+    shared = "Quartz valley"
+    (workspace / "docs" / "guide.md").write_text(
+        f"{documents} is the selected sample label in this synthetic field guide.", encoding="utf-8"
+    )
+    (workspace / "chats" / "session.txt").write_text(
+        f"> What is the selected sample label in these synthetic meeting notes?\n{discussions} is the answer.\n",
+        encoding="utf-8",
+    )
+    (workspace / "shared").mkdir()
+    (workspace / "shared" / "note.md").write_text(
+        f"{shared} is the selected sample label in the separate shared corpus.", encoding="utf-8"
+    )
+
+    def run(*args, input=None, local=True):
+        result = invoke(
+            *args,
+            input=input,
+            local=local,
+            extra_env={**environment, **({"MEMPALACE_BACKEND": "chroma"} if not local else {})},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        return result.stdout
+
+    for name, sources in {
+        "documents": ["projects=docs"],
+        "discussions": ["convos=chats"],
+        "combined": ["projects=docs", "convos=chats"],
+    }.items():
+        run("create", name, *(arg for source in sources for arg in ("--source", source)))
+        profile = workspace / ".mempalace" / "palaces" / name
+        (profile / "config" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (ambient / "config").mkdir(parents=True)
+    (ambient / "config" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    def mcp(palace, name, arguments, *flags):
+        request = {
+            "jsonrpc": "2.0",
+            "id": 17,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        output = run("mcp", palace, *flags, input=json.dumps(request) + "\n")
+        response = json.loads(output)
+        assert "result" in response, response
+        return json.loads(response["result"]["content"][0]["text"])
+
+    run("mine", "shared", local=False)
+    run("run", "documents", "--", "mine", "docs")
+    run("run", "combined", "--", "mine", "docs")
+    run("run", "combined", "--", "mine", "chats", "--mode", "convos")
+    filed = mcp("discussions", "mempalace_mine", {"source": "chats", "mode": "convos"})
+    assert filed["success"], filed
+
+    query = "Which sample label was selected?"
+    for palace, expected, excluded in [
+        ("documents", [documents], [discussions, shared]),
+        ("discussions", [discussions], [documents, shared]),
+        ("combined", [documents, discussions], [shared]),
+    ]:
+        result = mcp(palace, "mempalace_search", {"query": query, "limit": 10}, "--read-only")
+        text = "\n".join(hit["text"] for hit in result["results"])
+        assert all(phrase in text for phrase in expected), result
+        assert all(phrase not in text for phrase in excluded), result
+
+    cli_local = run("run", "documents", "--", "search", query)
+    cli_shared = run("search", query, local=False)
+    assert documents in cli_local and discussions not in cli_local and shared not in cli_local
+    assert shared in cli_shared and documents not in cli_shared and discussions not in cli_shared
