@@ -27,6 +27,7 @@ import os
 import sys
 import urllib.error
 
+from ._blas_threads import cap_server_blas_threads
 from .hub_client import (
     FORWARD_ERRORS,
     SEARCH_TOOL_NAMES,
@@ -405,6 +406,8 @@ def main() -> None:
     for a plain stdio session with no hub to proxy to — in both cases the
     heavy import was going to happen regardless.
     """
+    # A long-lived server: cap BLAS/OpenMP pools before mcp_server loads numpy.
+    cap_server_blas_threads()
     argv = sys.argv[1:]
     if not _is_plain_stdio_invocation(argv):
         from . import mcp_server

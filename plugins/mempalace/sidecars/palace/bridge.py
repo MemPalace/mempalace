@@ -46,6 +46,15 @@ from mempalace.hub_client import (  # noqa: E402
 )
 from mempalace.version import __version__  # noqa: E402
 
+try:
+    from mempalace._blas_threads import cap_server_blas_threads
+except ImportError:  # an older installed mempalace: same cap, inline
+
+    def cap_server_blas_threads() -> None:
+        for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(var, "1")
+
+
 # `mempalace.mcp_server` is imported lazily on demand (and exposed as `bridge.mp`
 # via PEP 562 module `__getattr__`) so hub-proxied runs never load chromadb,
 # onnxruntime, tokenizers, or a duplicate vector matrix, while callers/tests
@@ -1220,6 +1229,9 @@ _HANDLERS = {
 
 
 def main() -> None:
+    # A long-lived bridge: cap BLAS/OpenMP pools before a local fallback can
+    # import mempalace.mcp_server (and with it numpy).
+    cap_server_blas_threads()
     _init_stdio()
     _emit({"type": "ready", "version": __version__})
 
