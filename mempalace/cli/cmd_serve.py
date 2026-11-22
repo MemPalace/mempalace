@@ -127,9 +127,14 @@ def cmd_serve(args):
 
     # Build the child environment. Token rides in the env (never argv) so it
     # stays out of the process table.
+    from .._blas_threads import cap_server_blas_threads
     from .._proc import safe_child_env, safe_module_argv
 
     env = safe_child_env()
+    # The hub is long-lived and mostly idle: one BLAS/OpenMP thread each.
+    # The child also caps itself when started as a module; this keeps the
+    # cap explicit for the Windows subprocess path.
+    cap_server_blas_threads(env)
     env["MEMPALACE_PALACE_PATH"] = palace_path
     if backend:
         env["MEMPALACE_BACKEND"] = str(backend).strip().lower()

@@ -33,6 +33,7 @@ if __name__ == "__main__":
 import inspect  # noqa: E402
 import urllib.error  # noqa: E402
 
+from ._blas_threads import cap_server_blas_threads  # noqa: E402
 from .config import MempalaceConfig, normalize_wing_name  # noqa: E402
 from .hub_client import (  # noqa: E402
     FORWARD_ERRORS,
@@ -1498,6 +1499,9 @@ def _run_light_hub_proxy(hub: HubClient, palace_path: str) -> None:
 
 
 def main():
+    # A long-lived, mostly idle server: cap BLAS/OpenMP pools before a local
+    # fallback can import mcp_server (and with it numpy).
+    cap_server_blas_threads()
     parser = argparse.ArgumentParser(description="MemPalace Lightweight MCP Server")
     parser.add_argument("--palace", help="Path to palace directory")
     parser.add_argument("--collection", help="Chroma collection name")

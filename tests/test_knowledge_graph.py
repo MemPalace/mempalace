@@ -2,15 +2,19 @@
 test_knowledge_graph.py — Tests for the temporal knowledge graph.
 
 Covers: entity CRUD, triple CRUD, temporal queries, invalidation,
-timeline, stats, and edge cases (duplicate triples, ID collisions).
+timeline, stats, and edge cases (duplicate triples, ID collisions),
+multi-process locking, the SQLite retry decorator, and connection pragmas.
 """
 
+import gc
 import json
+import multiprocessing
 import sqlite3
+import weakref
 
 import pytest
 
-from mempalace.knowledge_graph import KnowledgeGraph
+from mempalace.knowledge_graph import KnowledgeGraph, _sqlite_retry
 
 
 class TestEntityOperations:
@@ -318,6 +322,144 @@ class TestWALMode:
         conn.close()
         assert mode == "wal"
 
+    def test_busy_timeout_survives_a_peer_checkpoint(self, kg):
+        """10s (sqlite3's ``timeout=10``) is not enough to sit out a
+        concurrent CLI mine's WAL checkpoint; the write then fails with
+        "database is locked"."""
+        conn = kg._conn()
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60000
+
+    def test_init_retry_after_locked_wal_pragma_starts_clean(self, tmp_path, monkeypatch):
+        """A lock on the first ``PRAGMA journal_mode=WAL`` must not leave a
+        half-configured connection behind. The ``_init_db`` retry used to
+        reuse it, without ``row_factory``, and ``_migrate_schema`` then failed
+        on ``row["name"]`` with a tuple-index TypeError."""
+        failed = []
+        opened = []
+
+        class LockedOnce(sqlite3.Connection):
+            def execute(self, sql, *args):
+                if sql == "PRAGMA journal_mode=WAL" and not failed:
+                    failed.append(self)
+                    raise sqlite3.OperationalError("database is locked")
+                return super().execute(sql, *args)
+
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            conn = real_connect(*args, factory=LockedOnce, **kwargs)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(sqlite3, "connect", connect)
+        kg = KnowledgeGraph(db_path=str(tmp_path / "locked_once.sqlite3"))
+        try:
+            assert len(failed) == 1
+            assert len(opened) == 2
+            with pytest.raises(sqlite3.ProgrammingError):
+                failed[0].execute("SELECT 1")
+            conn = kg._conn()
+            assert conn is opened[1]
+            assert conn.row_factory is sqlite3.Row
+            assert conn.isolation_level is None
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            kg.add_triple("alice", "knows", "bob")
+            assert kg.stats()["triples"] == 1
+        finally:
+            kg.close()
+
+    def test_wal_growth_is_bounded(self, kg):
+        """An unbounded WAL forces peer readers to walk every uncheckpointed
+        frame, so both the checkpoint threshold and the -wal size cap must be
+        set on the connection."""
+        conn = kg._conn()
+        assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 1000
+        assert conn.execute("PRAGMA journal_size_limit").fetchone()[0] == 67108864
+
+    def _trace(self, kg, fn):
+        conn = kg._conn()
+        statements = []
+        conn.set_trace_callback(statements.append)
+        try:
+            fn()
+        finally:
+            conn.set_trace_callback(None)
+        return statements
+
+    def test_writes_open_an_immediate_transaction(self, kg):
+        """Writes must take the write lock up front.
+
+        SQLite raises SQLITE_BUSY immediately, without consulting
+        busy_timeout, when a read transaction fails to upgrade to a write, so
+        a DEFERRED transaction defeats the timeout entirely. Assert on the
+        statement SQLite actually receives — ``isolation_level`` being set is
+        not proof the emitted BEGIN changed.
+        """
+        statements = self._trace(kg, lambda: kg.add_entity("Alice", entity_type="person"))
+        assert statements[0] == "BEGIN IMMEDIATE"
+        assert not any(st.strip() == "BEGIN" for st in statements), statements
+
+    def test_validating_read_happens_inside_the_write_lock(self, kg):
+        """``invalidate`` checks ``valid_from`` before it writes ``valid_to``.
+
+        sqlite3 opens an implicit transaction only on the first DML statement,
+        so with implicit transactions that SELECT ran *before* BEGIN — outside
+        the write lock. A peer process could then open a fact between the check
+        and the UPDATE and end up with valid_to < valid_from, an interval
+        invisible to every KG query. The BEGIN must precede the SELECT.
+        """
+        kg.add_triple("Max", "does", "swimming", valid_from="2025-01-01")
+        statements = self._trace(
+            kg, lambda: kg.invalidate("Max", "does", "swimming", ended="2026-02-15")
+        )
+        assert statements[0] == "BEGIN IMMEDIATE", statements
+        select_at = next(i for i, st in enumerate(statements) if st.startswith("SELECT"))
+        update_at = next(i for i, st in enumerate(statements) if st.startswith("UPDATE"))
+        assert 0 < select_at < update_at, statements
+
+    def test_failed_write_rolls_back(self, kg):
+        """The rejected-interval path must leave no partial write behind."""
+        kg.add_triple("Max", "does", "swimming", valid_from="2025-01-01")
+        with pytest.raises(ValueError):
+            kg.invalidate("Max", "does", "swimming", ended="2020-01-01")
+        assert not kg._conn().in_transaction
+        facts = kg.query_entity("Max")
+        assert [f["current"] for f in facts] == [True]
+
+    def test_failed_commit_does_not_leave_the_transaction_open(self, kg):
+        """A COMMIT that raises must still close the transaction.
+
+        COMMIT can fail in its own right — SQLITE_BUSY during a WAL
+        checkpoint — and a raising commit leaves the transaction open. The
+        next ``_sqlite_retry`` attempt then hits "cannot start a transaction
+        within a transaction", which is not a lock error, so the retry gives
+        up and reports that instead of the contention it exists to absorb.
+        Assert on ``in_transaction`` rather than on a message, so the guard
+        survives a reworded error.
+        """
+        real = kg._conn()
+
+        class CommitFails:
+            """Delegating proxy — ``sqlite3.Connection.commit`` is read-only."""
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def commit(self):
+                raise sqlite3.OperationalError("database is locked")
+
+        kg._connection = CommitFails()
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                kg.add_entity("Alice", entity_type="person")
+        finally:
+            kg._connection = real
+
+        assert not real.in_transaction, "a failed commit left the transaction open"
+        # The connection must still be usable: a retry has to be able to BEGIN.
+        kg.add_entity("Bob", entity_type="person")
+        assert kg.stats()["entities"] >= 1
+
 
 class TestStats:
     def test_stats_empty(self, kg):
@@ -481,6 +623,22 @@ class TestKnowledgeGraphConnectionCleanup:
         with pytest.raises(sqlite3.ProgrammingError):
             conn.execute("SELECT 1")
 
+    def test_instance_is_garbage_collected_after_close(self, tmp_path):
+        """Regression: registering ``close`` with ``atexit`` in ``__init__``
+        held a strong reference to every instance, so short-lived callers
+        (fact_checker) pinned a SQLite handle open until process exit. A
+        dropped, closed instance must be reclaimable."""
+        kg = KnowledgeGraph(str(tmp_path / "gc.sqlite3"))
+        kg.add_triple("alice", "knows", "bob")
+        ref = weakref.ref(kg)
+        kg.close()
+        del kg
+        gc.collect()
+        assert ref() is None, (
+            "KnowledgeGraph was retained after close() — something "
+            "(likely atexit) is still holding a strong reference."
+        )
+
 
 class TestSupersessionBoundary:
     """Regression coverage for the as-of boundary double-count (issue #1913):
@@ -591,3 +749,218 @@ class TestCandidateResolution:
         assert kg.query_entity("%") == []
         assert kg.query_entity("_") == []
         assert kg.query_entity("100%") == []
+
+
+class TestSQLiteRetryDecorator:
+    def test_retry_succeeds_on_second_attempt(self):
+        call_count = 0
+
+        @_sqlite_retry(max_retries=3, base_delay=0.01)
+        def flaky():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise sqlite3.OperationalError("database is locked")
+            return "ok"
+
+        assert flaky() == "ok"
+        assert call_count == 2
+
+    def test_retry_raises_after_max_retries(self):
+        @_sqlite_retry(max_retries=2, base_delay=0.01)
+        def always_locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            always_locked()
+
+    def test_retry_on_busy_error(self):
+        """The "database is busy" variant must be retried too."""
+        call_count = 0
+
+        @_sqlite_retry(max_retries=3, base_delay=0.01)
+        def busy_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 2:
+                raise sqlite3.OperationalError("database is busy")
+            return "ok"
+
+        assert busy_then_ok() == "ok"
+        assert call_count == 2
+
+    def test_no_retry_on_non_lock_operational_error(self):
+        """A corrupt DB or full disk must surface immediately, not after six
+        sleeps that make the real fault look like contention."""
+        call_count = 0
+
+        @_sqlite_retry(max_retries=3, base_delay=0.01)
+        def disk_error():
+            nonlocal call_count
+            call_count += 1
+            raise sqlite3.OperationalError("disk I/O error")
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+            disk_error()
+        assert call_count == 1
+
+    def test_no_retry_on_other_exception_types(self):
+        call_count = 0
+
+        @_sqlite_retry(max_retries=3, base_delay=0.01)
+        def value_error():
+            nonlocal call_count
+            call_count += 1
+            raise ValueError("bad value")
+
+        with pytest.raises(ValueError):
+            value_error()
+        assert call_count == 1
+
+    def _fake_clock(self, monkeypatch, step):
+        """Each call of the wrapped function advances a fake monotonic clock
+        by ``step`` seconds; sleeps are recorded instead of taken."""
+        import mempalace.knowledge_graph as kg_module
+
+        now = [1000.0]
+        sleeps = []
+        monkeypatch.setattr(kg_module.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(kg_module.time, "sleep", sleeps.append)
+
+        def locked_call():
+            now[0] += step
+            raise sqlite3.OperationalError("database is locked")
+
+        return locked_call, sleeps
+
+    def test_lock_after_full_busy_wait_is_not_retried(self, monkeypatch):
+        """A peer that never releases the lock: the first attempt already
+        waited out busy_timeout, so no second full wait is started. Without
+        the budget six such attempts stalled one KG call for over six
+        minutes."""
+        import mempalace.knowledge_graph as kg_module
+
+        locked_call, sleeps = self._fake_clock(monkeypatch, kg_module._BUSY_TIMEOUT_S)
+        calls = []
+
+        @_sqlite_retry()
+        def stuck():
+            calls.append(1)
+            locked_call()
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            stuck()
+        assert len(calls) == 1
+        assert sleeps == []
+
+    def test_retry_stops_once_the_budget_is_spent(self, monkeypatch):
+        """Attempts that each block 8s: retries start at 8s and 16s, then
+        the 20s budget is spent and the third failure is raised."""
+        locked_call, sleeps = self._fake_clock(monkeypatch, 8.0)
+        calls = []
+
+        @_sqlite_retry(max_retries=5, base_delay=0.01, max_elapsed=20.0)
+        def slow_lock():
+            calls.append(1)
+            locked_call()
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            slow_lock()
+        assert len(calls) == 3
+        assert len(sleeps) == 2
+
+    def test_fast_lock_errors_still_use_every_retry(self, monkeypatch):
+        """Immediate SQLITE_BUSY (no busy wait) is what the retry is for:
+        the budget must not cut those short."""
+        locked_call, sleeps = self._fake_clock(monkeypatch, 0.0)
+        calls = []
+
+        @_sqlite_retry(max_retries=5, base_delay=0.01)
+        def fast_lock():
+            calls.append(1)
+            locked_call()
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            fast_lock()
+        assert len(calls) == 6
+        assert len(sleeps) == 5
+
+    def test_default_budget_is_read_at_call_time(self, monkeypatch):
+        import mempalace.knowledge_graph as kg_module
+
+        locked_call, _ = self._fake_clock(monkeypatch, 1.0)
+        monkeypatch.setattr(kg_module, "_RETRY_BUDGET_S", 0.5)
+        calls = []
+
+        @_sqlite_retry(max_retries=5, base_delay=0.01)
+        def lock():
+            calls.append(1)
+            locked_call()
+
+        with pytest.raises(sqlite3.OperationalError):
+            lock()
+        assert len(calls) == 1
+
+    def test_connection_uses_the_module_busy_timeout(self, tmp_path):
+        import mempalace.knowledge_graph as kg_module
+
+        kg = KnowledgeGraph(db_path=str(tmp_path / "kg.sqlite3"))
+        try:
+            (ms,) = kg._conn().execute("PRAGMA busy_timeout").fetchone()
+            assert ms == kg_module._BUSY_TIMEOUT_S * 1000
+        finally:
+            kg.close()
+
+
+def _worker_write_triples(db_path, worker_id, count, errors):
+    """Write ``count`` triples from a separate process. Module level so the
+    spawn start method (the default on macOS and Windows) can import it."""
+    try:
+        kg = KnowledgeGraph(db_path=db_path)
+        for i in range(count):
+            kg.add_triple(f"worker_{worker_id}", "wrote", f"item_{worker_id}_{i}")
+        kg.close()
+    except Exception as exc:  # pragma: no cover - only on a real lock failure
+        errors.append(f"worker_{worker_id}: {exc!r}")
+
+
+class TestMultiProcessLocking:
+    def test_concurrent_process_writes(self, tmp_path):
+        """Several processes writing the same KG file must all land their rows.
+
+        Before the busy_timeout bump and BEGIN IMMEDIATE change this raised
+        "database is locked" from whichever worker lost the write race.
+        """
+        db_path = str(tmp_path / "test_mp.sqlite3")
+        num_workers = 4
+        triples_per_worker = 20
+
+        # spawn, not fork: matches the default on macOS/Windows and keeps the
+        # test honest on the platforms where CI actually reported failures.
+        ctx = multiprocessing.get_context("spawn")
+        manager = ctx.Manager()
+        errors = manager.list()
+
+        processes = [
+            ctx.Process(
+                target=_worker_write_triples,
+                args=(db_path, wid, triples_per_worker, errors),
+            )
+            for wid in range(num_workers)
+        ]
+        for p in processes:
+            p.start()
+        try:
+            for p in processes:
+                p.join(timeout=120)
+        finally:
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=10)
+
+        assert list(errors) == [], f"worker errors: {list(errors)}"
+        assert [p.exitcode for p in processes] == [0] * num_workers
+
+        with KnowledgeGraph(db_path=db_path) as kg:
+            assert kg.stats()["triples"] == num_workers * triples_per_worker
