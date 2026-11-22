@@ -157,8 +157,34 @@ class LocalPalace:
             if not key.upper().startswith(("MEMPALACE_", "MEMPAL_")) and key.upper() != "PYTHONPATH"
         }
         env[paths.LOCAL_ROOT_ENV] = str(self.root)
+        env["MEMPALACE_BACKEND_EXPLICIT"] = "chroma"
         env["MEMPALACE_HUB_FORWARD"] = "0"
         return safe_child_env(env)
+
+
+def enforce_source(source: str, palace_path: str, *modes: str) -> str:
+    """Resolve a selected local source before any file scanning or DB writes."""
+    root = paths.local_root()
+    if root is None:
+        return source
+    profile = LocalPalace.load(root.parents[2], root.name)
+    if not paths.same_path(palace_path, str(profile.palace)):
+        raise ValueError("cannot redirect the database of a named local palace")
+    try:
+        candidate = Path(source).expanduser().resolve(strict=True)
+        if not candidate.is_relative_to(profile.root.parent):
+            for mode in modes:
+                for relative in profile.sources.get(mode, []):
+                    allowed = profile.workspace / relative
+                    # Do not follow an allowed root that was replaced by a link.
+                    if candidate.is_relative_to(allowed) and allowed.resolve() == allowed:
+                        return str(candidate)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"cannot resolve local palace source {source!r}: {exc}") from exc
+    mode_names = "/".join(modes)
+    raise ValueError(
+        f"{source!r} is outside the local palace scope for {profile.name!r} ({mode_names})"
+    )
 
 
 def add_local_parser(subparsers) -> argparse.ArgumentParser:

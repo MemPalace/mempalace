@@ -801,6 +801,8 @@ class MempalaceConfig:
         Read from ``config.json`` first, then ``MEMPALACE_BACKEND``, then
         ``"chroma"`` for backwards compatibility with existing palaces.
         """
+        if paths.local_root() is not None:
+            return DEFAULT_BACKEND
         cfg_val = self._file_config.get("backend")
         if cfg_val:
             return str(cfg_val).strip().lower()

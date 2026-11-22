@@ -6,9 +6,18 @@ from typing import Optional
 
 
 def cmd_mine(args):
+    from ..local_palaces import enforce_source
+
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     mode = getattr(args, "mode", None) or "projects"
     source_adapter = getattr(args, "source", None)
+    try:
+        args.dir = enforce_source(args.dir, palace_path, source_adapter or mode)
+        if getattr(args, "redetect_origin", False):
+            enforce_source(args.dir, palace_path, "projects")
+    except ValueError as exc:
+        print(f"mempalace: {exc}", file=sys.stderr)
+        sys.exit(2)
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -307,6 +316,7 @@ def mine_source_adapter(
     import logging
 
     from ..knowledge_graph import KnowledgeGraph
+    from ..local_palaces import enforce_source
     from ..media import MediaAsset, MediaAssetError, MediaAssetSetupError, store_media_asset
     from ..palace import get_collection, mine_palace_lock
     from ..sources import (
@@ -321,6 +331,7 @@ def mine_source_adapter(
     logger = logging.getLogger(__name__)
 
     adapter_name = resolve_adapter_for_source(explicit=source_name)
+    source_path = enforce_source(source_path, palace_path, adapter_name)
     try:
         adapter = get_adapter(adapter_name)
     except KeyError as exc:

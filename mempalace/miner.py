@@ -2109,6 +2109,9 @@ def mine(
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
     """
+    from .local_palaces import enforce_source
+
+    project_dir = enforce_source(project_dir, palace_path, "projects")
     try:
         if dry_run:
             return _mine_impl(

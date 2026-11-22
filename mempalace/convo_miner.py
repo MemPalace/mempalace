@@ -843,8 +843,10 @@ def mine_convos(
     MempalaceConfig inside :func:`_mine_convos_impl` so `config.json`
     governs both this path and the project-file miner in `miner.py`.
     """
+    from .local_palaces import enforce_source
     from .miner import _cleanup_mine_pid_file
 
+    convo_dir = enforce_source(convo_dir, palace_path, "convos")
     try:
         if dry_run:
             return _mine_convos_impl(

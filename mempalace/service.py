@@ -204,8 +204,14 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
 
     if payload.get("redetect_origin") and not source_adapter:
         from .cli import _run_pass_zero
+        from .local_palaces import enforce_source
 
-        _run_pass_zero(project_dir=source, palace_dir=palace_path, llm_provider=None)
+        try:
+            scoped_source = enforce_source(source, palace_path, "projects")
+            enforce_source(source, palace_path, mode)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc), "exit_code": 2}
+        _run_pass_zero(project_dir=scoped_source, palace_dir=palace_path, llm_provider=None)
 
     from .daemon import LOCK_REFUSAL_ERROR_CLASS
     from .palace import MineAlreadyRunning, MineFileErrors, MineValidationError

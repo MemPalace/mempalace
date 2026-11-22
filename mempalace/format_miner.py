@@ -764,6 +764,9 @@ def mine_formats(
     - A real mine holds ``mine_palace_lock`` for its whole run, like the
       project and conversation miners.
     """
+    from .local_palaces import enforce_source
+
+    format_dir = enforce_source(format_dir, palace_path, "extract")
     if dry_run:
         return _mine_formats_impl(format_dir, palace_path, wing, agent, limit, dry_run)
     with mine_palace_lock(palace_path):
