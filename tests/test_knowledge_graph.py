@@ -817,6 +817,100 @@ class TestSQLiteRetryDecorator:
             value_error()
         assert call_count == 1
 
+    def _fake_clock(self, monkeypatch, step):
+        """Each call of the wrapped function advances a fake monotonic clock
+        by ``step`` seconds; sleeps are recorded instead of taken."""
+        import mempalace.knowledge_graph as kg_module
+
+        now = [1000.0]
+        sleeps = []
+        monkeypatch.setattr(kg_module.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(kg_module.time, "sleep", sleeps.append)
+
+        def locked_call():
+            now[0] += step
+            raise sqlite3.OperationalError("database is locked")
+
+        return locked_call, sleeps
+
+    def test_lock_after_full_busy_wait_is_not_retried(self, monkeypatch):
+        """A peer that never releases the lock: the first attempt already
+        waited out busy_timeout, so no second full wait is started. Without
+        the budget six such attempts stalled one KG call for over six
+        minutes."""
+        import mempalace.knowledge_graph as kg_module
+
+        locked_call, sleeps = self._fake_clock(monkeypatch, kg_module._BUSY_TIMEOUT_S)
+        calls = []
+
+        @_sqlite_retry()
+        def stuck():
+            calls.append(1)
+            locked_call()
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            stuck()
+        assert len(calls) == 1
+        assert sleeps == []
+
+    def test_retry_stops_once_the_budget_is_spent(self, monkeypatch):
+        """Attempts that each block 8s: retries start at 8s and 16s, then
+        the 20s budget is spent and the third failure is raised."""
+        locked_call, sleeps = self._fake_clock(monkeypatch, 8.0)
+        calls = []
+
+        @_sqlite_retry(max_retries=5, base_delay=0.01, max_elapsed=20.0)
+        def slow_lock():
+            calls.append(1)
+            locked_call()
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            slow_lock()
+        assert len(calls) == 3
+        assert len(sleeps) == 2
+
+    def test_fast_lock_errors_still_use_every_retry(self, monkeypatch):
+        """Immediate SQLITE_BUSY (no busy wait) is what the retry is for:
+        the budget must not cut those short."""
+        locked_call, sleeps = self._fake_clock(monkeypatch, 0.0)
+        calls = []
+
+        @_sqlite_retry(max_retries=5, base_delay=0.01)
+        def fast_lock():
+            calls.append(1)
+            locked_call()
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            fast_lock()
+        assert len(calls) == 6
+        assert len(sleeps) == 5
+
+    def test_default_budget_is_read_at_call_time(self, monkeypatch):
+        import mempalace.knowledge_graph as kg_module
+
+        locked_call, _ = self._fake_clock(monkeypatch, 1.0)
+        monkeypatch.setattr(kg_module, "_RETRY_BUDGET_S", 0.5)
+        calls = []
+
+        @_sqlite_retry(max_retries=5, base_delay=0.01)
+        def lock():
+            calls.append(1)
+            locked_call()
+
+        with pytest.raises(sqlite3.OperationalError):
+            lock()
+        assert len(calls) == 1
+
+    def test_connection_uses_the_module_busy_timeout(self, tmp_path):
+        import mempalace.knowledge_graph as kg_module
+
+        kg = KnowledgeGraph(db_path=str(tmp_path / "kg.sqlite3"))
+        try:
+            (ms,) = kg._conn().execute("PRAGMA busy_timeout").fetchone()
+            assert ms == kg_module._BUSY_TIMEOUT_S * 1000
+        finally:
+            kg.close()
+
 
 def _worker_write_triples(db_path, worker_id, count, errors):
     """Write ``count`` triples from a separate process. Module level so the

@@ -257,7 +257,18 @@ def import_graph_rows(source_path: str, target_path: str, apply: bool = False) -
     return counts
 
 
-def _sqlite_retry(max_retries=5, base_delay=0.1, max_delay=5.0):
+# SQLite's busy_timeout for the KG connection, in seconds: how long one
+# statement waits for a peer process to release the write lock.
+_BUSY_TIMEOUT_S = 60
+# Wall-time budget for starting another _sqlite_retry attempt. A retry is
+# only started while the call has spent less than this, so one KG call is
+# bounded by about _RETRY_BUDGET_S + _BUSY_TIMEOUT_S (~80s) even when a peer
+# holds the lock forever. Without it, six attempts that each wait out the
+# full busy_timeout would stall a tool call for over six minutes.
+_RETRY_BUDGET_S = 20.0
+
+
+def _sqlite_retry(max_retries=5, base_delay=0.1, max_delay=5.0, max_elapsed=None):
     """Retry on ``sqlite3.OperationalError`` caused by database locking.
 
     When multiple processes (separate mcp-proxy connections, or a CLI mine
@@ -269,12 +280,19 @@ def _sqlite_retry(max_retries=5, base_delay=0.1, max_delay=5.0):
     Only errors whose message mentions "locked" or "busy" are retried. Other
     ``OperationalError`` variants (corrupt database, disk full, missing table)
     propagate immediately so real faults are not masked by a retry loop.
+
+    ``max_elapsed`` (default ``_RETRY_BUDGET_S``, read at call time) caps
+    the wall time after which no further attempt is started: a lock error
+    that only surfaced after a full ``busy_timeout`` wait is not retried
+    into another full wait.
     """
 
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             last_exc = None
+            budget = _RETRY_BUDGET_S if max_elapsed is None else max_elapsed
+            started = time.monotonic()
             for attempt in range(max_retries + 1):
                 try:
                     return func(*args, **kwargs)
@@ -286,6 +304,8 @@ def _sqlite_retry(max_retries=5, base_delay=0.1, max_delay=5.0):
                     if attempt < max_retries:
                         delay = min(base_delay * (2**attempt), max_delay)
                         sleep_time = delay + delay * 0.5 * random.random()
+                        if time.monotonic() - started + sleep_time >= budget:
+                            break
                         logger.warning(
                             "SQLite locked in %s (attempt %d/%d), retrying in %.2fs",
                             func.__name__,
@@ -506,7 +526,7 @@ class KnowledgeGraph:
             # a peer process to release the write lock before raising
             # "database is locked". 10s is not enough under a concurrent CLI
             # mine; 60s absorbs a long WAL checkpoint.
-            conn = sqlite3.connect(self.db_path, timeout=60, check_same_thread=False)
+            conn = sqlite3.connect(self.db_path, timeout=_BUSY_TIMEOUT_S, check_same_thread=False)
             # Publish only a fully configured connection. The pragmas below
             # can raise "database is locked"; a connection cached before that
             # would be reused by the _sqlite_retry attempt without row_factory.
