@@ -1,17 +1,32 @@
 """Black-box regression coverage for release-manifest version checks."""
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHECKER = REPO_ROOT / "scripts" / "check_versions.py"
+
+
+def _load_checker():
+    spec = importlib.util.spec_from_file_location("check_versions", CHECKER)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+_CHECKER_MOD = _load_checker()
 VERSION = "9.12.4"
 
 
@@ -56,12 +71,14 @@ def fixture_repo(tmp_path):
 
 
 def _run(root, *extra):
-    return subprocess.run(
-        [sys.executable, str(CHECKER), "--root", str(root), *map(str, extra)],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        returncode = _CHECKER_MOD.main(["--root", str(root), *map(str, extra)])
+    return SimpleNamespace(
+        returncode=returncode,
+        stdout=stdout.getvalue(),
+        stderr=stderr.getvalue(),
     )
 
 
