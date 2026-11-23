@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **The first conversation mine after upgrade re-reads every previously mined
+  transcript in its selected sources.** Older rows have no verified source
+  fingerprint and must be re-mined once, even when their stored mtime and size
+  still match. Those fields cannot rule out a same-size rewrite with restored
+  mtime. This can be a substantial one-time cost for large palaces. Existing
+  text is preserved by the re-mine journal; unchanged chunks reuse stored
+  vectors. Once a transcript has a verified fingerprint, subsequent unchanged
+  passes skip it normally.
+- **Timestamp-preserving, same-size in-place rewrite detection is POSIX-only.**
+  It relies on POSIX ctime. On Windows the fingerprint tracks file identity,
+  size and mtime, but cannot detect an in-place rewrite that preserves size
+  and restores mtime; such a transcript can remain skipped with stale stored
+  text. The fingerprint is filesystem metadata, not a content hash.
+- Conversation re-mining prunes stale drawers only in the destination wing.
+  Re-reading a legacy transcript into another wing keeps the original wing's
+  drawers active; replacements within the destination are still journaled.
+- Source reads use bounded chunks instead of allocating the entire size cap
+  for every file. The byte limit also applies to growth during the read.
+- Conversation read failures, including files over the size limit, remain
+  eligible for retry and produce a warning on each mining pass until resolved.
+  They are not registered as successfully mined, and previously stored drawers
+  remain intact. Resolving a transient read failure allows the next pass to
+  recover without a source edit. Oversized files are retried until they fit
+  the reader's size limit.
+
 ### Added
 
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**

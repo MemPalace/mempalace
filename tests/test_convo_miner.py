@@ -1012,7 +1012,14 @@ def test_register_file_sentinel_includes_source_mtime():
         client = chromadb.PersistentClient(path=palace_path)
         col = client.get_or_create_collection("mempalace_drawers")
 
-        _register_file(col, str(tiny_file), "test", "mempalace", "exchange")
+        _register_file(
+            col,
+            str(tiny_file),
+            "test",
+            "mempalace",
+            "exchange",
+            source_metadata={"source_mtime": tiny_file.stat().st_mtime},
+        )
 
         mined = prefetch_mined_set(col, extract_mode="exchange")
         assert str(tiny_file) in mined
@@ -1137,10 +1144,23 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
         seen = {}
         real_prefetch_mined_set = convo_miner_module.prefetch_mined_set
 
-        def _spy_mined_set(collection, extract_mode=None, source_files=None):
+        def _spy_mined_set(
+            collection,
+            extract_mode=None,
+            source_files=None,
+            *,
+            source_fingerprints=False,
+            wing=None,
+        ):
             seen["mined_set_source_files"] = source_files
+            seen["mined_set_source_fingerprints"] = source_fingerprints
+            seen["mined_set_wing"] = wing
             return real_prefetch_mined_set(
-                collection, extract_mode=extract_mode, source_files=source_files
+                collection,
+                extract_mode=extract_mode,
+                source_files=source_files,
+                source_fingerprints=source_fingerprints,
+                wing=wing,
             )
 
         monkeypatch.setattr(convo_miner_module, "prefetch_mined_set", _spy_mined_set)
@@ -1149,6 +1169,8 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
 
         resolved = str(convo_path.resolve())
         assert seen["mined_set_source_files"] == [resolved]
+        assert seen["mined_set_source_fingerprints"] is True
+        assert seen["mined_set_wing"] == "test"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1249,10 +1271,12 @@ def _write_dry_run_transcript(path: Path) -> None:
     )
 
 
-def test_mine_convos_dry_run_skips_unchanged_mined_file(
+@pytest.mark.parametrize("wing", ["original", "target"])
+def test_mine_convos_dry_run_skips_only_the_unchanged_destination(
     tmp_path,
     capsys,
     monkeypatch,
+    wing,
 ):
     monkeypatch.setenv("HOME", str(tmp_path))
 
@@ -1272,15 +1296,19 @@ def test_mine_convos_dry_run_skips_unchanged_mined_file(
     mine_convos(
         str(convo_dir),
         palace_path,
-        wing="target",
+        wing=wing,
         dry_run=True,
     )
     output = capsys.readouterr().out
 
-    assert "[DRY RUN] session.txt" not in output
-    assert "Files processed: 0" in output
-    assert "Files skipped (already filed): 1" in output
-    assert "Drawers filed: 0" in output
+    skipped = wing == "original"
+    assert ("[DRY RUN] session.txt" not in output) == skipped
+    assert f"Files processed: {0 if skipped else 1}" in output
+    assert f"Files skipped (already filed): {1 if skipped else 0}" in output
+    assert f"Drawers filed: {0 if skipped else 3}" in output
+    rows = palace.get_collection(palace_path).get(include=["metadatas"])
+    assert rows["ids"]
+    assert all(meta["wing"] == "original" for meta in rows["metadatas"])
 
 
 def test_mine_convos_dry_run_keeps_modified_file_as_work(
@@ -1468,10 +1496,10 @@ def test_one_bad_transcript_does_not_abort_the_mine(tmp_path, monkeypatch):
     bad.write_text("[]", encoding="utf-8")
     real = convo_miner.normalize_conversations_with_mtime
 
-    def flaky(filepath):
+    def flaky(filepath, **kwargs):
         if filepath.endswith("bad.json"):
             raise TypeError("expected string or bytes-like object, got 'NoneType'")
-        return real(filepath)
+        return real(filepath, **kwargs)
 
     monkeypatch.setattr(convo_miner, "normalize_conversations_with_mtime", flaky)
     palace = tmp_path / "palace"
