@@ -135,6 +135,9 @@ def test_kg_rewrite_is_one_transaction(kg, monkeypatch):
         def __exit__(self, *a):
             return self._c.__exit__(*a)
 
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
         def execute(self, sql, *args):
             if sql.lstrip().startswith("INSERT INTO triples"):
                 raise RuntimeError("disk full")
