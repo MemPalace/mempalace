@@ -95,8 +95,17 @@ def test_unparseable_config_warns_on_load(tmp_path, capsys):
 
 
 def test_object_config_is_quiet(tmp_path, capsys):
+    # The ``palace_path`` getter resolves a file-config value through
+    # ``canonical_palace_path`` (which begins with ``abspath(expanduser())``).
+    # On Windows that prepends the active drive letter, so ``"/x"`` becomes
+    # e.g. ``"D:\\x"``. Assert against the same production resolver the getter
+    # uses, rather than a bare POSIX literal, so the test is cross-platform.
+    from mempalace.config import canonical_palace_path
+
+    expected = canonical_palace_path("/x")
+
     (tmp_path / "config.json").write_text(json.dumps({"palace_path": "/x"}), encoding="utf-8")
-    assert MempalaceConfig(config_dir=tmp_path).palace_path == "/x"
+    assert MempalaceConfig(config_dir=tmp_path).palace_path == expected
     assert capsys.readouterr().err == ""
 
 
