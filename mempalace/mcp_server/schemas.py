@@ -410,6 +410,14 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "created_by": {
+                    "type": "string",
+                    "description": "Alias for 'added_by' (artifact_put's spelling). 'added_by' wins if both are given.",
+                },
+                "from_agent": {
+                    "type": "string",
+                    "description": "Alias for 'added_by' (event tools' spelling). 'added_by' wins if both are given.",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -459,6 +467,14 @@ TOOLS = {
                 "added_by": {
                     "type": "string",
                     "description": "Who is filing these drawers. An explicit value takes precedence; otherwise the diary agent_name, else 'checkpoint'.",
+                },
+                "created_by": {
+                    "type": "string",
+                    "description": "Alias for 'added_by' (artifact_put's spelling). 'added_by' wins if both are given.",
+                },
+                "from_agent": {
+                    "type": "string",
+                    "description": "Alias for 'added_by' (event tools' spelling). 'added_by' wins if both are given.",
                 },
             },
             "required": ["items"],

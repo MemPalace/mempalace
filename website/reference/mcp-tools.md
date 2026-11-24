@@ -132,6 +132,8 @@ File verbatim content into the palace. Identical content (same deterministic dra
 | `content` | string | **Yes** | Verbatim content to store |
 | `source_file` | string | No | Where this came from |
 | `added_by` | string | No | Who is filing (default: "mcp") |
+| `created_by` | string | No | Alias for `added_by`; `added_by` wins if both are given |
+| `from_agent` | string | No | Alias for `added_by`; `added_by` wins if both are given |
 
 **Returns:** `{ success, drawer_id, wing, room }`
 
@@ -147,6 +149,8 @@ Save a whole session in one call. Semantic-dedups each item, files the non-dupli
 | `diary` | object | No | Diary entry written after filing: `{ agent_name, entry, topic?, wing? }` (`entry` is AAAK-format) |
 | `dedup_threshold` | number | No | Similarity threshold 0–1 for the per-item dedup check (default 0.9) |
 | `added_by` | string | No | Who is filing these drawers. An explicit value takes precedence; otherwise the diary `agent_name`, else `checkpoint` |
+| `created_by` | string | No | Alias for `added_by`; `added_by` wins if both are given |
+| `from_agent` | string | No | Alias for `added_by`; `added_by` wins if both are given |
 
 **Returns:** `{ added: [...], duplicates: [...], errors: [...], diary? }`
 

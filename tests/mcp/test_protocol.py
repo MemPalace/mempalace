@@ -2238,6 +2238,152 @@ class TestParamShapeDiagnostics:
         assert "some_helper" not in resp["error"]["message"]
 
 
+class TestIdentityAliasesForDrawerWriters:
+    """The shared-brain rules block used to tell every agent to pass its
+    identity as ``from_agent/created_by`` on every call, but the drawer tools
+    spell the writer ``added_by`` — following the text literally failed with
+    -32602 ``Unknown parameters 'created_by'``, and dropping the argument
+    filed anonymous drawers. Both old names stay accepted on the tools that
+    file drawers so instruction files rendered from the old wording work;
+    an explicit ``added_by`` still wins and the alias never reaches a handler.
+    """
+
+    @pytest.mark.parametrize("alias", ["created_by", "from_agent"])
+    def test_add_drawer_accepts_identity_alias(self, monkeypatch, alias):
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return {"success": True}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_add_drawer"], "handler", capture)
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 1,
+                "params": {
+                    "name": "mempalace_add_drawer",
+                    "arguments": {
+                        "wing": "w",
+                        "room": "r",
+                        "content": "fact",
+                        alias: "host:harness:proj",
+                    },
+                },
+            }
+        )
+        assert "error" not in resp, resp
+        assert captured["added_by"] == "host:harness:proj"
+        assert alias not in captured
+
+    @pytest.mark.parametrize("alias", ["created_by", "from_agent"])
+    def test_checkpoint_accepts_identity_alias(self, monkeypatch, alias):
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return {"success": True}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_checkpoint"], "handler", capture)
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 2,
+                "params": {
+                    "name": "mempalace_checkpoint",
+                    "arguments": {
+                        "items": [{"wing": "w", "room": "r", "content": "fact"}],
+                        alias: "host:harness:proj",
+                    },
+                },
+            }
+        )
+        assert "error" not in resp, resp
+        assert captured["added_by"] == "host:harness:proj"
+        assert alias not in captured
+
+    def test_explicit_added_by_wins_over_identity_alias(self, monkeypatch):
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return {"success": True}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_add_drawer"], "handler", capture)
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 3,
+                "params": {
+                    "name": "mempalace_add_drawer",
+                    "arguments": {
+                        "wing": "w",
+                        "room": "r",
+                        "content": "fact",
+                        "added_by": "explicit",
+                        "created_by": "alias",
+                        "from_agent": "other-alias",
+                    },
+                },
+            }
+        )
+        assert "error" not in resp, resp
+        assert captured["added_by"] == "explicit"
+        assert "created_by" not in captured
+        assert "from_agent" not in captured
+
+    def test_explicit_empty_added_by_is_not_overridden(self, monkeypatch):
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return {"success": True}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_add_drawer"], "handler", capture)
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 4,
+                "params": {
+                    "name": "mempalace_add_drawer",
+                    "arguments": {
+                        "wing": "w",
+                        "room": "r",
+                        "content": "fact",
+                        "added_by": "",
+                        "created_by": "alias",
+                    },
+                },
+            }
+        )
+        assert "error" not in resp, resp
+        assert captured["added_by"] == ""
+        assert "created_by" not in captured
+
+    def test_identity_aliases_are_declared_on_the_tools_that_accept_them(self):
+        """The unknown-parameter gate runs on the schema, so an alias that is
+        not declared there is refused before the mapping is reached."""
+        from mempalace import mcp_server
+
+        TOOLS = mcp_server.TOOLS
+
+        for tool in ("mempalace_add_drawer", "mempalace_checkpoint"):
+            props = TOOLS[tool]["input_schema"]["properties"]
+            for alias in ("created_by", "from_agent"):
+                assert alias in props, f"{tool} does not declare {alias}"
+        # Tools that already use their own spelling must not grow aliases.
+        assert "created_by" in TOOLS["mempalace_artifact_put"]["input_schema"]["properties"]
+        assert "added_by" not in TOOLS["mempalace_artifact_put"]["input_schema"]["properties"]
+
+
 class TestUnknownParamName:
     """A kwarg not in the tool schema (wrong parameter *name*, e.g. text=
     instead of content=) should surface as JSON-RPC -32602 naming the
