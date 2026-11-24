@@ -95,6 +95,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- Explicit `mine --mode convos --wing` names now use the same validated,
+  canonical spelling as other wing writers (`A B` and `a-b` become `a_b`).
+  Existing drawers under noncanonical wing names are not migrated.
+
 - **Importing `mempalace` no longer caps the thread pools of the process.**
   The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
   set at package import, so CPU embedding (EmbeddingGemma through torch) ran

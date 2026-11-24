@@ -784,8 +784,8 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
 
     Precedence (first match wins):
 
-      1. Explicit ``wing`` argument from the user — always wins, even on
-         an AI-tool path. Empty string is treated as "no wing".
+      1. Explicit ``wing`` argument from the user — validated and canonicalized,
+         then wins even on an AI-tool path. Empty string is treated as "no wing".
       2. AI-tool path detection — defaults to ``wing_api`` so Claude
          Code / Codex / Gemini conversations group under a single wing
          dedicated to API-sourced content.
@@ -795,10 +795,10 @@ def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
          ``room_detector_local``, and ``miner.load_config`` so all
          wing-slug producers stay in sync.
     """
-    from .config import normalize_wing_name
+    from .config import canonical_wing, normalize_wing_name
 
     if wing:
-        return wing
+        return canonical_wing(wing, "wing")
     if _is_ai_tool_path(convo_path):
         return "wing_api"
     return normalize_wing_name(convo_path.name)
