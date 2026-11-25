@@ -27,7 +27,7 @@ import time
 import pytest
 
 from tests.benchmarks.report import record_metric
-from tests.benchmarks.subwindow_data import build_corpus
+from tests.benchmarks.subwindow_data import build_corpus, head_control
 
 pytestmark = [pytest.mark.benchmark, pytest.mark.slow]
 
@@ -89,21 +89,23 @@ def _fill(palace_path, corpus):
 
 
 def _vector_ranking(col, palace_path, query, folded):
+    from mempalace.backends.embedding_wrapper import _embed_texts
     from mempalace.searcher import _fold_subwindow_hits, _metric_for_collection
 
     pool = K * 4
+    vectors = _embed_texts([query], query=True)
     results = col.query(
-        query_texts=[query], n_results=pool, include=["documents", "metadatas", "distances"]
+        query_embeddings=vectors, n_results=pool, include=["documents", "metadatas", "distances"]
     )
     if folded:
         results = _fold_subwindow_hits(
             col,
             results,
             palace_path=palace_path,
-            query=query,
             where={},
             pool_size=pool,
             metric=_metric_for_collection(col),
+            query_vectors=vectors,
         )
     return list(results["ids"][0])[:K]
 
@@ -140,7 +142,9 @@ def _run(palace_path, corpus, monkeypatch):
     queries = corpus.queries
     monkeypatch.setenv("MEMPALACE_EMBEDDING_SUBWINDOWS", "0")
     before = {
-        "vector": _score([_vector_ranking(col, palace_path, q.text, False) for q in queries], queries),
+        "vector": _score(
+            [_vector_ranking(col, palace_path, q.text, False) for q in queries], queries
+        ),
         "hybrid": _score([_hybrid_ranking(palace_path, q.text) for q in queries], queries),
     }
     bytes_before = _dir_bytes(palace_path)
@@ -202,13 +206,7 @@ def test_subwindow_recall(tmp_path, monkeypatch, minilm, bench_scale):
     scores, cost = _run(str(tmp_path / "mixed"), corpus, monkeypatch)
     _print("mixed palace: head + tail facts", scores, cost)
 
-    control = build_corpus(
-        n_tail=0,
-        n_head=size["n_head"],
-        n_short=size["n_short"],
-        n_long_filler=size["n_tail"],
-        count_tokens=count,
-    )
+    control = head_control(corpus)
     control_scores, control_cost = _run(str(tmp_path / "control"), control, monkeypatch)
     _print("control: head facts + fact-free long drawers", control_scores, control_cost)
 

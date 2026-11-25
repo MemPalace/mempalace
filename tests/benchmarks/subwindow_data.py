@@ -12,14 +12,14 @@ Each fact has two queries:
 * a **lexical** control query that reuses the fact's own words, where BM25
   is expected to find the drawer whatever the vector does.
 
-Filler vocabulary never contains a slot word or its synonym, so a query can
-only match its own drawer through the planted fact.
+The lexical triple identifies one fact. Individual terms and synonyms may
+match competitors, including the ordinary filler prose.
 """
 
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # (fact word, paraphrase word) pairs. The fact uses the left word, the
 # paraphrase query the right one.
@@ -73,7 +73,7 @@ WHENS = [
     ("during the holidays", "over the vacation"),
 ]
 
-# Filler topics. Words here must never overlap a slot word above.
+# Topic filler is sampled independently of each planted fact.
 FILLER_TOPICS = {
     "cooking": [
         "simmered the tomato sauce for an hour",
@@ -177,9 +177,12 @@ def _filler_sentences(rng: random.Random, topics: list, count: int) -> list:
 
 
 def _fact_slots(rng: random.Random, n: int) -> list:
-    combos = [
-        (s, a, o, w) for s in SUBJECTS for a in ACTIONS for o in OBJECTS for w in WHENS
-    ]
+    # Keep the published small/medium seeds stable. The stress corpus
+    # needs more distinct lexical triples than the original slots permit.
+    actions = ACTIONS
+    if n > len(SUBJECTS) * len(ACTIONS) * len(OBJECTS):
+        actions = [*ACTIONS, ("inherited", "received as a bequest"), ("assembled", "put together")]
+    combos = [(s, a, o, w) for s in SUBJECTS for a in actions for o in OBJECTS for w in WHENS]
     rng.shuffle(combos)
     # One fact per (subject, action, object) keeps every target distinguishable.
     seen, picked = set(), []
@@ -201,16 +204,13 @@ def build_corpus(
     seed: int = 390,
     count_tokens=None,
     tail_min_tokens: int = 300,
-    n_long_filler: int = 0,
 ) -> Corpus:
     """Build the corpus.
 
     ``count_tokens`` (a ``str -> int`` callable, the active embedder's real
     tokenizer) places every tail fact past ``tail_min_tokens``; without it a
     sentence count stands in (~12 tokens per filler sentence).
-    ``n_short`` short distractor drawers with no planted fact pad the palace;
-    ``n_long_filler`` long ones (past the window, no fact) let a control
-    measure what windows alone do to head queries.
+    ``n_short`` short distractor drawers with no planted fact pad the palace.
     """
     rng = random.Random(seed)
     slots = _fact_slots(rng, n_tail + n_head)
@@ -255,14 +255,21 @@ def build_corpus(
                 "lexical",
             )
         )
-    for index in range(n_long_filler):
-        drawer_topics = rng.sample(topics, 2)
-        body = _filler_sentences(rng, drawer_topics, 4)
-        while tokens(" ".join(body)) < tail_min_tokens + 40:
-            body.extend(_filler_sentences(rng, drawer_topics, 2))
-        corpus.drawers.append(Drawer(f"drawer_filler_{index:04d}", " ".join(body), "none", ""))
     for index in range(n_short):
         drawer_topics = rng.sample(topics, 1)
         text = " ".join(_filler_sentences(rng, drawer_topics, rng.randint(3, 8)))
         corpus.drawers.append(Drawer(f"drawer_short_{index:04d}", text, "none", ""))
     return corpus
+
+
+def head_control(mixed: Corpus) -> Corpus:
+    """Remove only the planted tail sentences, keeping the head comparison paired."""
+    return Corpus(
+        drawers=[
+            replace(d, text=d.text.replace(d.fact + " ", "", 1), fact="")
+            if d.position == "tail"
+            else d
+            for d in mixed.drawers
+        ],
+        queries=[q for q in mixed.queries if q.position == "head"],
+    )

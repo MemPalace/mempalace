@@ -2,6 +2,7 @@
 
 import hashlib
 import math
+import random
 import re
 
 import pytest
@@ -112,13 +113,13 @@ def test_stale_or_orphaned_windows_are_ignored():
     assert promoted == 0
 
 
-def test_merge_keeps_the_pool_size():
+def test_merge_keeps_displaced_drawers_for_the_hybrid_reranker():
     drawers = _results([("a", "A", {}, 0.5), ("b", "B", {}, 0.6)])
     best = {"c": (0.1, parent_sha("C"))}
     merged, _ = merge_window_hits(
         drawers, best, {"c": ("C", {})}, to_drawer_scale=lambda d: d, limit=2
     )
-    assert merged["ids"] == [["c", "a"]]
+    assert merged["ids"] == [["c", "a", "b"]]
 
 
 def test_window_distances_are_converted_to_the_drawer_scale():
@@ -497,3 +498,306 @@ def test_windows_build_reports_what_it_embedded(window_palace, capsys):
     out = capsys.readouterr().out
     assert "Over the window:  2" in out
     assert _windows_of(palace_path, "long_1")
+
+
+def test_hybrid_retains_head_candidate_for_bm25(window_palace, monkeypatch):
+    import mempalace.searcher as searcher
+
+    palace, col = window_palace
+    head = "zebra quokka migration"
+    col.upsert(ids=["head"], documents=[head], metadatas=[{"room": "r"}])
+    # The four baseline candidates include an exact lexical match. Four closer
+    # tail windows can outrank them by vector distance before the lexical pass.
+    tail_ids = [f"tail{i}" for i in range(4)]
+    tails = [_long_text(f"zebra herd {i}") for i in range(4)]
+    col.upsert(ids=tail_ids, documents=tails, metadatas=[{"room": "r"}] * 4)
+    subwindows.build_windows(palace)
+    monkeypatch.setattr(
+        searcher,
+        "_query_drawers_with_filter_fallback",
+        lambda *a: _results(
+            [(f"other{i}", f"haystack {i}", {}, 0.6) for i in range(3)] + [("head", head, {}, 0.61)]
+        ),
+    )
+    monkeypatch.setattr(
+        subwindows,
+        "window_candidates",
+        lambda *_: (
+            {i: (0.5, parent_sha(doc)) for i, doc in zip(tail_ids, tails)},
+            {i: (doc, {}) for i, doc in zip(tail_ids, tails)},
+        ),
+    )
+    assert _search(palace, head)["results"][0]["drawer_id"] == "head"
+
+
+def test_sweep_indexes_the_message_it_wrote(window_palace, tmp_path):
+    import json
+
+    from mempalace.sweeper import sweep
+
+    palace, _ = window_palace
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "sessionId": "s",
+                "uuid": "message",
+                "message": {"role": "user", "content": _long_text("a tapir on the riverbank")},
+            }
+        )
+    )
+    assert sweep(str(transcript), palace)["drawers_added"] == 1
+    assert _window_rows(palace)
+
+
+def test_real_tokenizer_accepts_losslessly_decoded_source_bytes():
+    from tokenizers import Tokenizer, models
+
+    tokenizer = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    offsets = subwindows._offsets_fn(tokenizer)
+    assert offsets("a\udcffb") == [(0, 3)]
+
+
+def test_default_off_write_never_opens_window_storage(window_palace, monkeypatch):
+    import mempalace.palace as palace_mod
+
+    palace, _ = window_palace
+    monkeypatch.setenv("MEMPALACE_EMBEDDING_SUBWINDOWS", "0")
+    opened = []
+    monkeypatch.setattr(palace_mod, "get_windows_collection", lambda *a, **k: opened.append(1))
+    subwindows.index_after_write(palace, ["id"], ["text"], [{}])
+    palace_mod.drawers_removed(palace, aaak_ids=["id"])
+    assert not opened
+
+
+def test_backfill_refuses_window_name_already_used_by_drawers(window_palace, monkeypatch):
+    import mempalace.config as config
+    from mempalace.palace import WINDOWS_COLLECTION_NAME, get_collection
+
+    palace, _ = window_palace
+    monkeypatch.setattr(config, "get_configured_collection_name", lambda: WINDOWS_COLLECTION_NAME)
+    col = get_collection(palace)
+    col.upsert(ids=["real"], documents=[_long_text("tail")], metadatas=[{"room": "r"}])
+    with pytest.raises(subwindows.SubwindowsUnsupported):
+        subwindows.build_windows(palace)
+    assert col.get(include=[])["ids"] == ["real"]
+
+
+def test_control_keeps_mixed_head_queries_and_unaffected_drawers():
+    from tests.benchmarks import subwindow_data as data
+
+    mixed = data.build_corpus(n_tail=4, n_head=4, n_short=4)
+    control = data.head_control(mixed)
+    assert control.queries == [q for q in mixed.queries if q.position == "head"]
+    assert len(control.drawers) == len(mixed.drawers)
+    for a, b in zip(mixed.drawers, control.drawers):
+        if a.position == "tail":
+            assert a.fact not in b.text and a.drawer_id == b.drawer_id
+        else:
+            assert a == b
+
+
+def test_rebuild_accepts_old_identity_on_derived_collection_only(window_palace):
+    import mempalace.palace as palace_mod
+    from mempalace.backends.base import EmbedderIdentity
+
+    palace, _ = window_palace
+    subwindows.build_windows(palace)
+    windows = palace_mod.get_windows_collection(palace)
+    windows.set_embedder_identity(EmbedderIdentity("embeddinggemma", DIM))
+    palace_mod._VALIDATED_IDENTITY.clear()
+    assert subwindows.build_windows(palace)["long_drawers"] == 2
+
+
+def test_window_collection_cannot_be_searched_as_drawers(window_palace):
+    from mempalace.palace import WINDOWS_COLLECTION_NAME
+    from mempalace.searcher import search_memories
+
+    palace, _ = window_palace
+    subwindows.build_windows(palace)
+    assert (
+        search_memories("migration", palace, collection_name=WINDOWS_COLLECTION_NAME)["results"]
+        == []
+    )
+
+
+def test_server_embedder_search_keeps_using_text(window_palace, monkeypatch):
+    from mempalace import searcher
+
+    palace, col = window_palace
+    monkeypatch.setattr(col._inner._backend, "capabilities", frozenset({"server_embedder"}))
+    monkeypatch.setattr(searcher, "_open_search_collection", lambda *a, **k: (col, None))
+    observed = []
+    real = col.query
+
+    def query(**kwargs):
+        observed.append("query_texts" in kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(col, "query", query)
+    assert _search(palace)["results"] and observed == [True]
+
+
+def test_stress_corpus_has_all_requested_distinct_lexical_targets():
+    from tests.benchmarks.subwindow_data import _fact_slots
+
+    slots = _fact_slots(random.Random(390), 2000)
+    assert len({(s, a, o) for s, a, o, _ in slots}) == 2000
+
+
+def test_filtered_window_search_reaches_past_global_window_limit(window_palace, monkeypatch):
+    from mempalace.searcher import search_memories
+
+    palace, col = window_palace
+    col.update(ids=["long_1"], metadatas=[{"room": "target"}])
+    distractors = [f"d{i}" for i in range(5)]
+    col.upsert(
+        ids=distractors,
+        documents=[f"migration apples pears {i}" for i in range(5)],
+        metadatas=[{"room": "target"}] * 5,
+    )
+    col.upsert(
+        ids=["other-room"],
+        documents=[_long_text("zebra quokka migration " * 12, filler_words=16)],
+        metadatas=[{"room": "elsewhere"}],
+    )
+    subwindows.build_windows(palace)
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    assert (
+        search_memories("zebra quokka migration", palace, room="target", n_results=1)["results"][0][
+            "drawer_id"
+        ]
+        == "long_1"
+    )
+
+
+def test_window_cannot_promote_an_older_snapshot_of_the_parent():
+    old = _results([("p", "previous version", {}, 0.9)])
+    best = {"p": (0.1, parent_sha("new version"))}
+    merged, _ = merge_window_hits(
+        old, best, {"p": ("new version", {})}, to_drawer_scale=float, limit=1
+    )
+    assert merged["documents"] == [["new version"]]
+
+
+def test_source_delete_retry_purges_windows_after_drawer_delete(mcp_windows):
+    from mempalace.palace import get_collection
+
+    palace, server = mcp_windows
+    subwindows.build_windows(palace)
+    get_collection(palace).delete(ids=["long_1"])
+    assert server.tool_delete_by_source("/src/long_1.md", dry_run=False)["success"]
+    assert not _windows_of(palace, "long_1")
+
+
+def test_partial_refresh_keeps_best_current_window(window_palace):
+    from mempalace.palace import get_windows_collection
+
+    palace, col = window_palace
+    subwindows.build_windows(palace)
+    windows = get_windows_collection(palace)
+    # One stale vector is an exact query match, while other rows for the
+    # same parent already carry the current fingerprint.
+    windows.upsert(
+        ids=["obsolete"],
+        documents=[""],
+        embeddings=[_truncating_embedding("zebra")],
+        metadatas=[
+            {
+                "window_of": "long_1",
+                "parent_sha": "stale",
+                "window_profile": subwindows.active_profile()[2].key,
+            }
+        ],
+    )
+    best, _ = subwindows.window_candidates(
+        col, windows, [_truncating_embedding("zebra")], subwindows.active_profile()[2].key, {}, 10
+    )
+    assert best["long_1"][1] == parent_sha(col.get(ids=["long_1"])["documents"][0])
+
+
+def test_backfill_drops_source_pointer_removed_from_parent(window_palace):
+    palace, col = window_palace
+    subwindows.build_windows(palace)
+    col.update(ids=["long_1"], metadatas=[{"source_file": None}])
+    assert "source_file" not in col.get(ids=["long_1"])["metadatas"][0]
+    subwindows.build_windows(palace)
+    assert all(
+        "source_file" not in meta
+        for _, meta in _window_rows(palace).values()
+        if meta["window_of"] == "long_1"
+    )
+
+
+def test_scoped_window_pass_reads_ids_only_and_is_bounded(window_palace, monkeypatch):
+    """The filtered fallback pages parent ids, not text, and stops at its cap."""
+    from mempalace.searcher import search_memories
+
+    palace, col = window_palace
+    col.update(ids=["long_1"], metadatas=[{"room": "target"}])
+    col.upsert(
+        ids=[f"t{i}" for i in range(12)],
+        documents=[f"migration apples pears {i}" for i in range(12)],
+        metadatas=[{"room": "target"}] * 12,
+    )
+    col.upsert(
+        ids=["other-room"],
+        documents=[_long_text("zebra quokka migration " * 12, filler_words=16)],
+        metadatas=[{"room": "elsewhere"}],
+    )
+    subwindows.build_windows(palace)
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    monkeypatch.setattr(subwindows, "WINDOW_SCOPED_PAGE", 5)
+    reads = []
+    real_get = col.get
+
+    def spy(**kwargs):
+        reads.append(kwargs)
+        return real_get(**kwargs)
+
+    monkeypatch.setattr(col, "get", spy)
+    monkeypatch.setattr("mempalace.searcher._open_search_collection", lambda *a, **k: (col, None))
+
+    hits = search_memories("zebra quokka migration", palace, room="target", n_results=1)
+    assert hits["results"][0]["drawer_id"] == "long_1"
+    paged = [r for r in reads if "offset" in r]
+    assert paged and all(r["include"] == [] for r in paged)
+
+    # With the cap below the in-scope parent count, the pass stops early.
+    reads.clear()
+    monkeypatch.setattr(subwindows, "WINDOW_SCOPED_MAX_PARENTS", 5)
+    search_memories("zebra quokka migration", palace, room="target", n_results=1)
+    assert len([r for r in reads if "offset" in r]) == 1
+
+
+def test_scoped_window_pass_skips_a_stale_nearest_window(window_palace, monkeypatch):
+    from mempalace.palace import get_windows_collection
+
+    palace, col = window_palace
+    col.update(ids=["long_1"], metadatas=[{"room": "target"}])
+    col.upsert(
+        ids=["other-room"],
+        documents=[_long_text("zebra quokka migration " * 12, filler_words=16)],
+        metadatas=[{"room": "elsewhere"}],
+    )
+    subwindows.build_windows(palace)
+    key = subwindows.active_profile()[2].key
+    get_windows_collection(palace).upsert(
+        ids=["stale"],
+        documents=[""],
+        embeddings=[_truncating_embedding("zebra quokka migration")],
+        metadatas=[{"window_of": "long_1", "parent_sha": "stale", "window_profile": key}],
+    )
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    best, parents = subwindows.window_candidates(
+        col,
+        get_windows_collection(palace),
+        [_truncating_embedding("zebra quokka migration")],
+        key,
+        {"room": "target"},
+        5,
+    )
+    assert set(best) == {"long_1"} and set(parents) == {"long_1"}
+    assert best["long_1"][1] == parent_sha(col.get(ids=["long_1"])["documents"][0])
