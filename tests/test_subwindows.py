@@ -732,7 +732,11 @@ def test_backfill_drops_source_pointer_removed_from_parent(window_palace):
 
 
 def test_scoped_window_pass_reads_ids_only_and_is_bounded(window_palace, monkeypatch):
-    """The filtered fallback pages parent ids, not text, and stops at its cap."""
+    """The filtered fallback reads in-scope ids once, without text, bounded by its cap.
+
+    Neither offset paging nor ``get(ids=..., where=...)``: both re-scan the
+    filter and cost seconds to minutes on a 100k-drawer wing.
+    """
     from mempalace.searcher import search_memories
 
     palace, col = window_palace
@@ -762,14 +766,18 @@ def test_scoped_window_pass_reads_ids_only_and_is_bounded(window_palace, monkeyp
 
     hits = search_memories("zebra quokka migration", palace, room="target", n_results=1)
     assert hits["results"][0]["drawer_id"] == "long_1"
-    paged = [r for r in reads if "offset" in r]
-    assert paged and all(r["include"] == [] for r in paged)
+    assert not any("offset" in r for r in reads)
+    assert not any("ids" in r and "where" in r for r in reads)
+    scoped = [r for r in reads if "where" in r and "ids" not in r]
+    assert len(scoped) == 1 and scoped[0]["include"] == []
+    assert scoped[0]["limit"] == subwindows.WINDOW_SCOPED_MAX_PARENTS
 
     # With the cap below the in-scope parent count, the pass stops early.
     reads.clear()
     monkeypatch.setattr(subwindows, "WINDOW_SCOPED_MAX_PARENTS", 5)
     search_memories("zebra quokka migration", palace, room="target", n_results=1)
-    assert len([r for r in reads if "offset" in r]) == 1
+    scoped = [r for r in reads if "where" in r and "ids" not in r]
+    assert len(scoped) == 1 and scoped[0]["limit"] == 5
 
 
 def test_scoped_window_pass_skips_a_stale_nearest_window(window_palace, monkeypatch):
@@ -801,3 +809,31 @@ def test_scoped_window_pass_skips_a_stale_nearest_window(window_palace, monkeypa
     )
     assert set(best) == {"long_1"} and set(parents) == {"long_1"}
     assert best["long_1"][1] == parent_sha(col.get(ids=["long_1"])["documents"][0])
+
+
+@pytest.mark.parametrize(
+    "where,meta,expected",
+    [
+        ({"wing": {"$in": ["a", "wing_a"]}}, {"wing": "wing_a"}, True),
+        ({"wing": {"$in": ["a"]}}, {"wing": "b"}, False),
+        ({"wing": {"$in": ["a"]}}, {}, False),
+        ({"room": "r"}, {"room": "r"}, True),
+        ({"room": "r"}, {"room": "s"}, False),
+        ({"$and": [{"wing": {"$in": ["a"]}}, {"room": "r"}]}, {"wing": "a", "room": "r"}, True),
+        ({"$and": [{"wing": {"$in": ["a"]}}, {"room": "r"}]}, {"wing": "a", "room": "x"}, False),
+        ({"$or": [{"room": "r"}, {"room": "s"}]}, {"room": "s"}, True),
+        ({"room": {"$ne": "r"}}, {"room": "s"}, True),
+        ({"room": {"$nin": ["r"]}}, {"room": "r"}, False),
+        ({"room": {"$eq": "r"}}, {"room": "r"}, True),
+    ],
+)
+def test_where_matches_scope_filters(where, meta, expected):
+    assert subwindows._where_matches(meta, where) is expected
+
+
+def test_parents_under_falls_back_to_chroma_for_unknown_operators(window_palace):
+    palace, col = window_palace
+    col.upsert(ids=["n1", "n2"], documents=["one", "two"], metadatas=[{"n": 1}, {"n": 5}])
+    assert subwindows._where_matches({"n": 1}, {"n": {"$gt": 2}}) is subwindows._UNSUPPORTED
+    got = subwindows._parents_under(col, ["n1", "n2"], {"n": {"$gt": 2}})
+    assert list(got) == ["n2"]

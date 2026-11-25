@@ -57,7 +57,7 @@ WINDOW_MAX_FETCH = 1000
 # When a filtered search's global window pass finds too few in-scope parents,
 # the scoped pass asks the windows of the in-scope parents directly, this many
 # parent ids per query, over at most WINDOW_SCOPED_MAX_PARENTS parents.
-WINDOW_SCOPED_PAGE = 500
+WINDOW_SCOPED_PAGE = 2000
 WINDOW_SCOPED_MAX_PARENTS = 20_000
 WINDOW_SCOPED_FETCH = 500
 # Drawers read / windows written per batch.
@@ -535,18 +535,65 @@ def fold_windows(window_results: dict, profile_key: str, parents: dict) -> dict:
     return best
 
 
+_UNSUPPORTED = object()
+
+
+def _where_matches(meta: dict, where: dict):
+    """Evaluate a Chroma metadata ``where`` on ``meta``; ``_UNSUPPORTED`` if unknown.
+
+    Covers what search scopes build (bare equality, ``$eq``/``$ne``/``$in``/
+    ``$nin``, ``$and``/``$or``). Chroma applies a ``where`` next to ``ids`` by
+    scanning the filter first, which is seconds on a large wing, so the
+    window path fetches by id and checks the scope here.
+    """
+    results = []
+    for key, cond in where.items():
+        if key in ("$and", "$or"):
+            parts = [_where_matches(meta, clause) for clause in cond]
+            if _UNSUPPORTED in parts:
+                return _UNSUPPORTED
+            results.append(all(parts) if key == "$and" else any(parts))
+            continue
+        if key.startswith("$"):
+            return _UNSUPPORTED
+        value = meta.get(key)
+        if not isinstance(cond, dict):
+            results.append(key in meta and value == cond)
+            continue
+        if len(cond) != 1:
+            return _UNSUPPORTED
+        op, arg = next(iter(cond.items()))
+        if op == "$eq":
+            results.append(key in meta and value == arg)
+        elif op == "$ne":
+            results.append(value != arg)
+        elif op == "$in":
+            results.append(key in meta and value in arg)
+        elif op == "$nin":
+            results.append(value not in arg)
+        else:
+            return _UNSUPPORTED
+    return all(results)
+
+
 def _parents_under(drawers, ids, where) -> dict:
     """``{id: (document, metadata)}`` of the drawers ``ids`` that pass ``where``."""
     parents: dict = {}
     ids = list(dict.fromkeys(ids))
     for start in range(0, len(ids), BATCH_SIZE):
-        kwargs = {"ids": ids[start : start + BATCH_SIZE], "include": ["documents", "metadatas"]}
+        batch = ids[start : start + BATCH_SIZE]
+        got = drawers.get(ids=batch, include=["documents", "metadatas"])
+        rows = list(
+            zip(got.get("ids") or [], got.get("documents") or [], got.get("metadatas") or [])
+        )
         if where:
-            kwargs["where"] = where
-        got = drawers.get(**kwargs)
-        for row_id, doc, meta in zip(
-            got.get("ids") or [], got.get("documents") or [], got.get("metadatas") or []
-        ):
+            checks = [_where_matches(meta or {}, where) for _, _, meta in rows]
+            if _UNSUPPORTED in checks:
+                kept = set(drawers.get(ids=batch, where=where, include=[]).get("ids") or [])
+                rows = [row for row in rows if row[0] in kept]
+            else:
+                rows = [row for row, ok in zip(rows, checks) if ok]
+        for row_id, doc, meta in rows:
             if isinstance(doc, str):
                 parents[row_id] = (doc, meta or {})
     return parents
@@ -557,10 +604,14 @@ def _window_parent_ids(window_results: dict) -> list:
     return list(dict.fromkeys(m["window_of"] for m in metas if m and m.get("window_of")))
 
 
-def _page_ids(collection, where):
-    """Ids of the drawers matching ``where``, a page at a time, without their text."""
-    for page in _page_rows(collection, where=where, include=(), page_size=WINDOW_SCOPED_PAGE):
-        yield [row_id for row_id, _, _ in page]
+def _scoped_ids(collection, where) -> list:
+    """Ids of up to :data:`WINDOW_SCOPED_MAX_PARENTS` drawers under ``where``.
+
+    One limit-bounded read without text: offset paging re-scans the filter
+    for every page, which is minutes on a 100k-drawer wing.
+    """
+    got = collection.get(where=where, include=[], limit=WINDOW_SCOPED_MAX_PARENTS)
+    return list(got.get("ids") or [])
 
 
 def window_candidates(drawers, windows, vectors, profile_key, where, pool_size):
@@ -574,7 +625,7 @@ def window_candidates(drawers, windows, vectors, profile_key, where, pool_size):
     One windows query of the active profile is enough unless ``where`` scopes
     the search and the nearest windows mostly belong to out-of-scope parents.
     Then a scoped pass asks the windows of the in-scope parents directly (ids
-    only, a page at a time, up to :data:`WINDOW_SCOPED_MAX_PARENTS`) and
+    only, in one bounded read, up to :data:`WINDOW_SCOPED_MAX_PARENTS`) and
     reads the text of just the strongest candidates.
     """
     fetch = min(
@@ -605,18 +656,17 @@ def window_candidates(drawers, windows, vectors, profile_key, where, pool_size):
     # nearest few (several, so a stale nearest window cannot hide a current one).
     per_page = min(WINDOW_SCOPED_FETCH, pool_size * WINDOW_OVERFETCH)
     rows: dict = {}
-    scanned = 0
-    for page in _page_ids(drawers, where):
+    in_scope = _scoped_ids(drawers, where)
+    if len(in_scope) >= WINDOW_SCOPED_MAX_PARENTS:
+        logger.debug("Scoped window pass limited to %d parents", len(in_scope))
+    for start in range(0, len(in_scope), WINDOW_SCOPED_PAGE):
+        page = in_scope[start : start + WINDOW_SCOPED_PAGE]
         scoped = query({"$and": [profile_filter, {"window_of": {"$in": page}}]}, per_page)
         metas = (scoped.get("metadatas") or [[]])[0] or []
         dists = (scoped.get("distances") or [[]])[0] or []
         for meta, dist in zip(metas, dists):
             if meta and meta.get("window_of") and dist is not None:
                 rows.setdefault(meta["window_of"], []).append((dist, meta))
-        scanned += len(page)
-        if scanned >= WINDOW_SCOPED_MAX_PARENTS:
-            logger.debug("Scoped window pass stopped after %d parents", scanned)
-            break
     if not rows:
         return best, parents
     ranked = sorted(rows, key=lambda parent: min(d for d, _ in rows[parent]))
