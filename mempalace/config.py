@@ -1515,6 +1515,81 @@ class MempalaceConfig:
             parsed = 2
         return max(1, parsed)
 
+    # Where a mine's hallway recompute runs when nothing chose it explicitly.
+    #   auto   - interactive mines (CLI, MCP) recompute inline; background
+    #            mines (hooks through the daemon) defer it.
+    #   always - every mine defers unless told ``--inline-hallways``.
+    #   never  - every mine recomputes inline, as before deferral existed.
+    HALLWAYS_DEFER_MODES = ("auto", "always", "never")
+    # (settle_seconds, max_wait_seconds) of the coalesced deferred recompute.
+    HALLWAYS_REFRESH_DEFAULTS = (600.0, 3600.0)
+
+    def _hallways_section(self) -> dict:
+        section = self._file_config.get("hallways", {})
+        return section if isinstance(section, dict) else {}
+
+    @property
+    def hallways_defer(self) -> str:
+        """``auto`` / ``always`` / ``never``: see :attr:`HALLWAYS_DEFER_MODES`.
+
+        Env ``MEMPALACE_HALLWAYS_DEFER`` > config ``hallways.defer`` > ``auto``.
+        A boolean reads as ``always`` / ``never``; anything unrecognised is
+        ``auto``, so a typo never silently drops a recompute.
+        """
+        raw = os.environ.get("MEMPALACE_HALLWAYS_DEFER")
+        if raw is None:
+            raw = self._hallways_section().get("defer")
+        if isinstance(raw, bool):
+            return "always" if raw else "never"
+        text = str(raw or "").strip().lower()
+        if text in self.HALLWAYS_DEFER_MODES:
+            return text
+        parsed = parse_bool(text) if text else None
+        if parsed is not None:
+            return "always" if parsed else "never"
+        return "auto"
+
+    def hallways_mode(self, explicit=None, *, background: bool = False) -> str:
+        """``inline`` or ``defer`` for one mine.
+
+        ``explicit`` (a CLI flag or a job payload's ``hallways``) wins when it
+        is ``inline`` or ``defer``. Otherwise :attr:`hallways_defer` decides,
+        with ``auto`` deferring only ``background`` mines.
+        """
+        if explicit in ("inline", "defer"):
+            return explicit
+        mode = self.hallways_defer
+        if mode == "always" or (mode == "auto" and background):
+            return "defer"
+        return "inline"
+
+    @property
+    def hallways_refresh_debounce(self) -> tuple[float, float]:
+        """``(settle_seconds, max_wait_seconds)`` of a deferred recompute.
+
+        A burst of mines into one wing collapses into one recompute that runs
+        ``settle`` after the last of them, but never later than ``max_wait``
+        after the first. Env ``MEMPALACE_HALLWAYS_SETTLE_SECONDS`` /
+        ``MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS`` > config
+        ``hallways.settle_seconds`` / ``max_wait_seconds`` > 600 / 3600. A
+        malformed or negative value falls back to the default.
+        """
+        section = self._hallways_section()
+
+        def _resolve(env: str, key: str, default: float) -> float:
+            val = env_float(env)
+            if val is None:
+                val = parse_number(section.get(key))
+            if val is None or val < 0:
+                return default
+            return float(val)
+
+        settle_default, max_default = self.HALLWAYS_REFRESH_DEFAULTS
+        return (
+            _resolve("MEMPALACE_HALLWAYS_SETTLE_SECONDS", "settle_seconds", settle_default),
+            _resolve("MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS", "max_wait_seconds", max_default),
+        )
+
     @property
     def post_mine_integrity_check(self) -> str:
         """``"scoped"`` (default) or ``"full"``: what a writing mine checks at its end.

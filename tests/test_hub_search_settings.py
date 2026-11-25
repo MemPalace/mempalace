@@ -55,6 +55,11 @@ _NOT_SEARCH_SETTINGS = {
     "MEMPALACE_WRITE_ROUTING",
     "MEMPALACE_HOOKS_AUTO_SAVE",
     "MEMPALACE_HOOKS_DAEMON",
+    # When a mine's hallway recompute runs (inline or deferred, and how long
+    # the deferral settles): hallway records only, never drawers or ranking.
+    "MEMPALACE_HALLWAYS_DEFER",
+    "MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS",
+    "MEMPALACE_HALLWAYS_SETTLE_SECONDS",
     # Pick the palace or the config file; the hub is looked up per palace and
     # the fingerprint hashes the values that file resolves to.
     "MEMPALACE_CONFIG_DIR",

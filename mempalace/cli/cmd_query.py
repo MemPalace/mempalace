@@ -114,6 +114,9 @@ def cmd_hallways(args):
         else MempalaceConfig().palace_path
     )
     config = MempalaceConfig(palace_path=palace_path)
+    if getattr(args, "dirty", False):
+        _cmd_hallways_dirty(args, palace_path, config)
+        return
     if getattr(args, "rebuild", False):
         from ..hallways import compute_hallways_for_wing
         from ..palace import get_collection
@@ -173,6 +176,40 @@ def cmd_hallways(args):
     for h in rows[: max(0, args.limit)]:
         label = h.get("label") or f"{h.get('entity_a', '?')} <-> {h.get('entity_b', '?')}"
         print(f"    {label}")
+
+
+def _cmd_hallways_dirty(args, palace_path, config):
+    """List the wings awaiting a deferred hallway recompute, or run it (--rebuild)."""
+    import time
+
+    from ..hallway_refresh import run_refresh
+    from ..hallways import dirty_wings
+
+    marks = dirty_wings(config)
+    wing_filter = getattr(args, "wing", None)
+    if wing_filter:
+        marks = [m for m in marks if m["wing"] == wing_filter]
+    if not marks:
+        print("  No wing is waiting for a hallway recompute.")
+        return
+    if not getattr(args, "rebuild", False):
+        now = time.time()
+        print(f"  {len(marks)} wing(s) waiting for a hallway recompute:")
+        for m in marks:
+            age = max(0, int(now - m["first_marked_at"])) // 60
+            print(f"    {m['wing']:<36} marked {age} min ago")
+        print("  Run `mempalace hallways --rebuild --dirty` to recompute them now.")
+        return
+    failed = 0
+    for m in marks:
+        result = run_refresh({"palace_path": palace_path, "wing": m["wing"]})
+        if result.get("success"):
+            print(f"  {m['wing']:<36} {result.get('hallways', 0):>7} hallways")
+        else:
+            failed += 1
+            print(f"  {m['wing']:<36} failed: {result.get('error')}", file=sys.stderr)
+    if failed:
+        sys.exit(1)
 
 
 def cmd_export(args):

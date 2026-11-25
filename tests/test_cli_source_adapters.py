@@ -66,6 +66,9 @@ class _FakeConfig:
     def __init__(self, palace_path=None):
         self.palace_path = palace_path or "/fake/palace"
 
+    def hallways_mode(self, explicit=None, *, background=False):
+        return explicit or "inline"
+
 
 class _DirectMutationAdapter(BaseSourceAdapter):
     name = "direct-mutation"
@@ -539,6 +542,7 @@ def test_cmd_mine_without_mode_preserves_projects_legacy_path(monkeypatch):
         respect_gitignore=True,
         include_ignored=[],
         max_chunks_per_file=None,
+        hallways="inline",
     )
 
 

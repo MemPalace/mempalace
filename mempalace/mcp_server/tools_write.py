@@ -869,6 +869,9 @@ def tool_mine(
     A mine that ran but could not file some files returns ``success: False``
     with ``error_class: "MineFileErrors"``, ``files_failed``, up to 20
     ``failed_files`` and the same ``output``.
+    Hallways are recomputed before the tool returns, as with ``mempalace mine``:
+    an MCP mine is interactive, and its caller usually wants to query the graph
+    next. Config ``hallways.defer: always`` defers them like a background mine.
     The palace write lock is held by the miners themselves, so a concurrent mine
     surfaces as a structured already-running error. Orphan cleanup is not part of
     mining — use ``mempalace_sync`` for that.

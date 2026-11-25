@@ -38,6 +38,9 @@ def cmd_mine(args):
         # The daemon names the palace in every job, so it cannot tell on its
         # own whether --palace was given; the graph path depends on that.
         "explicit_palace": bool(args.palace),
+        # Resolved here, as an interactive mine: a daemon that runs this job
+        # would otherwise treat it as background work and defer the hallways.
+        "hallways": MempalaceConfig().hallways_mode(getattr(args, "hallways", None)),
     }
     if source_adapter:
         payload["source_adapter"] = source_adapter
@@ -147,6 +150,7 @@ def cmd_mine(args):
                 dry_run=args.dry_run,
                 extract_mode=args.extract,
                 include_subagents=getattr(args, "include_subagents", False),
+                hallways=payload["hallways"],
             )
         elif mode == "extract":
             from ..format_miner import mine_formats
@@ -172,6 +176,7 @@ def cmd_mine(args):
                 respect_gitignore=not args.no_gitignore,
                 include_ignored=include_ignored,
                 max_chunks_per_file=getattr(args, "max_chunks_per_file", None),
+                hallways=payload["hallways"],
             )
     except MineAlreadyRunning as exc:
         # A live MCP server or another mine is already writing to this

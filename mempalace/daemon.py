@@ -133,6 +133,7 @@ class DaemonRuntime:
 
     def start_worker(self) -> threading.Thread:
         self.store.recover_running()
+        self._queue_dirty_hallways()
         # Bounded growth: drop terminal jobs older than the retention window
         # before bringing the worker up. Best-effort — a prune failure must not
         # block startup.
@@ -182,6 +183,25 @@ class DaemonRuntime:
             job_id: until for job_id, until in self._deferred_until.items() if until > now
         }
         return set(self._deferred_until)
+
+    def _queue_dirty_hallways(self, wing: str | None = None) -> None:
+        """Queue the deferred hallway recompute of every dirty wing (or ``wing``).
+
+        At start this picks up marks a crash or a daemon-less mine left; after a
+        ``hallways`` job it re-queues a mark the job did not clear (it failed,
+        was killed, or a mine marked the wing again), so a long-running daemon
+        never leaves a wing stale until the next mine. Best-effort: the mark is
+        durable either way.
+        """
+        try:
+            from .hallway_refresh import enqueue_dirty_wings, schedule
+
+            if wing is None:
+                enqueue_dirty_wings(self.palace_path, store=self.store)
+            else:
+                schedule(wing, self.palace_path, store=self.store)
+        except Exception:  # noqa: BLE001 - scheduling must never stop the daemon
+            pass
 
     def _worker_loop(self) -> None:
         from .service import execute_job
@@ -249,6 +269,8 @@ class DaemonRuntime:
                 )
             finally:
                 self.active_job_id = None
+            if job.kind == "hallways" and isinstance(job.payload.get("wing"), str):
+                self._queue_dirty_hallways(job.payload["wing"])
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:

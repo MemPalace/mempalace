@@ -196,7 +196,8 @@ def _mine_args_forwardable(args, include_ignored) -> bool:
     """Only forward mines the ``mempalace_mine`` MCP tool can express.
 
     Flags the tool has no parameters for (kg-extract, disabling gitignore,
-    chunking overrides, origin redetection, explicit backend) keep the
+    chunking overrides, origin redetection, explicit backend, hallway
+    timing) keep the
     direct path — where a held writer lease still surfaces as the existing
     MineAlreadyRunning error rather than being silently dropped.
     """
@@ -209,6 +210,10 @@ def _mine_args_forwardable(args, include_ignored) -> bool:
     if getattr(args, "max_chunks_per_file", None) is not None:
         return False
     if _backend_arg(args):
+        return False
+    # The tool recomputes hallways the way the hub's config says; an explicit
+    # --defer-hallways / --inline-hallways is honoured on the direct path.
+    if getattr(args, "hallways", None) is not None:
         return False
     return True
 

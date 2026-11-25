@@ -2100,6 +2100,7 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    hallways: Optional[str] = None,
 ):
     """Mine a project directory into the palace.
 
@@ -2113,6 +2114,11 @@ def mine(
     :func:`_resolve_max_chunks_per_file`). ``None`` defers to
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
+
+    ``hallways`` ``"inline"`` recomputes the wing's hallways and entity
+    tunnels before returning; ``"defer"`` marks the wing and queues one
+    coalesced recompute of both (:mod:`mempalace.hallway_refresh`); ``None``
+    lets config ``hallways.defer`` decide (default: inline).
     """
     try:
         if dry_run:
@@ -2127,6 +2133,7 @@ def mine(
                 include_ignored=include_ignored,
                 files=files,
                 max_chunks_per_file=max_chunks_per_file,
+                hallways=hallways,
             )
 
         # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -2144,6 +2151,7 @@ def mine(
                 include_ignored=include_ignored,
                 files=files,
                 max_chunks_per_file=max_chunks_per_file,
+                hallways=hallways,
             )
     finally:
         _cleanup_mine_pid_file()
@@ -2184,6 +2192,7 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    hallways: Optional[str] = None,
 ):
     from .config import MempalaceConfig
 
@@ -2329,38 +2338,15 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
-            # Within-wing hallways: link entities (people, projects, concepts)
-            # that co-occur in drawers across this wing's rooms. Mirrors the
-            # tunnel-compute fault-tolerance pattern — hallway computation
-            # must never fail a mine; it's a derived analytic, not load-bearing
-            # for the drawer write that already committed above.
-            try:
-                hallways_created = compute_hallways_for_wing(
-                    wing, col=collection, config=graph_config
-                )
-                if hallways_created:
-                    print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: hallway computation skipped — {e}",
-                    file=sys.stderr,
-                )
+            from .hallway_refresh import defer_if_configured
 
-            # Cross-wing entity tunnels: derived from the hallway records
-            # materialized just above. When an entity appears in hallways of
-            # this wing AND another wing, a tunnel bridges them. Runs in
-            # parallel with topic tunnels — both kinds coexist via
-            # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
-            # pattern: never fail a mine over a derived analytic.
-            try:
-                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing, config=graph_config)
-                if entity_tunnels_added:
-                    print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: entity tunnel computation skipped — {e}",
-                    file=sys.stderr,
-                )
+            # A deferred mine marks the wing and queues one coalesced
+            # recompute of its hallways and the entity tunnels derived from
+            # them; otherwise both run here, as below.
+            if not defer_if_configured(
+                wing, palace_path, config=graph_config, mode=hallways, entity_tunnels=True
+            ):
+                _hallways_and_entity_tunnels_inline(wing, collection, graph_config)
 
             _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
@@ -2596,6 +2582,42 @@ def _compute_topic_tunnels_for_wing(wing: str, config=None) -> int:
     min_count = cfg.topic_tunnel_min_count
     created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count, config=cfg)
     return len(created)
+
+
+def _hallways_and_entity_tunnels_inline(wing: str, collection, graph_config) -> None:
+    """A project mine's inline hallway recompute, then the entity tunnels.
+
+    Within-wing hallways link entities (people, projects, concepts) that
+    co-occur in drawers across this wing's rooms. Mirrors the tunnel-compute
+    fault-tolerance pattern — hallway computation must never fail a mine;
+    it's a derived analytic, not load-bearing for the drawer write that
+    already committed.
+    """
+    try:
+        hallways_created = compute_hallways_for_wing(wing, col=collection, config=graph_config)
+        if hallways_created:
+            print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
+    except Exception as e:
+        print(
+            f"\n  WARNING: hallway computation skipped — {e}",
+            file=sys.stderr,
+        )
+
+    # Cross-wing entity tunnels: derived from the hallway records
+    # materialized just above. When an entity appears in hallways of
+    # this wing AND another wing, a tunnel bridges them. Runs in
+    # parallel with topic tunnels — both kinds coexist via
+    # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
+    # pattern: never fail a mine over a derived analytic.
+    try:
+        entity_tunnels_added = _compute_entity_tunnels_for_wing(wing, config=graph_config)
+        if entity_tunnels_added:
+            print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
+    except Exception as e:
+        print(
+            f"\n  WARNING: entity tunnel computation skipped — {e}",
+            file=sys.stderr,
+        )
 
 
 def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
