@@ -125,32 +125,17 @@ def _cli_ranked_hits(
     folded copies or skipped rows leave it short.
     """
     try:
-        kwargs = {
-            "query_texts": [query],
-            # The window is a post-filter (ChromaDB can't range-compare
-            # string metadata), and copies folded below free their slots,
-            # so fetch a pool and trim back after both.
-            "n_results": fetch,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        query_vectors = _subwindow_query_vectors(query) if palace_path else None
-        if query_vectors is not None:
-            kwargs.pop("query_texts")
-            kwargs["query_embeddings"] = query_vectors
-        if where:
-            kwargs["where"] = where
-        results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
-        if palace_path:
-            results = _fold_subwindow_hits(
-                col,
-                results,
-                palace_path=palace_path,
-                query=query,
-                where=where,
-                pool_size=fetch,
-                metric=metric,
-                query_vectors=query_vectors,
-            )
+        results = _drawer_candidates(
+            col,
+            query,
+            palace_path=palace_path,
+            where=where,
+            pool_size=fetch,
+            metric=metric,
+            n_results=n_results,
+            wing=wing,
+            room=room,
+        )
     except Exception as e:
         if _model_error_class(e) is not None:
             # The configured embedding function could not be built (C): the

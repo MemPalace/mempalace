@@ -295,6 +295,7 @@ def drawers_removed(
     revision_source=None,
     aaak_col=None,
     windows_col=None,
+    windows_source=None,
     reraise=(),
 ) -> dict:
     """Purge what was derived from drawers just deleted or rewritten.
@@ -328,18 +329,22 @@ def drawers_removed(
             raise
         except Exception:
             logger.warning("AAAK purge failed for %s", aaak_source or "drawers", exc_info=True)
+    windows_source = windows_source or aaak_source
+    if aaak_ids or windows_source:
         try:
-            if windows_col is None and palace_path:
+            from ..subwindows import windows_may_exist
+
+            if windows_col is None and windows_may_exist(palace_path):
                 windows_col = open_windows_collection(palace_path)
             if windows_col is not None:
                 from ..subwindows import delete_windows
 
-                delete_windows(windows_col, aaak_ids, aaak_source)
+                delete_windows(windows_col, aaak_ids, windows_source)
         except reraise:
             raise
         except Exception:
             logger.warning(
-                "Sub-window purge failed for %s", aaak_source or "drawers", exc_info=True
+                "Sub-window purge failed for %s", windows_source or "drawers", exc_info=True
             )
     if revision_ids is None and revision_source is None:
         return result

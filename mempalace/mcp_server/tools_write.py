@@ -1167,7 +1167,9 @@ def tool_delete_by_source(source_file: str, dry_run: bool = True):
         # Idempotent: deleting an absent source is a no-op, not an error. Its
         # journaled earlier text can outlive its drawers (deleting one drawer
         # keeps the re-mine history of its slot), so it still goes here.
-        purged = drawers_removed(_config.palace_path, revision_source=source_file)
+        purged = drawers_removed(
+            _config.palace_path, revision_source=source_file, windows_source=source_file
+        )
         return {
             "success": True,
             "dry_run": False,

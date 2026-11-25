@@ -32,12 +32,17 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
 # ``kind`` stamped on every window row (rows of the windows collection only).
 WINDOW_KIND = "drawer_window"
+# A file in the palace directory, written when the windows collection is first
+# created or opened for writing. With the flag off, a palace without it skips
+# every windows lookup, so default-off writes and deletes cost nothing extra.
+WINDOWS_MARKER = ".mempalace-drawer-windows"
 # Tokens shared by neighbouring windows, so a fact cut by a window edge is
 # still whole in one window.
 WINDOW_OVERLAP_TOKENS = 64
@@ -49,6 +54,12 @@ WINDOW_OVERFETCH = 3
 # filter, so it fetches this many times wider, up to WINDOW_MAX_FETCH.
 WINDOW_FILTERED_WIDEN = 4
 WINDOW_MAX_FETCH = 1000
+# When a filtered search's global window pass finds too few in-scope parents,
+# the scoped pass asks the windows of the in-scope parents directly, this many
+# parent ids per query, over at most WINDOW_SCOPED_MAX_PARENTS parents.
+WINDOW_SCOPED_PAGE = 500
+WINDOW_SCOPED_MAX_PARENTS = 20_000
+WINDOW_SCOPED_FETCH = 500
 # Drawers read / windows written per batch.
 BATCH_SIZE = 500
 
@@ -90,8 +101,11 @@ def _untruncated(tokenizer):
 
 
 def _offsets_fn(tokenizer) -> Callable[[str], list]:
+    from .config import strip_lone_surrogates
+
     def offsets(text: str) -> list:
-        return list(tokenizer.encode(text, add_special_tokens=False).offsets)
+        # One replacement character per undecodable byte preserves parent offsets.
+        return list(tokenizer.encode(strip_lone_surrogates(text), add_special_tokens=False).offsets)
 
     return offsets
 
@@ -279,9 +293,14 @@ class WindowIndex:
                 continue
             keep = {window_id(drawer_id, i) for i in range(1, len(spans) + 1)}
             to_delete.extend(row_id for row_id, _ in stored if row_id not in keep)
+            previous = dict(stored)
             for (row_id, meta), (start, end) in zip(
                 window_rows(drawer_id, document, metadata, spans, self.profile), spans
             ):
+                if getattr(self.collection, "upsert_merges_metadata", False):
+                    for key in _COPIED_KEYS:
+                        if key in previous.get(row_id, {}) and key not in meta:
+                            meta[key] = None
                 to_write.append((row_id, document[start:end], meta))
         for start in range(0, len(to_write), BATCH_SIZE):
             batch = to_write[start : start + BATCH_SIZE]
@@ -358,6 +377,24 @@ class WindowPurger:
         return {"parents": 0, "embedded": 0, "skipped": 0, "removed": 0}
 
 
+def windows_may_exist(palace_path) -> bool:
+    """Whether the palace may hold window rows worth opening or purging.
+
+    True when ``embedding_subwindows`` is on (the windows collection is then
+    opened and, if it exists, its marker is restored) or when the palace's
+    :data:`WINDOWS_MARKER` says a windows collection was created. False keeps
+    a default-off palace that never had windows off the windows storage.
+    """
+    if not palace_path:
+        return False
+    if subwindows_enabled():
+        return True
+    try:
+        return (Path(palace_path) / WINDOWS_MARKER).is_file()
+    except OSError:
+        return False
+
+
 def open_window_index(palace_path: str, *, create: bool = True):
     """The palace's :class:`WindowIndex` when sub-windows are on.
 
@@ -370,6 +407,8 @@ def open_window_index(palace_path: str, *, create: bool = True):
         try:
             from .palace import open_windows_collection
 
+            if not windows_may_exist(palace_path):
+                return None
             col = open_windows_collection(palace_path)
         except Exception:
             return None
@@ -428,6 +467,29 @@ def index_after_write(palace_path: str, ids, documents, metadatas) -> None:
         )
 
 
+def _collection_palace_path(collection) -> Optional[str]:
+    """The palace directory a (possibly wrapped) drawer collection lives in."""
+    seen = 0
+    while collection is not None and seen < 4:
+        for attr in ("palace_path", "_palace_path"):
+            value = getattr(collection, attr, None)
+            if isinstance(value, str) and value:
+                return value
+        collection = getattr(collection, "_inner", None)
+        seen += 1
+    return None
+
+
+def index_collection_write(collection, ids, documents, metadatas) -> None:
+    """:func:`index_after_write` for a writer that holds only the drawer collection.
+
+    Used by the single-drawer helpers external integrations call
+    (``file_conversation_exchange``, ``miner.add_drawer``). A collection
+    whose palace directory is unknown is skipped; ``windows build`` covers it.
+    """
+    index_after_write(_collection_palace_path(collection), ids, documents, metadatas)
+
+
 def delete_windows(windows_col, parent_ids=(), source_file: Optional[str] = None) -> int:
     """Delete the windows of ``parent_ids`` and/or every window of ``source_file``."""
     ids: set = set()
@@ -447,7 +509,7 @@ def delete_windows(windows_col, parent_ids=(), source_file: Optional[str] = None
 # ── query time ───────────────────────────────────────────────────────────
 
 
-def fold_windows(window_results: dict, profile_key: str) -> dict:
+def fold_windows(window_results: dict, profile_key: str, parents: dict) -> dict:
     """Best window per parent: ``{parent_id: (distance, parent_sha)}``.
 
     Rows of another profile are skipped. ``window_results`` is a one-query
@@ -455,15 +517,119 @@ def fold_windows(window_results: dict, profile_key: str) -> dict:
     """
     metas = (window_results.get("metadatas") or [[]])[0] or []
     dists = (window_results.get("distances") or [[]])[0] or []
+    current = {i: parent_sha(doc) for i, (doc, _) in parents.items()}
     best: dict = {}
     for meta, dist in zip(metas, dists):
         meta = meta or {}
         parent = meta.get("window_of")
         if not parent or dist is None or meta.get("window_profile") != profile_key:
             continue
+        if parent not in current or meta.get("parent_sha") != current[parent]:
+            continue
         if parent not in best or dist < best[parent][0]:
             best[parent] = (dist, meta.get("parent_sha"))
     return best
+
+
+def _parents_under(drawers, ids, where) -> dict:
+    """``{id: (document, metadata)}`` of the drawers ``ids`` that pass ``where``."""
+    parents: dict = {}
+    ids = list(dict.fromkeys(ids))
+    for start in range(0, len(ids), BATCH_SIZE):
+        kwargs = {"ids": ids[start : start + BATCH_SIZE], "include": ["documents", "metadatas"]}
+        if where:
+            kwargs["where"] = where
+        got = drawers.get(**kwargs)
+        for row_id, doc, meta in zip(
+            got.get("ids") or [], got.get("documents") or [], got.get("metadatas") or []
+        ):
+            if isinstance(doc, str):
+                parents[row_id] = (doc, meta or {})
+    return parents
+
+
+def _window_parent_ids(window_results: dict) -> list:
+    metas = (window_results.get("metadatas") or [[]])[0] or []
+    return list(dict.fromkeys(m["window_of"] for m in metas if m and m.get("window_of")))
+
+
+def _page_ids(collection, where):
+    """Ids of the drawers matching ``where``, a page at a time, without their text."""
+    for page in _page_rows(collection, where=where, include=(), page_size=WINDOW_SCOPED_PAGE):
+        yield [row_id for row_id, _, _ in page]
+
+
+def window_candidates(drawers, windows, vectors, profile_key, where, pool_size):
+    """Best current window per parent, and the parents it was checked against.
+
+    Returns ``(best, parents)``: ``best`` as :func:`fold_windows` builds it,
+    ``parents`` the ``(document, metadata)`` of each parent, read from the
+    drawers collection under ``where``. Only windows whose ``parent_sha``
+    matches that current text count, so a stale or orphaned window is ignored.
+
+    One windows query of the active profile is enough unless ``where`` scopes
+    the search and the nearest windows mostly belong to out-of-scope parents.
+    Then a scoped pass asks the windows of the in-scope parents directly (ids
+    only, a page at a time, up to :data:`WINDOW_SCOPED_MAX_PARENTS`) and
+    reads the text of just the strongest candidates.
+    """
+    fetch = min(
+        WINDOW_MAX_FETCH, pool_size * WINDOW_OVERFETCH * (WINDOW_FILTERED_WIDEN if where else 1)
+    )
+    profile_filter = {"window_profile": profile_key}
+
+    def query(window_filter, n_results):
+        return windows.query(
+            query_embeddings=vectors,
+            where=window_filter,
+            n_results=n_results,
+            include=["metadatas", "distances"],
+        )
+
+    raw = query(profile_filter, fetch)
+    hit_ids = _window_parent_ids(raw)
+    if not hit_ids:
+        return {}, {}
+    parents = _parents_under(drawers, hit_ids, where)
+    best = fold_windows(raw, profile_key, parents)
+    saturated = len((raw.get("ids") or [[]])[0] or []) >= fetch
+    if not where or len(best) >= pool_size or not saturated:
+        return best, parents
+
+    # The globally nearest windows can all belong to out-of-scope parents.
+    # Ask the in-scope parents' windows directly and keep each parent's
+    # nearest few (several, so a stale nearest window cannot hide a current one).
+    per_page = min(WINDOW_SCOPED_FETCH, pool_size * WINDOW_OVERFETCH)
+    rows: dict = {}
+    scanned = 0
+    for page in _page_ids(drawers, where):
+        scoped = query({"$and": [profile_filter, {"window_of": {"$in": page}}]}, per_page)
+        metas = (scoped.get("metadatas") or [[]])[0] or []
+        dists = (scoped.get("distances") or [[]])[0] or []
+        for meta, dist in zip(metas, dists):
+            if meta and meta.get("window_of") and dist is not None:
+                rows.setdefault(meta["window_of"], []).append((dist, meta))
+        scanned += len(page)
+        if scanned >= WINDOW_SCOPED_MAX_PARENTS:
+            logger.debug("Scoped window pass stopped after %d parents", scanned)
+            break
+    if not rows:
+        return best, parents
+    ranked = sorted(rows, key=lambda parent: min(d for d, _ in rows[parent]))
+    ranked = ranked[: pool_size * WINDOW_OVERFETCH]
+    scoped_parents = _parents_under(drawers, ranked, where)
+    flat = [hit for parent in ranked for hit in rows[parent]]
+    scoped_best = fold_windows(
+        {"metadatas": [[m for _, m in flat]], "distances": [[d for d, _ in flat]]},
+        profile_key,
+        scoped_parents,
+    )
+    for parent, hit in scoped_best.items():
+        if parent not in best or hit[0] < best[parent][0]:
+            best[parent] = hit
+    parents.update(scoped_parents)
+    best = dict(sorted(best.items(), key=lambda item: item[1][0])[:pool_size])
+    return best, {i: parents[i] for i in best}
 
 
 def merge_window_hits(
@@ -484,7 +650,7 @@ def merge_window_hits(
 
     A drawer's distance becomes the smaller of its own and its best window's.
     A parent the drawer query missed joins the pool. The result is re-sorted
-    by distance and cut to ``limit`` so pool accounting is unchanged.
+    by distance, retaining the top ``limit`` plus any displaced drawer candidates.
     Returns ``(results, promoted)`` where ``promoted`` counts drawers whose
     distance a window improved or that a window brought in.
     """
@@ -512,6 +678,10 @@ def merge_window_hits(
     for row in zip(ids, docs, metas, dists):
         row_id, doc, meta, dist = row
         window = valid.get(row_id)
+        if window is not None and doc != parents[row_id][0]:
+            # A concurrent rewrite changed the text after the drawer query.
+            doc, meta = parents[row_id]
+            dist = None
         if window is not None and (dist is None or window < dist):
             dist = window
             promoted += 1
@@ -524,8 +694,11 @@ def merge_window_hits(
         rows.append((parent_id, doc, meta, window))
         promoted += 1
     rows.sort(key=lambda r: float("inf") if r[3] is None else r[3])
-    rows = rows[:limit]
+    # Hybrid BM25 must still see the original drawer candidates. A strong
+    # tail can otherwise evict an exact lexical match before reranking.
+    rows = rows[:limit] + [row for row in rows[limit:] if row[0] in seen]
     merged = {
+        "displaced_drawers": max(0, len(rows) - limit),
         "ids": [[r[0] for r in rows]],
         "documents": [[r[1] for r in rows]],
         "metadatas": [[r[2] for r in rows]],
@@ -541,10 +714,10 @@ class SubwindowsUnsupported(RuntimeError):
     """The active embedder exposes no tokenizer MemPalace can window with."""
 
 
-def _page_rows(collection, *, where=None, include=("documents", "metadatas")):
+def _page_rows(collection, *, where=None, include=("documents", "metadatas"), page_size=BATCH_SIZE):
     offset = 0
     while True:
-        kwargs = {"include": list(include), "limit": BATCH_SIZE, "offset": offset}
+        kwargs = {"include": list(include), "limit": page_size, "offset": offset}
         if where:
             kwargs["where"] = where
         got = collection.get(**kwargs)
@@ -555,7 +728,7 @@ def _page_rows(collection, *, where=None, include=("documents", "metadatas")):
         metas = got.get("metadatas") or [None] * len(ids)
         yield list(zip(ids, docs, metas))
         offset += len(ids)
-        if len(ids) < BATCH_SIZE:
+        if len(ids) < page_size:
             return
 
 

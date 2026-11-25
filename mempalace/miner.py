@@ -1719,6 +1719,9 @@ def add_drawer(
         ids=[drawer_id],
         metadatas=[metadata],
     )
+    from .subwindows import index_collection_write
+
+    index_collection_write(collection, [drawer_id], [content], [metadata])
     return True
 
 

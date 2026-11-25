@@ -300,6 +300,7 @@ def get_collection(
     read_only: bool = False,
     _skip_identity_check: bool = False,
     _skip_name_check: bool = False,
+    _derived_vectors: bool = False,
 ):
     """Get a first-class MemPalace collection (drawers, closets, or media assets).
 
@@ -364,6 +365,8 @@ def get_collection(
     backend_obj = get_backend_for_palace(palace_path, explicit=backend)
     palace_ref = PalaceRef(id=palace_path, local_path=palace_path)
     backend_options = {"read_only": True} if read_only else None
+    if _derived_vectors:
+        backend_options = {**(backend_options or {}), "derived_vectors": True}
     preferred_kwargs = {
         "palace": palace_ref,
         "collection_name": collection_name,
@@ -566,10 +569,35 @@ def get_windows_collection(
     ``window_of`` (the parent drawer id), and hold no text. Search folds them
     into their parent; nothing that lists, counts or exports drawers reads them.
     """
-    return get_collection(
+    from ..config import get_configured_collection_name
+    from ..subwindows import WINDOWS_MARKER, SubwindowsUnsupported
+
+    if get_configured_collection_name() == WINDOWS_COLLECTION_NAME:
+        raise SubwindowsUnsupported(
+            "The configured drawer collection uses the sub-window collection name."
+        )
+    if _backend_has_server_embedder(palace_path, backend):
+        raise SubwindowsUnsupported(
+            "Sub-windows require a backend that uses the configured local embedder."
+        )
+    collection = get_collection(
         palace_path,
         collection_name=WINDOWS_COLLECTION_NAME,
         create=create,
         backend=backend,
-        **({"read_only": True} if read_only else {}),
+        read_only=read_only,
+        # Each row carries its profile. A partially refreshed collection can
+        # legitimately contain vectors of both supported (384d) models.
+        _skip_identity_check=True,
+        _derived_vectors=True,
     )
+    if not read_only:
+        # Created now, or found by a writer: with the flag off, the marker is
+        # what tells later deletes there are windows to purge.
+        marker = Path(palace_path) / WINDOWS_MARKER
+        try:
+            if not marker.exists():
+                marker.touch(mode=0o600)
+        except OSError:
+            logger.debug("Could not write %s", marker, exc_info=True)
+    return collection

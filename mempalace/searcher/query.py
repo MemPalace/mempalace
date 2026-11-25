@@ -74,7 +74,11 @@ def _query_drawers_with_filter_fallback(
             filter_err,
         )
         raw = drawers_col.query(
-            query_texts=[query],
+            **{
+                key: value
+                for key, value in dkwargs.items()
+                if key in ("query_embeddings", "query_texts")
+            },
             n_results=min(n_results * 15, 500),
             include=["documents", "metadatas", "distances"],
         )
@@ -107,89 +111,75 @@ def _query_drawers_with_filter_fallback(
         }
 
 
-def _subwindow_query_vectors(query: str):
+def _subwindow_query_vectors(query: str, col, collection_name=None):
     """The query's embedding when ``embedding_subwindows`` is on, else None."""
     from ..subwindows import subwindows_enabled
 
-    if not subwindows_enabled():
+    if not subwindows_enabled() or "server_embedder" in _backend_capabilities(col):
+        return None
+    from ..config import MempalaceConfig, get_configured_collection_name
+
+    if collection_name and collection_name != get_configured_collection_name():
+        return None
+    if MempalaceConfig().embedding_model not in {"minilm", "embeddinggemma"}:
         return None
     from ..backends.embedding_wrapper import _embed_texts
 
     return _embed_texts([query], query=True)
 
 
-def _fold_subwindow_hits(
-    drawers_col,
-    drawer_results,
+def _drawer_candidates(
+    col,
+    query,
     *,
     palace_path,
-    query,
     where,
     pool_size,
     metric,
-    query_vectors=None,
+    n_results,
+    wing,
+    room,
+    source_file=None,
+    collection_name=None,
 ):
-    """Score each drawer by its best sub-window when ``embedding_subwindows`` is on.
-
-    Off (the default), or with no windows collection, returns
-    ``drawer_results`` untouched. Otherwise queries the windows collection
-    for ``pool_size * WINDOW_OVERFETCH`` rows of the active profile, folds
-    them into their parents (see :mod:`mempalace.subwindows`), re-reads those
-    parents from the drawers collection under ``where`` so a window can only
-    stand for a drawer the search may return, and merges. Any failure logs
-    and falls back to the plain drawer results.
-    """
-    from ..subwindows import (
-        WINDOW_FILTERED_WIDEN,
-        WINDOW_MAX_FETCH,
-        WINDOW_OVERFETCH,
-        active_profile,
-        fold_windows,
-        merge_window_hits,
-        subwindows_enabled,
+    vectors = _subwindow_query_vectors(query, col, collection_name) if palace_path else None
+    kwargs = {"query_texts": [query]} if vectors is None else {"query_embeddings": vectors}
+    kwargs.update(n_results=pool_size, include=["documents", "metadatas", "distances"])
+    if where:
+        kwargs["where"] = where
+    rows = _query_drawers_with_filter_fallback(
+        col, kwargs, query, n_results, wing, room, source_file
+    )
+    if vectors is None:
+        return rows
+    return _fold_subwindow_hits(
+        col,
+        rows,
+        palace_path=palace_path,
+        where=where,
+        pool_size=pool_size,
+        metric=metric,
+        query_vectors=vectors,
     )
 
-    if not subwindows_enabled():
-        return drawer_results
-    try:
-        from ..palace import open_windows_collection
 
+def _fold_subwindow_hits(
+    drawers_col, drawer_results, *, palace_path, where, pool_size, metric, query_vectors
+):
+    """Fold current window hits into their parents before hybrid reranking."""
+    from ..palace import open_windows_collection
+    from ..subwindows import active_profile, merge_window_hits, window_candidates
+
+    try:
         windows_col = open_windows_collection(palace_path, read_only=True)
         if windows_col is None:
             return drawer_results
         resolved = active_profile()
         if resolved is None:
             return drawer_results
-        profile = resolved[2]
-        # Windows are filtered by profile only: a drawer moved to another wing
-        # or room keeps windows stamped with the old one. The parent re-read
-        # below applies ``where``; a filtered search fetches wider to make up.
-        n_windows = pool_size * WINDOW_OVERFETCH * (WINDOW_FILTERED_WIDEN if where else 1)
-        vector_kwargs = (
-            {"query_embeddings": query_vectors}
-            if query_vectors is not None
-            else {"query_texts": [query]}
+        best, parents = window_candidates(
+            drawers_col, windows_col, query_vectors, resolved[2].key, where, pool_size
         )
-        window_results = windows_col.query(
-            **vector_kwargs,
-            n_results=min(n_windows, WINDOW_MAX_FETCH),
-            where={"window_profile": profile.key},
-            include=["metadatas", "distances"],
-        )
-        best = fold_windows(window_results, profile.key)
-        if not best:
-            return drawer_results
-        kwargs = {"ids": list(best), "include": ["documents", "metadatas"]}
-        if where:
-            kwargs["where"] = where
-        got = drawers_col.get(**kwargs)
-        parents = {
-            row_id: (doc, meta or {})
-            for row_id, doc, meta in zip(
-                got.get("ids") or [], got.get("documents") or [], got.get("metadatas") or []
-            )
-            if isinstance(doc, str)
-        }
         window_metric = _metric_for_collection(windows_col)
         merged, _promoted = merge_window_hits(
             drawer_results,
@@ -457,6 +447,16 @@ def search_memories(
     # regardless of whether the call routes through the vector path or
     # the BM25-only fallback below.
     _validate_candidate_strategy(candidate_strategy)
+    from ..config import get_configured_collection_name
+    from ..palace import WINDOWS_COLLECTION_NAME
+
+    if (
+        collection_name == WINDOWS_COLLECTION_NAME
+        and collection_name != get_configured_collection_name()
+    ):
+        return _search_error_result(
+            "Sub-window vectors must be searched through their parent drawers"
+        )
 
     if include_media or query_task != "search":
         if candidate_strategy == "lexical":
@@ -543,32 +543,21 @@ def search_memories(
         _pool_scale,
     )
     try:
-        dkwargs = {
-            "query_texts": [query],
-            "n_results": pool_size,  # over-fetch for re-ranking
-            "include": ["documents", "metadatas", "distances"],
-        }
-        # With sub-windows on, the query is embedded once for both the drawer
-        # and the window query. Off, the drawer query is exactly as before.
-        query_vectors = _subwindow_query_vectors(query)
-        if query_vectors is not None:
-            dkwargs.pop("query_texts")
-            dkwargs["query_embeddings"] = query_vectors
-        if where:
-            dkwargs["where"] = where
-        drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room, source_file
-        )
-        drawer_results = _fold_subwindow_hits(
+        drawer_results = _drawer_candidates(
             drawers_col,
-            drawer_results,
+            query,
             palace_path=palace_path,
-            query=query,
             where=where,
             pool_size=pool_size,
             metric=metric,
-            query_vectors=query_vectors,
+            n_results=n_results,
+            wing=wing,
+            room=room,
+            source_file=source_file,
+            collection_name=collection_name,
         )
+        if pre_enrichment_limit == pool_size:
+            pre_enrichment_limit += drawer_results.get("displaced_drawers", 0)
     except Exception as e:
         # The configured embedding function could not be built: the
         # read-only open succeeded, but embedding the query refused (C).

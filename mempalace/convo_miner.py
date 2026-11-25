@@ -157,6 +157,9 @@ def file_conversation_exchange(
         for key, value in extra_metadata.items():
             metadata.setdefault(key, value)
     collection.upsert(ids=[drawer_id], documents=[text], metadatas=[metadata])
+    from .subwindows import index_collection_write
+
+    index_collection_write(collection, [drawer_id], [text], [metadata])
     return drawer_id
 
 

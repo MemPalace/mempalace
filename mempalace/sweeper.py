@@ -229,6 +229,8 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
       earlier than what's already stored).
     * ``drawers_upserted`` — total writes = added + already_present.
     """
+    from .subwindows import index_after_write
+
     collection = get_collection(palace_path, create=True)
     cursors: dict = {}
 
@@ -288,6 +290,7 @@ def sweep(jsonl_path: str, palace_path: str, source_label: Optional[str] = None)
             documents=unique_docs,
             metadatas=unique_metas,
         )
+        index_after_write(palace_path, unique_ids, unique_docs, unique_metas)
         drawers_added += new_count
         drawers_already_present += already_count
         batch_ids.clear()
