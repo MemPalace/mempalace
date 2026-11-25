@@ -532,3 +532,201 @@ def test_a_failing_dimension_probe_is_paid_once_per_filing_not_once_per_batch(pa
 
     assert filed == 0
     assert len(probes) == 1
+
+
+# -- crash windows around the source record --------------------------------------
+
+
+def test_a_crash_between_the_drawer_writes_and_the_record_leaves_it_pending_then_finishes(
+    palace, monkeypatch
+):
+    import sqlite3
+
+    from mempalace.palace import SourceStateUnavailable
+
+    _file(palace, _drawers(["one", "two"]))
+
+    def crash(self, stream, **fields):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SourceStateStore, "mark_complete", crash)
+        with pytest.raises(SourceStateUnavailable):
+            _file(palace, _drawers(["one", "two", "three"], "2:2:2"))
+
+    # The new drawer is durable, but the source must not read as mined.
+    assert _rows(palace)["drawer_2"][0] == "three"
+    assert SourceStateStore(palace).get(_stream()).state == "pending"
+    assert not file_already_mined(
+        get_collection(palace),
+        SOURCE,
+        extract_mode="exchange",
+        wing=WING,
+        source_state=SourceStateStore(palace),
+    )
+
+    spy = _WriteSpy(monkeypatch, get_collection(palace))
+    filed = _file(palace, _drawers(["one", "two", "three"], "2:2:2"))
+
+    # The redo finds every drawer already written and only completes the record.
+    assert [name for name in spy.names() if name != "update"] == []
+    assert filed == 0
+    head = SourceStateStore(palace).get(_stream())
+    assert head.complete and head.chunk_total == 3 and head.source_fingerprint == "2:2:2"
+    assert {doc for doc, _ in _rows(palace).values()} == {"one", "two", "three"}
+
+
+def test_a_record_that_cannot_go_pending_stops_before_any_drawer_write(palace, monkeypatch):
+    import sqlite3
+
+    from mempalace.palace import SourceStateUnavailable
+
+    _file(palace, _drawers(["one", "two"]))
+    spy = _WriteSpy(monkeypatch, get_collection(palace))
+
+    def locked(self, stream, **fields):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(SourceStateStore, "mark_pending", locked)
+    with pytest.raises(SourceStateUnavailable):
+        _file(palace, _drawers(["ONE", "three"], "2:2:2"))
+
+    assert spy.names() == []
+    assert {doc for doc, _ in _rows(palace).values()} == {"one", "two"}
+
+
+# -- older binaries on the same palace ---------------------------------------------
+
+
+def _real_source(tmp_path, text):
+    import os
+
+    from mempalace.palace import source_fingerprint
+
+    path = tmp_path / "session.jsonl"
+    path.write_text(text, encoding="utf-8")
+    return str(path), source_fingerprint(os.stat(path))
+
+
+def _file_at(palace, path, texts, fingerprint, store):
+    drawers = [
+        (f"drawer_{i}", text, _meta(i, fingerprint, "2026-01-01T00:00:00Z", source_file=path))
+        for i, text in enumerate(texts)
+    ]
+    return write_file_drawers(
+        get_collection(palace),
+        path,
+        drawers,
+        extract_mode="exchange",
+        owner="convo",
+        palace_path=palace,
+        prune_wing=WING,
+        source_state=SourceStateStore(palace) if store else None,
+    )
+
+
+def _mined(palace, path, store):
+    return file_already_mined(
+        get_collection(palace),
+        path,
+        extract_mode="exchange",
+        check_source_fingerprint=True,
+        wing=WING,
+        source_state=SourceStateStore(palace) if store else None,
+    )
+
+
+def test_an_older_binary_re_mines_after_a_new_one_appended_and_nothing_is_lost(tmp_path):
+    palace = str(tmp_path / "palace")
+    path, first = _real_source(tmp_path, "a\n")
+    _file_at(palace, path, ["one", "two"], first, store=True)
+    assert _mined(palace, path, store=False)  # an older binary reads the first filing
+
+    import os
+
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("b\n")
+    os.utime(path, (1, 2_000_000_000))
+    from mempalace.palace import source_fingerprint
+
+    second = source_fingerprint(os.stat(path))
+    _file_at(palace, path, ["one", "two", "three"], second, store=True)
+
+    # The new binary skips it; an older one, reading only per-row stamps,
+    # sees an incomplete set for the current snapshot and re-mines.
+    assert _mined(palace, path, store=True)
+    assert not _mined(palace, path, store=False)
+
+    # The older binary's re-mine rewrites every row; nothing is lost.
+    _file_at(palace, path, ["one", "two", "three"], second, store=False)
+    assert _mined(palace, path, store=False)
+    assert _mined(palace, path, store=True)
+    rows = get_collection(palace).get(where={"source_file": path}, include=["documents"])
+    assert sorted(rows["documents"]) == ["one", "three", "two"]
+
+
+def test_a_new_binary_re_mines_a_source_an_older_one_filed_after_it(tmp_path, monkeypatch):
+    import os
+
+    from mempalace.palace import source_fingerprint
+
+    palace = str(tmp_path / "palace")
+    path, first = _real_source(tmp_path, "a\n")
+    _file_at(palace, path, ["one", "two"], first, store=True)
+
+    # An older binary files a grown source; the new record still names the
+    # old snapshot.
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("b\n")
+    os.utime(path, (1, 2_000_000_000))
+    second = source_fingerprint(os.stat(path))
+    _file_at(palace, path, ["one", "two", "three"], second, store=False)
+
+    assert not _mined(palace, path, store=True)
+    spy = _WriteSpy(monkeypatch, get_collection(palace))
+    filed = _file_at(palace, path, ["one", "two", "three"], second, store=True)
+
+    # The older binary already wrote everything: the new one only restamps.
+    assert filed == 0 and "upsert" not in spy.names()
+    assert _mined(palace, path, store=True)
+    rows = get_collection(palace).get(where={"source_file": path}, include=["documents"])
+    assert sorted(rows["documents"]) == ["one", "three", "two"]
+
+
+# -- a non-Chroma backend, end to end -------------------------------------------
+
+
+def test_a_touched_transcript_on_sqlite_exact_remines_without_a_write(convo, monkeypatch):
+    from mempalace.backends.base import PalaceRef
+    from mempalace.backends.sqlite_exact import SQLiteExactBackend
+
+    doc, palace, mine = convo
+    backend = SQLiteExactBackend()
+    backend.get_collection(
+        palace=PalaceRef(id=palace, local_path=palace),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+    backend.close()
+    monkeypatch.setenv("MEMPALACE_BACKEND", "sqlite_exact")
+
+    doc.write_text(_convo_text(range(3)), encoding="utf-8")
+    mine()
+    import os
+
+    assert not os.path.exists(os.path.join(palace, "chroma.sqlite3"))
+    collection = get_collection(palace)
+    before = collection.get(where={"source_file": str(doc)}, include=["documents"])
+
+    _bump_mtime(doc)
+    spy = _WriteSpy(monkeypatch, collection)
+    mine()
+    assert spy.names() == []
+
+    doc.write_text(_convo_text(range(5)), encoding="utf-8")
+    mine()
+    after = get_collection(palace).get(where={"source_file": str(doc)}, include=["documents"])
+    old = dict(zip(before["ids"], before["documents"]))
+    new = dict(zip(after["ids"], after["documents"]))
+    assert set(spy.ids("upsert")) == set(new) - set(old)
+    assert {i: new[i] for i in old} == old
