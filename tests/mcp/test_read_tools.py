@@ -1308,3 +1308,40 @@ def test_follow_tunnels_records_without_the_writer_lease(monkeypatch):
     monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
     mcp_server.tool_follow_tunnels("wing_a", "room_a", record=True)
     assert captured["record"] is False
+
+
+def test_follow_tunnels_accepts_entity_and_topic_room_names(monkeypatch):
+    """#3027: tunnel endpoints are stored verbatim by ``create_tunnel``.
+
+    Entity rooms are ``entity:<entity>`` and may carry paths or URLs, and topic
+    tunnels use ``topic:<name>``. Sanitizing the query room rejected the ``:``
+    (and ``/``) in those names, so no entity/topic tunnel could be followed
+    through MCP even though ``list_tunnels`` reported it.
+    """
+    from mempalace import mcp_server
+
+    captured = {}
+
+    def _fake_follow(wing, room, col=None, record=True):
+        captured["room"] = room
+        return [{"tunnel_id": "t1"}]
+
+    monkeypatch.setattr(mcp_server, "follow_tunnels", _fake_follow)
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: object())
+    monkeypatch.setattr(mcp_server, "_READ_ONLY", True)
+
+    for room in (
+        "entity:pillow-heif",
+        "entity:src/main.zig",
+        "entity:https://github.com/org/repo.git",
+        "topic:Angular",
+    ):
+        assert mcp_server.tool_follow_tunnels("wing_a", room) == [{"tunnel_id": "t1"}]
+        assert captured["room"] == room
+
+    assert mcp_server.tool_follow_tunnels("wing_a", "   ") == {
+        "error": "room must be a non-empty string"
+    }
+    assert mcp_server.tool_follow_tunnels("wing_a", "room\ninjected") == {
+        "error": "room must not contain control characters"
+    }
