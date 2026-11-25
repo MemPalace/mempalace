@@ -159,6 +159,14 @@ def _paged_metadata(collection):
         offset += len(batch["ids"])
 
 
+# Safe because the drawers keep everything the records summarize: without the
+# file, the next mine re-checks each source once and writes it back.
+_SOURCE_STATE_HINT = (
+    "if source_state.sqlite3 in the palace directory is damaged, deleting it is "
+    "safe: the next mine rebuilds it"
+)
+
+
 def _head_proves_mined(
     head,
     extract_mode: Optional[str],
@@ -311,7 +319,7 @@ def file_already_mined(
         except (OSError, sqlite3.Error) as exc:
             raise MinedSetUnavailable(
                 f"could not read the mining state of {source_file}; stopping rather "
-                f"than filing it again ({exc!r})"
+                f"than filing it again ({exc!r}); {_SOURCE_STATE_HINT}"
             ) from exc
     if owner is not None:
         from ..retention import owns
@@ -423,7 +431,7 @@ def _prefetched_mined(
         except (OSError, sqlite3.Error) as exc:
             raise MinedSetUnavailable(
                 f"could not read the palace's source records; stopping rather than "
-                f"mining against an incomplete registry ({exc!r})"
+                f"mining against an incomplete registry ({exc!r}); {_SOURCE_STATE_HINT}"
             ) from exc
     mined: dict[str, Optional[Union[float, str]]] = {}
     for src, head in heads.items():

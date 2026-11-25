@@ -623,12 +623,11 @@ def _refile_changed(
         if unusable:
             to_embed += [(i, doc, full) for i, doc, full, _ in kept_rows if i in unusable]
             updates = [update for update in updates if update[0] not in unusable]
+        updated = {drawer_id for drawer_id, _ in updates}
         restamp += [
             i
             for i, _, _, old_meta in kept_rows
-            if i not in unusable
-            and i not in {u[0] for u in updates}
-            and old_meta.get("chunk_total") == total + 1
+            if old_meta.get("chunk_total") == total + 1 and i not in unusable and i not in updated
         ]
         if preserving:
             _archive_prior_text(palace_path, source_file, journal, "remine_overwrite")
