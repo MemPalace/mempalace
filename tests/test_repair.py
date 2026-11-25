@@ -3,6 +3,7 @@
 import errno
 import logging
 import os
+import shutil
 import sqlite3
 import stat
 import sys
@@ -4765,10 +4766,18 @@ def test_rebuild_from_sqlite_skips_symlinked_journal_and_state_dir(tmp_path):
     if not journal_link.exists() and not journal_link.is_symlink():
         journal_link.symlink_to(outside / "secret")
     state_dir = src / ".mempalace"
+    # Seeding writes through Chroma, which leaves write markers in a real
+    # state dir; swap it for the link so the skip is actually exercised.
+    if state_dir.is_dir() and not state_dir.is_symlink():
+        shutil.rmtree(state_dir)
     if not state_dir.exists() and not state_dir.is_symlink():
         state_dir.symlink_to(outside, target_is_directory=True)
+    assert state_dir.is_symlink()
 
     repair.rebuild_from_sqlite(str(src), str(dest))
 
     assert not (dest / "drawer_revisions.jsonl").exists()
-    assert not (dest / ".mempalace").exists()
+    # The rebuild's own writes may create a fresh state dir; nothing may be
+    # copied through the link.
+    assert not (dest / ".mempalace").is_symlink()
+    assert not (dest / ".mempalace" / "secret").exists()
