@@ -1470,6 +1470,18 @@ class MempalaceConfig:
         return self._resolve_str_setting("MEMPALACE_EMBEDDING_API_KEY", "embedding_api_key")
 
     @property
+    def embedding_api_prefixes(self) -> tuple[str, str]:
+        """Return the query and document prefixes for OpenAI-compatible embeddings."""
+        prefixes = []
+        for role in ("query", "document"):
+            value = os.environ.get(f"MEMPALACE_EMBEDDING_API_{role.upper()}_PREFIX")
+            if value is None:
+                value = self._file_config.get(f"embedding_api_{role}_prefix")
+            # A trailing space is part of a model's input format.
+            prefixes.append(value if isinstance(value, str) else "")
+        return prefixes[0], prefixes[1]
+
+    @property
     def topic_tunnel_min_count(self):
         """Minimum number of overlapping confirmed topics required to create
         a cross-wing tunnel between two wings.

@@ -45,6 +45,9 @@ Architecture, concepts, and mining flows:
 
 ## Install
 
+For an optional local Nemotron embeddings setup, see
+[Nemotron embeddings](docs/nemotron.md).
+
 ### Agent-guided setup
 
 Install the MemPalace skills first, then ask your coding agent to set up
