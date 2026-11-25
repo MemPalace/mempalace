@@ -121,6 +121,73 @@ Override per trigger with `MEMPALACE_DAEMON_<TRIGGER>_SETTLE_SECONDS` /
 
 Diary checkpoints are never debounced.
 
+## Hallways off the mine path
+
+A mine used to finish by recomputing the hallways of the whole wing it filed
+into. That pass is exact but costs tens of seconds on a wing of ~100k drawers,
+and it cannot be made incremental: entity spellings are resolved across the
+whole wing, so one new drawer can change how earlier drawers' entities
+resolve. A hook that re-mines a transcript every few minutes paid it every
+time.
+
+Background mines now defer it:
+
+1. The mine files its drawers, then marks the wing dirty in the hallway store
+   (`hallways.sqlite3`, table `dirty_wings`) and queues one `hallways` job for
+   the wing (dedupe key `hallways:<wing>`).
+2. Jobs for one wing coalesce like mine jobs: the recompute runs 10 minutes
+   after the wing's last mine, and never later than 60 minutes after its first
+   dirty mark. A burst of mines costs one recompute.
+3. The daemon runs the job in its idle-priority mine child (or its worker
+   thread when `daemon.mine_child` is off), under the palace write lock, with
+   the same whole-wing algorithm as before. Project mines also refresh the
+   cross-wing entity tunnels derived from the wing's hallways there.
+
+The dirty mark is what guarantees the work, not the queue row:
+
+- A recompute clears the mark in the transaction that saves the new records,
+  and only if no mine marked the wing again after it started reading drawers.
+- When a `hallways` job ends with the mark still present (it failed, was
+  killed, or a mine marked the wing meanwhile), the daemon queues it again.
+- A daemon that starts queues every mark it finds, so marks left by a crash
+  or by a deferred mine that ran with no daemon are processed. The window
+  still counts from the first mark.
+- `mempalace hallways --dirty` lists the marked wings;
+  `mempalace hallways --rebuild --dirty` recomputes them now.
+
+Which mines defer:
+
+| Mine | Default |
+|------|---------|
+| Hook mine through the daemon (`prefer` / `require`) | deferred |
+| Hook mine on the direct path (spawns `mempalace mine`) | inline |
+| `mempalace mine`, direct or routed through the daemon | inline |
+| MCP `mempalace_mine` | inline |
+
+`mempalace mine --defer-hallways` / `--inline-hallways` choose per run.
+`hallways.defer` in `config.json` (env `MEMPALACE_HALLWAYS_DEFER`) changes the
+default: `auto` (the table above), `always` (every mine defers unless it says
+`--inline-hallways`; this is how a direct-path setup defers), or `never` (every
+mine recomputes inline, the behaviour before deferral). The window is
+`hallways.settle_seconds` / `hallways.max_wait_seconds` (env
+`MEMPALACE_HALLWAYS_SETTLE_SECONDS` / `MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS`):
+
+    {
+      "hallways": {"defer": "auto", "settle_seconds": 600, "max_wait_seconds": 3600}
+    }
+
+### Staleness while a wing is dirty
+
+Readers (`mempalace hallways`, `mempalace_list_hallways`, tunnel and graph
+tools) see the wing's previous hallway records until the recompute commits.
+They are stale, never missing or partial: the recompute replaces the wing's
+records in one SQLite transaction. Search reads drawers, not hallways, and is
+unaffected. With a daemon running, a wing's hallways lag its drawers by at
+most `max_wait` (60 minutes) after the first unprocessed mine, plus the
+recompute's own run time and any wait for the palace lock. With no daemon, a
+deferred mark waits for the next daemon start, the next inline mine of that
+wing, or `mempalace hallways --rebuild --dirty`.
+
 ## Submission ambiguity
 
 Once a daemon submission is attempted, an error never triggers direct
