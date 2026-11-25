@@ -2823,6 +2823,12 @@ def _rebuild_from_sqlite_locked(
         ts = filename_stamp()
         archive_path = f"{dest_palace}.pre-rebuild-{ts}"
         print(f"  Archiving {dest_palace} -> {archive_path}")
+        # Release this process's own Chroma handles first. A mine no longer
+        # closes them on its way out, and on Windows an open
+        # chroma.sqlite3 / HNSW file makes the directory rename below fail.
+        from .palace import _DEFAULT_BACKEND
+
+        _close_chroma_handles(dest_palace, backend=_DEFAULT_BACKEND)
         # os.rename, NOT shutil.move. When any file inside the palace is
         # held open by another process (MCP server, a running mine, another
         # harness), renaming the directory fails atomically UP FRONT on
