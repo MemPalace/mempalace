@@ -34,6 +34,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   remain intact. Resolving a transient read failure allows the next pass to
   recover without a source edit. Oversized files are retried until they fit
   the reader's size limit.
+- **Upgrade every hook install together.** Conversation and project re-mines
+  now write only the drawers that changed and keep each source's
+  `chunk_total`, snapshot and completion state in one record per source
+  (`source_state.sqlite3` in the palace directory) instead of on every drawer
+  (#3055). A drawer whose text and metadata are unchanged is not rewritten,
+  so it keeps its old per-row `source_fingerprint`, `chunk_total`, `filed_at`
+  and `authored_at`. An older binary reads those per-row stamps, sees an
+  incomplete set and re-mines the file. It does redundant work but never
+  loses data. Code that calls `file_already_mined`, `prefetch_mined_set` or
+  `prefetch_complete_mtimes` directly should pass the palace's
+  `SourceStateStore` as `source_state`. Without it, such a source reads as
+  not mined, which also errs toward redundant work.
 
 ### Added
 
@@ -56,6 +68,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Performance
 
+- **A re-mine writes only the drawers that changed (#3055).** New drawers are
+  added. Drawers whose text changed are journaled and rewritten. Drawers whose
+  metadata changed get a metadata-only update. Unchanged drawers are not
+  written at all. Previously every drawer of a grown transcript was upserted
+  with its stored vector and then updated again for `chunk_total`. A touched
+  but unchanged source now re-mines with zero Chroma writes, so the hallway
+  recompute and post-mine `quick_check` are skipped. Each drawer also carries
+  `content_sha256`, the hash of its text.
 - **The Antigravity sidecar no longer loads a second copy of the palace.**
   Its Python bridge starts on first use instead of with every IDE window
   (set `MEMPALACE_SIDECAR_WARMUP=1` or `MEMPALACE_EAGER_WARMUP=1` to start

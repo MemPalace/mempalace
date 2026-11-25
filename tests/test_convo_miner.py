@@ -1151,6 +1151,7 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
             *,
             source_fingerprints=False,
             wing=None,
+            source_state=None,
         ):
             seen["mined_set_source_files"] = source_files
             seen["mined_set_source_fingerprints"] = source_fingerprints
@@ -1161,6 +1162,7 @@ def test_mine_convos_scopes_mined_set_prefetch_to_candidate_files(monkeypatch):
                 source_files=source_files,
                 source_fingerprints=source_fingerprints,
                 wing=wing,
+                source_state=source_state,
             )
 
         monkeypatch.setattr(convo_miner_module, "prefetch_mined_set", _spy_mined_set)

@@ -61,6 +61,7 @@ from .palace import (
     upsert_closet_lines,
     write_file_drawers,
 )
+from .palace.source_state import SourceStateStore
 
 # Re-exported: callers and tests import these from the miner.
 from .project_config import (  # noqa: F401
@@ -1759,6 +1760,7 @@ def process_file(
     max_chunks_per_file: Optional[int] = None,
     mined_mtimes: Optional[dict] = None,
     aaak_col=None,
+    source_state=None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1775,6 +1777,10 @@ def process_file(
     ``mined_mtimes`` is :func:`prefetch_complete_mtimes`'s map for this
     mine. A file it proves already filed is skipped without querying the
     palace; any other file goes through ``file_already_mined()``.
+
+    ``source_state`` is the palace's source record store; with it a re-file
+    writes only the drawers that changed and ``drawer_count`` is what it
+    wrote (see :func:`mempalace.palace.write_file_drawers`).
     """
     effective_min = min_chunk_size if min_chunk_size is not None else MIN_CHUNK_SIZE
 
@@ -1782,7 +1788,13 @@ def process_file(
     source_file = str(filepath)
     if not dry_run and (
         _prefetched_as_mined(source_file, mined_mtimes)
-        or file_already_mined(collection, source_file, check_mtime=True, owner="project")
+        or file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            owner="project",
+            source_state=source_state,
+        )
     ):
         return 0, "general", None
 
@@ -1828,7 +1840,13 @@ def process_file(
     # and both file the file — creating duplicates or losing data.
     with mine_lock(source_file):
         # Re-check after acquiring lock — another agent may have just finished
-        if file_already_mined(collection, source_file, check_mtime=True, owner="project"):
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            owner="project",
+            source_state=source_state,
+        ):
             return 0, room, None
 
         # source_mtime is the mtime paired with the content actually read
@@ -1882,7 +1900,12 @@ def process_file(
         # A failed stale-drawer purge is an error the mine counts, not a skip.
         try:
             drawers_added = write_file_drawers(
-                collection, source_file, drawers, aaak_col=aaak_col, owner="project"
+                collection,
+                source_file,
+                drawers,
+                aaak_col=aaak_col,
+                owner="project",
+                source_state=source_state,
             )
         except StaleDrawerPurgeFailed as exc:
             print(f"  ! [error] {filepath.name[:50]:50} {exc}", file=sys.stderr)
@@ -1899,7 +1922,9 @@ def process_file(
             closets_col = None
         if closets_col:
             purge_file_closets(closets_col, source_file)
-        if closets_col and drawers_added > 0:
+        # ``drawers_added`` counts only drawers written; a re-file that only
+        # pruned still has ``drawers`` for the rebuilt closet to point at.
+        if closets_col and drawers:
             # Pass drawer_metas so build_closet_lines can emit the
             # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
             # when line_start / line_end / content_date are present. Falls
@@ -1920,7 +1945,7 @@ def process_file(
                 "wing": wing,
                 "room": room,
                 "source_file": source_file,
-                "drawer_count": int(drawers_added),
+                "drawer_count": len(drawers),
                 "filed_at": utc_now_iso(),
                 "normalize_version": NORMALIZE_VERSION,
             }
@@ -2236,8 +2261,13 @@ def _mine_impl(
         # One sqlite pass instead of one get(where=source_file) per file,
         # which costs ~0.1 s each on a 1M-drawer palace. None on
         # other backends: every file then takes the per-file check.
-        mined_mtimes = prefetch_complete_mtimes(collection, [str(f) for f in files])
+        # Per-source mining state, so a re-mine writes only what changed.
+        source_state = SourceStateStore(palace_path)
+        mined_mtimes = prefetch_complete_mtimes(
+            collection, [str(f) for f in files], source_state=source_state
+        )
     else:
+        source_state = None
         collection = None
         closets_col = None
         aaak_col = None
@@ -2276,6 +2306,7 @@ def _mine_impl(
                     # per file.
                     max_chunks_per_file=effective_chunk_cap,
                     mined_mtimes=mined_mtimes,
+                    source_state=source_state,
                 )
             except KeyboardInterrupt:
                 # Re-raise so the outer handler prints the summary; we

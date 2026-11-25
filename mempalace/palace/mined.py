@@ -159,6 +159,63 @@ def _paged_metadata(collection):
         offset += len(batch["ids"])
 
 
+def _head_proves_mined(
+    head,
+    extract_mode: Optional[str],
+    rows: int,
+    *,
+    fingerprint: Optional[str] = None,
+    mtime: Optional[float] = None,
+) -> bool:
+    """True when a source record proves its stream filed from this snapshot.
+
+    The record must be complete and written by the current normalizer and
+    chunker, its snapshot must match the one given (``fingerprint`` or
+    ``mtime``; neither checks no snapshot), and the stream must still hold
+    ``rows`` >= the record's ``chunk_total`` current drawers (at least one
+    when the record has no total), so drawers removed behind the record's
+    back read as "not mined".
+    """
+    if not head.complete:
+        return False
+    version = head.normalize_version
+    if not _is_plain_number(version) or version < NORMALIZE_VERSION:
+        return False
+    if extract_mode in CHUNKER_VERSIONS:
+        chunker = head.chunker_version
+        if not _is_plain_number(chunker) or chunker < CHUNKER_VERSIONS[extract_mode][1]:
+            return False
+    if fingerprint is not None and head.source_fingerprint != fingerprint:
+        return False
+    if mtime is not None and (
+        not _is_plain_number(head.source_mtime) or abs(head.source_mtime - mtime) >= 0.001
+    ):
+        return False
+    needed = head.chunk_total if head.chunk_total is not None else 1
+    return rows >= needed
+
+
+def _backfill_fields(state_key, largest, untracked, *, fingerprints: bool, extract_mode) -> dict:
+    """The record a complete legacy row group proves, for :meth:`SourceStateStore.backfill`."""
+    fields = {
+        "chunk_total": None if untracked else largest,
+        "normalize_version": NORMALIZE_VERSION,
+    }
+    if fingerprints:
+        fields["source_fingerprint"] = state_key
+    else:
+        fields["source_mtime"] = state_key
+    if extract_mode in CHUNKER_VERSIONS:
+        fields["chunker_version"] = CHUNKER_VERSIONS[extract_mode][1]
+    return fields
+
+
+def _stream(source_file, owner, extract_mode, wing):
+    from .source_state import source_stream
+
+    return source_stream(source_file, owner=owner, extract_mode=extract_mode, wing=wing)
+
+
 def file_already_mined(
     collection,
     source_file: str,
@@ -168,8 +225,19 @@ def file_already_mined(
     check_source_fingerprint: bool = False,
     *,
     wing: Optional[str] = None,
+    source_state=None,
 ) -> bool:
     """Check if a file has already been filed in the palace.
+
+    ``source_state`` is the palace's
+    :class:`~mempalace.palace.source_state.SourceStateStore`. When it holds a
+    record for this source stream, the record decides (see
+    :func:`_head_proves_mined`): its completion state, snapshot and versions,
+    plus a count of the stream's current drawers. Per-row ``chunk_total`` and
+    snapshot stamps are then ignored, since a re-file that wrote only what
+    changed leaves unchanged drawers with their old stamps. Without a record
+    the per-row rules below apply, and a source they prove filed gets a
+    record backfilled.
 
     ``owner`` (see :mod:`mempalace.retention`) counts only the drawers that
     miner filed: a conversation or format drawer stored under the same path
@@ -233,7 +301,18 @@ def file_already_mined(
     # largest chunk_total, whether some drawer has no chunk_total].
     groups: dict = {}
     unprovable = False
+    in_scope = 0
     offset = 0
+    head = None
+    if source_state is not None:
+        stream = _stream(source_file, owner, extract_mode, wing)
+        try:
+            head = source_state.get(stream)
+        except (OSError, sqlite3.Error) as exc:
+            raise MinedSetUnavailable(
+                f"could not read the mining state of {source_file}; stopping rather "
+                f"than filing it again ({exc!r})"
+            ) from exc
     if owner is not None:
         from ..retention import owns
     while True:
@@ -263,6 +342,7 @@ def file_already_mined(
                 continue
             if not _meta_is_current(meta, extract_mode):
                 continue
+            in_scope += 1
             stored_mtime = meta.get("source_mtime")
             if check_source_fingerprint:
                 if meta.get("source_fingerprint") != current_fingerprint:
@@ -285,12 +365,91 @@ def file_already_mined(
         offset += len(ids)
     if unprovable:
         return False
-    return any(untracked or seen >= largest for seen, largest, untracked in groups.values())
+    if head is not None:
+        return _head_proves_mined(
+            head,
+            extract_mode,
+            in_scope,
+            fingerprint=current_fingerprint,
+            mtime=current_mtime,
+        )
+    complete = [
+        (state_key, largest, untracked)
+        for state_key, (seen, largest, untracked) in groups.items()
+        if untracked or seen >= largest
+    ]
+    if complete and source_state is not None and check_mtime:
+        state_key, largest, untracked = complete[0]
+        source_state.backfill(
+            [
+                (
+                    stream,
+                    _backfill_fields(
+                        state_key,
+                        largest,
+                        untracked,
+                        fingerprints=check_source_fingerprint,
+                        extract_mode=extract_mode,
+                    ),
+                )
+            ]
+        )
+    return bool(complete)
 
 
 # Above this many candidate files, one filtered get costs more round trips
 # than a full paginated scan, so the scoped path below stops paying off.
 _PREFETCH_SCOPE_THRESHOLD = 50
+
+
+def _prefetched_mined(
+    groups: dict,
+    unprovable: set,
+    in_scope: dict,
+    source_state,
+    *,
+    extract_mode,
+    wing,
+    source_files,
+    source_fingerprints: bool,
+) -> dict:
+    """Decide :func:`prefetch_mined_set`'s answer from its scanned rows."""
+    heads: dict = {}
+    if source_state is not None:
+        try:
+            heads = source_state.get_many(
+                extract_mode=extract_mode, wing=wing, source_files=source_files
+            )
+        except (OSError, sqlite3.Error) as exc:
+            raise MinedSetUnavailable(
+                f"could not read the palace's source records; stopping rather than "
+                f"mining against an incomplete registry ({exc!r})"
+            ) from exc
+    mined: dict[str, Optional[Union[float, str]]] = {}
+    for src, head in heads.items():
+        if src not in unprovable and _head_proves_mined(head, extract_mode, in_scope.get(src, 0)):
+            mined[src] = head.source_fingerprint if source_fingerprints else head.source_mtime
+    backfill = []
+    for src, by_state in groups.items():
+        if src in unprovable or src in heads:
+            continue
+        for state_key, (count, largest, untracked) in by_state.items():
+            # Legacy / registry rows carry no completion marker: trusted.
+            if untracked or count >= largest:
+                mined[src] = state_key
+                if state_key is not None:
+                    fields = _backfill_fields(
+                        state_key,
+                        largest,
+                        untracked,
+                        fingerprints=source_fingerprints,
+                        extract_mode=extract_mode,
+                    )
+                    backfill.append((_stream(src, None, extract_mode, wing), fields))
+                break
+    if backfill and source_state is not None:
+        source_state.backfill(backfill)
+    return mined
 
 
 def prefetch_mined_set(
@@ -300,6 +459,7 @@ def prefetch_mined_set(
     *,
     source_fingerprints: bool = False,
     wing: Optional[str] = None,
+    source_state=None,
 ) -> dict[str, Optional[Union[float, str]]]:
     """Pre-fetch source_file -> stored source state for files already mined
     at the current NORMALIZE_VERSION, in one bulk pass instead of one
@@ -339,16 +499,23 @@ def prefetch_mined_set(
     comma-joined values. Above the threshold, or when source_files is
     omitted, the behaviour is unchanged: a bulk sweep still benefits more
     from one full scan than from many filtered queries.
+
+    ``source_state`` is read the way :func:`file_already_mined` reads it: a
+    source with a record is listed with the record's snapshot when the record
+    proves it filed and omitted otherwise; sources without one follow the
+    per-row rules and get a record backfilled when those prove them filed.
     """
     # Per source_file: per source-state group -> [count, largest chunk_total,
     # whether some drawer has no chunk_total]. A source is only "mined" once
     # some group is complete, and never while any of its rows is unprovable.
     groups: dict[str, dict] = {}
     unprovable: set = set()
+    in_scope: dict[str, int] = {}
 
     def _reset():
         groups.clear()
         unprovable.clear()
+        in_scope.clear()
 
     def _absorb(meta):
         meta = coerce_metadata_types(meta or {})
@@ -364,6 +531,7 @@ def prefetch_mined_set(
             return
         if not _meta_is_current(meta, extract_mode):
             return
+        in_scope[src] = in_scope.get(src, 0) + 1
         if source_fingerprints:
             state_key = meta.get("source_fingerprint")
         else:
@@ -404,16 +572,16 @@ def prefetch_mined_set(
     else:
         _scan_all()
 
-    mined: dict[str, Optional[Union[float, str]]] = {}
-    for src, by_state in groups.items():
-        if src in unprovable:
-            continue
-        for state_key, (count, largest, untracked) in by_state.items():
-            # Legacy / registry rows carry no completion marker: trusted.
-            if untracked or count >= largest:
-                mined[src] = state_key
-                break
-    return mined
+    return _prefetched_mined(
+        groups,
+        unprovable,
+        in_scope,
+        source_state,
+        extract_mode=extract_mode,
+        wing=wing,
+        source_files=source_files,
+        source_fingerprints=source_fingerprints,
+    )
 
 
 # The keys file_already_mined() reads for the project miner, including the
@@ -431,7 +599,9 @@ _PROJECT_MINED_KEYS = (
 )
 
 
-def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tuple]]:
+def prefetch_complete_mtimes(
+    collection, source_files, *, source_state=None
+) -> Optional[dict[str, tuple]]:
     """``source_file -> stored mtimes of its complete drawer groups``, in one
     sqlite pass, for the project miner's skip check.
 
@@ -451,6 +621,10 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
     Only ``source_files`` are tracked. Returns ``None`` on backends without
     Chroma's sqlite stream, or when the stream fails, so the caller keeps
     the per-file check for every file.
+
+    With ``source_state``, a source that has a project record is listed with
+    the record's mtime only when the record proves it filed (see
+    :func:`_head_proves_mined`); its per-row stamps are not read.
     """
     wanted = set(source_files)
     from ..backends.sqlite_exact import SQLiteExactCollection
@@ -472,6 +646,7 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
     # whether some drawer has no chunk_total].
     groups: dict[str, dict] = {}
     unprovable: set = set()
+    in_scope: dict[str, int] = {}
     from ..backends.chroma_sqlite import MetadataRecoveryPending
     from ..retention import owns
 
@@ -491,8 +666,11 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
             version = meta.get("normalize_version", 1)
             stored_mtime = meta.get("source_mtime")
             chunk_total = meta.get("chunk_total")
-            if version < NORMALIZE_VERSION or stored_mtime is None:
+            if version < NORMALIZE_VERSION:
                 # file_already_mined() skips this drawer without counting it.
+                continue
+            in_scope[src] = in_scope.get(src, 0) + 1
+            if stored_mtime is None:
                 continue
             entry = groups.setdefault(src, {}).setdefault(stored_mtime, [0, 0, False])
             entry[0] += 1
@@ -510,8 +688,24 @@ def prefetch_complete_mtimes(collection, source_files) -> Optional[dict[str, tup
         close = getattr(rows, "close", None)
         if close is not None:
             close()
+    heads: dict = {}
+    if source_state is not None:
+        try:
+            heads = source_state.get_many(owner="project", source_files=wanted)
+        except (OSError, sqlite3.Error):
+            logger.warning("source records unreadable; checking each file on its own")
+            return None
     complete: dict[str, tuple] = {}
+    for src, head in heads.items():
+        if (
+            src not in unprovable
+            and _is_plain_number(head.source_mtime)
+            and _head_proves_mined(head, None, in_scope.get(src, 0))
+        ):
+            complete[src] = (float(head.source_mtime),)
     for src, by_mtime in groups.items():
+        if src in heads:
+            continue
         mtimes = tuple(
             float(mtime)
             for mtime, (count, largest, untracked) in by_mtime.items()
