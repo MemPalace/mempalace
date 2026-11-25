@@ -117,6 +117,103 @@ class TestConnectionLifecycle:
         assert results[0]["object"] == "NewCo"
 
 
+class TestTimelineAndRelationshipProvenance:
+    """timeline and query_relationship return the provenance stored on write."""
+
+    def test_timeline_fact_carries_confidence_and_sources(self, kg):
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "NewCo",
+            confidence=0.42,
+            source_closet="career",
+            source_file="jobs.md",
+        )
+
+        (fact,) = kg.timeline("Alice")
+
+        assert fact["confidence"] == pytest.approx(0.42)
+        assert fact["source_closet"] == "career"
+        assert fact["source_file"] == "jobs.md"
+
+    def test_unfiltered_timeline_fact_carries_confidence_and_sources(self, kg):
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "NewCo",
+            confidence=0.42,
+            source_closet="career",
+            source_file="jobs.md",
+        )
+
+        (fact,) = kg.timeline()
+
+        assert fact["confidence"] == pytest.approx(0.42)
+        assert fact["source_closet"] == "career"
+        assert fact["source_file"] == "jobs.md"
+
+    def test_timeline_for_the_object_entity_carries_the_sources(self, kg):
+        kg.add_triple("Alice", "works_at", "NewCo", source_closet="career", source_file="jobs.md")
+
+        (fact,) = kg.timeline("NewCo")
+
+        assert fact["source_closet"] == "career"
+        assert fact["source_file"] == "jobs.md"
+
+    def test_query_relationship_fact_carries_confidence_and_sources(self, kg):
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "NewCo",
+            confidence=0.42,
+            source_closet="career",
+            source_file="jobs.md",
+        )
+
+        (fact,) = kg.query_relationship("works_at")
+
+        assert fact["confidence"] == pytest.approx(0.42)
+        assert fact["source_closet"] == "career"
+        assert fact["source_file"] == "jobs.md"
+
+    def test_query_relationship_with_as_of_carries_the_sources(self, kg):
+        kg.add_triple(
+            "Alice",
+            "works_at",
+            "NewCo",
+            valid_from="2020-01-01",
+            source_closet="career",
+            source_file="jobs.md",
+        )
+
+        (fact,) = kg.query_relationship("works_at", as_of="2021-01-01")
+
+        assert fact["source_closet"] == "career"
+        assert fact["source_file"] == "jobs.md"
+
+    def test_unsupplied_provenance_reads_back_as_defaults(self, kg):
+        kg.add_triple("Alice", "works_at", "NewCo")
+
+        (timeline_fact,) = kg.timeline("Alice")
+        (relationship_fact,) = kg.query_relationship("works_at")
+
+        for fact in (timeline_fact, relationship_fact):
+            assert fact["confidence"] == pytest.approx(1.0)
+            assert fact["source_closet"] is None
+            assert fact["source_file"] is None
+
+    def test_every_read_path_agrees_on_confidence_and_source_closet(self, kg):
+        kg.add_triple("Alice", "works_at", "NewCo", confidence=0.42, source_closet="career")
+
+        (entity_fact,) = kg.query_entity("Alice", direction="outgoing")
+        (timeline_fact,) = kg.timeline("Alice")
+        (relationship_fact,) = kg.query_relationship("works_at")
+
+        for key in ("confidence", "source_closet"):
+            assert timeline_fact[key] == entity_fact[key]
+            assert relationship_fact[key] == entity_fact[key]
+
+
 class TestStatsMetadata:
     def test_stats_reports_sorted_distinct_relationship_types(self, kg):
         kg.add_triple("Alice", "works at", "NewCo")

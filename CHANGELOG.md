@@ -37,6 +37,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **`kg_timeline` and `KnowledgeGraph.query_relationship` return each fact's `confidence`,
+  `source_closet` and `source_file`.** `query_entity` already returned the first two, but
+  the timeline and relationship reads dropped all three, so a fact's provenance depended
+  on which read path surfaced it. The three keys now carry the stored values on every
+  fact those reads return, and no existing key changes. (#2749)
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
   HTTP-capable clients connect to the running hub (`mempalace serve`)
   directly instead of starting a `mempalace-light-mcp` stdio process per
