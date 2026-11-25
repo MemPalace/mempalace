@@ -72,13 +72,17 @@ def _gather_origin_samples(project_dir) -> list:
     the project has no readable text.
     """
     from ..entity_detector import scan_for_detection
+    from ..local_palaces import source_guard
 
     files = scan_for_detection(project_dir, max_files=_PASS_ZERO_MAX_FILES)
+    allowed = source_guard(Path(project_dir))
     samples: list = []
     total_chars = 0
     for filepath in files:
         if total_chars >= _PASS_ZERO_TOTAL_CAP:
             break
+        if allowed is not None and not allowed(filepath):
+            continue
         try:
             # ``scan_for_detection`` picks candidates by extension, so a FIFO
             # named ``notes.md`` reaches this loop; opening one for reading

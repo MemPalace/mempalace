@@ -1958,7 +1958,10 @@ def scan_project(
     worktree locations (``.worktrees/``, ``.claude/worktrees/``) are always
     pruned via :func:`should_skip_dir`, independent of ``respect_gitignore``.
     """
+    from .local_palaces import source_guard
+
     project_path = Path(project_dir).expanduser().resolve()
+    allowed = source_guard(project_path)
     files = []
     active_matchers = []
     matcher_cache = {}
@@ -1991,8 +1994,11 @@ def scan_project(
         dirs[:] = [
             d
             for d in dirs
-            if is_force_included(root_path / d, project_path, include_paths)
-            or not should_skip_dir(root_path / d)
+            if (allowed is None or allowed(root_path / d))
+            and (
+                is_force_included(root_path / d, project_path, include_paths)
+                or not should_skip_dir(root_path / d)
+            )
         ]
         if respect_gitignore and active_matchers:
             dirs[:] = [
@@ -2017,6 +2023,8 @@ def scan_project(
             if not force_include and filename in SKIP_FILENAMES:
                 continue
             if filepath.suffix.lower() not in READABLE_EXTENSIONS and not exact_force_include:
+                continue
+            if allowed is not None and not allowed(filepath):
                 continue
             if respect_gitignore and active_matchers and not force_include:
                 if is_gitignored(filepath, active_matchers, is_dir=False):
@@ -2109,6 +2117,9 @@ def mine(
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
     """
+    from .local_palaces import enforce_source
+
+    project_dir = enforce_source(project_dir, palace_path, "projects")
     try:
         if dry_run:
             return _mine_impl(
@@ -2181,6 +2192,7 @@ def _mine_impl(
     max_chunks_per_file: Optional[int] = None,
 ):
     from .config import MempalaceConfig
+    from .local_palaces import filter_source_candidates
 
     writes_at_start = palace_write_serial()
     project_path = Path(project_dir).expanduser().resolve()
@@ -2202,10 +2214,12 @@ def _mine_impl(
             include_ignored=include_ignored,
             exclude_patterns=exclude_patterns,
         )
-    elif exclude_patterns:
-        files = _apply_exclude_patterns_to_prescanned_files(
-            files, project_path, exclude_patterns, include_ignored
-        )
+    else:
+        files = list(filter_source_candidates(project_path, files))
+        if exclude_patterns:
+            files = _apply_exclude_patterns_to_prescanned_files(
+                files, project_path, exclude_patterns, include_ignored
+            )
 
     from .embedding import describe_device
 

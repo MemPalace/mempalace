@@ -322,6 +322,16 @@ def _tally_wings_rooms(all_meta, wings=None, rooms=None, taxonomy=None) -> int:
 
 
 def tool_status():
+    result = _palace_status()
+    local = paths.local_root()
+    if local is not None:
+        result["palace_path"] = _config.palace_path
+        if not _backend_db_exists():
+            result["hint"] = f"Run: mempalace local run {local.name} -- mine <allowed-source>"
+    return result
+
+
+def _palace_status():
     _ensure_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = _tool_status_via_sqlite()

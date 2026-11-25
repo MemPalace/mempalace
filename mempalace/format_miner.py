@@ -446,29 +446,37 @@ def scan_formats(directory: Union[Path, str]) -> list[Path]:
     (sorted by path) so a re-mine processes files in the same order each
     time — useful for reproducing bug reports.
     """
+    from .local_palaces import source_guard
+
     # ``expanduser().resolve()`` normalizes ``~/docs`` and relative paths so
     # CLI inputs like ``mempalace mine --mode extract ~/docs`` work without
     # the caller pre-resolving.
     root = Path(directory).expanduser().resolve()
     if not root.exists():
         return []
+    allowed = source_guard(root)
 
     found: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         # Mutate dirnames in place to prune the walk. Uses the shared
         # palace.SKIP_DIRS constant so this stays in sync with the other
         # miners' skip set.
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        current = Path(dirpath)
+        dirnames[:] = [
+            d for d in dirnames if d not in SKIP_DIRS and (allowed is None or allowed(current / d))
+        ]
         for name in filenames:
             if name in _SKIP_FILENAMES:
                 continue
-            p = Path(dirpath) / name
+            p = current / name
             # Skip symlinks — prevents following links to /dev/urandom,
             # circular links, or processing the same file twice via
             # different paths. Mirrors miner.py:1068.
             if p.is_symlink():
                 continue
             if p.suffix.lower() not in SUPPORTED_FORMATS:
+                continue
+            if allowed is not None and not allowed(p):
                 continue
             found.append(p)
 
@@ -764,6 +772,9 @@ def mine_formats(
     - A real mine holds ``mine_palace_lock`` for its whole run, like the
       project and conversation miners.
     """
+    from .local_palaces import enforce_source
+
+    format_dir = enforce_source(format_dir, palace_path, "extract")
     if dry_run:
         return _mine_formats_impl(format_dir, palace_path, wing, agent, limit, dry_run)
     with mine_palace_lock(palace_path):
@@ -778,6 +789,8 @@ def _mine_formats_impl(
     limit: int,
     dry_run: bool,
 ) -> None:
+    from .local_palaces import filter_source_candidates
+
     # MempalaceConfig + chunk_text are imported at module level (above) so
     # tests can patch ``mempalace.format_miner.MempalaceConfig`` and
     # ``mempalace.format_miner.chunk_text`` directly.
@@ -853,7 +866,7 @@ def _mine_formats_impl(
         collection = get_collection(palace_path) if not dry_run else None
         aaak_col = open_aaak_collection(palace_path) if not dry_run else None
 
-        for i, filepath in enumerate(files, 1):
+        for i, filepath in enumerate(filter_source_candidates(format_path, files), 1):
             collection = _yield_and_reopen(palace_path, collection)
             files_processed = i
             source_file = str(filepath)

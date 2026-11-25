@@ -230,6 +230,8 @@ For Claude Code, Gemini CLI, [Antigravity](https://mempalaceofficial.com/guide/a
 MCP-compatible tools, and local models, see
 [mempalaceofficial.com/guide/getting-started](https://mempalaceofficial.com/guide/getting-started.html).
 
+To keep a project or corpus out of the default shared database, create a [named project-local palace](docs/project-local-palaces.md).
+
 ---
 
 ## Benchmarks

@@ -181,6 +181,9 @@ class MediaAdapter(BaseSourceAdapter):
                 yield root
             return
 
+        from ..local_palaces import source_guard
+
+        allowed = source_guard(root)
         for current, dirnames, filenames in os.walk(root, followlinks=False):
             current_path = Path(current)
             dirnames[:] = sorted(
@@ -189,11 +192,14 @@ class MediaAdapter(BaseSourceAdapter):
                 if not name.startswith(".")
                 and name.lower() not in _SKIP_DIRS
                 and not (current_path / name).is_symlink()
+                and (allowed is None or allowed(current_path / name))
             )
             for filename in sorted(filenames):
                 if filename.startswith("."):
                     continue
                 path = current_path / filename
                 if path.is_symlink() or path.suffix.lower() not in _MEDIA_BY_EXTENSION:
+                    continue
+                if allowed is not None and not allowed(path):
                     continue
                 yield path

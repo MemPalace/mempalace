@@ -743,6 +743,14 @@ class MempalaceConfig:
         Defaults to a "palace" sub-directory inside the active config
         directory, so the palace follows the config wherever XDG places it.
         """
+        local = paths.local_root()
+        if local is not None:
+            target = str(local / "palace")
+            if self._palace_path_override is not None and not paths.same_path(
+                self._palace_path_override, target
+            ):
+                raise ValueError("cannot redirect the database of a named local palace")
+            return target
         if self._palace_path_override is not None:
             return self._palace_path_override
         # Precedence: MEMPALACE_PALACE_PATH (documented, primary) >
@@ -793,6 +801,8 @@ class MempalaceConfig:
         Read from ``config.json`` first, then ``MEMPALACE_BACKEND``, then
         ``"chroma"`` for backwards compatibility with existing palaces.
         """
+        if paths.local_root() is not None:
+            return DEFAULT_BACKEND
         cfg_val = self._file_config.get("backend")
         if cfg_val:
             return str(cfg_val).strip().lower()
