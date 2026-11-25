@@ -310,7 +310,7 @@ Query entity relationships with time filtering.
 | `as_of` | string | No | Date filter — only facts valid at this date (YYYY-MM-DD) |
 | `direction` | string | No | `outgoing`, `incoming`, or `both` (default: `both`) |
 
-**Returns:** `{ entity, as_of, facts: [{ direction, subject, predicate, object, valid_from, valid_to, current }], count }`
+**Returns:** `{ entity, as_of, active_facts, historical_facts, future_facts, facts: [{ id, direction, subject, predicate, object, valid_from, valid_to, confidence, source_closet, source_file, current }], count }`. `id` is the same `triple_id` that `mempalace_kg_add` and `mempalace_kg_supersede` return.
 
 ---
 
@@ -368,8 +368,10 @@ Chronological timeline of facts.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `entity` | string | No | Entity to get timeline for (omit for full timeline) |
+| `limit` | integer | No | Max facts per page (default 100, max 100) |
+| `offset` | integer | No | Offset for pagination (default 0) |
 
-**Returns:** `{ entity, timeline: [{ subject, predicate, object, valid_from, valid_to, current }], count }`
+**Returns:** `{ entity, timeline: [{ id, subject, predicate, object, valid_from, valid_to, current }], count, total, offset, limit }`. `id` is the same `triple_id` that `mempalace_kg_add` and `mempalace_kg_supersede` return.
 
 ---
 
