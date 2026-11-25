@@ -431,6 +431,9 @@ def test_cli_reports_global_provider_error_instead_of_zero_success(tmp_path, mon
         def __init__(self, palace_path=None):
             self.palace_path = palace_path or self.__class__.palace_path
 
+        def hallways_mode(self, explicit=None, *, background=False):
+            return explicit or "inline"
+
     class _KnowledgeGraph:
         def __init__(self, **kwargs):
             pass
