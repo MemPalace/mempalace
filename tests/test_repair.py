@@ -4716,7 +4716,7 @@ def _seed_palace_with_journal(palace):
     journal = palace / "drawer_revisions.jsonl"
     journal.write_text('{"drawer_id": "d0", "content": "prior text"}\n', encoding="utf-8")
     journal.chmod(0o600)
-    (palace / ".mempalace").mkdir()
+    (palace / ".mempalace").mkdir(exist_ok=True)
     (palace / ".mempalace" / "origin.json").write_text('{"kind": "x"}', encoding="utf-8")
     palace.chmod(0o755)
     return journal
@@ -4761,8 +4761,12 @@ def test_rebuild_from_sqlite_skips_symlinked_journal_and_state_dir(tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret").write_text("s", encoding="utf-8")
-    (src / "drawer_revisions.jsonl").symlink_to(outside / "secret")
-    (src / ".mempalace").symlink_to(outside, target_is_directory=True)
+    journal_link = src / "drawer_revisions.jsonl"
+    if not journal_link.exists() and not journal_link.is_symlink():
+        journal_link.symlink_to(outside / "secret")
+    state_dir = src / ".mempalace"
+    if not state_dir.exists() and not state_dir.is_symlink():
+        state_dir.symlink_to(outside, target_is_directory=True)
 
     repair.rebuild_from_sqlite(str(src), str(dest))
 
