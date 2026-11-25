@@ -595,6 +595,28 @@ def test_a_record_that_cannot_go_pending_stops_before_any_drawer_write(palace, m
     assert {doc for doc, _ in _rows(palace).values()} == {"one", "two"}
 
 
+def test_text_that_cannot_be_journaled_is_not_replaced(palace, monkeypatch):
+    import mempalace.revisions as revisions
+    from mempalace.palace import PriorTextArchiveFailed
+
+    _file(palace, _drawers(["one", "two"]))
+    spy = _WriteSpy(monkeypatch, get_collection(palace))
+
+    def full_disk(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(revisions, "append_drawer_revisions", full_disk)
+    with pytest.raises(PriorTextArchiveFailed):
+        _file(palace, _drawers(["one", "TWO", "three"], "2:2:2"))
+
+    assert spy.names() == []
+    assert {i: doc for i, (doc, _) in _rows(palace).items()} == {
+        "drawer_0": "one",
+        "drawer_1": "two",
+    }
+    assert SourceStateStore(palace).get(_stream()).state == "pending"
+
+
 # -- older binaries on the same palace ---------------------------------------------
 
 
