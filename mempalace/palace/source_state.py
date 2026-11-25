@@ -15,7 +15,7 @@ Before this record, that bookkeeping lived on every drawer row, so a re-mine
 that changed one drawer still rewrote all of them to restamp it. With the
 record, a re-mine writes only drawers that changed, then flips the one record.
 
-Crash safety (the #2183 completeness rule): a writer marks the record
+Crash safety (no source may read as mined while drawers are missing): a writer marks the record
 ``pending`` before its first drawer write and ``complete`` in one transaction
 only after its drawers are durable and the stale ones are pruned. A crash in
 between leaves it pending, which reads as "not mined", so the next mine redoes
