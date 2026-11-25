@@ -277,9 +277,9 @@ def _record_probes(monkeypatch):
     calls = []
     real = ic.run_probe
 
-    def _spy(db_path, *, ids, full):
+    def _spy(db_path, *, ids, full, scan_all=False):
         calls.append({"ids": None if ids is None else set(ids), "full": full})
-        return real(db_path, ids=ids, full=full)
+        return real(db_path, ids=ids, full=full, scan_all=scan_all)
 
     monkeypatch.setattr(ic, "run_probe", _spy)
     return calls
@@ -565,3 +565,105 @@ def test_full_mode_checks_even_when_the_cache_matches(tmp_path, monkeypatch):
     _validate_palace_fts5_after_mine(str(palace), writes_since=before)
 
     assert probes == [{"ids": {"b"}, "full": True}]
+
+
+@pytest.mark.parametrize("baseline", ["no_writes", "unknown"])
+def test_required_full_probe_survives_unchanged_fingerprint(tmp_path, monkeypatch, baseline):
+    from mempalace.integrity_check import record_clean_full_check
+    from mempalace.palace import _validate_palace_fts5_after_mine
+
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    record_clean_full_check(str(palace))
+    before = None
+    if baseline == "no_writes":
+        import subprocess
+        import sys
+
+        # Crash after acquiring the writer lock and marking the write, before
+        # SQLite changes the fingerprint. A no-op successor still owes a check.
+        script = (
+            "import os, sys\n"
+            "from mempalace.palace import mine_palace_lock\n"
+            "from mempalace.integrity_check import note_write_started\n"
+            "with mine_palace_lock(sys.argv[1]):\n"
+            "    note_write_started(sys.argv[1])\n"
+            "    os._exit(17)\n"
+        )
+        crash = subprocess.run([sys.executable, "-c", script, str(palace)], timeout=60)
+        assert crash.returncode == 17
+        before = palace_write_serial()
+
+    probes = _record_probes(monkeypatch)
+    _validate_palace_fts5_after_mine(str(palace), writes_since=before)
+    assert [p["full"] for p in probes] == [True]
+
+
+def test_write_invalidates_maintenance_cache_even_with_unchanged_stat(tmp_path):
+    import os
+
+    from mempalace.integrity_check import run_full_check
+
+    palace = _palace_with(tmp_path, [("a", "one")])
+    assert not run_full_check(str(palace)).cached
+    db = palace / "chroma.sqlite3"
+    before = db.stat()
+    _mine_like_write(palace, ["a"], ["two"])
+    assert db.stat().st_size == before.st_size
+    os.utime(db, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert not run_full_check(str(palace)).cached
+
+
+def test_scoped_scan_checks_keys_of_numeric_metadata(tmp_path):
+    from mempalace.integrity_check import scoped_check_errors
+
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    _raw_sql(
+        palace,
+        "INSERT INTO embedding_metadata(id, key, int_value) VALUES(?, ?, 1)",
+        (_rowid(palace, "a"), "bad\x00key"),
+    )
+    errors = scoped_check_errors(str(palace / "chroma.sqlite3"), {"a"})
+    assert any("raw NUL" in message and "key" in message for message in errors)
+
+
+def test_missing_requested_child_verdict_fails_closed(tmp_path, monkeypatch):
+    from mempalace import integrity_check as ic
+
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    monkeypatch.setattr(ic, "_CHILD_CODE", """print('{"full": null, "scoped": null}')""")
+    outcome = ic.run_full_check(str(palace))
+    assert ic.all_unverified(outcome.errors)
+    assert not (palace / ".mempalace" / "integrity.json").exists()
+
+
+def test_maintenance_command_reports_unverified_child_without_recovery(
+    tmp_path, monkeypatch, capsys
+):
+    from mempalace import integrity_check as ic
+
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    monkeypatch.setattr(ic, "_CHILD_CODE", "raise SystemExit(3)")
+    with pytest.raises(SystemExit) as exc_info:
+        _integrity_check_cli(palace)
+    assert exc_info.value.code == 1
+    output = capsys.readouterr().out
+    assert "could not run" in output
+    assert "mempalace repair" not in output
+
+
+def test_evicted_write_cannot_hide_a_stored_nul(tmp_path, monkeypatch):
+    from mempalace.backends import chroma
+    from mempalace.palace import MineValidationError, _validate_palace_fts5_after_mine
+
+    palace = _palace_with(tmp_path, [("a", "before")])
+    monkeypatch.setattr(chroma, "_WRITTEN_IDS_CAP", 1)
+    since = _mine_like_write(palace, ["a", "b"], ["first", "second"])
+    assert chroma_written_ids_since(since) is None
+    _raw_sql(
+        palace,
+        "UPDATE embedding_metadata SET string_value=? WHERE id=? AND key='chroma:document'",
+        ("bad\x00row", _rowid(palace, "a")),
+    )
+    with pytest.raises(MineValidationError) as error:
+        _validate_palace_fts5_after_mine(str(palace), writes_since=since)
+    assert any("raw NUL" in message for message in error.value.errors)

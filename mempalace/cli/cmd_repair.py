@@ -80,7 +80,7 @@ def cmd_integrity_check(args):
         raise SystemExit(2)
     import time as _time
 
-    from ..integrity_check import run_full_check
+    from ..integrity_check import all_unverified, run_full_check
 
     outcome = run_full_check(palace_path, force=getattr(args, "force", False))
     if outcome.cached:
@@ -99,6 +99,9 @@ def cmd_integrity_check(args):
         print(f"    - {message}")
     if len(outcome.errors) > 5:
         print(f"    ... and {len(outcome.errors) - 5} more")
+    if all_unverified(outcome.errors):
+        print("  Palace not verified. Re-run the integrity check.")
+        raise SystemExit(1)
     print("  Stop all MemPalace writers, back up the palace, then run `mempalace repair`.")
     raise SystemExit(1)
 

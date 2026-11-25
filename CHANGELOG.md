@@ -13,8 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **The first mine that writes to an existing palace after upgrade runs one
   full integrity check** (no clean result is on record yet) and creates
   `<palace>/.mempalace/` if it is missing; later mines run the scoped check.
-  The FTS5 auto-heal after a failed check still writes through Python's
-  `sqlite3` in the mining process, after closing Chroma's handles, as before.
+  If a check finds isolated FTS5 damage, a child process rebuilds and
+  verifies the index while the miner holds the writer lease.
 
 - **The first conversation mine after upgrade re-reads every previously mined
   transcript in its selected sources.** Older rows have no verified source

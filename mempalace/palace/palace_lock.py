@@ -82,9 +82,8 @@ def _validate_palace_fts5_after_mine(
     """Raise MineValidationError if the post-mine integrity check fails.
 
     ``writes_since`` is :func:`palace_write_serial` read before the mine's
-    first write. When nothing was written since, the check is skipped: a mine
-    that filed, purged and registered nothing left the database as it found
-    it. ``None`` always checks, and always runs the full check, since there is
+    first write. A no-op mine skips validation unless a crash marker
+    requires recovery. ``None`` always checks, and always runs the full check, since there is
     no journal baseline to scope it to.
 
     The check itself (:func:`mempalace.integrity_check.check_after_mine`) runs
@@ -103,13 +102,18 @@ def _validate_palace_fts5_after_mine(
     last word here: it checks the content table against `embedding_metadata`
     before rebuilding from it, and declines when it cannot.
     """
-    if writes_since is not None and palace_write_serial() == writes_since:
+    from ..integrity_check import check_after_mine, unclean_exit_seen
+
+    if (
+        writes_since is not None
+        and palace_write_serial() == writes_since
+        and not unclean_exit_seen(palace_path)
+    ):
         return
     if resolve_backend_name(palace_path) != "chroma":
         return
 
     from ..backends.chroma import chroma_written_ids_since
-    from ..integrity_check import check_after_mine
 
     ids = None if writes_since is None else chroma_written_ids_since(writes_since)
     errors = check_after_mine(
@@ -122,13 +126,10 @@ def _validate_palace_fts5_after_mine(
 def _heal_after_mine(palace_path: str, errors: list[str]) -> list[str]:
     """Try the FTS5 auto-heal on a failed full check; return what remains."""
     # Defer-import: keeps the repair module graph out of mine's hot import path.
+    from ..integrity_check import run_locked_heal
     from ..repair import _close_chroma_handles, _errors_are_isolated_fts5, maybe_autoheal_fts5_index
 
-    # The heal writes through Python's sqlite3 in this process, so first close
-    # the writer's cached PersistentClient (the live singleton, not a
-    # transient ChromaBackend, which would only clear its own empty
-    # `_clients` dict and leave _DEFAULT_BACKEND's handle open; on Windows
-    # that keeps the sqlite file mmap'd).
+    # Drop cached Chroma handles before the child modifies the index.
     # Only when the heal will act: a declined heal writes nothing, and closing
     # throws away the writer's loaded index for no gain.
     if _errors_are_isolated_fts5(errors):
@@ -145,7 +146,9 @@ def _heal_after_mine(palace_path: str, errors: list[str]) -> list[str]:
     # quick_check already failed -- a rebuild being attempted, refused, or
     # completed against the operator's data -- so warning is both the level
     # that survives and the level that fits.
-    return maybe_autoheal_fts5_index(palace_path, errors, progress=logger.warning)
+    return maybe_autoheal_fts5_index(
+        palace_path, errors, progress=logger.warning, run_locked=run_locked_heal
+    )
 
 
 def palace_write_serial() -> int:

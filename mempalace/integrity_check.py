@@ -32,21 +32,22 @@ trigger below sends the next mine to the full check for exactly that case.
   left behind; see :func:`note_write_started`);
 * when the last clean full check is older than
   ``integrity_full_check_interval_hours`` (default 24) or there is none;
-* when the write journal cannot vouch for every row the mine wrote;
+* when the write journal cannot vouch for every row the mine wrote
+  (the text scan streams all metadata rows in that case);
 * when the scoped check fails, so the FTS5 auto-heal has a verdict to act on;
 * on every mine with ``post_mine_integrity_check = "full"``;
 * on demand with ``mempalace integrity-check``, and in ``mempalace repair``.
 
 A clean full check is recorded in ``<palace>/.mempalace/integrity.json``
-keyed on the database's size and mtime (and its journal's), and reused
+keyed on the last write generation and the database and journal sizes and mtimes, and reused
 until the palace changes.
 
 **Child process.** Chroma's Rust core links its own SQLite; Python's
 ``sqlite3`` is another copy. Two copies in one process can clear each
 other's POSIX locks (sqlite.org, "How To Corrupt An SQLite Database File",
 "Multiple copies of SQLite linked into the same application"). Both checks run in
-a short-lived ``python -I`` child, so the mining process never opens
-``chroma.sqlite3`` through Python's SQLite. A child that fails to start,
+a short-lived ``python -I`` child, so the post-mine probes and recovery transaction open
+``chroma.sqlite3`` only in a worker. A child that fails to start,
 crashes, or answers garbage is reported as a check failure, never as clean.
 
 This module keeps its imports light: it is the child's entry point too.
@@ -56,17 +57,21 @@ from __future__ import annotations
 
 import json
 import os
+import site
 import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from . import paths
+from .fsio import atomic_write_text, replace_with_retry, unlink_quietly
 
 SCOPED_TABLES = ("embeddings", "embedding_metadata")
 # Every error that means "no verdict" (the child could not run or answer)
@@ -122,23 +127,27 @@ def _label(blob) -> str:
     return bytes(blob).decode("utf-8", errors="replace").replace("\x00", "\\0")
 
 
-def _scan_written_rows(conn, ids: list[str]) -> list[str]:
+def _metadata_row_batches(conn, ids):
+    query = (
+        "SELECT id, embedding_id FROM embeddings "
+        "WHERE segment_id IN (SELECT id FROM segments WHERE scope = 'METADATA')"
+    )
+    if ids is None:
+        cursor = conn.execute(query)
+        while rows := cursor.fetchmany(_ID_BATCH):
+            yield dict(rows)
+    else:
+        for batch in _batches(ids):
+            marks = ",".join("?" * len(batch))
+            cursor = conn.execute(f"{query} AND embedding_id IN ({marks})", batch)
+            while rows := cursor.fetchmany(_ID_BATCH):
+                yield dict(rows)
+
+
+def _scan_written_rows(conn, ids: Optional[list[str]]) -> list[str]:
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
     if "embeddings" not in tables or "segments" not in tables:
         return []
-    segments = [row[0] for row in conn.execute("SELECT id FROM segments WHERE scope = 'METADATA'")]
-    if not segments:
-        return []
-    seg_marks = ",".join("?" * len(segments))
-    rowids: dict[int, str] = {}
-    for batch in _batches(ids):
-        marks = ",".join("?" * len(batch))
-        for rowid, drawer_id in conn.execute(
-            f"SELECT id, embedding_id FROM embeddings "
-            f"WHERE segment_id IN ({seg_marks}) AND embedding_id IN ({marks})",
-            (*segments, *batch),
-        ):
-            rowids[rowid] = drawer_id
 
     sources = []
     for table in ("embedding_metadata", "embedding_metadata_array"):
@@ -147,7 +156,7 @@ def _scan_written_rows(conn, ids: list[str]) -> list[str]:
                 (
                     table,
                     f"SELECT id, CAST(key AS BLOB), CAST(string_value AS BLOB) FROM {table} "
-                    "WHERE id IN ({marks}) AND string_value IS NOT NULL",
+                    "WHERE id IN ({marks})",
                 )
             )
     if "embedding_fulltext_search_content" in tables:
@@ -160,13 +169,16 @@ def _scan_written_rows(conn, ids: list[str]) -> list[str]:
         )
 
     errors: list[str] = []
-    for batch in _batches(sorted(rowids)):
+    for rowids in _metadata_row_batches(conn, ids):
+        batch = list(rowids)
         marks = ",".join("?" * len(batch))
         for table, sql in sources:
             for rowid, key, value in conn.execute(sql.format(marks=marks), batch):
                 for part, blob in (("key", key), ("value", value)):
                     fault = _text_fault(blob)
                     if fault:
+                        if len(errors) == _MAX_REPORTED:
+                            return [*errors, "... additional stored-text faults omitted"]
                         where = f"key {_label(key)!r}" if key is not None else "document"
                         errors.append(
                             f"{fault} in {table} {part} ({where}) of drawer "
@@ -181,7 +193,7 @@ def _capped(errors: list[str]) -> list[str]:
     return [*errors[:_MAX_REPORTED], f"... and {len(errors) - _MAX_REPORTED} more issue(s)"]
 
 
-def scoped_check_errors(db_path: str, ids: Iterable[str]) -> list[str]:
+def scoped_check_errors(db_path: str, ids: Optional[Iterable[str]]) -> list[str]:
     """Scan the rows written for ``ids`` and quick_check the tables writes touch.
 
     See the module docstring for what this catches and what it leaves to the
@@ -189,6 +201,9 @@ def scoped_check_errors(db_path: str, ids: Iterable[str]) -> list[str]:
     """
     try:
         with closing(_connect(db_path)) as conn:
+            if ids is None:
+                # The accompanying whole-database check covers the two tables.
+                return _scan_written_rows(conn, None)
             if sqlite3.sqlite_version_info < _TABLE_QUICK_CHECK_MIN:
                 errors = _quick_check(conn)
             else:
@@ -200,7 +215,7 @@ def scoped_check_errors(db_path: str, ids: Iterable[str]) -> list[str]:
 
 
 def full_check_errors(db_path: str) -> list[str]:
-    """``PRAGMA quick_check`` of the whole database (includes FTS5 integrity)."""
+    """``PRAGMA quick_check`` of the whole database (FTS5 xIntegrity on SQLite 3.44+)."""
     try:
         with closing(_connect(db_path)) as conn:
             return _capped(_quick_check(conn))
@@ -209,10 +224,29 @@ def full_check_errors(db_path: str) -> list[str]:
 
 
 def _child_main() -> None:  # pragma: no cover - runs in the child; see run_probe
-    request = json.loads(sys.stdin.read())
+    request = json.loads(sys.stdin.readline())
+    if "heal" in request:
+        # The parent retains the writer lease. Its private pipe closes on death,
+        # including on Windows. Exit immediately so SQLite rolls back an open
+        # transaction and the next mine can act on the in-flight marker.
+        def exit_with_parent():
+            os.read(0, 1)
+            os._exit(1)
+
+        threading.Thread(target=exit_with_parent, daemon=True).start()
+        if request.get("user_site"):
+            site.addsitedir(request["user_site"])
+        from .repair import _heal_fts5_index_locked
+
+        messages = []
+        remaining = _heal_fts5_index_locked(
+            request["palace"], request["heal"], progress=messages.append
+        )
+        print(json.dumps({"remaining": remaining, "progress": messages}))
+        return
     db_path = request["db_path"]
     answer = {"sqlite_version": sqlite3.sqlite_version, "scoped": None, "full": None}
-    if request.get("ids") is not None:
+    if request.get("ids") is not None or request.get("scan_all"):
         answer["scoped"] = scoped_check_errors(db_path, request["ids"])
     if request.get("full"):
         answer["full"] = full_check_errors(db_path)
@@ -226,6 +260,7 @@ _STATE_DIR = paths.DIRNAME
 _RECORD = "integrity.json"
 _IN_FLIGHT = "write-in-flight"
 _UNCLEAN = "integrity-unclean"
+_LAST_WRITE = "last-write"
 
 _in_flight_lock = threading.Lock()
 _in_flight: dict[str, int] = {}
@@ -251,17 +286,7 @@ def _state_path(palace_path: str, name: str) -> str:
 
 def _write_atomic(path: str, text: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(tmp, path)
-
-
-def _unlink(path: str) -> None:
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
+    atomic_write_text(path, text, follow_symlinks=False)
 
 
 def note_write_started(palace_path: str) -> None:
@@ -270,31 +295,22 @@ def note_write_started(palace_path: str) -> None:
     The marker outlives a writer killed mid-write (SIGKILL, power loss, a
     crash in Chroma's core). Finding one that no write in this process owns
     means the last writer died with a write open, so the next mine runs the
-    full check. A finished write, even a failed one, removes it. Best-effort:
-    it never fails a write.
+    full check. A finished write publishes its unique generation. If the
+    marker cannot be established the write must not start.
     """
     if not palace_path:
         return
     key = _key(palace_path)
     with _in_flight_lock:
         count = _in_flight.get(key, 0)
-        _in_flight[key] = count + 1
-        if count:
-            return
-        try:
+        if not count:
             marker = _state_path(palace_path, _IN_FLIGHT)
-            if os.path.exists(marker):
-                # Latch the evidence before this write replaces the marker.
-                _write_atomic(_state_path(palace_path, _UNCLEAN), "")
-            elif not os.path.isdir(os.path.dirname(marker)):
-                if not os.path.isdir(palace_path):
-                    return
-                os.mkdir(os.path.dirname(marker))
-            # One create, no rename: a torn marker still proves a write was open.
-            with open(marker, "w", encoding="ascii") as handle:
-                handle.write(str(os.getpid()))
-        except OSError:
-            pass
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            if os.path.lexists(marker):
+                # Preserve evidence before replacing a dead writer's marker.
+                replace_with_retry(marker, _state_path(palace_path, _UNCLEAN))
+            atomic_write_text(marker, uuid.uuid4().hex, follow_symlinks=False)
+        _in_flight[key] = count + 1
 
 
 def note_write_finished(palace_path: str) -> None:
@@ -308,10 +324,12 @@ def note_write_finished(palace_path: str) -> None:
             _in_flight[key] = count
             return
         _in_flight.pop(key, None)
-        _unlink(_state_path(palace_path, _IN_FLIGHT))
+        replace_with_retry(
+            _state_path(palace_path, _IN_FLIGHT), _state_path(palace_path, _LAST_WRITE)
+        )
 
 
-def _unclean_exit_seen(palace_path: str) -> bool:
+def unclean_exit_seen(palace_path: str) -> bool:
     if os.path.exists(_state_path(palace_path, _UNCLEAN)):
         return True
     with _in_flight_lock:
@@ -333,6 +351,13 @@ def db_fingerprint(palace_path: str) -> Optional[dict]:
         except OSError:
             return None
         fingerprint[suffix or "db"] = [st.st_size, st.st_mtime_ns]
+    try:
+        with open(_state_path(palace_path, _LAST_WRITE), encoding="ascii") as handle:
+            fingerprint["write"] = handle.read(32)
+    except FileNotFoundError:
+        pass  # A palace that predates the write marker.
+    except (OSError, UnicodeError):
+        return None
     return fingerprint
 
 
@@ -373,10 +398,10 @@ def record_clean_full_check(
         return
     if not holds_writer_lock:
         return
-    _unlink(_state_path(palace_path, _UNCLEAN))
+    unlink_quietly(_state_path(palace_path, _UNCLEAN))
     with _in_flight_lock:
         if not _in_flight.get(_key(palace_path)):
-            _unlink(_state_path(palace_path, _IN_FLIGHT))
+            unlink_quietly(_state_path(palace_path, _IN_FLIGHT))
 
 
 def _cached_clean(record: Optional[dict], palace_path: str) -> bool:
@@ -398,22 +423,21 @@ def full_check_reason(
 ) -> Optional[str]:
     """Why the full check must run now, or None when the scoped check suffices.
 
-    A clean record for the database exactly as it is now (same size and
-    mtime) answers every trigger except ``force``: nothing changed since a
-    full check found it clean.
+    An unchanged database can reuse a scheduled check. Explicit requests,
+    a dead writer and incomplete write coverage always require a fresh check.
     """
     now = time.time() if now is None else now
     record = _load_record(palace_path)
-    if not force and _cached_clean(record, palace_path):
-        return None
     if force:
         return "requested"
     if mode == "full":
         return "post_mine_integrity_check = full"
-    if _unclean_exit_seen(palace_path):
+    if unclean_exit_seen(palace_path):
         return "a writer exited mid-write"
     if not ids_complete:
         return "the write journal cannot name every row this mine wrote"
+    if _cached_clean(record, palace_path):
+        return None
     if record is None:
         return "no full check on record"
     if interval_hours > 0 and now - float(record["checked_at"]) >= interval_hours * 3600:
@@ -439,7 +463,56 @@ _CHILD_CODE = (
 )
 
 
-def run_probe(db_path: str, *, ids: Optional[Iterable[str]], full: bool) -> ProbeResult:
+def run_locked_heal(palace_path: str, errors: list[str], *, progress) -> list[str]:
+    """Execute repair's locked transaction in a child. The parent owns both writer locks."""
+    note_write_started(palace_path)
+    try:
+        # Keep the recovery obligation even if the worker itself dies mid-heal.
+        _write_atomic(_state_path(palace_path, _UNCLEAN), "")
+        return _run_heal_child(palace_path, errors, progress)
+    finally:
+        note_write_finished(palace_path)
+
+
+def _run_heal_child(palace_path, errors, progress):
+    package_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    user_site = site.getusersitepackages() if site.ENABLE_USER_SITE else None
+    request = json.dumps({"palace": palace_path, "heal": errors, "user_site": user_site})
+
+    # Keep stdin open as a parent-liveness pipe while waiting. A temporary file
+    # lets the worker report a verdict of any size without blocking on stdout.
+    with (
+        tempfile.TemporaryFile() as output,
+        subprocess.Popen(
+            [sys.executable, "-I", "-c", _CHILD_CODE, package_parent],
+            stdin=subprocess.PIPE,
+            stdout=output,
+            stderr=None,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ) as proc,
+    ):
+        try:
+            proc.stdin.write(request.encode("ascii") + b"\n")
+            proc.stdin.flush()
+            if proc.wait(timeout=_FULL_TIMEOUT_SECONDS):
+                raise RuntimeError(f"integrity repair child exited with status {proc.returncode}")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        output.seek(0)
+        answer = json.load(output)
+        remaining = answer["remaining"]
+        if not isinstance(remaining, list) or not all(isinstance(e, str) for e in remaining):
+            raise ValueError("invalid integrity repair verdict")
+        for message in answer["progress"]:
+            progress(message)
+        return remaining
+
+
+def run_probe(
+    db_path: str, *, ids: Optional[Iterable[str]], full: bool, scan_all=False
+) -> ProbeResult:
     """Run the scoped check (``ids`` not None) and/or the full check in a child.
 
     The one door between a mining process and Python's SQLite on the palace:
@@ -448,6 +521,7 @@ def run_probe(db_path: str, *, ids: Optional[Iterable[str]], full: bool) -> Prob
     """
     package_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     request = {"db_path": db_path, "ids": None if ids is None else sorted(set(ids)), "full": full}
+    request["scan_all"] = scan_all
     timeout = _FULL_TIMEOUT_SECONDS if full else _SCOPED_TIMEOUT_SECONDS
     failure = None
     try:
@@ -469,6 +543,14 @@ def run_probe(db_path: str, *, ids: Optional[Iterable[str]], full: bool) -> Prob
                 raise ValueError(f"exit status {proc.returncode}")
             answer = json.loads(proc.stdout)
             scoped, full_errors = answer["scoped"], answer["full"]
+            for verdict, requested in ((scoped, ids is not None or scan_all), (full_errors, full)):
+                if requested:
+                    if not isinstance(verdict, list) or not all(
+                        isinstance(e, str) for e in verdict
+                    ):
+                        raise ValueError("missing or invalid requested verdict")
+                elif verdict is not None:
+                    raise ValueError("unexpected verdict")
             return ProbeResult(
                 scoped=None if scoped is None else tuple(scoped),
                 full=None if full_errors is None else tuple(full_errors),
@@ -480,7 +562,9 @@ def run_probe(db_path: str, *, ids: Optional[Iterable[str]], full: bool) -> Prob
                 f": {' | '.join(tail)}" if tail else ""
             )
     errors = (failure,)
-    return ProbeResult(scoped=None if ids is None else errors, full=errors if full else None)
+    return ProbeResult(
+        scoped=errors if ids is not None or scan_all else None, full=errors if full else None
+    )
 
 
 # ── The post-mine check ───────────────────────────────────────────────
@@ -535,30 +619,37 @@ def check_after_mine(palace_path: str, ids: Optional[Iterable[str]], *, heal) ->
         return [
             "PRAGMA quick_check failed: chroma.sqlite3 resolves to a named pipe, not a database"
         ]
+    from .backends._inproc_sqlite import palace_db_lock
+
+    # Keep other local writes out through the recovery transaction and cache
+    # publication as well as the probes. Mines already hold the cross-process lease.
+    with palace_db_lock(db_path):
+        return _check_after_mine_locked(palace_path, db_path, ids, heal)
+
+
+def _check_after_mine_locked(palace_path, db_path, ids, heal) -> list[str]:
     mode, interval_hours = _settings()
-    # "full" restores the old behaviour exactly: no cache, a check every time.
     reason = full_check_reason(
         palace_path,
         mode=mode,
         interval_hours=interval_hours,
         ids_complete=ids is not None,
-        force=mode == "full",
     )
     started, fingerprint = time.time(), db_fingerprint(palace_path)
-    result = _probe_without_inproc_writes(db_path, ids=ids, full=reason is not None)
+    result = run_probe(db_path, ids=ids, full=reason is not None, scan_all=ids is None)
     scoped = list(result.scoped or ())
     full = result.full
     if scoped and full is None:
         # Escalate: the heal acts on a full check's verdict, and the operator
         # gets the whole picture.
-        result = _probe_without_inproc_writes(db_path, ids=None, full=True)
+        result = run_probe(db_path, ids=None, full=True)
         full = result.full
     full_errors = list(full or ())
     if full_errors and not all_unverified(full_errors):
         full_errors = list(heal(full_errors))
         # A heal wrote the database: record what it left, not the pre-probe state.
-        started, fingerprint = time.time(), None
-    if full is not None and not full_errors and not scoped:
+        started, fingerprint = time.time(), db_fingerprint(palace_path)
+    if full is not None and not full_errors and not scoped and fingerprint is not None:
         # Not when the scoped scan failed: quick_check cannot see a stored NUL,
         # so a clean full verdict would certify the very rows that failed.
         record_clean_full_check(
@@ -600,12 +691,12 @@ def run_full_check(palace_path: str, *, force: bool = False) -> FullCheckOutcome
             errors=("chroma.sqlite3 resolves to a named pipe, not a database",), cached=False
         )
     record = _load_record(palace_path)
-    if not force and _cached_clean(record, palace_path):
+    if not force and not unclean_exit_seen(palace_path) and _cached_clean(record, palace_path):
         return FullCheckOutcome(errors=(), cached=True, checked_at=record.get("checked_at"))
     started, fingerprint = time.time(), db_fingerprint(palace_path)
     result = _probe_without_inproc_writes(db_path, ids=None, full=True)
     errors = tuple(result.full or ())
-    if not errors:
+    if not errors and fingerprint is not None:
         # Takes no writer lock (a long check must not refuse mines), so it
         # records only the verdict and leaves the unclean-exit evidence alone.
         record_clean_full_check(

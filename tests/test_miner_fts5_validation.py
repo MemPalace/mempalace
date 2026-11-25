@@ -136,7 +136,7 @@ def _script_probe(monkeypatch, full_errors) -> list:
 
     calls: list = []
 
-    def _probe(db_path, *, ids, full):
+    def _probe(db_path, *, ids, full, scan_all=False):
         calls.append(os.path.dirname(db_path))
         return ic.ProbeResult(
             scoped=None if ids is None else (),
@@ -176,7 +176,7 @@ def test_helper_raises_on_page_mangled_sqlite(tmp_path):
     assert "malformed" in combined or "quick_check failed" in combined
 
 
-def test_helper_auto_heals_fts5_segment_corruption(tmp_path):
+def test_helper_auto_heals_fts5_segment_corruption(tmp_path, monkeypatch):
     """The reporter-shaped failure: FTS5 inverted index malformed, main pages
     OK. This is exactly the isolated-FTS5 condition
     ``maybe_autoheal_fts5_index`` (#1926/#1928) rebuilds in place, so the
@@ -189,9 +189,20 @@ def test_helper_auto_heals_fts5_segment_corruption(tmp_path):
     _build_palace_with_drawer(palace)
     _corrupt_fts5_segment(palace / "chroma.sqlite3")
 
+    from mempalace.palace import resolve_backend_name
+
+    assert resolve_backend_name(str(palace)) == "chroma"
+    real_connect = sqlite3.connect
+
+    def parent_connect(database, *args, **kwargs):
+        assert "chroma.sqlite3" not in str(database), "heal opened the palace in the parent"
+        return real_connect(database, *args, **kwargs)
+
     # Must not raise: isolated FTS5 corruption is auto-healed before the
     # validator would otherwise raise MineValidationError.
-    assert _validate_palace_fts5_after_mine(str(palace)) is None
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", parent_connect)
+        assert _validate_palace_fts5_after_mine(str(palace)) is None
 
     with closing(sqlite3.connect(str(palace / "chroma.sqlite3"))) as conn:
         assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
@@ -663,13 +674,13 @@ def test_convo_miner_dry_run_skips_validator(tmp_path, monkeypatch):
     assert calls == [], f"convo_miner must not validate in dry-run, got: {calls}"
 
 
-# ── 6. Handles are closed only before a heal, which writes in-process ──
+# ── 6. Handles are closed only before a heal, which writes in a child ──
 
 
 def test_close_handles_called_before_heal_and_not_on_a_clean_check(tmp_path, monkeypatch):
     """The check reads in a child, so a clean mine keeps the writer's client.
 
-    The heal writes through Python's sqlite3 in this process, so ChromaDB's
+    The heal updates the index in a child process, so ChromaDB's
     handles (mmap'd on Windows) must be released before it, and only then.
     """
     palace = tmp_path / "palace"
