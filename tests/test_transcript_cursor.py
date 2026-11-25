@@ -306,6 +306,15 @@ def test_lines_that_crashed_the_old_counter_are_skipped(tmp_path, state_dir):
     assert hooks_cli._count_human_messages(str(f)) == 1
 
 
+def test_nesting_too_deep_for_stdlib_json_is_skipped(tmp_path, state_dir, parser):
+    """Deliberate change: 100k-deep nesting raised RecursionError out of the hook."""
+    f = tmp_path / "t.jsonl"
+    f.write_bytes(
+        b'{"x":' + b"[" * 100000 + b"]" * 100000 + b', "role": "user"}\n' + LINE_POOL[0] + b"\n"
+    )
+    assert hooks_cli._count_human_messages(str(f)) == 1
+
+
 def test_corrupt_sidecar_falls_back_to_full_count(tmp_path, state_dir):
     f = tmp_path / "t.jsonl"
     f.write_bytes((LINE_POOL[0] + b"\n") * 3)
