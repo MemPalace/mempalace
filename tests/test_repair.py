@@ -4,6 +4,7 @@ import errno
 import logging
 import os
 import sqlite3
+import stat
 import sys
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
@@ -4704,3 +4705,70 @@ def test_vacuum_and_rebuild_fts5_strict_check_reads_the_file_cold(tmp_path):
     assert damage, "the VACUUM never ran; the test proved nothing"
     assert "FTS5 integrity-check failed" in str(excinfo.value), str(excinfo.value)
     assert _fts5_check_errors(tmp_path) != [], "the palace really was left malformed"
+
+
+# ── journal + .mempalace/ carried into rebuilt palaces (#3053) ───────────────
+
+
+def _seed_palace_with_journal(palace):
+    rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(3)]
+    _seed_palace(palace, "mempalace_drawers", rows)
+    journal = palace / "drawer_revisions.jsonl"
+    journal.write_text('{"drawer_id": "d0", "content": "prior text"}\n', encoding="utf-8")
+    journal.chmod(0o600)
+    (palace / ".mempalace").mkdir(exist_ok=True)
+    (palace / ".mempalace" / "origin.json").write_text('{"kind": "x"}', encoding="utf-8")
+    palace.chmod(0o755)
+    return journal
+
+
+def _assert_carried(palace):
+    journal = palace / "drawer_revisions.jsonl"
+    assert "prior text" in journal.read_text(encoding="utf-8")
+    assert (palace / ".mempalace" / "origin.json").read_text(encoding="utf-8") == '{"kind": "x"}'
+    if os.name != "nt":
+        assert stat.S_IMODE(palace.stat().st_mode) == 0o700
+        assert stat.S_IMODE((palace / ".mempalace").stat().st_mode) == 0o700
+        assert stat.S_IMODE(journal.stat().st_mode) == 0o600
+
+
+def test_rebuild_from_sqlite_in_place_carries_journal_and_state_dir(tmp_path):
+    """--archive-existing in place (what ``repair rebuild-index`` runs)."""
+    palace = tmp_path / "palace"
+    _seed_palace_with_journal(palace)
+
+    repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    _assert_carried(palace)
+
+
+def test_rebuild_from_sqlite_source_carries_journal_and_state_dir(tmp_path):
+    """--source <palace> into a fresh dest dir."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    _seed_palace_with_journal(src)
+
+    repair.rebuild_from_sqlite(str(src), str(dest))
+
+    _assert_carried(dest)
+    assert (src / "drawer_revisions.jsonl").exists()
+
+
+def test_rebuild_from_sqlite_skips_symlinked_journal_and_state_dir(tmp_path):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    _seed_palace(src, "mempalace_drawers", [("d0", "body", {"wing": "w", "room": "r"})])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_text("s", encoding="utf-8")
+    journal_link = src / "drawer_revisions.jsonl"
+    if not journal_link.exists() and not journal_link.is_symlink():
+        journal_link.symlink_to(outside / "secret")
+    state_dir = src / ".mempalace"
+    if not state_dir.exists() and not state_dir.is_symlink():
+        state_dir.symlink_to(outside, target_is_directory=True)
+
+    repair.rebuild_from_sqlite(str(src), str(dest))
+
+    assert not (dest / "drawer_revisions.jsonl").exists()
+    assert not (dest / ".mempalace").exists()

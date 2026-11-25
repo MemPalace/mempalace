@@ -95,6 +95,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- **Repair rebuilds keep the re-mine journal and `.mempalace/` and create
+  the rebuilt palace owner-only (`0700`).** `repair rebuild-index` and
+  `repair --mode from-sqlite` used to leave the new palace at umask
+  permissions and drop `drawer_revisions.jsonl` and `.mempalace/`, so a
+  user who deleted the archive after a good rebuild lost the prior
+  verbatim text the journal exists to keep. The journal is copied at
+  `0600`, `.mempalace/` is walked without following symlinks, and the
+  archive is left intact. Thanks to [Lautaro Antúnez](https://github.com/Staberman).
+  ([#3059](https://github.com/MemPalace/mempalace/pull/3059),
+  [#3053](https://github.com/MemPalace/mempalace/issues/3053))
 - **Importing `mempalace` no longer caps the thread pools of the process.**
   The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
   set at package import, so CPU embedding (EmbeddingGemma through torch) ran
