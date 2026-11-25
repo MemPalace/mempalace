@@ -55,10 +55,22 @@ class MineValidationError(RuntimeError):
         # renders the abort banner, which carries the version; the MCP `mine`
         # tool and the daemon's job runner render this message instead, so it
         # belongs in the message.
-        super().__init__(
-            f"FTS5/SQLite quick_check failed: {len(errors)} issue(s) "
-            f"(SQLite {sqlite3.sqlite_version})"
-        )
+        from ..integrity_check import all_unverified
+
+        # True when the check never produced a verdict (its child process
+        # could not run or answer): not evidence of damage.
+        self.unverified = all_unverified(errors)
+        if self.unverified:
+            message = (
+                f"post-mine integrity check could not run, palace not verified: {errors[0]}; "
+                "re-run `mempalace integrity-check`"
+            )
+        else:
+            message = (
+                f"FTS5/SQLite quick_check failed: {len(errors)} issue(s) "
+                f"(SQLite {sqlite3.sqlite_version})"
+            )
+        super().__init__(message)
         self.palace_path = palace_path
         # Freeze the forensic snapshot so handlers cannot mutate it.
         self.errors: tuple[str, ...] = tuple(errors)

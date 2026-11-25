@@ -69,6 +69,9 @@ from typing import Iterable, Optional
 from . import paths
 
 SCOPED_TABLES = ("embeddings", "embedding_metadata")
+# Every error that means "no verdict" (the child could not run or answer)
+# starts with this, so callers never present it as damage to the database.
+PROBE_FAILED_PREFIX = "integrity check could not run"
 # PRAGMA quick_check(TABLE) arrived in SQLite 3.33.0; older builds read the
 # argument as a row limit, so they get the whole-database check instead.
 _TABLE_QUICK_CHECK_MIN = (3, 33, 0)
@@ -459,7 +462,7 @@ def run_probe(db_path: str, *, ids: Optional[Iterable[str]], full: bool) -> Prob
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        failure = f"integrity check child could not run: {exc}"
+        failure = f"{PROBE_FAILED_PREFIX}: {exc}"
     else:
         try:
             if proc.returncode != 0:
@@ -473,7 +476,7 @@ def run_probe(db_path: str, *, ids: Optional[Iterable[str]], full: bool) -> Prob
             )
         except (ValueError, KeyError, TypeError) as exc:
             tail = (proc.stderr or "").strip().splitlines()[-3:]
-            failure = f"integrity check child failed ({exc})" + (
+            failure = f"{PROBE_FAILED_PREFIX}: the child failed ({exc})" + (
                 f": {' | '.join(tail)}" if tail else ""
             )
     errors = (failure,)
@@ -533,8 +536,13 @@ def check_after_mine(palace_path: str, ids: Optional[Iterable[str]], *, heal) ->
             "PRAGMA quick_check failed: chroma.sqlite3 resolves to a named pipe, not a database"
         ]
     mode, interval_hours = _settings()
+    # "full" restores the old behaviour exactly: no cache, a check every time.
     reason = full_check_reason(
-        palace_path, mode=mode, interval_hours=interval_hours, ids_complete=ids is not None
+        palace_path,
+        mode=mode,
+        interval_hours=interval_hours,
+        ids_complete=ids is not None,
+        force=mode == "full",
     )
     started, fingerprint = time.time(), db_fingerprint(palace_path)
     result = _probe_without_inproc_writes(db_path, ids=ids, full=reason is not None)
@@ -546,7 +554,7 @@ def check_after_mine(palace_path: str, ids: Optional[Iterable[str]], *, heal) ->
         result = _probe_without_inproc_writes(db_path, ids=None, full=True)
         full = result.full
     full_errors = list(full or ())
-    if full_errors:
+    if full_errors and not all_unverified(full_errors):
         full_errors = list(heal(full_errors))
         # A heal wrote the database: record what it left, not the pre-probe state.
         started, fingerprint = time.time(), None
@@ -560,6 +568,12 @@ def check_after_mine(palace_path: str, ids: Optional[Iterable[str]], *, heal) ->
             sqlite_version=result.sqlite_version,
         )
     return scoped + full_errors
+
+
+def all_unverified(errors: Iterable[str]) -> bool:
+    """True when every error says the check could not run, none that it found damage."""
+    errors = list(errors)
+    return bool(errors) and all(e.startswith(PROBE_FAILED_PREFIX) for e in errors)
 
 
 @dataclass(frozen=True)

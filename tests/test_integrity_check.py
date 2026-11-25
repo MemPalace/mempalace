@@ -426,6 +426,7 @@ def test_a_child_that_cannot_answer_fails_the_check(tmp_path, monkeypatch):
     monkeypatch.setattr(ic, "_CHILD_CODE", "import sys; sys.exit(3)")
     result = ic.run_probe(str(palace / "chroma.sqlite3"), ids={"a"}, full=True)
     assert result.scoped and "exit status 3" in result.scoped[0]
+    assert result.scoped[0].startswith(ic.PROBE_FAILED_PREFIX)
     assert result.full == result.scoped
 
 
@@ -493,3 +494,74 @@ def test_integrity_check_command_exits_nonzero_on_corruption(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "mempalace repair" in out
     assert not (palace / ".mempalace" / "integrity.json").exists()
+
+
+# ── 6. A check that could not run is not reported as corruption ─────
+
+
+def test_a_child_that_cannot_run_fails_the_mine_without_the_corruption_banner(
+    tmp_path, monkeypatch, capsys
+):
+    from types import SimpleNamespace
+
+    from mempalace import cli, integrity_check as ic, miner, repair as repair_mod
+    from mempalace.palace import MineValidationError, _validate_palace_fts5_after_mine
+
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    before = _mine_like_write(palace, ["b"], ["two"])
+    monkeypatch.setattr(ic, "_CHILD_CODE", "import sys; sys.exit(3)")
+    healed = []
+    monkeypatch.setattr(
+        repair_mod, "maybe_autoheal_fts5_index", lambda p, e, **_k: healed.append(e) or e
+    )
+
+    with pytest.raises(MineValidationError) as exc_info:
+        _validate_palace_fts5_after_mine(str(palace), writes_since=before)
+    exc = exc_info.value
+    assert exc.unverified and "could not run" in str(exc)
+    assert healed == [], "no verdict, nothing to heal"
+    assert not (palace / ".mempalace" / "integrity.json").exists()
+
+    def _raise(*_a, **_k):
+        raise exc
+
+    monkeypatch.setattr(miner, "mine", _raise)
+    src = tmp_path / "src"
+    src.mkdir()
+    args = SimpleNamespace(
+        palace=str(palace),
+        dir=str(src),
+        mode="project",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=None,
+        extract="exchange",
+        redetect_origin=False,
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        cli.cmd_mine(args)
+    assert exit_info.value.code == 1
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "could not run" in combined
+    assert "corruption" not in combined.lower()
+
+
+def test_full_mode_checks_even_when_the_cache_matches(tmp_path, monkeypatch):
+    """A same-size in-place update under a coarse-mtime filesystem can keep the
+    fingerprint; ``full`` must not trust it."""
+    from mempalace.integrity_check import record_clean_full_check
+    from mempalace.palace import _validate_palace_fts5_after_mine
+
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    before = _mine_like_write(palace, ["b"], ["two"])
+    record_clean_full_check(str(palace))  # cache matches the database exactly
+    monkeypatch.setenv("MEMPALACE_POST_MINE_INTEGRITY_CHECK", "full")
+    probes = _record_probes(monkeypatch)
+
+    _validate_palace_fts5_after_mine(str(palace), writes_since=before)
+
+    assert probes == [{"ids": {"b"}, "full": True}]
