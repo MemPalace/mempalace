@@ -591,6 +591,12 @@ def tool_add_drawer(
                     "The palace index may be stale; run reconnect or repair."
                 )
             _invalidate_overview_caches()
+            index_after_write(
+                getattr(_config, "palace_path", None),
+                [drawer_id],
+                [content],
+                [{**base_meta, "chunk_index": 0}],
+            )
             logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room}")
             outcome = {
                 "success": True,
@@ -628,6 +634,7 @@ def tool_add_drawer(
                 "The palace index may be stale; run reconnect or repair."
             )
         _invalidate_overview_caches()
+        index_after_write(getattr(_config, "palace_path", None), chunk_ids, chunk_docs, chunk_metas)
         logger.info(f"Filed drawer: {drawer_id} -> {wing}/{room} ({len(chunk_ids)} chunks)")
         outcome = {
             "success": True,
@@ -1684,6 +1691,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             "wing": new_meta.get("wing", ""),
             "room": new_meta.get("room", ""),
         }
+        written = ([record["ids"][0]], [new_doc], [new_meta])
         if should_chunk:
             chunk_ids, chunk_docs, chunk_metas = _build_chunk_rows(
                 drawer_id,
@@ -1701,6 +1709,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
 
             outcome["chunks"] = len(chunk_ids)
             outcome["chunk_ids"] = chunk_ids
+            written = (chunk_ids, chunk_docs, chunk_metas)
             logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
         else:
             update_kwargs = {"ids": [record["ids"][0]]}
@@ -1724,6 +1733,8 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 aaak_ids=[drawer_id, *record["ids"]],
                 closet_sources=[source_file] if source_file else (),
             ).get("closets_deleted", 0)
+        # After the purge above, which drops the old text's windows.
+        index_after_write(getattr(_config, "palace_path", None), *written)
         _invalidate_overview_caches()
         if revision_id:
             outcome["revision_id"] = revision_id

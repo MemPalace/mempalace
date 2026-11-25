@@ -133,13 +133,15 @@ def _fold_subwindow_hits(
 
     Off (the default), or with no windows collection, returns
     ``drawer_results`` untouched. Otherwise queries the windows collection
-    for ``pool_size * WINDOW_OVERFETCH`` rows under the same filter, folds
+    for ``pool_size * WINDOW_OVERFETCH`` rows of the active profile, folds
     them into their parents (see :mod:`mempalace.subwindows`), re-reads those
     parents from the drawers collection under ``where`` so a window can only
     stand for a drawer the search may return, and merges. Any failure logs
     and falls back to the plain drawer results.
     """
     from ..subwindows import (
+        WINDOW_FILTERED_WIDEN,
+        WINDOW_MAX_FETCH,
         WINDOW_OVERFETCH,
         active_profile,
         fold_windows,
@@ -159,9 +161,10 @@ def _fold_subwindow_hits(
         if resolved is None:
             return drawer_results
         profile = resolved[2]
-        clauses = [{"window_profile": profile.key}]
-        if where:
-            clauses.append(where)
+        # Windows are filtered by profile only: a drawer moved to another wing
+        # or room keeps windows stamped with the old one. The parent re-read
+        # below applies ``where``; a filtered search fetches wider to make up.
+        n_windows = pool_size * WINDOW_OVERFETCH * (WINDOW_FILTERED_WIDEN if where else 1)
         vector_kwargs = (
             {"query_embeddings": query_vectors}
             if query_vectors is not None
@@ -169,8 +172,8 @@ def _fold_subwindow_hits(
         )
         window_results = windows_col.query(
             **vector_kwargs,
-            n_results=pool_size * WINDOW_OVERFETCH,
-            where=clauses[0] if len(clauses) == 1 else {"$and": clauses},
+            n_results=min(n_windows, WINDOW_MAX_FETCH),
+            where={"window_profile": profile.key},
             include=["metadatas", "distances"],
         )
         best = fold_windows(window_results, profile.key)

@@ -44,6 +44,11 @@ WINDOW_OVERLAP_TOKENS = 64
 # Window hits fetched per drawer slot in the search pool. A long drawer can
 # own several windows near the query, and folding them leaves fewer parents.
 WINDOW_OVERFETCH = 3
+# A wing/room/source-filtered search reads windows unfiltered (their copy of
+# the parent's metadata can be stale) and keeps only parents that pass the
+# filter, so it fetches this many times wider, up to WINDOW_MAX_FETCH.
+WINDOW_FILTERED_WIDEN = 4
+WINDOW_MAX_FETCH = 1000
 # Drawers read / windows written per batch.
 BATCH_SIZE = 500
 
@@ -160,15 +165,17 @@ def window_id(parent_id: str, index: int) -> str:
     return f"{parent_id}::w{index:03d}"
 
 
-_COPIED_KEYS = ("wing", "room", "source_file")
+# ``source_file`` lets a whole-source delete purge windows without the
+# parent ids. Wing and room are not copied: search scopes windows through the
+# parent row, so a drawer that moves keeps working windows.
+_COPIED_KEYS = ("source_file",)
 
 
 def window_rows(parent_id: str, document: str, metadata: dict, spans: list, profile) -> list:
     """``(id, metadata)`` for each window of one parent.
 
-    Window rows copy the parent's ``wing``/``room``/``source_file`` so a
-    filtered search can pre-filter windows the way it filters drawers; the
-    parent row stays the authority and is re-checked at query time.
+    Window rows copy the parent's ``source_file`` (see ``_COPIED_KEYS``); the
+    parent row stays the authority and is re-read at query time.
     """
     sha = parent_sha(document)
     base = {key: metadata[key] for key in _COPIED_KEYS if metadata.get(key) is not None}
@@ -305,7 +312,7 @@ def subwindows_enabled() -> bool:
         return False
 
 
-# (model, id(embedder)) -> (embedder, WindowTokenizer | None). Copying a
+# model -> (embedder, WindowTokenizer | None). Copying a
 # tokenizer is milliseconds; search calls this once per query.
 _TOKENIZER_CACHE: dict = {}
 
@@ -320,32 +327,59 @@ def active_profile(embedder=None):
 
     model = current_model_name()
     ef = embedder if embedder is not None else configured_embedding_function()
-    key = (model, id(ef))
-    cached = _TOKENIZER_CACHE.get(key)
+    cached = _TOKENIZER_CACHE.get(model)
     if cached is None or cached[0] is not ef:
+        # One entry per model: a reloaded embedder replaces the old one, so
+        # an idle unload does not leave embedders pinned here.
         cached = (ef, window_tokenizer(ef, model))
-        _TOKENIZER_CACHE[key] = cached
+        _TOKENIZER_CACHE[model] = cached
     tokenizer = cached[1]
     if tokenizer is None:
         return None
-    profile = WindowProfile(model, probe_dimension(), tokenizer.budget, WINDOW_OVERLAP_TOKENS)
+    dimension = probe_dimension()
+    if dimension <= 0:
+        # A failed probe is not cached; a profile stamped d0 would never match.
+        return None
+    profile = WindowProfile(model, dimension, tokenizer.budget, WINDOW_OVERLAP_TOKENS)
     return ef, tokenizer, profile
 
 
-def open_window_index(palace_path: str, *, create: bool = True) -> Optional[WindowIndex]:
-    """The palace's :class:`WindowIndex` when sub-windows are on, else None.
+class WindowPurger:
+    """Stand-in for :class:`WindowIndex` with sub-windows off.
 
-    Never raises: a mine keeps going without windows (``mempalace windows
-    build`` fills them in later) when the collection or tokenizer is missing.
+    A palace that has windows keeps purging them with their drawers after the
+    flag is turned off, but writes none.
+    """
+
+    def __init__(self, collection):
+        self.collection = collection
+
+    def index(self, rows) -> dict:
+        return {"parents": 0, "embedded": 0, "skipped": 0, "removed": 0}
+
+
+def open_window_index(palace_path: str, *, create: bool = True):
+    """The palace's :class:`WindowIndex` when sub-windows are on.
+
+    Off, a :class:`WindowPurger` when the palace already has a windows
+    collection, else None. Never raises: a mine keeps going without windows
+    (``mempalace windows build`` fills them in later) when the collection or
+    tokenizer is missing.
     """
     if not subwindows_enabled():
-        return None
+        try:
+            from .palace import open_windows_collection
+
+            col = open_windows_collection(palace_path)
+        except Exception:
+            return None
+        return WindowPurger(col) if col is not None else None
     try:
         resolved = active_profile()
         if resolved is None:
             logger.warning(
-                "embedding_subwindows is on but the active embedder's tokenizer is not "
-                "available; drawers are embedded as before"
+                "embedding_subwindows is on but the active embedder's tokenizer or "
+                "dimension is not available; drawers are embedded as before"
             )
             return None
         from .palace import get_windows_collection
@@ -360,12 +394,36 @@ def index_quietly(windows: Optional[WindowIndex], rows: list) -> None:
     """:meth:`WindowIndex.index` for a miner: a failure is logged, never raised."""
     if windows is None or not rows:
         return
+    from .palace import MINE_ABORTS
+
     try:
         windows.index(rows)
+    except MINE_ABORTS:
+        raise
     except Exception:
         logger.warning(
             "Sub-window indexing failed for %d drawers; `mempalace windows build` retries",
             len(rows),
+            exc_info=True,
+        )
+
+
+def index_after_write(palace_path: str, ids, documents, metadatas) -> None:
+    """Index the windows of drawers just written outside a miner (MCP tools).
+
+    The drawer write already succeeded, so nothing here may fail it: every
+    error is logged and ``mempalace windows build`` picks the drawers up later.
+    """
+    if not palace_path or not ids:
+        return
+    try:
+        windows = open_window_index(palace_path)
+        if windows is not None:
+            windows.index(list(zip(ids, documents, metadatas)))
+    except Exception:
+        logger.warning(
+            "Sub-window indexing failed for %d drawers; `mempalace windows build` retries",
+            len(ids),
             exc_info=True,
         )
 
@@ -526,13 +584,14 @@ def build_windows(
     from .palace import get_collection, get_windows_collection, open_windows_collection
     from .search_util import build_where_filter
 
+    drawers_col = get_collection(palace_path, create=False, read_only=True)
     resolved = active_profile()
     if resolved is None:
         raise SubwindowsUnsupported(
-            "the active embedder exposes no tokenizer; sub-windows need minilm or embeddinggemma"
+            "the active embedder's tokenizer or dimension is not available; "
+            "sub-windows need minilm or embeddinggemma"
         )
     embedder, tokenizer, profile = resolved
-    drawers_col = get_collection(palace_path, create=False, read_only=True)
     where = build_where_filter(wing, col=drawers_col) or None
     if dry_run:
         windows_col = open_windows_collection(palace_path, read_only=True)

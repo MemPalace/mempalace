@@ -3,6 +3,8 @@
 
 
 def cmd_windows(args):
+    from ..backends import PalaceNotFoundError
+    from ..embedding import EmbeddingFunctionUnavailableError, UnknownEmbeddingModelError
     from ..palace import MineAlreadyRunning, mine_palace_lock
     from ..subwindows import SubwindowsUnsupported, build_windows
 
@@ -37,10 +39,20 @@ def cmd_windows(args):
                 progress=report,
             )
     except MineAlreadyRunning:
-        print("  Another mine is writing this palace; run `mempalace windows build` after it.")
+        print(
+            "  Another writer (a mine or the hub) holds this palace's lock;\n"
+            "  run `mempalace windows build` again once it is done."
+        )
         sys.exit(1)
-    except SubwindowsUnsupported as exc:
+    except PalaceNotFoundError:
+        # Also covers CollectionNotInitializedError: a palace with no drawers yet.
+        print(f"  No palace with drawers at {palace_path}. Run `mempalace mine` first.")
+        sys.exit(1)
+    except (SubwindowsUnsupported, UnknownEmbeddingModelError) as exc:
         print(f"  {exc}")
+        sys.exit(1)
+    except EmbeddingFunctionUnavailableError as exc:
+        print(f"  The embedding model could not be loaded: {exc}")
         sys.exit(1)
     print()
     print(f"  Profile:          {stats['profile']}")

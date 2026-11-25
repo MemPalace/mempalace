@@ -414,3 +414,86 @@ def test_real_minilm_tokenizer_windows_past_256_tokens():
     spans = plan_windows(text, tokenizer, 64)
     assert spans and spans[-1][1] == len(text)
     assert subwindows.window_tokenizer(object(), "openai-compat") is None
+
+
+# ── MCP writes ───────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def mcp_windows(window_palace, config, monkeypatch):
+    from mempalace import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_config", config)
+    return window_palace[0], mcp_server
+
+
+def _windows_of(palace_path, parent):
+    return {i for i, (_, m) in _window_rows(palace_path).items() if m["window_of"] == parent}
+
+
+def test_an_mcp_added_drawer_gets_windows(mcp_windows):
+    palace_path, server = mcp_windows
+
+    added = server.tool_add_drawer("w", "r", _long_text("an okapi tapir sighting"))
+
+    assert added["success"], added
+    assert _windows_of(palace_path, added["drawer_id"])
+    hits = _search(palace_path, "okapi tapir sighting")["results"]
+    assert [h["drawer_id"] for h in hits] == [added["drawer_id"]]
+
+
+def test_an_mcp_update_replaces_the_windows_of_the_old_text(mcp_windows):
+    palace_path, server = mcp_windows
+    subwindows.build_windows(palace_path)
+    old = _window_rows(palace_path)
+
+    updated = server.tool_update_drawer("long_1", content=_long_text("a narwhal walrus encounter"))
+
+    assert updated["success"], updated
+    new = {i: m for i, (_, m) in _window_rows(palace_path).items() if m["window_of"] == "long_1"}
+    assert new
+    old_shas = {m["parent_sha"] for _, m in old.values() if m["window_of"] == "long_1"}
+    assert not old_shas & {m["parent_sha"] for m in new.values()}
+    hits = _search(palace_path, "narwhal walrus encounter")["results"]
+    assert [h["drawer_id"] for h in hits] == ["long_1"]
+
+
+def test_an_mcp_diary_entry_gets_windows(mcp_windows):
+    palace_path, server = mcp_windows
+
+    wrote = server.tool_diary_write("agent", _long_text("the ibex chamois climb"))
+
+    assert wrote["success"], wrote
+    assert _windows_of(palace_path, wrote["entry_id"])
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────
+
+
+def test_windows_status_on_a_missing_palace_exits_with_a_hint(tmp_path, capsys):
+    import argparse
+
+    from mempalace.cli import cmd_windows
+
+    missing = tmp_path / "no-palace"
+    args = argparse.Namespace(palace=str(missing), windows_action="status", wing=None)
+    with pytest.raises(SystemExit) as exited:
+        cmd_windows(args)
+
+    assert exited.value.code == 1
+    assert "No palace with drawers" in capsys.readouterr().out
+    assert not missing.exists()
+
+
+def test_windows_build_reports_what_it_embedded(window_palace, capsys):
+    import argparse
+
+    from mempalace.cli import cmd_windows
+
+    palace_path, _ = window_palace
+    args = argparse.Namespace(palace=palace_path, windows_action="build", wing=None, dry_run=False)
+    cmd_windows(args)
+
+    out = capsys.readouterr().out
+    assert "Over the window:  2" in out
+    assert _windows_of(palace_path, "long_1")

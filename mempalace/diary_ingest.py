@@ -38,6 +38,7 @@ from .palace import (
     write_file_drawers,
 )
 from .source_identity import identity_metadata
+from .subwindows import open_window_index
 from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,7 @@ def ingest_diaries(
     drawers_col = get_collection(palace_path)
     closets_col = get_closets_collection(palace_path)
     aaak_col = open_aaak_collection(palace_path)
+    windows = open_window_index(palace_path)
     chunk_size = MempalaceConfig().chunk_size
 
     days_updated = 0
@@ -227,6 +229,7 @@ def ingest_diaries(
                     aaak_col=aaak_col,
                     owner="diary",
                     palace_path=palace_path,
+                    windows=windows,
                 )
             except StaleDrawerPurgeFailed as exc:
                 logger.warning("%s", exc)

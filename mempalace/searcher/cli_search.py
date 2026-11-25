@@ -105,7 +105,18 @@ def _print_also_in(hit: dict) -> None:
 
 
 def _cli_ranked_hits(
-    col, query, *, fetch, n_results, where, wing, room, window, metric, stop_words
+    col,
+    query,
+    *,
+    fetch,
+    n_results,
+    where,
+    wing,
+    room,
+    window,
+    metric,
+    stop_words,
+    palace_path=None,
 ):
     """``(hits, fetched, skipped)``: the top ``fetch`` drawers, re-ranked and
     folded, and how many bookkeeping rows the fetch held.
@@ -122,9 +133,24 @@ def _cli_ranked_hits(
             "n_results": fetch,
             "include": ["documents", "metadatas", "distances"],
         }
+        query_vectors = _subwindow_query_vectors(query) if palace_path else None
+        if query_vectors is not None:
+            kwargs.pop("query_texts")
+            kwargs["query_embeddings"] = query_vectors
         if where:
             kwargs["where"] = where
         results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
+        if palace_path:
+            results = _fold_subwindow_hits(
+                col,
+                results,
+                palace_path=palace_path,
+                query=query,
+                where=where,
+                pool_size=fetch,
+                metric=metric,
+                query_vectors=query_vectors,
+            )
     except Exception as e:
         if _model_error_class(e) is not None:
             # The configured embedding function could not be built (C): the
@@ -297,6 +323,7 @@ def search(
             window=(since_dt, before_dt) if date_window_active else None,
             metric=metric,
             stop_words=stop_words,
+            palace_path=palace_path,
         )
         # Folded copies or skipped bookkeeping rows can leave the page short
         # while the fetch came back full, so more candidates exist: widen, as
