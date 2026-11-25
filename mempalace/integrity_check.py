@@ -226,12 +226,31 @@ def full_check_errors(db_path: str) -> list[str]:
 def _child_main() -> None:  # pragma: no cover - runs in the child; see run_probe
     request = json.loads(sys.stdin.readline())
     if "heal" in request:
-        # The parent retains the writer lease. Its private pipe closes on death,
-        # including on Windows. Exit immediately so SQLite rolls back an open
-        # transaction and the next mine can act on the in-flight marker.
-        def exit_with_parent():
-            os.read(0, 1)
-            os._exit(1)
+        # The parent retains the writer lease. When it dies, exit immediately
+        # so SQLite rolls back an open transaction and the next mine can act
+        # on the in-flight marker. POSIX watches stdin, which the parent holds
+        # open until it is gone; Windows watches the parent's process handle.
+        if os.name == "nt":
+            # Not a read on stdin: on Windows a thread blocked in ReadFile on
+            # the stdin pipe makes every later GetFileType on that handle wait
+            # for it, and the C runtime of each DLL the heal imports (numpy,
+            # chromadb) calls GetFileType on the std handles while loading.
+            # The child would deadlock in its imports. Wait on the parent's
+            # process handle instead; it is opened while the parent is
+            # provably alive (it is blocked waiting for this child).
+            import _winapi
+
+            parent = _winapi.OpenProcess(0x00100000, False, request["parent_pid"])  # SYNCHRONIZE
+
+            def exit_with_parent():
+                _winapi.WaitForSingleObject(parent, _winapi.INFINITE)
+                os._exit(1)
+
+        else:
+
+            def exit_with_parent():
+                os.read(0, 1)
+                os._exit(1)
 
         threading.Thread(target=exit_with_parent, daemon=True).start()
         if request.get("user_site"):
@@ -477,7 +496,9 @@ def run_locked_heal(palace_path: str, errors: list[str], *, progress) -> list[st
 def _run_heal_child(palace_path, errors, progress):
     package_parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     user_site = site.getusersitepackages() if site.ENABLE_USER_SITE else None
-    request = json.dumps({"palace": palace_path, "heal": errors, "user_site": user_site})
+    request = json.dumps(
+        {"palace": palace_path, "heal": errors, "user_site": user_site, "parent_pid": os.getpid()}
+    )
 
     # Keep stdin open as a parent-liveness pipe while waiting. A temporary file
     # lets the worker report a verdict of any size without blocking on stdout.

@@ -667,3 +667,84 @@ def test_evicted_write_cannot_hide_a_stored_nul(tmp_path, monkeypatch):
     with pytest.raises(MineValidationError) as error:
         _validate_palace_fts5_after_mine(str(palace), writes_since=since)
     assert any("raw NUL" in message for message in error.value.errors)
+
+
+# ── Heal child: parent-death watchdog ───────────────────────────────
+
+
+_WATCHDOG_PARENT = """
+import site, sys
+site.ENABLE_USER_SITE = True
+site.getusersitepackages = lambda: sys.argv[1]
+from mempalace.integrity_check import _run_heal_child
+_run_heal_child(sys.argv[2], ["x"], print)
+"""
+
+
+def test_heal_child_exits_when_its_parent_is_killed(tmp_path):
+    """The heal child must not outlive a parent killed mid-heal (it would
+    keep the recovery transaction open with nobody holding the lease).
+
+    A ``.pth`` in the user site the parent hands over parks the child after
+    its watchdog started, standing in for a slow heal. Killing the parent
+    (TerminateProcess on Windows, SIGKILL elsewhere) must end the child within
+    seconds: the child shares the parent's stderr pipe, so EOF on it means
+    both are gone. On Windows the watchdog used to read stdin, which also
+    deadlocked the heal's own DLL imports.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys
+    import threading
+    import time
+
+    import mempalace
+
+    slow = tmp_path / "slow-site"
+    slow.mkdir()
+    pid_file = tmp_path / "child.pid"
+    (slow / "slow_heal.pth").write_text(
+        f"import os, time; open({str(pid_file)!r}, 'w').write(str(os.getpid())); time.sleep(120)\n"
+    )
+    env = dict(os.environ)
+    package_parent = os.path.dirname(os.path.dirname(os.path.abspath(mempalace.__file__)))
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (package_parent, env.get("PYTHONPATH")) if p)
+    parent = subprocess.Popen(
+        [sys.executable, "-c", _WATCHDOG_PARENT, str(slow), str(tmp_path / "palace")],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    child_pid = None
+    try:
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline and parent.poll() is None:
+            if pid_file.exists() and pid_file.read_text().strip():
+                child_pid = int(pid_file.read_text())
+                break
+            time.sleep(0.1)
+        assert child_pid, f"heal child never started (parent exit {parent.poll()})"
+
+        parent.kill()
+        parent.wait(timeout=30)
+        drained = threading.Event()
+
+        def drain():
+            parent.stderr.read()
+            drained.set()
+
+        threading.Thread(target=drain, daemon=True).start()
+        assert drained.wait(15), "heal child outlived its killed parent"
+        child_pid = None
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
+        if child_pid:
+            kill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            try:
+                os.kill(child_pid, kill)
+            except OSError:
+                pass
