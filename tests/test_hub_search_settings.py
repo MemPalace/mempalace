@@ -54,6 +54,7 @@ _NOT_SEARCH_SETTINGS = {
     "MEMPALACE_HOOK_WRITE_ROUTING",
     "MEMPALACE_WRITE_ROUTING",
     "MEMPALACE_HOOKS_AUTO_SAVE",
+    "MEMPALACE_HOOKS_MINE_TRANSCRIPT",
     "MEMPALACE_HOOKS_DAEMON",
     # Pick the palace or the config file; the hub is looked up per palace and
     # the fingerprint hashes the values that file resolves to.
