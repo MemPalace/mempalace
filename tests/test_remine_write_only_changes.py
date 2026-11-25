@@ -514,3 +514,21 @@ def test_a_prune_only_convo_remine_still_recomputes_hallways(convo, monkeypatch)
     mine()
 
     assert hallways and hallways[0] > 0
+
+
+def test_a_failing_dimension_probe_is_paid_once_per_filing_not_once_per_batch(palace, monkeypatch):
+    import mempalace.embedding as embedding
+    import mempalace.palace as palace_pkg
+
+    monkeypatch.setattr(palace_pkg, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    texts = [f"text {i}" for i in range(7)]
+    _file(palace, _drawers(texts))
+
+    # A down embedder: probe_dimension returns 0 and caches nothing, so every
+    # call would pay another embedder round trip.
+    probes = []
+    monkeypatch.setattr(embedding, "probe_dimension", lambda *a, **k: probes.append(1) or 0)
+    filed = _file(palace, _drawers(texts, "2:2:2"))
+
+    assert filed == 0
+    assert len(probes) == 1

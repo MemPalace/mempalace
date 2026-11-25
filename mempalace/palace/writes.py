@@ -519,7 +519,7 @@ def _with_reused_vectors(collection, rows: list) -> tuple:
     return reuse, reuse_vectors, to_embed
 
 
-def _unusable_vectors(collection, ids: list) -> set:
+def _unusable_vectors(collection, ids: list, dimension_cache: dict) -> set:
     """Ids among ``ids`` whose stored vector cannot serve the current embedder.
 
     A re-file repairs those even though their text did not change: Milvus
@@ -527,6 +527,10 @@ def _unusable_vectors(collection, ids: list) -> set:
     --force`` can leave vectors of another size. Repair is best effort: a
     failed read, or an embedder whose dimension cannot be probed, repairs
     nothing rather than rewriting drawers that may be fine.
+
+    ``dimension_cache`` holds the probed dimension for the rest of one
+    filing: a failed probe is not cached process-wide and costs an embedder
+    call, which per batch made an unchanged re-mine of a large file slow.
     """
     if not ids:
         return set()
@@ -539,9 +543,11 @@ def _unusable_vectors(collection, ids: list) -> set:
     if vectors is None:
         return set()
     stored = dict(zip(got.get("ids") or [], vectors))
-    from ..embedding import probe_dimension
+    if "dimension" not in dimension_cache:
+        from ..embedding import probe_dimension
 
-    dimension = probe_dimension()
+        dimension_cache["dimension"] = probe_dimension()
+    dimension = dimension_cache["dimension"]
     if dimension <= 0:
         return {i for i in ids if i in stored and (stored[i] is None or len(stored[i]) == 0)}
     return {i for i in ids if i in stored and not _reusable_vector(stored[i], dimension)}
@@ -593,6 +599,7 @@ def _refile_changed(
     rewritten: list = []
     # Unchanged drawers a crashed earlier pass left with its pending marker.
     restamp: list = []
+    dimension_cache: dict = {}
     for start in range(0, len(drawers), DRAWER_UPSERT_BATCH_SIZE):
         batch = drawers[start : start + DRAWER_UPSERT_BATCH_SIZE]
         assert_no_collisions([(drawer_id, meta) for drawer_id, _, meta in batch], collection)
@@ -619,7 +626,7 @@ def _refile_changed(
             if changed:
                 updates.append((drawer_id, changed))
             kept_rows.append((drawer_id, doc, full, old_meta))
-        unusable = _unusable_vectors(collection, [row[0] for row in kept_rows])
+        unusable = _unusable_vectors(collection, [row[0] for row in kept_rows], dimension_cache)
         if unusable:
             to_embed += [(i, doc, full) for i, doc, full, _ in kept_rows if i in unusable]
             updates = [update for update in updates if update[0] not in unusable]
