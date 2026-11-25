@@ -3132,6 +3132,7 @@ def test_ingest_transcript_passes_the_project_wing_to_mine(tmp_path, monkeypatch
     class Routing:
         blocked = False
         use_daemon = False
+        use_remote = False
 
     monkeypatch.setattr(hooks_cli, "_current_hook_write_routing", lambda: Routing())
     spawned = []

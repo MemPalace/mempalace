@@ -1590,6 +1590,24 @@ class MempalaceConfig:
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
 
+    @property
+    def hook_remote_url(self):
+        """The remote server the save hooks write to, or "" for the local palace."""
+        env_val = os.environ.get("MEMPALACE_HOOK_REMOTE_URL", "").strip()
+        if env_val:
+            return env_val
+        value = self._file_config.get("hooks", {}).get("remote_url")
+        return value.strip() if isinstance(value, str) else ""
+
+    @property
+    def hook_remote_token(self):
+        """Bearer token for ``hook_remote_url``, or "" when none is configured."""
+        env_val = os.environ.get("MEMPALACE_HOOK_REMOTE_TOKEN", "").strip()
+        if env_val:
+            return env_val
+        value = self._file_config.get("hooks", {}).get("remote_token")
+        return value.strip() if isinstance(value, str) else ""
+
     def resolve_write_routing(self, scope: str) -> ResolvedWriteRoutingPolicy:
         """Resolve the configured write policy for ``hooks`` or ``cli``.
 
