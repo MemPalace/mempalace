@@ -53,6 +53,7 @@ from .registry import (
 )
 from .rust_exact import RustExactBackend, RustExactCollection
 from .sqlite_exact import SQLiteExactBackend, SQLiteExactCollection
+from .turso import TursoBackend, TursoCollection
 
 register("rust_exact", RustExactBackend)
 
@@ -86,6 +87,8 @@ __all__ = [
     "RustExactCollection",
     "SQLiteExactBackend",
     "SQLiteExactCollection",
+    "TursoBackend",
+    "TursoCollection",
     "UnsupportedCapabilityError",
     "UnsupportedFilterError",
     "UnsupportedMaintenanceKindError",

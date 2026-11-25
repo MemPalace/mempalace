@@ -198,12 +198,13 @@ non-default backend is opt-in.
 | `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
 | `sqlite_exact` | Local (exact NumPy) | bundled | – | ✓ | – |
 | `rust_exact` | Local (native vectors) | wheel / compiled | – | ✓ | – |
+| `turso` | Local (embedded, engine-side search) | `mempalace[turso]` | – | ✓ | `MEMPALACE_TURSO_EXPERIMENTAL_FEATURES` |
 | `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
 | `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
 | `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
 
 Select with `--backend <name>`, `MEMPALACE_BACKEND=<name>`, or
-`"backend": "<name>"` in `config.json`. `rust_exact` uses the exact same `sqlite_exact.sqlite3` file on disk as `sqlite_exact` with zero data migration. See [native installation and vector CLI usage](crates/README.md) for the separately distributed wheel and executables.
+`"backend": "<name>"` in `config.json`. `rust_exact` uses the exact same `sqlite_exact.sqlite3` file on disk as `sqlite_exact` with zero data migration. See [native installation and vector CLI usage](crates/README.md) for the separately distributed wheel and executables. `turso` embeds the Turso database engine for fully local, engine-side search (Linux and macOS; no backend migration to or from it) — see the [turso backend guide](docs/turso-backend.md) for installation, platform support, experimental features, and maintenance.
 
 ### Native vector search
 

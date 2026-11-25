@@ -99,6 +99,8 @@ def _backend_artifact_label(backend_name: Optional[str]) -> str:
         return "qdrant_backend.json"
     if backend_name == "pgvector":
         return "pgvector_backend.json"
+    if backend_name == "turso":
+        return "turso.db"
     if backend_name in {"sqlite_exact", "rust_exact"}:
         return "sqlite_exact.sqlite3"
     return "backend database"
