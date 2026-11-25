@@ -1070,6 +1070,8 @@ def _mine_convos_impl(
     )
 
     total_drawers = 0
+    # Drawers written or pruned: what the hallway recompute depends on.
+    palace_changes = 0
     files_mined = 0
     files_skipped = 0
     files_failed: list = []
@@ -1202,6 +1204,7 @@ def _mine_convos_impl(
                 room_counts[r] += n
 
             total_drawers += drawers_added
+            palace_changes += drawers_added + getattr(drawers_added, "pruned", 0)
             files_mined += 1
             print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
             if limit > 0 and files_mined >= limit:
@@ -1217,7 +1220,7 @@ def _mine_convos_impl(
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+        _compute_hallways_for_wing_safe(wing, collection, palace_changes, config=palace_config)
         _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
     print(f"\n{'=' * 55}")

@@ -79,10 +79,12 @@ class FiledDrawers(int):
 
     ``unchanged`` is true for a pruning re-file that stored every drawer
     under its old id with its old text and removed nothing, so the file's
-    closets and AAAK summaries still describe it.
+    closets and AAAK summaries still describe it. ``pruned`` is how many
+    stale drawers it removed (record mode only; 0 otherwise).
     """
 
     unchanged = False
+    pruned = 0
 
 
 # Per-source stamps every drawer of a filing carries. They change on every
@@ -517,6 +519,34 @@ def _with_reused_vectors(collection, rows: list) -> tuple:
     return reuse, reuse_vectors, to_embed
 
 
+def _unusable_vectors(collection, ids: list) -> set:
+    """Ids among ``ids`` whose stored vector cannot serve the current embedder.
+
+    A re-file repairs those even though their text did not change: Milvus
+    stores an empty vector for a row without one, and ``set-embedder
+    --force`` can leave vectors of another size. Repair is best effort: a
+    failed read, or an embedder whose dimension cannot be probed, repairs
+    nothing rather than rewriting drawers that may be fine.
+    """
+    if not ids:
+        return set()
+    try:
+        got = collection.get(ids=ids, include=["embeddings"])
+    except Exception:
+        logger.debug("could not read stored vectors to check them", exc_info=True)
+        return set()
+    vectors = got.get("embeddings")
+    if vectors is None:
+        return set()
+    stored = dict(zip(got.get("ids") or [], vectors))
+    from ..embedding import probe_dimension
+
+    dimension = probe_dimension()
+    if dimension <= 0:
+        return {i for i in ids if i in stored and (stored[i] is None or len(stored[i]) == 0)}
+    return {i for i in ids if i in stored and not _reusable_vector(stored[i], dimension)}
+
+
 def _refile_changed(
     collection,
     source_file: str,
@@ -561,11 +591,13 @@ def _refile_changed(
 
     written: list = []
     rewritten: list = []
+    # Unchanged drawers a crashed earlier pass left with its pending marker.
+    restamp: list = []
     for start in range(0, len(drawers), DRAWER_UPSERT_BATCH_SIZE):
         batch = drawers[start : start + DRAWER_UPSERT_BATCH_SIZE]
         assert_no_collisions([(drawer_id, meta) for drawer_id, _, meta in batch], collection)
         stored = _read_stored(collection, [drawer_id for drawer_id, _, _ in batch])
-        to_embed, journal, updates, repaired = [], [], [], []
+        to_embed, journal, updates, repaired, kept_rows = [], [], [], [], []
         for drawer_id, doc, meta in batch:
             if drawer_id not in stored:
                 to_embed.append((drawer_id, doc, meta))
@@ -583,8 +615,21 @@ def _refile_changed(
             changed, removed = _metadata_changes(old_meta, meta)
             if removed:
                 repaired.append((drawer_id, doc, full))
-            elif changed:
+                continue
+            if changed:
                 updates.append((drawer_id, changed))
+            kept_rows.append((drawer_id, doc, full, old_meta))
+        unusable = _unusable_vectors(collection, [row[0] for row in kept_rows])
+        if unusable:
+            to_embed += [(i, doc, full) for i, doc, full, _ in kept_rows if i in unusable]
+            updates = [update for update in updates if update[0] not in unusable]
+        restamp += [
+            i
+            for i, _, _, old_meta in kept_rows
+            if i not in unusable
+            and i not in {u[0] for u in updates}
+            and old_meta.get("chunk_total") == total + 1
+        ]
         if preserving:
             _archive_prior_text(palace_path, source_file, journal, "remine_overwrite")
         reuse, reuse_vectors, re_embed = _with_reused_vectors(collection, repaired)
@@ -596,7 +641,8 @@ def _refile_changed(
                 metadatas=[changed for _, changed in updates],
             )
         written += [row[0] for row in reuse + to_embed + re_embed] + [u[0] for u in updates]
-        rewritten += [drawer_id for drawer_id, _, _ in to_embed]
+        # A vector repair keeps the drawer's text, so its summaries still fit.
+        rewritten += [i for i, _, _ in to_embed if i not in unusable]
 
     fresh = {drawer_id for drawer_id, _, _ in drawers}
     kept = 0
@@ -633,10 +679,12 @@ def _refile_changed(
         )
     if rewritten or stale:
         drawers_removed(None, aaak_ids=rewritten + stale, aaak_col=aaak_col, reraise=MINE_ABORTS)
-    for start in range(0, len(written), DRAWER_UPSERT_BATCH_SIZE):
-        batch = written[start : start + DRAWER_UPSERT_BATCH_SIZE]
+    finished = written + restamp
+    for start in range(0, len(finished), DRAWER_UPSERT_BATCH_SIZE):
+        batch = finished[start : start + DRAWER_UPSERT_BATCH_SIZE]
         collection.update(ids=batch, metadatas=[{"chunk_total": total}] * len(batch))
     _mark_source(source_state.mark_complete, stream, drawers, extract_mode, total)
     filed = FiledDrawers(len(written))
     filed.unchanged = bool(drawers) and not rewritten and not stale
+    filed.pruned = len(stale)
     return filed

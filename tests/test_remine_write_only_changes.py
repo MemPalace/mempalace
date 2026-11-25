@@ -463,3 +463,54 @@ def test_a_replacing_backend_appends_and_drops_keys_the_same_way(palace):
         wing=WING,
         source_state=SourceStateStore(palace),
     )
+
+
+def test_a_redo_after_a_crash_finishes_the_pending_marker_on_unchanged_drawers(palace, monkeypatch):
+    _file(palace, _drawers(["one", "two", "three"]))
+
+    def fail(self, *args, **kwargs):
+        raise RuntimeError("killed before the stale delete")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(get_collection(palace)), "delete", fail)
+        with pytest.raises(StaleDrawerPurgeFailed):
+            _file(palace, _drawers(["ONE", "two"], "2:2:2"))
+    assert _rows(palace)["drawer_0"][1]["chunk_total"] == 3  # the pending marker
+
+    _file(palace, _drawers(["ONE", "two"], "2:2:2"))
+
+    rows = _rows(palace)
+    assert set(rows) == {"drawer_0", "drawer_1"}
+    assert rows["drawer_0"][1]["chunk_total"] == 2
+
+
+def test_an_unchanged_drawer_with_an_unusable_vector_is_re_embedded(palace, monkeypatch):
+    _file(palace, _drawers(["one", "two"]))
+    spy = _WriteSpy(monkeypatch, get_collection(palace))
+    import mempalace.embedding as embedding
+
+    # Vectors of another size, as ``set-embedder --force`` leaves behind.
+    monkeypatch.setattr(embedding, "probe_dimension", lambda *a, **k: 7)
+    filed = _file(palace, _drawers(["one", "two"], "2:2:2"))
+
+    assert set(spy.ids("upsert")) == {"drawer_0", "drawer_1"}
+    assert filed == 2 and filed.unchanged  # same text: closets and summaries still fit
+
+
+def test_a_prune_only_convo_remine_still_recomputes_hallways(convo, monkeypatch):
+    from mempalace import convo_miner
+
+    doc, palace, mine = convo
+    doc.write_text(_convo_text(range(5)), encoding="utf-8")
+    mine()
+    doc.write_text(_convo_text(range(3)), encoding="utf-8")
+
+    hallways = []
+    monkeypatch.setattr(
+        convo_miner,
+        "_compute_hallways_for_wing_safe",
+        lambda wing, collection, filed, config=None: hallways.append(filed),
+    )
+    mine()
+
+    assert hallways and hallways[0] > 0

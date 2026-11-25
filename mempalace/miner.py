@@ -2258,11 +2258,11 @@ def _mine_impl(
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
         aaak_col = open_aaak_collection(palace_path)
+        # Per-source mining state, so a re-mine writes only what changed.
+        source_state = SourceStateStore(palace_path)
         # One sqlite pass instead of one get(where=source_file) per file,
         # which costs ~0.1 s each on a 1M-drawer palace. None on
         # other backends: every file then takes the per-file check.
-        # Per-source mining state, so a re-mine writes only what changed.
-        source_state = SourceStateStore(palace_path)
         mined_mtimes = prefetch_complete_mtimes(
             collection, [str(f) for f in files], source_state=source_state
         )
@@ -2323,7 +2323,8 @@ def _mine_impl(
             # that failed is neither skipped nor mined.
             if skip_reason == "purge_failed":
                 files_failed.append(str(filepath))
-            elif drawers == 0:
+            elif drawers == 0 and not getattr(drawers, "pruned", 0):
+                # Nothing written: skipped, or re-filed with nothing changed.
                 files_skipped += 1
                 if skip_reason == "chunk_cap":
                     files_skipped_chunk_cap += 1
