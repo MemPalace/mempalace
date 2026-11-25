@@ -527,8 +527,8 @@ class TestForwardSearchToHub:
             hub.stop()
 
     @pytest.mark.parametrize("local_token", [None, "stale-token"])
-    def test_authenticated_hub_without_matching_token_keeps_direct_path(
-        self, isolated_home, local_token
+    def test_authenticated_hub_without_matching_token_fails_closed(
+        self, isolated_home, local_token, capsys
     ):
         palace = str(isolated_home / "palace")
         hub = _FakeHub(required_token="actual-token")
@@ -537,10 +537,34 @@ class TestForwardSearchToHub:
             if local_token is not None:
                 server_registry.server_token_path(palace).write_text(local_token)
 
-            assert cli._forward_search_to_hub(_search_args(), palace) is False
+            with pytest.raises(SystemExit) as exc:
+                cli._forward_search_to_hub(_search_args(), palace)
+            assert exc.value.code == 1
+            assert "not falling back to a local search" in capsys.readouterr().err
             assert hub.requests == []
         finally:
             hub.stop()
+
+    def test_registered_matching_hub_health_failure_does_not_load_local_index(
+        self, isolated_home, fake_hub, monkeypatch, capsys
+    ):
+        palace = str(isolated_home / "palace")
+        _register_hub(palace, fake_hub)
+        monkeypatch.setattr(hub_client.HubClient, "healthy", lambda self: False)
+
+        real_import = builtins.__import__
+
+        def reject_local_searcher(name, *args, **kwargs):
+            if name == "mempalace.searcher":
+                raise AssertionError("a failed hub must not cold-load local HNSW")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", reject_local_searcher)
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_search(_search_args(palace=palace))
+        assert exc.value.code == 1
+        assert "not falling back to a local search" in capsys.readouterr().err
+        assert fake_hub.requests == []
 
     def test_authenticated_hub_with_matching_token_forwards(self, isolated_home):
         palace = str(isolated_home / "palace")
