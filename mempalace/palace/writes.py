@@ -500,14 +500,10 @@ def _read_stored(collection, ids: list) -> dict:
     return {drawer_id: (doc, meta or {}) for drawer_id, doc, meta in zip(got, documents, metadatas)}
 
 
-def _with_reused_vectors(collection, rows: list) -> tuple:
+def _with_reused_vectors(collection, rows: list, dimension_cache: dict) -> tuple:
     """Split ``rows`` into ``(reusable, vectors, to_embed)`` by stored vector."""
     vectors = _stored_vectors(collection, [drawer_id for drawer_id, _, _ in rows])
-    dimension = 0
-    if vectors:
-        from ..embedding import probe_dimension
-
-        dimension = probe_dimension()
+    dimension = _probed_dimension(dimension_cache) if vectors else 0
     reuse, reuse_vectors, to_embed = [], [], []
     for row in rows:
         vector = vectors.get(row[0])
@@ -517,6 +513,15 @@ def _with_reused_vectors(collection, rows: list) -> tuple:
         else:
             to_embed.append(row)
     return reuse, reuse_vectors, to_embed
+
+
+def _probed_dimension(dimension_cache: dict) -> int:
+    """The embedder's dimension, probed at most once per ``dimension_cache``."""
+    if "dimension" not in dimension_cache:
+        from ..embedding import probe_dimension
+
+        dimension_cache["dimension"] = probe_dimension()
+    return dimension_cache["dimension"]
 
 
 def _unusable_vectors(collection, ids: list, dimension_cache: dict) -> set:
@@ -536,6 +541,8 @@ def _unusable_vectors(collection, ids: list, dimension_cache: dict) -> set:
         return set()
     try:
         got = collection.get(ids=ids, include=["embeddings"])
+    except MINE_ABORTS:
+        raise
     except Exception:
         logger.debug("could not read stored vectors to check them", exc_info=True)
         return set()
@@ -543,11 +550,7 @@ def _unusable_vectors(collection, ids: list, dimension_cache: dict) -> set:
     if vectors is None:
         return set()
     stored = dict(zip(got.get("ids") or [], vectors))
-    if "dimension" not in dimension_cache:
-        from ..embedding import probe_dimension
-
-        dimension_cache["dimension"] = probe_dimension()
-    dimension = dimension_cache["dimension"]
+    dimension = _probed_dimension(dimension_cache)
     if dimension <= 0:
         return {i for i in ids if i in stored and (stored[i] is None or len(stored[i]) == 0)}
     return {i for i in ids if i in stored and not _reusable_vector(stored[i], dimension)}
@@ -638,7 +641,7 @@ def _refile_changed(
         ]
         if preserving:
             _archive_prior_text(palace_path, source_file, journal, "remine_overwrite")
-        reuse, reuse_vectors, re_embed = _with_reused_vectors(collection, repaired)
+        reuse, reuse_vectors, re_embed = _with_reused_vectors(collection, repaired, dimension_cache)
         _upsert(collection, reuse, embeddings=reuse_vectors)
         _upsert(collection, to_embed + re_embed)
         if updates:

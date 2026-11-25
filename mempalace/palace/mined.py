@@ -700,8 +700,11 @@ def prefetch_complete_mtimes(
     if source_state is not None:
         try:
             heads = source_state.get_many(owner="project", source_files=wanted)
-        except (OSError, sqlite3.Error):
-            logger.warning("source records unreadable; checking each file on its own")
+        except (OSError, sqlite3.Error) as exc:
+            # The per-file check reads the same store and stops the mine.
+            logger.warning(
+                "could not read the palace's source records (%r); %s", exc, _SOURCE_STATE_HINT
+            )
             return None
     complete: dict[str, tuple] = {}
     for src, head in heads.items():

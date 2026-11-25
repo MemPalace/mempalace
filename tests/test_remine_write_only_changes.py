@@ -752,3 +752,21 @@ def test_a_touched_transcript_on_sqlite_exact_remines_without_a_write(convo, mon
     new = dict(zip(after["ids"], after["documents"]))
     assert set(spy.ids("upsert")) == set(new) - set(old)
     assert {i: new[i] for i in old} == old
+
+
+def test_a_dead_backend_during_the_vector_check_stops_the_refile(palace, monkeypatch):
+    from mempalace.backends.base import BackendError
+
+    _file(palace, _drawers(["one", "two"]))
+    collection = get_collection(palace)
+    real_get = type(collection).get
+
+    def get(self, *args, **kwargs):
+        if "embeddings" in (kwargs.get("include") or []):
+            raise BackendError("connection reset")
+        return real_get(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(collection), "get", get)
+    with pytest.raises(BackendError):
+        _file(palace, _drawers(["one", "two", "three"], "2:2:2"))
+    assert SourceStateStore(palace).get(_stream()).state == "pending"
