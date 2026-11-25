@@ -181,6 +181,27 @@ def test_in_place_tail_rewrite_on_same_inode_is_detected(tmp_path):
     assert fed == b"aaaa\ncccc\nmore\n"
 
 
+def test_rewrite_of_a_long_last_line_keeping_its_last_4k_is_detected(tmp_path):
+    f = tmp_path / "t.jsonl"
+    long_line = b"A" * 20000 + b"Z" * 8000 + b"\n"
+    f.write_bytes(b"head\n" + long_line)
+    first, _ = _collect(f, None)
+    with open(f, "r+b") as fh:  # change the start of the line, keep its last 8 KiB
+        fh.seek(5)
+        fh.write(b"B" * 100)
+    scan, _ = _collect(f, first.cursor)
+    assert scan.reason == "anchor"
+
+
+def test_unchanged_file_keeps_an_identical_cursor(tmp_path):
+    f = tmp_path / "t.jsonl"
+    f.write_bytes(b"a\n" * 3000 + b"x" * 5000 + b"\n")
+    first, _ = _collect(f, None)
+    again, fed = _collect(f, first.cursor)
+    assert again.resumed and fed == b""
+    assert again.cursor == first.cursor
+
+
 def test_shrunk_file_is_rescanned(tmp_path):
     f = tmp_path / "t.jsonl"
     f.write_bytes(b"aaaa\nbbbb\n")
@@ -210,7 +231,7 @@ def test_fifo_is_not_a_transcript(tmp_path):
 
 def test_sidecar_round_trip_and_corruption(tmp_path):
     side = tmp_path / "cur" / "x.json"
-    cur = Cursor("r/1", 10, "ab" * 32, 1, 2, 12, {"count": 3})
+    cur = Cursor("r/1", 10, "ab" * 32, 4, 1, 2, 12, {"count": 3})
     save_cursor(side, cur)
     assert load_cursor(side) == cur
     assert not [p for p in side.parent.iterdir() if p.name != "x.json"]  # no temp left
@@ -295,6 +316,18 @@ def test_corrupt_sidecar_falls_back_to_full_count(tmp_path, state_dir):
     assert load_cursor(side) is not None
 
 
+def test_sidecar_with_a_bad_count_state_is_recounted(tmp_path, state_dir):
+    f = tmp_path / "t.jsonl"
+    f.write_bytes((LINE_POOL[0] + b"\n") * 3)
+    assert hooks_cli._count_human_messages(str(f)) == 3
+    side = hooks_cli._cursor_sidecar(f.resolve())
+    data = json.loads(side.read_text())
+    data["state"] = {"count": 99}
+    side.write_text(json.dumps(data))
+    assert hooks_cli._count_human_messages(str(f)) == 3
+    assert load_cursor(side).state == {"count": 3, "codex_events": 0, "codex_items": 0}
+
+
 def test_cursor_failure_never_raises_into_the_hook(tmp_path, state_dir, monkeypatch):
     f = tmp_path / "t.jsonl"
     f.write_bytes(LINE_POOL[0] + b"\n")
@@ -322,6 +355,7 @@ def test_session_end_clears_the_cursor(tmp_path, state_dir):
     assert side.exists()
     hooks_cli._clear_transcript_cursor(str(f))
     assert not side.exists()
+    hooks_cli._clear_transcript_cursor("bad\x00path.jsonl")  # must not raise
 
 
 @pytest.mark.parametrize("line", LINE_POOL)
@@ -398,13 +432,14 @@ def _apply(path: Path, edit, rng_term):
         os.replace(tmp, path)
 
 
-@pytest.mark.parametrize("anchor", [16, 4096])
+@pytest.mark.parametrize("anchor", [(16, 40), (4096, 1024 * 1024)])
 @settings(
     max_examples=60, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture]
 )
 @given(edits=st.lists(_edit, min_size=1, max_size=12))
 def test_incremental_count_equals_full_recount(edits, anchor, parser, monkeypatch):
-    monkeypatch.setattr(transcript_cursor, "ANCHOR_BYTES", anchor)
+    monkeypatch.setattr(transcript_cursor, "ANCHOR_BYTES", anchor[0])
+    monkeypatch.setattr(transcript_cursor, "MAX_ANCHOR_BYTES", anchor[1])
     monkeypatch.setattr(transcript_cursor, "READ_BLOCK", 97)  # many block boundaries
     monkeypatch.setattr(hooks_cli, "_palace_root_exists", lambda: True)
     with tempfile.TemporaryDirectory() as d:

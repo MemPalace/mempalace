@@ -38,7 +38,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 CURSOR_FORMAT = 1
+# The anchor covers the whole last committed line, but at least ANCHOR_BYTES
+# and at most MAX_ANCHOR_BYTES. Covering the whole line catches a rewrite of a
+# long record (tool results run to hundreds of KiB) that keeps its last 4 KiB.
 ANCHOR_BYTES = 4096
+MAX_ANCHOR_BYTES = 1024 * 1024
 READ_BLOCK = 8 * 1024 * 1024
 
 _OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
@@ -49,13 +53,14 @@ class Cursor:
     """Where a scan of one file stopped, and how to check it still applies.
 
     ``offset`` is the end of the last committed line. ``anchor_sha256`` hashes
-    the up to ``ANCHOR_BYTES`` bytes ending at ``offset``; it is the
-    authority. ``dev``/``ino``/``size`` are only hints for logging.
+    the ``anchor_len`` bytes ending at ``offset``; it is the authority.
+    ``dev``/``ino``/``size`` are only hints for logging.
     """
 
     recipe: str
     offset: int
     anchor_sha256: str
+    anchor_len: int = 0
     dev: int = 0
     ino: int = 0
     size: int = 0
@@ -67,6 +72,7 @@ class Cursor:
             "recipe": self.recipe,
             "offset": self.offset,
             "anchor_sha256": self.anchor_sha256,
+            "anchor_len": self.anchor_len,
             "dev": self.dev,
             "ino": self.ino,
             "size": self.size,
@@ -82,6 +88,7 @@ class Cursor:
             recipe = data["recipe"]
             offset = data["offset"]
             anchor = data["anchor_sha256"]
+            anchor_len = data["anchor_len"]
             state = data.get("state", {})
             hints = [data.get(k, 0) for k in ("dev", "ino", "size")]
         except (KeyError, TypeError):
@@ -90,9 +97,11 @@ class Cursor:
             return None
         if type(offset) is not int or offset < 0 or not isinstance(state, dict):
             return None
+        if type(anchor_len) is not int or not 0 <= anchor_len <= offset:
+            return None
         if any(type(h) is not int for h in hints):
             return None
-        return cls(recipe, offset, anchor, *hints, state=state)
+        return cls(recipe, offset, anchor, anchor_len, *hints, state=state)
 
 
 @dataclass(frozen=True)
@@ -116,20 +125,29 @@ def _read_at(f, start: int, length: int) -> bytes:
     return f.read(length)
 
 
-def anchor_digest(f, offset: int, anchor_bytes: Optional[int] = None) -> Optional[str]:
-    """SHA-256 of the up to ``anchor_bytes`` bytes ending at ``offset``.
+def anchor_digest(f, offset: int, length: int) -> Optional[str]:
+    """SHA-256 of the ``length`` bytes ending at ``offset``.
 
-    Returns None when the file no longer holds that many bytes.
+    Returns None when the file no longer holds those bytes.
     """
-    anchor_bytes = anchor_bytes or ANCHOR_BYTES
-    start = max(0, offset - anchor_bytes)
-    data = _read_at(f, start, offset - start)
-    if len(data) != offset - start:
+    data = _read_at(f, offset - length, length)
+    if len(data) != length:
         return None
     return hashlib.sha256(data).hexdigest()
 
 
-def verify(f, cursor: Cursor, size: int, anchor_bytes: Optional[int] = None) -> str:
+def anchor_span(window: bytes) -> bytes:
+    """The anchor for a committed prefix whose last bytes are ``window``.
+
+    ``window`` ends at the cursor offset (just after a newline). The anchor is
+    the whole last line, widened to ``ANCHOR_BYTES`` and clipped to the window.
+    """
+    n = len(window)
+    line_start = window.rfind(b"\n", 0, n - 1) + 1 if n else 0
+    return window[min(line_start, max(0, n - ANCHOR_BYTES)) :]
+
+
+def verify(f, cursor: Cursor, size: int) -> str:
     """Check ``cursor`` against an open file of ``size`` bytes.
 
     Returns ``"match"``, or the reason it does not: ``"shrunk"`` or
@@ -138,7 +156,7 @@ def verify(f, cursor: Cursor, size: int, anchor_bytes: Optional[int] = None) -> 
     """
     if size < cursor.offset:
         return "shrunk"
-    if anchor_digest(f, cursor.offset, anchor_bytes) != cursor.anchor_sha256:
+    if anchor_digest(f, cursor.offset, cursor.anchor_len) != cursor.anchor_sha256:
         return "anchor"
     return "match"
 
@@ -177,7 +195,6 @@ def advance(
     recipe: str,
     initial_state: Callable[[], dict],
     feed: Callable[[dict, bytes], None],
-    anchor_bytes: Optional[int] = None,
 ) -> Optional[Scan]:
     """Fold the complete lines of ``path`` into a state, resuming when it can.
 
@@ -187,7 +204,6 @@ def advance(
     ``initial_state()``. Returns None when ``path`` is not a regular file.
     OSError propagates to the caller.
     """
-    anchor_bytes = anchor_bytes or ANCHOR_BYTES
     fd = os.open(os.fspath(path), _OPEN_FLAGS)
     with os.fdopen(fd, "rb") as f:
         st = os.fstat(f.fileno())
@@ -200,16 +216,16 @@ def advance(
         elif cursor.recipe != recipe:
             reason = "recipe"
         else:
-            reason = verify(f, cursor, size, anchor_bytes)
+            reason = verify(f, cursor, size)
 
         if reason == "match":
             start = cursor.offset
             state = json.loads(json.dumps(cursor.state))
-            anchor_window = _read_at(f, max(0, start - anchor_bytes), min(start, anchor_bytes))
+            window = _read_at(f, start - cursor.anchor_len, cursor.anchor_len)
         else:
             start = 0
             state = initial_state()
-            anchor_window = b""
+            window = b""
 
         offset = start
         lines = iter_complete_lines(f, start, size)
@@ -221,12 +237,15 @@ def advance(
                 break
             feed(state, chunk)
             offset += len(chunk)
-            anchor_window = (anchor_window + chunk[-anchor_bytes:])[-anchor_bytes:]
+            cap = MAX_ANCHOR_BYTES
+            window = chunk[-cap:] if len(chunk) >= cap else (window + chunk)[-cap:]
 
+    anchor = anchor_span(window)
     new_cursor = Cursor(
         recipe=recipe,
         offset=offset,
-        anchor_sha256=hashlib.sha256(anchor_window).hexdigest(),
+        anchor_sha256=hashlib.sha256(anchor).hexdigest(),
+        anchor_len=len(anchor),
         dev=st.st_dev,
         ino=st.st_ino,
         size=size,

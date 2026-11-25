@@ -258,10 +258,26 @@ def _cursor_sidecar(path: Path) -> Path:
     return STATE_DIR / _CURSOR_SUBDIR / transcript_cursor.sidecar_name(path)
 
 
+def _valid_count_state(state: dict) -> bool:
+    keys = _new_count_state().keys()
+    return state.keys() == keys and all(type(state[k]) is int and state[k] >= 0 for k in keys)
+
+
+def _ensure_cursor_dir() -> None:
+    for d in (STATE_DIR, STATE_DIR / _CURSOR_SUBDIR):
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            d.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+
+
 def _count_with_cursor(path: Path) -> int:
     """Count via the stored cursor, parsing only what was appended since."""
     sidecar = _cursor_sidecar(path)
     previous = transcript_cursor.load_cursor(sidecar)
+    if previous is not None and not _valid_count_state(previous.state):
+        previous = None
     scan = transcript_cursor.advance(
         path,
         previous,
@@ -275,6 +291,7 @@ def _count_with_cursor(path: Path) -> int:
         _log(f"transcript cursor {scan.reason}; recounted {path.name}")
     if scan.cursor != previous and _palace_root_exists():
         try:
+            _ensure_cursor_dir()
             transcript_cursor.save_cursor(sidecar, scan.cursor)
         except OSError as exc:
             _log(f"WARNING: could not save transcript cursor: {exc}")
@@ -305,11 +322,16 @@ def _count_human_messages(transcript_path: str) -> int:
         return 0
     except Exception as exc:  # never let cursor bookkeeping break the hook
         _log(f"WARNING: transcript cursor failed ({exc!r}); counting without it")
+        try:
+            _cursor_sidecar(path).unlink()
+        except OSError:
+            pass
     try:
         scan = transcript_cursor.advance(
             path, None, recipe=_COUNT_RECIPE, initial_state=_new_count_state, feed=_feed_count
         )
-    except Exception:
+    except Exception as exc:
+        _log(f"WARNING: could not count transcript messages ({exc!r})")
         return 0
     if scan is None:
         return 0
@@ -324,7 +346,7 @@ def _clear_transcript_cursor(transcript_path: str) -> None:
         path = _validate_transcript_path(transcript_path) if transcript_path else None
         if path is not None:
             _cursor_sidecar(path).unlink()
-    except (OSError, TypeError):
+    except Exception:  # best-effort cleanup inside a finally; never raise
         pass
 
 
