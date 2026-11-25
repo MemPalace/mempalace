@@ -42,6 +42,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
@@ -98,6 +99,13 @@ CREATE TABLE IF NOT EXISTS hallways (
     record TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_hallways_wing ON hallways(wing);
+CREATE TABLE IF NOT EXISTS dirty_wings (
+    wing TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    first_marked_at REAL NOT NULL,
+    last_marked_at REAL NOT NULL,
+    entity_tunnels INTEGER NOT NULL DEFAULT 0
+);
 """
 
 # An upsert keeps the row's rowid, so list order (insertion order) survives a
@@ -402,6 +410,116 @@ def _save_hallways(hallways: list[dict], config=None) -> None:
     with _writing(config) as conn:
         conn.execute("DELETE FROM hallways")
         conn.executemany(_UPSERT, [_row(h) for h in hallways if isinstance(h, dict)])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dirty marks — wings whose hallways a mine left for a deferred recompute
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# A mine that defers its hallway recompute marks the wing here, in the same
+# store as the records, so the mark is as durable as they are and survives any
+# crash of whoever was going to run the recompute. ``generation`` grows with
+# every mark: :func:`compute_hallways_for_wing` notes it before reading the
+# wing's drawers and clears the mark in the transaction that saves the new
+# records only if it is unchanged, so drawers filed after that read keep the
+# wing dirty. Readers never look at the marks; until the recompute commits
+# they read the wing's previous records, which are stale but whole.
+
+
+def mark_wing_dirty(wing: str, config=None, *, entity_tunnels: bool = False, now=None) -> int:
+    """Mark ``wing`` as needing a hallway recompute; return the new generation.
+
+    ``entity_tunnels`` records that the recompute must also refresh the
+    wing's cross-wing entity tunnels, which are derived from its hallways
+    (project mines). Repeat marks keep the first mark's time, which bounds
+    how long a wing may stay stale, and keep the flag once any mark set it.
+    """
+    stamp = time.time() if now is None else float(now)
+    conn = _connect(_get_hallway_db(config), readonly=False)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                INSERT INTO dirty_wings
+                    (wing, generation, first_marked_at, last_marked_at, entity_tunnels)
+                VALUES (?, 1, ?, ?, ?)
+                ON CONFLICT(wing) DO UPDATE SET
+                    generation = generation + 1,
+                    last_marked_at = excluded.last_marked_at,
+                    entity_tunnels = MAX(entity_tunnels, excluded.entity_tunnels)
+                """,
+                (wing, stamp, stamp, int(bool(entity_tunnels))),
+            )
+            row = conn.execute(
+                "SELECT generation FROM dirty_wings WHERE wing = ?", (wing,)
+            ).fetchone()
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+    finally:
+        conn.close()
+    return int(row[0])
+
+
+def _read_dirty(config=None, wing: Optional[str] = None) -> list[dict]:
+    path = _get_hallway_db(config)
+    if not os.path.exists(path):
+        return []
+    try:
+        conn = _connect(path, readonly=True)
+    except sqlite3.Error:
+        logger.debug("hallways: store open failed reading dirty marks", exc_info=True)
+        return []
+    with contextlib.closing(conn):
+        sql = (
+            "SELECT wing, generation, first_marked_at, last_marked_at, entity_tunnels"
+            " FROM dirty_wings"
+        )
+        params: tuple = ()
+        if wing is not None:
+            sql += " WHERE wing = ?"
+            params = (wing,)
+        try:
+            rows = conn.execute(sql + " ORDER BY first_marked_at, wing", params).fetchall()
+        except sqlite3.OperationalError:
+            return []  # a store written before marks existed has no table yet
+    return [
+        {
+            "wing": row[0],
+            "generation": int(row[1]),
+            "first_marked_at": float(row[2]),
+            "last_marked_at": float(row[3]),
+            "entity_tunnels": bool(row[4]),
+        }
+        for row in rows
+    ]
+
+
+def dirty_wings(config=None) -> list[dict]:
+    """Every wing marked for a deferred recompute, oldest mark first.
+
+    Each entry: ``wing``, ``generation``, ``first_marked_at`` and
+    ``last_marked_at`` (epoch seconds), ``entity_tunnels``. Read-only: no
+    store yet means no marks, and nothing is created.
+    """
+    return _read_dirty(config)
+
+
+def dirty_mark(wing: str, config=None) -> Optional[dict]:
+    """The dirty mark of ``wing``, or ``None`` when it is clean."""
+    marks = _read_dirty(config, wing)
+    return marks[0] if marks else None
+
+
+def _clear_dirty(conn: sqlite3.Connection, wing: str, generation: Optional[int]) -> None:
+    """Inside a write transaction: drop ``wing``'s mark if no mark followed ``generation``."""
+    if generation is None:
+        return
+    conn.execute(
+        "DELETE FROM dirty_wings WHERE wing = ? AND generation = ?", (wing, int(generation))
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -944,6 +1062,11 @@ def compute_hallways_for_wing(
         threshold = min_count
     min_count = max(1, int(threshold))
 
+    # The wing's dirty mark as of now, before its drawers are read: the save
+    # below clears it only if no mine marked the wing again after this point.
+    mark = dirty_mark(wing, config)
+    generation = mark["generation"] if mark else None
+
     # 1. Query drawers for this wing. On Chroma, one linear pass over the
     #    drawers holding entities; elsewhere, wing-scoped pages.
     try:
@@ -957,6 +1080,11 @@ def compute_hallways_for_wing(
         return []
 
     if not metadatas:
+        # No drawers: nothing to recompute. A mark left here would only
+        # schedule the same empty recompute again.
+        if generation is not None:
+            with _writing(config) as conn:
+                _clear_dirty(conn, wing, generation)
         return []
 
     # 2. Walk drawers, counting entity-pair co-occurrence + tracking rooms.
@@ -1108,6 +1236,7 @@ def compute_hallways_for_wing(
             [(row[0],) for row in stored if row[0] not in kept_ids],
         )
         conn.executemany(_UPSERT, [_row(h) for h in changed])
+        _clear_dirty(conn, wing, generation)
 
     return created
 
