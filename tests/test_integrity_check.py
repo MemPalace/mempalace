@@ -342,9 +342,14 @@ def test_validator_catches_a_nul_written_past_the_chokepoint(tmp_path):
         ("fresh\x00words", _rowid(palace, "b")),
     )
 
+    record = palace / ".mempalace" / "integrity.json"
+    recorded = record.read_text()
     with pytest.raises(MineValidationError) as exc_info:
         _validate_palace_fts5_after_mine(str(palace), writes_since=before)
     assert any("raw NUL" in e and "'b'" in e for e in exc_info.value.errors)
+    # The escalated full check passes (quick_check cannot see a stored NUL);
+    # it must not certify the palace that just failed.
+    assert record.read_text() == recorded
 
 
 def test_fts_index_damage_is_left_to_the_maintenance_check(tmp_path):
@@ -457,6 +462,23 @@ def test_integrity_check_command_runs_then_reuses_a_clean_result(tmp_path, capsy
     assert "unchanged since" in capsys.readouterr().out
     _integrity_check_cli(palace, force=True)
     assert [p["full"] for p in probes] == [True, True], "the cached run probes nothing"
+
+    _mine_like_write(palace, ["b"], ["a change since the last check"])
+    _integrity_check_cli(palace)
+    assert "found no issues" in capsys.readouterr().out
+    assert len(probes) == 3, "a changed palace must be checked again"
+
+
+def test_integrity_check_command_leaves_another_writers_marker_alone(tmp_path, capsys):
+    """It takes no writer lock, so a marker may belong to a live mine elsewhere."""
+    palace = _palace_with(tmp_path, [("a", "hello")])
+    marker = palace / ".mempalace" / "write-in-flight"
+    marker.parent.mkdir(exist_ok=True)
+    marker.write_text("4242")
+
+    _integrity_check_cli(palace)
+
+    assert marker.exists()
 
 
 def test_integrity_check_command_exits_nonzero_on_corruption(tmp_path, capsys):

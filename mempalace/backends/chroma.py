@@ -2206,7 +2206,7 @@ _write_serial = 0
 _write_serial_lock = threading.Lock()
 
 # The ids each write declared, tagged with the serial it ran under, so the
-# post-mine check can scan just the rows a mine wrote (#2684). Bounded by id
+# post-mine check can scan just the rows a mine wrote. Bounded by id
 # count: past the cap the oldest entries go and ``_written_ids_floor`` records
 # the newest serial they covered, so a caller whose baseline predates it gets
 # ``None`` (scan incomplete, run the full check) rather than a short set.
@@ -2336,7 +2336,7 @@ class ChromaCollection(BaseCollection):
             palace_db_lock(os.path.join(self._palace_path, "chroma.sqlite3")),
         ):
             # Inside the writer lock, so a marker no write here owns can only
-            # have been left by a writer that died mid-write (#2684).
+            # have been left by a writer that died mid-write.
             note_write_started(self._palace_path)
             try:
                 yield

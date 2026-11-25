@@ -68,7 +68,7 @@ def cmd_repair_status(args):
 
 
 def cmd_integrity_check(args):
-    """Full ``PRAGMA quick_check`` of the palace, in a child process (#2684).
+    """Full ``PRAGMA quick_check`` of the palace, in a child process.
 
     The maintenance half of the post-mine check: a batch runner can set
     ``MEMPALACE_INTEGRITY_FULL_CHECK_INTERVAL_HOURS=0`` for its mines and run

@@ -110,14 +110,17 @@ def _validate_palace_fts5_after_mine(
 def _heal_after_mine(palace_path: str, errors: list[str]) -> list[str]:
     """Try the FTS5 auto-heal on a failed full check; return what remains."""
     # Defer-import: keeps the repair module graph out of mine's hot import path.
-    from ..repair import _close_chroma_handles, maybe_autoheal_fts5_index
+    from ..repair import _close_chroma_handles, _errors_are_isolated_fts5, maybe_autoheal_fts5_index
 
     # The heal writes through Python's sqlite3 in this process, so first close
     # the writer's cached PersistentClient (the live singleton, not a
     # transient ChromaBackend, which would only clear its own empty
     # `_clients` dict and leave _DEFAULT_BACKEND's handle open; on Windows
     # that keeps the sqlite file mmap'd).
-    _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
+    # Only when the heal will act: a declined heal writes nothing, and closing
+    # throws away the writer's loaded index for no gain.
+    if _errors_are_isolated_fts5(errors):
+        _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
     # Not the default print: this runs inside the MCP server process too
     # (mcp_server.tool_mine -> miner.mine), where stdout is the JSON-RPC
     # transport -- a stray print() here would corrupt the protocol stream
