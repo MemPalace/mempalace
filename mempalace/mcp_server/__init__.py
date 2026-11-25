@@ -202,6 +202,7 @@ _FRAGMENTS = (
     "tools_diary.py",
     "tools_coord.py",
     "schemas.py",
+    "instructions.py",
     "protocol.py",
     "http.py",
     "runtime.py",
