@@ -433,13 +433,15 @@ def index_quietly(windows: Optional[WindowIndex], rows: list) -> None:
     """:meth:`WindowIndex.index` for a miner: a failure is logged, never raised."""
     if windows is None or not rows:
         return
-    from .palace import MINE_ABORTS
+    from .palace import MineAlreadyRunning
 
     try:
         windows.index(rows)
-    except MINE_ABORTS:
+    except MineAlreadyRunning:
         raise
     except Exception:
+        # A derived index never aborts a mine, even when its handle went bad
+        # (a backend reset closes it): the drawers are already filed.
         logger.warning(
             "Sub-window indexing failed for %d drawers; `mempalace windows build` retries",
             len(rows),
@@ -453,7 +455,9 @@ def index_after_write(palace_path: str, ids, documents, metadatas) -> None:
     The drawer write already succeeded, so nothing here may fail it: every
     error is logged and ``mempalace windows build`` picks the drawers up later.
     """
-    if not palace_path or not ids:
+    # Flag off, nothing is written: a re-filed drawer's old windows were
+    # already purged by the caller's delete cascade.
+    if not palace_path or not ids or not subwindows_enabled():
         return
     try:
         windows = open_window_index(palace_path)
@@ -807,12 +811,19 @@ def build_windows(
             progress(dict(stats))
 
     if wing is None and windows_col is not None:
-        orphans = [
-            row_id
+        candidates = [
+            (row_id, (meta or {}).get("window_of"))
             for page in _page_rows(windows_col, include=("metadatas",))
             for row_id, _, meta in page
             if (meta or {}).get("window_of") not in seen
         ]
+        # A drawer filed (and windowed) after the scan above is not an orphan.
+        parents = list({parent for _, parent in candidates if parent})
+        alive: set = set()
+        for start in range(0, len(parents), BATCH_SIZE):
+            got = drawers_col.get(ids=parents[start : start + BATCH_SIZE], include=[])
+            alive.update(got.get("ids") or [])
+        orphans = [row_id for row_id, parent in candidates if parent not in alive]
         stats["orphans_pruned"] = len(orphans)
         if not dry_run:
             for start in range(0, len(orphans), BATCH_SIZE):

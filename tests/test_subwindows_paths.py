@@ -728,3 +728,74 @@ def test_colliding_writes_deletes_and_search_never_touch_real_drawers(colliding,
 
     assert _snapshot(col) == before
     assert "real-2" in hits
+
+
+# ── review follow-ups ────────────────────────────────────────────────────
+
+
+def test_build_does_not_prune_windows_of_a_drawer_filed_during_the_scan(windowed, monkeypatch):
+    """A drawer (and its windows) written after the build's drawer scan is not an orphan."""
+    palace, col = windowed
+    real_page_rows = subwindows._page_rows
+    injected = []
+
+    def page_rows(collection, **kwargs):
+        # The windows scan starts after the drawer scan: file a drawer now.
+        if (
+            "metadatas" in kwargs.get("include", ())
+            and "documents" not in kwargs.get("include", ())
+            and not injected
+        ):
+            injected.append(1)
+            col.upsert(
+                ids=["late"],
+                documents=[_long_text("a drawer filed mid-build")],
+                metadatas=[{"wing": "w", "room": "r", "source_file": "/src/late.md"}],
+            )
+            subwindows.index_after_write(
+                palace, ["late"], [_long_text("a drawer filed mid-build")], [{}]
+            )
+        yield from real_page_rows(collection, **kwargs)
+
+    monkeypatch.setattr(subwindows, "_page_rows", page_rows)
+    stats = subwindows.build_windows(palace)
+
+    assert injected and stats["orphans_pruned"] == 0
+    assert {m["window_of"] for _, m, _ in _windows(palace).values()} >= {"late"}
+
+
+def test_a_window_failure_never_aborts_a_mine(windows_on, tmp_path, monkeypatch):
+    from mempalace.backends import BackendError
+    from mempalace.miner import mine
+
+    def broken(self, rows):
+        raise BackendError("windows collection closed under the miner")
+
+    monkeypatch.setattr(subwindows.WindowIndex, "index", broken)
+    palace = str(tmp_path / "palace")
+    root = _project(tmp_path, {"a.md": _words("alpha", 300), "b.md": _words("beta", 300)})
+    mine(str(root), palace)
+
+    assert len(_drawers(palace)) >= 2
+    assert _windows(palace) == {}  # missing until `windows build`, never wrong
+
+
+def test_a_rechunking_move_purges_windows_of_dropped_chunks(mcp, monkeypatch):
+    from mempalace.config import MempalaceConfig
+
+    palace, server = mcp
+
+    def chunk_size(size):
+        monkeypatch.setattr(MempalaceConfig, "chunk_size", property(lambda self: size))
+
+    chunk_size(400)
+    big = " ".join(_long_text(f"chapter {i} heron") for i in range(20))
+    added = server.tool_add_drawer("w", "r", big)
+    assert added["success"]
+    before = set(_drawers(palace))
+    # A larger chunk size re-chunks the drawer into fewer rows on a
+    # metadata-only update; the dropped rows' windows must go with them.
+    chunk_size(2000)
+    assert server.tool_update_drawer(added["drawer_id"], wing="moved")["success"]
+    assert set(_drawers(palace)) < before
+    assert_windows_consistent(palace)

@@ -1708,6 +1708,12 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             stale_ids = [old_id for old_id in record["ids"] if old_id not in keep_ids]
             if stale_ids:
                 col.delete(ids=stale_ids)
+                if content is None:
+                    # Re-chunked without a text change: the purge below
+                    # does not run, so the dropped rows' derived data goes here.
+                    from ..palace import drawers_removed
+
+                    drawers_removed(_config.palace_path, aaak_ids=stale_ids)
 
             outcome["chunks"] = len(chunk_ids)
             outcome["chunk_ids"] = chunk_ids
