@@ -220,6 +220,10 @@ ASSETS_COLLECTION_NAME = "mempalace_assets"
 # Lossy AAAK summaries written by ``mempalace compress``. They used to share
 # the closets collection, where they boosted search like real closet pointers.
 AAAK_COLLECTION_NAME = "mempalace_aaak"
+# Derived sub-window vectors of long drawers (``embedding_subwindows``). Rows
+# hold a vector and a pointer to their parent drawer, never text; only search
+# and ``mempalace windows`` read them. See ``mempalace.subwindows``.
+WINDOWS_COLLECTION_NAME = "mempalace_drawer_windows"
 
 
 def _allowed_wrapper_collection_names() -> List[str]:
@@ -237,6 +241,7 @@ def _allowed_wrapper_collection_names() -> List[str]:
         CLOSETS_COLLECTION_NAME,
         ASSETS_COLLECTION_NAME,
         AAAK_COLLECTION_NAME,
+        WINDOWS_COLLECTION_NAME,
     ]
     seen: set[str] = set()
     out: list[str] = []
@@ -542,6 +547,28 @@ def get_aaak_collection(
     return get_collection(
         palace_path,
         collection_name=AAAK_COLLECTION_NAME,
+        create=create,
+        backend=backend,
+        **({"read_only": True} if read_only else {}),
+    )
+
+
+def get_windows_collection(
+    palace_path: str,
+    create: bool = True,
+    backend: Optional[str] = None,
+    *,
+    read_only: bool = False,
+):
+    """Get the sub-window collection — derived vectors of long drawers.
+
+    Rows are keyed ``<drawer id>::wNNN``, carry ``kind="drawer_window"`` and
+    ``window_of`` (the parent drawer id), and hold no text. Search folds them
+    into their parent; nothing that lists, counts or exports drawers reads them.
+    """
+    return get_collection(
+        palace_path,
+        collection_name=WINDOWS_COLLECTION_NAME,
         create=create,
         backend=backend,
         **({"read_only": True} if read_only else {}),

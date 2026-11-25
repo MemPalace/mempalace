@@ -37,6 +37,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Opt-in sub-window vectors for drawers longer than the embedder reads
+  (#390).** With `embedding_subwindows` on (`config.json` or
+  `MEMPALACE_EMBEDDING_SUBWINDOWS=1`; off by default), mining also embeds
+  overlapping windows of the verbatim text of any drawer past the embedder's
+  token window (MiniLM: 256 tokens), cut with the embedder's own tokenizer.
+  The windows are derived vectors in a sibling `mempalace_drawer_windows`
+  collection that point at their parent drawer and store no text; search
+  scores a drawer by its best window and returns the drawer itself. Drawers
+  never change. `mempalace windows build` backfills an existing palace
+  incrementally and resumably and prunes stale windows; `mempalace windows
+  status` shows how many drawers need them. Deleting or re-mining a drawer
+  purges its windows, and windows built by another embedder or for older
+  text are ignored. Needs `minilm` or `embeddinggemma`; `openai-compat` and
+  `embeddinggemma2` are not supported yet.
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
   HTTP-capable clients connect to the running hub (`mempalace serve`)
   directly instead of starting a `mempalace-light-mcp` stdio process per

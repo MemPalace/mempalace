@@ -69,6 +69,7 @@ from .project_config import (  # noqa: F401
     find_project_config,
 )
 from .source_identity import source_directory_identity
+from .subwindows import open_window_index
 from .timeutil import utc_now_iso
 
 logger = logging.getLogger(__name__)
@@ -1759,6 +1760,7 @@ def process_file(
     max_chunks_per_file: Optional[int] = None,
     mined_mtimes: Optional[dict] = None,
     aaak_col=None,
+    windows=None,
 ) -> tuple:
     """Read, chunk, route, and file one file.
 
@@ -1882,7 +1884,12 @@ def process_file(
         # A failed stale-drawer purge is an error the mine counts, not a skip.
         try:
             drawers_added = write_file_drawers(
-                collection, source_file, drawers, aaak_col=aaak_col, owner="project"
+                collection,
+                source_file,
+                drawers,
+                aaak_col=aaak_col,
+                owner="project",
+                windows=windows,
             )
         except StaleDrawerPurgeFailed as exc:
             print(f"  ! [error] {filepath.name[:50]:50} {exc}", file=sys.stderr)
@@ -2233,6 +2240,7 @@ def _mine_impl(
         collection = get_collection(palace_path)
         closets_col = get_closets_collection(palace_path)
         aaak_col = open_aaak_collection(palace_path)
+        windows = open_window_index(palace_path)
         # One sqlite pass instead of one get(where=source_file) per file,
         # which costs ~0.1 s each on a 1M-drawer palace. None on
         # other backends: every file then takes the per-file check.
@@ -2241,6 +2249,7 @@ def _mine_impl(
         collection = None
         closets_col = None
         aaak_col = None
+        windows = None
         mined_mtimes = None
 
     total_drawers = 0
@@ -2267,6 +2276,7 @@ def _mine_impl(
                     dry_run=dry_run,
                     closets_col=closets_col,
                     aaak_col=aaak_col,
+                    windows=windows,
                     chunk_size=cfg_chunk_size,
                     chunk_overlap=cfg_chunk_overlap,
                     min_chunk_size=cfg_min_chunk_size,

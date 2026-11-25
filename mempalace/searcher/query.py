@@ -107,6 +107,102 @@ def _query_drawers_with_filter_fallback(
         }
 
 
+def _subwindow_query_vectors(query: str):
+    """The query's embedding when ``embedding_subwindows`` is on, else None."""
+    from ..subwindows import subwindows_enabled
+
+    if not subwindows_enabled():
+        return None
+    from ..backends.embedding_wrapper import _embed_texts
+
+    return _embed_texts([query], query=True)
+
+
+def _fold_subwindow_hits(
+    drawers_col,
+    drawer_results,
+    *,
+    palace_path,
+    query,
+    where,
+    pool_size,
+    metric,
+    query_vectors=None,
+):
+    """Score each drawer by its best sub-window when ``embedding_subwindows`` is on.
+
+    Off (the default), or with no windows collection, returns
+    ``drawer_results`` untouched. Otherwise queries the windows collection
+    for ``pool_size * WINDOW_OVERFETCH`` rows under the same filter, folds
+    them into their parents (see :mod:`mempalace.subwindows`), re-reads those
+    parents from the drawers collection under ``where`` so a window can only
+    stand for a drawer the search may return, and merges. Any failure logs
+    and falls back to the plain drawer results.
+    """
+    from ..subwindows import (
+        WINDOW_OVERFETCH,
+        active_profile,
+        fold_windows,
+        merge_window_hits,
+        subwindows_enabled,
+    )
+
+    if not subwindows_enabled():
+        return drawer_results
+    try:
+        from ..palace import open_windows_collection
+
+        windows_col = open_windows_collection(palace_path, read_only=True)
+        if windows_col is None:
+            return drawer_results
+        resolved = active_profile()
+        if resolved is None:
+            return drawer_results
+        profile = resolved[2]
+        clauses = [{"window_profile": profile.key}]
+        if where:
+            clauses.append(where)
+        vector_kwargs = (
+            {"query_embeddings": query_vectors}
+            if query_vectors is not None
+            else {"query_texts": [query]}
+        )
+        window_results = windows_col.query(
+            **vector_kwargs,
+            n_results=pool_size * WINDOW_OVERFETCH,
+            where=clauses[0] if len(clauses) == 1 else {"$and": clauses},
+            include=["metadatas", "distances"],
+        )
+        best = fold_windows(window_results, profile.key)
+        if not best:
+            return drawer_results
+        kwargs = {"ids": list(best), "include": ["documents", "metadatas"]}
+        if where:
+            kwargs["where"] = where
+        got = drawers_col.get(**kwargs)
+        parents = {
+            row_id: (doc, meta or {})
+            for row_id, doc, meta in zip(
+                got.get("ids") or [], got.get("documents") or [], got.get("metadatas") or []
+            )
+            if isinstance(doc, str)
+        }
+        window_metric = _metric_for_collection(windows_col)
+        merged, _promoted = merge_window_hits(
+            drawer_results,
+            best,
+            parents,
+            to_drawer_scale=lambda d: _metric_scale_distance(
+                _cosine_scale_distance(d, window_metric), metric
+            ),
+            limit=pool_size,
+        )
+        return merged
+    except Exception:
+        logger.warning("Sub-window search failed; using drawer vectors only", exc_info=True)
+        return drawer_results
+
+
 def _backend_capabilities(col) -> frozenset:
     backend = getattr(col, "_backend", None)
     if backend is None:
@@ -449,10 +545,26 @@ def search_memories(
             "n_results": pool_size,  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
+        # With sub-windows on, the query is embedded once for both the drawer
+        # and the window query. Off, the drawer query is exactly as before.
+        query_vectors = _subwindow_query_vectors(query)
+        if query_vectors is not None:
+            dkwargs.pop("query_texts")
+            dkwargs["query_embeddings"] = query_vectors
         if where:
             dkwargs["where"] = where
         drawer_results = _query_drawers_with_filter_fallback(
             drawers_col, dkwargs, query, n_results, wing, room, source_file
+        )
+        drawer_results = _fold_subwindow_hits(
+            drawers_col,
+            drawer_results,
+            palace_path=palace_path,
+            query=query,
+            where=where,
+            pool_size=pool_size,
+            metric=metric,
+            query_vectors=query_vectors,
         )
     except Exception as e:
         # The configured embedding function could not be built: the

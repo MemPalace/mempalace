@@ -52,6 +52,7 @@ from .palace import (
     write_file_drawers,
 )
 from .source_identity import identity_metadata, source_directory_identity
+from .subwindows import open_window_index
 from .timeutil import parse_timestamp, utc_now_iso
 
 logger = logging.getLogger(__name__)
@@ -644,6 +645,7 @@ def _file_chunks_locked(
     source_encoding: str = "utf-8",
     aaak_col=None,
     palace_path: Optional[str] = None,
+    windows=None,
 ):
     """Lock the source file and replace its drawers in this extraction mode.
 
@@ -731,6 +733,7 @@ def _file_chunks_locked(
             owner="convo",
             palace_path=palace_path,
             prune_wing=wing,
+            windows=windows,
         )
     return drawers_added, room_counts_delta, False
 
@@ -1029,6 +1032,7 @@ def _mine_convos_impl(
         dry_run=dry_run,
     )
     aaak_col = None if dry_run else open_aaak_collection(palace_path)
+    windows = None if dry_run else open_window_index(palace_path)
 
     # Bulk pre-fetch already-mined source_file -> verified fingerprint in one
     # paginated pass instead of `len(files)` separate WHERE-source_file
@@ -1171,6 +1175,7 @@ def _mine_convos_impl(
                 source_encoding=normalize_run.encoding,
                 aaak_col=aaak_col,
                 palace_path=palace_path,
+                windows=windows,
             )
             if skipped:
                 files_skipped += 1

@@ -96,6 +96,7 @@ _FRAGMENTS = (
     "cmd_coord.py",
     "cmd_repair.py",
     "cmd_serve.py",
+    "cmd_windows.py",
     "parser.py",
 )
 
