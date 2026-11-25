@@ -317,14 +317,17 @@ _MINE_YIELD = threading.local()
 
 
 @contextlib.contextmanager
-def mine_yield_hook(fn):
-    """Call ``fn`` at every :func:`mine_yield_point` reached in this thread."""
+def mine_yield_hook(fn, *, readers_fn=None):
+    """Install file-boundary and optional CPU-only reader handoff hooks."""
     previous = getattr(_MINE_YIELD, "fn", None)
+    previous_readers = getattr(_MINE_YIELD, "readers_fn", None)
     _MINE_YIELD.fn = fn
+    _MINE_YIELD.readers_fn = readers_fn
     try:
         yield
     finally:
         _MINE_YIELD.fn = previous
+        _MINE_YIELD.readers_fn = previous_readers
 
 
 def mine_yield_point() -> bool:
@@ -343,3 +346,13 @@ def mine_yield_point() -> bool:
     if fn is None:
         return False
     return bool(fn())
+
+
+def mine_yield_readers_point() -> bool:
+    """Let queued Hub readers run during CPU work after a backend snapshot.
+
+    Unlike a file-boundary handoff, no other mutation may enter. This is a
+    no-op for CLI mines and outside an HTTP mine_yield_hook context.
+    """
+    fn = getattr(_MINE_YIELD, "readers_fn", None)
+    return bool(fn()) if fn is not None else False
