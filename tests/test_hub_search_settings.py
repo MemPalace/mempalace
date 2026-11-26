@@ -55,6 +55,14 @@ _NOT_SEARCH_SETTINGS = {
     "MEMPALACE_WRITE_ROUTING",
     "MEMPALACE_HOOKS_AUTO_SAVE",
     "MEMPALACE_HOOKS_DAEMON",
+    "MEMPALACE_HOOK_DAEMON_AUTOSTART",
+    # Daemon lifecycle and the mine child's scheduling: where and how fast a
+    # mine runs, never what it stores or how a query ranks.
+    "MEMPALACE_DAEMON_IDLE_EXIT_MINUTES",
+    "MEMPALACE_DAEMON_MINE_CHILD",
+    "MEMPALACE_DAEMON_MINE_STALL_SECONDS",
+    "MEMPALACE_DAEMON_MINE_THREADS",
+    "MEMPALACE_ORT_ALLOW_SPINNING",
     # Pick the palace or the config file; the hub is looked up per palace and
     # the fingerprint hashes the values that file resolves to.
     "MEMPALACE_CONFIG_DIR",

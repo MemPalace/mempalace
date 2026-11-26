@@ -1724,6 +1724,144 @@ class MempalaceConfig:
 
         return self.resolve_write_routing("cli").policy
 
+    # Debounce defaults for hook-submitted daemon mines, per trigger:
+    # (settle seconds, max wait seconds). Stop fires after every assistant
+    # turn, so bursts are coalesced over a two-minute settle window but never
+    # held past fifteen minutes. PreCompact and SessionEnd run immediately:
+    # they are the last chance to catch a session before it changes shape.
+    DAEMON_DEBOUNCE_DEFAULTS = {
+        "stop": (120.0, 900.0),
+        "precompact": (0.0, 0.0),
+        "session_end": (0.0, 0.0),
+    }
+
+    def daemon_debounce(self, trigger: str) -> tuple[float, float]:
+        """``(settle_seconds, max_wait_seconds)`` for a hook trigger's daemon mine.
+
+        Resolved per value: env ``MEMPALACE_DAEMON_<TRIGGER>_SETTLE_SECONDS`` /
+        ``..._MAX_WAIT_SECONDS`` > ``config.json``
+        ``daemon.debounce.<trigger>.settle_seconds`` / ``max_wait_seconds`` >
+        :attr:`DAEMON_DEBOUNCE_DEFAULTS`. An unknown trigger runs immediately.
+        A malformed value falls back to the default rather than raising: a
+        typo must not stop a hook from queuing its work. A ``max_wait`` below
+        ``settle`` simply caps the window.
+        """
+        key = str(trigger or "").strip().lower()
+        default_settle, default_max = self.DAEMON_DEBOUNCE_DEFAULTS.get(key, (0.0, 0.0))
+        daemon_cfg = self._file_config.get("daemon")
+        debounce = daemon_cfg.get("debounce") if isinstance(daemon_cfg, dict) else None
+        trig_cfg = debounce.get(key) if isinstance(debounce, dict) else None
+        if not isinstance(trig_cfg, dict):
+            trig_cfg = {}
+
+        def _resolve(suffix: str, cfg_key: str, default: float) -> float:
+            val = env_float(f"MEMPALACE_DAEMON_{key.upper()}_{suffix}")
+            if val is None:
+                val = parse_number(trig_cfg.get(cfg_key))
+            if val is None or val < 0:
+                return default
+            return float(val)
+
+        settle = _resolve("SETTLE_SECONDS", "settle_seconds", default_settle)
+        max_wait = _resolve("MAX_WAIT_SECONDS", "max_wait_seconds", default_max)
+        return settle, max_wait
+
+    @property
+    def hook_daemon_autostart(self) -> bool:
+        """Whether hooks start the daemon (detached) when it is not running.
+
+        Consulted only when hook write routing is ``prefer`` or ``require``;
+        the default ``direct`` policy never touches the daemon. Env
+        ``MEMPALACE_HOOK_DAEMON_AUTOSTART`` > config ``hooks.daemon_autostart``
+        > off. Off by default: a started daemon holds the palace writer lock
+        until it exits idle, which refuses MCP writes and manual mines.
+        """
+        flag = env_flag("MEMPALACE_HOOK_DAEMON_AUTOSTART")
+        if flag is not None:
+            return flag
+        hooks = self._file_config.get("hooks", {})
+        value = hooks.get("daemon_autostart", False) if isinstance(hooks, dict) else False
+        parsed = parse_bool(value) if isinstance(value, (bool, str)) else None
+        return parsed is True
+
+    def _daemon_section(self) -> dict:
+        daemon = self._file_config.get("daemon", {})
+        return daemon if isinstance(daemon, dict) else {}
+
+    @property
+    def daemon_mine_child(self) -> bool:
+        """Whether the daemon runs mine jobs in an idle-priority child process.
+
+        Env ``MEMPALACE_DAEMON_MINE_CHILD`` > config ``daemon.mine_child`` > off.
+        Off runs mines on the daemon's own worker thread, as before. Off by
+        default for now: only Linux ``SCHED_IDLE`` lets the reaper tell a
+        starved child from a wedged one.
+        """
+        flag = env_flag("MEMPALACE_DAEMON_MINE_CHILD")
+        if flag is not None:
+            return flag
+        value = self._daemon_section().get("mine_child", False)
+        parsed = parse_bool(value) if isinstance(value, (bool, str)) else None
+        return parsed is True
+
+    @property
+    def daemon_mine_threads(self) -> int:
+        """ONNX Runtime intra-op threads for the daemon's mine child.
+
+        Env ``MEMPALACE_DAEMON_MINE_THREADS`` > config ``daemon.mine_threads``
+        > 2. A background mine on few threads spends far less CPU per drawer
+        than one on every core. ``0`` leaves the general
+        ``embedding_threads`` setting in charge.
+        """
+        raw = os.environ.get("MEMPALACE_DAEMON_MINE_THREADS")
+        if raw is None:
+            raw = self._daemon_section().get("mine_threads", 2)
+        try:
+            return max(0, int(str(raw).strip()))
+        except (TypeError, ValueError):
+            return 2
+
+    @property
+    def daemon_mine_stall_seconds(self) -> float:
+        """Seconds a daemon mine child may go silent before it is killed.
+
+        The child sends a heartbeat every 10 s and a message per storage call;
+        time the daemon spends running a call does not count. Env
+        ``MEMPALACE_DAEMON_MINE_STALL_SECONDS`` > config
+        ``daemon.mine_stall_seconds`` > 60, never under 20 (two heartbeats).
+        ``0`` disables the reaper.
+        """
+        raw = os.environ.get("MEMPALACE_DAEMON_MINE_STALL_SECONDS")
+        if raw is None:
+            raw = self._daemon_section().get("mine_stall_seconds", 60)
+        try:
+            value = max(0.0, float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return 60.0
+        # Below two heartbeats (mine_child.HEARTBEAT_SECONDS = 10) a healthy
+        # child computing between storage calls would be killed.
+        return value if value == 0 else max(value, 20.0)
+
+    @property
+    def daemon_idle_exit_minutes(self) -> "float | None":
+        """Minutes with an empty queue after which the daemon exits, if set.
+
+        Env ``MEMPALACE_DAEMON_IDLE_EXIT_MINUTES`` > config
+        ``daemon.idle_exit_minutes``; ``0`` never exits. ``None`` when neither
+        is set: a hook-started daemon then exits after 30 idle minutes (the
+        next hook starts it again), and ``mempalace daemon start`` keeps
+        running.
+        """
+        raw = os.environ.get("MEMPALACE_DAEMON_IDLE_EXIT_MINUTES")
+        if raw is None:
+            raw = self._daemon_section().get("idle_exit_minutes")
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            return max(0.0, float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return None
+
     @property
     def hook_use_daemon(self):
         """Whether hooks should submit save/mine work to the opt-in daemon."""

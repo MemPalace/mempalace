@@ -10,7 +10,7 @@ import time
 import pytest
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace import daemon, service
+from mempalace import daemon, daemon_queue, service
 
 _LOCK_CONTENDER = """
 from mempalace.palace import MineAlreadyRunning, mine_palace_lock
@@ -177,7 +177,7 @@ def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
         def __init__(self):
             self.submitted = None
 
-        def submit(self, kind, payload, dedupe_key=None, priority=0):
+        def submit(self, kind, payload, dedupe_key=None, priority=0, **_debounce):
             self.submitted = (kind, payload, dedupe_key, priority)
             return {"id": "job-1", "state": "queued"}
 
@@ -717,8 +717,9 @@ def test_wait_returns_a_lock_deferred_job_instead_of_waiting_out_the_holder(tmp_
 def test_wait_timeout_names_the_job_it_gave_up_on_and_its_state(tmp_path, monkeypatch):
     """A wait that runs out does not end the job: the daemon keeps it and runs it
     in turn. The timeout says which job it gave up on and where that job was, so
-    a hook can report a checkpoint queued behind a running mine as pending
-    instead of failed (#2757). It is still a DaemonError for every other caller."""
+    a caller can report a job queued behind a running mine as pending instead of
+    failed (#2757). It is still a DaemonError for every other caller. (A diary
+    checkpoint no longer queues behind a mine: it has its own lane.)"""
     release = threading.Event()
 
     def fake_execute(kind, payload):
@@ -731,7 +732,7 @@ def test_wait_timeout_names_the_job_it_gave_up_on_and_its_state(tmp_path, monkey
         deadline = time.monotonic() + 5
         while client.get_job(mine["id"])["state"] != "running" and time.monotonic() < deadline:
             time.sleep(0.05)
-        checkpoint = client.submit("diary_write", {"entry": "e"}, priority=10)
+        checkpoint = client.submit("sync", {"source": "other"}, priority=10)
 
         with pytest.raises(daemon.DaemonWaitTimeout) as queued:
             client.wait(checkpoint["id"], timeout=0.3)
@@ -882,7 +883,7 @@ def test_defer_scoped_to_a_stale_claim_is_a_no_op(tmp_path, monkeypatch):
     # the assertions exercise the guard, not the clock.
     real_now = daemon._now
     stamps = iter(range(10_000))
-    monkeypatch.setattr(daemon, "_now", lambda: f"{real_now()}#{next(stamps):04d}")
+    monkeypatch.setattr(daemon_queue, "_now", lambda: f"{real_now()}#{next(stamps):04d}")
 
     stale = store.claim_next()  # the claim that got the refusal
     deferred = store.defer(job.id, claimed_started_at=stale.started_at)
@@ -1028,7 +1029,7 @@ def test_submit_job_forwards_stop_on_lock_deferral_to_wait(monkeypatch):
     seen = {}
 
     class _Client:
-        def submit(self, kind, payload, dedupe_key=None, priority=0):
+        def submit(self, kind, payload, dedupe_key=None, priority=0, **_debounce):
             return {"id": "job-1", "state": "queued"}
 
         def wait(self, job_id, *, timeout=None, stop_on_lock_deferral=False):

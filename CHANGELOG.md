@@ -41,8 +41,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   recover without a source edit. Oversized files are retried until they fit
   the reader's size limit.
 
+### Behaviour changes
+
+- **Diary checkpoints the daemon files get a new id shape,
+  `diary_<wing>_checkpoint_<sha>`.** The id is derived from the entry and an
+  idempotency key, so a checkpoint job replayed after a crashed worker finds
+  the drawer it already filed instead of filing it twice. Direct writes keep
+  the old id shape.
+- **On the daemon route, PreCompact no longer waits for the mine.** The hook
+  queues the job and returns; the daemon runs it at once.
+- **A Stop-triggered daemon mine lands 2 to 15 minutes later.** Stop jobs wait
+  for 120 s without a new Stop for the same source, and never longer than
+  15 minutes after the first one (`daemon.debounce.stop`). PreCompact and
+  SessionEnd still run at once.
+- **Repeated checkpoints for one session are coalesced while queued.** A
+  newer checkpoint for a session replaces the one still waiting in the queue
+  (latest wins; it covers the most messages). The same holds for repeated
+  mines of one source.
+
 ### Added
 
+- **The daemon can run a mine's compute in a background-priority child**
+  (`daemon.mine_child`, `MEMPALACE_DAEMON_MINE_CHILD=1`; off by default).
+  The child parses and embeds; every write still runs in the daemon, so the
+  palace keeps one writer. A heartbeat and reaper kill a child that goes
+  silent. Only Linux `SCHED_IDLE` lets the reaper tell a starved child from a
+  wedged one; elsewhere a silent background child gets 10 minutes, not 60 s.
+- **Hooks can start the daemon in the background**
+  (`hooks.daemon_autostart: true`, `MEMPALACE_HOOK_DAEMON_AUTOSTART=1`; off by
+  default, and the legacy `hooks.daemon: true` does not turn it on). A daemon
+  a hook started exits after 30 idle minutes. While it runs it holds the
+  palace writer lock, so a writable MCP server or a manual `mempalace mine`
+  is refused until it exits. A hook does not queue work for a daemon it would
+  start while another process holds that lock.
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
   HTTP-capable clients connect to the running hub (`mempalace serve`)
   directly instead of starting a `mempalace-light-mcp` stdio process per

@@ -4207,3 +4207,40 @@ def test_file_already_mined_answers_the_same_in_any_row_order(totals):
     # An untracked row next to one whose total cannot be compared proves nothing.
     col = _RowsCollection(_exchange_rows("s.jsonl", *totals))
     assert file_already_mined(col, "s.jsonl", extract_mode="exchange") is False
+
+
+class _Killed(BaseException):
+    """Stands in for the process dying: nothing in the mine catches it."""
+
+
+def test_mine_killed_before_its_closets_rebuilds_them_on_the_next_run(tmp_path, monkeypatch):
+    """A mine killed after a file's drawers are written but before its closet
+    exists must leave the file unfinished, so the next mine builds the closet
+    instead of skipping a file it thinks is done."""
+    import mempalace.miner as miner_mod
+    from mempalace.palace import get_closets_collection, get_collection
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    write_file(
+        project / "notes.md",
+        "# Field notes\n\n" + "The heron waited by the reed bed until the tide turned.\n" * 20,
+    )
+    with open(project / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "proj", "rooms": [{"name": "general", "description": "All"}]}, f)
+    palace = str(tmp_path / "palace")
+
+    def killed(*_args):
+        raise _Killed()
+
+    monkeypatch.setattr(miner_mod, "purge_file_closets", killed)
+    with pytest.raises(_Killed):
+        mine(str(project), palace)
+    original = get_collection(palace).get(include=["documents"])
+    assert original.ids, "the drawers were written before the kill"
+    monkeypatch.undo()
+
+    mine(str(project), palace)
+    after = get_collection(palace).get(include=["documents"])
+    assert sorted(after.ids) == sorted(original.ids)
+    assert get_closets_collection(palace).count() > 0

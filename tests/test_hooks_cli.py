@@ -954,7 +954,30 @@ def test_daemon_available_probe_stays_under_hook_budget(tmp_path, monkeypatch):
     assert elapsed < daemon.HOOK_PROBE_TIMEOUT + 0.2
 
 
-def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
+def _queued(palace_dir, state_root):
+    """Jobs a hook queued for the daemon, read back through the queue's own API."""
+    from mempalace import daemon_queue
+
+    with patch.dict("os.environ", {daemon_queue.STATE_ROOT_ENV: str(state_root)}):
+        store = daemon_queue.QueueStore(daemon_queue.queue_path(str(palace_dir)))
+        return store.list(50)
+
+
+def _daemon_env(tmp_path, palace_dir, **extra):
+    env = {
+        "MEMPALACE_HOOKS_DAEMON": "yes",
+        "MEMPALACE_PALACE_PATH": str(palace_dir),
+        "MEMPALACE_DAEMON_STATE_ROOT": str(tmp_path / "daemon_state"),
+        # These tests observe the queue; spawning is covered separately.
+        "MEMPALACE_HOOK_DAEMON_AUTOSTART": "0",
+    }
+    env.update(extra)
+    return env
+
+
+def test_save_diary_direct_daemon_opt_in_queues_job_without_waiting(tmp_path):
+    """The daemon path queues the checkpoint and returns: the daemon files it and
+    writes the ack itself (hook_ack), so the hook neither waits nor acks."""
     transcript = tmp_path / "session.jsonl"
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
@@ -962,120 +985,60 @@ def test_save_diary_direct_daemon_opt_in_submits_job(tmp_path):
         transcript,
         [{"message": {"role": "user", "content": f"message {i}"}} for i in range(3)],
     )
-    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
-    job = {"id": "job", "state": "succeeded", "result": {"success": True, "entry_id": "e1"}}
+    env = _daemon_env(tmp_path, palace_dir)
 
     with patch.dict("os.environ", env):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._daemon_available", return_value=True):
-                with patch("mempalace.daemon.submit_job", return_value=job) as mock_submit:
+                with patch("mempalace.hooks_cli._queue_diary_checkpoint") as mock_direct:
                     result = _save_diary_direct(
                         str(transcript),
                         "sess1",
                         wing="wing_project",
                         agent_name="claude",
+                        exchange_count=7,
                     )
 
-    assert result["drawers_filed"] == 1
-    assert result["messages_folded"] == 3
-    mock_submit.assert_called_once()
-    assert mock_submit.call_args.args[0] == "diary_write"
-    payload = mock_submit.call_args.args[1]
-    assert payload["agent_name"] == "claude"
-    assert payload["wing"] == "wing_project"
-    assert payload["topic"] == "checkpoint"
-    assert (tmp_path / "last_checkpoint").exists()
-
-
-def test_save_diary_daemon_lock_deferral_does_not_stall_the_hook(tmp_path):
-    """A refused job is deferred, not failed (#2014), so it is never terminal
-    while the holder lives.
-
-    This path waits on purpose -- a real diary write takes its time -- but it
-    waits for a state that a parked job cannot reach. Without
-    stop_on_lock_deferral it burns its whole 30s timeout on every session stop
-    and then reports a submission failure that never happened: the entry is
-    queued and the daemon files it once the lock frees."""
-    transcript = tmp_path / "t.jsonl"
-    palace_dir = tmp_path / "palace"
-    palace_dir.mkdir()
-    _write_transcript(
-        transcript,
-        [{"message": {"role": "user", "content": f"message {i}"}} for i in range(3)],
-    )
-    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
-    parked = {
-        "id": "job-parked",
-        "state": "queued",
-        "error": {
-            "error_class": "LockHeldByOtherProcess",
-            "message": "palace /p is held by PID 999 (mempalace-mcp)",
-        },
-        "result": None,
-    }
-
-    with patch.dict("os.environ", env):
-        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
-                with patch("mempalace.daemon.submit_job", return_value=parked) as mock_submit:
-                    with patch("mempalace.hooks_cli._log") as mock_log:
-                        result = _save_diary_direct(
-                            str(transcript), "sess1", wing="wing_project", agent_name="claude"
-                        )
-
-    # The hook must ask the daemon to hand a parked job straight back.
-    assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
-
-    assert result["drawers_filed"] == 0  # nothing filed yet -- the daemon still owes the write
-    assert not (tmp_path / "last_checkpoint").exists()  # and it must not be acked
-
-    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
-    assert "deferred" in logged
-    assert "PID 999" in logged
-    assert "Daemon diary checkpoint failed" not in logged, "a parked job is not a failure"
-
-
-def test_save_diary_daemon_wait_timeout_is_logged_as_still_queued(tmp_path):
-    """The daemon runs one job at a time, so a SessionEnd checkpoint submitted
-    while a mine from an earlier Stop hook still runs waits behind it, often for
-    longer than the 30s this path waits. The job is not failed: the daemon files
-    the entry once the mine ends, so the hook must not log a failure, must not
-    write the entry itself, and must not ack a checkpoint not yet filed (#2757)."""
-    from mempalace.daemon import DaemonWaitTimeout
-
-    transcript = tmp_path / "t.jsonl"
-    palace_dir = tmp_path / "palace"
-    palace_dir.mkdir()
-    _write_transcript(
-        transcript,
-        [{"message": {"role": "user", "content": f"message {i}"}} for i in range(3)],
-    )
-    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
-
-    with patch.dict("os.environ", env):
-        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
-                with patch(
-                    "mempalace.daemon.submit_job",
-                    side_effect=DaemonWaitTimeout("job-behind-mine", "queued"),
-                ) as mock_submit:
-                    with patch("mempalace.hooks_cli._queue_diary_checkpoint") as mock_queue:
-                        with patch("mempalace.hooks_cli._log") as mock_log:
-                            result = _save_diary_direct(
-                                str(transcript), "sess1", wing="wing_project", agent_name="claude"
-                            )
-
-    mock_submit.assert_called_once()
-    mock_queue.assert_not_called()  # the daemon holds the entry; a second write would duplicate it
+    assert result["checkpoint_queued"] is True
+    assert result["mines_pending"] is True, "no detached child will run the mines"
     assert result["drawers_filed"] == 0
-    assert not (tmp_path / "last_checkpoint").exists()
+    assert result["messages_folded"] == 3
+    mock_direct.assert_not_called()
+    assert not (tmp_path / "last_checkpoint").exists(), "acked only once filed"
+    (job,) = _queued(palace_dir, tmp_path / "daemon_state")
+    assert job.kind == "diary_write"
+    assert job.state == "queued"
+    assert job.payload["agent_name"] == "claude"
+    assert job.payload["wing"] == "wing_project"
+    assert job.payload["topic"] == "checkpoint"
+    assert job.payload["idempotency_key"]
+    assert job.payload["hook_ack"]["exchange_count"] == 7
+    assert job.payload["hook_ack"]["session_id"] == "sess1"
 
-    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
-    assert "Daemon diary checkpoint still queued: job job-behind-mine" in logged
-    assert "failed" not in logged
 
-
-# --- hook_session_start ---
+def test_repeated_daemon_checkpoints_for_a_session_coalesce(tmp_path):
+    """Stop hooks that fire before the daemon files a checkpoint replace the
+    pending one (latest wins) instead of queuing overlapping entries."""
+    transcript = tmp_path / "session.jsonl"
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    env = _daemon_env(tmp_path, palace_dir)
+    with patch.dict("os.environ", env):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
+                for count in (3, 5):
+                    _write_transcript(
+                        transcript,
+                        [
+                            {"message": {"role": "user", "content": f"message {i}"}}
+                            for i in range(count)
+                        ],
+                    )
+                    _save_diary_direct(
+                        str(transcript), "sess1", agent_name="claude", exchange_count=count
+                    )
+    (job,) = _queued(palace_dir, tmp_path / "daemon_state")
+    assert job.payload["hook_ack"]["exchange_count"] == 5
 
 
 def test_session_start_passes_through(tmp_path):
@@ -1547,31 +1510,24 @@ def test_maybe_auto_ingest_with_env(tmp_path):
                     assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
-def test_maybe_auto_ingest_daemon_opt_in_submits_job(tmp_path):
-    """Daemon-enabled hooks submit a background mine instead of spawning one."""
+def test_maybe_auto_ingest_daemon_opt_in_queues_job(tmp_path):
+    """Daemon-enabled hooks queue a background mine instead of spawning one."""
     mempal_dir = tmp_path / "project"
     palace_dir = tmp_path / "palace"
     mempal_dir.mkdir()
     palace_dir.mkdir()
-    env = {
-        "MEMPAL_DIR": str(mempal_dir),
-        "MEMPALACE_HOOKS_DAEMON": "yes",
-        "MEMPALACE_PALACE_PATH": str(palace_dir),
-    }
+    env = _daemon_env(tmp_path, palace_dir, MEMPAL_DIR=str(mempal_dir))
     with patch.dict("os.environ", env):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._daemon_available", return_value=True):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
-                    with patch(
-                        "mempalace.daemon.submit_job", return_value={"id": "job"}
-                    ) as mock_submit:
-                        _maybe_auto_ingest()
+                    _maybe_auto_ingest()
 
     mock_popen.assert_not_called()
-    mock_submit.assert_called_once()
-    assert mock_submit.call_args.args[0] == "mine"
-    assert mock_submit.call_args.args[1]["source"] == str(mempal_dir.resolve())
-    assert mock_submit.call_args.kwargs["wait"] is False
+    (job,) = _queued(palace_dir, tmp_path / "daemon_state")
+    assert job.kind == "mine"
+    assert job.payload["source"] == str(mempal_dir.resolve())
+    assert job.dedupe_key.startswith("hook:mine:projects:")
 
 
 def test_maybe_auto_ingest_uses_mempalace_python(tmp_path):
@@ -1609,64 +1565,28 @@ def test_mine_sync_with_env_uses_projects_mode(tmp_path):
                 assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
-def test_mine_sync_daemon_lock_deferral_is_not_reported_as_a_failure(tmp_path):
-    """The precompact sync path waits (wait=True, timeout=60) but is documented as
-    living under the harness 30s ceiling, so a job it can never see go terminal is
-    doubly bad here: without stop_on_lock_deferral it burns past the ceiling and
-    then logs a failure for work the daemon still holds and will run."""
+def test_mine_sync_daemon_queues_an_immediate_mine_and_does_not_wait(tmp_path):
+    """PreCompact queues the mine to run at once and returns; it neither waits
+    on the daemon nor spawns its own mine of the same directory."""
+    from mempalace.hooks_cli import _hook_trigger
+
     mempal_dir = tmp_path / "project"
+    palace_dir = tmp_path / "palace"
     mempal_dir.mkdir()
-    parked = {
-        "id": "job-parked",
-        "state": "queued",
-        "error": {
-            "error_class": "LockHeldByOtherProcess",
-            "message": "palace /p is held by PID 999 (mempalace-mcp)",
-        },
-        "result": None,
-    }
-    env = {"MEMPAL_DIR": str(mempal_dir), "MEMPALACE_HOOKS_DAEMON": "yes"}
+    palace_dir.mkdir()
+    env = _daemon_env(tmp_path, palace_dir, MEMPAL_DIR=str(mempal_dir))
     with patch.dict("os.environ", env):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._daemon_available", return_value=True):
-                with patch("mempalace.daemon.submit_job", return_value=parked) as mock_submit:
-                    with patch("mempalace.hooks_cli._log") as mock_log:
-                        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-                            _mine_sync()
-
-    assert mock_submit.call_args.kwargs["stop_on_lock_deferral"] is True
-    mock_run.assert_not_called()  # the daemon owns it; spawning a mine would double-write
-
-    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
-    assert "deferred" in logged
-    assert "PID 999" in logged
-    assert "Daemon sync mine failed" not in logged, "a parked job is not a failure"
-
-
-def test_mine_sync_daemon_wait_timeout_is_not_reported_as_a_failure(tmp_path):
-    """A sync mine the daemon accepted but did not finish within the 60s wait is
-    still queued or running there, so the precompact path reports it as pending
-    and does not spawn its own mine of the same directory (#2757)."""
-    from mempalace.daemon import DaemonWaitTimeout
-
-    mempal_dir = tmp_path / "project"
-    mempal_dir.mkdir()
-    env = {"MEMPAL_DIR": str(mempal_dir), "MEMPALACE_HOOKS_DAEMON": "yes"}
-    with patch.dict("os.environ", env):
-        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
-            with patch("mempalace.hooks_cli._daemon_available", return_value=True):
-                with patch(
-                    "mempalace.daemon.submit_job",
-                    side_effect=DaemonWaitTimeout("job-slow-mine", "running"),
-                ):
-                    with patch("mempalace.hooks_cli._log") as mock_log:
-                        with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
-                            _mine_sync()
+                with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                    with _hook_trigger("precompact"):
+                        _mine_sync()
 
     mock_run.assert_not_called()
-    logged = " ".join(str(c.args[0]) for c in mock_log.call_args_list)
-    assert "Daemon sync mine still running: job job-slow-mine" in logged
-    assert "failed" not in logged
+    (job,) = _queued(palace_dir, tmp_path / "daemon_state")
+    assert job.kind == "mine"
+    assert job.run_after <= job.deadline
+    assert job.deadline - job.run_after == 0, "PreCompact has no settle window"
 
 
 def test_mine_sync_uses_mempalace_python(tmp_path):
@@ -1972,29 +1892,25 @@ def test_ingest_transcript_uses_detached_kwargs(tmp_path):
                 assert kwargs.get("close_fds") is True
 
 
-def test_ingest_transcript_daemon_opt_in_submits_job(tmp_path):
+def test_ingest_transcript_daemon_opt_in_queues_job(tmp_path):
     transcript = tmp_path / "session.jsonl"
     palace_dir = tmp_path / "palace"
     palace_dir.mkdir()
     transcript.write_text("x" * 200)
-    env = {"MEMPALACE_HOOKS_DAEMON": "yes", "MEMPALACE_PALACE_PATH": str(palace_dir)}
+    env = _daemon_env(tmp_path, palace_dir)
     with patch.dict("os.environ", env):
         with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
             with patch("mempalace.hooks_cli._daemon_available", return_value=True):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
-                    with patch(
-                        "mempalace.daemon.submit_job", return_value={"id": "job"}
-                    ) as mock_submit:
-                        from mempalace.hooks_cli import _ingest_transcript
+                    from mempalace.hooks_cli import _ingest_transcript
 
-                        _ingest_transcript(str(transcript))
+                    _ingest_transcript(str(transcript))
 
     mock_popen.assert_not_called()
-    mock_submit.assert_called_once()
-    payload = mock_submit.call_args.args[1]
-    assert payload["source"] == str(transcript.resolve())
-    assert payload["mode"] == "convos"
-    assert payload["wing"] == "sessions"
+    (job,) = _queued(palace_dir, tmp_path / "daemon_state")
+    assert job.payload["source"] == str(transcript.resolve())
+    assert job.payload["mode"] == "convos"
+    assert job.payload["wing"] == "sessions"
 
 
 def test_ingest_transcript_skips_when_target_running(tmp_path):
