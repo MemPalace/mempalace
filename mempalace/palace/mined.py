@@ -218,6 +218,33 @@ def _backfill_fields(state_key, largest, untracked, *, fingerprints: bool, extra
     return fields
 
 
+def _collection_palace_path(collection) -> Optional[str]:
+    """The palace directory ``collection`` lives in, when the backend says."""
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    path = getattr(inner, "_palace_path", None)
+    if path is None:
+        path = getattr(getattr(inner, "_handle", None), "palace_path", None)
+    return path if isinstance(path, str) and os.path.isdir(path) else None
+
+
+def _palace_source_state(collection, source_state):
+    """``source_state``, or else the store of ``collection``'s palace.
+
+    A caller that passes no store still reads the palace's records, since a
+    re-file with a store leaves unchanged drawers with their old stamps.
+    The store opened here is read-only (it never backfills). ``None`` only
+    when no palace path is known; the per-row stamps then decide.
+    """
+    if source_state is not None or collection is None:
+        return source_state
+    path = _collection_palace_path(collection)
+    if path is None:
+        return None
+    from .source_state import SourceStateStore
+
+    return SourceStateStore(path, read_only=True)
+
+
 def _stream(source_file, owner, extract_mode, wing):
     from .source_state import source_stream
 
@@ -245,7 +272,9 @@ def file_already_mined(
     snapshot stamps are then ignored, since a re-file that wrote only what
     changed leaves unchanged drawers with their old stamps. Without a record
     the per-row rules below apply, and a source they prove filed gets a
-    record backfilled.
+    record backfilled. ``None`` reads the store of the collection's palace
+    (read-only, no backfill); only when no palace path is known do the
+    per-row rules alone decide.
 
     ``owner`` (see :mod:`mempalace.retention`) counts only the drawers that
     miner filed: a conversation or format drawer stored under the same path
@@ -311,6 +340,7 @@ def file_already_mined(
     unprovable = False
     in_scope = 0
     offset = 0
+    source_state = _palace_source_state(collection, source_state)
     head = None
     if source_state is not None:
         stream = _stream(source_file, owner, extract_mode, wing)
@@ -512,7 +542,9 @@ def prefetch_mined_set(
     source with a record is listed with the record's snapshot when the record
     proves it filed and omitted otherwise; sources without one follow the
     per-row rules and get a record backfilled when those prove them filed.
+    ``None`` reads the palace's store, as in :func:`file_already_mined`.
     """
+    source_state = _palace_source_state(collection, source_state)
     # Per source_file: per source-state group -> [count, largest chunk_total,
     # whether some drawer has no chunk_total]. A source is only "mined" once
     # some group is complete, and never while any of its rows is unprovable.
@@ -632,8 +664,10 @@ def prefetch_complete_mtimes(
 
     With ``source_state``, a source that has a project record is listed with
     the record's mtime only when the record proves it filed (see
-    :func:`_head_proves_mined`); its per-row stamps are not read.
+    :func:`_head_proves_mined`); its per-row stamps are not read. ``None``
+    reads the palace's store, as in :func:`file_already_mined`.
     """
+    source_state = _palace_source_state(collection, source_state)
     wanted = set(source_files)
     from ..backends.sqlite_exact import SQLiteExactCollection
 

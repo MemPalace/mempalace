@@ -436,6 +436,55 @@ def test_drawers_deleted_behind_the_record_read_as_not_mined(palace, monkeypatch
     assert SOURCE not in mined
 
 
+def test_a_reader_given_no_store_reads_the_palaces_own_record(tmp_path):
+    import os
+
+    from mempalace.palace import prefetch_mined_set, source_fingerprint
+
+    palace = str(tmp_path / "palace")
+    path, first = _real_source(tmp_path, "a\n")
+    _file_at(palace, path, ["one", "two"], first, store=True)
+    # Touched: the re-file writes nothing, so the rows keep the first stamps.
+    os.utime(path, (1, 2_000_000_000))
+    second = source_fingerprint(os.stat(path))
+    assert _file_at(palace, path, ["one", "two"], second, store=True) == 0
+
+    assert file_already_mined(
+        get_collection(palace),
+        path,
+        extract_mode="exchange",
+        check_source_fingerprint=True,
+        wing=WING,
+    )
+    mined = prefetch_mined_set(
+        get_collection(palace),
+        extract_mode="exchange",
+        source_files=[path],
+        source_fingerprints=True,
+        wing=WING,
+    )
+    assert mined == {path: second}
+
+
+def test_a_project_prefetch_given_no_store_reads_the_palaces_own_record(tmp_path):
+    import os
+
+    from mempalace import miner
+    from mempalace.palace import prefetch_complete_mtimes
+
+    src = (tmp_path / "proj").resolve()
+    src.mkdir()
+    doc = src / "notes.md"
+    doc.write_text("paragraph. " + "verbatim words " * 40, encoding="utf-8")
+    palace = str(tmp_path / "palace")
+    miner.mine(str(src), palace, wing_override="proj", agent="test")
+    _bump_mtime(doc)
+    miner.mine(str(src), palace, wing_override="proj", agent="test")
+
+    mtimes = prefetch_complete_mtimes(get_collection(palace), [str(doc)])
+    assert mtimes == {str(doc): (os.stat(doc).st_mtime,)}
+
+
 def test_a_replacing_backend_appends_and_drops_keys_the_same_way(palace):
     collection = get_collection(palace, create=True, backend="sqlite_exact")
     _file(palace, _drawers(["one", "two"], hall="hall_facts"), collection=collection)
@@ -642,14 +691,22 @@ def _file_at(palace, path, texts, fingerprint, store):
 
 
 def _mined(palace, path, store):
-    return file_already_mined(
-        get_collection(palace),
-        path,
-        extract_mode="exchange",
-        check_source_fingerprint=True,
-        wing=WING,
-        source_state=SourceStateStore(palace) if store else None,
-    )
+    """``store=False`` reads like an older binary: per-row stamps only."""
+    from unittest import mock
+
+    import mempalace.palace as palace_pkg
+
+    with mock.patch.object(
+        palace_pkg, "_collection_palace_path", lambda _c: palace if store else None
+    ):
+        return file_already_mined(
+            get_collection(palace),
+            path,
+            extract_mode="exchange",
+            check_source_fingerprint=True,
+            wing=WING,
+            source_state=SourceStateStore(palace) if store else None,
+        )
 
 
 def test_an_older_binary_re_mines_after_a_new_one_appended_and_nothing_is_lost(tmp_path):
