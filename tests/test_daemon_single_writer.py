@@ -29,6 +29,7 @@ import pytest
 from test_mine_child import _EMBEDDER, REAL_CHILD, _child_argv
 
 from mempalace import daemon, daemon_queue, hooks_cli
+from mempalace._proc import pid_alive
 from mempalace.mine_supervisor import run_mine_in_child
 
 
@@ -889,13 +890,18 @@ def test_shutdown_requeues_the_running_mine_until_its_attempts_run_out(
         conn.execute("UPDATE jobs SET attempts = ? WHERE id = ?", (prior_attempts, job.id))
     runtime.start_worker()
     _wait_for(lambda: runtime.active_child is not None)
-    child_pid = runtime.active_child.pid
-    daemon._drain_and_cleanup(runtime, state, {})
-    after = runtime.store.get(job.id)
-    if prior_attempts + 1 < daemon_queue.MAX_ATTEMPTS:
-        assert (after.state, after.attempts) == ("queued", prior_attempts + 1)
-    else:
-        # Dead-lettered: the worker fails the killed run, or the drain cancels it.
-        assert after.state in {"failed", "cancelled"}, after.state
-    with pytest.raises(ProcessLookupError):
-        _wait_for(lambda: os.kill(child_pid, 0) and False, timeout=5)
+    child = runtime.active_child
+    try:
+        daemon._drain_and_cleanup(runtime, state, {})
+        after = runtime.store.get(job.id)
+        if prior_attempts + 1 < daemon_queue.MAX_ATTEMPTS:
+            assert (after.state, after.attempts) == ("queued", prior_attempts + 1)
+        else:
+            # Dead-lettered: the worker fails the killed run, or the drain cancels it.
+            assert after.state in {"failed", "cancelled"}, after.state
+        # Not os.kill(pid, 0): on Windows that terminates the child, so the
+        # test would do the product's job.
+        _wait_for(lambda: not pid_alive(child.pid), timeout=5)
+    finally:
+        child.proc.kill()
+        child.proc.wait(timeout=30)

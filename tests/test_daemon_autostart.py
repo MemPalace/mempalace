@@ -556,3 +556,105 @@ def test_cli_start_keeps_registration_published_by_racing_hook_daemon(state, mon
             with pytest.raises(OSError, match="end test"):
                 daemon.start_daemon(state)
         assert daemon_queue._registered_pid(state) == os.getpid()
+
+
+# SQLite's default busy handler: its sleep schedule in ms (sqliteDefaultBusyCallback).
+_SQLITE_BUSY_DELAYS_MS = (1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100)
+# How long each sleep overruns on a loaded machine. macOS CI measured a
+# 0.15 s busy timeout taking about 0.6 s, i.e. ~45 ms over per sleep.
+_OVERSHOOT = 0.05
+
+
+def _overshooting_busy_model(monkeypatch):
+    """Make every sleep overshoot, including inside SQLite's busy handler.
+
+    The C busy handler cannot be patched from Python, so connections opened
+    with a timeout get a model of it: the real handler is off and a BUSY
+    statement is retried on SQLite's schedule, counting planned sleeps (as
+    SQLite does) while each real sleep runs ``_OVERSHOOT`` long.
+    """
+    import sqlite3
+
+    real_sleep = time.sleep
+    real_connect = sqlite3.connect
+
+    def slow_sleep(seconds):
+        real_sleep(seconds + _OVERSHOOT)
+
+    class SlowBusyConnection(sqlite3.Connection):
+        busy_budget_ms = 0.0
+
+        def execute(self, *args, **kwargs):
+            planned = 0.0
+            for delay in _SQLITE_BUSY_DELAYS_MS + (100,) * 1000:
+                try:
+                    return super().execute(*args, **kwargs)
+                except sqlite3.OperationalError as exc:
+                    if "locked" not in str(exc) or planned >= self.busy_budget_ms:
+                        raise
+                    delay = min(delay, self.busy_budget_ms - planned)
+                    slow_sleep(delay / 1000)
+                    planned += delay
+
+    def connect(database, timeout=5.0, **kwargs):
+        conn = real_connect(database, timeout=0, factory=SlowBusyConnection, **kwargs)
+        conn.busy_budget_ms = timeout * 1000
+        return conn
+
+    monkeypatch.setattr(time, "sleep", slow_sleep)
+    monkeypatch.setattr(sqlite3, "connect", connect)
+
+
+def test_contended_enqueue_is_bounded_by_wall_time_when_every_sleep_overshoots(state, monkeypatch):
+    import sqlite3
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    store = daemon_queue.QueueStore(daemon_queue.queue_path(state))
+    with store._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _overshooting_busy_model(monkeypatch)
+        t0 = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            hooks_cli._submit_daemon_job("mine", {"source": "s"})
+        elapsed = time.monotonic() - t0
+    # The 0.15 s busy budget plus at most one overshooting retry sleep.
+    assert elapsed < 0.15 + 0.02 + _OVERSHOOT + 0.1
+    assert elapsed < 0.5
+
+
+def test_wall_clock_busy_enqueue_lands_once_the_writer_lets_go(state, monkeypatch):
+    import threading
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    path = daemon_queue.queue_path(state)
+    store = daemon_queue.QueueStore(path)
+    hook_store = daemon_queue.QueueStore(path, timeout=2.0, wall_clock_busy=True)
+    locked = threading.Event()
+
+    def hold_briefly():
+        with store._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            locked.set()
+            time.sleep(0.1)
+
+    holder = threading.Thread(target=hold_briefly)
+    holder.start()
+    assert locked.wait(5)
+    job = hook_store.enqueue("mine", {"source": "s"})
+    holder.join()
+    assert [j.id for j in store.list(10)] == [job.id]
+
+
+def test_wall_clock_busy_does_not_retry_other_errors(tmp_path, monkeypatch):
+    import sqlite3
+
+    store = daemon_queue.QueueStore(tmp_path / "q.sqlite3", wall_clock_busy=True)
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise sqlite3.OperationalError("no such table: jobs")
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        store._retry_busy(broken)
+    assert calls == [1]

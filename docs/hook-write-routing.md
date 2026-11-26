@@ -58,6 +58,8 @@ A hook never waits on the daemon and never imports the storage stack:
 1. It probes `/health` with a 150 ms timeout, using only the standard library.
 2. It writes the job straight into the daemon's durable SQLite queue
    (`mempalace/daemon_queue.py`, which imports neither chromadb nor numpy).
+   If another writer holds the queue, it retries for at most 150 ms of wall
+   time, then reports the failure and returns.
 3. With auto-start on and no daemon registered, it spawns
    `mempalace.daemon serve` detached (its own session on POSIX; a hidden
    console and its own process group on Windows) and returns. The daemon's own
