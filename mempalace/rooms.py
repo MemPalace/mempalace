@@ -535,13 +535,15 @@ def plan_rooms(
     decider: RoomDecider,
     threshold: float = DEFAULT_THRESHOLD,
     progress=None,
-    from_rooms: Optional[frozenset] = GENERIC_ROOMS,
+    from_rooms: Optional[frozenset] = None,
 ) -> RoomPlan:
     """Decide a room for every drawer in ``wing``; change nothing.
 
-    Only drawers whose current room is in ``from_rooms`` are candidates to
-    move; the rest are counted under their current room as ``kept``. Pass
-    ``from_rooms=None`` to reclassify every drawer in the wing.
+    Every drawer is a candidate by default, including those already filed in a
+    project room: a room created after an earlier apply must be able to claim
+    them (issue #2953). Pass ``from_rooms`` to narrow the scope to drawers whose
+    current room is in that set; the rest are counted under their current room
+    as ``kept``.
     """
     changes: list[tuple[str, str, str]] = []
     source_moves: dict[tuple[str, str], Counter] = {}
