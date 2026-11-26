@@ -119,6 +119,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- **A scoped search whose filtered query fails no longer loses in-scope
+  results.** When Chroma refuses a wing/room/source-filtered query (e.g. its
+  Windows HNSW reader error "Nothing found on disk"), the unfiltered +
+  post-filter fallback used to read a fixed top 15×`n_results` of the whole
+  palace and filter that, so an in-scope drawer ranked below it was dropped.
+  The fallback now widens the unfiltered read until it holds as many in-scope
+  rows as the filtered query would return, or the palace has no more; the
+  sub-window queries fall back the same way instead of being skipped.
+- **`mempalace migrate` and the in-place `repair --mode from-sqlite` close
+  this process's own Chroma clients on the palace before moving it aside.**
+  On Windows a directory with an open file cannot be renamed, so an
+  in-process caller that had opened the palace (or its sub-window
+  collection) made the swap fail with "held open by another process".
+
 - **Importing `mempalace` no longer caps the thread pools of the process.**
   The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
   set at package import, so CPU embedding (EmbeddingGemma through torch) ran

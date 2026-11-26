@@ -39,6 +39,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from .search_util import query_post_filtered
+
 logger = logging.getLogger(__name__)
 
 # ``kind`` stamped on every window row (rows of the windows collection only).
@@ -754,12 +756,28 @@ def window_candidates(drawers, windows, vectors, profile_key, where, pool_size):
     profile_filter = {"window_profile": profile_key}
 
     def query(window_filter, n_results):
-        return windows.query(
-            query_embeddings=vectors,
-            where=window_filter,
-            n_results=n_results,
-            include=["metadatas", "distances"],
-        )
+        kwargs = {
+            "query_embeddings": vectors,
+            "where": window_filter,
+            "n_results": n_results,
+            "include": ["metadatas", "distances"],
+        }
+        try:
+            return windows.query(**kwargs)
+        except Exception as exc:
+            # Chroma's HNSW reader can fail a filtered query only. Same rows,
+            # read unfiltered and widened until the filter's own count is met.
+            logger.warning(
+                "Filtered window search failed (%s); falling back to unfiltered + post-filter",
+                exc,
+            )
+            return query_post_filtered(
+                windows,
+                kwargs,
+                lambda meta: _where_matches(meta, window_filter) is True,
+                n_results,
+                n_results,
+            )
 
     def saturated(result, n_results):
         return len((result.get("ids") or [[]])[0] or []) >= n_results

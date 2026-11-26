@@ -62,6 +62,7 @@ from ..search_util import (
     build_where_filter,
     chroma_known_wings,
     palace_wing_aliases,
+    query_post_filtered,
 )
 from ..stored_text import decode_record, encode_filter
 from ..timeutil import localize, recency_key

@@ -73,42 +73,24 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
-        raw = drawers_col.query(
-            **{
-                key: value
-                for key, value in dkwargs.items()
-                if key in ("query_embeddings", "query_texts")
-            },
-            n_results=min(n_results * 15, 500),
-            include=["documents", "metadatas", "distances"],
-        )
-        raw_docs = _first_or_empty(raw, "documents")
-        raw_ids = _aligned_query_ids(raw, len(raw_docs))
-        fids, fdocs, fmetas, fdists = [], [], [], []
         wings = set(palace_wing_aliases(wing, drawers_col)) if wing else None
-        for stored_drawer_id, doc, meta, dist in zip(
-            raw_ids,
-            raw_docs,
-            _first_or_empty(raw, "metadatas"),
-            _first_or_empty(raw, "distances"),
-        ):
-            meta = meta or {}
+
+        def in_scope(meta):
             if wings and meta.get("wing") not in wings:
-                continue
+                return False
             if room and meta.get("room") != room:
-                continue
-            if source_file and meta.get("source_file") != source_file:
-                continue
-            fids.append(stored_drawer_id)
-            fdocs.append(doc)
-            fmetas.append(meta)
-            fdists.append(dist)
-        return {
-            "ids": [fids],
-            "documents": [fdocs],
-            "metadatas": [fmetas],
-            "distances": [fdists],
-        }
+                return False
+            return not (source_file and meta.get("source_file") != source_file)
+
+        # Widened until the scope's own n_results are found, so the fallback
+        # returns what the filtered query would have (see query_post_filtered).
+        return query_post_filtered(
+            drawers_col,
+            {**dkwargs, "include": ["documents", "metadatas", "distances"]},
+            in_scope,
+            dkwargs.get("n_results") or n_results,
+            first_fetch=min(n_results * 15, 500),
+        )
 
 
 def _subwindow_query_vectors(query: str, col, collection_name=None):

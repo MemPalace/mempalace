@@ -673,6 +673,76 @@ def test_filtered_window_search_reaches_past_global_window_limit(window_palace, 
     )
 
 
+def test_filtered_search_fallback_finds_what_the_filter_finds(window_palace, monkeypatch):
+    """Windows' HNSW reader can fail filtered queries only ("Nothing found on
+    disk"). The unfiltered + post-filter fallback, for drawers and windows,
+    must still find the in-scope drawer the filtered search finds."""
+    from chromadb.api.models.Collection import Collection
+
+    from mempalace.searcher import search_memories
+
+    palace, col = window_palace
+    col.update(ids=["long_1"], metadatas=[{"room": "target"}])
+    col.upsert(
+        ids=[f"d{i}" for i in range(5)],
+        documents=[f"migration apples pears {i}" for i in range(5)],
+        metadatas=[{"room": "target"}] * 5,
+    )
+    col.upsert(
+        ids=["other-room"],
+        documents=[_long_text("zebra quokka migration " * 12, filler_words=16)],
+        metadatas=[{"room": "elsewhere"}],
+    )
+    subwindows.build_windows(palace)
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+
+    def search():
+        hits = search_memories("zebra quokka migration", palace, room="target", n_results=1)
+        return [hit["drawer_id"] for hit in hits["results"]]
+
+    assert search() == ["long_1"]
+    real_query = Collection.query
+
+    def flaky_query(self, *args, **kwargs):
+        if kwargs.get("where"):
+            raise RuntimeError(
+                "Error executing plan: Internal error: Error creating hnsw segment reader: "
+                "Nothing found on disk"
+            )
+        return real_query(self, *args, **kwargs)
+
+    monkeypatch.setattr(Collection, "query", flaky_query)
+    assert search() == ["long_1"]
+
+
+def test_post_filtered_fallback_widens_past_the_global_top():
+    from mempalace.search_util import query_post_filtered
+
+    rows = [(f"id{i}", {"room": "far" if i == 49 else "near"}, i / 100) for i in range(50)]
+    calls = []
+
+    class Col:
+        def query(self, n_results, include, **_):
+            calls.append(n_results)
+            got = rows[:n_results]
+            return {
+                "ids": [[r[0] for r in got]],
+                "metadatas": [[r[1] for r in got]],
+                "distances": [[r[2] for r in got]],
+            }
+
+    out = query_post_filtered(
+        Col(),
+        {"query_texts": ["q"], "where": {"room": "far"}, "include": ["metadatas", "distances"]},
+        lambda meta: meta.get("room") == "far",
+        n_results=3,
+        first_fetch=4,
+    )
+    assert out["ids"] == [["id49"]]
+    assert out["distances"] == [[0.49]]
+    assert calls == [4, 16, 64]
+
+
 def test_window_cannot_promote_an_older_snapshot_of_the_parent():
     old = _results([("p", "previous version", {}, 0.9)])
     best = {"p": (0.1, parent_sha("new version"))}
