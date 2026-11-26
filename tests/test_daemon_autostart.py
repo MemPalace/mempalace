@@ -571,15 +571,20 @@ def _overshooting_busy_model(monkeypatch):
     The C busy handler cannot be patched from Python, so connections opened
     with a timeout get a model of it: the real handler is off and a BUSY
     statement is retried on SQLite's schedule, counting planned sleeps (as
-    SQLite does) while each real sleep runs ``_OVERSHOOT`` long.
+    SQLite does) while each sleep runs ``_OVERSHOOT`` long.
+
+    Time is simulated: a sleep only advances the clock ``daemon_queue`` reads,
+    and the returned function reads that clock. The bound then depends on the
+    retry logic alone, not on how loaded the machine running the test is.
     """
     import sqlite3
+    import types
 
-    real_sleep = time.sleep
     real_connect = sqlite3.connect
+    now = [0.0]
 
     def slow_sleep(seconds):
-        real_sleep(seconds + _OVERSHOOT)
+        now[0] += seconds + _OVERSHOOT
 
     class SlowBusyConnection(sqlite3.Connection):
         busy_budget_ms = 0.0
@@ -601,8 +606,10 @@ def _overshooting_busy_model(monkeypatch):
         conn.busy_budget_ms = timeout * 1000
         return conn
 
-    monkeypatch.setattr(time, "sleep", slow_sleep)
+    fake_time = types.SimpleNamespace(monotonic=lambda: now[0], sleep=slow_sleep, time=time.time)
+    monkeypatch.setattr(daemon_queue, "time", fake_time)
     monkeypatch.setattr(sqlite3, "connect", connect)
+    return lambda: now[0]
 
 
 def test_contended_enqueue_is_bounded_by_wall_time_when_every_sleep_overshoots(state, monkeypatch):
@@ -612,14 +619,15 @@ def test_contended_enqueue_is_bounded_by_wall_time_when_every_sleep_overshoots(s
     store = daemon_queue.QueueStore(daemon_queue.queue_path(state))
     with store._connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        _overshooting_busy_model(monkeypatch)
-        t0 = time.monotonic()
+        clock = _overshooting_busy_model(monkeypatch)
+        t0 = clock()
         with pytest.raises(sqlite3.OperationalError, match="locked"):
             hooks_cli._submit_daemon_job("mine", {"source": "s"})
-        elapsed = time.monotonic() - t0
-    # The 0.15 s busy budget plus at most one overshooting retry sleep.
-    assert elapsed < 0.15 + 0.02 + _OVERSHOOT + 0.1
-    assert elapsed < 0.5
+        elapsed = clock() - t0
+    # Simulated time: the 0.15 s busy budget plus at most one overshooting
+    # retry sleep. SQLite's own handler, counting planned sleeps, takes ~0.65 s.
+    # The real-clock 0.5 s check is test_contended_queue_returns_within_hook_budget.
+    assert elapsed <= 0.15 + daemon_queue.BUSY_RETRY_MAX_SLEEP_SECONDS + _OVERSHOOT
 
 
 def test_wall_clock_busy_enqueue_lands_once_the_writer_lets_go(state, monkeypatch):
