@@ -436,6 +436,41 @@ def test_drawers_deleted_behind_the_record_read_as_not_mined(palace, monkeypatch
     assert SOURCE not in mined
 
 
+@pytest.mark.parametrize("field", ["normalize_version", "chunker_version"])
+def test_a_record_from_an_older_normalizer_or_chunker_reads_as_not_mined(palace, field):
+    from mempalace.palace import CHUNKER_VERSIONS, prefetch_mined_set
+
+    _file(palace, _drawers(["one", "two"]))
+    store = SourceStateStore(palace)
+    current = {
+        "chunk_total": 2,
+        "source_fingerprint": "1:1:1",
+        "source_mtime": 100.0,
+        "normalize_version": NORMALIZE_VERSION,
+        "chunker_version": CHUNKER_VERSIONS["exchange"][1],
+    }
+
+    def mined():
+        collection = get_collection(palace)
+        one = file_already_mined(
+            collection, SOURCE, extract_mode="exchange", wing=WING, source_state=store
+        )
+        bulk = prefetch_mined_set(
+            collection,
+            extract_mode="exchange",
+            source_fingerprints=True,
+            wing=WING,
+            source_state=store,
+        )
+        return one, SOURCE in bulk
+
+    store.mark_complete(_stream(), **current)
+    assert mined() == (True, True)
+
+    store.mark_complete(_stream(), **{**current, field: current[field] - 1})
+    assert mined() == (False, False)
+
+
 def test_a_reader_given_no_store_reads_the_palaces_own_record(tmp_path):
     import os
 
