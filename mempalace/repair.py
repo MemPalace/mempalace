@@ -2374,14 +2374,16 @@ def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> li
 
 
 def _preserve_logstream_and_replica(source_palace: str, dest_palace: str) -> list[str]:
-    """Copy the logstream database and replica identity into a rebuilt palace.
+    """Copy the logstream database, replica identity and peers into a rebuilt palace.
 
-    Neither file is derived from chroma.sqlite3, so a rebuild cannot
+    None of these files is derived from chroma.sqlite3, so a rebuild cannot
     reconstruct them. Left behind, the rebuilt palace starts with an empty
-    coordination log and mints a new replica id on next use.
+    coordination log, mints a new replica id on next use and has no peers
+    to sync with.
     """
     from .logstream import LOGSTREAM_DB_FILENAME
     from .replica import REPLICA_FILENAME
+    from .transport import PEERS_FILENAME
 
     if os.path.abspath(source_palace) == os.path.abspath(dest_palace):
         return []
@@ -2395,15 +2397,15 @@ def _preserve_logstream_and_replica(source_palace: str, dest_palace: str) -> lis
         _copy_sqlite_db(ls_src, ls_dst)
         copied.append(LOGSTREAM_DB_FILENAME)
 
-    rep_src = os.path.join(source_palace, REPLICA_FILENAME)
-    rep_dst = os.path.join(dest_palace, REPLICA_FILENAME)
-    if not os.path.islink(rep_src) and os.path.isfile(rep_src):
-        os.makedirs(dest_palace, exist_ok=True)
-        _copy_file_no_follow(rep_src, rep_dst, replace=True)
-        copied.append(REPLICA_FILENAME)
+    for filename in (REPLICA_FILENAME, PEERS_FILENAME):
+        src = os.path.join(source_palace, filename)
+        if not os.path.islink(src) and os.path.isfile(src):
+            os.makedirs(dest_palace, exist_ok=True)
+            _copy_file_no_follow(src, os.path.join(dest_palace, filename), replace=True)
+            copied.append(filename)
 
     if copied:
-        print(" Preserved logstream and replica identity: " + ", ".join(copied))
+        print(" Preserved logstream, replica identity and peers: " + ", ".join(copied))
 
     return copied
 
