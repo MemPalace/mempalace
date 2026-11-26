@@ -546,6 +546,17 @@ def main():
         help="Compare sqlite vs HNSW element counts (read-only; never opens a chromadb client)",
     )
 
+    p_integrity = sub.add_parser(
+        "integrity-check",
+        help=(
+            "Full SQLite quick_check of the palace in a child process (read-only); "
+            "reuses a clean result while the palace is unchanged"
+        ),
+    )
+    p_integrity.add_argument(
+        "--force", action="store_true", help="Re-run even if a clean result is cached"
+    )
+
     # daemon
     p_daemon = sub.add_parser("daemon", help="Manage the opt-in long-lived daemon")
     daemon_sub = p_daemon.add_subparsers(dest="daemon_action")
@@ -1197,6 +1208,7 @@ def main():
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,
+        "integrity-check": cmd_integrity_check,
         "migrate": cmd_migrate,
         "migrate-wings": cmd_migrate_wings,
         "hallways": cmd_hallways,

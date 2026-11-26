@@ -3,7 +3,9 @@
 import errno
 import logging
 import os
+import shutil
 import sqlite3
+import stat
 import sys
 from contextlib import closing
 from unittest.mock import MagicMock, call, patch
@@ -2953,6 +2955,36 @@ def test_rebuild_from_sqlite_in_place_archives_when_opted_in(tmp_path):
     assert rebuilt.count() == 15
 
 
+def test_rebuild_from_sqlite_in_place_releases_own_handles_before_archiving(tmp_path, monkeypatch):
+    """The archive rename must not race this process's own open Chroma
+    handles: a mine no longer closes them on its way out, and on
+    Windows an open chroma.sqlite3 makes renaming the palace fail."""
+    from mempalace.palace import _DEFAULT_BACKEND
+
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "body", {"wing": "w", "room": "r"})])
+    _DEFAULT_BACKEND.get_collection(str(palace), "mempalace_drawers").count()
+
+    events = []
+    real_close, real_rename = repair._close_chroma_handles, os.rename
+
+    def close(path, backend=None):
+        events.append(("close", os.path.abspath(path), backend))
+        return real_close(path, backend=backend)
+
+    def rename(src, dst):
+        events.append(("rename", os.path.abspath(src), None))
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(repair, "_close_chroma_handles", close)
+    monkeypatch.setattr(repair.os, "rename", rename)
+    counts = repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+    assert counts["mempalace_drawers"] == 1
+
+    archived = events.index(("rename", str(palace), None))
+    assert ("close", str(palace), _DEFAULT_BACKEND) in events[:archived]
+
+
 def _seed_palace_with_logstream_event(palace):
     from mempalace.logstream import Logstream
 
@@ -4704,3 +4736,78 @@ def test_vacuum_and_rebuild_fts5_strict_check_reads_the_file_cold(tmp_path):
     assert damage, "the VACUUM never ran; the test proved nothing"
     assert "FTS5 integrity-check failed" in str(excinfo.value), str(excinfo.value)
     assert _fts5_check_errors(tmp_path) != [], "the palace really was left malformed"
+
+
+# ── journal + .mempalace/ carried into rebuilt palaces (#3053) ───────────────
+
+
+def _seed_palace_with_journal(palace):
+    rows = [(f"d{i}", f"body {i}", {"wing": "w", "room": "r"}) for i in range(3)]
+    _seed_palace(palace, "mempalace_drawers", rows)
+    journal = palace / "drawer_revisions.jsonl"
+    journal.write_text('{"drawer_id": "d0", "content": "prior text"}\n', encoding="utf-8")
+    journal.chmod(0o600)
+    (palace / ".mempalace").mkdir(exist_ok=True)
+    (palace / ".mempalace" / "origin.json").write_text('{"kind": "x"}', encoding="utf-8")
+    palace.chmod(0o755)
+    return journal
+
+
+def _assert_carried(palace):
+    journal = palace / "drawer_revisions.jsonl"
+    assert "prior text" in journal.read_text(encoding="utf-8")
+    assert (palace / ".mempalace" / "origin.json").read_text(encoding="utf-8") == '{"kind": "x"}'
+    if os.name != "nt":
+        assert stat.S_IMODE(palace.stat().st_mode) == 0o700
+        assert stat.S_IMODE((palace / ".mempalace").stat().st_mode) == 0o700
+        assert stat.S_IMODE(journal.stat().st_mode) == 0o600
+
+
+def test_rebuild_from_sqlite_in_place_carries_journal_and_state_dir(tmp_path):
+    """--archive-existing in place (what ``repair rebuild-index`` runs)."""
+    palace = tmp_path / "palace"
+    _seed_palace_with_journal(palace)
+
+    repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    _assert_carried(palace)
+
+
+def test_rebuild_from_sqlite_source_carries_journal_and_state_dir(tmp_path):
+    """--source <palace> into a fresh dest dir."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    _seed_palace_with_journal(src)
+
+    repair.rebuild_from_sqlite(str(src), str(dest))
+
+    _assert_carried(dest)
+    assert (src / "drawer_revisions.jsonl").exists()
+
+
+def test_rebuild_from_sqlite_skips_symlinked_journal_and_state_dir(tmp_path):
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    _seed_palace(src, "mempalace_drawers", [("d0", "body", {"wing": "w", "room": "r"})])
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_text("s", encoding="utf-8")
+    journal_link = src / "drawer_revisions.jsonl"
+    if not journal_link.exists() and not journal_link.is_symlink():
+        journal_link.symlink_to(outside / "secret")
+    state_dir = src / ".mempalace"
+    # Seeding writes through Chroma, which leaves write markers in a real
+    # state dir; swap it for the link so the skip is actually exercised.
+    if state_dir.is_dir() and not state_dir.is_symlink():
+        shutil.rmtree(state_dir)
+    if not state_dir.exists() and not state_dir.is_symlink():
+        state_dir.symlink_to(outside, target_is_directory=True)
+    assert state_dir.is_symlink()
+
+    repair.rebuild_from_sqlite(str(src), str(dest))
+
+    assert not (dest / "drawer_revisions.jsonl").exists()
+    # The rebuild's own writes may create a fresh state dir; nothing may be
+    # copied through the link.
+    assert not (dest / ".mempalace").is_symlink()
+    assert not (dest / ".mempalace" / "secret").exists()
