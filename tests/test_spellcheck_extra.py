@@ -22,6 +22,14 @@ class TestLoadKnownNames:
             names = _load_known_names()
             assert names == {"riley", "ri", "alice", "alicia"}
 
+    def test_includes_registered_projects(self):
+        data = EntityRegistry._empty()
+        data["people"] = {"Riley": {"aliases": []}}
+        data["projects"] = ["Quillo"]
+        reg = EntityRegistry(data, Path("unused"))
+        with patch.object(EntityRegistry, "load", return_value=reg):
+            assert _load_known_names() == {"riley", "quillo"}
+
     def test_returns_empty_on_exception(self):
         with patch(
             "mempalace.entity_registry.EntityRegistry.load",
@@ -45,6 +53,20 @@ class TestSpellerEdgeCases:
             with patch("mempalace.spellcheck._get_speller", return_value=fake_speller):
                 with patch("mempalace.spellcheck._get_system_words", return_value=set()):
                     assert spellcheck_user_text("riley knoe") == "riley know"
+
+    def test_registered_project_not_corrected(self):
+        data = EntityRegistry._empty()
+        data["projects"] = ["Quillo"]
+        reg = EntityRegistry(data, Path("unused"))
+
+        def fake_speller(word):
+            corrections = {"quillo": "quell", "knoe": "know"}
+            return corrections.get(word, word)
+
+        with patch.object(EntityRegistry, "load", return_value=reg):
+            with patch("mempalace.spellcheck._get_speller", return_value=fake_speller):
+                with patch("mempalace.spellcheck._get_system_words", return_value=set()):
+                    assert spellcheck_user_text("deploy quillo knoe") == "deploy quillo know"
 
     def test_capitalized_word_skipped(self):
         """Capitalized words (likely proper nouns) are not corrected."""
