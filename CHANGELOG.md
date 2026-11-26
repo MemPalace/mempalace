@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
+- **The first mine that writes to an existing palace after upgrade runs one
+  full integrity check** (no clean result is on record yet) and creates
+  `<palace>/.mempalace/` if it is missing; later mines run the scoped check.
+  If a check finds isolated FTS5 damage, a child process rebuilds and
+  verifies the index while the miner holds the writer lease.
+
 - **The first conversation mine after upgrade re-reads every previously mined
   transcript in its selected sources.** Older rows have no verified source
   fingerprint and must be re-mined once, even when their stored mtime and size
@@ -80,6 +86,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Performance
 
+- **The post-mine integrity check is scoped to what the mine wrote and runs
+  in a child process** (#2684). A mine that wrote anything used to end with a
+  whole-database `PRAGMA quick_check` (7-12 s on a 1.2 GB palace) in the mining
+  process, beside Chroma's own SQLite. It now scans the rows it wrote for a raw
+  NUL or invalid UTF-8 and quick_checks `embeddings` / `embedding_metadata`
+  (0.2-0.5 s on a 50k-drawer palace). The full check runs on the first mine
+  after a writer died mid-write, every 24 h
+  (`integrity_full_check_interval_hours`), with
+  `post_mine_integrity_check = "full"`, or on demand with the new
+  `mempalace integrity-check`. FTS5 inverted-index damage is now found by that
+  full check rather than by every mine.
+
 - **The Antigravity sidecar no longer loads a second copy of the palace.**
   Its Python bridge starts on first use instead of with every IDE window
   (set `MEMPALACE_SIDECAR_WARMUP=1` or `MEMPALACE_EAGER_WARMUP=1` to start
@@ -116,6 +134,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   on the first writable open of an existing palace (6.4 s on that palace); a
   read-only open leaves the schema alone.
   ([#2998](https://github.com/MemPalace/mempalace/pull/2998))
+- **Every `mempalace` command starts faster.** `mempalace.cli`, `mempalace.palace`,
+  `mempalace.searcher` and `mempalace.mcp_server` execute their source files
+  into one namespace, and compiled those files from source on every start:
+  no bytecode cache applied to them. They now load through the import
+  system's cache, like any module. The HTTP opener that refuses redirects is
+  built on first use instead of at import. `mempalace --version` went from
+  about 340 ms to 180 ms on a busy machine, which every hook run pays.
+  ([#3038](https://github.com/MemPalace/mempalace/pull/3038))
 
 ### Bug Fixes
 
@@ -133,6 +159,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   in-process caller that had opened the palace (or its sub-window
   collection) made the swap fail with "held open by another process".
 
+- **Repair rebuilds keep the re-mine journal and `.mempalace/` and create
+  the rebuilt palace owner-only (`0700`).** `repair rebuild-index` and
+  `repair --mode from-sqlite` used to leave the new palace at umask
+  permissions and drop `drawer_revisions.jsonl` and `.mempalace/`, so a
+  user who deleted the archive after a good rebuild lost the prior
+  verbatim text the journal exists to keep. The journal is copied at
+  `0600`, `.mempalace/` is walked without following symlinks, and the
+  archive is left intact. Thanks to [Lautaro Antúnez](https://github.com/Staberman).
+  ([#3059](https://github.com/MemPalace/mempalace/pull/3059),
+  [#3053](https://github.com/MemPalace/mempalace/issues/3053))
 - **Importing `mempalace` no longer caps the thread pools of the process.**
   The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
   set at package import, so CPU embedding (EmbeddingGemma through torch) ran

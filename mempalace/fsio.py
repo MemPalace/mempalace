@@ -218,7 +218,8 @@ def _open_publish_temp(path: Path, mode: int):
     return open_new_temp_file(path.parent, prefix=f".{path.name}.", suffix=".tmp", mode=mode)
 
 
-def _replace(tmp: str, path: Path) -> None:
+def replace_with_retry(tmp: PathLike, path: PathLike) -> None:
+    """Replace a file, retrying transient Windows sharing violations."""
     for delay in _REPLACE_BACKOFF:
         try:
             os.replace(tmp, str(path))
@@ -336,7 +337,7 @@ def atomic_publish(
 
     _fill_temp(fd, tmp, write_body, binary, keep)
     try:
-        _replace(tmp, path)
+        replace_with_retry(tmp, path)
     except BaseException as exc:
         _finish_failed_replace(exc, tmp, path, write_body, binary, private, follow_symlinks)
         return
@@ -437,7 +438,7 @@ def move_aside(path: PathLike, *, label: str) -> Optional[str]:
     fd, target = open_new_temp_file(path.parent, prefix=f"{path.name}.{label}-{stamp}-")
     os.close(fd)
     try:
-        _replace(str(path), Path(target))
+        replace_with_retry(str(path), Path(target))
     except FileNotFoundError:
         unlink_quietly(target)
         return None

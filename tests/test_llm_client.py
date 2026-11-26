@@ -474,6 +474,51 @@ def test_openai_compat_retries_without_reasoning_effort_on_400():
     assert len(bodies) == 2 and "reasoning_effort" not in bodies[1]
 
 
+def test_openai_compat_retries_without_response_format_on_400():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        body = json.loads(req.data)
+        bodies.append(body)
+        if "response_format" in body:
+            raise HTTPError(
+                req.full_url,
+                400,
+                "'response_format' with type 'json_object' requires a JSON schema",
+                hdrs=None,
+                fp=None,
+            )
+        return _mock_openai_response('{"ok": true}')
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="x", endpoint="http://localhost")
+        assert p.classify("s", "u", think=False).text == '{"ok": true}'
+        # The retry dropped the rejected field and kept the reasoning hint.
+        assert "response_format" not in bodies[1]
+        assert bodies[1]["reasoning_effort"] == "none"
+        # The provider remembers, so the next call does not repeat the failure.
+        assert p.classify("s", "u").text == '{"ok": true}'
+    assert len(bodies) == 3 and "response_format" not in bodies[2]
+
+
+def test_openai_compat_keeps_json_mode_when_a_400_does_not_name_it():
+    from urllib.error import HTTPError
+
+    bodies = []
+
+    def fake_urlopen(req, *, timeout):
+        bodies.append(json.loads(req.data))
+        raise HTTPError(req.full_url, 400, "context length exceeded", hdrs=None, fp=None)
+
+    with patch("mempalace.llm_client.urlopen", side_effect=fake_urlopen):
+        p = OpenAICompatProvider(model="x", endpoint="http://localhost")
+        with pytest.raises(LLMError, match="context length"):
+            p.classify("s", "u")
+    assert len(bodies) == 1 and bodies[0]["response_format"] == {"type": "json_object"}
+
+
 def test_openai_compat_drops_temperature_a_400_names_and_remembers_it():
     from urllib.error import HTTPError
 

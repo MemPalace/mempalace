@@ -55,10 +55,22 @@ class MineValidationError(RuntimeError):
         # renders the abort banner, which carries the version; the MCP `mine`
         # tool and the daemon's job runner render this message instead, so it
         # belongs in the message.
-        super().__init__(
-            f"FTS5/SQLite quick_check failed: {len(errors)} issue(s) "
-            f"(SQLite {sqlite3.sqlite_version})"
-        )
+        from ..integrity_check import all_unverified
+
+        # True when the check never produced a verdict (its child process
+        # could not run or answer): not evidence of damage.
+        self.unverified = all_unverified(errors)
+        if self.unverified:
+            message = (
+                f"post-mine integrity check could not run, palace not verified: {errors[0]}; "
+                "re-run `mempalace integrity-check`"
+            )
+        else:
+            message = (
+                f"FTS5/SQLite quick_check failed: {len(errors)} issue(s) "
+                f"(SQLite {sqlite3.sqlite_version})"
+            )
+        super().__init__(message)
         self.palace_path = palace_path
         # Freeze the forensic snapshot so handlers cannot mutate it.
         self.errors: tuple[str, ...] = tuple(errors)
@@ -67,17 +79,19 @@ class MineValidationError(RuntimeError):
 def _validate_palace_fts5_after_mine(
     palace_path: str, *, writes_since: Optional[int] = None
 ) -> None:
-    """Raise MineValidationError if PRAGMA quick_check reports any error after a mine.
+    """Raise MineValidationError if the post-mine integrity check fails.
 
     ``writes_since`` is :func:`palace_write_serial` read before the mine's
-    first write. When nothing was written since, the check is skipped: a mine
-    that filed, purged and registered nothing left the database as it found
-    it, and on a 1M-drawer palace the full quick_check costs ~40 s warm, most
-    of a no-op mine. ``None`` always checks.
+    first write. A no-op mine skips validation unless a crash marker
+    requires recovery. ``None`` always checks, and always runs the full check, since there is
+    no journal baseline to scope it to.
 
-    Reuses the same primitive that `cmd_repair` already runs as preflight so the
-    operator sees the same recovery banner regardless of which command surfaces
-    the bug.
+    The check itself (:func:`mempalace.integrity_check.check_after_mine`) runs
+    in a child process. By default it scans only the rows this mine wrote and
+    quick_checks ``embeddings`` / ``embedding_metadata``; the whole-database
+    ``PRAGMA quick_check`` runs when it is due (unclean exit, interval,
+    config, or a failed scoped check). That module's docstring says exactly
+    what the scoped check catches and what it leaves to the full one.
 
     An isolated FTS5 inverted-index corruption (the common case after a
     killed-mid-write mine) is auto-healed in place first via the same
@@ -88,38 +102,53 @@ def _validate_palace_fts5_after_mine(
     last word here: it checks the content table against `embedding_metadata`
     before rebuilding from it, and declines when it cannot.
     """
-    if writes_since is not None and palace_write_serial() == writes_since:
+    from ..integrity_check import check_after_mine, unclean_exit_seen
+
+    if (
+        writes_since is not None
+        and palace_write_serial() == writes_since
+        and not unclean_exit_seen(palace_path)
+    ):
         return
     if resolve_backend_name(palace_path) != "chroma":
         return
 
-    # Defer-import: keeps the repair module graph out of mine's hot import path.
-    from ..repair import _close_chroma_handles, maybe_autoheal_fts5_index, sqlite_integrity_errors
+    from ..backends.chroma import chroma_written_ids_since
 
-    # Pass the live singleton so the writer's cached PersistentClient actually
-    # gets closed and WAL flushes before the read-only sqlite3 re-open.
-    # A transient ChromaBackend (the default) would only clear its own empty
-    # `_clients` dict and leave _DEFAULT_BACKEND's live handle in place,
-    # which on Windows keeps the sqlite file mmap'd.
-    _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
-
-    errors = sqlite_integrity_errors(palace_path)
-    if errors:
-        # Not the default print: this runs inside the MCP server process too
-        # (mcp_server.tool_mine -> miner.mine), where stdout is the JSON-RPC
-        # transport -- a stray print() here would corrupt the protocol stream
-        # and crash the connection.
-        #
-        # warning, not info: this module logs through the `mempalace.palace`
-        # logger, which sets no level of its own, and nothing configures logging
-        # on the `mempalace mine` path -- so root keeps its default and info
-        # records are dropped. Every message this call can emit describes a palace whose
-        # quick_check already failed -- a rebuild being attempted, refused, or
-        # completed against the operator's data -- so warning is both the level
-        # that survives and the level that fits.
-        errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.warning)
+    ids = None if writes_since is None else chroma_written_ids_since(writes_since)
+    errors = check_after_mine(
+        palace_path, ids, heal=lambda found: _heal_after_mine(palace_path, found)
+    )
     if errors:
         raise MineValidationError(palace_path, errors)
+
+
+def _heal_after_mine(palace_path: str, errors: list[str]) -> list[str]:
+    """Try the FTS5 auto-heal on a failed full check; return what remains."""
+    # Defer-import: keeps the repair module graph out of mine's hot import path.
+    from ..integrity_check import run_locked_heal
+    from ..repair import _close_chroma_handles, _errors_are_isolated_fts5, maybe_autoheal_fts5_index
+
+    # Drop cached Chroma handles before the child modifies the index.
+    # Only when the heal will act: a declined heal writes nothing, and closing
+    # throws away the writer's loaded index for no gain.
+    if _errors_are_isolated_fts5(errors):
+        _close_chroma_handles(palace_path, backend=_DEFAULT_BACKEND)
+    # Not the default print: this runs inside the MCP server process too
+    # (mcp_server.tool_mine -> miner.mine), where stdout is the JSON-RPC
+    # transport -- a stray print() here would corrupt the protocol stream
+    # and crash the connection.
+    #
+    # warning, not info: this module logs through the `mempalace.palace`
+    # logger, which sets no level of its own, and nothing configures logging
+    # on the `mempalace mine` path -- so root keeps its default and info
+    # records are dropped. Every message this call can emit describes a palace whose
+    # quick_check already failed -- a rebuild being attempted, refused, or
+    # completed against the operator's data -- so warning is both the level
+    # that survives and the level that fits.
+    return maybe_autoheal_fts5_index(
+        palace_path, errors, progress=logger.warning, run_locked=run_locked_heal
+    )
 
 
 def palace_write_serial() -> int:
