@@ -199,6 +199,11 @@ def cmd_mine(args):
         print(f"mempalace: {exc}", file=sys.stderr)
         sys.exit(1)
     except MineValidationError as exc:
+        if exc.unverified:
+            # The check never ran; the recovery banner below would send the
+            # operator to back up and recover a palace nothing found broken.
+            print(f"\n  mempalace: {exc}", file=sys.stderr)
+            sys.exit(1)
         # PRAGMA quick_check on chroma.sqlite3 returned errors at end of mine.
         # The corruption may pre-date the mine; we surface it here so automation
         # cannot proceed against a half-broken palace. Reuse cmd_repair's

@@ -257,8 +257,9 @@ def _get_where_sql(where, *, collection_id, locus_columns):
 
     A plain ``collection_id = ? AND (a = ? OR b = ?)`` can make SQLite
     scan every row in the collection despite indexes on both fields. Each
-    UNION arm instead seeks its own index; UNION deduplicates rows carrying
-    both parent keys. The caller orders and paginates the combined result.
+    arm instead seeks its own index. The arms join with UNION ALL: ``rowid
+    IN`` already counts a row matched by two arms once, and SQLite 3.53
+    plans a plain UNION as a rowid-ordered merge that scans the collection. The caller orders and paginates the combined result.
     Unsupported predicates retain the decoded Python filter path.
     """
     if not isinstance(where, dict) or list(where) != ["$or"]:
@@ -277,7 +278,7 @@ def _get_where_sql(where, *, collection_id, locus_columns):
         params.extend([collection_id, *values])
     if not arms:
         return "0=1", []
-    return "rowid IN (" + " UNION ".join(arms) + ")", params
+    return "rowid IN (" + " UNION ALL ".join(arms) + ")", params
 
 
 def _cosine_distances(
