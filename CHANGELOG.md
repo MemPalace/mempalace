@@ -137,6 +137,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   erase; deleting a source erases its re-mine history in
   `drawer_revisions.jsonl` too. Deleting a single drawer keeps the re-mine
   history of its position until its source is deleted.
+- A handful of colliding HNSW label-map pairs no longer quarantines the whole
+  segment. Each shared label keeps the drawer id `label_to_id` already holds and
+  only the extra ids leave the map, so the label stays in the graph and a query
+  that reaches it still resolves instead of failing with `Error finding id`.
+  The original map is kept next to it as
+  `index_metadata.pickle.pre-repair-<stamp>`, the dropped ids are recorded in the
+  palace state so `mempalace status` reports them, and they come back with
+  `mempalace repair --mode from-sqlite`; the next mine skips them as unchanged.
+  Label shapes the repair cannot keep in the graph still quarantine.
 
 ---
 

@@ -22,6 +22,8 @@ from chromadb.api.types import validate_where_document
 from chromadb.config import Settings as _ChromaSettings
 from chromadb.errors import NotFoundError as _ChromaNotFoundError
 
+from .. import paths
+from ..fsio import atomic_write_bytes, atomic_write_json
 from ..lexical import bm25_scores
 from ..stored_text import (
     document_filter_candidate,
@@ -30,7 +32,7 @@ from ..stored_text import (
     prepare_stored_write,
     restore_rows,
 )
-from ..timeutil import filename_stamp
+from ..timeutil import filename_stamp, utc_now_iso
 from ._filters import matches_where_document, validate_where
 from ._inproc_sqlite import (
     open_reader as open_palace_reader,
@@ -1689,6 +1691,26 @@ def _missing_dimensionality_appears_recoverable(
 ) -> bool:
     total = _persisted_metadata_value(persisted, "total_elements_added")
     label_to_id = _persisted_metadata_value(persisted, "label_to_id")
+    if not _hnsw_label_map_payload_ok(persisted, label_to_id, seg_dir):
+        return False
+
+    label_count = len(id_to_label)
+    # total_elements_added is monotonic across every add, while id_to_label and
+    # label_to_id hold only live elements, so a segment that has had deletions
+    # carries total_elements_added > label_count. Require >= (not ==), otherwise
+    # every post-deletion dim-None segment is wrongly quarantined; the
+    # label-map size and bijection checks still reject inconsistent label maps.
+    if int(total) < label_count or len(label_to_id) != label_count:
+        return False
+    try:
+        return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
+    except TypeError:
+        return False
+
+
+def _hnsw_label_map_payload_ok(persisted: object, label_to_id: object, seg_dir: str) -> bool:
+    """Return True when the segment carries counters and payload a load can use."""
+    total = _persisted_metadata_value(persisted, "total_elements_added")
     data_path = os.path.join(seg_dir, "data_level0.bin")
     link_path = os.path.join(seg_dir, "link_lists.bin")
 
@@ -1705,21 +1727,185 @@ def _missing_dimensionality_appears_recoverable(
             return False
     except OSError:
         return False
-    if not _hnsw_payload_appears_sane(seg_dir):
+    return _hnsw_payload_appears_sane(seg_dir)
+
+
+# Two mines writing one palace at once (one per wing) can hand the same labels
+# to different drawer ids. Chroma then persists a label map where a few labels
+# carry two ids, and the all-or-nothing bijection gate above quarantined the
+# entire segment for it: 330k vectors left search for a week, recovered only by
+# a 47-minute rebuild. Repair drops only the extra ids for those labels, keeping
+# each label mapped to the id label_to_id already holds: the label stays in the
+# HNSW graph, so a query that reaches it still resolves instead of failing with
+# "Error finding id". The dropped drawers fall back to the unindexed rows; their
+# vectors come back with `mempalace repair --mode from-sqlite`, since the next
+# mine skips unchanged sources. Real corruption is bigger than this or breaks
+# the payload, so it still quarantines.
+_HNSW_LABEL_MAP_REPAIR_MAX_FRACTION = 0.0001  # 0.01% of the live labels
+_HNSW_LABEL_MAP_REPAIR_MAX_LABELS = 8
+
+
+def _label_map_collisions(id_to_label: dict, label_to_id: dict) -> Optional[set]:
+    """Return the extra drawer ids to drop so the maps become a bijection.
+
+    One shape is repairable: a label two ids share where ``label_to_id``
+    already holds one of them. That id keeps the label, so the label stays in
+    the HNSW graph and a query reaching it still resolves; only the extra ids
+    leave ``id_to_label``.
+
+    Every other shape returns None and quarantines as before. When
+    ``label_to_id`` names an id that is not in ``id_to_label``, or holds a
+    label with no partner, the vector at that label is still in the graph.
+    Dropping the map entry would make a query that reaches it fail with
+    ``Error finding id`` — the failure this repair exists to avoid — so it is
+    left to quarantine.
+    """
+    label_ids: dict[object, list] = {}
+    for item_id, label in id_to_label.items():
+        if not isinstance(label, Integral) or isinstance(label, bool):
+            return None
+        label_ids.setdefault(label, []).append(item_id)
+
+    ids_to_drop: set = set()
+    for label, ids in label_ids.items():
+        if len(ids) == 1 and label_to_id.get(label) == ids[0]:
+            continue
+        keeper = label_to_id.get(label)
+        if keeper not in ids:
+            return None
+        ids_to_drop.update(item_id for item_id in ids if item_id != keeper)
+    # A label_to_id entry whose label has no id_to_label partner is the same
+    # kind of half-pair, and its vector is still in the graph.
+    for label in label_to_id:
+        if label not in label_ids:
+            return None
+    return ids_to_drop
+
+
+def _dropped_labels_path(palace_path: str) -> Path:
+    """Where a repair records the drawer ids it left unindexed, per palace."""
+    return paths.state_path("hnsw-label-repair", f"{paths.palace_key(palace_path)}.json")
+
+
+def read_dropped_label_repairs(palace_path: str) -> list[dict]:
+    """The recorded repairs for ``palace_path``; empty when none were made."""
+    try:
+        payload = json.loads(_dropped_labels_path(palace_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    repairs = payload.get("repairs") if isinstance(payload, dict) else None
+    return [entry for entry in repairs or [] if isinstance(entry, dict)]
+
+
+def _record_dropped_labels(palace_path: str, seg_dir: str, ids_to_drop: set) -> None:
+    """Append this repair to the palace state so ``status`` can report it.
+
+    Best-effort: a palace state dir that will not take the write must not
+    undo a repair that already landed on disk.
+    """
+    entry = {
+        "repaired_at": utc_now_iso(),
+        "segment": os.path.basename(seg_dir),
+        "dropped_ids": sorted(str(item_id) for item_id in ids_to_drop),
+    }
+    recorded = read_dropped_label_repairs(palace_path)
+    target = _dropped_labels_path(palace_path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(target, {"repairs": [*recorded, entry]})
+    except OSError:
+        logger.warning("Could not record the repaired drawer ids for %s", seg_dir, exc_info=True)
+
+
+def _repair_label_map_collisions(
+    persisted: object, id_to_label: dict, seg_dir: str, palace_path: str
+) -> bool:
+    """Drop a handful of colliding label-map pairs in place; True when repaired."""
+    label_to_id = _persisted_metadata_value(persisted, "label_to_id")
+    if not _hnsw_label_map_payload_ok(persisted, label_to_id, seg_dir):
         return False
 
-    label_count = len(id_to_label)
-    # total_elements_added is monotonic across every add, while id_to_label and
-    # label_to_id hold only live elements, so a segment that has had deletions
-    # carries total_elements_added > label_count. Require >= (not ==), otherwise
-    # every post-deletion dim-None segment is wrongly quarantined; the
-    # label-map size and bijection checks still reject inconsistent label maps.
-    if int(total) < label_count or len(label_to_id) != label_count:
+    ids_to_drop = _label_map_collisions(id_to_label, label_to_id)
+    if not ids_to_drop:
         return False
+    # The cap counts dropped drawer ids: a label whose keeper survives costs
+    # only the extra ids, and that is what the segment actually loses.
+    if len(ids_to_drop) > _HNSW_LABEL_MAP_REPAIR_MAX_LABELS:
+        return False
+    if len(ids_to_drop) > len(id_to_label) * _HNSW_LABEL_MAP_REPAIR_MAX_FRACTION:
+        return False
+
+    kept_labels = dict(label_to_id)
+    kept_ids = {
+        item_id: label for item_id, label in id_to_label.items() if item_id not in ids_to_drop
+    }
+    # Whatever survives must already be a bijection, otherwise this is not a
+    # collision-only map and a partial rewrite would hide the real damage.
+    if not kept_ids or len(kept_ids) != len(kept_labels):
+        return False
+    if any(kept_labels.get(label) != item_id for item_id, label in kept_ids.items()):
+        return False
+
+    # total_elements_added is monotonic and must stay >= the live label count;
+    # copying a counter that is already too small would only move the segment
+    # from this gate to the next quarantine pass.
+    total = _persisted_metadata_value(persisted, "total_elements_added")
+    if not isinstance(total, Integral) or isinstance(total, bool) or int(total) < len(kept_ids):
+        return False
+
+    seq_ids = _persisted_metadata_value(persisted, "id_to_seq_id")
+    if isinstance(seq_ids, dict):
+        seq_ids = {k: v for k, v in seq_ids.items() if k not in ids_to_drop}
+    else:
+        seq_ids = {}
+
+    if _segment_is_held(seg_dir):
+        return False
+
+    # Supported chromadb writers persist this metadata as a plain dict of the
+    # IdMap fields; older builds pickled a PersistentData instance. Rewrite in
+    # the dict shape either way: importing the instance class drags in the
+    # optional ``hnswlib`` dependency, which the Rust-backed client never needs.
+    repaired = (
+        dict(persisted) if isinstance(persisted, dict) else dict(getattr(persisted, "__dict__", {}))
+    )
+    repaired.update(
+        {
+            "id_to_label": kept_ids,
+            "label_to_id": kept_labels,
+            "id_to_seq_id": seq_ids,
+        }
+    )
+
+    meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+    stamp = filename_stamp()
     try:
-        return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
-    except TypeError:
+        # Keep the original next to it first: the quarantine path can be undone
+        # by renaming back, and this one overwrites in place, so a heuristic
+        # that misfires must leave the previous bytes recoverable by hand.
+        with open(meta_path, "rb") as handle:
+            original = handle.read()
+        atomic_write_bytes(f"{meta_path}.pre-repair-{stamp}", original)
+        atomic_write_bytes(meta_path, pickle.dumps(repaired, protocol=pickle.HIGHEST_PROTOCOL))
+    except OSError:
+        logger.exception("Failed to repair colliding HNSW labels in %s", meta_path)
         return False
+
+    _record_dropped_labels(palace_path, seg_dir, ids_to_drop)
+
+    logger.warning(
+        "Repaired %d colliding HNSW label(s) in %s by dropping %d drawer id(s): %s "
+        "(recorded in %s). Their vectors stay unindexed; the next mine skips them "
+        "as unchanged, so run `mempalace repair --mode from-sqlite` to index them "
+        "again. The original map is kept at %s.",
+        len(ids_to_drop),
+        seg_dir,
+        len(ids_to_drop),
+        ", ".join(sorted(str(item_id) for item_id in ids_to_drop)),
+        _dropped_labels_path(palace_path),
+        f"{meta_path}.pre-repair-{stamp}",
+    )
+    return True
 
 
 # Stability gate for the invalid-metadata quarantine. A torn read of
@@ -1880,10 +2066,13 @@ def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
                             persisted, id_to_label, seg_dir
                         )
                     ):
-                        reason = (
-                            "labels present but dimensionality is missing or invalid "
-                            f"({dimensionality!r})"
-                        )
+                        if not _repair_label_map_collisions(
+                            persisted, id_to_label, seg_dir, palace_path
+                        ):
+                            reason = (
+                                "labels present but dimensionality is missing or invalid "
+                                f"({dimensionality!r})"
+                            )
                     elif (
                         has_labels
                         and dimensionality is not None

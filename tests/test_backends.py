@@ -33,9 +33,11 @@ from mempalace.backends.chroma import (
     _fix_missing_collection_type,
     _load_hnsw_metadata_stable,
     _pin_hnsw_threads,
+    _SafePersistentDataUnpickler,
     _segment_appears_healthy,
     quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
+    read_dropped_label_repairs,
 )
 
 # embeddinggemma-300m Matryoshka truncation (first 384 of 768 dims).
@@ -2286,6 +2288,198 @@ def test_quarantine_invalid_hnsw_metadata_allows_uninitialized_segment(tmp_path)
 
     assert moved == []
     assert seg.exists()
+
+
+def _persistent_data(labels: dict, label_to_id: dict, total: int):
+    """Plain dict payload, the shape a supported chromadb writer persists.
+
+    Building ``PersistentData`` instead needs the optional ``hnswlib`` import,
+    which a normal install (and CI) does not have.
+    """
+    return {
+        "dimensionality": None,
+        "total_elements_added": total,
+        "id_to_label": labels,
+        "label_to_id": label_to_id,
+        "id_to_seq_id": {},
+    }
+
+
+def _write_colliding_segment(tmp_path, label_count, colliding_labels):
+    """Segment whose label maps disagree on ``colliding_labels`` only (#3010)."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+
+    id_to_label = {f"drawer-{label}": label for label in range(1, label_count + 1)}
+    label_to_id = {label: item_id for item_id, label in id_to_label.items()}
+    for label in colliding_labels:
+        # A second writer handed the same label to another drawer id.
+        id_to_label[f"drawer-dup-{label}"] = label
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(_persistent_data(id_to_label, label_to_id, label_count), f)
+    return palace, seg
+
+
+def test_quarantine_invalid_hnsw_metadata_repairs_tiny_label_collisions(tmp_path):
+    """3 of 40k labels colliding must not cost the whole segment (#3010)."""
+    palace, seg = _write_colliding_segment(tmp_path, 40000, (39354, 39355, 39356))
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+    persisted = _SafePersistentDataUnpickler.load(str(seg / "index_metadata.pickle"))
+    labels = persisted["id_to_label"] if isinstance(persisted, dict) else persisted.id_to_label
+    by_label = persisted["label_to_id"] if isinstance(persisted, dict) else persisted.label_to_id
+    # The shared labels keep the id label_to_id already held; only the extra
+    # drawer ids go, so the labels stay in the graph and remain queryable.
+    assert len(labels) == len(by_label) == 40000
+    assert not any(key.startswith("drawer-dup-") for key in labels)
+    assert all(by_label[label] == item_id for item_id, label in labels.items())
+    assert by_label[39354] == "drawer-39354"
+
+
+def test_quarantine_invalid_hnsw_metadata_keeps_original_and_records_dropped_ids(tmp_path):
+    """A repair keeps the pre-repair map and records the ids it left unindexed."""
+    palace, seg = _write_colliding_segment(tmp_path, 40000, (39354,))
+    meta = seg / "index_metadata.pickle"
+    before = meta.read_bytes()
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    (kept,) = seg.glob("index_metadata.pickle.pre-repair-*")
+    assert kept.read_bytes() == before
+    repairs = read_dropped_label_repairs(str(palace))
+    assert [entry["dropped_ids"] for entry in repairs] == [["drawer-dup-39354"]]
+    assert repairs[0]["segment"] == seg.name
+
+
+@pytest.mark.parametrize("shape", ("keeper_missing", "half_pair"))
+def test_quarantine_invalid_hnsw_metadata_quarantines_unrepairable_label_shapes(tmp_path, shape):
+    """A label whose vector cannot be kept in the graph quarantines, not repairs.
+
+    ``label_to_id`` naming an id that is not in ``id_to_label``, or holding a
+    label with no partner, leaves a vector in the HNSW graph that the map no
+    longer points at. Dropping the entry would make a query that reaches it
+    fail with ``Error finding id``, so the segment still quarantines.
+    """
+    palace, seg = _write_colliding_segment(tmp_path, 40000, ())
+    meta = seg / "index_metadata.pickle"
+    persisted = _SafePersistentDataUnpickler.load(str(meta))
+    label = persisted["id_to_label"]["drawer-39354"]
+    if shape == "keeper_missing":
+        persisted["label_to_id"][label] = "drawer-never-written"
+    else:
+        persisted["label_to_id"][999999] = "drawer-39354"
+        del persisted["id_to_label"]["drawer-39354"]
+    with open(meta, "wb") as f:
+        pickle.dump(persisted, f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert not seg.exists()
+    assert read_dropped_label_repairs(str(palace)) == []
+
+
+def test_repaired_segment_answers_a_query_for_the_shared_label(tmp_path):
+    """The repaired map must still resolve a query that reaches the shared label.
+
+    Built against a real chromadb segment, not a hand-written pickle: the
+    failure this repair avoids is the loader's ``Error finding id``, which
+    only shows up when a real segment is opened and queried.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    client = chromadb.PersistentClient(path=str(palace))
+    collection = client.get_or_create_collection("mempalace_drawers")
+    count = 12000
+    for start in range(0, count, 4000):
+        batch = range(start, min(start + 4000, count))
+        collection.add(
+            ids=[f"drawer-{index}" for index in batch],
+            embeddings=[[float(index), 1.0, 0.5] for index in batch],
+        )
+    del collection, client
+
+    (meta,) = palace.glob("*/index_metadata.pickle")
+    persisted = _SafePersistentDataUnpickler.load(str(meta))
+    # #3010 shape: a second writer handed drawer-17's label to another id.
+    persisted["id_to_label"]["drawer-dup-17"] = persisted["id_to_label"]["drawer-17"]
+    with open(meta, "wb") as f:
+        pickle.dump(persisted, f)
+
+    assert quarantine_invalid_hnsw_metadata(str(palace)) == []
+
+    client = chromadb.PersistentClient(path=str(palace))
+    collection = client.get_collection("mempalace_drawers")
+    assert collection.count() == count
+    nearest = collection.query(query_embeddings=[[17.0, 1.0, 0.5]], n_results=3)["ids"][0]
+    assert nearest[0] == "drawer-17"
+
+
+def test_quarantine_invalid_hnsw_metadata_quarantines_large_label_mismatches(tmp_path):
+    """A map that disagrees well beyond a handful of labels is still corruption."""
+    palace, seg = _write_colliding_segment(tmp_path, 40, range(1, 21))
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_repairs_dict_payload_collisions(tmp_path):
+    """Supported writers persist a plain dict; that shape repairs the same way."""
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    (seg / "data_level0.bin").write_bytes(b"x" * 2048)
+    (seg / "link_lists.bin").write_bytes(b"x" * 128)
+
+    id_to_label = {f"drawer-{label}": label for label in range(1, 40001)}
+    label_to_id = {label: item_id for item_id, label in id_to_label.items()}
+    id_to_label["drawer-dup-39354"] = 39354
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(
+            {
+                "dimensionality": None,
+                "total_elements_added": 40000,
+                "id_to_label": id_to_label,
+                "label_to_id": label_to_id,
+                "id_to_seq_id": {},
+            },
+            f,
+        )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    persisted = _SafePersistentDataUnpickler.load(str(seg / "index_metadata.pickle"))
+    assert isinstance(persisted, dict)
+    assert persisted["label_to_id"][39354] == "drawer-39354"
+    assert "drawer-dup-39354" not in persisted["id_to_label"]
+    assert len(persisted["id_to_label"]) == len(persisted["label_to_id"]) == 40000
+
+
+def test_quarantine_invalid_hnsw_metadata_rejects_repair_with_stale_counter(tmp_path):
+    """A repair must not carry a counter below the surviving label count."""
+    palace, seg = _write_colliding_segment(tmp_path, 40000, (39354,))
+    meta = seg / "index_metadata.pickle"
+    persisted = _SafePersistentDataUnpickler.load(str(meta))
+    persisted["total_elements_added"] = 0
+    with open(meta, "wb") as f:
+        pickle.dump(persisted, f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert not seg.exists()
 
 
 def test_quarantine_invalid_hnsw_metadata_rejects_non_dict_id_to_label(tmp_path):
