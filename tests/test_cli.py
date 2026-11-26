@@ -888,6 +888,62 @@ def test_cmd_mine_convos_mode(mock_config_cls):
         )
 
 
+@pytest.mark.parametrize("mode", ["projects", "extract"])
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_rejects_a_file_in_directory_modes(mock_config_cls, mode, tmp_path, capsys):
+    """projects and extract walk a tree; a file mines nothing, so say so (#3018)."""
+    mock_config_cls.return_value.palace_path = str(tmp_path / "palace")
+    src = tmp_path / "notes.md"
+    src.write_text("# notes\n", encoding="utf-8")
+    args = argparse.Namespace(
+        dir=str(src),
+        palace=None,
+        mode=mode,
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+    )
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.format_miner.mine_formats") as mock_formats,
+        pytest.raises(SystemExit) as exc_info,
+    ):
+        cmd_mine(args)
+    assert exc_info.value.code == 1
+    mock_mine.assert_not_called()
+    mock_formats.assert_not_called()
+    err = capsys.readouterr().err
+    assert f"{mode} mode mines directories" in err
+    assert "--mode convos" in err
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_mine_convos_mode_accepts_a_single_file(mock_config_cls, tmp_path):
+    mock_config_cls.return_value.palace_path = str(tmp_path / "palace")
+    src = tmp_path / "session.jsonl"
+    src.write_text("{}\n", encoding="utf-8")
+    args = argparse.Namespace(
+        dir=str(src),
+        palace=None,
+        mode="convos",
+        wing=None,
+        agent="mempalace",
+        limit=0,
+        dry_run=False,
+        no_gitignore=False,
+        include_ignored=[],
+        extract="exchange",
+        include_subagents=False,
+    )
+    with patch("mempalace.convo_miner.mine_convos") as mock_mine:
+        cmd_mine(args)
+    assert mock_mine.call_args.kwargs["convo_dir"] == str(src)
+
+
 @patch("mempalace.cli.MempalaceConfig")
 def test_cmd_mine_convos_mode_threads_include_subagents_flag(mock_config_cls):
     mock_config_cls.return_value.palace_path = "/fake/palace"
