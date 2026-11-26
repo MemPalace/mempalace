@@ -272,14 +272,15 @@ def _get_orjson():
     return _orjson
 
 
-def loads_line(raw: bytes) -> Any:
+def loads_line(raw: bytes | str) -> Any:
     """Parse one JSON line exactly as ``json.loads`` on its UTF-8 text would.
 
     Uses orjson when available. orjson rejects some input stdlib accepts (lone
     surrogate escapes, NaN, huge numbers, invalid UTF-8 after ``replace``
     decoding), so any orjson error retries that line with stdlib ``json`` on
-    the ``errors="replace"`` decoded text. Raises ``ValueError`` (or
-    ``RecursionError``) when the line is not JSON.
+    the ``errors="replace"`` decoded text. ``raw`` may also be text already
+    decoded. Raises ``ValueError`` (or ``RecursionError``) when the line is
+    not JSON.
     """
     fast = _get_orjson()
     if fast is not None:
@@ -287,7 +288,7 @@ def loads_line(raw: bytes) -> Any:
             return fast.loads(raw)
         except fast.JSONDecodeError:
             pass
-    return json.loads(raw.decode("utf-8", "replace"))
+    return json.loads(raw if isinstance(raw, str) else raw.decode("utf-8", "replace"))
 
 
 def iter_records(chunk: bytes, keep: Optional[Callable[[bytes], bool]] = None) -> Iterator[Any]:

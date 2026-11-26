@@ -28,6 +28,19 @@ def _mine(source, palace):
     convo_miner.mine_convos(str(source), str(palace), wing="snapshot")
 
 
+def _recorded(palace, source, wing="snapshot", mode="exchange"):
+    """The source record a convo mine keeps for ``source`` (#3055).
+
+    Its snapshot is the freshness proof: drawers a re-mine did not need to
+    rewrite keep the per-row stamps they were filed with.
+    """
+    from mempalace.palace.source_state import SourceStateStore, source_stream
+
+    return SourceStateStore(str(palace)).get(
+        source_stream(str(source), extract_mode=mode, wing=wing)
+    )
+
+
 def _documents(palace):
     # Mining may close cached backend handles; reopen after each completed run.
     rows = get_collection(str(palace)).get(include=["documents", "metadatas"])
@@ -217,11 +230,11 @@ def test_atomic_replacement_with_same_size_and_mtime_is_remined(tmp_path):
         where={"source_file": str(source)}, include=["metadatas"]
     )
     assert replaced_rows["ids"]
-    assert all(
-        m["source_fingerprint"] not in original_fingerprints
-        and m.get("source_dir_ino") == directory_identity
-        for m in replaced_rows["metadatas"]
-    )
+    assert all(m.get("source_dir_ino") == directory_identity for m in replaced_rows["metadatas"])
+    head = _recorded(palace, source)
+    assert head.complete
+    assert head.source_fingerprint == source_fingerprint(replaced_stat)
+    assert head.source_fingerprint not in original_fingerprints
 
 
 @pytest.mark.parametrize("rewrite", [False, True], ids=["unchanged", "same-size-rewrite"])
@@ -237,6 +250,10 @@ def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch, re
         ids=rows["ids"],
         metadatas=[{"source_fingerprint": None} for _ in rows["ids"]],
     )
+    # A palace mined before source records had none.
+    from mempalace.palace.source_state import SOURCE_STATE_FILENAME
+
+    os.remove(palace / SOURCE_STATE_FILENAME)
     legacy_rows = collection.get(include=["metadatas"])
     assert all("source_fingerprint" not in meta for meta in legacy_rows["metadatas"])
     assert all("source_mtime" in meta for meta in legacy_rows["metadatas"])
@@ -257,8 +274,7 @@ def test_legacy_mtime_only_rows_upgrade_once_then_skip(tmp_path, monkeypatch, re
     monkeypatch.setattr(convo_miner, "normalize_conversations_with_mtime", counted_normalize)
     _mine(source, palace)
     assert normalizations == 1, "legacy mtime-only rows must be verified once"
-    upgraded = get_collection(str(palace)).get(include=["metadatas"])
-    assert all(meta.get("source_fingerprint") for meta in upgraded["metadatas"])
+    assert _recorded(palace, source).source_fingerprint == source_fingerprint(source.stat())
     if rewrite:
         assert any("design" in doc for doc in _documents(palace))
 
@@ -957,10 +973,7 @@ def test_lossless_decoding_keeps_snapshot_freshness(
     assert any("APPENDED_TURN_MARKER" in doc for doc in rows["documents"])
     assert any(expected in doc for doc in rows["documents"])
     assert all(meta["source_encoding"] == encoding for meta in rows["metadatas"])
-    assert all(
-        meta["source_fingerprint"] == source_fingerprint(source.stat())
-        for meta in rows["metadatas"]
-    )
+    assert _recorded(palace, source).source_fingerprint == source_fingerprint(source.stat())
 
 
 @pytest.mark.parametrize("field", ["st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"])
@@ -1036,9 +1049,7 @@ def test_failed_source_retries_each_pass_and_recovers_without_source_change(
     _mine(source, palace)
     rows = _rows(palace)
     assert rows
-    assert all(
-        meta["source_fingerprint"] == source_fingerprint(snapshot) for _, meta in rows.values()
-    )
+    assert _recorded(palace, source).source_fingerprint == source_fingerprint(snapshot)
     if already_mined:
         assert any("APPENDED_TURN_MARKER" in doc for doc, _ in rows.values())
     with monkeypatch.context() as unchanged:

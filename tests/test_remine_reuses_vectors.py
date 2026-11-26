@@ -279,13 +279,22 @@ def test_a_failed_vector_read_embeds_again_instead_of_failing_the_mine(
     monkeypatch.undo()
 
     assert [include for include in includes if "embeddings" in include]
-    assert len(embedded) == len(first)
+    # Unchanged drawers are not rewritten, so they need no stored vector: the
+    # failed read only skips the vector check and nothing is embedded again.
+    assert embedded == []
     second = _palace_rows(palace)
     assert {drawer_id: row[0] for drawer_id, row in second.items()} == {
         drawer_id: row[0] for drawer_id, row in first.items()
     }
+    from mempalace.palace.source_state import SourceStateStore
+
     assert file_already_mined(
-        get_collection(palace), str(src / "a.txt"), check_mtime=True, extract_mode="exchange"
+        get_collection(palace),
+        str(src / "a.txt"),
+        check_mtime=True,
+        extract_mode="exchange",
+        wing="chats",
+        source_state=SourceStateStore(palace),
     )
 
 

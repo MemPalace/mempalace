@@ -283,6 +283,7 @@ def drawers_removed(
     closet_sources=(),
     revision_ids=None,
     revision_source=None,
+    record_source=None,
     aaak_col=None,
     reraise=(),
 ) -> dict:
@@ -295,9 +296,21 @@ def drawers_removed(
     never raised, so it cannot undo the drawer change; only errors in
     ``reraise`` propagate. Returns ``closets_deleted`` when closets were asked
     for, and ``revisions_deleted`` (None plus ``revisions_error`` on failure)
-    when revisions were.
+    when revisions were. ``record_source`` deletes that source's records in
+    ``source_state.sqlite3`` and adds ``source_records_deleted`` (None on
+    failure).
     """
     result = {}
+    if record_source is not None and palace_path:
+        from .source_state import SourceStateStore
+
+        try:
+            result["source_records_deleted"] = SourceStateStore(palace_path).delete_source(
+                record_source
+            )
+        except Exception:
+            logger.warning("source record purge failed for %s", record_source, exc_info=True)
+            result["source_records_deleted"] = None
     if closet_sources:
         result["closets_deleted"] = sum(
             purge_source_closets(palace_path, source) for source in dict.fromkeys(closet_sources)

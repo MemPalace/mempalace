@@ -333,25 +333,65 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
     return None
 
 
-def _try_claude_code_jsonl(content: str) -> Optional[str]:
-    """Claude Code JSONL sessions."""
-    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
-    messages = []
-    tool_use_map = {}  # tool_use_id → tool_name
+class _ToolNames(dict):
+    """``tool_use_id -> tool name`` for one Claude Code transcript.
 
-    for line in lines:
-        try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    Behaves as the plain dict the parser always used, and also tracks the ids
+    no result has looked up yet (``pending``), so a parse that resumes mid-file
+    can carry them. A map built from a resume point is not ``complete``: a
+    lookup of an id it does not hold sets ``missed``, because the full file may
+    name that tool where the resumed parse cannot see it.
+    """
+
+    def __init__(self, names=None, *, complete: bool = True):
+        super().__init__(names or {})
+        self.pending = dict(self)
+        self.complete = complete
+        self.missed = False
+
+    def __bool__(self) -> bool:
+        # The parser reads ``tool_use_map or {}``; an empty map must still be
+        # this object so its lookups are tracked.
+        return True
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        self.pending[key] = value
+
+    def get(self, key, default=None):
+        if key in self:
+            self.pending.pop(key, None)
+            return self[key]
+        if not self.complete:
+            self.missed = True
+        return default
+
+
+class ClaudeCodeParser:
+    """Fold parsed Claude Code JSONL entries into ``(role, text)`` messages.
+
+    One entry at a time, so the convo miner's cursor can resume at a user
+    message with only the tool names still pending (``tool_names``).
+    """
+
+    def __init__(self, tool_names: Optional[dict] = None):
+        self.messages: list = []
+        self.tool_use_map = (
+            _ToolNames() if tool_names is None else _ToolNames(tool_names, complete=False)
+        )
+
+    def feed(self, entry) -> bool:
+        """Fold one parsed line; True when it started a new user message."""
         if not isinstance(entry, dict):
-            continue
+            return False
+        messages = self.messages
+        tool_use_map = self.tool_use_map
         msg_type = entry.get("type", "")
         # system, summary and other entries carry session bookkeeping and UI
         # chrome rather than conversation, so skipping them is not recorded.
         message = entry.get("message", {})
         if not isinstance(message, dict):
-            continue
+            return False
         msg_content = message.get("content", "")
 
         # Build tool_use_map from assistant messages
@@ -379,6 +419,7 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
                     messages[-1] = (prev_role, prev_text + "\n" + text)
                 elif not is_tool_only:
                     messages.append(("user", text))
+                    return True
                 else:
                     _record("tool_result_omitted")
         elif msg_type == "assistant":
@@ -393,9 +434,23 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
                     messages[-1] = (prev_role, prev_text + "\n" + text)
                 else:
                     messages.append(("assistant", text))
+        return False
 
-    if len(messages) >= 2:
-        return _messages_to_transcript(messages)
+
+def _try_claude_code_jsonl(content: str) -> Optional[str]:
+    """Claude Code JSONL sessions."""
+    lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
+    parser = ClaudeCodeParser()
+
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        parser.feed(entry)
+
+    if len(parser.messages) >= 2:
+        return _messages_to_transcript(parser.messages)
     return None
 
 
@@ -1284,15 +1339,28 @@ def recording_transforms(spellcheck: bool = False):
         _NORMALIZE_RUN.reset(token)
 
 
-def _messages_to_transcript(messages: list) -> str:
+def _messages_to_transcript(messages: list, user_lines: Optional[dict] = None) -> str:
     """Convert [(role, text), ...] to transcript format with > markers.
 
     Turns are kept as written unless the caller opted in to spell correction
     with ``recording_transforms(spellcheck=True)``, which only touches user
     messages.
+
+    ``user_lines``, when given, receives ``message index -> (line, char)``:
+    where each user message's ``> `` line starts in the result, as a line
+    number of ``result.split("\\n")`` and a character offset.
     """
     run = _NORMALIZE_RUN.get()
     lines = []
+    line_no = char_no = 0
+
+    def add(line: str) -> None:
+        nonlocal line_no, char_no
+        lines.append(line)
+        if user_lines is not None:
+            line_no += line.count("\n") + 1
+            char_no += len(line) + 1
+
     i = 0
     while i < len(messages):
         role, text = messages[i]
@@ -1304,16 +1372,18 @@ def _messages_to_transcript(messages: list) -> str:
                 if corrected != text:
                     run.applied.add("spellcheck_user")
                 text = corrected
-            lines.append(f"> {text}")
+            if user_lines is not None:
+                user_lines[i] = (line_no, char_no)
+            add(f"> {text}")
             if i + 1 < len(messages) and messages[i + 1][0] == "assistant":
-                lines.append(messages[i + 1][1])
+                add(messages[i + 1][1])
                 i += 2
             else:
                 i += 1
         else:
-            lines.append(text)
+            add(text)
             i += 1
-        lines.append("")
+        add("")
     return "\n".join(lines)
 
 
