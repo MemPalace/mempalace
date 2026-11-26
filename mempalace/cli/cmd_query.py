@@ -183,11 +183,17 @@ def cmd_export(args):
 
 
 def cmd_status(args):
+    from ..backends.chroma import read_dropped_label_repairs
     from ..knowledge_graph import knowledge_graph_notice
     from ..miner import status
 
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     status(palace_path=palace_path)
+    repairs = read_dropped_label_repairs(palace_path)
+    dropped = sum(len(entry.get("dropped_ids") or ()) for entry in repairs)
+    if dropped:
+        print(f"  Unindexed: {dropped} drawer(s) dropped by an HNSW label repair.")
+        print("  Run `mempalace repair --mode from-sqlite` to index them again.")
     notice = knowledge_graph_notice(palace_path, explicit=bool(args.palace))
     if notice:
         print(f"\n  Note: {notice}")

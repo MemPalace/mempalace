@@ -37,6 +37,7 @@ from mempalace.backends.chroma import (
     _segment_appears_healthy,
     quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
+    read_dropped_label_repairs,
 )
 
 # embeddinggemma-300m Matryoshka truncation (first 384 of 768 dims).
@@ -2340,6 +2341,86 @@ def test_quarantine_invalid_hnsw_metadata_repairs_tiny_label_collisions(tmp_path
     assert not any(key.startswith("drawer-dup-") for key in labels)
     assert all(by_label[label] == item_id for item_id, label in labels.items())
     assert by_label[39354] == "drawer-39354"
+
+
+def test_quarantine_invalid_hnsw_metadata_keeps_original_and_records_dropped_ids(tmp_path):
+    """A repair keeps the pre-repair map and records the ids it left unindexed."""
+    palace, seg = _write_colliding_segment(tmp_path, 40000, (39354,))
+    meta = seg / "index_metadata.pickle"
+    before = meta.read_bytes()
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    (kept,) = seg.glob("index_metadata.pickle.pre-repair-*")
+    assert kept.read_bytes() == before
+    repairs = read_dropped_label_repairs(str(palace))
+    assert [entry["dropped_ids"] for entry in repairs] == [["drawer-dup-39354"]]
+    assert repairs[0]["segment"] == seg.name
+
+
+@pytest.mark.parametrize("shape", ("keeper_missing", "half_pair"))
+def test_quarantine_invalid_hnsw_metadata_quarantines_unrepairable_label_shapes(tmp_path, shape):
+    """A label whose vector cannot be kept in the graph quarantines, not repairs.
+
+    ``label_to_id`` naming an id that is not in ``id_to_label``, or holding a
+    label with no partner, leaves a vector in the HNSW graph that the map no
+    longer points at. Dropping the entry would make a query that reaches it
+    fail with ``Error finding id``, so the segment still quarantines.
+    """
+    palace, seg = _write_colliding_segment(tmp_path, 40000, ())
+    meta = seg / "index_metadata.pickle"
+    persisted = _SafePersistentDataUnpickler.load(str(meta))
+    label = persisted["id_to_label"]["drawer-39354"]
+    if shape == "keeper_missing":
+        persisted["label_to_id"][label] = "drawer-never-written"
+    else:
+        persisted["label_to_id"][999999] = "drawer-39354"
+        del persisted["id_to_label"]["drawer-39354"]
+    with open(meta, "wb") as f:
+        pickle.dump(persisted, f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert not seg.exists()
+    assert read_dropped_label_repairs(str(palace)) == []
+
+
+def test_repaired_segment_answers_a_query_for_the_shared_label(tmp_path):
+    """The repaired map must still resolve a query that reaches the shared label.
+
+    Built against a real chromadb segment, not a hand-written pickle: the
+    failure this repair avoids is the loader's ``Error finding id``, which
+    only shows up when a real segment is opened and queried.
+    """
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    client = chromadb.PersistentClient(path=str(palace))
+    collection = client.get_or_create_collection("mempalace_drawers")
+    count = 12000
+    for start in range(0, count, 4000):
+        batch = range(start, min(start + 4000, count))
+        collection.add(
+            ids=[f"drawer-{index}" for index in batch],
+            embeddings=[[float(index), 1.0, 0.5] for index in batch],
+        )
+    del collection, client
+
+    (meta,) = palace.glob("*/index_metadata.pickle")
+    persisted = _SafePersistentDataUnpickler.load(str(meta))
+    # #3010 shape: a second writer handed drawer-17's label to another id.
+    persisted["id_to_label"]["drawer-dup-17"] = persisted["id_to_label"]["drawer-17"]
+    with open(meta, "wb") as f:
+        pickle.dump(persisted, f)
+
+    assert quarantine_invalid_hnsw_metadata(str(palace)) == []
+
+    client = chromadb.PersistentClient(path=str(palace))
+    collection = client.get_collection("mempalace_drawers")
+    assert collection.count() == count
+    nearest = collection.query(query_embeddings=[[17.0, 1.0, 0.5]], n_results=3)["ids"][0]
+    assert nearest[0] == "drawer-17"
 
 
 def test_quarantine_invalid_hnsw_metadata_quarantines_large_label_mismatches(tmp_path):
