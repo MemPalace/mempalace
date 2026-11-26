@@ -547,6 +547,8 @@ class QueueStore:
         self,
         *,
         exclude: set[str] | None = None,
+        kinds: tuple[str, ...] | None = None,
+        exclude_kinds: tuple[str, ...] | None = None,
     ) -> Job | None:
         # Atomic across processes: the UPDATE only fires if the row is still
         # 'queued'. If two daemon processes SELECT the same row, the first to
@@ -582,18 +584,29 @@ class QueueStore:
         # A job is claimable once its debounce window (``run_after``) has
         # passed, and only while no job of the same dedupe key is running: the
         # pending rerun waits for the run it follows, so one source is never
-        # processed twice at once.
+        # processed twice at once. ``kinds`` restricts a lane (the diary lane
+        # claims only ``diary_write``); ``exclude_kinds`` keeps the main lane off
+        # them.
         exclude = exclude or set()
+        kind_sql = ""
+        kind_params: tuple = ()
+        if kinds:
+            kind_sql = f"AND kind IN ({', '.join('?' for _ in kinds)})"
+            kind_params = tuple(kinds)
+        if exclude_kinds:
+            kind_sql += f" AND kind NOT IN ({', '.join('?' for _ in exclude_kinds)})"
+            kind_params += tuple(exclude_kinds)
         with self._lock, self._connect() as conn:
             now = float(self.clock())
             # Only the ids: the rows being skipped are here to be discarded, and
             # jobs carry verbatim payloads, so selecting * would materialise a
             # cooling job's user content just to read its id past it.
             candidates = conn.execute(
-                """
+                f"""
                 SELECT id FROM jobs AS q
                 WHERE state = 'queued'
                   AND COALESCE(run_after, 0) <= ?
+                  {kind_sql}
                   AND (
                     dedupe_key IS NULL OR NOT EXISTS (
                       SELECT 1 FROM jobs AS r
@@ -603,19 +616,20 @@ class QueueStore:
                 ORDER BY priority DESC, created_at ASC
                 LIMIT ?
                 """,
-                (now, len(exclude) + 1),
+                (now, *kind_params, len(exclude) + 1),
             ).fetchall()
             job_id = next((r["id"] for r in candidates if r["id"] not in exclude), None)
             if job_id is None:
                 return None
             cur = conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET state = 'running', started_at = ?, attempts = attempts + 1,
                     error_json = NULL
                 WHERE id = ? AND state = 'queued' AND COALESCE(run_after, 0) <= ?
+                  {kind_sql}
                 """,
-                (_now(), job_id, now),
+                (_now(), job_id, now, *kind_params),
             )
             if cur.rowcount != 1:
                 # Lost the race to another process — nothing to run this iteration.

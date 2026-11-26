@@ -61,6 +61,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **The daemon can run a mine's compute in a background-priority child**
+  (`daemon.mine_child`, `MEMPALACE_DAEMON_MINE_CHILD=1`; off by default).
+  The child parses and embeds; every write still runs in the daemon, so the
+  palace keeps one writer. A heartbeat and reaper kill a child that goes
+  silent. Only Linux `SCHED_IDLE` lets the reaper tell a starved child from a
+  wedged one; elsewhere a silent background child gets 10 minutes, not 60 s.
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
   HTTP-capable clients connect to the running hub (`mempalace serve`)
   directly instead of starting a `mempalace-light-mcp` stdio process per

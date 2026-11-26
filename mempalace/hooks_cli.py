@@ -1357,9 +1357,10 @@ def _save_diary_direct(
     try:
         if routing.use_daemon:
             # Queued, not waited on -- the same contract as the direct path's
-            # detached child: the daemon files the drawer and then writes the
-            # ack and the save marker from ``hook_ack``. The caller still runs
-            # the transcript and project mines, since no child will.
+            # detached child: the daemon files the drawer (on its diary lane,
+            # so a running mine does not hold it up) and then writes the ack
+            # and the save marker from ``hook_ack``. The caller still runs the
+            # transcript and project mines, since no child will.
             try:
                 job = _submit_daemon_job(
                     "diary_write",

@@ -717,8 +717,9 @@ def test_wait_returns_a_lock_deferred_job_instead_of_waiting_out_the_holder(tmp_
 def test_wait_timeout_names_the_job_it_gave_up_on_and_its_state(tmp_path, monkeypatch):
     """A wait that runs out does not end the job: the daemon keeps it and runs it
     in turn. The timeout says which job it gave up on and where that job was, so
-    a hook can report a checkpoint queued behind a running mine as pending
-    instead of failed (#2757). It is still a DaemonError for every other caller."""
+    a caller can report a job queued behind a running mine as pending instead of
+    failed (#2757). It is still a DaemonError for every other caller. (A diary
+    checkpoint no longer queues behind a mine: it has its own lane.)"""
     release = threading.Event()
 
     def fake_execute(kind, payload):
@@ -731,7 +732,7 @@ def test_wait_timeout_names_the_job_it_gave_up_on_and_its_state(tmp_path, monkey
         deadline = time.monotonic() + 5
         while client.get_job(mine["id"])["state"] != "running" and time.monotonic() < deadline:
             time.sleep(0.05)
-        checkpoint = client.submit("diary_write", {"entry": "e"}, priority=10)
+        checkpoint = client.submit("sync", {"source": "other"}, priority=10)
 
         with pytest.raises(daemon.DaemonWaitTimeout) as queued:
             client.wait(checkpoint["id"], timeout=0.3)
