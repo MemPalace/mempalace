@@ -40,6 +40,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   remain intact. Resolving a transient read failure allows the next pass to
   recover without a source edit. Oversized files are retried until they fit
   the reader's size limit.
+- **Behavior change: `mempalace_kg_invalidate` returns `success: false` when
+  no active fact matches.** It used to answer `success: true` with an `ended`
+  date even when the subject, predicate and object matched nothing (a typo,
+  or a fact that was already ended) and the graph was unchanged. The failure
+  response carries `matched: 0` and an `error`, and has no `ended`; a
+  successful one adds `matched`, the number of active facts ended. MCP
+  clients that treated every invalidate as successful now see the failure.
+  `KnowledgeGraph.invalidate()` returns that count instead of `None`. The
+  write-ahead log still records the intent before the lookup, and now
+  follows it with an outcome entry, so an invalidate that matched nothing is
+  recorded as `success: false`.
+  ([#3011](https://github.com/MemPalace/mempalace/pull/3011))
+- **Behavior change: the Hermes provider's `mempalace_kg_invalidate` returns
+  `success: false` when no active fact matches**, with `matched: 0` and an
+  `error`, and adds `matched` to a successful response. It had the same
+  always-successful answer as the MCP tool above.
+
+### Added
+  the reader's size limit.
 
 ### Added
 
