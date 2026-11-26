@@ -55,7 +55,7 @@ from .fsio import (
     refuse_unparsed as _refuse_unparsed,
 )
 from .metadata_types import is_bookkeeping
-from .timeutil import utc_now_iso
+from .timeutil import recency_key, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +232,21 @@ def _reader(config=None) -> Optional[sqlite3.Connection]:
         conn.close()
         return None
     return conn
+
+
+def _has_hallway_input(config=None) -> bool:
+    """Whether JSON or an imported SQLite store holds this palace's input.
+
+    An empty database left by a failed import is not replacement input for
+    JSON that the strict reader quarantined.
+    """
+    if os.path.exists(_get_hallway_file(config)):
+        return True
+    conn = _reader(config)
+    if conn is None:
+        return False
+    conn.close()
+    return True
 
 
 def _import_json_once(conn: sqlite3.Connection, config=None) -> Optional[str]:
@@ -746,6 +761,18 @@ def _parse_entities(value) -> list[str]:
     return result
 
 
+def _hallway_label(entity_a: str, entity_b: str, count: int, rooms: list) -> str:
+    """Human-readable hallway label. Single source of truth so freshly-computed
+    and re-keyed/merged records format identically."""
+    room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
+    if len(rooms) > 3:
+        room_summary += f", +{len(rooms) - 3} more"
+    return (
+        f"{entity_a} \u2194 {entity_b} (co-occur in {count} drawers across "
+        f"{len(rooms) or 'no'} room{'s' if len(rooms) != 1 else ''}: {room_summary})"
+    )
+
+
 def _hallway_id(wing: str, entity_a: str, entity_b: str) -> str:
     """Deterministic id derived from wing + sorted entity pair.
 
@@ -1072,9 +1099,6 @@ def compute_hallways_for_wing(
                 continue
             entity_a, entity_b = key
             rooms = sorted(pair_rooms.get(key, set()))
-            room_summary = ", ".join(rooms[:3]) if rooms else "(no room tags)"
-            if len(rooms) > 3:
-                room_summary += f", +{len(rooms) - 3} more"
             record = {
                 "id": _hallway_id(wing, entity_a, entity_b),
                 "wing": wing,
@@ -1082,7 +1106,7 @@ def compute_hallways_for_wing(
                 "entity_b": entity_b,
                 "co_occurrence_count": count,
                 "rooms": rooms,
-                "label": f"{entity_a} ↔ {entity_b} (co-occur in {count} drawers across {len(rooms) or 'no'} room{'s' if len(rooms) != 1 else ''}: {room_summary})",
+                "label": _hallway_label(entity_a, entity_b, count, rooms),
                 "created_at": created_at,
                 "created_by": "auto",
             }
@@ -1323,3 +1347,73 @@ def drop_wing_hallways(wing: str, config=None) -> int:
     """Remove every hallway record of ``wing``. Returns how many were removed."""
     with _hallway_file_lock(config), _writing(config) as conn:
         return conn.execute("DELETE FROM hallways WHERE wing = ?", (wing,)).rowcount
+
+
+def _merge_hallways(dst: dict, src: dict) -> None:
+    """Fold ``src`` into ``dst`` in place when two hallways collapse onto the
+    same (wing, entity-pair). Counts/rooms combine; dynamics keep the stronger
+    and more-recent signal so the learned connection state is not reset."""
+    count = int(dst.get("co_occurrence_count", 0)) + int(src.get("co_occurrence_count", 0))
+    rooms = sorted(set(dst.get("rooms") or []) | set(src.get("rooms") or []))
+    dst["co_occurrence_count"] = count
+    dst["rooms"] = rooms
+    dst["label"] = _hallway_label(dst.get("entity_a"), dst.get("entity_b"), count, rooms)
+    dst["strength"] = max(float(dst.get("strength", 1.0)), float(src.get("strength", 1.0)))
+    dst["stability"] = max(float(dst.get("stability", 1.0)), float(src.get("stability", 1.0)))
+    if recency_key(src.get("last_activated")) > recency_key(dst.get("last_activated")):
+        dst["last_activated"] = src.get("last_activated")
+    dst["access_count"] = int(dst.get("access_count", 0)) + int(src.get("access_count", 0))
+
+
+def rekey_hallway_wings(rename_map: dict, config=None) -> int:
+    """Move hallway wings/IDs without recomputing their learned dynamics.
+
+    Colliding entity pairs sum counts/accesses, union rooms and keep the
+    stronger, more recent dynamics. Returns the number of source rows moved.
+    The one-time legacy JSON import and all row changes share one transaction;
+    unrelated rows (including unrelated duplicate pairs) are never rewritten.
+    """
+    renames = {old: new for old, new in rename_map.items() if old != new}
+    if not renames:
+        return 0
+    with _hallway_file_lock(config):
+        if not os.path.exists(_get_hallway_db(config)) and not os.path.exists(
+            _get_hallway_file(config)
+        ):
+            return 0
+        with _writing(config) as conn:
+            groups = defaultdict(list)
+            # Read only source and destination wings, using the wing index.
+            for wing in sorted(set(renames) | set(renames.values())):
+                for hid, raw in conn.execute(
+                    "SELECT id, record FROM hallways WHERE wing = ? ORDER BY rowid", (wing,)
+                ):
+                    record = json.loads(raw)
+                    moved = record.get("wing") in renames
+                    if moved:
+                        record["wing"] = renames[record["wing"]]
+                        record["id"] = _hallway_id(
+                            record["wing"], record["entity_a"], record["entity_b"]
+                        )
+                    pair = tuple(sorted((record.get("entity_a"), record.get("entity_b"))))
+                    groups[(record.get("wing"), pair)].append((hid, record, moved))
+            deleted, updated = [], []
+            changed = 0
+            for members in groups.values():
+                count = sum(moved for _, _, moved in members)
+                if not count:
+                    continue
+                changed += count
+                # Prefer the existing destination's descriptive fields.
+                members.sort(key=lambda member: member[2])
+                record = members[0][1]
+                record["id"] = _hallway_id(record["wing"], record["entity_a"], record["entity_b"])
+                for _, other, _ in members[1:]:
+                    _merge_hallways(record, other)
+                deleted.extend((hid,) for hid, _, _ in members)
+                updated.append(_row(record))
+            # Delete before inserting so a simultaneous map cannot overwrite
+            # a source row that still needs to move.
+            conn.executemany("DELETE FROM hallways WHERE id = ?", deleted)
+            conn.executemany(_UPSERT, updated)
+    return changed
