@@ -189,10 +189,19 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
         },
     )
 
-    matched = _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
+    # The intent entry above is written before the graph knows whether any
+    # active fact matches. The outcome entry below is what tells a WAL reader
+    # that an invalidate matched nothing (or raised) and changed no row.
+    try:
+        matched = _call_kg(
+            lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended)
+        )
+    except Exception as e:
+        _wal_result("kg_invalidate", {"success": False, "error": str(e)})
+        raise
     matched = int(matched or 0)
     if matched == 0:
-        return {
+        outcome = {
             "success": False,
             "error": (
                 f"no active fact matched {subject!r} -> {predicate!r} -> {object!r}; "
@@ -200,14 +209,16 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
             ),
             "matched": 0,
         }
-    return _with_kg_notice(
-        {
-            "success": True,
-            "fact": f"{subject} → {predicate} → {object}",
-            "ended": resolved_ended,
-            "matched": matched,
-        }
-    )
+        _wal_result("kg_invalidate", outcome)
+        return outcome
+    outcome = {
+        "success": True,
+        "fact": f"{subject} → {predicate} → {object}",
+        "ended": resolved_ended,
+        "matched": matched,
+    }
+    _wal_result("kg_invalidate", outcome)
+    return _with_kg_notice(outcome)
 
 
 def tool_kg_supersede(

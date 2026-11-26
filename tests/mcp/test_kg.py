@@ -184,6 +184,44 @@ class TestKGTools:
         assert again["success"] is False
         assert again["matched"] == 0
 
+    def test_kg_invalidate_wal_records_the_outcome(
+        self, monkeypatch, config, palace_path, seeded_kg, tmp_path
+    ):
+        # The intent entry is written before the graph knows whether anything
+        # matches, so the outcome entry is what tells a WAL reader that a
+        # mistyped invalidate changed nothing.
+        import json
+
+        from mempalace import wal
+
+        wal_file = tmp_path / "write_log.jsonl"
+        monkeypatch.setattr(wal, "_WAL_FILE", wal_file)
+        monkeypatch.setattr(wal, "_WAL_INITIALIZED_DIR", None)
+        _patch_mcp_server(monkeypatch, config, seeded_kg)
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        def entries():
+            lines = wal_file.read_text().splitlines()
+            return [e for e in map(json.loads, lines) if e["operation"] == "kg_invalidate"]
+
+        missing = tool_kg_invalidate(subject="Max", predicate="loves", object="Chess")
+        assert missing["success"] is False
+        intent, outcome = entries()
+        assert intent["result"] is None
+        assert intent["params"]["object"] == "Chess"
+        assert outcome["result"]["success"] is False
+        assert outcome["result"]["matched"] == 0
+        assert "params" not in outcome
+
+        ended = tool_kg_invalidate(
+            subject="Max", predicate="does", object="swimming", ended="2026-04-28"
+        )
+        assert ended["success"] is True
+        outcome = entries()[-1]
+        assert outcome["result"]["success"] is True
+        assert outcome["result"]["matched"] == 1
+        assert outcome["result"]["ended"] == "2026-04-28"
+
     def test_kg_timeline(self, monkeypatch, config, palace_path, seeded_kg):
         _patch_mcp_server(monkeypatch, config, seeded_kg)
         from mempalace.mcp_server import tool_kg_timeline
