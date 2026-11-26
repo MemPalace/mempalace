@@ -1551,16 +1551,30 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         resolved_ended = ended or date.today().isoformat()
         kg = KnowledgeGraph(db_path=self._kg_db_path())
         try:
-            kg.invalidate(subject, predicate, obj, ended=resolved_ended)
+            matched = kg.invalidate(subject, predicate, obj, ended=resolved_ended)
         finally:
             try:
                 kg.close()
             except Exception:
                 pass
+        # invalidate() returns how many active facts it ended. Zero means a
+        # typo or an already-ended fact: the graph is unchanged, so do not
+        # report an end date.
+        matched = int(matched or 0)
+        if matched == 0:
+            return {
+                "success": False,
+                "error": (
+                    f"no active fact matched {subject!r} -> {predicate!r} -> {obj!r}; "
+                    "nothing was invalidated"
+                ),
+                "matched": 0,
+            }
         return {
             "success": True,
             "fact": f"{subject} → {predicate} → {obj}",
             "ended": resolved_ended,
+            "matched": matched,
         }
 
     def _tool_kg_timeline(self, entity: Optional[str] = None) -> Dict[str, Any]:

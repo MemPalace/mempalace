@@ -1021,10 +1021,42 @@ def test_kg_tools_all_use_the_provider_palace_kg(initialized_provider, palace_pa
         )
     )
     assert inv["success"] is True
+    assert inv["matched"] == 1
 
     # And the file itself lives in the palace dir.
     assert (Path(palace_path) / "knowledge_graph.sqlite3").exists()
     assert not (Path(palace_path).parent / "knowledge_graph.sqlite3").exists()
+
+
+def test_kg_invalidate_fails_when_no_active_fact_matches(initialized_provider):
+    def invalidate(obj):
+        return json.loads(
+            initialized_provider.handle_tool_call(
+                "mempalace_kg_invalidate",
+                {"subject": "user", "predicate": "drinks", "object": obj},
+            )
+        )
+
+    add = json.loads(
+        initialized_provider.handle_tool_call(
+            "mempalace_kg_add",
+            {"subject": "user", "predicate": "drinks", "object": "tea"},
+        )
+    )
+    assert add["status"] == "ok"
+
+    # A fact that was never recorded (a typo) changes nothing.
+    missing = invalidate("coffee")
+    assert missing["success"] is False
+    assert missing["matched"] == 0
+    assert "no active fact matched" in missing["error"]
+    assert "ended" not in missing
+
+    # An already-ended fact has no active row left to end.
+    assert invalidate("tea")["success"] is True
+    again = invalidate("tea")
+    assert again["success"] is False
+    assert again["matched"] == 0
 
 
 def test_kg_invalidate_rejects_invalid_input(initialized_provider):

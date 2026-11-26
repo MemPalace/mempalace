@@ -52,6 +52,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   follows it with an outcome entry, so an invalidate that matched nothing is
   recorded as `success: false`.
   ([#3011](https://github.com/MemPalace/mempalace/pull/3011))
+- **Behavior change: the Hermes provider's `mempalace_kg_invalidate` returns
+  `success: false` when no active fact matches**, with `matched: 0` and an
+  `error`, and adds `matched` to a successful response. It had the same
+  always-successful answer as the MCP tool above.
 
 ### Added
   the reader's size limit.
