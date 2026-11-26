@@ -529,6 +529,11 @@ def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
         entry=payload.get("entry") or "",
         topic=payload.get("topic") or "general",
         wing=payload.get("wing") or "",
+        **(
+            {"idempotency_key": payload["idempotency_key"]}
+            if payload.get("idempotency_key")
+            else {}
+        ),
     )
     result.setdefault("exit_code", 0 if result.get("success") else 1)
     return result

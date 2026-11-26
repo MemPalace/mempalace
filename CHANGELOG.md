@@ -41,6 +41,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   recover without a source edit. Oversized files are retried until they fit
   the reader's size limit.
 
+### Behaviour changes
+
+- **Diary checkpoints the daemon files get a new id shape,
+  `diary_<wing>_checkpoint_<sha>`.** The id is derived from the entry and an
+  idempotency key, so a checkpoint job replayed after a crashed worker finds
+  the drawer it already filed instead of filing it twice. Direct writes keep
+  the old id shape.
+
 ### Added
 
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**

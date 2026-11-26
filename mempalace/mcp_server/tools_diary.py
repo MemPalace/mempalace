@@ -6,7 +6,14 @@ if __name__ != "mempalace.mcp_server":
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
+def tool_diary_write(
+    agent_name: str,
+    entry: str,
+    topic: str = "general",
+    wing: str = "",
+    *,
+    idempotency_key: str = "",
+):
     """
     Write a diary entry for this agent. Entries are timestamped and
     accumulate over time in a diary room.
@@ -44,17 +51,39 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
         f"{hashlib.sha256(entry.encode()).hexdigest()[:12]}"
     )
 
-    _wal_log(
-        "diary_write",
-        {
-            "agent_name": agent_name,
-            "topic": topic,
-            "entry_id": entry_id,
-            "entry_preview": entry[:200],
-        },
-    )
-
     try:
+        if idempotency_key:
+            digest = hashlib.sha256(
+                json.dumps([agent_name, wing, topic, entry, idempotency_key]).encode()
+            ).hexdigest()
+            entry_id = f"diary_{wing}_checkpoint_{digest}"
+            # A worker can die after filing and before finishing its queue
+            # row. A batched diary add commits all chunks together.
+            found = col.get(ids=[entry_id, f"{entry_id}_chunk_000000"], include=["metadatas"])
+            if found["ids"]:
+                replay = {
+                    "success": True,
+                    "entry_id": entry_id,
+                    "agent": agent_name,
+                    "topic": topic,
+                    "timestamp": ((found.get("metadatas") or [None])[0] or {}).get("filed_at"),
+                    "chunks": 1,
+                }
+                if entry_id not in found["ids"]:
+                    chunks = sorted(col.get(where={"parent_entry_id": entry_id}, include=[])["ids"])
+                    replay.update(chunk_ids=chunks, chunks=len(chunks))
+                return replay
+
+        _wal_log(
+            "diary_write",
+            {
+                "agent_name": agent_name,
+                "topic": topic,
+                "entry_id": entry_id,
+                "entry_preview": entry[:200],
+            },
+        )
+
         # TODO: Future versions should expand AAAK before embedding to improve
         # semantic search quality. For now, store raw AAAK in metadata so it's
         # preserved, and keep the document as-is for embedding (even though
