@@ -184,6 +184,16 @@ Creates a backup at `<palace_path>.backup` before rebuilding, replacing any back
 | `--from-sidecar` | Pre-corruption `chroma.sqlite3` to copy clean `max_seq_id` values from |
 | `--confirm-truncation-ok` | Override the truncation safety guard. Disables the abort that protects you when the collection layer returns fewer drawers than SQLite holds |
 
+On macOS, a known-unsafe HNSW segment is preserved and automatic native opening
+is refused. File-handle inspection cannot establish that no descriptor-free
+memory mappings remain. Healthy palaces open normally. For recovery, close all
+palace clients and rebuild into a separate destination so the original files
+remain available:
+
+```bash
+mempalace --palace /path/to/new-palace repair --mode from-sqlite --source /path/to/original-palace
+```
+
 ## `mempalace mcp`
 
 Helper command that outputs setup syntax (like `claude mcp add...`) to connect MemPalace to your AI client, automatically handling paths.
