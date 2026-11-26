@@ -368,6 +368,7 @@ def _migrate_locked(palace_path: str, dry_run: bool = False, confirm: bool = Fal
     from .repair import (
         RebuildCleanupError,
         RebuildPartialError,
+        _close_chroma_handles,
         move_aaak_after_rebuild,
         rebuild_from_sqlite,
     )
@@ -385,6 +386,10 @@ def _migrate_locked(palace_path: str, dry_run: bool = False, confirm: bool = Fal
         _carry_over_palace_files(palace_path, temp_palace)
 
         print("  Swapping old palace for migrated version...")
+        # Windows will not rename a directory with a file open inside it.
+        # Close this process's own Chroma clients on the palace (drawers,
+        # closets, sub-windows) so only another process can block the swap.
+        _close_chroma_handles(palace_path)
         stale_path = _unique_aside_path(palace_path)
         try:
             os.replace(palace_path, stale_path)

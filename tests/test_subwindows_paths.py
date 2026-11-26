@@ -550,6 +550,91 @@ def test_migrate_never_yields_a_wrong_window(windowed):
     assert_windows_consistent(palace)
 
 
+def _files_held_under(palace) -> list:
+    """Files under ``palace`` this process holds open or mapped (Linux /proc)."""
+    root = str(Path(palace).resolve()) + "/"
+    held = []
+    for fd in Path("/proc/self/fd").iterdir():
+        with contextlib.suppress(OSError):
+            target = str(fd.readlink())
+            if target.startswith(root):
+                held.append(target)
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        parts = line.split(None, 5)
+        if len(parts) == 6 and parts[5].startswith(root):
+            held.append(parts[5])
+    return sorted(set(held))
+
+
+@pytest.fixture
+def windows_handle_rules(monkeypatch):
+    """Keep only the handles Windows would have, so a rename check means something.
+
+    Windows refuses to rename a directory while a file under it is open; Linux
+    allows it. Linux also keeps two descriptors Windows never has (the reader
+    anchor for OFD locks and the retained magic probe); those are dropped.
+    """
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("needs /proc")
+    from mempalace.backends import _inproc_sqlite, _magic
+
+    _inproc_sqlite.release_all()
+    monkeypatch.setattr(_inproc_sqlite, "_F_OFD_SETLK", None)
+    monkeypatch.setattr(_inproc_sqlite, "_ANCHORED", False)
+    monkeypatch.setattr(_inproc_sqlite, "_HOLD_LOCKS", False)
+    return _magic.close_retained
+
+
+def _held_at_rename(monkeypatch, palace, close_posix_only) -> dict:
+    """Record what is still open under ``palace`` when it is renamed away."""
+    import os
+
+    real = {"rename": os.rename, "replace": os.replace}
+    seen: dict = {}
+
+    def check(name):
+        def move(src, dst, *args, **kwargs):
+            if os.fspath(src) == palace and "held" not in seen:
+                close_posix_only()
+                seen["held"] = _files_held_under(palace)
+            return real[name](src, dst, *args, **kwargs)
+
+        return move
+
+    monkeypatch.setattr(os, "rename", check("rename"))
+    monkeypatch.setattr(os, "replace", check("replace"))
+    return seen
+
+
+@pytest.mark.parametrize("backend", ["chroma"], indirect=True)  # a Chroma-only tool
+def test_migrate_closes_this_process_handles_before_moving_the_palace(
+    windowed, windows_handle_rules, monkeypatch
+):
+    """The palace is open in this process (drawers and windows collections).
+    Windows refuses the swap unless migrate closes those handles first."""
+    from unittest.mock import patch
+
+    from mempalace.migrate import migrate
+
+    palace, _ = windowed
+    seen = _held_at_rename(monkeypatch, palace, windows_handle_rules)
+    with patch("mempalace.migrate.collection_write_roundtrip_works", return_value=False):
+        assert migrate(palace, confirm=True) is True
+    assert seen["held"] == []
+
+
+@pytest.mark.parametrize("backend", ["chroma"], indirect=True)  # a Chroma-only tool
+def test_in_place_rebuild_closes_this_process_handles_before_archiving(
+    windowed, windows_handle_rules, monkeypatch
+):
+    from mempalace import repair
+
+    palace, _ = windowed
+    seen = _held_at_rename(monkeypatch, palace, windows_handle_rules)
+    assert repair.rebuild_from_sqlite(palace, palace, archive_existing_dest=True)
+    assert seen["held"] == []
+
+
 def test_encoding_repair_rewrites_leave_only_ignored_windows(windowed, tmp_path):
     from mempalace.encoding_repair import repair_collection
 

@@ -2780,7 +2780,10 @@ def _rebuild_from_sqlite_locked(
         # two interrupted in-place repairs; the palace survived only
         # because the locked chroma.sqlite3/*.bin themselves could not be
         # unlinked. Same lesson as the source-validation comment above:
-        # fail cleanly before touching anything.
+        # fail cleanly before touching anything. This process's own Chroma
+        # clients on the palace are closed first, so only another process
+        # can block the rename.
+        _close_chroma_handles(dest_palace)
         try:
             os.rename(dest_palace, archive_path)
         except OSError as exc:
