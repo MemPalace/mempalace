@@ -1017,6 +1017,10 @@ def compute_hallways_for_wing(
     # Returning here left every stale hallway of the wing in place after a
     # rebuild that correctly produced none.
 
+    return _store_wing_hallways(wing, file_keys, pair_counts, pair_rooms, min_count, config=config)
+
+
+def _store_wing_hallways(wing, file_keys, pair_counts, pair_rooms, min_count, *, config):
     # 3. Materialize hallway records for pairs above the threshold.
     #    Read this wing's stored rows first so we can PRESERVE L7 dynamics
     #    fields (strength, stability, last_activated, access_count) across

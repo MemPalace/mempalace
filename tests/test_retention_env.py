@@ -12,11 +12,14 @@ import importlib
 import pytest
 
 import mempalace.daemon as _daemon
+import mempalace.daemon_queue as _daemon_queue
 
 VAR = "MEMPALACE_DAEMON_RETENTION_DAYS"
 
 
 def _reload():
+    # The read lives in daemon_queue; daemon re-exports it.
+    importlib.reload(_daemon_queue)
     return importlib.reload(_daemon)
 
 
@@ -24,7 +27,7 @@ def _reload():
 def _clean(monkeypatch):
     monkeypatch.delenv(VAR, raising=False)
     yield
-    importlib.reload(_daemon)  # restore original module-level read
+    _reload()  # restore original module-level read
 
 
 @pytest.mark.parametrize(

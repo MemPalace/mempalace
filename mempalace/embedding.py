@@ -277,14 +277,35 @@ def _intra_op_session_options(intra_op_num_threads: int):
     ``OMP_NUM_THREADS`` — ORT owns its own intra-op pool, settable only via
     ``SessionOptions`` at session construction — so a cap has to be threaded
     through here rather than via the environment.
+
+    ``MEMPALACE_ORT_ALLOW_SPINNING=0`` (set by the daemon for its mine child)
+    also turns off thread spinning, and returns options even when uncapped.
     """
-    if not intra_op_num_threads or intra_op_num_threads <= 0:
+    capped = bool(intra_op_num_threads) and intra_op_num_threads > 0
+    if not capped and not _spinning_disabled():
         return None
     import onnxruntime as ort
 
     so = ort.SessionOptions()
-    so.intra_op_num_threads = intra_op_num_threads
+    if capped:
+        so.intra_op_num_threads = intra_op_num_threads
+    _apply_spinning_policy(so)
     return so
+
+
+def _spinning_disabled() -> bool:
+    return os.environ.get("MEMPALACE_ORT_ALLOW_SPINNING", "").strip() == "0"
+
+
+def _apply_spinning_policy(so) -> None:
+    """Turn off ORT thread spinning when ``MEMPALACE_ORT_ALLOW_SPINNING=0``.
+
+    A spinning worker thread busy-waits for the next op; in a background mine
+    that burns idle cores between batches for no throughput gain.
+    """
+    if _spinning_disabled():
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        so.add_session_config_entry("session.inter_op.allow_spinning", "0")
 
 
 def _resolve_intra_op_threads() -> int:
@@ -369,6 +390,7 @@ def _build_ef_class():
                 so.enable_cpu_mem_arena = False
                 if cap and cap > 0:
                     so.intra_op_num_threads = cap
+                _apply_spinning_policy(so)
                 return ort.InferenceSession(
                     os.path.join(self.DOWNLOAD_PATH, self.EXTRACTED_FOLDER_NAME, "model.onnx"),
                     providers=providers,
