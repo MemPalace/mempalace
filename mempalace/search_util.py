@@ -77,9 +77,9 @@ def known_wings(col) -> frozenset:
         return frozenset()
     inner = getattr(col, "_inner", col)
     palace_path = getattr(inner, "_palace_path", None)
-    from .backends.chroma import ChromaCollection
+    from .backends.chroma import ChromaCollection, ChromaRecentReader
 
-    if isinstance(inner, ChromaCollection):
+    if isinstance(inner, (ChromaCollection, ChromaRecentReader)):
         if isinstance(palace_path, str):
             return chroma_known_wings(palace_path)
         return frozenset()

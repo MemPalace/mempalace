@@ -18,11 +18,6 @@ from numbers import Integral
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
-import chromadb
-from chromadb.api.types import validate_where_document
-from chromadb.config import Settings as _ChromaSettings
-from chromadb.errors import NotFoundError as _ChromaNotFoundError
-
 from ..lexical import bm25_scores
 from ..stored_text import (
     document_filter_candidate,
@@ -60,8 +55,10 @@ from .chroma_sqlite import (
     _SEARCHABLE_COVERAGE_MAX_IDS,
     CandidateRows as CandidateRows,
     MetadataRecoveryPending as MetadataRecoveryPending,
+    RecentReadUnavailable as RecentReadUnavailable,
     _sqlite_embedding_count,
     _sqlite_embedding_ids,
+    _sqlite_has_collection,
     _sqlite_recent_records,
     _string_equalities,
     _wal_pending_ids,
@@ -73,6 +70,7 @@ from .chroma_sqlite import (
     sqlite_lexical_rows,
     sqlite_list_id_metadata as sqlite_list_id_metadata,
     sqlite_metadata_snapshot as sqlite_metadata_snapshot,
+    sqlite_records_for_ids,
     sqlite_room_wing_hall_counts as sqlite_room_wing_hall_counts,
     sqlite_wing_names as sqlite_wing_names,
     sqlite_wing_source_counts as sqlite_wing_source_counts,
@@ -111,7 +109,26 @@ _ignore_embeddinggemma2_reconstruct_warning()
 # and MemPalace promises the data never leaves the machine. Every client this
 # backend opens says no explicitly, so a future ChromaDB release cannot turn
 # collection back on underneath us. (GHSA-8h77)
-_CLIENT_SETTINGS = _ChromaSettings(anonymized_telemetry=False)
+def _client_settings():
+    from chromadb.config import Settings
+
+    return Settings(anonymized_telemetry=False)
+
+
+def __getattr__(name: str):
+    """``chromadb`` and ``_CLIENT_SETTINGS``, resolved on first use.
+
+    Importing chromadb takes about a second, and the readers that answer from
+    ``chroma.sqlite3`` (wake-up among them) never call it. Nothing here imports
+    it at module load; the code below imports it where it opens a client.
+    """
+    if name == "chromadb":
+        import chromadb
+
+        return chromadb
+    if name == "_CLIENT_SETTINGS":
+        return _client_settings()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # A healthy HNSW payload should keep link_lists.bin proportional to
@@ -408,6 +425,8 @@ def _caller_vector_schema(options: Optional[dict]):
     ):
         if opts.get(option) is not None:
             hnsw_options[option] = int(opts[option])
+
+    import chromadb
 
     return chromadb.Schema().create_index(
         config=chromadb.VectorIndexConfig(
@@ -2484,6 +2503,8 @@ class ChromaCollection(BaseCollection):
 
     def _get_document_filtered(self, where_document, **kwargs):
         """Refill one native response before logical pagination and projection."""
+        from chromadb.api.types import validate_where_document
+
         validate_where_document(where_document)
         candidate = document_filter_candidate(where_document)
         fields = ["ids", *kwargs["include"]]
@@ -2515,6 +2536,8 @@ class ChromaCollection(BaseCollection):
 
     def _query_document_filtered(self, where_document, **kwargs):
         """Refill native ranking until the original-text predicate fills top-k."""
+        from chromadb.api.types import validate_where_document
+
         validate_where_document(where_document)
         candidate = document_filter_candidate(where_document)
         fields = ["ids", *kwargs["include"]]
@@ -2783,41 +2806,24 @@ class ChromaCollection(BaseCollection):
         ``supports_recency_order``. A filter this path cannot evaluate keeps
         the base implementation's approximate window.
         """
-        equalities = _string_equalities(where)
         spec = _IncludeSpec.resolve(include, default_distances=False)
-        records = None
         sqlite_ordering = (
             limit > 0
             and self._palace_path is not None
-            and equalities is not None
+            and _string_equalities(where) is not None
             and not spec.embeddings
         )
         if sqlite_ordering:
-            validate_where(where)
-            records = _sqlite_recent_records(
-                self._palace_path,
-                self._collection.name,
-                limit=limit,
-                equalities=[
-                    (key, tuple(encode_filter(value) for value in values))
-                    for key, values in equalities
-                ],
-                order_field=order_field,
-                ids_only=not (spec.documents or spec.metadatas),
+            result = _sqlite_recent(
+                self._palace_path, self._collection.name, limit, where, order_field, spec
             )
-        if records is None:
-            if sqlite_ordering:
-                return self._recent_from_metadata(
-                    limit=limit, where=where, order_field=order_field, include=include, spec=spec
-                )
-            return super().get_recent(
-                limit=limit, where=where, order_field=order_field, include=include
+            if result is not None:
+                return result
+            return self._recent_from_metadata(
+                limit=limit, where=where, order_field=order_field, include=include, spec=spec
             )
-        return GetResult(
-            ids=[record_id for record_id, _, _ in records],
-            documents=[document for _, document, _ in records] if spec.documents else [],
-            metadatas=[metadata for _, _, metadata in records] if spec.metadatas else [],
-            embeddings=None,
+        return super().get_recent(
+            limit=limit, where=where, order_field=order_field, include=include
         )
 
     def lexical_search(
@@ -2983,6 +2989,99 @@ class ChromaCollection(BaseCollection):
 
     def set_embedder_identity(self, identity) -> None:
         write_embedder_sidecar(self._embedder_sidecar_path(), self._collection_name(), identity)
+
+
+def _sqlite_recent(
+    palace_path, collection_name, limit, where, order_field, spec, metadata_keys=None
+):
+    """``get_recent`` answered from ``chroma.sqlite3``, or ``None`` if it cannot be.
+
+    ``where`` must be string equalities (see :func:`_string_equalities`).
+    """
+    validate_where(where)
+    records = _sqlite_recent_records(
+        palace_path,
+        collection_name,
+        limit=limit,
+        equalities=[
+            (key, tuple(encode_filter(value) for value in values))
+            for key, values in _string_equalities(where)
+        ],
+        order_field=order_field,
+        ids_only=not (spec.documents or spec.metadatas),
+        metadata_keys=metadata_keys,
+    )
+    if records is None:
+        return None
+    return GetResult(
+        ids=[record_id for record_id, _, _ in records],
+        documents=[document for _, document, _ in records] if spec.documents else [],
+        metadatas=[metadata for _, _, metadata in records] if spec.metadatas else [],
+        embeddings=None,
+    )
+
+
+class ChromaRecentReader:
+    """The :class:`~mempalace.backends.base.RecentReader` of a Chroma palace.
+
+    :meth:`ChromaCollection.get_recent` already answers from the metadata
+    tables of ``chroma.sqlite3``, but a ``ChromaCollection`` exists only once
+    chromadb is imported and a ``PersistentClient`` is built: about a second
+    of start-up, and a write to ``chroma.sqlite3``, for a read that needs
+    neither. This is the same read without them, for a short-lived process
+    such as ``mempalace wake-up``.
+
+    It has no Chroma handle to fall back on: a read ``chroma.sqlite3`` cannot
+    answer raises :class:`RecentReadUnavailable`, and the caller opens the
+    collection instead.
+    """
+
+    def __init__(self, palace_path: str, collection_name: str):
+        self._palace_path = palace_path
+        self._name = collection_name
+
+    def get_recent(
+        self,
+        *,
+        limit: int,
+        where: Optional[dict] = None,
+        order_field: str = "filed_at",
+        include: Optional[list[str]] = None,
+        metadata_keys: Optional[Iterable[str]] = None,
+    ) -> GetResult:
+        """See :meth:`ChromaCollection.get_recent`; exact for the same filters."""
+        if limit <= 0:
+            return GetResult.empty()
+        spec = _IncludeSpec.resolve(include, default_distances=False)
+        if _string_equalities(where) is None or spec.embeddings:
+            raise RecentReadUnavailable("chroma.sqlite3 cannot answer this recent read")
+        if metadata_keys is not None:
+            if spec.documents:
+                raise ValueError("metadata_keys reads no documents; leave them out of include")
+            metadata_keys = tuple(metadata_keys)
+        result = _sqlite_recent(
+            self._palace_path, self._name, limit, where, order_field, spec, metadata_keys
+        )
+        if result is None:
+            raise RecentReadUnavailable("chroma.sqlite3 could not be read")
+        return result
+
+    def get(self, *, ids: list[str], include: Optional[list[str]] = None) -> GetResult:
+        """The drawers ``ids`` names, in storage order; unknown ids are left out."""
+        spec = _IncludeSpec.resolve(include, default_distances=False)
+        if spec.embeddings:
+            raise RecentReadUnavailable("chroma.sqlite3 holds no embeddings to read")
+        if not ids:
+            return GetResult.empty()
+        records = sqlite_records_for_ids(self._palace_path, self._name, ids)
+        if records is None:
+            raise RecentReadUnavailable("chroma.sqlite3 could not be read")
+        return GetResult(
+            ids=[record_id for record_id, _, _ in records],
+            documents=[document for _, document, _ in records] if spec.documents else [],
+            metadatas=[metadata for _, _, metadata in records] if spec.metadatas else [],
+            embeddings=None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3240,7 +3339,9 @@ class ChromaBackend(BaseBackend):
                 _close_client(self._clients.pop(palace_path, None))
 
             ChromaBackend._prepare_palace_for_open(palace_path)
-            cached = chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
+            import chromadb
+
+            cached = chromadb.PersistentClient(path=palace_path, settings=_client_settings())
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
             # chroma.sqlite3 lazily, so the stat captured before the call
@@ -3354,11 +3455,15 @@ class ChromaBackend(BaseBackend):
         """
         with palace_db_lock(os.path.join(palace_path, "chroma.sqlite3")):
             ChromaBackend._prepare_palace_for_open(palace_path)
-            return chromadb.PersistentClient(path=palace_path, settings=_CLIENT_SETTINGS)
+            import chromadb
+
+            return chromadb.PersistentClient(path=palace_path, settings=_client_settings())
 
     @staticmethod
     def backend_version() -> str:
         """Return the installed chromadb package version string."""
+        import chromadb
+
         return chromadb.__version__
 
     # ------------------------------------------------------------------
@@ -3379,6 +3484,8 @@ class ChromaBackend(BaseBackend):
         * Legacy: ``get_collection(palace_path, collection_name, create=False)``
           — still used by callers not yet migrated.
         """
+        from chromadb.errors import NotFoundError as _ChromaNotFoundError
+
         palace_ref, collection_name, create, options = _normalize_get_collection_args(args, kwargs)
         self.require_namespace_support(palace_ref)
         caller_vectors = bool(options and options.get("caller_vectors", False))
@@ -3464,6 +3571,23 @@ class ChromaBackend(BaseBackend):
         )
         wrapped._require_embeddings = caller_vectors
         return wrapped
+
+    def recent_reader(self, *, palace: PalaceRef, collection_name: str):
+        """A :class:`ChromaRecentReader`, or ``None`` if only an open can tell.
+
+        Raises as a read-only :meth:`get_collection` does for a palace or
+        collection that is not there. Opens no client and writes nothing.
+        """
+        self.require_namespace_support(palace)
+        palace_path = palace.local_path
+        if palace_path is None or not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
+            raise PalaceNotFoundError(palace_path)
+        present = _sqlite_has_collection(palace_path, collection_name)
+        if present is None:
+            return None
+        if not present:
+            raise CollectionNotInitializedError(palace_path)
+        return ChromaRecentReader(palace_path, collection_name)
 
     def close_palace(self, palace) -> None:
         """Drop cached handles for ``palace`` and release its SQLite file lock.

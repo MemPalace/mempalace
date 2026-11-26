@@ -121,6 +121,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Bug Fixes
 
+- `mempalace wake-up` reads a Chroma palace without importing chromadb or
+  building its client, and no longer skips its recent memories ("Palace could
+  not be read right now (TimeoutError)") on a large palace. The read was
+  already plain SQLite, but the collection open in front of it imported
+  chromadb, onnxruntime and numpy and built a `PersistentClient`: about a
+  second of start-up, and a write to `chroma.sqlite3`, several times the
+  500 ms a session-start hook allows. Backends can now offer a
+  `recent_reader` that serves `get_recent` without opening the collection;
+  Chroma's reads `chroma.sqlite3` directly, and wake-up falls back to the
+  collection when that reader cannot answer. `mempalace.backends.chroma`
+  imports chromadb on first use, so other backends no longer load it at all,
+  and the backends import numpy on first use, so a command that touches no
+  vector does not load it.
+  The read itself is narrower too:
+  - Layer 1 ranks its 2,000-drawer window on six metadata keys and then
+    fetches the 15 drawers it prints, where it used to load every document
+    and every metadata cell of the window.
+  - A wing matching at least half the dated drawers is read off the
+    `filed_at` index. It used to be read whole and ordered in Python, which
+    grew with the wing.
+  - A timestamp form (UTC or naive local) is read only when a stored value
+    carries it; the read took three ordered passes whatever the palace held.
+  - Listing the palace's wings to resolve a wing's spellings scanned every
+    metadata row on its first step, because the statement did not rule out
+    NULL and so missed Chroma's partial `(key, string_value)` index. Every
+    wing-scoped search and wake-up paid for that scan.
+
+  In an 80,000-drawer palace on a busy machine, `mempalace wake-up --wing`
+  for a 50,000-drawer wing went from 2.1–2.3 s, usually without its
+  memories, to about 0.55 s with them; the text it prints is unchanged.
 - **Repair rebuilds keep the re-mine journal and `.mempalace/` and create
   the rebuilt palace owner-only (`0700`).** `repair rebuild-index` and
   `repair --mode from-sqlite` used to leave the new palace at umask

@@ -20,8 +20,6 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
-
 from ..lexical import bm25_scores, tokenize
 from ..stored_text import (
     decode_record,
@@ -33,6 +31,7 @@ from ..stored_text import (
 from ..timeutil import recency_floor, recency_key, utc_now_iso as _utcnow
 from ._filters import matches_where, matches_where_document, validate_where
 from ._magic import has_sqlite_magic, read_header_fields
+from ._numpy import np
 from .base import (
     BackendClosedError,
     BackendError,
