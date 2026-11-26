@@ -110,6 +110,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   on the first writable open of an existing palace (6.4 s on that palace); a
   read-only open leaves the schema alone.
   ([#2998](https://github.com/MemPalace/mempalace/pull/2998))
+- **Every `mempalace` command starts faster.** `mempalace.cli`, `mempalace.palace`,
+  `mempalace.searcher` and `mempalace.mcp_server` execute their source files
+  into one namespace, and compiled those files from source on every start:
+  no bytecode cache applied to them. They now load through the import
+  system's cache, like any module. The HTTP opener that refuses redirects is
+  built on first use instead of at import. `mempalace --version` went from
+  about 340 ms to 180 ms on a busy machine, which every hook run pays.
+  ([#3038](https://github.com/MemPalace/mempalace/pull/3038))
 
 ### Bug Fixes
 
