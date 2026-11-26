@@ -9,7 +9,9 @@ extraction mode and the destination wing. Its record says how many drawers
 the last complete filing produced (``chunk_total``), which snapshot of the
 file it read (``source_fingerprint`` / ``source_mtime``), which normalizer and
 chunker revisions produced it, and whether that filing finished
-(``pending`` / ``complete``).
+(``pending`` / ``complete``). A convo transcript's record can also hold a
+verified append cursor (``cursor``, see :mod:`mempalace.convo_cursor`), so the
+next mine reads only from its resume point.
 
 Before this record, that bookkeeping lived on every drawer row, so a re-mine
 that changed one drawer still rewrote all of them to restamp it. With the
@@ -19,7 +21,9 @@ Crash safety (no source may read as mined while drawers are missing): a writer m
 ``pending`` before its first drawer write and ``complete`` in one transaction
 only after its drawers are durable and the stale ones are pruned. A crash in
 between leaves it pending, which reads as "not mined", so the next mine redoes
-the file.
+the file. The cursor is set only by the complete mark, in the same
+transaction; the pending mark keeps the old one, which a pending record never
+lets a mine use.
 
 A record never proves a source mined on its own. The readers in
 ``mempalace.palace`` also count the stream's drawers and require at least
@@ -63,6 +67,7 @@ CREATE TABLE IF NOT EXISTS source_head (
     normalize_version INTEGER,
     chunker_version INTEGER,
     updated_at TEXT NOT NULL,
+    cursor TEXT,
     PRIMARY KEY (source_file, owner, extract_mode, wing)
 );
 """
@@ -79,12 +84,27 @@ _COLUMNS = (
     "normalize_version",
     "chunker_version",
     "updated_at",
+    "cursor",
 )
+# Columns a database written before the cursor existed still lacks.
+_ADDED_COLUMNS = (("cursor", "TEXT"),)
 
 # The producer each conversation-style extract mode belongs to, so a reader
 # that scopes by extract mode alone (the convo miner passes no owner to its
 # mined-set checks) names the same stream its writer does.
 _MODE_OWNERS = {"exchange": "convo", "general": "convo", "format": "format"}
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    have = {row[1] for row in conn.execute("PRAGMA table_info(source_head)")}
+    for name, kind in _ADDED_COLUMNS:
+        if name not in have:
+            try:
+                conn.execute(f"ALTER TABLE source_head ADD COLUMN {name} {kind}")
+            except sqlite3.OperationalError as exc:
+                # Another writer added it first.
+                if "duplicate column" not in str(exc):
+                    raise
 
 
 @dataclass(frozen=True)
@@ -126,6 +146,7 @@ class SourceHead:
     normalize_version: Optional[int]
     chunker_version: Optional[int]
     updated_at: str
+    cursor: Optional[str] = None
 
     @property
     def complete(self) -> bool:
@@ -167,6 +188,7 @@ class SourceStateStore:
             conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(_DDL)
+            _add_missing_columns(conn)
         else:
             uri = Path(os.path.abspath(self.path)).as_uri() + "?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None)
@@ -178,7 +200,14 @@ class SourceStateStore:
         if conn is None:
             return []
         try:
-            return conn.execute(sql, params).fetchall()
+            try:
+                return conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError as exc:
+                # A database no writer of this version has opened yet.
+                if "no such column" not in str(exc):
+                    raise
+                old = ", ".join(c for c in _COLUMNS if c not in dict(_ADDED_COLUMNS))
+                return conn.execute(sql.replace(", ".join(_COLUMNS), old), params).fetchall()
         except sqlite3.OperationalError as exc:
             # A writer creates the file before its table.
             if "no such table" in str(exc):
@@ -251,20 +280,29 @@ class SourceStateStore:
             fields.get("normalize_version"),
             fields.get("chunker_version"),
             utc_now_iso(),
+            fields.get("cursor"),
         )
 
     _UPSERT = f"INSERT OR REPLACE INTO source_head ({', '.join(_COLUMNS)}) VALUES ({', '.join('?' * len(_COLUMNS))})"
+    # The pending mark keeps whatever cursor the record has.
+    _UPSERT_KEEP_CURSOR = (
+        f"INSERT INTO source_head ({', '.join(_COLUMNS)}) VALUES ({', '.join('?' * len(_COLUMNS))}) "
+        "ON CONFLICT (source_file, owner, extract_mode, wing) DO UPDATE SET "
+        + ", ".join(f"{c} = excluded.{c}" for c in _COLUMNS[4:] if c != "cursor")
+    )
     _INSERT_IF_ABSENT = f"INSERT OR IGNORE INTO source_head ({', '.join(_COLUMNS)}) VALUES ({', '.join('?' * len(_COLUMNS))})"
 
     def mark_pending(self, stream: SourceStream, **fields) -> None:
         """Record that a filing of ``stream`` has started and is not durable yet."""
-        self._write(self._UPSERT, [self._row(stream, PENDING, fields)])
+        fields.pop("cursor", None)
+        self._write(self._UPSERT_KEEP_CURSOR, [self._row(stream, PENDING, fields)])
 
     def mark_complete(self, stream: SourceStream, **fields) -> None:
         """Record a finished filing, in one transaction.
 
         Call only after the stream's drawers are written and its stale ones
-        pruned.
+        pruned. ``cursor`` (JSON text) replaces the record's cursor; without
+        one the record has none.
         """
         self._write(self._UPSERT, [self._row(stream, COMPLETE, fields)])
 

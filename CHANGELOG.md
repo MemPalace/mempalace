@@ -75,6 +75,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Performance
 
+- **A re-mine of a grown Claude Code transcript reads only from its last
+  user turn (#3057).** The convo miner used to read, parse and chunk the
+  whole file on every pass, then parse it a second time for `authored_at`.
+  On a 108 MB session that took seconds per pass and grew with the session.
+  The source's record now holds a verified append cursor: the offset of the
+  last complete line, an anchor hash of the bytes ending there, a chained
+  digest, and the parse state at the start of the last user turn that can
+  resume (room, next chunk index, pending tool names). The next mine checks
+  the anchor even when the inode is unchanged, then reads from that turn
+  only and refiles only the drawers from there on. If anything does not
+  match (a tail rewritten in place, a truncated or replaced file, a
+  normalizer or chunker bump, different shared metadata), the mine reads the
+  whole file, and unchanged drawers still cost no write. Lines are parsed
+  once, with orjson and a stdlib `json` fallback per line; NUL and malformed
+  lines are skipped. The cursor is stored only by the record's complete
+  mark, so a crash leaves the old cursor on a pending record and the next
+  mine redoes the file. Files that are not plain UTF-8, and mines with
+  `convo_spellcheck` on, keep the full pass.
+
 - **A re-mine writes only the drawers that changed (#3055).** New drawers are
   added. Drawers whose text changed are journaled and rewritten. Drawers whose
   metadata changed get a metadata-only update. Unchanged drawers are not

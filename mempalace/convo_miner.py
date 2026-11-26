@@ -8,6 +8,7 @@ Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
 Same palace as project mining. Different ingest strategy.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -272,12 +273,15 @@ def chunk_exchanges(
     content: str,
     chunk_size: int = None,
     min_chunk_size: int = None,
+    units: Optional[dict] = None,
 ) -> list:
     """
     Chunk by exchange pair: one > turn + AI response = one unit.
     Falls back to paragraph chunking if no > markers.
 
-    Optional params override module-level defaults when provided.
+    Optional params override module-level defaults when provided. ``units``
+    is filled as in :func:`_chunk_by_exchange` (left empty by the paragraph
+    fallback).
 
     Raises ``ValueError`` if ``chunk_size`` is not a positive integer or
     ``min_chunk_size`` is negative. A non-positive ``chunk_size`` would
@@ -299,17 +303,24 @@ def chunk_exchanges(
     quote_lines = sum(1 for line in lines if line.strip().startswith(">"))
 
     if quote_lines >= 3:
-        return _chunk_by_exchange(lines, chunk_size, min_chunk_size)
+        return _chunk_by_exchange(lines, chunk_size, min_chunk_size, units)
     return _chunk_by_paragraph(content, chunk_size, min_chunk_size)
 
 
-def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> list:
+def _chunk_by_exchange(
+    lines: list, chunk_size: int, min_chunk_size: int, units: Optional[dict] = None
+) -> list:
     """One user turn (>) + the AI response that follows = one or more chunks.
 
     Every non-blank line lands in a chunk. A response runs until the next
     user turn — a ``---`` rule inside it is part of the response — and any
     text before the first user turn is filed as its own unit. When a unit
     exceeds chunk_size it is split across consecutive drawers.
+
+    ``units``, when given, receives ``line index -> (chunks before, small)``
+    for each user turn. A unit that is not small never joins the drawer
+    before it, so chunking from its line on depends only on the lines from
+    there and the count of chunks before it.
     """
     chunks = []
     i = 0
@@ -327,6 +338,7 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
     gap = "\n" * (len(raw_preamble) - len(raw_preamble.rstrip("\n")) + 1)
 
     while i < len(lines):
+        unit_start = i
         user_turn = lines[i].strip()
         i += 1
 
@@ -344,6 +356,8 @@ def _chunk_by_exchange(lines: list, chunk_size: int, min_chunk_size: int) -> lis
         ai_response = raw_response.rstrip("\n")
         content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
+        if units is not None:
+            units[unit_start] = (len(chunks), len(content.strip()) <= min_chunk_size)
         _emit_bounded(chunks, content, chunk_size, min_chunk_size, joiner=gap)
         gap = "\n" * (len(raw_response) - len(ai_response) + 1)
 
@@ -633,6 +647,74 @@ def _extract_authored_at(filepath):
     return latest
 
 
+def _build_drawers(
+    chunks,
+    source_file,
+    wing,
+    room,
+    agent,
+    extract_mode,
+    *,
+    authored_at=None,
+    source_dir_ino=None,
+    source_mtime: Optional[float] = None,
+    source_metadata: Optional[dict] = None,
+    transforms: str = "",
+    source_encoding: str = "utf-8",
+):
+    """``(drawers, room_counts_delta)`` for one transcript's chunks.
+
+    ``drawers`` are ``(drawer_id, text, metadata)`` as ``write_file_drawers``
+    takes them.
+    """
+    room_counts_delta: dict = defaultdict(int)
+    # One filed_at per source file so all transcript drawers share an
+    # ingest timestamp. Prefer the mtime captured with the read: a fresh
+    # stat here can observe an append that this pass did not ingest.
+    filed_at = utc_now_iso()
+    drawers = []
+    for chunk in chunks:
+        chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+        if extract_mode == "general":
+            room_counts_delta[chunk_room] += 1
+        meta = {
+            "wing": wing,
+            "room": chunk_room,
+            "hall": _detect_hall_cached(chunk["content"]),
+            "source_file": source_file,
+            "chunk_index": chunk["chunk_index"],
+            "added_by": agent,
+            "filed_at": filed_at,
+            "entities": entities_metadata(chunk["content"]),
+            "authored_at": authored_at if authored_at is not None else filed_at,
+            "ingest_mode": "convos",
+            "extract_mode": extract_mode,
+            "normalize_version": NORMALIZE_VERSION,
+            "id_recipe": ID_RECIPE,
+        }
+        if extract_mode in CHUNKER_VERSIONS:
+            key, version = CHUNKER_VERSIONS[extract_mode]
+            meta[key] = version
+        if source_mtime is not None:
+            meta["source_mtime"] = source_mtime
+        meta.update(source_metadata or {})
+        if transforms:
+            # Every drawer of a file whose parse changed its text: the
+            # RFC 002 transformations it applied.
+            meta["transforms"] = transforms
+        meta.update(encoding_metadata(source_encoding))
+        if source_dir_ino:
+            # Which directory this transcript was read from, so ``sync``
+            # can tell a neighbour in the same directory from one on a
+            # volume mounted there since.
+            meta["source_dir_ino"] = source_dir_ino
+        drawer_id = make_convo_drawer_id(
+            wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+        )
+        drawers.append((drawer_id, chunk["content"], meta))
+    return drawers, room_counts_delta
+
+
 def _file_chunks_locked(
     collection,
     source_file,
@@ -670,7 +752,6 @@ def _file_chunks_locked(
     or its ``PriorTextArchiveFailed`` subclass when the prior text could not be
     journaled; the mine counts either as an error.
     """
-    room_counts_delta: dict = defaultdict(int)
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
         # at the current schema/fingerprint.
@@ -683,52 +764,22 @@ def _file_chunks_locked(
             wing=wing,
             source_state=source_state,
         ):
-            return 0, room_counts_delta, True
+            return 0, defaultdict(int), True
 
-        # One filed_at per source file so all transcript drawers share an
-        # ingest timestamp. Prefer the mtime captured with the read: a fresh
-        # stat here can observe an append that this pass did not ingest.
-        filed_at = utc_now_iso()
-        drawers = []
-        for chunk in chunks:
-            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-            if extract_mode == "general":
-                room_counts_delta[chunk_room] += 1
-            meta = {
-                "wing": wing,
-                "room": chunk_room,
-                "hall": _detect_hall_cached(chunk["content"]),
-                "source_file": source_file,
-                "chunk_index": chunk["chunk_index"],
-                "added_by": agent,
-                "filed_at": filed_at,
-                "entities": entities_metadata(chunk["content"]),
-                "authored_at": authored_at if authored_at is not None else filed_at,
-                "ingest_mode": "convos",
-                "extract_mode": extract_mode,
-                "normalize_version": NORMALIZE_VERSION,
-                "id_recipe": ID_RECIPE,
-            }
-            if extract_mode in CHUNKER_VERSIONS:
-                key, version = CHUNKER_VERSIONS[extract_mode]
-                meta[key] = version
-            if source_mtime is not None:
-                meta["source_mtime"] = source_mtime
-            meta.update(source_metadata or {})
-            if transforms:
-                # Every drawer of a file whose parse changed its text: the
-                # RFC 002 transformations it applied.
-                meta["transforms"] = transforms
-            meta.update(encoding_metadata(source_encoding))
-            if source_dir_ino:
-                # Which directory this transcript was read from, so ``sync``
-                # can tell a neighbour in the same directory from one on a
-                # volume mounted there since.
-                meta["source_dir_ino"] = source_dir_ino
-            drawer_id = make_convo_drawer_id(
-                wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-            )
-            drawers.append((drawer_id, chunk["content"], meta))
+        drawers, room_counts_delta = _build_drawers(
+            chunks,
+            source_file,
+            wing,
+            room,
+            agent,
+            extract_mode,
+            authored_at=authored_at,
+            source_dir_ino=source_dir_ino,
+            source_mtime=source_mtime,
+            source_metadata=source_metadata,
+            transforms=transforms,
+            source_encoding=source_encoding,
+        )
         drawers_added = write_file_drawers(
             collection,
             source_file,
@@ -741,6 +792,309 @@ def _file_chunks_locked(
             source_state=source_state,
         )
     return drawers_added, room_counts_delta, False
+
+
+class _FullPass(Exception):
+    """A resumed scan cannot prove its drawers match a full pass; read it all."""
+
+
+# detect_convo_room reads this many leading characters: a resume point past
+# them leaves the room fixed.
+_ROOM_CHARS = 3000
+# Drawer metadata that differs per chunk; every other non-stamp key is the
+# same on every drawer of a filing and goes into the cursor's ``meta_sig``.
+_PER_CHUNK_KEYS = frozenset({"hall", "entities", "chunk_index"})
+
+
+def _cursor_recipe(extract_mode: str, chunk_size: int, min_chunk_size: int) -> str:
+    """What a stored cursor must have been computed with to be resumed."""
+    chunker = CHUNKER_VERSIONS.get(extract_mode, ("", ""))[1]
+    return f"convo:{extract_mode}:n{NORMALIZE_VERSION}:c{chunker}:{chunk_size}:{min_chunk_size}"
+
+
+def _meta_sig(meta: dict) -> str:
+    """Digest of the metadata every drawer of one filing shares, stamps aside.
+
+    A resumed pass writes only the last drawers, so it is valid only when a
+    full pass would leave this the same on the drawers before them.
+    """
+    from .palace import _SOURCE_STAMP_KEYS
+
+    shared = {
+        k: v for k, v in meta.items() if k not in _PER_CHUNK_KEYS and k not in _SOURCE_STAMP_KEYS
+    }
+    blob = json.dumps(shared, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _stored_cursor(head, recipe: str):
+    """The cursor a complete record holds for ``recipe``, or None."""
+    from .transcript_cursor import Cursor
+
+    if head is None or not head.complete or not head.cursor:
+        return None
+    try:
+        cursor = Cursor.from_json(json.loads(head.cursor))
+    except ValueError:
+        return None
+    if cursor is None or cursor.recipe != recipe or cursor.state.get("mode") != "exchange":
+        return None
+    if cursor.state.get("room") is None or type(cursor.state.get("next_chunk_index")) is not int:
+        return None
+    if type(head.chunk_total) is not int or head.chunk_total < cursor.state["next_chunk_index"]:
+        return None
+    return cursor
+
+
+def _next_cursor(scan, recipe, *, user_lines, units, base, room, sig, chunk_size, min_chunk_size):
+    """The cursor to store after ``scan``, as JSON text, or None.
+
+    The resume point is the last user message whose unit is not small (so it
+    never joins the drawer before it) and starts past the room's characters.
+    It is judged on the complete lines alone: a half-written last line can
+    only extend the transcript, never shorten a unit. A resumed scan with no
+    new point keeps its old one.
+    """
+    from .convo_cursor import chain
+    from .normalize import _messages_to_transcript
+    from .transcript_cursor import Cursor
+
+    if not scan.committed:
+        return None
+    if not scan.tail_blank:
+        user_lines, units = {}, {}
+        content = _messages_to_transcript(scan.complete_messages, user_lines)
+        lines = content.split("\n")
+        if scan.resumed or sum(1 for line in lines if line.strip().startswith(">")) >= 3:
+            _chunk_by_exchange(lines, chunk_size, min_chunk_size, units)
+    chosen = None
+    for mark in reversed(scan.marks):
+        if mark.message not in user_lines:
+            continue
+        line_no, char_no = user_lines[mark.message]
+        unit = units.get(line_no)
+        if unit is None or unit[1] or (not scan.resumed and char_no < _ROOM_CHARS):
+            continue
+        if not all(isinstance(key, str) for key in mark.tool_names):
+            continue
+        chosen = (mark, base + unit[0])
+        break
+    data, start = scan.data, scan.start
+    if chosen is not None:
+        mark, next_index = chosen
+        before = scan.state["chain_at_resume"] if scan.resumed else ""
+        at_resume = chain(before, data[: mark.offset - start])
+        state = {
+            "resume_offset": mark.offset,
+            "chain_at_resume": at_resume,
+            "next_chunk_index": next_index,
+            "transforms": sorted(mark.transforms),
+            "tool_names": mark.tool_names,
+            "latest_timestamp": mark.latest_timestamp,
+            "quote_lines": mark.quote_lines,
+        }
+    elif scan.resumed:
+        state = {k: scan.state[k] for k in _CARRIED}
+    else:
+        return None
+    resume = state["resume_offset"]
+    state.update(
+        mode="exchange",
+        room=room,
+        meta_sig=sig,
+        chain_at_offset=chain(
+            state["chain_at_resume"], data[resume - start : scan.committed - start]
+        ),
+    )
+    st = scan.stat
+    cursor = Cursor(
+        recipe=recipe,
+        offset=scan.committed,
+        anchor_sha256=scan.anchor[0],
+        anchor_len=scan.anchor[1],
+        dev=st.st_dev,
+        ino=st.st_ino,
+        size=st.st_size,
+        state=state,
+    )
+    # ASCII-escaped, so a lone surrogate in a tool name still stores.
+    return json.dumps(cursor.to_json(), separators=(",", ":"))
+
+
+_CARRIED = (
+    "resume_offset",
+    "chain_at_resume",
+    "next_chunk_index",
+    "transforms",
+    "tool_names",
+    "latest_timestamp",
+    "quote_lines",
+)
+
+
+def _cursor_pass(filepath, source_file, cursor, *, wing, agent, chunk_size, min_chunk_size):
+    """Read a Claude Code transcript from ``cursor`` (or whole) into drawers.
+
+    Returns ``(drawers, room, chunk_total, next_cursor, resumed)``, None when the full
+    normalizer must take the file, and raises :class:`_FullPass` when a
+    resumed scan cannot be proven equal to a full one.
+    """
+    from . import convo_cursor
+    from .normalize import _messages_to_transcript
+
+    extract_mode = "exchange"
+    recipe = _cursor_recipe(extract_mode, chunk_size, min_chunk_size)
+    source_metadata: dict = {}
+    with recording_transforms(spellcheck=False) as run:
+        scan = convo_cursor.scan_transcript(
+            filepath, cursor, run=run, source_metadata=source_metadata
+        )
+        if scan is None:
+            return None
+        if scan.quote_lines >= 3 or scan.tool_missed:
+            # Raw ">" lines make the normalizer pass the file through; a
+            # tool result naming a tool from before the resume point needs
+            # the whole map.
+            if scan.resumed:
+                raise _FullPass
+            return None
+        user_lines: dict = {}
+        content = _messages_to_transcript(scan.messages, user_lines)
+        units: dict = {}
+        if scan.resumed:
+            state = scan.state
+            chunks = _chunk_by_exchange(content.split("\n"), chunk_size, min_chunk_size, units)
+            first = units.get(0)
+            if first is None or first[1]:
+                raise _FullPass
+            base = state["next_chunk_index"]
+            for chunk in chunks:
+                chunk["chunk_index"] += base
+            room = state["room"]
+        else:
+            if len(scan.messages) < 2 or not content.strip():
+                return None
+            chunks = chunk_exchanges(
+                content, chunk_size=chunk_size, min_chunk_size=min_chunk_size, units=units
+            )
+            if not chunks:
+                return None
+            base = 0
+            room = detect_convo_room(content)
+        transforms = run.transforms
+    drawers, _ = _build_drawers(
+        chunks,
+        source_file,
+        wing,
+        room,
+        agent,
+        extract_mode,
+        authored_at=scan.latest_timestamp,
+        source_dir_ino=source_directory_identity(filepath),
+        source_mtime=source_metadata.get("source_mtime"),
+        source_metadata=source_metadata,
+        transforms=transforms,
+    )
+    sig = _meta_sig(drawers[0][2]) if drawers else ""
+    if scan.resumed and sig != scan.state.get("meta_sig"):
+        raise _FullPass
+    next_cursor = None
+    if units:
+        next_cursor = _next_cursor(
+            scan,
+            recipe,
+            user_lines=user_lines,
+            units=units,
+            base=base,
+            room=room,
+            sig=sig,
+            chunk_size=chunk_size,
+            min_chunk_size=min_chunk_size,
+        )
+    return drawers, room, base + len(chunks), next_cursor, scan.resumed
+
+
+def _mine_with_cursor(
+    filepath,
+    source_file,
+    collection,
+    *,
+    wing,
+    agent,
+    chunk_size,
+    min_chunk_size,
+    mined,
+    aaak_col,
+    palace_path,
+    source_state,
+):
+    """File a Claude Code transcript through its append cursor.
+
+    Returns ``(drawers_added, room, skipped)``, or None when the file is not
+    a plain UTF-8 Claude Code transcript and the full normalizer must file it.
+    A resumed pass refiles only the drawers from the cursor's
+    ``next_chunk_index`` on; anything it cannot prove equal to a full pass
+    reads the whole file, where unchanged drawers cost no write. The new
+    cursor is stored by the record's complete mark, after the drawers are
+    written and the stale ones pruned.
+    """
+    from .palace.source_state import source_stream
+
+    extract_mode = "exchange"
+    with mine_lock(source_file):
+        if file_already_mined(
+            collection,
+            source_file,
+            check_mtime=True,
+            extract_mode=extract_mode,
+            check_source_fingerprint=True,
+            wing=wing,
+            source_state=source_state,
+        ):
+            return 0, None, True
+        cursor = head = None
+        if source_file in mined:
+            stream = source_stream(source_file, extract_mode=extract_mode, wing=wing)
+            head = source_state.get(stream)
+            recipe = _cursor_recipe(extract_mode, chunk_size, min_chunk_size)
+            cursor = _stored_cursor(head, recipe)
+        options = dict(wing=wing, agent=agent, chunk_size=chunk_size, min_chunk_size=min_chunk_size)
+        try:
+            try:
+                planned = _cursor_pass(filepath, source_file, cursor, **options)
+            except _FullPass:
+                planned = _cursor_pass(filepath, source_file, None, **options)
+        except OSError:
+            # Unreadable, or changed while read: the full normalizer skips it
+            # the same way and leaves it eligible for the next mine.
+            return None
+        if planned is None:
+            return None
+        drawers, room, total, next_cursor, resumed = planned
+        tail = {}
+        if resumed:
+            # Only the drawers from next_chunk_index on were built.
+            tail = dict(
+                chunk_total=total,
+                stale_ids=[
+                    make_convo_drawer_id(wing, room, source_file, extract_mode, index)
+                    for index in range(total, max(total, head.chunk_total))
+                ],
+            )
+        drawers_added = write_file_drawers(
+            collection,
+            source_file,
+            drawers,
+            extract_mode=extract_mode,
+            aaak_col=aaak_col,
+            owner="convo",
+            palace_path=palace_path,
+            prune_wing=wing,
+            source_state=source_state,
+            cursor=next_cursor,
+            **tail,
+        )
+    return drawers_added, room, False
 
 
 def _is_ai_tool_path(path: Path) -> bool:
@@ -1098,6 +1452,42 @@ def _mine_convos_impl(
 
             if not _is_regular_source_file(filepath, Path(convo_dir).expanduser().resolve()):
                 files_skipped += 1
+                continue
+
+            # A Claude Code transcript resumes from its append cursor. The
+            # spellcheck rewrites user turns, so it keeps the full pass.
+            filed = None
+            if (
+                not dry_run
+                and extract_mode == "exchange"
+                and filepath.suffix == ".jsonl"
+                and not spellcheck
+            ):
+                filed = _mine_with_cursor(
+                    filepath,
+                    source_file,
+                    collection,
+                    wing=wing,
+                    agent=agent,
+                    chunk_size=cfg_chunk_size,
+                    min_chunk_size=cfg_min_chunk_size,
+                    mined=mined_fingerprints,
+                    aaak_col=aaak_col,
+                    palace_path=palace_path,
+                    source_state=source_state,
+                )
+            if filed is not None:
+                drawers_added, room, skipped = filed
+                if skipped:
+                    files_skipped += 1
+                    continue
+                room_counts[room] += 1
+                total_drawers += drawers_added
+                palace_changes += drawers_added + getattr(drawers_added, "pruned", 0)
+                files_mined += 1
+                print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
+                if limit > 0 and files_mined >= limit:
+                    break
                 continue
 
             source_metadata: dict = {}

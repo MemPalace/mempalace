@@ -290,6 +290,9 @@ def write_file_drawers(
     palace_path: Optional[str] = None,
     prune_wing: Optional[str] = None,
     source_state=None,
+    cursor: Optional[str] = None,
+    chunk_total: Optional[int] = None,
+    stale_ids: Optional[list] = None,
 ) -> int:
     """File one source file's drawers: write the new ones, then drop the stale.
 
@@ -337,6 +340,12 @@ def write_file_drawers(
     store records the source complete with no ``chunk_total``. Without a
     store every drawer is rewritten and restamped, as before.
 
+    With a store, a pruning re-file also takes ``cursor``, stored by the
+    complete mark, and for a re-file of only a source's last drawers (the
+    convo cursor's resumed pass) ``chunk_total``, the source's whole drawer
+    count, and ``stale_ids``, the ids to prune instead of scanning the
+    source's drawers.
+
     Returns a :class:`FiledDrawers` count of the drawers written. Raises
     :class:`StaleDrawerPurgeFailed` when the stale drawers could not be
     removed and :class:`PriorTextArchiveFailed` when prior text could not be
@@ -363,6 +372,9 @@ def write_file_drawers(
             preserving=preserving,
             palace_path=palace_path,
             prune_wing=prune_wing,
+            cursor=cursor,
+            total=len(drawers) if chunk_total is None else chunk_total,
+            stale_ids=stale_ids,
         )
     if prune:
         total = len(drawers)
@@ -460,9 +472,12 @@ def _source_fields(drawers: list, extract_mode: Optional[str], chunk_total) -> d
     return fields
 
 
-def _mark_source(mark, stream, drawers, extract_mode, chunk_total) -> None:
+def _mark_source(mark, stream, drawers, extract_mode, chunk_total, cursor=None) -> None:
+    fields = _source_fields(drawers, extract_mode, chunk_total)
+    if cursor is not None:
+        fields["cursor"] = cursor
     try:
-        mark(stream, **_source_fields(drawers, extract_mode, chunk_total))
+        mark(stream, **fields)
     except (OSError, sqlite3.Error) as exc:
         raise SourceStateUnavailable(
             f"could not record the mining state of {stream.source_file!r} ({exc!r}); "
@@ -550,6 +565,9 @@ def _refile_changed(
     preserving: bool,
     palace_path,
     prune_wing,
+    cursor=None,
+    total: int,
+    stale_ids=None,
 ) -> "FiledDrawers":
     """Re-file one source writing only what changed, then complete its record.
 
@@ -572,8 +590,11 @@ def _refile_changed(
     drawers keep the stamps they were filed with, which those binaries read
     as an incomplete set and re-mine. Older binaries fail toward redundant
     work, never toward loss.
+
+    ``total`` is the source's drawer count; it exceeds ``len(drawers)`` when
+    only its last drawers are re-filed, and ``stale_ids`` then names the ids
+    to prune. ``cursor`` is stored with the complete mark.
     """
-    total = len(drawers)
     _mark_source(source_state.mark_pending, stream, drawers, extract_mode, total)
     drawers = [(i, doc, {**meta, "chunk_total": total + 1}) for i, doc, meta in drawers]
     merges = getattr(collection, "upsert_merges_metadata", False) is True
@@ -637,13 +658,11 @@ def _refile_changed(
     fresh = {drawer_id for drawer_id, _, _ in drawers}
     kept = 0
     try:
-        stale = [
-            drawer_id
-            for drawer_id in _source_file_delete_ids(
+        if stale_ids is None:
+            stale_ids = _source_file_delete_ids(
                 collection, source_file, extract_mode, wing=prune_wing
             )
-            if drawer_id not in fresh
-        ]
+        stale = [drawer_id for drawer_id in stale_ids if drawer_id not in fresh]
         if stale and owner is not None:
             owned, kept = _owned_rows(collection, stale, owner)
             stale = [drawer_id for drawer_id, _, _ in owned]
@@ -676,7 +695,7 @@ def _refile_changed(
     for start in range(0, len(finished), DRAWER_UPSERT_BATCH_SIZE):
         batch = finished[start : start + DRAWER_UPSERT_BATCH_SIZE]
         collection.update(ids=batch, metadatas=[{"chunk_total": total}] * len(batch))
-    _mark_source(source_state.mark_complete, stream, drawers, extract_mode, total)
+    _mark_source(source_state.mark_complete, stream, drawers, extract_mode, total, cursor)
     filed = FiledDrawers(len(written))
     filed.unchanged = bool(drawers) and not rewritten and not stale
     filed.pruned = len(stale)
