@@ -76,6 +76,8 @@ def test_project_key_reads_codex_cwd_when_file_exists(tmp_path):
         ("-Users-me-dev-mempalace--claude-worktrees-review-pr-1696", "mempalace", "existing"),
         ("-Users-me--codex-worktrees-8c22-mempalace", "mempalace", "existing"),
         ("-Users-me--codex-worktrees-8c22-acme-app", "acme_app", "existing"),
+        ("-Users-me-dev-acme-app--worktrees-42-fix-login", "acme_app", "existing"),
+        ("-Users-me-dev-ledger-rfp--worktrees-42-fix-login", "ledger_rfp", "derived"),
     ],
 )
 def test_resolve_target(key, target, how):
