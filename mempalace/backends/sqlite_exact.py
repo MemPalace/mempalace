@@ -130,6 +130,8 @@ _WING_FILED_AT_INDEX = "idx_documents_coll_wing_filed_at"
 # Both current drawer chunks and legacy diary chunks resolve through these
 # high-cardinality metadata keys. Indexes are additive, like source_file.
 _PARENT_ID_KEYS = ("parent_drawer_id", "parent_entry_id")
+# The embedding wrapper looks vectors up by ``embed_key`` on every write.
+_INDEXED_METADATA_KEYS = (*_PARENT_ID_KEYS, "embed_key")
 
 
 def _json_field_sql(key: str, *, locus_columns: bool = True) -> str:
@@ -1786,6 +1788,7 @@ class SQLiteExactBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_metadata_facets",
+            "supports_embedding_reuse",
             "supports_lexical_search",
             "local_mode",
         }
@@ -2004,7 +2007,7 @@ class SQLiteExactBackend(BaseBackend):
         if "dimension" not in columns:
             conn.execute("ALTER TABLE collections ADD COLUMN dimension INTEGER")
         self._ensure_locus_columns(conn)
-        for key in _PARENT_ID_KEYS:
+        for key in _INDEXED_METADATA_KEYS:
             conn.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_documents_coll_{key} "
                 f"ON documents(collection_id, json_extract(metadata_json, '$.{key}'))"

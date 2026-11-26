@@ -2959,6 +2959,7 @@ class ChromaBackend(BaseBackend):
             "supports_embeddings_out",
             "supports_metadata_filters",
             "supports_contains_fast",
+            "supports_embedding_reuse",
             "supports_lexical_search",
             "supports_recency_order",
             "local_mode",

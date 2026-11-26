@@ -404,8 +404,11 @@ def get_collection(
                     collection_name=collection_name,
                     create=create,
                 )
-    if "requires_explicit_embeddings" in getattr(backend_obj, "capabilities", frozenset()):
-        collection = EmbeddingCollection(collection)
+    capabilities = getattr(backend_obj, "capabilities", frozenset())
+    if "requires_explicit_embeddings" in capabilities:
+        collection = EmbeddingCollection(
+            collection, content_reuse="supports_embedding_reuse" in capabilities
+        )
     if not _skip_identity_check:
         _enforce_embedder_identity(collection, palace_path, collection_name, create=create)
     return collection

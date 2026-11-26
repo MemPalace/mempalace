@@ -79,6 +79,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   keep their original `authored_at` and `filed_at` on re-mine, which the
   ranking tie-break and Layer 1 wake-up read per drawer. A project file whose
   `content_date` falls back to its mtime still gets a metadata update when touched, because that date really changed.
+- **Drawers with the same text share one vector across source files
+  (#3056).** A forked, resumed or re-exported transcript has a new
+  `source_file`, so its drawer ids are new and the same-id vector reuse
+  missed every chunk. On Chroma and `sqlite_exact` each vector the embedding
+  wrapper computes is now stored with an `embed_key`: a SHA-256 of the
+  embedder's profile (model and tokenizer hashes, max length, pooling,
+  normalization, quantization; for `openai-compat`, the endpoint URL and
+  model) and the exact text the model receives. A write first looks its keys
+  up, 1,000 at a time, and copies the vector of a stored row whose key, recomputed
+  from that row's own text, matches and whose dimension fits; anything else,
+  including a failed lookup, is embedded as before. Identical texts within
+  one batch are embedded once. Only the vector is shared: each drawer keeps
+  its own verbatim text and metadata. EmbeddingGemma 2 puts the title (the
+  `source_file` basename) into its input, so forks still re-embed there.
+  Drawers filed before this change carry no key and are not given one; they
+  simply miss this reuse. Other backends keep embedding every write.
+  `sqlite_exact` adds an index on `embed_key` the first time a palace opens.
 - **The Antigravity sidecar no longer loads a second copy of the palace.**
   Its Python bridge starts on first use instead of with every IDE window
   (set `MEMPALACE_SIDECAR_WARMUP=1` or `MEMPALACE_EAGER_WARMUP=1` to start

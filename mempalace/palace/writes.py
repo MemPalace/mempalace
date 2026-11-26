@@ -97,8 +97,19 @@ _SOURCE_STAMP_KEYS = frozenset(
     {"filed_at", "authored_at", "source_mtime", "source_fingerprint", "chunk_total"}
 )
 
-# Keys a backend writes on its own; a re-filed drawer never names them.
-_BACKEND_DERIVED_KEYS = frozenset({"last_modified", "_repaired_empty_meta"})
+# Keys a backend or the embedding wrapper writes on its own; a re-filed
+# drawer never names them.
+_BACKEND_DERIVED_KEYS = frozenset({"last_modified", "_repaired_empty_meta", "embed_key"})
+
+
+def _keeping_embed_key(meta: dict, old_meta: dict) -> dict:
+    """``meta`` with the stored ``embed_key``, for a drawer keeping its stored vector.
+
+    The key names that vector, so it stays true; without it a write that
+    passes the vector explicitly would drop the key.
+    """
+    key = (old_meta or {}).get("embed_key")
+    return {**meta, "embed_key": key} if key else meta
 
 
 def _metadata_changes(old_meta: dict, meta: dict) -> tuple:
@@ -167,6 +178,8 @@ def _split_unchanged(collection, batch: list, prior: Optional[dict] = None) -> t
         if merges:
             meta = {**dict.fromkeys(set(old_meta) - set(meta)), **meta}
         same = old_doc == doc and _metadata_title(old_meta) == _metadata_title(meta)
+        if same:
+            meta = _keeping_embed_key(meta, old_meta)
         rows.append((drawer_id, doc, meta, same))
         if same:
             unchanged.append(drawer_id)
@@ -605,7 +618,7 @@ def _refile_changed(
                 continue
             changed, removed = _metadata_changes(old_meta, meta)
             if removed:
-                repaired.append((drawer_id, doc, full))
+                repaired.append((drawer_id, doc, _keeping_embed_key(full, old_meta)))
                 continue
             if changed:
                 updates.append((drawer_id, changed))
