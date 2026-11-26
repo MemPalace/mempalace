@@ -913,6 +913,17 @@ def tool_mine(
     # ingest failed against a running hub. The other modes still walk a
     # tree, so they keep the directory requirement.
     if not src or not (os.path.isdir(src) or (mode == "convos" and os.path.isfile(src))):
+        if src and os.path.isfile(src):
+            # The path exists — saying "source not found" would send the caller
+            # debugging paths and the hub instead of the mode.
+            return {
+                "success": False,
+                "error": (
+                    f"{mode} mode mines directories; {source!r} is a file — "
+                    "pass its directory, or use mode='convos' for a single "
+                    "conversation file"
+                ),
+            }
         return {"success": False, "error": f"source not found: {source!r}"}
 
     def _run():

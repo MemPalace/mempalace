@@ -1516,6 +1516,50 @@ class MempalaceConfig:
         return max(1, parsed)
 
     @property
+    def post_mine_integrity_check(self) -> str:
+        """``"scoped"`` (default) or ``"full"``: what a writing mine checks at its end.
+
+        ``scoped`` scans the rows the mine wrote and quick_checks the two
+        tables writes touch, running the whole-database check only when it is
+        due (see :mod:`mempalace.integrity_check`). ``full`` restores the
+        whole-database ``PRAGMA quick_check`` after every writing mine. Reads
+        ``MEMPALACE_POST_MINE_INTEGRITY_CHECK`` env first, then
+        ``post_mine_integrity_check`` in ``config.json``. Anything else is
+        ``scoped``.
+        """
+        for raw in (
+            os.environ.get("MEMPALACE_POST_MINE_INTEGRITY_CHECK"),
+            self._file_config.get("post_mine_integrity_check"),
+        ):
+            if isinstance(raw, str) and raw.strip().lower() in ("scoped", "full"):
+                return raw.strip().lower()
+        return "scoped"
+
+    @property
+    def integrity_full_check_interval_hours(self) -> float:
+        """Hours a clean full check stays fresh before a writing mine runs another.
+
+        Reads ``MEMPALACE_INTEGRITY_FULL_CHECK_INTERVAL_HOURS`` env first, then
+        ``integrity_full_check_interval_hours`` in ``config.json``, then 24.
+        ``0`` turns the interval trigger off (the unclean-exit trigger and
+        ``mempalace integrity-check`` still run the full check). Negative or
+        non-numeric values fall back to the default.
+        """
+        for raw in (
+            os.environ.get("MEMPALACE_INTEGRITY_FULL_CHECK_INTERVAL_HOURS"),
+            self._file_config.get("integrity_full_check_interval_hours"),
+        ):
+            if raw is None or isinstance(raw, bool):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value >= 0 and value == value and value != float("inf"):
+                return value
+        return 24.0
+
+    @property
     def max_backups(self) -> int:
         """Number of timestamped palace backups to retain before pruning.
 

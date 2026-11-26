@@ -19,6 +19,8 @@ Located at `~/.mempalace/config.json`:
 | `collection_name` | `mempalace_drawers` | Default backend collection name |
 | `people_map` | `{}` | Entity name → AAAK code mappings |
 | `max_backups` | `10` | How many timestamped palace backups to keep before the oldest are pruned. Applies to `mempalace migrate` (`<palace>.pre-migrate.*`) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-*`), which each write a full copy every run. Set to `0` to keep every backup (e.g. when an external retention policy manages cleanup). |
+| `post_mine_integrity_check` | `scoped` | What a mine that wrote anything checks at its end. `scoped` scans the rows it wrote for a raw NUL or invalid UTF-8 and quick_checks the `embeddings` / `embedding_metadata` tables, in a child process; the whole-database `PRAGMA quick_check` (which checks FTS5 on SQLite 3.44+) runs on the first mine after a writer died mid-write, when the last clean full check is older than `integrity_full_check_interval_hours`, or on demand with `mempalace integrity-check`. `full` restores the whole-database check after every writing mine. |
+| `integrity_full_check_interval_hours` | `24` | How long a clean full check stays fresh before a writing mine runs another. `0` turns the interval off; a batch runner can then run `mempalace integrity-check` once at the end. |
 
 Each setting resolves from its environment variable first, then
 `config.json`, then the default (`backend` is the exception: `config.json`
@@ -298,6 +300,8 @@ python -m mempalace.mcp_server --palace /custom/palace
 | `MEMPALACE_PALACE_PATH` | Override palace path (same as `--palace`) |
 | `MEMPAL_DIR` | Directory for auto-mining in hooks |
 | `MEMPALACE_MAX_BACKUPS` | Override `max_backups` retention count (`0` disables pruning) |
+| `MEMPALACE_POST_MINE_INTEGRITY_CHECK` | Override `post_mine_integrity_check` (`scoped` or `full`) |
+| `MEMPALACE_INTEGRITY_FULL_CHECK_INTERVAL_HOURS` | Override `integrity_full_check_interval_hours` (`0` disables the interval trigger) |
 | `MEMPALACE_BACKEND` | Select the storage backend (default `chroma`) — see [Storage backends](#storage-backends) for each backend's connection variables |
 | `MEMPALACE_MCP_WRITER_WAIT_SECONDS` | Seconds a writable HTTP server waits at startup for another process to release the palace writer lease before exiting with status `2` (default `120`; `0` refuses immediately). See [Remote server](/guide/remote-server#operating-notes) |
 | `MEMPALACE_MCP_IDLE_HOURS` | Hours with no MCP request before the server exits by itself (default `8`; `0` disables). See [Remote server](/guide/remote-server#operating-notes) |
