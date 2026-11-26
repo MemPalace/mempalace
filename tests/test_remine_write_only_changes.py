@@ -5,7 +5,6 @@ because the keys a backend adds on its own (``last_modified``, ...) are what
 would turn an unchanged re-file into a spurious metadata write.
 """
 
-import hashlib
 import json
 
 import pytest
@@ -113,7 +112,7 @@ def test_a_first_filing_writes_every_drawer_and_completes_the_record(palace):
     head = SourceStateStore(palace).get(_stream())
     assert head.complete and head.chunk_total == 3 and head.source_fingerprint == "1:1:1"
     rows = _rows(palace)
-    assert rows["drawer_1"][1]["content_sha256"] == hashlib.sha256(b"two").hexdigest()
+    assert all("content_sha256" not in meta for _, meta in rows.values())
     # Old binaries still read a complete per-row group from the rows written.
     assert {meta["chunk_total"] for _, meta in rows.values()} == {3}
 
@@ -230,8 +229,8 @@ def test_a_crash_before_the_record_completes_leaves_the_source_pending(palace, m
     assert SourceStateStore(palace).get(_stream()).complete
 
 
-def test_legacy_rows_get_their_hash_by_a_metadata_update(palace, monkeypatch):
-    # Rows filed before the record: no content_sha256, every row stamped.
+def test_legacy_rows_refile_with_no_write_when_unchanged(palace, monkeypatch):
+    # Rows filed before the record, every row stamped with the per-row group.
     collection = get_collection(palace)
     legacy = _drawers(["one", "two"])
     collection.upsert(
@@ -243,14 +242,9 @@ def test_legacy_rows_get_their_hash_by_a_metadata_update(palace, monkeypatch):
 
     _file(palace, _drawers(["one", "two"], "2:2:2"))
 
-    assert "upsert" not in spy.names()
-    assert {m["content_sha256"] for _, m in _rows(palace).values()} == {
-        hashlib.sha256(b"one").hexdigest(),
-        hashlib.sha256(b"two").hexdigest(),
-    }
-    spy.reset()
-    _file(palace, _drawers(["one", "two"], "3:3:3"))
     assert spy.names() == []
+    assert SourceStateStore(palace).get(_stream()).complete
+    assert all("content_sha256" not in m for _, m in _rows(palace).values())
 
 
 # -- the miners, end to end ----------------------------------------------------

@@ -74,11 +74,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   written at all. Previously every drawer of a grown transcript was upserted
   with its stored vector and then updated again for `chunk_total`. A touched
   but unchanged source now re-mines with zero Chroma writes, so the hallway
-  recompute and post-mine `quick_check` are skipped. Each drawer also carries
-  `content_sha256`, the hash of its text. The first re-mine of a source after
-  upgrade still runs one metadata-only update per drawer to stamp it. A
-  project file whose `content_date` falls back to its mtime still gets a
-  metadata update when touched, because that date really changed.
+  recompute and post-mine `quick_check` are skipped. A project file whose
+  `content_date` falls back to its mtime still gets a metadata update when touched, because that date really changed.
 - **The Antigravity sidecar no longer loads a second copy of the palace.**
   Its Python bridge starts on first use instead of with every IDE window
   (set `MEMPALACE_SIDECAR_WARMUP=1` or `MEMPALACE_EAGER_WARMUP=1` to start

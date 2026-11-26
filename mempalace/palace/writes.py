@@ -100,25 +100,6 @@ _SOURCE_STAMP_KEYS = frozenset(
 # Keys a backend writes on its own; a re-filed drawer never names them.
 _BACKEND_DERIVED_KEYS = frozenset({"last_modified", "_repaired_empty_meta"})
 
-CONTENT_SHA256_KEY = "content_sha256"
-
-
-def content_sha256(document) -> Optional[str]:
-    """The hex SHA-256 of a drawer's text, as stamped in ``content_sha256``."""
-    if not isinstance(document, str):
-        return None
-    return hashlib.sha256(document.encode("utf-8", "surrogatepass")).hexdigest()
-
-
-def _with_content_hash(drawers: list) -> list:
-    out = []
-    for drawer_id, doc, meta in drawers:
-        digest = content_sha256(doc)
-        out.append(
-            (drawer_id, doc, meta if digest is None else {**meta, CONTENT_SHA256_KEY: digest})
-        )
-    return out
-
 
 def _metadata_changes(old_meta: dict, meta: dict) -> tuple:
     """``(changed, removed)``: what a re-filed drawer's metadata changes.
@@ -356,8 +337,6 @@ def write_file_drawers(
     store records the source complete with no ``chunk_total``. Without a
     store every drawer is rewritten and restamped, as before.
 
-    Every drawer is stamped with ``content_sha256``, the hash of its text.
-
     Returns a :class:`FiledDrawers` count of the drawers written. Raises
     :class:`StaleDrawerPurgeFailed` when the stale drawers could not be
     removed and :class:`PriorTextArchiveFailed` when prior text could not be
@@ -369,7 +348,6 @@ def write_file_drawers(
     if owner is not None and owner not in OWNERS:
         raise ValueError(f"unknown drawer owner {owner!r}")
     preserving = owner in PRESERVING_OWNERS
-    drawers = _with_content_hash(drawers)
     if source_state is not None:
         stream = _source_stream_of(source_file, owner, extract_mode, prune_wing)
     if source_state is not None and prune:
