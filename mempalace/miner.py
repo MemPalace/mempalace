@@ -1877,56 +1877,61 @@ def process_file(
             )
             for chunk in chunks
         ]
+
+        def rebuild_closets(drawers_added):
+            # Build closet — the searchable index pointing to these drawers.
+            # Purge unconditionally: the old drawers this closet pointed at are
+            # gone, so a re-mine that ends up with zero filed drawers must still
+            # end up with zero closets, not stale ones dangling on deleted drawer
+            # IDs (see #24). Only the closet rebuild itself is conditional on
+            # there being new drawers to point at. A re-file that changed nothing
+            # keeps the closets it has, including LLM-generated ones.
+            if closets_col:
+                purge_file_closets(closets_col, source_file)
+            if closets_col and drawers_added > 0:
+                # Pass drawer_metas so build_closet_lines can emit the
+                # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
+                # when line_start / line_end / content_date are present. Falls
+                # back to the legacy 3-segment form automatically when not.
+                closet_lines = build_closet_lines(
+                    source_file,
+                    [drawer_id for drawer_id, _, _ in drawers],
+                    content,
+                    wing,
+                    room,
+                    drawer_metas=[meta for _, _, meta in drawers],
+                )
+                closet_id_base = (
+                    f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+                )
+                entities = _extract_entities_for_metadata(content)
+                closet_meta = {
+                    "wing": wing,
+                    "room": room,
+                    "source_file": source_file,
+                    "drawer_count": int(drawers_added),
+                    "filed_at": utc_now_iso(),
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+                if entities:
+                    closet_meta["entities"] = entities
+                upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
+
         # The project miner's own drawers for this path are replaced; a
         # conversation, diary or manual drawer filed under the same path stays.
         # A failed stale-drawer purge is an error the mine counts, not a skip.
         try:
             drawers_added = write_file_drawers(
-                collection, source_file, drawers, aaak_col=aaak_col, owner="project"
+                collection,
+                source_file,
+                drawers,
+                aaak_col=aaak_col,
+                owner="project",
+                before_complete=rebuild_closets,
             )
         except StaleDrawerPurgeFailed as exc:
             print(f"  ! [error] {filepath.name[:50]:50} {exc}", file=sys.stderr)
             return 0, room, "purge_failed"
-
-        # Build closet — the searchable index pointing to these drawers.
-        # Purge unconditionally: the old drawers this closet pointed at are
-        # gone, so a re-mine that ends up with zero filed drawers must still
-        # end up with zero closets, not stale ones dangling on deleted drawer
-        # IDs (see #24). Only the closet rebuild itself is conditional on
-        # there being new drawers to point at. A re-file that changed nothing
-        # keeps the closets it has, including LLM-generated ones.
-        if getattr(drawers_added, "unchanged", False):
-            closets_col = None
-        if closets_col:
-            purge_file_closets(closets_col, source_file)
-        if closets_col and drawers_added > 0:
-            # Pass drawer_metas so build_closet_lines can emit the
-            # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
-            # when line_start / line_end / content_date are present. Falls
-            # back to the legacy 3-segment form automatically when not.
-            closet_lines = build_closet_lines(
-                source_file,
-                [drawer_id for drawer_id, _, _ in drawers],
-                content,
-                wing,
-                room,
-                drawer_metas=[meta for _, _, meta in drawers],
-            )
-            closet_id_base = (
-                f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
-            )
-            entities = _extract_entities_for_metadata(content)
-            closet_meta = {
-                "wing": wing,
-                "room": room,
-                "source_file": source_file,
-                "drawer_count": int(drawers_added),
-                "filed_at": utc_now_iso(),
-                "normalize_version": NORMALIZE_VERSION,
-            }
-            if entities:
-                closet_meta["entities"] = entities
-            upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
     return drawers_added, room, None
 
