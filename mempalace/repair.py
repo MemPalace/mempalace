@@ -62,7 +62,7 @@ from .backends.chroma import (
 # backends._inproc_sqlite, which opens them with connect_sqlite_read under the
 # palace's in-process lock.
 from .config import connect_sqlite_read, sqlite_read_uri  # noqa: F401
-from .fsio import atomic_write_text
+from .fsio import atomic_write_text, make_private_dir
 from .stored_text import decode_record
 from .timeutil import filename_stamp
 
@@ -2398,6 +2398,50 @@ def _preserve_logstream_and_replica(source_palace: str, dest_palace: str) -> lis
     return copied
 
 
+def _preserve_journal_and_state_dir(source_palace: str, dest_palace: str) -> list[str]:
+    """Copy the revision journal and the ``.mempalace/`` state dir into a rebuilt palace.
+
+    Neither is derived from chroma.sqlite3. Left behind, the rebuilt palace
+    has no drawer history (``drawer_revisions.jsonl`` journals the prior
+    verbatim text of re-mined and updated drawers) and loses ``.mempalace/``
+    (e.g. ``origin.json``). The journal is forced to 0600 and every
+    directory created here to 0700; symlinks are skipped.
+    """
+    from .revisions import _REVISION_FILENAME
+
+    if os.path.abspath(source_palace) == os.path.abspath(dest_palace):
+        return []
+
+    copied: list[str] = []
+
+    journal_src = os.path.join(source_palace, _REVISION_FILENAME)
+    journal_dst = os.path.join(dest_palace, _REVISION_FILENAME)
+    if not os.path.islink(journal_src) and os.path.isfile(journal_src):
+        make_private_dir(dest_palace)
+        _copy_file_no_follow(journal_src, journal_dst, replace=True)
+        with suppress(OSError):
+            os.chmod(journal_dst, 0o600)
+        copied.append(_REVISION_FILENAME)
+
+    state_src = os.path.join(source_palace, paths.DIRNAME)
+    if not os.path.islink(state_src) and os.path.isdir(state_src):
+        for root, dirs, files in os.walk(state_src):
+            rel = os.path.relpath(root, source_palace)
+            make_private_dir(os.path.join(dest_palace, rel))
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+            for name in files:
+                src = os.path.join(root, name)
+                if os.path.islink(src) or not os.path.isfile(src):
+                    continue
+                _copy_file_no_follow(src, os.path.join(dest_palace, rel, name), replace=True)
+        copied.append(paths.DIRNAME + "/")
+
+    if copied:
+        print(" Preserved journal and state: " + ", ".join(copied))
+
+    return copied
+
+
 def rebuild_from_sqlite(
     source_palace: str,
     dest_palace: str,
@@ -2807,9 +2851,12 @@ def _rebuild_from_sqlite_locked(
                 "in-place rebuild may fail with 'Collection already exists'."
             )
 
-    os.makedirs(dest_palace, exist_ok=True)
+    # The umask would leave a fresh palace at 755; chroma.sqlite3 holds
+    # verbatim transcripts, so create it owner-only like every other path.
+    make_private_dir(dest_palace)
     _preserve_knowledge_graph_sqlite(source_palace, dest_palace)
     _preserve_logstream_and_replica(source_palace, dest_palace)
+    _preserve_journal_and_state_dir(source_palace, dest_palace)
 
     # Backend lifetime is wrapped in try/finally so the dest palace's
     # PersistentClient handle (opened lazily inside ``create_collection``

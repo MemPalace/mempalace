@@ -10,6 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
+- Explicit `mine --mode convos --wing` now normalizes valid names to a
+  canonical spelling (`A B` and `a-b` become `a_b`). Existing drawers in a
+  differently spelled wing are not moved automatically. Re-mining the same
+  transcript into the canonical destination can leave copies in the old wing.
+  Preview any affected wing renames with `mempalace migrate-wings --dry-run`,
+  then follow [the wing-name migration procedure](docs/recovery/wing-name-migration.md)
+  to merge them when appropriate. Check the dry-run plan before applying it.
 - **The first conversation mine after upgrade re-reads every previously mined
   transcript in its selected sources.** Older rows have no verified source
   fingerprint and must be re-mined once, even when their stored mtime and size
@@ -98,7 +105,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Explicit `mine --mode convos --wing` names now use the same validated,
   canonical spelling as other wing writers (`A B` and `a-b` become `a_b`).
   Existing drawers under noncanonical wing names are not migrated.
-
+- **Repair rebuilds keep the re-mine journal and `.mempalace/` and create
+  the rebuilt palace owner-only (`0700`).** `repair rebuild-index` and
+  `repair --mode from-sqlite` used to leave the new palace at umask
+  permissions and drop `drawer_revisions.jsonl` and `.mempalace/`, so a
+  user who deleted the archive after a good rebuild lost the prior
+  verbatim text the journal exists to keep. The journal is copied at
+  `0600`, `.mempalace/` is walked without following symlinks, and the
+  archive is left intact. Thanks to [Lautaro Antúnez](https://github.com/Staberman).
+  ([#3059](https://github.com/MemPalace/mempalace/pull/3059),
+  [#3053](https://github.com/MemPalace/mempalace/issues/3053))
 - **Importing `mempalace` no longer caps the thread pools of the process.**
   The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
   set at package import, so CPU embedding (EmbeddingGemma through torch) ran

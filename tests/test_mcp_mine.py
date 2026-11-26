@@ -85,6 +85,45 @@ def test_missing_source_dir_returns_structured_error(monkeypatch, config):
     assert "source" in result["error"].lower()
 
 
+@pytest.mark.parametrize("mode", ["projects", "extract"])
+def test_existing_file_in_directory_mode_gets_a_clear_error(monkeypatch, config, tmp_path, mode):
+    """An existing file in a directory-only mode is not reported as "not found" (#3018).
+
+    ``projects`` and ``extract`` walk a tree, so a lone file is rejected — but
+    saying "source not found" for a file that exists sends users debugging
+    paths, the CWD or the hub instead of the mode.
+    """
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+
+    def _unexpected_mine(*args, **kwargs):
+        pytest.fail("a rejected source reached the miner")
+
+    monkeypatch.setattr("mempalace.miner.mine", _unexpected_mine)
+    monkeypatch.setattr("mempalace.format_miner.mine_formats", _unexpected_mine)
+    src = tmp_path / "notes.md"
+    src.write_text("# notes\n", encoding="utf-8")
+
+    result = mcp_server.tool_mine(source=str(src), mode=mode)
+    assert result["success"] is False
+    assert "not found" not in result["error"]
+    assert f"{mode} mode mines directories" in result["error"]
+    assert "mode='convos'" in result["error"]
+
+
+@pytest.mark.parametrize("mode", ["projects", "extract"])
+def test_nonexistent_path_in_directory_mode_still_reports_not_found(
+    monkeypatch, config, tmp_path, mode
+):
+    from mempalace import mcp_server
+
+    _patch(monkeypatch, config)
+    result = mcp_server.tool_mine(source=str(tmp_path / "missing.md"), mode=mode)
+    assert result["success"] is False
+    assert "source not found" in result["error"]
+
+
 @pytest.mark.parametrize("include_ignored", ["notes.md", 1, {}, [1], [None], [""], ["  "]])
 def test_invalid_include_ignored_is_rejected_before_ingestion(
     monkeypatch, config, tmp_path, include_ignored
@@ -421,7 +460,7 @@ def test_projects_mode_still_rejects_a_file(monkeypatch, config, tmp_dir):
 
     result = mcp_server.tool_mine(source=src, mode="projects")
     assert result["success"] is False
-    assert "source" in result["error"].lower()
+    assert "projects mode mines directories" in result["error"]
 
 
 def test_stdout_captured_not_leaked_to_fd(monkeypatch, config, tmp_dir, capfd):
