@@ -125,6 +125,8 @@ def _load_known_names() -> set:
                 names.add(entity["canonical"].lower())
             for alias in entity.get("aliases", []):
                 names.add(alias.lower())
+        for project in reg.projects:
+            names.add(project.lower())
         return names
     except Exception:
         return set()
