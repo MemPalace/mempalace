@@ -114,3 +114,25 @@ def test_the_store_file_is_private(tmp_path):
     SourceStateStore(str(tmp_path)).mark_pending(_stream(owner="project"))
     if os.name == "posix":
         assert (tmp_path / SOURCE_STATE_FILENAME).stat().st_mode & 0o077 == 0
+
+
+def test_delete_source_removes_every_stream_of_that_path_only(tmp_path):
+    store = SourceStateStore(str(tmp_path))
+    store.mark_complete(_stream(owner="project", wing="notes"), chunk_total=1)
+    store.mark_pending(_stream(owner="convo", extract_mode="exchange", wing="chats"))
+    store.mark_complete(_stream("/notes/b.md", owner="project", wing="notes"), chunk_total=2)
+
+    assert store.delete_source("/notes/a.md") == 2
+
+    assert store.get(_stream(owner="project", wing="notes")) is None
+    assert store.get(_stream(owner="convo", extract_mode="exchange", wing="chats")) is None
+    assert store.get(_stream("/notes/b.md", owner="project", wing="notes")).complete
+
+
+def test_delete_source_on_a_missing_or_read_only_store_deletes_nothing(tmp_path):
+    assert SourceStateStore(str(tmp_path)).delete_source("/notes/a.md") == 0
+    assert not (tmp_path / SOURCE_STATE_FILENAME).exists()
+
+    SourceStateStore(str(tmp_path)).mark_complete(_stream(owner="project"), chunk_total=1)
+    assert SourceStateStore(str(tmp_path), read_only=True).delete_source("/notes/a.md") == 0
+    assert SourceStateStore(str(tmp_path)).get(_stream(owner="project")).complete

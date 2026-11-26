@@ -282,3 +282,21 @@ class SourceStateStore:
             self._write(self._INSERT_IF_ABSENT, rows)
         except (OSError, sqlite3.Error):
             logger.warning("could not backfill %d source records", len(rows), exc_info=True)
+
+    def delete_source(self, source_file: str) -> int:
+        """Delete every stream's record for ``source_file``; returns how many.
+
+        For deleting a source's drawers: a record left behind would outlive
+        what it describes. A missing database or a read-only store deletes
+        nothing.
+        """
+        if self.read_only or not os.path.exists(self.path):
+            return 0
+        conn = self._connect(write=True)
+        try:
+            cursor = conn.execute(
+                "DELETE FROM source_head WHERE source_file = ?", (str(source_file),)
+            )
+            return max(cursor.rowcount, 0)
+        finally:
+            conn.close()
