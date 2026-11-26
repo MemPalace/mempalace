@@ -900,8 +900,9 @@ class TestDiaryIngest:
         assert state_path.parent.parent.name == ".mempalace"
 
     def test_state_file_is_never_left_partial(self, tmp_path, monkeypatch):
-        # The state file is replaced atomically: if the swap fails, the
-        # previous state file is still complete and valid JSON.
+        # The state file is published through fsio.atomic_write_json: if the
+        # swap fails, the previous state file is still complete and valid
+        # JSON, and the temporary file is cleaned up.
         diary_dir = tmp_path / "diaries"
         diary_dir.mkdir()
         (diary_dir / "2026-04-13.md").write_text(
@@ -909,7 +910,6 @@ class TestDiaryIngest:
         )
         palace_dir = tmp_path / "palace"
 
-        from mempalace import diary_ingest
         from mempalace.diary_ingest import _state_file_for, ingest_diaries
 
         ingest_diaries(str(diary_dir), str(palace_dir), force=True)
@@ -929,12 +929,14 @@ class TestDiaryIngest:
                 raise OSError("simulated crash before the swap")
             return real_replace(src, dst, *args, **kwargs)
 
-        monkeypatch.setattr(diary_ingest.os, "replace", failing_replace)
+        # fsio renames the temporary file into place with os.replace.
+        monkeypatch.setattr(os, "replace", failing_replace)
         with pytest.raises(OSError, match="simulated crash"):
             ingest_diaries(str(diary_dir), str(palace_dir))
         monkeypatch.undo()
 
         assert state_file.read_bytes() == before
+        assert not list(state_file.parent.glob("*.tmp"))
         assert json.loads(state_file.read_bytes())
 
     def test_wing_prefixed_drawer_id_prevents_cross_diary_collision(self, tmp_path):
