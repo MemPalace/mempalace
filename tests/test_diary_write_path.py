@@ -144,3 +144,23 @@ def test_two_diary_files_sharing_a_date_refuse_to_overwrite_each_other(diary):
         ingest_diaries(str(diary_dir), palace)
     assert first.name in str(exc.value) and second.name in str(exc.value)
     assert "Entry 1 body" in _rows(palace, first)[0][3]
+
+
+@pytest.mark.parametrize("entry", ["short entry", "longer entry " * 60])
+def test_replaying_a_checkpoint_with_its_idempotency_key_files_nothing_new(
+    monkeypatch, collection, entry
+):
+    """A worker can die after filing a checkpoint and before finishing its job.
+    The replayed job finds the drawers it already filed."""
+    from mempalace import mcp_server, service
+
+    monkeypatch.setattr(mcp_server, "_get_collection", lambda **_: collection)
+    monkeypatch.setattr(type(mcp_server._config), "chunk_size", property(lambda self: 100))
+    payload = {"entry": entry, "wing": "proj", "idempotency_key": "checkpoint-key"}
+    first = service.run_diary_write(payload)
+    stored = collection.get(include=["documents", "metadatas"])
+    repeated = service.run_diary_write(payload)
+    assert first["success"] and repeated["success"]
+    assert first["entry_id"].startswith("diary_proj_checkpoint_")
+    assert repeated["entry_id"] == first["entry_id"]
+    assert collection.get(include=["documents", "metadatas"]) == stored
