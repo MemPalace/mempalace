@@ -513,12 +513,23 @@ def dirty_mark(wing: str, config=None) -> Optional[dict]:
     return marks[0] if marks else None
 
 
-def _clear_dirty(conn: sqlite3.Connection, wing: str, generation: Optional[int]) -> None:
-    """Inside a write transaction: drop ``wing``'s mark if no mark followed ``generation``."""
+def _clear_dirty(
+    conn: sqlite3.Connection, wing: str, generation: Optional[int], read_at: float
+) -> None:
+    """Inside a write transaction: drop ``wing``'s mark if no mark followed ``generation``.
+
+    A mark that did follow is only stale since ``read_at``, when the drawers
+    were read, so its wait restarts there: a busy wing past max wait would
+    otherwise be recomputed back to back.
+    """
     if generation is None:
         return
     conn.execute(
         "DELETE FROM dirty_wings WHERE wing = ? AND generation = ?", (wing, int(generation))
+    )
+    conn.execute(
+        "UPDATE dirty_wings SET first_marked_at = MAX(first_marked_at, ?) WHERE wing = ?",
+        (float(read_at), wing),
     )
 
 
@@ -1066,6 +1077,7 @@ def compute_hallways_for_wing(
     # below clears it only if no mine marked the wing again after this point.
     mark = dirty_mark(wing, config)
     generation = mark["generation"] if mark else None
+    read_at = time.time()
 
     # 1. Query drawers for this wing. On Chroma, one linear pass over the
     #    drawers holding entities; elsewhere, wing-scoped pages.
@@ -1084,7 +1096,7 @@ def compute_hallways_for_wing(
         # schedule the same empty recompute again.
         if generation is not None:
             with _writing(config) as conn:
-                _clear_dirty(conn, wing, generation)
+                _clear_dirty(conn, wing, generation, read_at)
         return []
 
     # 2. Walk drawers, counting entity-pair co-occurrence + tracking rooms.
@@ -1236,7 +1248,7 @@ def compute_hallways_for_wing(
             [(row[0],) for row in stored if row[0] not in kept_ids],
         )
         conn.executemany(_UPSERT, [_row(h) for h in changed])
-        _clear_dirty(conn, wing, generation)
+        _clear_dirty(conn, wing, generation, read_at)
 
     return created
 

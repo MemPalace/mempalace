@@ -35,18 +35,49 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 JOB_KIND = "hallways"
+# A failed recompute is retried no sooner than this (or the settle, if longer),
+# so a wing whose drawers cannot be read does not spin the daemon.
+RETRY_FLOOR_SECONDS = 60.0
+
+# Palaces whose daemon runs in this process: a mine inside it can always defer.
+_SERVING: set[str] = set()
+
+
+def serve(palace_path: str) -> None:
+    """Record that this process runs the daemon of ``palace_path``."""
+    from .daemon_queue import canonical_palace_path
+
+    _SERVING.add(canonical_palace_path(palace_path))
+
+
+def _daemon_serves(palace_path: str) -> bool:
+    """True when a daemon will run the queued recompute of ``palace_path``.
+
+    The daemon is opt-in: with none running, a deferred recompute would wait
+    in a queue nobody reads, so the caller recomputes inline instead.
+    """
+    from .daemon_queue import HOOK_PROBE_TIMEOUT, canonical_palace_path, probe_daemon_health
+
+    palace_path = canonical_palace_path(palace_path)
+    if palace_path in _SERVING:
+        return True
+    try:
+        return probe_daemon_health(palace_path, timeout=HOOK_PROBE_TIMEOUT)
+    except Exception:  # noqa: BLE001 - no answer means no daemon
+        return False
 
 
 def dedupe_key(wing: str) -> str:
     return f"{JOB_KIND}:{wing}"
 
 
-def schedule(wing: str, palace_path: str, *, config=None, store=None, mark=None):
+def schedule(wing: str, palace_path: str, *, config=None, store=None, mark=None, retry=False):
     """Queue the coalesced recompute for ``wing``'s dirty mark; return the job.
 
     The window is measured from the mark's first time, so a mark that waited
     (a restart, a mine with no daemon) runs no later than ``max_wait`` after
-    it was made. ``None`` when the wing is not dirty.
+    it was made. ``retry`` (the last recompute failed) waits at least
+    :data:`RETRY_FLOOR_SECONDS` instead. ``None`` when the wing is not dirty.
     """
     from .config import MempalaceConfig
     from .daemon_queue import QueueStore, queue_path
@@ -59,6 +90,9 @@ def schedule(wing: str, palace_path: str, *, config=None, store=None, mark=None)
     store = store or QueueStore(queue_path(palace_path))
     settle, max_wait = config.hallways_refresh_debounce
     remaining = max(0.0, mark["first_marked_at"] + max_wait - float(store.clock()))
+    if retry:
+        remaining = max(remaining, settle, RETRY_FLOOR_SECONDS)
+        settle = remaining
     return store.enqueue(
         JOB_KIND,
         {"wing": wing},
@@ -190,4 +224,45 @@ def defer_if_configured(
     """
     if config.hallways_mode(mode) != "defer":
         return False
+    if not _daemon_serves(palace_path):
+        print("  Hallways: no daemon serves this palace; recomputing now")
+        return False
     return defer_wing(wing, palace_path, config=config, entity_tunnels=entity_tunnels)
+
+
+def run_overdue_without_daemon(palace_path: str, *, config=None) -> int:
+    """With no daemon, run the recomputes it left behind; return how many ran.
+
+    A daemon that deferred a wing and was then stopped or turned off leaves
+    the mark for nobody. A direct mine calls this afterwards, so such a mark
+    waits at most ``max_wait`` past the next mine instead of forever. Marks
+    still inside their window are left: a daemon may yet come back for them.
+    """
+    import time
+
+    from .config import MempalaceConfig
+    from .hallways import dirty_wings
+
+    config = config or MempalaceConfig(palace_path=palace_path)
+    try:
+        marks = dirty_wings(config)
+    except Exception:  # noqa: BLE001 - best-effort, like every hallway step
+        return 0
+    if not marks:
+        return 0
+    _settle, max_wait = config.hallways_refresh_debounce
+    now = time.time()
+    overdue = [m for m in marks if m["first_marked_at"] + max_wait <= now]
+    if not overdue or _daemon_serves(palace_path):
+        return 0
+    ran = 0
+    for mark in overdue:
+        result = run_refresh({"palace_path": palace_path, "wing": mark["wing"]})
+        if result.get("success"):
+            ran += 1
+        else:
+            print(
+                f"  WARNING: hallway recompute of {mark['wing']} failed: {result.get('error')}",
+                file=sys.stderr,
+            )
+    return ran

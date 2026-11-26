@@ -147,6 +147,14 @@ def convo_palace(tmp_path, monkeypatch):
     return convos, tmp_path / "palace"
 
 
+@pytest.fixture
+def daemon_serving(monkeypatch):
+    """A daemon serves the palace, so a deferring mine may leave it the work."""
+    from mempalace import hallway_refresh
+
+    monkeypatch.setattr(hallway_refresh, "_daemon_serves", lambda *a, **k: True)
+
+
 def _palace_config(palace):
     from mempalace.config import MempalaceConfig
 
@@ -179,7 +187,9 @@ def test_a_mine_recomputes_hallways_inline_by_default(convo_palace):
     assert _queued_hallway_jobs(palace) == []
 
 
-def test_a_deferred_mine_marks_the_wing_and_queues_one_debounced_recompute(convo_palace):
+def test_a_deferred_mine_marks_the_wing_and_queues_one_debounced_recompute(
+    convo_palace, daemon_serving
+):
     import time
 
     from mempalace.convo_miner import mine_convos
@@ -197,7 +207,7 @@ def test_a_deferred_mine_marks_the_wing_and_queues_one_debounced_recompute(convo
     assert before + 600 - 5 <= job.run_after <= time.time() + 600
 
 
-def test_config_always_defers_a_mine_that_did_not_choose(convo_palace, monkeypatch):
+def test_config_always_defers_a_mine_that_did_not_choose(convo_palace, monkeypatch, daemon_serving):
     from mempalace.convo_miner import mine_convos
 
     convos, palace = convo_palace
@@ -207,7 +217,7 @@ def test_config_always_defers_a_mine_that_did_not_choose(convo_palace, monkeypat
     assert [d["wing"] for d in hallways_mod.dirty_wings(_palace_config(palace))] == ["chat"]
 
 
-def test_the_deferred_recompute_equals_the_inline_one(convo_palace, tmp_path):
+def test_the_deferred_recompute_equals_the_inline_one(convo_palace, tmp_path, daemon_serving):
     from mempalace.convo_miner import mine_convos
     from mempalace.hallway_refresh import run_refresh
 
@@ -234,7 +244,9 @@ def test_a_refresh_of_a_clean_wing_does_nothing(convo_palace):
     assert result.get("skipped") == "clean"
 
 
-def test_a_deferred_project_mine_also_defers_its_entity_tunnels(tmp_path, monkeypatch):
+def test_a_deferred_project_mine_also_defers_its_entity_tunnels(
+    tmp_path, monkeypatch, daemon_serving
+):
     from mempalace import daemon_queue, miner as miner_mod
 
     monkeypatch.setenv(daemon_queue.STATE_ROOT_ENV, str(tmp_path / "state"))
@@ -429,7 +441,9 @@ def test_an_interactive_mine_through_the_daemon_stays_inline(convo_palace, fast_
     assert _queued_hallway_jobs(palace) == []
 
 
-def test_a_mark_left_by_a_crash_is_processed_when_the_daemon_restarts(convo_palace, fast_refresh):
+def test_a_mark_left_by_a_crash_is_processed_when_the_daemon_restarts(
+    convo_palace, fast_refresh, daemon_serving
+):
     """The mine committed and marked the wing, then the process died before
     any job was queued: the next daemon finds the mark and recomputes."""
     from mempalace.convo_miner import mine_convos
@@ -449,7 +463,9 @@ def test_a_mark_left_by_a_crash_is_processed_when_the_daemon_restarts(convo_pala
     assert _pairs(hallways_mod.list_hallways("chat", config=_palace_config(palace)))
 
 
-def test_a_recompute_killed_mid_run_reruns_after_restart(convo_palace, fast_refresh):
+def test_a_recompute_killed_mid_run_reruns_after_restart(
+    convo_palace, fast_refresh, daemon_serving
+):
     from mempalace import daemon_queue
     from mempalace.convo_miner import mine_convos
 
@@ -466,14 +482,15 @@ def test_a_recompute_killed_mid_run_reruns_after_restart(convo_palace, fast_refr
     assert hallways_mod.dirty_wings(_palace_config(palace)) == []
 
 
-def test_a_mark_that_outlives_its_job_is_queued_again(convo_palace, fast_refresh, monkeypatch):
+def test_a_mark_that_outlives_its_job_is_queued_again(
+    convo_palace, fast_refresh, monkeypatch, daemon_serving
+):
     """A recompute that failed leaves the mark; the daemon queues it again."""
     from mempalace import hallway_refresh
     from mempalace.convo_miner import mine_convos
 
     convos, palace = convo_palace
     mine_convos(str(convos), str(palace), wing="chat", hallways="defer")
-    monkeypatch.setenv("MEMPALACE_HALLWAYS_SETTLE_SECONDS", "3600")
     monkeypatch.setenv("MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS", "0")  # runs the queued job now
     real = hallway_refresh.run_refresh
     attempts = []
@@ -485,6 +502,7 @@ def test_a_mark_that_outlives_its_job_is_queued_again(convo_palace, fast_refresh
         return real(payload)
 
     monkeypatch.setattr(hallway_refresh, "run_refresh", flaky)
+    monkeypatch.setattr(hallway_refresh, "RETRY_FLOOR_SECONDS", 0.5)
 
     _run_daemon_until(palace, lambda rt: len(attempts) >= 2 and _hallway_jobs_done(rt))
 
@@ -524,7 +542,7 @@ def test_cli_mine_recomputes_hallways_inline(convo_palace, monkeypatch):
     assert hallways_mod.dirty_wings(config) == []
 
 
-def test_cli_mine_defer_flag_then_dirty_rebuild(convo_palace, monkeypatch, capsys):
+def test_cli_mine_defer_flag_then_dirty_rebuild(convo_palace, monkeypatch, capsys, daemon_serving):
     convos, palace = convo_palace
     _cli(
         monkeypatch,
@@ -599,3 +617,115 @@ def test_hallway_mode_resolution(monkeypatch, setting, explicit, background, exp
     else:
         monkeypatch.setenv("MEMPALACE_HALLWAYS_DEFER", setting)
     assert MempalaceConfig().hallways_mode(explicit, background=background) == expected
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Nothing stays stale: no daemon, failed jobs, busy wings
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_mark_that_survives_a_recompute_restarts_its_wait_at_the_read(store):
+    """Drawers filed during a recompute are newer than its read, not than the
+    first mark: their wait starts there, so a busy wing past max wait is not
+    recomputed back to back."""
+    import time
+
+    hallways_mod.mark_wing_dirty("w", now=1.0)  # long overdue
+    marked_again = []
+
+    def mine_lands_mid_read():
+        if not marked_again:
+            marked_again.append(hallways_mod.mark_wing_dirty("w"))
+
+    before = time.time()
+    hallways_mod.compute_hallways_for_wing("w", col=_collection(_drawers(), mine_lands_mid_read))
+
+    (mark,) = _dirty("w")
+    assert mark["first_marked_at"] >= before - 1
+
+
+def test_a_deferred_cli_mine_with_no_daemon_recomputes_inline(convo_palace, monkeypatch, capsys):
+    """Daemons are opt-in: with none serving the palace a deferral would sit in a
+    queue nobody reads, so the mine recomputes inline instead."""
+    convos, palace = convo_palace
+    monkeypatch.setenv("MEMPALACE_HALLWAYS_DEFER", "always")
+    _cli(
+        monkeypatch,
+        "--palace",
+        str(palace),
+        "mine",
+        str(convos),
+        "--mode",
+        "convos",
+        "--wing",
+        "chat",
+    )
+
+    config = _palace_config(palace)
+    assert _pairs(hallways_mod.list_hallways("chat", config=config))
+    assert hallways_mod.dirty_wings(config) == []
+    assert _queued_hallway_jobs(palace) == []
+
+
+def test_a_deferred_mine_defers_while_a_daemon_serves_the_palace(convo_palace, monkeypatch):
+    from mempalace import daemon_queue
+    from mempalace.convo_miner import mine_convos
+
+    convos, palace = convo_palace
+    monkeypatch.setattr(daemon_queue, "probe_daemon_health", lambda *a, **k: True)
+    mine_convos(str(convos), str(palace), wing="chat", hallways="defer")
+
+    assert [d["wing"] for d in hallways_mod.dirty_wings(_palace_config(palace))] == ["chat"]
+    assert len(_queued_hallway_jobs(palace)) == 1
+
+
+def test_with_no_daemon_a_mine_runs_the_marks_a_daemon_left(convo_palace, monkeypatch):
+    """A daemon deferred a wing and was then turned off: the next direct mine,
+    of any wing, runs that recompute once it is overdue."""
+    convos, palace = convo_palace
+    config = _palace_config(palace)
+    from mempalace.convo_miner import mine_convos
+
+    monkeypatch.setenv("MEMPALACE_HALLWAYS_DEFER", "never")
+    mine_convos(str(convos), str(palace), wing="left")
+    expected = _pairs(hallways_mod.list_hallways("left", config=config))
+    with hallways_mod._writing(config) as conn:  # the daemon's deferred mine
+        conn.execute("DELETE FROM hallways WHERE wing = 'left'")
+    hallways_mod.mark_wing_dirty("left", config, now=1.0)
+    monkeypatch.delenv("MEMPALACE_HALLWAYS_DEFER")
+
+    other = convos.parent / "other"
+    other.mkdir()
+    (other / "x.txt").write_text(_EXCHANGE * 2, encoding="utf-8")
+    _cli(monkeypatch, "--palace", str(palace), "mine", str(other), "--mode", "convos")
+
+    assert hallways_mod.dirty_wings(config) == []
+    assert _pairs(hallways_mod.list_hallways("left", config=config)) == expected and expected
+
+
+def test_a_failed_recompute_is_retried_after_a_pause_not_at_once(
+    convo_palace, fast_refresh, monkeypatch
+):
+    """An overdue mark whose recompute keeps failing must not spin the daemon."""
+    import time
+
+    from mempalace import hallway_refresh
+    from mempalace.convo_miner import mine_convos
+
+    convos, palace = convo_palace
+    monkeypatch.setattr(hallway_refresh, "_daemon_serves", lambda *a, **k: True)
+    mine_convos(str(convos), str(palace), wing="chat", hallways="defer")
+    monkeypatch.setenv("MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS", "0")
+    attempts = []
+    monkeypatch.setattr(
+        hallway_refresh,
+        "run_refresh",
+        lambda payload: attempts.append(1) or {"success": False, "error": "unreadable"},
+    )
+
+    _run_daemon_until(palace, lambda rt: attempts)
+    time.sleep(1.0)
+
+    assert len(attempts) == 1
+    (retry,) = [j for j in _queued_hallway_jobs(palace) if j.state == "queued"]
+    assert retry.run_after >= time.time() + 30

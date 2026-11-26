@@ -227,6 +227,13 @@ def cmd_mine(args):
         )
         sys.exit(1)
 
+    if not args.dry_run:
+        # A daemon that deferred a wing's hallways and was then stopped leaves
+        # the mark for nobody: with no daemon, the direct mine runs it.
+        from ..hallway_refresh import run_overdue_without_daemon
+
+        run_overdue_without_daemon(palace_path)
+
 
 class UnknownSourceAdapterError(ValueError):
     """Raised when an explicit ``--source`` name is absent from the registry."""
