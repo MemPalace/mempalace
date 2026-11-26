@@ -851,8 +851,9 @@ def _submit_daemon_job(
     payload["palace_path"] = palace_path
     settle, max_wait = _mine_debounce() if kind == "mine" else (0.0, 0.0)
     # A failed enqueue is reported by the hook. Do not spend the daemon's
-    # 30-second maintenance busy timeout in the foreground hook.
-    job = QueueStore(queue_path(palace_path), timeout=0.15).enqueue(
+    # 30-second maintenance busy timeout in the foreground hook, and bound the
+    # wait by wall time (see ``QueueStore.wall_clock_busy``).
+    job = QueueStore(queue_path(palace_path), timeout=0.15, wall_clock_busy=True).enqueue(
         kind,
         payload,
         dedupe_key=dedupe_key,
