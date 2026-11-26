@@ -124,6 +124,16 @@ def cmd_mine(args):
     ):
         return
 
+    # Only convos takes a single file; the other modes walk a tree, so a file
+    # would mine nothing and still report "Done". tool_mine rejects it the same way.
+    if mode != "convos" and os.path.isfile(os.path.expanduser(args.dir)):
+        print(
+            f"mempalace: {mode} mode mines directories; {args.dir!r} is a file — "
+            "pass its directory, or use --mode convos for a single conversation file",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # --redetect-origin re-runs corpus_origin on the current corpus state
     # and overwrites <palace>/.mempalace/origin.json before mining proceeds.
     # Heuristic-only by design — full LLM detection lives on `mempalace init`.
