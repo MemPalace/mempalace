@@ -4080,7 +4080,15 @@ def test_mine_skips_prefetched_files_without_a_per_file_query(tmp_path, monkeypa
     os.utime(edited, (0, os.path.getmtime(edited) + 5))
     mine(str(project_root), palace_path)
     assert asked == ["f1.py", "f1.py"]  # the pre-lock check and the in-lock re-check
-    assert real_check(palace_pkg.get_collection(palace_path), str(edited), check_mtime=True)
+    from mempalace.palace.source_state import SourceStateStore
+
+    assert real_check(
+        palace_pkg.get_collection(palace_path),
+        str(edited),
+        check_mtime=True,
+        owner="project",
+        source_state=SourceStateStore(palace_path),
+    )
 
     # Without the sqlite stream every file takes the per-file check, and
     # is still skipped.

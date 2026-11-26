@@ -1828,6 +1828,43 @@ class TestDeleteBySource:
         assert result["deleted"] == 0 and result["revisions_deleted"] == 1
         assert load_drawer_revisions(palace_path) == []
 
+    def test_delete_by_source_removes_that_sources_records(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.palace.source_state import SourceStateStore, source_stream
+
+        store = SourceStateStore(palace_path)
+        bench = "results_mempal_hybrid_v4_session_1.jsonl"
+        store.mark_complete(source_stream(bench, extract_mode="exchange", wing="bench"))
+        store.mark_pending(source_stream(bench, owner="project", wing="bench"))
+        store.mark_complete(source_stream("notes/clients.md", owner="project", wing="clients"))
+
+        result = tool_delete_by_source(bench, dry_run=False)
+
+        assert result["deleted"] == 2
+        assert store.get_many(extract_mode="exchange", wing="bench") == {}
+        assert store.get_many(owner="project", wing="bench") == {}
+        assert list(store.get_many(owner="project", wing="clients")) == ["notes/clients.md"]
+
+    def test_a_source_with_no_drawers_left_still_loses_its_record(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        self._seed(monkeypatch, config, palace_path, kg)
+        from mempalace.mcp_server import tool_delete_by_source
+        from mempalace.palace.source_state import SourceStateStore, source_stream
+
+        store = SourceStateStore(palace_path)
+        store.mark_complete(source_stream("gone.jsonl", extract_mode="exchange", wing="bench"))
+
+        assert tool_delete_by_source("gone.jsonl")["success"]
+        assert store.get(source_stream("gone.jsonl", extract_mode="exchange", wing="bench"))
+
+        result = tool_delete_by_source("gone.jsonl", dry_run=False)
+        assert result["deleted"] == 0
+        assert store.get(source_stream("gone.jsonl", extract_mode="exchange", wing="bench")) is None
+
     def test_empty_source_file_rejected(self, monkeypatch, config, palace_path, kg):
         self._seed(monkeypatch, config, palace_path, kg)
         from mempalace.mcp_server import tool_delete_by_source

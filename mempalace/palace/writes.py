@@ -59,15 +59,63 @@ def _source_file_delete_ids(
     return ids
 
 
+class SourceStateUnavailable(StaleDrawerPurgeFailed):
+    """The source's record in ``source_state.sqlite3`` could not be written.
+
+    Raised before any drawer write when the pending mark fails, so nothing
+    changed; raised after the drawers when the complete mark fails, which
+    leaves the record pending and the next mine redoes the file (writing
+    nothing that is already there).
+    """
+
+
 class FiledDrawers(int):
-    """How many drawers :func:`write_file_drawers` wrote.
+    """How many drawers :func:`write_file_drawers` actually wrote.
+
+    With a source record (``source_state``) that counts only the drawers
+    added, rewritten or given changed metadata, so a re-file that changed
+    nothing is 0 and the skips gated on "nothing written" (hallways,
+    the post-mine quick_check) fire. Without one it is every drawer filed.
 
     ``unchanged`` is true for a pruning re-file that stored every drawer
     under its old id with its old text and removed nothing, so the file's
-    closets and AAAK summaries still describe it.
+    closets and AAAK summaries still describe it. ``pruned`` is how many
+    stale drawers it removed (record mode only; 0 otherwise).
     """
 
     unchanged = False
+    pruned = 0
+
+
+# Per-source stamps every drawer of a filing carries. They change on every
+# re-mine of a grown file (a convo's ``authored_at`` is the file's newest
+# timestamp) but describe the source, not the drawer, so a difference in them
+# alone never makes a drawer worth rewriting: the source record holds them.
+# A drawer written for another reason gets their new values too, which is
+# what older binaries read.
+_SOURCE_STAMP_KEYS = frozenset(
+    {"filed_at", "authored_at", "source_mtime", "source_fingerprint", "chunk_total"}
+)
+
+# Keys a backend writes on its own; a re-filed drawer never names them.
+_BACKEND_DERIVED_KEYS = frozenset({"last_modified", "_repaired_empty_meta"})
+
+
+def _metadata_changes(old_meta: dict, meta: dict) -> tuple:
+    """``(changed, removed)``: what a re-filed drawer's metadata changes.
+
+    ``changed`` maps every key whose value differs (stamps included, so a
+    drawer that is written carries fresh ones) and is empty when only stamps
+    differ. ``removed`` is the keys the stored drawer has and the new one
+    drops, other than stamps and backend-derived keys.
+    """
+    old = coerce_metadata_types(dict(old_meta or {}))
+    new = coerce_metadata_types(dict(meta))
+    changed = {key: value for key, value in new.items() if old.get(key) != value}
+    removed = set(old) - set(new) - _SOURCE_STAMP_KEYS - _BACKEND_DERIVED_KEYS
+    if not removed and all(key in _SOURCE_STAMP_KEYS for key in changed):
+        return {}, set()
+    return {key: meta[key] for key in changed}, removed
 
 
 def _reusable_vector(vector, dimension: int) -> bool:
@@ -241,6 +289,7 @@ def write_file_drawers(
     owner: Optional[str] = None,
     palace_path: Optional[str] = None,
     prune_wing: Optional[str] = None,
+    source_state=None,
 ) -> int:
     """File one source file's drawers: write the new ones, then drop the stale.
 
@@ -279,6 +328,15 @@ def write_file_drawers(
     since they quote text the file no longer has; drawers whose text did not
     change keep theirs.
 
+    ``source_state`` is the palace's
+    :class:`~mempalace.palace.source_state.SourceStateStore`. With it, a
+    pruning re-file writes only what changed and keeps the file's
+    bookkeeping in one per-source record instead of on every drawer (see
+    :func:`_refile_changed`); the same store must be passed to the mined-set
+    checks that read this source. A non-pruning filing (a skip marker) with a
+    store records the source complete with no ``chunk_total``. Without a
+    store every drawer is rewritten and restamped, as before.
+
     Returns a :class:`FiledDrawers` count of the drawers written. Raises
     :class:`StaleDrawerPurgeFailed` when the stale drawers could not be
     removed and :class:`PriorTextArchiveFailed` when prior text could not be
@@ -290,6 +348,22 @@ def write_file_drawers(
     if owner is not None and owner not in OWNERS:
         raise ValueError(f"unknown drawer owner {owner!r}")
     preserving = owner in PRESERVING_OWNERS
+    if source_state is not None:
+        stream = _source_stream_of(source_file, owner, extract_mode, prune_wing)
+    if source_state is not None and prune:
+        return _refile_changed(
+            collection,
+            source_file,
+            drawers,
+            stream=stream,
+            source_state=source_state,
+            extract_mode=extract_mode,
+            aaak_col=aaak_col,
+            owner=owner,
+            preserving=preserving,
+            palace_path=palace_path,
+            prune_wing=prune_wing,
+        )
     if prune:
         total = len(drawers)
         drawers = [(i, doc, {**meta, "chunk_total": total + 1}) for i, doc, meta in drawers]
@@ -316,6 +390,8 @@ def write_file_drawers(
         written += reuse + to_embed
         rewritten += [drawer_id for drawer_id, _, _ in to_embed]
     if not prune:
+        if source_state is not None:
+            _mark_source(source_state.mark_complete, stream, drawers, extract_mode, None)
         return FiledDrawers(len(written))
 
     fresh = {drawer_id for drawer_id, _, _ in drawers}
@@ -361,4 +437,247 @@ def write_file_drawers(
         )
     filed = FiledDrawers(len(written))
     filed.unchanged = bool(written) and not rewritten and not stale
+    return filed
+
+
+def _source_stream_of(source_file, owner, extract_mode, wing):
+    from .source_state import source_stream
+
+    return source_stream(source_file, owner=owner, extract_mode=extract_mode, wing=wing)
+
+
+def _source_fields(drawers: list, extract_mode: Optional[str], chunk_total) -> dict:
+    """The record fields of one filing, read off the drawers it files."""
+    meta = drawers[0][2] if drawers else {}
+    fields = {
+        "chunk_total": chunk_total,
+        "source_fingerprint": meta.get("source_fingerprint"),
+        "source_mtime": meta.get("source_mtime"),
+        "normalize_version": meta.get("normalize_version"),
+    }
+    if extract_mode in CHUNKER_VERSIONS:
+        fields["chunker_version"] = meta.get(CHUNKER_VERSIONS[extract_mode][0])
+    return fields
+
+
+def _mark_source(mark, stream, drawers, extract_mode, chunk_total) -> None:
+    try:
+        mark(stream, **_source_fields(drawers, extract_mode, chunk_total))
+    except (OSError, sqlite3.Error) as exc:
+        raise SourceStateUnavailable(
+            f"could not record the mining state of {stream.source_file!r} ({exc!r}); "
+            "the next mine retries"
+        ) from exc
+
+
+def _read_stored(collection, ids: list) -> dict:
+    existing = collection.get(ids=ids, include=["documents", "metadatas"])
+    got = existing.get("ids") or []
+    documents = existing.get("documents") or [None] * len(got)
+    metadatas = existing.get("metadatas") or [None] * len(got)
+    return {drawer_id: (doc, meta or {}) for drawer_id, doc, meta in zip(got, documents, metadatas)}
+
+
+def _with_reused_vectors(collection, rows: list, dimension_cache: dict) -> tuple:
+    """Split ``rows`` into ``(reusable, vectors, to_embed)`` by stored vector."""
+    vectors = _stored_vectors(collection, [drawer_id for drawer_id, _, _ in rows])
+    dimension = _probed_dimension(dimension_cache) if vectors else 0
+    reuse, reuse_vectors, to_embed = [], [], []
+    for row in rows:
+        vector = vectors.get(row[0])
+        if _reusable_vector(vector, dimension):
+            reuse.append(row)
+            reuse_vectors.append(vector)
+        else:
+            to_embed.append(row)
+    return reuse, reuse_vectors, to_embed
+
+
+def _probed_dimension(dimension_cache: dict) -> int:
+    """The embedder's dimension, probed at most once per ``dimension_cache``."""
+    if "dimension" not in dimension_cache:
+        from ..embedding import probe_dimension
+
+        dimension_cache["dimension"] = probe_dimension()
+    return dimension_cache["dimension"]
+
+
+def _unusable_vectors(collection, ids: list, dimension_cache: dict) -> set:
+    """Ids among ``ids`` whose stored vector cannot serve the current embedder.
+
+    A re-file repairs those even though their text did not change: Milvus
+    stores an empty vector for a row without one, and ``set-embedder
+    --force`` can leave vectors of another size. Repair is best effort: a
+    failed read, or an embedder whose dimension cannot be probed, repairs
+    nothing rather than rewriting drawers that may be fine.
+
+    ``dimension_cache`` holds the probed dimension for the rest of one
+    filing: a failed probe is not cached process-wide and costs an embedder
+    call, which per batch made an unchanged re-mine of a large file slow.
+
+    Reading the stored vectors of unchanged drawers on every re-file is
+    deliberate: it costs one read per batch and is how a re-mine repairs them.
+    """
+    if not ids:
+        return set()
+    try:
+        got = collection.get(ids=ids, include=["embeddings"])
+    except MINE_ABORTS:
+        raise
+    except Exception:
+        logger.debug("could not read stored vectors to check them", exc_info=True)
+        return set()
+    vectors = got.get("embeddings")
+    if vectors is None:
+        return set()
+    stored = dict(zip(got.get("ids") or [], vectors))
+    dimension = _probed_dimension(dimension_cache)
+    if dimension <= 0:
+        return {i for i in ids if i in stored and (stored[i] is None or len(stored[i]) == 0)}
+    return {i for i in ids if i in stored and not _reusable_vector(stored[i], dimension)}
+
+
+def _refile_changed(
+    collection,
+    source_file: str,
+    drawers: list,
+    *,
+    stream,
+    source_state,
+    extract_mode,
+    aaak_col,
+    owner,
+    preserving: bool,
+    palace_path,
+    prune_wing,
+) -> "FiledDrawers":
+    """Re-file one source writing only what changed, then complete its record.
+
+    Each drawer is compared with what is stored under its id:
+
+    - absent: written (upsert, embedded);
+    - text or embedding title changed: the prior text is journaled for a
+      preserving owner, then the drawer is rewritten and re-embedded;
+    - metadata changed: a metadata-only ``update`` of the changed keys (no
+      document, no vector), or, when a key was dropped, an upsert that
+      reuses the stored vector, since an update cannot remove a key;
+    - only the per-source stamps differ (``_SOURCE_STAMP_KEYS``): nothing.
+
+    The record goes pending before the first write and complete, in one
+    transaction, only after the drawers are written and the stale ones
+    pruned, so a crash anywhere reads as "not mined" and the next mine
+    finishes the job. Drawers written here carry ``chunk_total`` one higher
+    than the count until the prune is done, so binaries that read only the
+    per-row stamps see the same unfinished set they always did; unchanged
+    drawers keep the stamps they were filed with, which those binaries read
+    as an incomplete set and re-mine. Older binaries fail toward redundant
+    work, never toward loss.
+    """
+    total = len(drawers)
+    _mark_source(source_state.mark_pending, stream, drawers, extract_mode, total)
+    drawers = [(i, doc, {**meta, "chunk_total": total + 1}) for i, doc, meta in drawers]
+    merges = getattr(collection, "upsert_merges_metadata", False) is True
+    from ..backends.embedding_wrapper import _metadata_title
+
+    written: list = []
+    rewritten: list = []
+    # Unchanged drawers a crashed earlier pass left with its pending marker.
+    restamp: list = []
+    dimension_cache: dict = {}
+    for start in range(0, len(drawers), DRAWER_UPSERT_BATCH_SIZE):
+        batch = drawers[start : start + DRAWER_UPSERT_BATCH_SIZE]
+        assert_no_collisions([(drawer_id, meta) for drawer_id, _, meta in batch], collection)
+        stored = _read_stored(collection, [drawer_id for drawer_id, _, _ in batch])
+        to_embed, journal, updates, repaired, kept_rows = [], [], [], [], []
+        for drawer_id, doc, meta in batch:
+            if drawer_id not in stored:
+                to_embed.append((drawer_id, doc, meta))
+                continue
+            old_doc, old_meta = stored[drawer_id]
+            if merges:
+                full = {**dict.fromkeys(set(old_meta) - set(meta)), **meta}
+            else:
+                full = meta
+            if old_doc != doc or _metadata_title(old_meta) != _metadata_title(meta):
+                to_embed.append((drawer_id, doc, full))
+                if old_doc != doc:
+                    journal.append((drawer_id, old_doc, old_meta))
+                continue
+            changed, removed = _metadata_changes(old_meta, meta)
+            if removed:
+                repaired.append((drawer_id, doc, full))
+                continue
+            if changed:
+                updates.append((drawer_id, changed))
+            kept_rows.append((drawer_id, doc, full, old_meta))
+        unusable = _unusable_vectors(collection, [row[0] for row in kept_rows], dimension_cache)
+        if unusable:
+            to_embed += [(i, doc, full) for i, doc, full, _ in kept_rows if i in unusable]
+            updates = [update for update in updates if update[0] not in unusable]
+        updated = {drawer_id for drawer_id, _ in updates}
+        restamp += [
+            i
+            for i, _, _, old_meta in kept_rows
+            if old_meta.get("chunk_total") == total + 1 and i not in unusable and i not in updated
+        ]
+        if preserving:
+            _archive_prior_text(palace_path, source_file, journal, "remine_overwrite")
+        reuse, reuse_vectors, re_embed = _with_reused_vectors(collection, repaired, dimension_cache)
+        _upsert(collection, reuse, embeddings=reuse_vectors)
+        _upsert(collection, to_embed + re_embed)
+        if updates:
+            collection.update(
+                ids=[drawer_id for drawer_id, _ in updates],
+                metadatas=[changed for _, changed in updates],
+            )
+        written += [row[0] for row in reuse + to_embed + re_embed] + [u[0] for u in updates]
+        # A vector repair keeps the drawer's text, so its summaries still fit.
+        rewritten += [i for i, _, _ in to_embed if i not in unusable]
+
+    fresh = {drawer_id for drawer_id, _, _ in drawers}
+    kept = 0
+    try:
+        stale = [
+            drawer_id
+            for drawer_id in _source_file_delete_ids(
+                collection, source_file, extract_mode, wing=prune_wing
+            )
+            if drawer_id not in fresh
+        ]
+        if stale and owner is not None:
+            owned, kept = _owned_rows(collection, stale, owner)
+            stale = [drawer_id for drawer_id, _, _ in owned]
+            if preserving:
+                _archive_prior_text(palace_path, source_file, owned, "remine_prune")
+        if stale:
+            collection.delete(ids=stale)
+    except MINE_ABORTS:
+        raise
+    except PriorTextArchiveFailed:
+        raise
+    except Exception as exc:
+        raise StaleDrawerPurgeFailed(
+            f"stale-drawer purge failed for {source_file!r} ({exc!r}); the source "
+            "stays marked unfinished and the next mine retries"
+        ) from exc
+    if kept:
+        logger.info(
+            "kept %d drawers another producer filed under %r while re-filing it as %s",
+            kept,
+            source_file,
+            owner,
+        )
+    if rewritten or stale:
+        drawers_removed(None, aaak_ids=rewritten + stale, aaak_col=aaak_col, reraise=MINE_ABORTS)
+    finished = written + restamp
+    # A second write, even for rows that only got a metadata update: they were
+    # written with chunk_total one too high, so a reader of per-row stamps
+    # (an older binary) never sees a complete set before the prune is done.
+    for start in range(0, len(finished), DRAWER_UPSERT_BATCH_SIZE):
+        batch = finished[start : start + DRAWER_UPSERT_BATCH_SIZE]
+        collection.update(ids=batch, metadatas=[{"chunk_total": total}] * len(batch))
+    _mark_source(source_state.mark_complete, stream, drawers, extract_mode, total)
+    filed = FiledDrawers(len(written))
+    filed.unchanged = bool(drawers) and not rewritten and not stale
+    filed.pruned = len(stale)
     return filed
