@@ -3395,7 +3395,8 @@ class ChromaBackend(BaseBackend):
         if read_only and not os.path.isfile(os.path.join(palace_path, "chroma.sqlite3")):
             raise PalaceNotFoundError(palace_path)
 
-        if caller_vectors:
+        derived_vectors = bool(options and options.get("derived_vectors"))
+        if caller_vectors or derived_vectors:
             # Passing None explicitly prevents Chroma's client default EF.
             ef_kwargs = {
                 "embedding_function": None,
@@ -3422,7 +3423,7 @@ class ChromaBackend(BaseBackend):
                 try:
                     collection = client.get_collection(collection_name, **ef_kwargs)
                 except _ChromaNotFoundError:
-                    if caller_vectors:
+                    if caller_vectors or derived_vectors:
                         collection = client.create_collection(
                             collection_name,
                             schema=_caller_vector_schema(options),
@@ -3462,7 +3463,7 @@ class ChromaBackend(BaseBackend):
             palace_path=palace_path,
             backend=self,
         )
-        wrapped._require_embeddings = caller_vectors
+        wrapped._require_embeddings = caller_vectors or derived_vectors
         return wrapped
 
     def close_palace(self, palace) -> None:

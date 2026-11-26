@@ -230,6 +230,14 @@ def _owned_rows(collection, ids: list, owner: str) -> tuple:
     return owned, kept
 
 
+def _index_windows(windows, written: list) -> None:
+    if windows is None:
+        return
+    from ..subwindows import index_quietly
+
+    index_quietly(windows, written)
+
+
 def write_file_drawers(
     collection,
     source_file: str,
@@ -241,6 +249,7 @@ def write_file_drawers(
     owner: Optional[str] = None,
     palace_path: Optional[str] = None,
     prune_wing: Optional[str] = None,
+    windows=None,
 ) -> int:
     """File one source file's drawers: write the new ones, then drop the stale.
 
@@ -279,6 +288,12 @@ def write_file_drawers(
     since they quote text the file no longer has; drawers whose text did not
     change keep theirs.
 
+    ``windows`` is the palace's :class:`mempalace.subwindows.WindowIndex`
+    when ``embedding_subwindows`` is on. Windows of rewritten or removed
+    drawers are purged with their AAAK summaries, and the written drawers'
+    windows are brought up to date last; a window failure is logged and never
+    fails the file (``mempalace windows build`` retries).
+
     Returns a :class:`FiledDrawers` count of the drawers written. Raises
     :class:`StaleDrawerPurgeFailed` when the stale drawers could not be
     removed and :class:`PriorTextArchiveFailed` when prior text could not be
@@ -316,6 +331,7 @@ def write_file_drawers(
         written += reuse + to_embed
         rewritten += [drawer_id for drawer_id, _, _ in to_embed]
     if not prune:
+        _index_windows(windows, written)
         return FiledDrawers(len(written))
 
     fresh = {drawer_id for drawer_id, _, _ in drawers}
@@ -352,13 +368,20 @@ def write_file_drawers(
             owner,
         )
     if rewritten or stale:
-        drawers_removed(None, aaak_ids=rewritten + stale, aaak_col=aaak_col, reraise=MINE_ABORTS)
+        drawers_removed(
+            None,
+            aaak_ids=rewritten + stale,
+            aaak_col=aaak_col,
+            windows_col=getattr(windows, "collection", None),
+            reraise=MINE_ABORTS,
+        )
     for start in range(0, len(written), DRAWER_UPSERT_BATCH_SIZE):
         batch = written[start : start + DRAWER_UPSERT_BATCH_SIZE]
         collection.update(
             ids=[drawer_id for drawer_id, _, _ in batch],
             metadatas=[{**meta, "chunk_total": total} for _, _, meta in batch],
         )
+    _index_windows(windows, written)
     filed = FiledDrawers(len(written))
     filed.unchanged = bool(written) and not rewritten and not stale
     return filed

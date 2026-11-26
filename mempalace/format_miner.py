@@ -97,6 +97,7 @@ from .palace import (
     write_file_drawers,
 )
 from .source_identity import identity_metadata, source_directory_identity
+from .subwindows import open_window_index
 from .timeutil import utc_now_iso
 
 __all__ = [
@@ -605,6 +606,7 @@ def _file_chunks_locked(
     content: Optional[str] = None,
     source_dir_ino: Optional[str] = None,
     aaak_col=None,
+    windows=None,
 ):
     """Lock the source file and replace its format drawers with fresh chunks.
 
@@ -695,6 +697,7 @@ def _file_chunks_locked(
             extract_mode="format",
             aaak_col=aaak_col,
             owner="format",
+            windows=windows,
         )
     return drawers_added, False
 
@@ -824,6 +827,7 @@ def _mine_formats_impl(
     files: list = []
     collection = None
     aaak_col = None
+    windows = None
     total_drawers = 0
     files_mined = 0
     files_skipped = 0
@@ -852,6 +856,7 @@ def _mine_formats_impl(
 
         collection = get_collection(palace_path) if not dry_run else None
         aaak_col = open_aaak_collection(palace_path) if not dry_run else None
+        windows = open_window_index(palace_path) if not dry_run else None
 
         for i, filepath in enumerate(files, 1):
             collection = _yield_and_reopen(palace_path, collection)
@@ -943,6 +948,7 @@ def _mine_formats_impl(
                     content=text,
                     source_dir_ino=source_directory_identity(filepath),
                     aaak_col=aaak_col,
+                    windows=windows,
                 )
                 if skipped:
                     files_skipped += 1

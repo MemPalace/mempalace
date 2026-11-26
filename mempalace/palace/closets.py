@@ -244,6 +244,25 @@ def purge_file_closets(closets_col, source_file: str) -> None:
         logger.debug("Closet purge failed for %s", source_file, exc_info=True)
 
 
+def open_windows_collection(palace_path: str, *, read_only: bool = False):
+    """The sub-window collection, or None when no window was ever built.
+
+    Also None on a backend that cannot hold windows (it never has any).
+    """
+    try:
+        return get_windows_collection(
+            palace_path, create=False, **({"read_only": True} if read_only else {})
+        )
+    except (CollectionNotInitializedError, PalaceNotFoundError):
+        return None
+    except Exception as exc:
+        from ..subwindows import SubwindowsBackendUnsupported
+
+        if isinstance(exc, SubwindowsBackendUnsupported):
+            return None
+        raise
+
+
 def open_aaak_collection(palace_path: str):
     """The AAAK collection, or None when ``compress`` never created it."""
     try:
@@ -284,6 +303,8 @@ def drawers_removed(
     revision_ids=None,
     revision_source=None,
     aaak_col=None,
+    windows_col=None,
+    windows_source=None,
     reraise=(),
 ) -> dict:
     """Purge what was derived from drawers just deleted or rewritten.
@@ -296,6 +317,11 @@ def drawers_removed(
     ``reraise`` propagate. Returns ``closets_deleted`` when closets were asked
     for, and ``revisions_deleted`` (None plus ``revisions_error`` on failure)
     when revisions were.
+
+    Sub-window vectors (``mempalace.subwindows``) go with the same ids and
+    source as the AAAK summaries, from ``windows_col`` or, given a
+    ``palace_path``, from the windows collection when one exists — whether or
+    not ``embedding_subwindows`` is on now.
     """
     result = {}
     if closet_sources:
@@ -312,6 +338,23 @@ def drawers_removed(
             raise
         except Exception:
             logger.warning("AAAK purge failed for %s", aaak_source or "drawers", exc_info=True)
+    windows_source = windows_source or aaak_source
+    if aaak_ids or windows_source:
+        try:
+            from ..subwindows import windows_may_exist
+
+            if windows_col is None and windows_may_exist(palace_path):
+                windows_col = open_windows_collection(palace_path)
+            if windows_col is not None:
+                from ..subwindows import delete_windows
+
+                delete_windows(windows_col, aaak_ids, windows_source)
+        except reraise:
+            raise
+        except Exception:
+            logger.warning(
+                "Sub-window purge failed for %s", windows_source or "drawers", exc_info=True
+            )
     if revision_ids is None and revision_source is None:
         return result
     if not revision_ids and revision_source is None:

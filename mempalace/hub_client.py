@@ -35,6 +35,7 @@ SEARCH_SETTINGS = (
     ("lang_explicit", ("MEMPALACE_LANG", "MEMPAL_LANG"), None),
     ("hybrid_rank_vector_weight", ("MEMPALACE_HYBRID_VECTOR_WEIGHT",), None),
     ("hybrid_rank_bm25_weight", ("MEMPALACE_HYBRID_BM25_WEIGHT",), None),
+    ("embedding_subwindows", ("MEMPALACE_EMBEDDING_SUBWINDOWS",), None),
     ("embedding_api_key", ("MEMPALACE_EMBEDDING_API_KEY",), ("embedding", "openai-compat")),
     ("embedding_api_model", ("MEMPALACE_EMBEDDING_API_MODEL",), ("embedding", "openai-compat")),
     ("embedding_api_url", ("MEMPALACE_EMBEDDING_API_URL",), ("embedding", "openai-compat")),

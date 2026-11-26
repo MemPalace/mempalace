@@ -23,6 +23,45 @@ def _first_or_empty(results, key: str) -> list:
     return outer[0] or []
 
 
+# A post-filtered fallback widens its unfiltered fetch this many times at most
+# (x4 each time), which covers any collection size.
+_POST_FILTER_WIDEN_STEPS = 16
+
+
+def query_post_filtered(col, query_kwargs: dict, keep, n_results: int, first_fetch: int) -> dict:
+    """The rows a filtered ``col.query`` would return, read without its filter.
+
+    For when the filtered query itself failed (e.g. Chroma's HNSW reader).
+    Runs the query unfiltered and keeps the rows whose metadata ``keep``
+    accepts, widening the fetch until ``n_results`` rows are kept or the
+    collection has no more. A fixed fetch would drop in-scope rows that rank
+    below the global top, so the fallback would find less than the filter.
+    Returns ``ids``, ``metadatas`` and the other requested columns, nearest
+    first, at most ``n_results`` rows.
+    """
+    include = list(query_kwargs.get("include") or ["documents", "metadatas", "distances"])
+    if "metadatas" not in include:
+        include.append("metadatas")
+    base = {k: v for k, v in query_kwargs.items() if k in ("query_embeddings", "query_texts")}
+    fetch = max(1, first_fetch, n_results)
+    for _ in range(_POST_FILTER_WIDEN_STEPS):
+        raw = col.query(**base, n_results=fetch, include=include)
+        metas = _first_or_empty(raw, "metadatas")
+        kept = [i for i, meta in enumerate(metas) if keep(meta or {})]
+        if len(kept) >= n_results or len(metas) < fetch:
+            break
+        fetch *= 4
+    kept = kept[:n_results]
+    ids = list(_first_or_empty(raw, "ids"))
+    ids += [None] * (len(metas) - len(ids))
+    out = {"ids": [[ids[i] for i in kept]]}
+    for key in include:
+        column = list(_first_or_empty(raw, key))
+        column += [None] * (len(metas) - len(column))
+        out[key] = [[column[i] for i in kept]]
+    return out
+
+
 _KNOWN_WINGS_TTL = 30.0
 _known_wings_cache: dict = {}
 

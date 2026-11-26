@@ -364,6 +364,26 @@ def main():
         "--config", default=None, help="Entity config JSON (e.g. entities.json)"
     )
 
+    # windows
+    p_windows = sub.add_parser(
+        "windows",
+        help="Sub-window vectors for drawers longer than the embedder reads",
+        description=(
+            "Embed overlapping windows of drawers longer than the embedding model's "
+            "token window, so search can match their tails. Drawers are never changed; "
+            "windows are derived vectors. Search uses them when embedding_subwindows is on."
+        ),
+    )
+    windows_sub = p_windows.add_subparsers(dest="windows_action")
+    p_windows_build = windows_sub.add_parser(
+        "build", help="Backfill or refresh windows (incremental, resumable)"
+    )
+    p_windows_build.add_argument("--wing", default=None, help="Only drawers of this wing")
+    p_windows_build.add_argument(
+        "--dry-run", action="store_true", help="Count what a build would embed"
+    )
+    windows_sub.add_parser("status", help="Show how many drawers need windows")
+
     # wake-up
     p_wakeup = sub.add_parser("wake-up", help="Show L0 + L1 wake-up context (~600-900 tokens)")
     p_wakeup.add_argument("--wing", default=None, help="Wake-up for a specific project/wing")
@@ -1205,6 +1225,7 @@ def main():
         "mcp": cmd_mcp,
         "serve": cmd_serve,
         "compress": cmd_compress,
+        "windows": cmd_windows,
         "wake-up": cmd_wakeup,
         "repair": cmd_repair,
         "repair-status": cmd_repair_status,

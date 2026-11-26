@@ -76,6 +76,12 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 documents=[entry],
                 metadatas=[{**base_metadata, "chunk_index": 0}],
             )
+            index_after_write(
+                getattr(_config, "palace_path", None),
+                [entry_id],
+                [entry],
+                [{**base_metadata, "chunk_index": 0}],
+            )
             logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic}")
             return {
                 "success": True,
@@ -123,6 +129,7 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
                 }
             )
         col.add(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+        index_after_write(getattr(_config, "palace_path", None), chunk_ids, chunk_docs, chunk_metas)
         logger.info(f"Diary entry: {entry_id} -> {wing}/diary/{topic} ({len(chunk_ids)} chunks)")
         return {
             "success": True,

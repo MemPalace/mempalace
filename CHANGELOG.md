@@ -43,6 +43,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Opt-in sub-window vectors for drawers longer than the embedder reads
+  (#390).** With `embedding_subwindows` on (`config.json` or
+  `MEMPALACE_EMBEDDING_SUBWINDOWS=1`; off by default), mining also embeds
+  overlapping windows of the verbatim text of any drawer past the embedder's
+  token window (MiniLM: 256 tokens), cut with the embedder's own tokenizer.
+  The windows are derived vectors in a sibling `mempalace_drawer_windows`
+  collection that point at their parent drawer and store no text; search
+  scores a drawer by its best window and returns the drawer itself. Drawers
+  never change. `mempalace windows build` backfills an existing palace
+  incrementally and resumably and prunes stale windows; `mempalace windows
+  status` shows how many drawers need them. Deleting or re-mining a drawer
+  purges its windows, and windows built by another embedder or for older
+  text are ignored. Needs `minilm` or `embeddinggemma`; `openai-compat` and
+  `embeddinggemma2` are not supported yet. Needs the `chroma` or
+  `sqlite_exact` backend; any other refuses with a clear error. Turning it on
+  trades some head-of-drawer recall for tail recall: in the PR's benchmark,
+  vector-only queries about a drawer's head fell from 0.390 to 0.240, and
+  hybrid head/paraphrase queries from 0.091 to 0.042, while tail queries
+  gained. Search hits promoted by a window say `matched_via: "window"` and
+  carry `window_span`. `windows build` takes the palace lock per batch, so
+  mines and `sync` keep running during a long build. A wing-scoped search
+  reaches every window of the wing; a room- or source-scoped search whose
+  nearest windows lie outside its scope checks the windows of at most
+  20,000 in-scope drawers and logs at info when it hits that cap.
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
   HTTP-capable clients connect to the running hub (`mempalace serve`)
   directly instead of starting a `mempalace-light-mcp` stdio process per
@@ -120,6 +144,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   ([#3038](https://github.com/MemPalace/mempalace/pull/3038))
 
 ### Bug Fixes
+
+- **A scoped search whose filtered query fails no longer loses in-scope
+  results.** When Chroma refuses a wing/room/source-filtered query (e.g. its
+  Windows HNSW reader error "Nothing found on disk"), the unfiltered +
+  post-filter fallback used to read a fixed top 15×`n_results` of the whole
+  palace and filter that, so an in-scope drawer ranked below it was dropped.
+  The fallback now widens the unfiltered read until it holds as many in-scope
+  rows as the filtered query would return, or the palace has no more; the
+  sub-window queries fall back the same way instead of being skipped.
+- **`mempalace migrate` and the in-place `repair --mode from-sqlite` close
+  this process's own Chroma clients on the palace before moving it aside.**
+  On Windows a directory with an open file cannot be renamed, so an
+  in-process caller that had opened the palace (or its sub-window
+  collection) made the swap fail with "held open by another process".
 
 - **Repair rebuilds keep the re-mine journal and `.mempalace/` and create
   the rebuilt palace owner-only (`0700`).** `repair rebuild-index` and

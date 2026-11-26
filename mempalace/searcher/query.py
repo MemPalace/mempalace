@@ -73,38 +73,109 @@ def _query_drawers_with_filter_fallback(
             "Filtered search failed (%s); falling back to unfiltered + post-filter",
             filter_err,
         )
-        raw = drawers_col.query(
-            query_texts=[query],
-            n_results=min(n_results * 15, 500),
-            include=["documents", "metadatas", "distances"],
-        )
-        raw_docs = _first_or_empty(raw, "documents")
-        raw_ids = _aligned_query_ids(raw, len(raw_docs))
-        fids, fdocs, fmetas, fdists = [], [], [], []
         wings = set(palace_wing_aliases(wing, drawers_col)) if wing else None
-        for stored_drawer_id, doc, meta, dist in zip(
-            raw_ids,
-            raw_docs,
-            _first_or_empty(raw, "metadatas"),
-            _first_or_empty(raw, "distances"),
-        ):
-            meta = meta or {}
+
+        def in_scope(meta):
             if wings and meta.get("wing") not in wings:
-                continue
+                return False
             if room and meta.get("room") != room:
-                continue
-            if source_file and meta.get("source_file") != source_file:
-                continue
-            fids.append(stored_drawer_id)
-            fdocs.append(doc)
-            fmetas.append(meta)
-            fdists.append(dist)
-        return {
-            "ids": [fids],
-            "documents": [fdocs],
-            "metadatas": [fmetas],
-            "distances": [fdists],
-        }
+                return False
+            return not (source_file and meta.get("source_file") != source_file)
+
+        # Widened until the scope's own n_results are found, so the fallback
+        # returns what the filtered query would have (see query_post_filtered).
+        return query_post_filtered(
+            drawers_col,
+            {**dkwargs, "include": ["documents", "metadatas", "distances"]},
+            in_scope,
+            dkwargs.get("n_results") or n_results,
+            first_fetch=min(n_results * 15, 500),
+        )
+
+
+def _subwindow_query_vectors(query: str, col, collection_name=None):
+    """The query's embedding when ``embedding_subwindows`` is on, else None."""
+    from ..subwindows import subwindows_enabled
+
+    if not subwindows_enabled() or "server_embedder" in _backend_capabilities(col):
+        return None
+    from ..config import MempalaceConfig, get_configured_collection_name
+
+    if collection_name and collection_name != get_configured_collection_name():
+        return None
+    if MempalaceConfig().embedding_model not in {"minilm", "embeddinggemma"}:
+        return None
+    from ..backends.embedding_wrapper import _embed_texts
+
+    return _embed_texts([query], query=True)
+
+
+def _drawer_candidates(
+    col,
+    query,
+    *,
+    palace_path,
+    where,
+    pool_size,
+    metric,
+    n_results,
+    wing,
+    room,
+    source_file=None,
+    collection_name=None,
+):
+    vectors = _subwindow_query_vectors(query, col, collection_name) if palace_path else None
+    kwargs = {"query_texts": [query]} if vectors is None else {"query_embeddings": vectors}
+    kwargs.update(n_results=pool_size, include=["documents", "metadatas", "distances"])
+    if where:
+        kwargs["where"] = where
+    rows = _query_drawers_with_filter_fallback(
+        col, kwargs, query, n_results, wing, room, source_file
+    )
+    if vectors is None:
+        return rows
+    return _fold_subwindow_hits(
+        col,
+        rows,
+        palace_path=palace_path,
+        where=where,
+        pool_size=pool_size,
+        metric=metric,
+        query_vectors=vectors,
+    )
+
+
+def _fold_subwindow_hits(
+    drawers_col, drawer_results, *, palace_path, where, pool_size, metric, query_vectors
+):
+    """Fold current window hits into their parents before hybrid reranking."""
+    from ..palace import open_windows_collection
+    from ..subwindows import active_profile, merge_window_hits, window_candidates
+
+    try:
+        windows_col = open_windows_collection(palace_path, read_only=True)
+        if windows_col is None:
+            return drawer_results
+        resolved = active_profile()
+        if resolved is None:
+            return drawer_results
+        best, parents = window_candidates(
+            drawers_col, windows_col, query_vectors, resolved[2].key, where, pool_size
+        )
+        window_metric = _metric_for_collection(windows_col)
+        merged, _promoted = merge_window_hits(
+            drawer_results,
+            best,
+            parents,
+            to_drawer_scale=lambda d: _metric_scale_distance(
+                _cosine_scale_distance(d, window_metric), metric
+            ),
+            limit=pool_size,
+        )
+        return merged
+    except Exception:
+        logger.warning("Sub-window search failed; using drawer vectors only", exc_info=True)
+        return drawer_results
 
 
 def _backend_capabilities(col) -> frozenset:
@@ -358,6 +429,16 @@ def search_memories(
     # regardless of whether the call routes through the vector path or
     # the BM25-only fallback below.
     _validate_candidate_strategy(candidate_strategy)
+    from ..config import get_configured_collection_name
+    from ..palace import WINDOWS_COLLECTION_NAME
+
+    if (
+        collection_name == WINDOWS_COLLECTION_NAME
+        and collection_name != get_configured_collection_name()
+    ):
+        return _search_error_result(
+            "Sub-window vectors must be searched through their parent drawers"
+        )
 
     if include_media or query_task != "search":
         if candidate_strategy == "lexical":
@@ -444,16 +525,21 @@ def search_memories(
         _pool_scale,
     )
     try:
-        dkwargs = {
-            "query_texts": [query],
-            "n_results": pool_size,  # over-fetch for re-ranking
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            dkwargs["where"] = where
-        drawer_results = _query_drawers_with_filter_fallback(
-            drawers_col, dkwargs, query, n_results, wing, room, source_file
+        drawer_results = _drawer_candidates(
+            drawers_col,
+            query,
+            palace_path=palace_path,
+            where=where,
+            pool_size=pool_size,
+            metric=metric,
+            n_results=n_results,
+            wing=wing,
+            room=room,
+            source_file=source_file,
+            collection_name=collection_name,
         )
+        if pre_enrichment_limit == pool_size:
+            pre_enrichment_limit += drawer_results.get("displaced_drawers", 0)
     except Exception as e:
         # The configured embedding function could not be built: the
         # read-only open succeeded, but embedding the query refused (C).
@@ -487,6 +573,8 @@ def search_memories(
     bookkeeping_dropped = 0
     drawer_docs = _first_or_empty(drawer_results, "documents")
     stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
+    # Drawers whose distance came from a sub-window (mempalace.subwindows).
+    window_spans = drawer_results.get("window_spans") or {}
     for stored_drawer_id, doc, meta, dist in zip(
         stored_drawer_ids,
         drawer_docs,
@@ -509,13 +597,14 @@ def search_memories(
         meta = meta or {}
         source = meta.get("source_file", "") or ""
         boost = 0.0
-        matched_via = "drawer"
+        via_window = stored_drawer_id in window_spans
+        matched_via = "window" if via_window else "drawer"
         closet_preview = None
         if source in closet_boost_by_source:
             c_rank, c_dist, c_preview = closet_boost_by_source[source]
             if c_dist <= CLOSET_DISTANCE_CAP and c_rank < len(CLOSET_RANK_BOOSTS):
                 boost = CLOSET_RANK_BOOSTS[c_rank]
-                matched_via = "drawer+closet"
+                matched_via = f"{matched_via}+closet"
                 closet_preview = c_preview
 
         # On the cosine scale, so l2 and ip palaces rank the same way.
@@ -548,6 +637,9 @@ def search_memories(
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
+        if via_window and window_spans[stored_drawer_id]:
+            # Char span of the matching window in ``text``.
+            entry["window_span"] = list(window_spans[stored_drawer_id])
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
@@ -581,6 +673,8 @@ def search_memories(
     if strategy_error:
         return strategy_error
 
+    # With sub-windows on this can exceed pool_size: merge_window_hits keeps
+    # drawers a window displaced past the pool so BM25 still reranks them.
     candidates_fetched = len(_first_or_empty(drawer_results, "documents"))
     envelope = _search_result_envelope(
         query=query,

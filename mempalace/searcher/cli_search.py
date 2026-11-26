@@ -105,7 +105,18 @@ def _print_also_in(hit: dict) -> None:
 
 
 def _cli_ranked_hits(
-    col, query, *, fetch, n_results, where, wing, room, window, metric, stop_words
+    col,
+    query,
+    *,
+    fetch,
+    n_results,
+    where,
+    wing,
+    room,
+    window,
+    metric,
+    stop_words,
+    palace_path=None,
 ):
     """``(hits, fetched, skipped)``: the top ``fetch`` drawers, re-ranked and
     folded, and how many bookkeeping rows the fetch held.
@@ -114,17 +125,17 @@ def _cli_ranked_hits(
     folded copies or skipped rows leave it short.
     """
     try:
-        kwargs = {
-            "query_texts": [query],
-            # The window is a post-filter (ChromaDB can't range-compare
-            # string metadata), and copies folded below free their slots,
-            # so fetch a pool and trim back after both.
-            "n_results": fetch,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-        results = _query_drawers_with_filter_fallback(col, kwargs, query, n_results, wing, room)
+        results = _drawer_candidates(
+            col,
+            query,
+            palace_path=palace_path,
+            where=where,
+            pool_size=fetch,
+            metric=metric,
+            n_results=n_results,
+            wing=wing,
+            room=room,
+        )
     except Exception as e:
         if _model_error_class(e) is not None:
             # The configured embedding function could not be built (C): the
@@ -297,6 +308,7 @@ def search(
             window=(since_dt, before_dt) if date_window_active else None,
             metric=metric,
             stop_words=stop_words,
+            palace_path=palace_path,
         )
         # Folded copies or skipped bookkeeping rows can leave the page short
         # while the fetch came back full, so more candidates exist: widen, as
