@@ -1,0 +1,63 @@
+{
+  "name": "opencode-plugin-mempalace",
+  "version": "1.0.0",
+  "description": "An OpenCode plugin that integrates MemPalace's lifetime memory (L0-L3 memory stack, AAAK compression, auto context saving) into the OpenCode terminal assistant.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js -c jest.config.cjs",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "mempalace",
+    "ai-memory",
+    "context",
+    "aaak",
+    "llm",
+    "terminal"
+  ],
+  "author": "Kevin <131496729+option-K@users.noreply.github.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/milla-jovovich/mempalace.git"
+  },
+  "bugs": {
+    "url": "https://github.com/milla-jovovich/mempalace/issues"
+  },
+  "homepage": "https://github.com/milla-jovovich/mempalace#readme",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "execa": "^5.1.1"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.4.1",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^20.17.19",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "eslint": "^8.57.1",
+    "eslint-config-prettier": "^9.1.2",
+    "jest": "^29.7.0",
+    "prettier": "^3.5.2",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.7.3"
+  }
+}
