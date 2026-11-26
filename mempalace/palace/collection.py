@@ -556,6 +556,11 @@ def get_aaak_collection(
     )
 
 
+# Backends whose windows collection stores the caller's window vectors as
+# given (``derived_vectors``). Tested by tests/test_subwindows_paths.py.
+WINDOW_BACKENDS = frozenset({"chroma", "sqlite_exact"})
+
+
 def get_windows_collection(
     palace_path: str,
     create: bool = True,
@@ -568,10 +573,19 @@ def get_windows_collection(
     Rows are keyed ``<drawer id>::wNNN``, carry ``kind="drawer_window"`` and
     ``window_of`` (the parent drawer id), and hold no text. Search folds them
     into their parent; nothing that lists, counts or exports drawers reads them.
+
+    Only the backends in :data:`WINDOW_BACKENDS` store caller-computed window
+    vectors; any other raises :class:`~mempalace.subwindows.SubwindowsUnsupported`.
     """
     from ..config import get_configured_collection_name
-    from ..subwindows import WINDOWS_MARKER, SubwindowsUnsupported
+    from ..subwindows import WINDOWS_MARKER, SubwindowsBackendUnsupported, SubwindowsUnsupported
 
+    backend_name = resolve_backend_name(palace_path, explicit=backend)
+    if backend_name not in WINDOW_BACKENDS:
+        raise SubwindowsBackendUnsupported(
+            f"Sub-windows are not supported on the {backend_name!r} backend; "
+            f"they need one of: {', '.join(sorted(WINDOW_BACKENDS))}."
+        )
     if get_configured_collection_name() == WINDOWS_COLLECTION_NAME:
         raise SubwindowsUnsupported(
             "The configured drawer collection uses the sub-window collection name."

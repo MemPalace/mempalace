@@ -147,3 +147,14 @@ def make_triple_id(
         f"t_{sub_id}_{predicate}_{obj_id}_"
         f"{_delimited_sha256((valid_from, recorded_at), _HASH_TRUNC_TRIPLE)}"
     )
+
+
+def content_fingerprint(text: str) -> str:
+    """Fingerprint of a drawer's verbatim text: SHA-256, first 32 hex chars.
+
+    Sub-window rows store it as ``parent_sha`` and search compares it with
+    the parent's current text, so a window cut from older text is ignored.
+    Lone surrogates are hashed as-is (``surrogatepass``), never replaced.
+    """
+    data = (text or "").encode("utf-8", "surrogatepass")
+    return hashlib.sha256(data).hexdigest()[:32]

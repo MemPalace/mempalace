@@ -30,18 +30,19 @@ def cmd_windows(args):
         print(line, flush=True)
 
     try:
-        lock = contextlib.nullcontext() if dry_run else mine_palace_lock(palace_path)
-        with lock:
-            stats = build_windows(
-                palace_path,
-                wing=getattr(args, "wing", None),
-                dry_run=dry_run,
-                progress=report,
-            )
+        # The lock is taken per batch, so mines and sync keep writing during a
+        # long build; it waits for a writer that holds it between batches.
+        stats = build_windows(
+            palace_path,
+            wing=getattr(args, "wing", None),
+            dry_run=dry_run,
+            progress=report,
+            lock=None if dry_run else (lambda: mine_palace_lock(palace_path)),
+        )
     except MineAlreadyRunning:
         print(
-            "  Another writer (a mine or the hub) holds this palace's lock;\n"
-            "  run `mempalace windows build` again once it is done."
+            "  Another writer (a mine or the hub) kept this palace's lock too long;\n"
+            "  run `mempalace windows build` again: it resumes where it stopped."
         )
         sys.exit(1)
     except PalaceNotFoundError:

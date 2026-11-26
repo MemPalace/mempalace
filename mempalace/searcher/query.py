@@ -591,6 +591,8 @@ def search_memories(
     bookkeeping_dropped = 0
     drawer_docs = _first_or_empty(drawer_results, "documents")
     stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
+    # Drawers whose distance came from a sub-window (mempalace.subwindows).
+    window_spans = drawer_results.get("window_spans") or {}
     for stored_drawer_id, doc, meta, dist in zip(
         stored_drawer_ids,
         drawer_docs,
@@ -613,13 +615,14 @@ def search_memories(
         meta = meta or {}
         source = meta.get("source_file", "") or ""
         boost = 0.0
-        matched_via = "drawer"
+        via_window = stored_drawer_id in window_spans
+        matched_via = "window" if via_window else "drawer"
         closet_preview = None
         if source in closet_boost_by_source:
             c_rank, c_dist, c_preview = closet_boost_by_source[source]
             if c_dist <= CLOSET_DISTANCE_CAP and c_rank < len(CLOSET_RANK_BOOSTS):
                 boost = CLOSET_RANK_BOOSTS[c_rank]
-                matched_via = "drawer+closet"
+                matched_via = f"{matched_via}+closet"
                 closet_preview = c_preview
 
         # On the cosine scale, so l2 and ip palaces rank the same way.
@@ -652,6 +655,9 @@ def search_memories(
         }
         if closet_preview:
             entry["closet_preview"] = closet_preview
+        if via_window and window_spans[stored_drawer_id]:
+            # Char span of the matching window in ``text``.
+            entry["window_span"] = list(window_spans[stored_drawer_id])
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
@@ -685,6 +691,8 @@ def search_memories(
     if strategy_error:
         return strategy_error
 
+    # With sub-windows on this can exceed pool_size: merge_window_hits keeps
+    # drawers a window displaced past the pool so BM25 still reranks them.
     candidates_fetched = len(_first_or_empty(drawer_results, "documents"))
     envelope = _search_result_envelope(
         query=query,

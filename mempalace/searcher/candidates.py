@@ -130,7 +130,7 @@ def _enrich_closet_hits(hits: list, drawers_col) -> list:
     source_cache: dict = {}
 
     for hit in hits:
-        if hit.get("matched_via") == "drawer":
+        if hit.get("matched_via") in ("drawer", "window"):
             continue
         full_source = hit.get("_source_file_full") or ""
         if not full_source:

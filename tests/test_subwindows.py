@@ -837,3 +837,219 @@ def test_parents_under_falls_back_to_chroma_for_unknown_operators(window_palace)
     assert subwindows._where_matches({"n": 1}, {"n": {"$gt": 2}}) is subwindows._UNSUPPORTED
     got = subwindows._parents_under(col, ["n1", "n2"], {"n": {"$gt": 2}})
     assert list(got) == ["n2"]
+
+
+# ── review fixes ─────────────────────────────────────────────────────────
+
+
+def _late_tail_palace(window_palace):
+    """``late`` (wing ``w``, filed last) holds a tail-only fact; ``noise`` holds nearer ones."""
+    palace, col = window_palace
+    col.upsert(
+        ids=["late"],
+        documents=[_long_text("walrus narwhal expedition logged")],
+        metadatas=[{"wing": "w", "room": "r", "source_file": "/src/late.md"}],
+    )
+    col.upsert(
+        ids=["noise"],
+        documents=[_long_text("walrus narwhal expedition " * 12, filler_words=16)],
+        metadatas=[{"wing": "noise", "room": "r", "source_file": "/src/noise.md"}],
+    )
+    subwindows.build_windows(palace)
+    return palace, col
+
+
+def _candidates(palace, col, where, query="walrus narwhal expedition logged"):
+    from mempalace.palace import get_windows_collection
+
+    return subwindows.window_candidates(
+        col,
+        get_windows_collection(palace),
+        [_truncating_embedding(query)],
+        subwindows.active_profile()[2].key,
+        where,
+        5,
+    )
+
+
+def test_wing_scoped_window_pass_reaches_past_the_scoped_cap(window_palace, monkeypatch):
+    palace, col = _late_tail_palace(window_palace)
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    # Wing w holds 33 drawers; ``late`` was filed last, far past the first five.
+    monkeypatch.setattr(subwindows, "WINDOW_SCOPED_MAX_PARENTS", 5)
+    monkeypatch.setattr(subwindows, "WINDOW_SCOPED_PAGE", 2)
+
+    best, parents = _candidates(palace, col, {"wing": {"$in": ["w"]}})
+
+    assert "late" in best and "noise" not in best
+    assert parents["late"][1]["wing"] == "w"
+
+
+def test_window_rows_carry_the_parent_wing_as_a_hint(window_palace):
+    palace, _ = _late_tail_palace(window_palace)
+    rows = _window_rows(palace)
+    assert rows and all(
+        meta["wing"] == ("noise" if meta["window_of"] == "noise" else "w")
+        for _, meta in rows.values()
+    )
+
+
+def test_a_stale_wing_hint_never_admits_an_out_of_scope_parent(window_palace, monkeypatch):
+    from mempalace.palace import get_windows_collection
+
+    palace, col = _late_tail_palace(window_palace)
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    windows = get_windows_collection(palace)
+    noise_ids = [i for i, (_, m) in _window_rows(palace).items() if m["window_of"] == "noise"]
+    windows.update(ids=noise_ids, metadatas=[{"wing": "w"}] * len(noise_ids))
+
+    best, _ = _candidates(palace, col, {"wing": {"$in": ["w"]}})
+
+    assert "noise" not in best and "late" in best
+
+
+def test_a_moved_drawer_gets_its_hint_back_without_reembedding(window_palace, monkeypatch):
+    palace, col = _late_tail_palace(window_palace)
+    col.update(ids=["late"], metadatas=[{"wing": "moved"}])
+
+    stats = subwindows.build_windows(palace)
+
+    assert stats["embedded"] == 0
+    hints = {m["wing"] for _, m in _window_rows(palace).values() if m["window_of"] == "late"}
+    assert hints == {"moved"}
+
+
+def test_a_capped_room_scoped_pass_logs_at_info(window_palace, monkeypatch, caplog):
+    import logging
+
+    palace, col = _late_tail_palace(window_palace)
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    monkeypatch.setattr(subwindows, "WINDOW_SCOPED_MAX_PARENTS", 5)
+
+    with caplog.at_level(logging.INFO, logger="mempalace.subwindows"):
+        _candidates(palace, col, {"room": "r"})
+
+    assert any(
+        r.levelno == logging.INFO and "limited to 5" in r.getMessage() for r in caplog.records
+    )
+
+
+def _lock_probe(palace) -> str:
+    """Whether another process can take the palace lock right now."""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys\n"
+        "from mempalace.palace import MineAlreadyRunning, mine_palace_lock\n"
+        "try:\n"
+        "    with mine_palace_lock(sys.argv[1]):\n"
+        "        print('took')\n"
+        "except MineAlreadyRunning:\n"
+        "    print('busy')\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script, palace], capture_output=True, text=True, timeout=120
+    )
+    return out.stdout.strip() or out.stderr[-500:]
+
+
+def test_windows_build_lets_another_writer_take_the_lock_between_batches(
+    window_palace, monkeypatch
+):
+    import argparse
+
+    from mempalace.cli import cmd_windows
+
+    palace, _ = window_palace
+    monkeypatch.setattr(subwindows, "BATCH_SIZE", 10)
+    probes = {"inside": [], "between": []}
+    real_index = subwindows.WindowIndex.index
+    real_pages = subwindows._page_rows
+
+    def index(self, rows):
+        if not probes["inside"]:
+            probes["inside"].append(_lock_probe(palace))
+        return real_index(self, rows)
+
+    def pages(*args, **kwargs):
+        for number, page in enumerate(real_pages(*args, **kwargs)):
+            if number == 1:
+                probes["between"].append(_lock_probe(palace))
+            yield page
+
+    monkeypatch.setattr(subwindows.WindowIndex, "index", index)
+    monkeypatch.setattr(subwindows, "_page_rows", pages)
+    cmd_windows(argparse.Namespace(palace=palace, windows_action="build", wing=None, dry_run=False))
+
+    assert probes == {"inside": ["busy"], "between": ["took"]}
+    assert _windows_of(palace, "long_1")
+
+
+def test_windows_build_waits_for_a_writer_between_batches(window_palace, monkeypatch):
+    import contextlib
+
+    from mempalace.palace import MineAlreadyRunning
+
+    palace, _ = window_palace
+    monkeypatch.setattr(subwindows, "LOCK_RETRY_SECONDS", 0.0)
+    refusals = [2]
+
+    @contextlib.contextmanager
+    def lock():
+        if refusals[0]:
+            refusals[0] -= 1
+            raise MineAlreadyRunning("busy")
+        yield
+
+    assert subwindows.build_windows(palace, lock=lock)["embedded"] > 0
+    assert refusals == [0]
+
+    monkeypatch.setattr(subwindows, "LOCK_WAIT_SECONDS", 0.0)
+
+    @contextlib.contextmanager
+    def never():
+        raise MineAlreadyRunning("busy")
+        yield
+
+    with pytest.raises(MineAlreadyRunning):
+        subwindows.build_windows(palace, lock=never)
+
+
+@pytest.mark.parametrize("name", ["qdrant", "pgvector", "milvus", "rust_exact"])
+def test_windows_collection_refuses_backends_without_window_support(palace_path, monkeypatch, name):
+    import mempalace.palace as palace_mod
+    from mempalace.palace import get_windows_collection, open_windows_collection
+
+    monkeypatch.setattr(palace_mod, "resolve_backend_name", lambda *_a, **_k: name)
+    with pytest.raises(subwindows.SubwindowsUnsupported, match=name):
+        get_windows_collection(palace_path)
+    # Readers and purges see "no windows" instead of an error.
+    assert open_windows_collection(palace_path) is None
+
+
+def test_promoted_hits_say_they_matched_via_a_window(window_palace):
+    palace, _ = window_palace
+    subwindows.build_windows(palace)
+
+    hit = _search(palace)["results"][0]
+
+    assert hit["drawer_id"] == "long_1" and hit["matched_via"] == "window"
+    start, end = hit["window_span"]
+    assert "zebra quokka migration" in hit["text"][start:end]
+
+
+def test_merge_reports_the_span_of_each_promoted_window():
+    best = {"p": (0.1, parent_sha("tail text"), (5, 9))}
+    merged, _ = merge_window_hits(
+        _results([]), best, {"p": ("tail text", {})}, to_drawer_scale=float, limit=1
+    )
+    assert merged["window_spans"] == {"p": (5, 9)}
+
+
+def test_parent_sha_is_the_shared_content_fingerprint():
+    from mempalace.ids import content_fingerprint
+
+    assert parent_sha("some text") == content_fingerprint("some text")
+    assert content_fingerprint("some text") == hashlib.sha256(b"some text").hexdigest()[:32]
+    assert content_fingerprint(None) == content_fingerprint("")

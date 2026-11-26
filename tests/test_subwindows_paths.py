@@ -15,6 +15,7 @@ repair) are allowed to leave untrusted windows behind; for those the test
 checks that search ignores them, and that ``windows build`` cleans them up.
 """
 
+import contextlib
 import json
 import math
 from pathlib import Path
@@ -34,6 +35,13 @@ from tests.test_subwindows import (
 )
 
 PROFILE = WindowProfile("test-words", DIM, WINDOW, 4)
+
+
+# The two backends that store window vectors (see ``get_windows_collection``).
+@pytest.fixture(autouse=True, params=["chroma", "sqlite_exact"])
+def backend(request, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_BACKEND", request.param)
+    return request.param
 
 
 @pytest.fixture
@@ -104,6 +112,8 @@ def assert_windows_consistent(palace, *, complete=True, profile=PROFILE):
             untrusted.add(row_id)
             continue
         text = parent[0]
+        # The wing hint the scoped search prefilters by follows the parent.
+        assert meta.get("wing") == parent[1].get("wing"), f"window {row_id} has a stale wing hint"
         start, end = meta["char_start"], meta["char_end"]
         assert 0 <= start < end <= len(text), f"window {row_id} span out of range"
         assert _close(vector, _truncating_embedding(text[start:end])), (
@@ -312,6 +322,13 @@ def test_diary_ingest_and_reingest_keep_windows_current(windows_on, tmp_path):
 @pytest.fixture
 def mcp(windows_on, palace_path, config, monkeypatch):
     from mempalace import mcp_server
+    from mempalace.palace import get_collection
+
+    # sqlite_exact does not create a palace on a read; the MCP tools open with create=False.
+    get_collection(palace_path, create=True)
+    # A stdio MCP opens sqlite_exact read-only until it owns the writer lock;
+    # the tools are called directly here, so it already does.
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", contextlib.nullcontext())
 
     monkeypatch.setattr(mcp_server, "_config", config)
     return palace_path, mcp_server
@@ -486,6 +503,7 @@ def windowed(windows_on, palace_path):
     return palace_path, col
 
 
+@pytest.mark.parametrize("backend", ["chroma"], indirect=True)  # a Chroma-only tool
 def test_prune_corrupt_purges_windows_of_pruned_drawers(windowed):
     from mempalace import repair
 
@@ -498,6 +516,7 @@ def test_prune_corrupt_purges_windows_of_pruned_drawers(windowed):
     assert_windows_consistent(palace)
 
 
+@pytest.mark.parametrize("backend", ["chroma"], indirect=True)  # a Chroma-only tool
 def test_rebuild_from_sqlite_never_yields_a_wrong_window(windowed, tmp_path):
     """A rebuild re-embeds the drawers it restores. Windows are derived data:
     they are either carried over intact, or absent and rebuilt by `windows
@@ -515,6 +534,7 @@ def test_rebuild_from_sqlite_never_yields_a_wrong_window(windowed, tmp_path):
     assert _search_ids(dest, "the tail fact 2 zebra quokka", n_results=1) == ["long_2"]
 
 
+@pytest.mark.parametrize("backend", ["chroma"], indirect=True)  # a Chroma-only tool
 def test_migrate_never_yields_a_wrong_window(windowed):
     from unittest.mock import patch
 
@@ -584,7 +604,7 @@ def test_mcp_listings_and_counts_see_only_drawers(windowed, config, monkeypatch)
 # ── flag off: exactly what develop does ──────────────────────────────────
 
 
-def test_flag_off_mine_write_delete_and_search_never_touch_windows(tmp_path, monkeypatch):
+def test_flag_off_mine_write_delete_and_search_never_touch_windows(tmp_path, monkeypatch, backend):
     """With the flag off and no windows ever built, no path opens the windows
     collection, writes the marker, or runs an extra query."""
     import chromadb
@@ -618,6 +638,7 @@ def test_flag_off_mine_write_delete_and_search_never_touch_windows(tmp_path, mon
     cfg_dir.mkdir()
     (cfg_dir / "config.json").write_text(json.dumps({"palace_path": palace}))
     monkeypatch.setattr(mcp_server, "_config", MempalaceConfig(config_dir=str(cfg_dir)))
+    monkeypatch.setattr(mcp_server, "_MCP_WRITER_LOCK_CM", contextlib.nullcontext())
     added = mcp_server.tool_add_drawer("w", "r", _long_text("an otter"))
     mcp_server.tool_update_drawer(added["drawer_id"], content=_long_text("a heron"))
     mcp_server.tool_delete_drawer(added["drawer_id"])
@@ -634,6 +655,8 @@ def test_flag_off_mine_write_delete_and_search_never_touch_windows(tmp_path, mon
     assert len(queries) == 1 and "query_texts" in queries[0]
     assert opened == []
     assert not Path(palace, subwindows.WINDOWS_MARKER).exists()
+    if backend != "chroma":
+        return
     client = chromadb.PersistentClient(path=palace)
     try:
         names = {c.name if hasattr(c, "name") else c for c in client.list_collections()}
@@ -799,3 +822,89 @@ def test_a_rechunking_move_purges_windows_of_dropped_chunks(mcp, monkeypatch):
     assert server.tool_update_drawer(added["drawer_id"], wing="moved")["success"]
     assert set(_drawers(palace)) < before
     assert_windows_consistent(palace)
+
+
+# ── moves between wings ──────────────────────────────────────────────────
+
+
+def _scoped_window_parents(palace, wing, query):
+    """Parents the scoped window pass finds for ``query`` under ``wing``.
+
+    The global pass is cut to one window, so only the wing-scoped pass can
+    reach a parent.
+    """
+    from mempalace.palace import get_collection, open_windows_collection
+    from tests.test_subwindows import _truncating_embedding
+
+    best, _ = subwindows.window_candidates(
+        get_collection(palace, create=False),
+        open_windows_collection(palace, read_only=True),
+        [_truncating_embedding(query)],
+        PROFILE.key,
+        {"wing": {"$in": [wing]}},
+        5,
+    )
+    return set(best)
+
+
+def _noise(server):
+    # Nearer windows outside every wing the tests scope to.
+    for i in range(3):
+        server.tool_add_drawer("noise", "r", _long_text(f"heron egret ibis {i} " * 6))
+
+
+def test_a_moved_drawers_window_is_found_under_its_new_wing_only(mcp, monkeypatch):
+    palace, server = mcp
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    _noise(server)
+    moved = server.tool_add_drawer("old", "r", _long_text("heron egret ibis spotted"))["drawer_id"]
+    assert _scoped_window_parents(palace, "old", "heron egret ibis spotted") == {moved}
+
+    assert server.tool_update_drawer(moved, wing="new")["success"]
+
+    assert_windows_consistent(palace)
+    assert _scoped_window_parents(palace, "new", "heron egret ibis spotted") == {moved}
+    assert _scoped_window_parents(palace, "old", "heron egret ibis spotted") == set()
+
+
+def test_wing_split_moves_the_window_hints(mcp, config, monkeypatch):
+    from mempalace.palace import get_collection
+    from mempalace.wing_split import apply_split
+
+    palace, server = mcp
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    _noise(server)
+    col = get_collection(palace, create=False)
+    source = "/home/u/.claude/projects/-home-u-dev-proj/s.jsonl"
+    col.upsert(
+        ids=["split_me"],
+        documents=[_long_text("heron egret ibis spotted")],
+        metadatas=[{"wing": "w", "room": "r", "source_file": source}],
+    )
+    subwindows.build_windows(palace)
+    plan = {"wing": "w", "projects": {"-home-u-dev-proj": {"target": "proj", "drawers": 1}}}
+
+    assert apply_split(col, plan, config=config)["moved"] == 1
+
+    assert_windows_consistent(palace)
+    assert _scoped_window_parents(palace, "proj", "heron egret ibis spotted") == {"split_me"}
+
+
+def test_wing_name_migration_moves_the_window_hints(mcp, monkeypatch):
+    from mempalace.migrate import migrate_wing_names
+    from mempalace.palace import get_collection
+
+    palace, server = mcp
+    monkeypatch.setattr(subwindows, "WINDOW_MAX_FETCH", 1)
+    _noise(server)
+    get_collection(palace, create=False).upsert(
+        ids=["renamed"],
+        documents=[_long_text("heron egret ibis spotted")],
+        metadatas=[{"wing": "_odd_wing_", "room": "r", "source_file": "/src/renamed.md"}],
+    )
+    subwindows.build_windows(palace)
+
+    assert migrate_wing_names(palace, confirm=True)
+
+    assert_windows_consistent(palace)
+    assert _scoped_window_parents(palace, "odd_wing", "heron egret ibis spotted") == {"renamed"}

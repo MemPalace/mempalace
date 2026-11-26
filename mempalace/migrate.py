@@ -621,6 +621,9 @@ def _migrate_wing_names_locked(
             return False
 
     _apply_wing_updates(drawers, d_updates)
+    from .subwindows import retag_windows
+
+    retag_windows(palace_path, {rec_id: meta["wing"] for rec_id, meta in d_updates})
     if closets is not None and c_updates:
         _apply_wing_updates(closets, c_updates)
     _apply_topics_by_wing_renames(topic_renames)

@@ -245,13 +245,22 @@ def purge_file_closets(closets_col, source_file: str) -> None:
 
 
 def open_windows_collection(palace_path: str, *, read_only: bool = False):
-    """The sub-window collection, or None when no window was ever built."""
+    """The sub-window collection, or None when no window was ever built.
+
+    Also None on a backend that cannot hold windows (it never has any).
+    """
     try:
         return get_windows_collection(
             palace_path, create=False, **({"read_only": True} if read_only else {})
         )
     except (CollectionNotInitializedError, PalaceNotFoundError):
         return None
+    except Exception as exc:
+        from ..subwindows import SubwindowsBackendUnsupported
+
+        if isinstance(exc, SubwindowsBackendUnsupported):
+            return None
+        raise
 
 
 def open_aaak_collection(palace_path: str):

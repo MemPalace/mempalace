@@ -241,12 +241,15 @@ def plan_targets(plan: dict) -> dict[str, int]:
 # ── apply ────────────────────────────────────────────────────────────────────
 
 
-def _rekey_collection(col, wing: str, targets: dict[str, str], stamp: str, progress=None):
+def _rekey_collection(
+    col, wing: str, targets: dict[str, str], stamp: str, progress=None, *, drawers=False
+):
     """Move every record of ``wing`` whose source file maps to a target.
 
     Returns ``(moved, per_target, skipped)``. Ids are materialized first:
     rewriting ``wing`` while paging a wing-scoped query would shift the pages
-    under the cursor.
+    under the cursor. With ``drawers``, the moved drawers' sub-windows get
+    their new wing hint too.
     """
     per_target: dict[str, int] = defaultdict(int)
     moved = skipped = 0
@@ -258,6 +261,10 @@ def _rekey_collection(col, wing: str, targets: dict[str, str], stamp: str, progr
         if not batch_ids:
             return
         col.update(ids=list(batch_ids), metadatas=list(batch_metas))
+        if drawers:
+            from .subwindows import retag_windows
+
+            retag_windows(col, {i: m["wing"] for i, m in zip(batch_ids, batch_metas)})
         moved += len(batch_ids)
         batch_ids.clear()
         batch_metas.clear()
@@ -360,7 +367,9 @@ def apply_split(
     wing = plan["wing"]
     targets = {key: entry["target"] for key, entry in plan["projects"].items()}
     stamp = utc_now_iso()
-    moved, per_target, skipped = _rekey_collection(col, wing, targets, stamp, progress)
+    moved, per_target, skipped = _rekey_collection(
+        col, wing, targets, stamp, progress, drawers=True
+    )
     closets_moved = 0
     if closets_col is not None:
         closets_moved, _, _ = _rekey_collection(closets_col, wing, targets, stamp)
