@@ -5,9 +5,10 @@ monkeypatched seam, or a child crash placed at an exact storage call -- rather
 than sleeping and hoping a race lines up:
 
 * a queue written by an older daemon, migrated with a crashed run still in it;
-* hooks in separate processes enqueuing at the same moment;
+* hooks in separate processes enqueuing and spawning at the same moment;
 * a mine child killed at every storage call, then re-mined;
 * every write a mine makes reaching the daemon, in order, errors included;
+* a daemon exiting idle while a hook enqueues;
 * a killed mine coming back on its own.
 """
 
@@ -22,11 +23,12 @@ import textwrap
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_mine_child import _EMBEDDER, REAL_CHILD, _child_argv
 
-from mempalace import daemon, daemon_queue
+from mempalace import daemon, daemon_queue, hooks_cli
 from mempalace.mine_supervisor import run_mine_in_child
 
 
@@ -183,7 +185,7 @@ def test_develop_queue_crashed_run_alone_is_requeued_not_lost(tmp_path):
     assert (job.id, job.payload, job.attempts) == ("crashed", {"rev": 1}, 2)
 
 
-# --- Cross-process enqueue races ----------------------------------------------
+# --- Cross-process enqueue and spawn races ------------------------------------
 
 _HOOK_PROCESS = textwrap.dedent(
     """
@@ -211,8 +213,8 @@ _HOOK_PROCESS = textwrap.dedent(
 def test_hooks_in_separate_processes_enqueue_one_job_and_spawn_one_daemon(tmp_path, state, schema):
     """Eight Stop hooks released at once, against a queue that does not exist
     yet or one develop wrote: every hook succeeds inside its busy timeout,
-    they share one queued job holding the last payload written, and none
-    starts a daemon."""
+    they share one queued job holding the last payload written, and exactly
+    one daemon is spawned."""
     qpath = daemon_queue.queue_path(state)
     qpath.parent.mkdir(parents=True, exist_ok=True)
     if schema == "develop":
@@ -223,6 +225,7 @@ def test_hooks_in_separate_processes_enqueue_one_job_and_spawn_one_daemon(tmp_pa
         **os.environ,
         "MEMPALACE_PALACE_PATH": state,
         "MEMPALACE_HOOK_WRITE_ROUTING": "require",
+        "MEMPALACE_HOOK_DAEMON_AUTOSTART": "1",
         "SPAWN_LOG": str(spawn_log),
         "DAEMON_STANDIN_PID": str(standin.pid),
     }
@@ -256,7 +259,78 @@ def test_hooks_in_separate_processes_enqueue_one_job_and_spawn_one_daemon(tmp_pa
     queued = store.list(10)
     assert [j.state for j in queued] == ["queued"]
     assert queued[0].payload["rev"] in range(8)
-    assert not spawn_log.exists(), "a hook started a daemon"
+    assert len(spawn_log.read_text().split()) == 1, "more than one daemon spawned"
+
+
+def test_crashed_daemon_leaves_no_lock_and_a_stale_registration_is_replaced(state, tmp_path):
+    """A daemon killed with SIGKILL: the OS drops its lifetime lock, its pid
+    file points at a dead pid, and the next hook spawns a successor."""
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "from mempalace import daemon_queue\n"
+            "with daemon_queue.daemon_singleton(sys.argv[1]) as won:\n"
+            "    print(won, flush=True)\n"
+            "    time.sleep(600)\n",
+            state,
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert holder.stdout.readline().strip() == "True"
+    daemon_queue._write_private(daemon.pid_path(state), f"{holder.pid}\n")
+    assert daemon_queue.daemon_lock_held(state)
+    assert daemon_queue.spawn_daemon_detached(state) is False, "a live holder must block a spawn"
+    holder.kill()
+    holder.wait()
+
+    assert daemon_queue.daemon_lock_held(state) is False
+    assert daemon_queue.daemon_registered_alive(state) is False
+    spawned = []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(
+            daemon_queue.subprocess,
+            "Popen",
+            lambda *a, **k: spawned.append(a) or SimpleNamespace(pid=os.getpid()),
+        )
+        assert daemon_queue.spawn_daemon_detached(state) is True
+    assert len(spawned) == 1
+    with daemon_queue.daemon_singleton(state, retry_seconds=0) as won:
+        assert won, "the successor can take the lock"
+
+
+def test_no_spawn_while_a_daemon_holds_the_lock_but_is_not_registered(state):
+    """A daemon still importing, or one waiting for the writer lock, holds the
+    lifetime lock before it registers. A hook must not start another."""
+    with daemon_queue.daemon_singleton(state) as won:
+        assert won
+        assert daemon_queue.daemon_registered_alive(state) is False
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(daemon_queue.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned"))
+            assert daemon_queue.spawn_daemon_detached(state) is False
+            assert daemon_queue.spawn_daemon_detached(state, ignore_throttle=True) is False
+
+
+def test_a_daemon_that_dies_at_startup_is_not_respawned_by_every_hook(state, monkeypatch):
+    """The throttle is on the last spawn's age, not on whether it lived: a
+    daemon that crashes on startup must not be restarted by each Stop hook."""
+    spawned = []
+
+    class _DeadOnArrival:
+        pid = 2**22 + 12345  # beyond pid_max: never a live process
+
+        def __init__(self, *a, **kw):
+            spawned.append(a)
+
+    monkeypatch.setattr(daemon_queue.subprocess, "Popen", _DeadOnArrival)
+    assert daemon_queue.spawn_daemon_detached(state) is True
+    assert daemon_queue.spawn_daemon_detached(state) is False
+    assert len(spawned) == 1
+    # The idle handoff still overrides the throttle.
+    assert daemon_queue.spawn_daemon_detached(state, ignore_throttle=True) is True
 
 
 # --- Running job plus one pending rerun ----------------------------------------
@@ -697,6 +771,57 @@ def _serve_in_thread(state, **kwargs):
     thread = threading.Thread(target=_serve, daemon=True)
     thread.start()
     return thread, errors
+
+
+def test_hook_enqueuing_while_the_daemon_exits_idle_gets_a_successor(state, monkeypatch):
+    """The window that strands work: the daemon's idle check saw an empty
+    queue, then a hook enqueues while the daemon is still shutting down. The
+    hook sees the lock held and starts nothing; the exiting daemon, after it
+    lets the lock go, finds the job and starts its successor."""
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", state)
+    monkeypatch.setenv("MEMPALACE_HOOK_WRITE_ROUTING", "require")
+    monkeypatch.setenv("MEMPALACE_HOOK_DAEMON_AUTOSTART", "1")
+    hook_spawns, handoff_spawns, hook_jobs = [], [], []
+    real_drain = daemon._drain_and_cleanup
+
+    def drain_with_a_hook_arriving(runtime, palace_path, previous_env):
+        # Inside the shutdown, after the idle decision: a Stop hook fires.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                daemon_queue.subprocess,
+                "Popen",
+                lambda *a, **k: hook_spawns.append(a) or SimpleNamespace(pid=os.getpid()),
+            )
+            with hooks_cli._hook_trigger("stop"), hooks_cli._hook_write_routing_context():
+                hook_jobs.append(
+                    hooks_cli._submit_daemon_job("mine", {"source": "s"}, dedupe_key="k")
+                )
+        return real_drain(runtime, palace_path, previous_env)
+
+    monkeypatch.setattr(daemon, "_drain_and_cleanup", drain_with_a_hook_arriving)
+    monkeypatch.setattr(
+        daemon,
+        "spawn_daemon_detached",
+        lambda palace, **kw: handoff_spawns.append((palace, kw)) or True,
+    )
+    thread, errors = _serve_in_thread(state, idle_exit_minutes=0.002)
+    thread.join(30)
+    assert not thread.is_alive() and not errors, errors
+    assert hook_jobs and hook_jobs[0]["state"] == "queued"
+    assert hook_spawns == [], "the hook started a daemon while the old one held the lock"
+    assert handoff_spawns == [(state, {"backend": None, "ignore_throttle": True})]
+    assert daemon_queue.daemon_lock_held(state) is False
+    store = daemon_queue.QueueStore(daemon_queue.queue_path(state))
+    assert store.get(hook_jobs[0]["id"]).state == "queued", "the job is still there to run"
+
+
+def test_idle_daemon_with_nothing_queued_starts_no_successor(state, monkeypatch):
+    spawns = []
+    monkeypatch.setattr(daemon, "spawn_daemon_detached", lambda *a, **k: spawns.append(a))
+    thread, errors = _serve_in_thread(state, idle_exit_minutes=0.002)
+    thread.join(30)
+    assert not thread.is_alive() and not errors
+    assert spawns == []
 
 
 # --- A mine cut short comes back -----------------------------------------------

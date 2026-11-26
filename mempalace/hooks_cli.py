@@ -655,14 +655,56 @@ def _daemon_available() -> bool:
     A short localhost health probe (``HOOK_PROBE_TIMEOUT``) from the
     stdlib-only ``daemon_queue`` module: importing ``mempalace.daemon`` pulls
     in the storage stack and alone costs more than the hook budget. A daemon
-    that is registered but does not answer counts as unavailable. Hooks never
-    start the daemon: ``prefer`` may fall back to the direct path when this
-    returns false; ``require`` must block the write.
+    that is registered but does not answer counts as unavailable -- and, being
+    alive, also blocks an auto-start (see ``_daemon_can_start``).
     """
     from .daemon_queue import HOOK_PROBE_TIMEOUT, probe_daemon_health
 
     try:
         return probe_daemon_health(MempalaceConfig().palace_path, timeout=HOOK_PROBE_TIMEOUT)
+    except Exception:
+        return False
+
+
+def _daemon_can_start() -> bool:
+    """Whether this hook may start a daemon.
+
+    Auto-start must be on, no daemon registered alive, no other process
+    holding the palace's writer lock right now, and no daemon refused to start
+    in the last minute for that reason. A daemon started then would only
+    refuse, so ``prefer`` takes its direct path instead of queuing work
+    nothing will run (and a later direct save filing it a second time).
+    """
+    if not _daemon_autostart_enabled():
+        return False
+    from .daemon_queue import (
+        daemon_registered_alive,
+        palace_writer_lock_held,
+        start_recently_refused,
+    )
+
+    try:
+        palace = MempalaceConfig().palace_path
+        return (
+            not daemon_registered_alive(palace)
+            and not start_recently_refused(palace)
+            and not palace_writer_lock_held(palace)
+        )
+    except Exception:
+        return False
+
+
+def _daemon_autostart_enabled() -> bool:
+    """Whether a hook may start the daemon when it is absent.
+
+    Only consulted under ``prefer``/``require``: the default ``direct`` policy
+    never probes or starts a daemon, so daemon mode stays opt-in. Within an
+    opted-in policy the hook starts the daemon detached and returns at once,
+    but only with ``hooks.daemon_autostart: true`` (or
+    ``MEMPALACE_HOOK_DAEMON_AUTOSTART=1``); it is off by default.
+    """
+    try:
+        return MempalaceConfig().hook_daemon_autostart
     except Exception:
         return False
 
@@ -754,13 +796,15 @@ def _compute_hook_write_routing() -> HookWriteRouting:
         )
 
     daemon_available = False
+    daemon_can_start = False
     if resolved.policy is not WriteRoutingPolicy.DIRECT:
         daemon_available = _daemon_available()
+        daemon_can_start = not daemon_available and _daemon_can_start()
 
     decision = choose_write_route(
         resolved.policy,
         daemon_available=daemon_available,
-        daemon_can_start=False,
+        daemon_can_start=daemon_can_start,
     )
     routing = HookWriteRouting(
         decision=decision,
@@ -838,7 +882,9 @@ def _submit_daemon_job(
 
     Writes straight into the daemon's durable SQLite queue through the
     stdlib-only ``daemon_queue`` module -- no HTTP round trip and no import of
-    the storage stack. The running daemon claims the job on its next poll.
+    the storage stack -- then starts the daemon detached if the routing
+    decision says it may and none is registered. The daemon claims the job on
+    its next poll.
 
     Raises on a real failure (queue unwritable). Callers must NOT fall back to
     the direct path on such errors: the row may already be committed, and a
@@ -860,7 +906,23 @@ def _submit_daemon_job(
         settle_seconds=settle,
         max_wait_seconds=max_wait,
     )
+    _ensure_daemon_started(palace_path)
     return {"id": job.id, "state": job.state, "run_after": job.run_after}
+
+
+def _ensure_daemon_started(palace_path: str) -> None:
+    """Start the daemon detached when this hook fire's route allows it."""
+    routing = _current_hook_write_routing()
+    if not routing.use_daemon or not _daemon_autostart_enabled():
+        return
+    from .daemon_queue import spawn_daemon_detached
+
+    try:
+        if spawn_daemon_detached(palace_path):
+            _log("Daemon not running; started it in the background")
+    except Exception as exc:
+        # The job is durable in the queue: it runs when a daemon next starts.
+        _log(f"Daemon background start failed: {exc}; job stays queued")
 
 
 def _maybe_auto_ingest():
@@ -1842,12 +1904,20 @@ def hook_session_start(data: dict, harness: str):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
     # Surface a required-daemon problem at session start instead of waiting
-    # until the first save is due. Hooks still never cold-start the daemon.
+    # until the first save is due. With auto-start on, start the daemon now
+    # (detached), so it is warm by the first Stop.
     with _hook_write_routing_context() as routing:
         if routing.blocked:
             _log_hook_write_blocked(routing, "session-start readiness check")
             _output(_blocked_hook_output(routing))
             return
+        if routing.use_daemon:
+            try:
+                from .daemon_queue import canonical_palace_path
+
+                _ensure_daemon_started(canonical_palace_path(MempalaceConfig().palace_path))
+            except Exception as exc:
+                _log(f"Daemon background start failed: {exc}")
 
     # Pass through — no blocking on session start
     _output({})

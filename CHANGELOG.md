@@ -67,6 +67,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   palace keeps one writer. A heartbeat and reaper kill a child that goes
   silent. Only Linux `SCHED_IDLE` lets the reaper tell a starved child from a
   wedged one; elsewhere a silent background child gets 10 minutes, not 60 s.
+- **Hooks can start the daemon in the background**
+  (`hooks.daemon_autostart: true`, `MEMPALACE_HOOK_DAEMON_AUTOSTART=1`; off by
+  default, and the legacy `hooks.daemon: true` does not turn it on). A daemon
+  a hook started exits after 30 idle minutes. While it runs it holds the
+  palace writer lock, so a writable MCP server or a manual `mempalace mine`
+  is refused until it exits. A hook does not queue work for a daemon it would
+  start while another process holds that lock.
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
   HTTP-capable clients connect to the running hub (`mempalace serve`)
   directly instead of starting a `mempalace-light-mcp` stdio process per

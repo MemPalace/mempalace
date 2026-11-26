@@ -32,35 +32,24 @@ The daemon is not probed.
 
 ### `prefer`
 
-Hooks use the daemon when it is already healthy.
-
-If the daemon is unavailable, hooks retain the historical direct fallback.
+Hooks use the daemon when it is healthy. With auto-start on, they also start it
+(detached) when none is registered. If it cannot be used -- auto-start is off
+(the default), another writer holds the palace lock, or a registered daemon is
+alive but does not answer -- hooks retain the historical direct fallback.
 
 ### `require`
 
-Hooks use the daemon when it is already healthy.
+Hooks use the daemon when it is healthy. With auto-start on, they also start it
+(detached) when none is registered.
 
-If the daemon is unavailable:
+If the daemon cannot be used (auto-start off, another writer holding the palace
+lock, or a registered daemon that does not answer):
 
 - no in-process ChromaDB write runs;
 - no direct `mempalace mine` subprocess is started;
-- no daemon is cold-started from the hook;
 - the hook log records the skipped operation;
 - the hook returns a visible `systemMessage`;
 - the Stop save marker is not advanced, allowing a later retry.
-
-## Why hooks do not start the daemon
-
-Hooks operate under strict latency budgets. Starting a Python daemon and its
-storage dependencies from a Stop or SessionEnd hook can exceed that budget.
-
-A supervised installation using `require` must start the daemon earlier, for
-example at login, plugin initialization, or session setup:
-
-    mempalace daemon start
-
-SessionStart performs a fast health probe in `require` mode and warns early if
-the required daemon is unavailable.
 
 ## How hooks reach the daemon
 
@@ -69,10 +58,31 @@ A hook never waits on the daemon and never imports the storage stack:
 1. It probes `/health` with a 150 ms timeout, using only the standard library.
 2. It writes the job straight into the daemon's durable SQLite queue
    (`mempalace/daemon_queue.py`, which imports neither chromadb nor numpy).
+3. With auto-start on and no daemon registered, it spawns
+   `mempalace.daemon serve` detached (its own session on POSIX; a hidden
+   console and its own process group on Windows) and returns. The daemon's own
+   start-up runs outside the hook budget. SessionStart does the same, so the
+   daemon is usually warm by the first Stop.
+
+Before it queues work for a daemon it would start, the hook probes the palace
+writer lock without waiting. If another process holds it (a writable MCP
+server, a manual `mempalace mine`), a daemon could not take it either, so the
+hook takes the policy's no-daemon path instead of queuing a job nothing runs.
+
+Two hooks may spawn at the same moment. Every daemon takes a per-palace
+lifetime lock (`daemon.lock`) before touching the palace; the loser exits with
+status 0 and the winner drains the queue. Hooks also skip the spawn for
+10 seconds after one, while the first daemon comes up.
 
 Diary checkpoints are queued the same way. The daemon files the drawer and
 then writes the checkpoint ack and the session's save marker, so the marker
 still advances only once the entry is really stored.
+
+A daemon a hook started exits after 30 minutes with nothing running or queued
+(a debounced job not yet due counts as queued), and the next hook starts it
+again. `mempalace daemon start` keeps running unless configured:
+
+    MEMPALACE_DAEMON_IDLE_EXIT_MINUTES=30  # or daemon.idle_exit_minutes; 0 = never
 
 ### Where a daemon mine runs
 
@@ -110,6 +120,25 @@ limit, 10 minutes by default, before it is killed.
 served, seconds since its last message).
 
     MEMPALACE_DAEMON_MINE_STALL_SECONDS=60  # or daemon.mine_stall_seconds; 0 = no reaper
+
+### Turning auto-start on
+
+Auto-start is off by default. A running daemon holds the palace writer lock,
+the same lock a writable MCP server and `mempalace mine` take, so while a
+hook-started daemon idles (up to 30 minutes after the last job) those writers
+are refused. Auto-start only acts under `prefer` or `require`; the default
+`direct` policy never probes or starts a daemon. To let hooks start it:
+
+    MEMPALACE_HOOK_DAEMON_AUTOSTART=1
+
+or in `config.json`:
+
+    {"hooks": {"daemon_autostart": true}}
+
+The legacy `hooks.daemon: true` setting does not turn it on. With auto-start
+off, start the daemon yourself before the first hook:
+
+    mempalace daemon start
 
 ## One decision per hook event
 

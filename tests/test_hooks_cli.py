@@ -968,6 +968,8 @@ def _daemon_env(tmp_path, palace_dir, **extra):
         "MEMPALACE_HOOKS_DAEMON": "yes",
         "MEMPALACE_PALACE_PATH": str(palace_dir),
         "MEMPALACE_DAEMON_STATE_ROOT": str(tmp_path / "daemon_state"),
+        # These tests observe the queue; spawning is covered separately.
+        "MEMPALACE_HOOK_DAEMON_AUTOSTART": "0",
     }
     env.update(extra)
     return env

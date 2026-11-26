@@ -226,6 +226,7 @@ def test_stop_hook_mine_is_queued_with_the_stop_debounce(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(palace))
     monkeypatch.setenv(daemon_queue.STATE_ROOT_ENV, str(tmp_path / "state"))
     monkeypatch.delenv("MEMPALACE_DAEMON_STOP_SETTLE_SECONDS", raising=False)
+    monkeypatch.setattr(hooks_cli, "_ensure_daemon_started", lambda _p: None)
 
     with hooks_cli._hook_trigger("stop"):
         stop = hooks_cli._submit_daemon_job("mine", {"source": "/x"}, dedupe_key="stop-k")

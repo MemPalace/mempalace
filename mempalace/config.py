@@ -1766,6 +1766,24 @@ class MempalaceConfig:
         max_wait = _resolve("MAX_WAIT_SECONDS", "max_wait_seconds", default_max)
         return settle, max_wait
 
+    @property
+    def hook_daemon_autostart(self) -> bool:
+        """Whether hooks start the daemon (detached) when it is not running.
+
+        Consulted only when hook write routing is ``prefer`` or ``require``;
+        the default ``direct`` policy never touches the daemon. Env
+        ``MEMPALACE_HOOK_DAEMON_AUTOSTART`` > config ``hooks.daemon_autostart``
+        > off. Off by default: a started daemon holds the palace writer lock
+        until it exits idle, which refuses MCP writes and manual mines.
+        """
+        flag = env_flag("MEMPALACE_HOOK_DAEMON_AUTOSTART")
+        if flag is not None:
+            return flag
+        hooks = self._file_config.get("hooks", {})
+        value = hooks.get("daemon_autostart", False) if isinstance(hooks, dict) else False
+        parsed = parse_bool(value) if isinstance(value, (bool, str)) else None
+        return parsed is True
+
     def _daemon_section(self) -> dict:
         daemon = self._file_config.get("daemon", {})
         return daemon if isinstance(daemon, dict) else {}
@@ -1823,6 +1841,26 @@ class MempalaceConfig:
         # Below two heartbeats (mine_child.HEARTBEAT_SECONDS = 10) a healthy
         # child computing between storage calls would be killed.
         return value if value == 0 else max(value, 20.0)
+
+    @property
+    def daemon_idle_exit_minutes(self) -> "float | None":
+        """Minutes with an empty queue after which the daemon exits, if set.
+
+        Env ``MEMPALACE_DAEMON_IDLE_EXIT_MINUTES`` > config
+        ``daemon.idle_exit_minutes``; ``0`` never exits. ``None`` when neither
+        is set: a hook-started daemon then exits after 30 idle minutes (the
+        next hook starts it again), and ``mempalace daemon start`` keeps
+        running.
+        """
+        raw = os.environ.get("MEMPALACE_DAEMON_IDLE_EXIT_MINUTES")
+        if raw is None:
+            raw = self._daemon_section().get("idle_exit_minutes")
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            return max(0.0, float(str(raw).strip()))
+        except (TypeError, ValueError):
+            return None
 
     @property
     def hook_use_daemon(self):

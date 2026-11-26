@@ -32,14 +32,17 @@ from ._proc import (
     safe_module_argv as _safe_module_argv,
 )
 from .daemon_queue import (  # noqa: F401 - re-exported for existing callers
+    EXIT_ALREADY_RUNNING,
     HOOK_PROBE_TIMEOUT,
     JOB_RETENTION_DAYS,
     LOCK_REFUSAL_ERROR_CLASS,
     MAX_ATTEMPTS,
     QUEUE_SCHEMA_VERSION,
+    SPAWN_STAMP_NAME,
     STATE_ROOT_ENV,
     SUPERSEDED_ERROR_CLASS,
     TERMINAL_STATES,
+    DaemonAlreadyRunning,
     DaemonError,
     DaemonWaitTimeout,
     Job,
@@ -52,12 +55,18 @@ from .daemon_queue import (  # noqa: F401 - re-exported for existing callers
     _registered_pid,
     _write_private,
     canonical_palace_path,
+    clear_start_refused,
+    daemon_lock_held,
+    daemon_registered_alive,
+    daemon_singleton,
     endpoint_path,
     job_deferred_by_lock,
     job_to_dict,
     palace_key,
     pid_path,
     queue_path,
+    record_start_refused,
+    spawn_daemon_detached,
     state_dir,
     state_root,
 )
@@ -97,6 +106,9 @@ SHUTDOWN_DRAIN_SECONDS = 10.0
 # file), this many seconds times the attempt number later, until the job's
 # MAX_ATTEMPTS claims are spent.
 MINE_RETRY_BACKOFF_SECONDS = 30.0
+# How long a hook-started daemon keeps retrying a writer lease another process
+# holds, while jobs are queued, before it gives up and exits.
+WRITER_LEASE_WAIT_SECONDS = 600.0
 # Results of a mine cut short in its child rather than failed by the mine.
 MINE_CHILD_CUT_SHORT = ("MineChildKilled", "MineChildDied")
 try:
@@ -168,11 +180,14 @@ class DaemonRuntime:
         # (single-writer backends). A mine child counts it as held only then;
         # otherwise the child takes the lock itself, as any other miner would.
         self.holds_palace_lock = True
+        # Set when the idle watch stopped the server (see run_server).
+        self.idle_exited = False
         self.worker_threads: dict[str, threading.Thread] = {}
         # job_id -> monotonic deadline before which a lock-refused job is not
         # re-claimed. Each lane only touches its own jobs' entries.
         self._deferred_until: dict[str, float] = {}
         self._deferred_lock = threading.Lock()
+        self._last_busy = time.monotonic()
 
     @property
     def active_job_id(self) -> str | None:
@@ -213,6 +228,22 @@ class DaemonRuntime:
 
     def alive_workers(self) -> list[threading.Thread]:
         return [thread for thread in self.worker_threads.values() if thread.is_alive()]
+
+    def idle_seconds(self) -> float:
+        """How long nothing has been running or waiting in the queue."""
+        now = time.monotonic()
+        if self.active_jobs:
+            self._last_busy = now
+            return 0.0
+        try:
+            queued = self.store.counts().get("queued", 0)
+        except Exception:  # noqa: BLE001 - an unreadable queue is not idleness
+            queued = 1
+        if queued:
+            # A debounced job not yet due still keeps the daemon up to run it.
+            self._last_busy = now
+            return 0.0
+        return now - self._last_busy
 
     def progress(self) -> dict | None:
         child = self.active_child
@@ -387,6 +418,7 @@ class DaemonRuntime:
                 )
             finally:
                 self.active_jobs.pop(lane, None)
+                self._last_busy = time.monotonic()
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict[str, Any]) -> None:
@@ -526,7 +558,47 @@ def _ensure_lifecycle_logging() -> None:
     _lifecycle_logging_ready = True
 
 
-def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -> None:  # noqa: C901
+def _resolve_idle_exit_minutes(default: float | None) -> float:
+    try:
+        from .config import MempalaceConfig
+
+        configured = MempalaceConfig().daemon_idle_exit_minutes
+    except Exception:  # noqa: BLE001 - a bad config must not stop the daemon
+        configured = None
+    if configured is not None:
+        return configured
+    return default or 0.0
+
+
+def _start_idle_exit_watch(runtime: "DaemonRuntime", httpd, idle_minutes: float) -> None:
+    """Stop serving once the queue has been empty for ``idle_minutes``."""
+    limit = idle_minutes * 60.0
+    tick = max(0.05, min(10.0, limit / 4))
+
+    def watch() -> None:
+        while not runtime.shutdown_event.wait(tick):
+            if runtime.idle_seconds() >= limit:
+                _LIFECYCLE_LOGGER.info("idle for %g min with an empty queue; exiting", idle_minutes)
+                runtime.idle_exited = True
+                runtime.shutdown_event.set()
+                httpd.shutdown()
+                return
+
+    threading.Thread(target=watch, name="mempalace-daemon-idle-exit", daemon=True).start()
+
+
+def run_server(  # noqa: C901
+    palace_path: str,
+    *,
+    backend: str | None = None,
+    port: int = 0,
+    idle_exit_minutes: float | None = None,
+) -> None:
+    """Serve the palace's queue until shutdown.
+
+    ``idle_exit_minutes`` is the default idle exit when config sets none
+    (``daemon.idle_exit_minutes``); ``None`` or ``0`` keeps serving.
+    """
     palace_path = canonical_palace_path(palace_path)
     previous_env = {
         "MEMPALACE_PALACE_PATH": os.environ.get("MEMPALACE_PALACE_PATH"),
@@ -547,18 +619,44 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     runtime = None
     writer_lease = contextlib.ExitStack()
     try:
+        # One daemon per palace, whoever started it (a hook's detached spawn,
+        # ``daemon start``, a service manager). Taken first, before the palace
+        # is touched, and held for the life of the process.
+        if not writer_lease.enter_context(daemon_singleton(palace_path)):
+            raise DaemonAlreadyRunning(f"a daemon is already running for {palace_path!r}")
         resolved_backend = resolve_backend_name(palace_path, explicit=backend)
         if backend_requires_single_writer(resolved_backend):
-            try:
-                writer_lease.enter_context(mine_palace_lock(palace_path))
-            except MineAlreadyRunning as exc:
-                raise DaemonError(
-                    "writable daemon startup refused: another writer owns "
-                    f"local backend {resolved_backend!r} for {palace_path!r}; "
-                    "stop the existing writable MCP/direct/daemon owner, or "
-                    "route all writes through that owner"
-                ) from exc
+            delay = 1.0
+            lease_deadline = time.monotonic() + WRITER_LEASE_WAIT_SECONDS
+            while True:
+                try:
+                    writer_lease.enter_context(mine_palace_lock(palace_path))
+                    break
+                except MineAlreadyRunning as exc:
+                    message = (
+                        "writable daemon startup refused: another writer owns "
+                        f"local backend {resolved_backend!r} for {palace_path!r}; "
+                        "stop the existing writable MCP/direct/daemon owner, or "
+                        "route all writes through that owner"
+                    )
+                    # Hooks read this and stop starting daemons that would only
+                    # refuse again; ``prefer`` then takes its direct path.
+                    record_start_refused(palace_path, message)
+                    # A hook has already committed its job. Retain the daemon
+                    # singleton and retry the writer lease without another hook,
+                    # for a bounded time: a writer that never lets go must not
+                    # leave an unregistered daemon holding the singleton forever.
+                    # The job stays queued for the next daemon.
+                    if (
+                        idle_exit_minutes is None
+                        or time.monotonic() >= lease_deadline
+                        or not QueueStore(queue_path(palace_path)).counts().get("queued")
+                    ):
+                        raise DaemonError(message) from exc
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30)
         holds_palace_lock = backend_requires_single_writer(resolved_backend)
+        clear_start_refused(palace_path)
 
         token = ensure_token(palace_path)
         # Backend resolution above is only the ownership decision. Preserve
@@ -735,6 +833,9 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                 palace_path,
             )
             runtime.start_worker()
+            idle_minutes = _resolve_idle_exit_minutes(idle_exit_minutes)
+            if idle_minutes > 0:
+                _start_idle_exit_watch(runtime, httpd, idle_minutes)
             try:
                 httpd.serve_forever(poll_interval=0.5)
             finally:
@@ -743,6 +844,28 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
     finally:
         _close_or_defer_writer_lease(writer_lease, runtime)
         _restore_server_process_state(previous_env, prev_umask)
+        if runtime is not None and runtime.idle_exited:
+            _hand_off_late_work(runtime, palace_path, backend)
+
+
+def _hand_off_late_work(runtime: "DaemonRuntime", palace_path: str, backend: str | None) -> None:
+    """Start a successor if a job was queued while this idle daemon exited.
+
+    A hook that enqueued after the idle check but before the registration was
+    removed saw this daemon alive and started none. By now the registration
+    and the lifetime lock are gone, so a hook enqueuing from here on starts
+    its own; this check covers the jobs that arrived before.
+    """
+    try:
+        queued = runtime.store.counts().get("queued", 0)
+    except Exception:  # noqa: BLE001 - best-effort; the next hook starts one anyway
+        return
+    if queued:
+        _LIFECYCLE_LOGGER.info("%d job(s) arrived while exiting; starting a successor", queued)
+        try:
+            spawn_daemon_detached(palace_path, backend=backend, ignore_throttle=True)
+        except Exception:  # noqa: BLE001 - the jobs stay queued for the next hook
+            pass
 
 
 def _drain_and_cleanup(
@@ -792,7 +915,11 @@ def _drain_and_cleanup(
             result={"success": False, "exit_code": 1},
             error={"message": "cancelled by daemon shutdown"},
         )
-    for stale in (endpoint_path(palace_path), pid_path(palace_path)):
+    for stale in (
+        state_dir(palace_path) / SPAWN_STAMP_NAME,
+        endpoint_path(palace_path),
+        pid_path(palace_path),
+    ):
         try:
             stale.unlink()
         except OSError:
@@ -1141,7 +1268,11 @@ def _remove_registration(palace_path: str, *, expected_pid: int | None = None) -
     """
     if expected_pid is not None and _registered_pid(palace_path) != expected_pid:
         return
-    for stale in (endpoint_path(palace_path), pid_path(palace_path)):
+    for stale in (
+        state_dir(palace_path) / SPAWN_STAMP_NAME,
+        endpoint_path(palace_path),
+        pid_path(palace_path),
+    ):
         try:
             stale.unlink()
         except OSError:
@@ -1205,7 +1336,12 @@ def start_daemon(
     # replaced below.
     _refuse_live_registration(palace_path)
 
-    _remove_registration(palace_path)
+    # A daemon a hook started may have taken the lifetime lock since the
+    # probe above and be about to register, or have just registered. Its
+    # registration is not stale; the server spawned below loses the lock and
+    # exits 0, and the loop waits for that daemon to answer instead.
+    if not daemon_lock_held(palace_path):
+        _remove_registration(palace_path)
     # Started from the caller's cwd, which may be an untrusted checkout: run
     # the installed module, never one planted in the working directory.
     cmd = _safe_module_argv("mempalace.daemon", "serve", "--palace", palace_path)
@@ -1226,8 +1362,10 @@ def start_daemon(
         deadline = time.monotonic() + timeout
         last_error = None
         while time.monotonic() < deadline:
-            if proc.poll() is not None:
+            if proc.poll() is not None and proc.returncode != EXIT_ALREADY_RUNNING:
                 raise DaemonError(f"daemon exited during startup with code {proc.returncode}")
+            # A clean exit means another daemon (say, one a hook spawned) won
+            # the lifetime lock: keep polling until that one answers.
             try:
                 client = DaemonClient(palace_path)
                 client.health()
@@ -1334,7 +1472,19 @@ def stop_daemon(palace_path: str) -> bool:
 
 
 def _cmd_serve(args) -> None:
-    run_server(args.palace, backend=args.backend, port=args.port)
+    try:
+        run_server(
+            args.palace,
+            backend=args.backend,
+            port=args.port,
+            idle_exit_minutes=args.idle_exit_default,
+        )
+    except DaemonAlreadyRunning as exc:
+        # Losing the start race is the expected outcome of two hooks spawning
+        # at once, not an error: the winner serves the queue.
+        _ensure_lifecycle_logging()
+        _LIFECYCLE_LOGGER.info("not starting: %s", exc)
+        sys.exit(EXIT_ALREADY_RUNNING)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1344,6 +1494,8 @@ def main(argv: list[str] | None = None) -> None:
     serve.add_argument("--palace", required=True)
     serve.add_argument("--backend", default=None)
     serve.add_argument("--port", type=int, default=0)
+    # Idle exit when config sets none; hooks pass 30 for the daemon they start.
+    serve.add_argument("--idle-exit-default", type=float, default=None)
     args = parser.parse_args(argv)
     if args.command == "serve":
         _cmd_serve(args)

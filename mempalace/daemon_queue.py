@@ -1,6 +1,6 @@
 """The daemon's durable job queue and on-disk registration, stdlib-only.
 
-Hooks enqueue into this queue and probe the daemon from here, so this module
+Hooks enqueue into this queue and start the daemon from here, so this module
 must stay cheap to import: it may not import ``chromadb``, ``numpy``,
 ``onnxruntime`` or anything under ``mempalace.palace`` / ``mempalace.backends``
 (``tests/test_daemon_autostart.py`` checks it). ``mempalace.daemon``
@@ -887,6 +887,269 @@ def _registered_pid(palace_path: str) -> int | None:
         return int(pid)
     except (TypeError, ValueError):
         return None
+
+
+# --- Single-instance guard and detached start ------------------------------
+#
+# Hooks start the daemon without waiting for it (the Gradle/Bazel
+# client-starts-daemon pattern): a detached spawn costs a few milliseconds in
+# the hook, and the daemon's own start-up (importing the storage stack) runs
+# outside the hook budget. Correctness against two daemons does not rest on
+# the hook's check -- the hook exits long before its child is up -- but on
+# ``daemon.lock``, which every ``serve`` takes for its whole lifetime before
+# touching the palace. A second daemon that loses that race exits quietly.
+
+DAEMON_LOCK_NAME = "daemon.lock"
+SPAWN_STAMP_NAME = "spawn.stamp"
+# A daemon takes about a second to register. Hooks that fire inside that
+# window skip the spawn instead of each paying for a Python start that would
+# only lose the lock race.
+SPAWN_THROTTLE_SECONDS = 10.0
+# A daemon a hook started exits after this many minutes with nothing to do,
+# unless daemon.idle_exit_minutes says otherwise; the next hook restarts it.
+AUTOSTART_IDLE_EXIT_MINUTES = 30
+# ``serve`` exit status when another daemon already owns this palace.
+EXIT_ALREADY_RUNNING = 0
+
+
+class DaemonAlreadyRunning(DaemonError):
+    """Raised by ``run_server`` when another daemon holds ``daemon.lock``."""
+
+
+def _try_lock_nonblocking(fh) -> bool:
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        fcntl = None
+    if fcntl is not None:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+    import msvcrt  # pragma: no cover - Windows
+
+    try:  # pragma: no cover - Windows
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:  # pragma: no cover - Windows
+        return False
+
+
+def _unlock(fh) -> None:
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        fcntl = None
+    try:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        else:  # pragma: no cover - Windows
+            import msvcrt
+
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+# How long a starting daemon keeps trying for the lifetime lock. Long enough
+# to ride out a hook's momentary probe of it (``daemon_lock_held``), short
+# enough that the loser of a real start race exits quickly.
+SINGLETON_RETRY_SECONDS = 2.0
+
+
+@contextlib.contextmanager
+def daemon_singleton(palace_path: str, *, retry_seconds: float = SINGLETON_RETRY_SECONDS):
+    """Hold this palace's daemon lifetime lock; yield whether it was won.
+
+    The OS drops the lock when the holder exits, however it exits, so a
+    crashed daemon never blocks its successor.
+    """
+    sd = state_dir(palace_path)
+    sd.mkdir(parents=True, exist_ok=True)
+    _chmod_dir_private(sd)
+    fh = open(sd / DAEMON_LOCK_NAME, "a+")
+    try:
+        _chmod_private(sd / DAEMON_LOCK_NAME)
+        won = _try_lock_nonblocking(fh)
+        deadline = time.monotonic() + retry_seconds
+        while not won and time.monotonic() < deadline:
+            time.sleep(0.05)
+            won = _try_lock_nonblocking(fh)
+        yield won
+    finally:
+        fh.close()
+
+
+def daemon_lock_held(palace_path: str) -> bool:
+    """Whether some process holds this palace's daemon lifetime lock.
+
+    Probes the lock without waiting and drops it at once if it was free. A
+    daemon starting at that instant retries for ``SINGLETON_RETRY_SECONDS``,
+    so the probe cannot cost it the start.
+    """
+    path = state_dir(palace_path) / DAEMON_LOCK_NAME
+    try:
+        fh = open(path, "r+")
+    except OSError:
+        return False  # no daemon has ever run for this palace
+    try:
+        if _try_lock_nonblocking(fh):
+            _unlock(fh)
+            return False
+        return True
+    finally:
+        fh.close()
+
+
+def daemon_registered_alive(palace_path: str) -> bool:
+    """True when a daemon is registered, its pid is alive, and it holds the lock.
+
+    A file read, a signal-0 probe and a lock probe: no HTTP, so a hook can
+    afford it. The lock probe catches a registration a crashed daemon left
+    behind whose pid the OS has since given to another process.
+    """
+    from ._proc import pid_alive
+
+    pid = _registered_pid(palace_path)
+    if pid is None or not pid_alive(pid):
+        return False
+    return daemon_lock_held(palace_path)
+
+
+def _palace_writer_lock_paths(palace_path: str) -> list[str]:
+    """The lock files ``mine_palace_lock`` takes, computed without importing it.
+
+    Keep in step with ``palace_lock._palace_side_lock_path`` and the
+    ``mine_palace_<key>.lock`` name there; a test checks they match.
+    """
+    found = [
+        os.path.join(
+            paths.lock_dir(), f"mine_palace_{paths.palace_key(palace_path, length=16)}.lock"
+        )
+    ]
+    parent, name = os.path.split(paths.canonical_palace_path(palace_path))
+    if name:
+        found.append(os.path.join(parent, f".{name}.mempalace.lock"))
+    return found
+
+
+def palace_writer_lock_held(palace_path: str) -> bool:
+    """Whether some process holds the palace's writer lock right now.
+
+    Probes each lock file without waiting and drops it at once. A missing
+    file, or one that is not a regular file, counts as free.
+    """
+    import stat
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    for path in _palace_writer_lock_paths(palace_path):
+        try:
+            fd = os.open(path, flags | getattr(os, "O_BINARY", 0))
+        except OSError:
+            continue
+        with os.fdopen(fd, "rb", buffering=0) as fh:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                continue
+            if not _try_lock_nonblocking(fh):
+                return True
+            _unlock(fh)
+    return False
+
+
+# Written by a daemon that could not take the palace's writer lock (another
+# writer owns a single-writer backend). Hooks stop starting daemons that would
+# only refuse again, and ``prefer`` falls back to its direct path.
+START_REFUSED_NAME = "start.refused"
+START_REFUSED_TTL_SECONDS = 60.0
+
+
+def record_start_refused(palace_path: str, message: str) -> None:
+    try:
+        sd = state_dir(palace_path)
+        sd.mkdir(parents=True, exist_ok=True)
+        _write_private(sd / START_REFUSED_NAME, json.dumps({"ts": time.time(), "error": message}))
+    except OSError:
+        pass
+
+
+def clear_start_refused(palace_path: str) -> None:
+    try:
+        (state_dir(palace_path) / START_REFUSED_NAME).unlink()
+    except OSError:
+        pass
+
+
+def start_recently_refused(palace_path: str) -> bool:
+    try:
+        age = time.time() - (state_dir(palace_path) / START_REFUSED_NAME).stat().st_mtime
+    except OSError:
+        return False
+    return age < START_REFUSED_TTL_SECONDS
+
+
+def spawn_daemon_detached(
+    palace_path: str, *, backend: str | None = None, ignore_throttle: bool = False
+) -> bool:
+    """Start a daemon for ``palace_path`` in the background; never wait for it.
+
+    Returns True when a process was spawned. Skips the spawn when any process
+    holds the palace's daemon lock, when another launcher is inside this
+    function, or when this function spawned one less than
+    ``SPAWN_THROTTLE_SECONDS`` ago (whether or not it is still alive). The child runs in its own session (POSIX) or
+    process group without a console window (Windows; see ``_detached_kwargs``
+    for why that is ``CREATE_NO_WINDOW`` rather than ``DETACHED_PROCESS``), so
+    it survives the hook and the terminal that ran it.
+    """
+    from ._proc import safe_child_env, safe_module_argv
+
+    palace_path = canonical_palace_path(palace_path)
+    # Any holder of the lifetime lock will run what is queued: a registered
+    # daemon, one still starting up, one waiting for the writer lock, and one
+    # exiting idle (which re-checks the queue after it lets the lock go; see
+    # ``daemon._hand_off_late_work``). A second server would only lose the lock.
+    if daemon_lock_held(palace_path):
+        return False
+    sd = state_dir(palace_path)
+    sd.mkdir(parents=True, exist_ok=True)
+    _chmod_dir_private(sd)
+    stamp = sd / SPAWN_STAMP_NAME
+    # The lifetime lock admits one server. This separate, short reservation
+    # also admits just one launcher while the server is still importing.
+    with open(sd / "spawn.lock", "a+b") as launch_lock:
+        if not _try_lock_nonblocking(launch_lock):
+            return False
+        if daemon_lock_held(palace_path):
+            return False
+        try:
+            # On age alone: a daemon that dies at startup (bad config, refused
+            # writer lease) must not be respawned by every hook fire.
+            if not ignore_throttle and time.time() - stamp.stat().st_mtime < SPAWN_THROTTLE_SECONDS:
+                return False
+        except OSError:
+            pass
+        cmd = safe_module_argv(
+            "mempalace.daemon",
+            "serve",
+            "--palace",
+            palace_path,
+            "--idle-exit-default",
+            str(AUTOSTART_IDLE_EXIT_MINUTES),
+        )
+        if backend:
+            cmd.extend(["--backend", backend])
+        env = safe_child_env()
+        kwargs = _detached_kwargs(sd / "daemon.log")
+        try:
+            proc = subprocess.Popen(cmd, env=env, **kwargs)
+            _write_private(stamp, str(proc.pid))
+        finally:
+            log_fh = kwargs.get("stdout")
+            if hasattr(log_fh, "close"):
+                log_fh.close()
+    return True
 
 
 def probe_daemon_health(palace_path: str, *, timeout: float = 0.15) -> bool:
