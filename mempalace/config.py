@@ -1724,6 +1724,48 @@ class MempalaceConfig:
 
         return self.resolve_write_routing("cli").policy
 
+    # Debounce defaults for hook-submitted daemon mines, per trigger:
+    # (settle seconds, max wait seconds). Stop fires after every assistant
+    # turn, so bursts are coalesced over a two-minute settle window but never
+    # held past fifteen minutes. PreCompact and SessionEnd run immediately:
+    # they are the last chance to catch a session before it changes shape.
+    DAEMON_DEBOUNCE_DEFAULTS = {
+        "stop": (120.0, 900.0),
+        "precompact": (0.0, 0.0),
+        "session_end": (0.0, 0.0),
+    }
+
+    def daemon_debounce(self, trigger: str) -> tuple[float, float]:
+        """``(settle_seconds, max_wait_seconds)`` for a hook trigger's daemon mine.
+
+        Resolved per value: env ``MEMPALACE_DAEMON_<TRIGGER>_SETTLE_SECONDS`` /
+        ``..._MAX_WAIT_SECONDS`` > ``config.json``
+        ``daemon.debounce.<trigger>.settle_seconds`` / ``max_wait_seconds`` >
+        :attr:`DAEMON_DEBOUNCE_DEFAULTS`. An unknown trigger runs immediately.
+        A malformed value falls back to the default rather than raising: a
+        typo must not stop a hook from queuing its work. A ``max_wait`` below
+        ``settle`` simply caps the window.
+        """
+        key = str(trigger or "").strip().lower()
+        default_settle, default_max = self.DAEMON_DEBOUNCE_DEFAULTS.get(key, (0.0, 0.0))
+        daemon_cfg = self._file_config.get("daemon")
+        debounce = daemon_cfg.get("debounce") if isinstance(daemon_cfg, dict) else None
+        trig_cfg = debounce.get(key) if isinstance(debounce, dict) else None
+        if not isinstance(trig_cfg, dict):
+            trig_cfg = {}
+
+        def _resolve(suffix: str, cfg_key: str, default: float) -> float:
+            val = env_float(f"MEMPALACE_DAEMON_{key.upper()}_{suffix}")
+            if val is None:
+                val = parse_number(trig_cfg.get(cfg_key))
+            if val is None or val < 0:
+                return default
+            return float(val)
+
+        settle = _resolve("SETTLE_SECONDS", "settle_seconds", default_settle)
+        max_wait = _resolve("MAX_WAIT_SECONDS", "max_wait_seconds", default_max)
+        return settle, max_wait
+
     @property
     def hook_use_daemon(self):
         """Whether hooks should submit save/mine work to the opt-in daemon."""

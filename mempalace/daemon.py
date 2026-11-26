@@ -13,22 +13,17 @@ import json
 import logging
 import os
 import secrets
-import sqlite3
 import subprocess
 import sys
 import threading
 import time
-import uuid
-from dataclasses import dataclass
-from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib import error as urlerror, request as urlrequest
 from urllib.parse import parse_qs, urlparse
 
-from . import paths
-from ._env import env_float, env_int
+from ._env import env_float
 from ._net import NoRedirectHandler as _NoRedirectHandler, bind_without_reverse_dns
 from ._proc import (
     kernel32 as _kernel32,
@@ -36,8 +31,37 @@ from ._proc import (
     safe_child_env as _safe_child_env,
     safe_module_argv as _safe_module_argv,
 )
-from .config import MempalaceConfig
-from .fsio import atomic_write_text, read_published_bytes
+from .daemon_queue import (  # noqa: F401 - re-exported for existing callers
+    HOOK_PROBE_TIMEOUT,
+    JOB_RETENTION_DAYS,
+    LOCK_REFUSAL_ERROR_CLASS,
+    MAX_ATTEMPTS,
+    QUEUE_SCHEMA_VERSION,
+    STATE_ROOT_ENV,
+    SUPERSEDED_ERROR_CLASS,
+    TERMINAL_STATES,
+    DaemonError,
+    DaemonWaitTimeout,
+    Job,
+    QueueStore,
+    _chmod_dir_private,
+    _chmod_private,
+    _detached_kwargs,
+    _now,
+    _read_endpoint,
+    _registered_pid,
+    _write_private,
+    canonical_palace_path,
+    endpoint_path,
+    job_deferred_by_lock,
+    job_to_dict,
+    palace_key,
+    pid_path,
+    queue_path,
+    state_dir,
+    state_root,
+)
+from .fsio import read_published_bytes
 from .palace import (
     MineAlreadyRunning,
     backend_requires_single_writer,
@@ -45,23 +69,9 @@ from .palace import (
     resolve_backend_name,
 )
 from .stored_text import dumps_internal
-from .timeutil import utc_now, utc_now_iso
 
 HOST = "127.0.0.1"
-STATE_ROOT_ENV = "MEMPALACE_DAEMON_STATE_ROOT"
 DEFAULT_WAIT_TIMEOUT = 60.0 * 60.0
-# Liveness-probe timeout for the hook "is a daemon already running?" precheck.
-# 0.15s stays well under the 500ms hook budget: a wedged daemon must not
-# consume the whole budget before the hook falls back. A healthy local daemon
-# answers /health in single-digit ms, so this rarely false-negatives.
-HOOK_PROBE_TIMEOUT = 0.15
-TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
-MAX_ATTEMPTS = 3
-# ``error_class`` marking a job refused the per-palace write lock. The lock
-# wraps the palace write itself, so a refusal means no drawer was filed and
-# re-running cannot duplicate palace content. Distinct from a crash
-# mid-execution, whose outcome is unknown -- see ``QueueStore.defer``.
-LOCK_REFUSAL_ERROR_CLASS = "LockHeldByOtherProcess"
 _DEFAULT_LOCK_BACKOFF_SECONDS = 60.0
 
 
@@ -83,74 +93,10 @@ def _lock_defer_backoff_seconds() -> float:
 LOCK_DEFER_BACKOFF_SECONDS = _lock_defer_backoff_seconds()
 MAX_BODY_BYTES = 1 << 20  # 1 MiB cap on request bodies (auth-gated DoS guard)
 SHUTDOWN_DRAIN_SECONDS = 10.0
-# Terminal jobs are kept for diagnostics then pruned so the queue DB (which
-# holds verbatim payloads) doesn't grow without bound across a long-lived
-# daemon. Override via env for operators who want a longer/shorter window.
-JOB_RETENTION_DAYS = env_int("MEMPALACE_DAEMON_RETENTION_DAYS", 7)
 try:
     import fcntl as _fcntl  # POSIX only; absent on Windows
 except ImportError:  # pragma: no cover - Windows fallback
     _fcntl = None
-
-
-def _chmod_private(path: Path) -> None:
-    try:
-        os.chmod(str(path), 0o600)
-    except OSError:
-        pass
-
-
-def _chmod_dir_private(path: Path) -> None:
-    try:
-        os.chmod(str(path), 0o700)
-    except OSError:
-        pass
-
-
-class DaemonError(RuntimeError):
-    """Raised when daemon client operations fail."""
-
-
-class DaemonWaitTimeout(DaemonError):
-    """Raised when a wait runs out before the job it waits on ends.
-
-    The daemon keeps the job and still runs it in turn, so a caller that only
-    waited to report the outcome must not count this as a failure. ``state`` is
-    the job's last seen state, ``queued`` or ``running``.
-    """
-
-    def __init__(self, job_id: str, state: str):
-        super().__init__(f"timed out waiting for job {job_id}")
-        self.job_id = job_id
-        self.state = state
-
-
-def _now() -> str:
-    return utc_now_iso()
-
-
-def canonical_palace_path(path: str | None = None) -> str:
-    return paths.canonical_palace_path(path or MempalaceConfig().palace_path)
-
-
-def palace_key(palace_path: str) -> str:
-    return paths.palace_key(canonical_palace_path(palace_path))
-
-
-def state_root() -> Path:
-    raw = os.environ.get(STATE_ROOT_ENV)
-    if raw:
-        return Path(raw).expanduser()
-    return paths.state_path("daemon")
-
-
-def state_dir(palace_path: str) -> Path:
-    return state_root() / palace_key(palace_path)
-
-
-def _write_private(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(path, text)
 
 
 def ensure_token(palace_path: str) -> str:
@@ -170,464 +116,6 @@ def read_token(palace_path: str) -> str:
         return read_published_bytes(token_path).decode("utf-8").strip()
     except OSError as exc:
         raise DaemonError(f"daemon token not found for {palace_path}") from exc
-
-
-def endpoint_path(palace_path: str) -> Path:
-    return state_dir(palace_path) / "endpoint.json"
-
-
-def pid_path(palace_path: str) -> Path:
-    return state_dir(palace_path) / "pid"
-
-
-def queue_path(palace_path: str) -> Path:
-    return state_dir(palace_path) / "queue.sqlite3"
-
-
-def _read_endpoint(palace_path: str) -> dict[str, Any]:
-    try:
-        return json.loads(read_published_bytes(endpoint_path(palace_path)).decode("utf-8"))
-    except (OSError, ValueError) as exc:
-        raise DaemonError("daemon endpoint not found") from exc
-
-
-@dataclass
-class Job:
-    id: str
-    kind: str
-    payload: dict[str, Any]
-    state: str
-    priority: int
-    dedupe_key: str | None
-    created_at: str
-    started_at: str | None
-    finished_at: str | None
-    result: dict[str, Any] | None
-    error: dict[str, Any] | None
-    attempts: int
-
-
-class QueueStore:
-    def __init__(self, path: Path):
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        self._init_db()
-
-    @contextlib.contextmanager
-    def _connect(self):
-        """Open a short-lived sqlite3 connection and close it on exit.
-
-        The bare ``with sqlite3.connect(...)`` context manager only manages the
-        transaction (commit/rollback) — it does NOT close the connection, so every
-        QueueStore call in this long-lived daemon process leaked a connection FD.
-        In a daemon that runs thousands of jobs that is an unbounded FD leak. This
-        wrapper closes the connection on exit so each call is self-contained.
-        """
-        conn = sqlite3.connect(str(self.path), timeout=30)
-        try:
-            conn.row_factory = sqlite3.Row
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS jobs (
-                    id TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    priority INTEGER NOT NULL DEFAULT 0,
-                    dedupe_key TEXT,
-                    created_at TEXT NOT NULL,
-                    started_at TEXT,
-                    finished_at TEXT,
-                    result_json TEXT,
-                    error_json TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, priority)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(dedupe_key, state)")
-            # Unique partial index: at most one queued/running job per dedupe_key.
-            # Enforces the dedupe invariant across processes (TOCTOU-safe); finished
-            # jobs drop out of the index so a later identical enqueue is allowed.
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_active "
-                "ON jobs(dedupe_key) WHERE state IN ('queued', 'running')"
-            )
-        # The queue DB holds verbatim payloads (diary text, source paths) — lock it
-        # down to owner-only regardless of the invoking user's umask. The WAL/SHM
-        # sidecars carry the same un-checkpointed payloads, so harden them too when
-        # present (the daemon also runs under a 0o077 umask; this covers any
-        # QueueStore opened outside that scope, e.g. the CLI `daemon jobs` path).
-        _chmod_private(self.path)
-        for sidecar_suffix in ("-wal", "-shm"):
-            sidecar = self.path.with_name(self.path.name + sidecar_suffix)
-            if sidecar.exists():
-                _chmod_private(sidecar)
-
-    def prune_terminal(self, older_than_days: int = JOB_RETENTION_DAYS) -> int:
-        """Delete terminal (succeeded/failed/cancelled) jobs older than the
-        retention window.
-
-        Bounded growth for the queue DB, which holds verbatim payloads. Only
-        terminal jobs are eligible — queued/running jobs are never touched, so
-        a crash mid-prune cannot drop in-flight work (incremental-only). The
-        cutoff uses ``finished_at``; a terminal job is never re-examined by
-        recover_running, so deleting it is safe.
-        """
-        if older_than_days <= 0:
-            return 0
-        cutoff = (utc_now() - timedelta(days=older_than_days)).isoformat(timespec="microseconds")
-        with self._lock, self._connect() as conn:
-            cur = conn.execute(
-                """
-                DELETE FROM jobs
-                WHERE state IN ('succeeded', 'failed', 'cancelled')
-                  AND finished_at IS NOT NULL
-                  AND finished_at < ?
-                """,
-                (cutoff,),
-            )
-            return int(cur.rowcount or 0)
-
-    def recover_running(self) -> int:
-        """Re-queue jobs left ``running`` by a crashed/killed daemon.
-
-        Jobs that have already exhausted ``MAX_ATTEMPTS`` claims are dead-lettered
-        to ``failed`` instead of being retried — non-idempotent kinds (diary_write
-        derives its entry_id from wall-clock time) would otherwise duplicate
-        verbatim palace content on every restart, violating the incremental-only
-        principle. The last error_json is preserved for diagnostics.
-        """
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET state = 'failed', finished_at = ?,
-                    error_json = COALESCE(error_json, ?)
-                WHERE state = 'running' AND attempts >= ?
-                """,
-                (
-                    _now(),
-                    json.dumps(
-                        {"error_class": "MaxAttemptsExceeded", "message": "max attempts exceeded"},
-                        ensure_ascii=False,
-                    ),
-                    MAX_ATTEMPTS,
-                ),
-            )
-            cur = conn.execute(
-                """
-                UPDATE jobs
-                SET state = 'queued', started_at = NULL
-                WHERE state = 'running' AND attempts < ?
-                """,
-                (MAX_ATTEMPTS,),
-            )
-            return int(cur.rowcount or 0)
-
-    def enqueue(
-        self,
-        kind: str,
-        payload: dict[str, Any],
-        *,
-        dedupe_key: str | None = None,
-        priority: int = 0,
-    ) -> Job:
-        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        with self._lock, self._connect() as conn:
-            if dedupe_key:
-                row = conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE dedupe_key = ? AND state IN ('queued', 'running')
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (dedupe_key,),
-                ).fetchone()
-                if row is not None:
-                    return self._row_to_job(row)
-
-            job_id = uuid.uuid4().hex
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO jobs (
-                        id, kind, payload_json, state, priority, dedupe_key, created_at, attempts
-                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0)
-                    """,
-                    (job_id, kind, payload_json, int(priority), dedupe_key, _now()),
-                )
-            except sqlite3.IntegrityError:
-                # Unique partial index beat us in a cross-process race — return the
-                # job that won. SELECT-then-INSERT is not atomic across processes; the
-                # index is the source of truth.
-                if not dedupe_key:
-                    raise
-                row = conn.execute(
-                    """
-                    SELECT * FROM jobs
-                    WHERE dedupe_key = ? AND state IN ('queued', 'running')
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (dedupe_key,),
-                ).fetchone()
-                if row is None:
-                    # Index guard fired but the row is already gone — retry the INSERT.
-                    conn.execute(
-                        """
-                        INSERT INTO jobs (
-                            id, kind, payload_json, state, priority, dedupe_key, created_at, attempts
-                        ) VALUES (?, ?, ?, 'queued', ?, ?, ?, 0)
-                        """,
-                        (job_id, kind, payload_json, int(priority), dedupe_key, _now()),
-                    )
-                    row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-                return self._row_to_job(row)
-            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            return self._row_to_job(row)
-
-    def claim_next(self, *, exclude: set[str] | None = None) -> Job | None:
-        # Atomic across processes: the UPDATE only fires if the row is still
-        # 'queued'. If two daemon processes SELECT the same row, the first to
-        # UPDATE it flips state to 'running' (rowcount=1); the second's UPDATE
-        # matches 0 rows (WHERE state='queued' is now false) and we re-loop
-        # instead of double-executing the job. The in-process RLock does not
-        # protect against a second OS process — this guard does.
-        #
-        # ``exclude`` skips jobs still cooling off after a lock refusal, so the
-        # ordering below cannot hand back the same refused job forever while
-        # newer work waits behind it. The cooldown is the worker's, held in
-        # memory rather than the schema (which has no migrations): a restart
-        # just retries such a job at once, costing one refusal, never the work.
-        #
-        # The filter runs in Python rather than as ``id NOT IN (?, ?, ...)``:
-        # that binds one host parameter per cooling job, and
-        # SQLITE_MAX_VARIABLE_NUMBER defaults to 999 below SQLite 3.32 (we
-        # support Python 3.9, whose bundled SQLite can predate it). Over the cap
-        # the query raises into the worker's catch-all, which retries a second
-        # later against a set that only ages out on the cooldown, so the queue
-        # would stall in cooldown-long fits rather than drain. Fetching
-        # ``len(exclude) + 1`` rows costs one parameter and is enough by
-        # pigeonhole: at most ``len(exclude)`` of those rows can be excluded, so
-        # the first one that survives the filter is the row a plain LIMIT 1 would
-        # have returned.
-        #
-        # ``error_json`` is cleared because it describes the claim that just
-        # ended: ``defer`` parks the refusal reason on a queued job, and a stale
-        # one would outlive its cause -- reporting a lock refusal for a job that
-        # later crashed, and leaking into recover_running's dead-letter (which
-        # COALESCEs it) in place of ``MaxAttemptsExceeded``.
-        exclude = exclude or set()
-        with self._lock, self._connect() as conn:
-            # Only the ids: the rows being skipped are here to be discarded, and
-            # jobs carry verbatim payloads, so selecting * would materialise a
-            # cooling job's user content just to read its id past it.
-            candidates = conn.execute(
-                """
-                SELECT id FROM jobs
-                WHERE state = 'queued'
-                ORDER BY priority DESC, created_at ASC
-                LIMIT ?
-                """,
-                (len(exclude) + 1,),
-            ).fetchall()
-            job_id = next((r["id"] for r in candidates if r["id"] not in exclude), None)
-            if job_id is None:
-                return None
-            cur = conn.execute(
-                """
-                UPDATE jobs
-                SET state = 'running', started_at = ?, attempts = attempts + 1,
-                    error_json = NULL
-                WHERE id = ? AND state = 'queued'
-                """,
-                (_now(), job_id),
-            )
-            if cur.rowcount != 1:
-                # Lost the race to another process — nothing to run this iteration.
-                return None
-            claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            return self._row_to_job(claimed)
-
-    def finish(
-        self,
-        job_id: str,
-        *,
-        state: str,
-        result: dict[str, Any] | None = None,
-        error: dict[str, Any] | None = None,
-        only_if_running: bool = False,
-    ) -> Job:
-        # ``only_if_running`` guards the worker's finish against a lost race with
-        # shutdown's cancel: if the active job was already flipped to 'cancelled'
-        # by _drain_and_cleanup, a late worker finish must NOT overwrite it back to
-        # 'succeeded'/'failed' (which would un-cancel a job recover_running must
-        # not re-run). The conditional UPDATE makes the worker's finish a no-op in
-        # that window instead of relying on process-exit timing.
-        where = "WHERE id = ?" + (" AND state = 'running'" if only_if_running else "")
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                f"""
-                UPDATE jobs
-                SET state = ?, finished_at = ?, result_json = ?, error_json = ?
-                {where}
-                """,
-                (
-                    state,
-                    _now(),
-                    json.dumps(result or {}, ensure_ascii=False),
-                    json.dumps(error or {}, ensure_ascii=False) if error else None,
-                    job_id,
-                ),
-            )
-            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            return self._row_to_job(row)
-
-    def defer(
-        self,
-        job_id: str,
-        *,
-        claimed_started_at: str | None = None,
-        error: dict[str, Any] | None = None,
-    ) -> Job:
-        """Return a job refused the palace write lock to ``queued``, unspent.
-
-        ``mine_palace_lock`` wraps the palace write itself, so a refusal means
-        no drawer was filed and re-running cannot duplicate palace content.
-        That is what separates it from the failure ``MAX_ATTEMPTS`` guards -- a
-        daemon that died mid-execution, whose outcome is unknown and whose blind
-        retry would re-file verbatim content. Undoing ``claim_next``'s increment
-        keeps a palace that stays locked from spending the retry budget of work
-        that never landed.
-
-        ``error`` records why the job went back to the queue, so a job parked
-        behind a lock is distinguishable from one merely awaiting its turn.
-        ``claim_next`` clears it on the next claim, so the reason never outlives
-        the claim it describes.
-
-        The ``state = 'running'`` guard mirrors ``finish(only_if_running=True)``:
-        if shutdown already cancelled this job, deferring must not resurrect it.
-        ``claimed_started_at`` narrows the update further, to the claim that was
-        actually refused: if the row was re-queued and re-claimed in the window
-        (recover_running on another daemon start), a late defer must not throw
-        away that newer claim by re-queuing -- and refunding -- work it does not
-        own. ``None`` skips the check.
-        """
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET state = 'queued', started_at = NULL,
-                    attempts = MAX(attempts - 1, 0),
-                    error_json = ?
-                WHERE id = ? AND state = 'running'
-                  AND (? IS NULL OR started_at = ?)
-                """,
-                (
-                    json.dumps(error or {}, ensure_ascii=False) if error else None,
-                    job_id,
-                    claimed_started_at,
-                    claimed_started_at,
-                ),
-            )
-            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            return self._row_to_job(row)
-
-    def get(self, job_id: str) -> Job:
-        with self._lock, self._connect() as conn:
-            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
-            if row is None:
-                raise DaemonError(f"unknown job id: {job_id}")
-            return self._row_to_job(row)
-
-    def list(self, limit: int = 20) -> list[Job]:
-        with self._lock, self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?",
-                (max(1, int(limit)),),
-            ).fetchall()
-            return [self._row_to_job(row) for row in rows]
-
-    def counts(self) -> dict[str, int]:
-        with self._lock, self._connect() as conn:
-            rows = conn.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state").fetchall()
-            return {str(row["state"]): int(row["n"]) for row in rows}
-
-    @staticmethod
-    def _row_to_job(row: sqlite3.Row) -> Job:
-        def _loads(value):
-            if not value:
-                return None
-            try:
-                return json.loads(value)
-            except json.JSONDecodeError:
-                return None
-
-        return Job(
-            id=str(row["id"]),
-            kind=str(row["kind"]),
-            payload=_loads(row["payload_json"]) or {},
-            state=str(row["state"]),
-            priority=int(row["priority"]),
-            dedupe_key=row["dedupe_key"],
-            created_at=str(row["created_at"]),
-            started_at=row["started_at"],
-            finished_at=row["finished_at"],
-            result=_loads(row["result_json"]),
-            error=_loads(row["error_json"]),
-            attempts=int(row["attempts"]),
-        )
-
-
-def job_deferred_by_lock(job: dict[str, Any]) -> bool:
-    """True when a job's last claim was refused the palace lock.
-
-    Such a job is deferred, not failed: it went back to the queue and
-    runs once the lock frees. That makes it non-terminal, so a caller blocking
-    until ``TERMINAL_STATES`` would wait out the holder -- which can be a
-    long-lived session. Interactive callers use this to report the parked job
-    instead of stranding the terminal.
-
-    Keyed on the reason ``defer`` records, which ``claim_next`` clears on the
-    next claim: the answer is about the claim that just ended, not a live probe
-    of the lock (the holder may already have exited during the backoff).
-    """
-    if job.get("state") != "queued":
-        return False
-    return (job.get("error") or {}).get("error_class") == LOCK_REFUSAL_ERROR_CLASS
-
-
-def job_to_dict(job: Job, *, include_payload: bool = True) -> dict[str, Any]:
-    out = {
-        "id": job.id,
-        "kind": job.kind,
-        "state": job.state,
-        "priority": job.priority,
-        "dedupe_key": job.dedupe_key,
-        "created_at": job.created_at,
-        "started_at": job.started_at,
-        "finished_at": job.finished_at,
-        "result": job.result,
-        "error": job.error,
-        "attempts": job.attempts,
-    }
-    if include_payload:
-        out["payload"] = job.payload
-    return out
 
 
 class DaemonRuntime:
@@ -1042,6 +530,12 @@ def run_server(palace_path: str, *, backend: str | None = None, port: int = 0) -
                         body.get("payload") or {},
                         dedupe_key=body.get("dedupe_key"),
                         priority=int(body.get("priority") or 0),
+                        settle_seconds=float(body.get("settle_seconds") or 0.0),
+                        max_wait_seconds=(
+                            None
+                            if body.get("max_wait_seconds") is None
+                            else float(body["max_wait_seconds"])
+                        ),
                     )
                     runtime.worker_wake.set()
                 except Exception as exc:  # noqa: BLE001 - client gets structured failure
@@ -1225,12 +719,21 @@ class DaemonClient:
         *,
         dedupe_key: str | None = None,
         priority: int = 0,
+        settle_seconds: float = 0.0,
+        max_wait_seconds: float | None = None,
     ) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/jobs",
-            {"kind": kind, "payload": payload, "dedupe_key": dedupe_key, "priority": priority},
-        )["job"]
+        body: dict[str, Any] = {
+            "kind": kind,
+            "payload": payload,
+            "dedupe_key": dedupe_key,
+            "priority": priority,
+        }
+        # Only sent when set, so an older daemon sees the request it always did.
+        if settle_seconds:
+            body["settle_seconds"] = settle_seconds
+        if max_wait_seconds is not None:
+            body["max_wait_seconds"] = max_wait_seconds
+        return self.request("POST", "/jobs", body)["job"]
 
     def get_job(self, job_id: str) -> dict[str, Any]:
         return self.request("GET", f"/jobs/{job_id}")["job"]
@@ -1275,43 +778,6 @@ def get_client_if_running(palace_path: str, *, health_timeout: float = 5.0) -> D
         return client
     except DaemonError:
         return None
-
-
-def _detached_kwargs(log_path: Path) -> dict[str, Any]:
-    """Kwargs that spawn the daemon with a hidden console, detached from the CLI.
-
-    Shares the Windows flag logic with ``hooks_cli._detached_popen_kwargs``
-    (which takes no args and opens no log file). On Windows we use
-    ``CREATE_NO_WINDOW`` rather than ``DETACHED_PROCESS``: the latter gives the
-    child no console, so a console-subsystem grandchild later allocates a fresh
-    *visible* window; ``CREATE_NO_WINDOW`` gives a hidden console that
-    descendants inherit instead. Surviving the launching terminal is carried by
-    ``CREATE_BREAKAWAY_FROM_JOB`` (escapes the parent Job Object's kill-on-close)
-    plus the daemon never being attached to that console -- not by the console
-    flag -- while ``CREATE_NEW_PROCESS_GROUP`` isolates Ctrl-C/Ctrl-Break routing.
-    ``CREATE_NO_WINDOW`` is ignored when OR'd with ``DETACHED_PROCESS``, so this
-    replaces that flag rather than adding it. ``stdin=DEVNULL`` and stdout/stderr
-    redirected to the log keep the parent from hanging on inherited pipes.
-    """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(log_path, "a", encoding="utf-8")
-    # The daemon log may capture verbatim content in tracebacks — owner-only.
-    _chmod_private(log_path)
-    kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": log_fh,
-        "stderr": log_fh,
-        "close_fds": True,
-    }
-    if os.name == "nt":
-        flags = 0
-        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP", "CREATE_BREAKAWAY_FROM_JOB"):
-            flags |= getattr(subprocess, name, 0)
-        if flags:
-            kwargs["creationflags"] = flags
-    else:
-        kwargs["start_new_session"] = True
-    return kwargs
 
 
 def _process_start_time_windows(pid: int) -> float | None:
@@ -1518,29 +984,6 @@ def _stop_hint(pid: int) -> str:
     return f"taskkill /PID {pid} /F" if os.name == "nt" else f"kill {pid}"
 
 
-def _registered_pid(palace_path: str) -> int | None:
-    """Pid recorded by the last daemon that registered for ``palace_path``.
-
-    Reads ``endpoint.json`` first (written together with the pid file by
-    ``run_server``), then the bare pid file, so a partially written
-    registration still yields the pid. Returns None when nothing is registered
-    or the value is not an int.
-    """
-    try:
-        pid = _read_endpoint(palace_path).get("pid")
-    except DaemonError:
-        pid = None
-    if pid is None:
-        try:
-            pid = pid_path(palace_path).read_text(encoding="utf-8").strip()
-        except OSError:
-            return None
-    try:
-        return int(pid)
-    except (TypeError, ValueError):
-        return None
-
-
 def start_daemon(
     palace_path: str,
     *,
@@ -1663,6 +1106,8 @@ def submit_job(
     backend: str | None = None,
     dedupe_key: str | None = None,
     priority: int = 0,
+    settle_seconds: float = 0.0,
+    max_wait_seconds: float | None = None,
     wait: bool = True,
     auto_start: bool = False,
     timeout: float = DEFAULT_WAIT_TIMEOUT,
@@ -1677,7 +1122,14 @@ def submit_job(
     if backend:
         payload["backend"] = backend
     client = ensure_client(resolved_palace, backend=backend, auto_start=auto_start)
-    job = client.submit(kind, payload, dedupe_key=dedupe_key, priority=priority)
+    job = client.submit(
+        kind,
+        payload,
+        dedupe_key=dedupe_key,
+        priority=priority,
+        settle_seconds=settle_seconds,
+        max_wait_seconds=max_wait_seconds,
+    )
     if not wait:
         return job
     return client.wait(job["id"], timeout=timeout, stop_on_lock_deferral=stop_on_lock_deferral)

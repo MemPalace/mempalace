@@ -62,6 +62,18 @@ example at login, plugin initialization, or session setup:
 SessionStart performs a fast health probe in `require` mode and warns early if
 the required daemon is unavailable.
 
+## How hooks reach the daemon
+
+A hook never waits on the daemon and never imports the storage stack:
+
+1. It probes `/health` with a 150 ms timeout, using only the standard library.
+2. It writes the job straight into the daemon's durable SQLite queue
+   (`mempalace/daemon_queue.py`, which imports neither chromadb nor numpy).
+
+Diary checkpoints are queued the same way. The daemon files the drawer and
+then writes the checkpoint ack and the session's save marker, so the marker
+still advances only once the entry is really stored.
+
 ## One decision per hook event
 
 A Stop or SessionEnd event may perform several writes:
@@ -73,6 +85,41 @@ A Stop or SessionEnd event may perform several writes:
 The route is resolved once and stored in a context-local value for the whole
 write burst. This avoids repeated health probes and prevents different writes
 from selecting inconsistent routes during the same event.
+
+## Coalescing and debounce
+
+Daemon mine jobs are keyed by source (`hook:mine:<mode>:<path>`). The queue
+keeps at most one *queued* job per key, next to at most one *running* job:
+
+- an event for a source that is already queued replaces that job's payload
+  (latest wins) and keeps its place in line;
+- an event for a source that is currently running queues one pending rerun,
+  so content that arrived mid-run is mined right after it, not at the next
+  hook.
+
+Each trigger has a settle window and a maximum wait. The job runs at
+`MIN(first_enqueued + max_wait, last_enqueued + settle)`; an immediate trigger
+is never delayed by a later debounced one.
+
+| Trigger      | Settle | Max wait |
+|--------------|--------|----------|
+| Stop         | 120 s  | 15 min   |
+| PreCompact   | 0      | 0        |
+| SessionEnd   | 0      | 0        |
+
+Override per trigger with `MEMPALACE_DAEMON_<TRIGGER>_SETTLE_SECONDS` /
+`MEMPALACE_DAEMON_<TRIGGER>_MAX_WAIT_SECONDS` (`STOP`, `PRECOMPACT`,
+`SESSION_END`), or in `config.json`:
+
+    {
+      "daemon": {
+        "debounce": {
+          "stop": {"settle_seconds": 120, "max_wait_seconds": 900}
+        }
+      }
+    }
+
+Diary checkpoints are never debounced.
 
 ## Submission ambiguity
 

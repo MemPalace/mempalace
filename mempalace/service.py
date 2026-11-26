@@ -536,6 +536,16 @@ def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
         ),
     )
     result.setdefault("exit_code", 0 if result.get("success") else 1)
+    hook_ack = payload.get("hook_ack")
+    if result.get("success") and isinstance(hook_ack, dict):
+        # A hook queued this checkpoint and returned at once; the save marker
+        # advances only now that the drawer is filed.
+        try:
+            from .hooks_cli import write_checkpoint_ack
+
+            write_checkpoint_ack(hook_ack)
+        except Exception:  # noqa: BLE001 - the drawer is filed; the ack is best-effort
+            pass
     return result
 
 

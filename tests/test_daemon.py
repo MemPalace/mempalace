@@ -10,7 +10,7 @@ import time
 import pytest
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace import daemon, service
+from mempalace import daemon, daemon_queue, service
 
 _LOCK_CONTENDER = """
 from mempalace.palace import MineAlreadyRunning, mine_palace_lock
@@ -177,7 +177,7 @@ def test_submit_job_uses_client_and_waits(monkeypatch, tmp_path):
         def __init__(self):
             self.submitted = None
 
-        def submit(self, kind, payload, dedupe_key=None, priority=0):
+        def submit(self, kind, payload, dedupe_key=None, priority=0, **_debounce):
             self.submitted = (kind, payload, dedupe_key, priority)
             return {"id": "job-1", "state": "queued"}
 
@@ -882,7 +882,7 @@ def test_defer_scoped_to_a_stale_claim_is_a_no_op(tmp_path, monkeypatch):
     # the assertions exercise the guard, not the clock.
     real_now = daemon._now
     stamps = iter(range(10_000))
-    monkeypatch.setattr(daemon, "_now", lambda: f"{real_now()}#{next(stamps):04d}")
+    monkeypatch.setattr(daemon_queue, "_now", lambda: f"{real_now()}#{next(stamps):04d}")
 
     stale = store.claim_next()  # the claim that got the refusal
     deferred = store.defer(job.id, claimed_started_at=stale.started_at)
@@ -1028,7 +1028,7 @@ def test_submit_job_forwards_stop_on_lock_deferral_to_wait(monkeypatch):
     seen = {}
 
     class _Client:
-        def submit(self, kind, payload, dedupe_key=None, priority=0):
+        def submit(self, kind, payload, dedupe_key=None, priority=0, **_debounce):
             return {"id": "job-1", "state": "queued"}
 
         def wait(self, job_id, *, timeout=None, stop_on_lock_deferral=False):
