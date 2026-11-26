@@ -3,6 +3,7 @@
 import errno
 import logging
 import os
+import shutil
 import sqlite3
 import stat
 import sys
@@ -2954,6 +2955,36 @@ def test_rebuild_from_sqlite_in_place_archives_when_opted_in(tmp_path):
     assert rebuilt.count() == 15
 
 
+def test_rebuild_from_sqlite_in_place_releases_own_handles_before_archiving(tmp_path, monkeypatch):
+    """The archive rename must not race this process's own open Chroma
+    handles: a mine no longer closes them on its way out, and on
+    Windows an open chroma.sqlite3 makes renaming the palace fail."""
+    from mempalace.palace import _DEFAULT_BACKEND
+
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "body", {"wing": "w", "room": "r"})])
+    _DEFAULT_BACKEND.get_collection(str(palace), "mempalace_drawers").count()
+
+    events = []
+    real_close, real_rename = repair._close_chroma_handles, os.rename
+
+    def close(path, backend=None):
+        events.append(("close", os.path.abspath(path), backend))
+        return real_close(path, backend=backend)
+
+    def rename(src, dst):
+        events.append(("rename", os.path.abspath(src), None))
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(repair, "_close_chroma_handles", close)
+    monkeypatch.setattr(repair.os, "rename", rename)
+    counts = repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+    assert counts["mempalace_drawers"] == 1
+
+    archived = events.index(("rename", str(palace), None))
+    assert ("close", str(palace), _DEFAULT_BACKEND) in events[:archived]
+
+
 def _seed_palace_with_logstream_event(palace):
     from mempalace.logstream import Logstream
 
@@ -4765,10 +4796,18 @@ def test_rebuild_from_sqlite_skips_symlinked_journal_and_state_dir(tmp_path):
     if not journal_link.exists() and not journal_link.is_symlink():
         journal_link.symlink_to(outside / "secret")
     state_dir = src / ".mempalace"
+    # Seeding writes through Chroma, which leaves write markers in a real
+    # state dir; swap it for the link so the skip is actually exercised.
+    if state_dir.is_dir() and not state_dir.is_symlink():
+        shutil.rmtree(state_dir)
     if not state_dir.exists() and not state_dir.is_symlink():
         state_dir.symlink_to(outside, target_is_directory=True)
+    assert state_dir.is_symlink()
 
     repair.rebuild_from_sqlite(str(src), str(dest))
 
     assert not (dest / "drawer_revisions.jsonl").exists()
-    assert not (dest / ".mempalace").exists()
+    # The rebuild's own writes may create a fresh state dir; nothing may be
+    # copied through the link.
+    assert not (dest / ".mempalace").is_symlink()
+    assert not (dest / ".mempalace" / "secret").exists()

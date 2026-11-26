@@ -1,5 +1,6 @@
 """ChromaDB-backed MemPalace storage backend (RFC 001 reference implementation)."""
 
+import collections
 import contextlib
 import hashlib
 import json
@@ -2204,16 +2205,60 @@ def _clear_chroma_system_cache() -> bool:
 _write_serial = 0
 _write_serial_lock = threading.Lock()
 
+# The ids each write declared, tagged with the serial it ran under, so the
+# post-mine check can scan just the rows a mine wrote. Bounded by id
+# count: past the cap the oldest entries go and ``_written_ids_floor`` records
+# the newest serial they covered, so a caller whose baseline predates it gets
+# ``None`` (scan incomplete, run the full check) rather than a short set.
+# A write that declares no ids (``ids=None``) raises the floor the same way.
+_WRITTEN_IDS_CAP = 200_000
+_written_ids_log: "collections.deque[tuple[int, tuple[str, ...]]]" = collections.deque()
+_written_ids_total = 0
+_written_ids_floor = 0
+
 
 def chroma_write_serial() -> int:
     """Number of Chroma writes (add, upsert, update, delete) started in this process."""
     return _write_serial
 
 
-def _count_write() -> None:
-    global _write_serial
+def chroma_written_ids_since(serial: int) -> "Optional[set[str]]":
+    """Ids written by Chroma writes in this process after ``serial``, or None.
+
+    ``None`` means the journal cannot vouch for every write since ``serial``:
+    entries were evicted past ``_WRITTEN_IDS_CAP`` or a write declared no ids.
+    Process-wide like the serial, so ids written to another palace in between
+    are included; the scan just finds nothing for them.
+    """
+    with _write_serial_lock:
+        if _written_ids_floor > serial:
+            return None
+        return {record_id for tag, ids in _written_ids_log if tag > serial for record_id in ids}
+
+
+def _count_write(ids) -> None:
+    """Count one write and journal the ids it declared.
+
+    ``ids`` is required on purpose: a write path that does not say what it
+    wrote passes ``None`` and makes the journal incomplete, which sends the
+    next post-mine check to the full quick_check instead of a scan that would
+    quietly miss its rows. A delete passes ``()``: removed rows need no scan.
+    """
+    global _write_serial, _written_ids_total, _written_ids_floor
     with _write_serial_lock:
         _write_serial += 1
+        if ids is None:
+            _written_ids_floor = _write_serial
+            return
+        ids = (ids,) if isinstance(ids, str) else tuple(ids)
+        if not ids:
+            return
+        _written_ids_log.append((_write_serial, ids))
+        _written_ids_total += len(ids)
+        while _written_ids_total > _WRITTEN_IDS_CAP and _written_ids_log:
+            tag, dropped = _written_ids_log.popleft()
+            _written_ids_total -= len(dropped)
+            _written_ids_floor = max(_written_ids_floor, tag)
 
 
 def _validate_list_batch(ids, documents, metadatas, embeddings) -> None:
@@ -2260,7 +2305,7 @@ class ChromaCollection(BaseCollection):
         self._backend = backend
 
     @contextlib.contextmanager
-    def _write_lock(self):
+    def _write_lock(self, ids):
         """Acquire ``mine_palace_lock`` for the configured palace, if any.
 
         No-op (yields immediately) when ``self._palace_path`` is None.
@@ -2273,13 +2318,15 @@ class ChromaCollection(BaseCollection):
         it had already paid for. That made the file-a-drawer-then-search cycle
         reload the whole index each time.
 
-        Counts the write first, so one that fails partway still counts.
+        Counts the write first, so one that fails partway still counts, and
+        journals ``ids`` (see :func:`_count_write`).
         """
-        _count_write()
+        _count_write(ids)
         if self._palace_path is None:
             yield
             return
         # Late import — palace.py imports ChromaBackend from this module.
+        from ..integrity_check import note_write_finished, note_write_started
         from ..palace import mine_palace_lock
 
         # palace_db_lock keeps this process's Python sqlite3 readers out of the
@@ -2288,9 +2335,13 @@ class ChromaCollection(BaseCollection):
             mine_palace_lock(self._palace_path),
             palace_db_lock(os.path.join(self._palace_path, "chroma.sqlite3")),
         ):
+            # Inside the writer lock, so a marker no write here owns can only
+            # have been left by a writer that died mid-write.
+            note_write_started(self._palace_path)
             try:
                 yield
             finally:
+                note_write_finished(self._palace_path)
                 if self._backend is not None:
                     self._backend._restamp(self._palace_path)
 
@@ -2333,7 +2384,7 @@ class ChromaCollection(BaseCollection):
             kwargs["metadatas"] = sanitized
         if embeddings is not None:
             kwargs["embeddings"] = embeddings
-        with self._write_lock():
+        with self._write_lock(kwargs["ids"]):
             self._collection.add(**kwargs)
 
     def _upsert_with_metadata_guard(self, *, expected, documents, ids, metadatas, embeddings):
@@ -2343,7 +2394,7 @@ class ChromaCollection(BaseCollection):
         lock there). Cooperating MemPalace writers cannot change metadata
         between this comparison and publication.
         """
-        with self._write_lock():
+        with self._write_lock(ids):
             result = self.get(ids=ids, include=["metadatas"])
             current = dict(zip(result.ids, result.metadatas))
             if current != expected:
@@ -2374,12 +2425,12 @@ class ChromaCollection(BaseCollection):
         kwargs = self._upsert_kwargs(
             documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings
         )
-        with self._write_lock():
+        with self._write_lock(kwargs["ids"]):
             self._collection.upsert(**kwargs)
 
     def _update_with_metadata_guard(self, *, expected, ids, documents, metadatas, embeddings):
         """Publish only if the documents and metadata used by embedding still agree."""
-        with self._write_lock():
+        with self._write_lock(ids):
             result = self.get(ids=ids, include=["documents", "metadatas"])
             current = {
                 record_id: (result.documents[index], result.metadatas[index] or {})
@@ -2424,7 +2475,7 @@ class ChromaCollection(BaseCollection):
         kwargs = self._update_kwargs(
             ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings
         )
-        with self._write_lock():
+        with self._write_lock(kwargs["ids"]):
             self._collection.update(**kwargs)
 
     # ------------------------------------------------------------------
@@ -2642,7 +2693,8 @@ class ChromaCollection(BaseCollection):
             kwargs["ids"] = ids
         if where is not None:
             kwargs["where"] = encode_where(where)
-        with self._write_lock():
+        # Removed rows need no scan.
+        with self._write_lock(()):
             self._collection.delete(**kwargs)
 
     def count(self):

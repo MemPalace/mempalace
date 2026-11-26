@@ -3,8 +3,9 @@
 mempalace mine must not print "Done." and exit 0 on a palace whose
 chroma.sqlite3 left FTS5 in a malformed state. The validation hook in
 ``palace._validate_palace_fts5_after_mine`` runs PRAGMA quick_check at
-the end of every non-dry-run mine that wrote to the palace (#2684) and
-raises ``MineValidationError`` so ``cmd_mine`` can surface the same
+the end of every non-dry-run mine that wrote to the palace (#2684), scoped
+to the rows the mine wrote unless a full check is due (see
+``mempalace.integrity_check``), and raises ``MineValidationError`` so ``cmd_mine`` can surface the same
 recovery banner ``cmd_repair`` prints.
 """
 
@@ -121,6 +122,31 @@ def _mine_args(
     )
 
 
+def _script_probe(monkeypatch, full_errors) -> list:
+    """Make the post-mine check's child report ``full_errors`` (#2684).
+
+    The check runs in a child process, so in-process patches of the repair
+    primitives never reach it; :func:`mempalace.integrity_check.run_probe` is
+    the one seam between the mining process and the child. Returns the list
+    of palace paths probed.
+    """
+    import os
+
+    from mempalace import integrity_check as ic
+
+    calls: list = []
+
+    def _probe(db_path, *, ids, full, scan_all=False):
+        calls.append(os.path.dirname(db_path))
+        return ic.ProbeResult(
+            scoped=None if ids is None else (),
+            full=tuple(full_errors) if full else None,
+        )
+
+    monkeypatch.setattr(ic, "run_probe", _probe)
+    return calls
+
+
 # ── 1. Helper returns silently on a clean palace ────────────────────
 
 
@@ -150,7 +176,7 @@ def test_helper_raises_on_page_mangled_sqlite(tmp_path):
     assert "malformed" in combined or "quick_check failed" in combined
 
 
-def test_helper_auto_heals_fts5_segment_corruption(tmp_path):
+def test_helper_auto_heals_fts5_segment_corruption(tmp_path, monkeypatch):
     """The reporter-shaped failure: FTS5 inverted index malformed, main pages
     OK. This is exactly the isolated-FTS5 condition
     ``maybe_autoheal_fts5_index`` (#1926/#1928) rebuilds in place, so the
@@ -163,9 +189,20 @@ def test_helper_auto_heals_fts5_segment_corruption(tmp_path):
     _build_palace_with_drawer(palace)
     _corrupt_fts5_segment(palace / "chroma.sqlite3")
 
+    from mempalace.palace import resolve_backend_name
+
+    assert resolve_backend_name(str(palace)) == "chroma"
+    real_connect = sqlite3.connect
+
+    def parent_connect(database, *args, **kwargs):
+        assert "chroma.sqlite3" not in str(database), "heal opened the palace in the parent"
+        return real_connect(database, *args, **kwargs)
+
     # Must not raise: isolated FTS5 corruption is auto-healed before the
     # validator would otherwise raise MineValidationError.
-    assert _validate_palace_fts5_after_mine(str(palace)) is None
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", parent_connect)
+        assert _validate_palace_fts5_after_mine(str(palace)) is None
 
     with closing(sqlite3.connect(str(palace / "chroma.sqlite3"))) as conn:
         assert conn.execute("PRAGMA quick_check").fetchall() == [("ok",)]
@@ -366,7 +403,7 @@ def test_validator_suppresses_raise_when_autoheal_clears(tmp_path, monkeypatch):
 
     _corrupt_fts5_segment pytest.skips on SQLite builds that refuse direct
     FTS5 shadow-table writes, so on those builds the auto-heal wiring is
-    never actually exercised. Stubbing sqlite_integrity_errors and
+    never actually exercised. Scripting the child's verdict and stubbing
     maybe_autoheal_fts5_index directly (rather than fabricating real
     corruption) proves the wiring in _validate_palace_fts5_after_mine itself,
     deterministically, on every build.
@@ -379,7 +416,7 @@ def test_validator_suppresses_raise_when_autoheal_clears(tmp_path, monkeypatch):
     fts_error = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
     heal_calls = []
 
-    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(fts_error))
+    _script_probe(monkeypatch, fts_error)
 
     def _fake_heal(palace_path, errors, **_kwargs):
         heal_calls.append((palace_path, tuple(errors)))
@@ -420,7 +457,7 @@ def test_validator_passes_logger_progress_not_print_to_autoheal(tmp_path, monkey
     fts_error = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
     captured_kwargs = {}
 
-    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(fts_error))
+    _script_probe(monkeypatch, fts_error)
 
     def _fake_heal(palace_path, errors, **kwargs):
         captured_kwargs.update(kwargs)
@@ -463,10 +500,8 @@ def test_validator_progress_level_survives_the_default_logging_config(tmp_path, 
     _build_palace_with_drawer(palace)
 
     captured = {}
-    monkeypatch.setattr(
-        repair_mod,
-        "sqlite_integrity_errors",
-        lambda _p: ["malformed inverted index for FTS5 table main.embedding_fulltext_search"],
+    _script_probe(
+        monkeypatch, ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
     )
 
     def _fake_heal(palace_path, errors, **kwargs):
@@ -512,7 +547,7 @@ def test_validator_still_raises_when_autoheal_cannot_clear(tmp_path, monkeypatch
     _build_palace_with_drawer(palace)
 
     errors = ["database disk image is malformed"]
-    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(errors))
+    _script_probe(monkeypatch, errors)
     monkeypatch.setattr(
         repair_mod, "maybe_autoheal_fts5_index", lambda palace_path, errs, **_kwargs: errs
     )
@@ -639,11 +674,15 @@ def test_convo_miner_dry_run_skips_validator(tmp_path, monkeypatch):
     assert calls == [], f"convo_miner must not validate in dry-run, got: {calls}"
 
 
-# ── 6. Helper closes ChromaDB handles before re-opening read-only ───
+# ── 6. Handles are closed only before a heal, which writes in a child ──
 
 
-def test_close_handles_called_before_quick_check(tmp_path, monkeypatch):
-    """Windows guard: ChromaDB mmap handles must be released before the read-only re-open."""
+def test_close_handles_called_before_heal_and_not_on_a_clean_check(tmp_path, monkeypatch):
+    """The check reads in a child, so a clean mine keeps the writer's client.
+
+    The heal updates the index in a child process, so ChromaDB's
+    handles (mmap'd on Windows) must be released before it, and only then.
+    """
     palace = tmp_path / "palace"
     _build_palace_with_drawer(palace)
 
@@ -651,25 +690,24 @@ def test_close_handles_called_before_quick_check(tmp_path, monkeypatch):
 
     from mempalace import repair as repair_mod
 
-    real_close = repair_mod._close_chroma_handles
-    real_errors = repair_mod.sqlite_integrity_errors
-
     def _close_spy(palace_path, *args, **kwargs):
         order.append("close")
-        return real_close(palace_path, *args, **kwargs)
 
-    def _errors_spy(palace_path, *args, **kwargs):
-        order.append("quick_check")
-        return real_errors(palace_path, *args, **kwargs)
+    def _heal_spy(palace_path, errors, **kwargs):
+        order.append("heal")
+        return []
 
     monkeypatch.setattr(repair_mod, "_close_chroma_handles", _close_spy)
-    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", _errors_spy)
+    monkeypatch.setattr(repair_mod, "maybe_autoheal_fts5_index", _heal_spy)
 
     _validate_palace_fts5_after_mine(str(palace))
+    assert order == [], f"a clean check closed or healed: {order}"
 
-    assert order == ["close", "quick_check"], (
-        f"_close_chroma_handles must run before sqlite_integrity_errors, got: {order}"
-    )
+    # The clean check above is cached for the unchanged database; forget it.
+    (palace / ".mempalace" / "integrity.json").unlink()
+    _script_probe(monkeypatch, ["malformed inverted index for FTS5 table x"])
+    _validate_palace_fts5_after_mine(str(palace))
+    assert order == ["close", "heal"]
 
 
 # ── 7. --mode extract / mine_formats coverage (post-#1555 gap close) ──
@@ -867,16 +905,7 @@ def test_mine_formats_full_chain_auto_heals_isolated_fts5_corruption(tmp_path, m
 
 
 def _record_quick_checks(monkeypatch) -> list:
-    from mempalace import repair as repair_mod
-
-    calls: list = []
-
-    def _clean(palace_path):
-        calls.append(palace_path)
-        return []
-
-    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", _clean)
-    return calls
+    return _script_probe(monkeypatch, [])
 
 
 def test_validator_skips_only_when_nothing_was_written_since(tmp_path, monkeypatch):

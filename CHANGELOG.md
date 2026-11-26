@@ -10,6 +10,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Upgrade notes
 
+- **The first mine that writes to an existing palace after upgrade runs one
+  full integrity check** (no clean result is on record yet) and creates
+  `<palace>/.mempalace/` if it is missing; later mines run the scoped check.
+  If a check finds isolated FTS5 damage, a child process rebuilds and
+  verifies the index while the miner holds the writer lease.
+
 - **The first conversation mine after upgrade re-reads every previously mined
   transcript in its selected sources.** Older rows have no verified source
   fingerprint and must be re-mined once, even when their stored mtime and size
@@ -55,6 +61,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   ([#3021](https://github.com/MemPalace/mempalace/pull/3021))
 
 ### Performance
+
+- **The post-mine integrity check is scoped to what the mine wrote and runs
+  in a child process** (#2684). A mine that wrote anything used to end with a
+  whole-database `PRAGMA quick_check` (7-12 s on a 1.2 GB palace) in the mining
+  process, beside Chroma's own SQLite. It now scans the rows it wrote for a raw
+  NUL or invalid UTF-8 and quick_checks `embeddings` / `embedding_metadata`
+  (0.2-0.5 s on a 50k-drawer palace). The full check runs on the first mine
+  after a writer died mid-write, every 24 h
+  (`integrity_full_check_interval_hours`), with
+  `post_mine_integrity_check = "full"`, or on demand with the new
+  `mempalace integrity-check`. FTS5 inverted-index damage is now found by that
+  full check rather than by every mine.
 
 - **The Antigravity sidecar no longer loads a second copy of the palace.**
   Its Python bridge starts on first use instead of with every IDE window
