@@ -286,7 +286,7 @@ EXPECTED = {
     "embedding_count": 10,
     "hall_counts": [
         ("_registry", "my_app", "", 1, ""),
-        ("code", "other", "", 3, ""),
+        ("code", "other", "", 2, ""),
         ("diary", "my_app", "", 1, ""),
         ("diary", "wing_my_app", "", 1, ""),
         ("ideas", "wing_my_app", "", 1, ""),
@@ -610,11 +610,11 @@ EXPECTED = {
     ],
     "wing_names": ["my-app", "my_app", "other", "wing_my_app"],
     "wing_rooms": (
-        8,
+        7,
         [
             ("my-app", [("notes", 1)]),
             ("my_app", [("diary", 1), ("notes", 1)]),
-            ("other", [("code", 3)]),
+            ("other", [("code", 2)]),
             ("wing_my_app", [("diary", 1), ("ideas", 1)]),
         ],
     ),
