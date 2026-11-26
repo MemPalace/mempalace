@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import paths
 from .config import MempalaceConfig
-from .fsio import decode_source, encoding_metadata
+from .fsio import atomic_write_json, decode_source, encoding_metadata
 from .miner import _extract_entities_for_metadata
 from .palace import (
     StaleDrawerPurgeFailed,
@@ -273,7 +273,10 @@ def ingest_diaries(
             }
         days_updated += 1
 
-    state_file.write_text(json.dumps(state, indent=2))
+    # Published atomically, so a crash mid-write cannot leave a truncated
+    # state file (which the reader would treat as empty and re-ingest every
+    # diary).
+    atomic_write_json(state_file, state)
     if days_updated:
         print(f"Diary: {days_updated} days updated, {closets_created} new closets")
 
