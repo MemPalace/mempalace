@@ -159,9 +159,28 @@ SUPERSEDED_ERROR_CLASS = "Superseded"
 # ``QueueStore._init_db``); steady-state calls use the caller's timeout.
 INIT_BUSY_TIMEOUT_SECONDS = 2.0
 
+# Longest pause between two tries of a write that found the queue busy, in
+# ``wall_clock_busy`` mode.
+BUSY_RETRY_MAX_SLEEP_SECONDS = 0.02
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
 
 class QueueStore:
-    def __init__(self, path: Path, *, clock=time.time, timeout: float = 30.0):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        clock=time.time,
+        timeout: float = 30.0,
+        wall_clock_busy: bool = False,
+    ):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -170,6 +189,14 @@ class QueueStore:
         # Injected by tests to drive the debounce deterministically.
         self.clock = clock
         self.timeout = timeout
+        # SQLite's own busy handler sleeps a fixed schedule and adds up the
+        # sleeps it planned, not the time that passed. On a loaded machine
+        # each sleep runs long, so a 0.15 s timeout can take several times
+        # that. The hook has a hard budget: with ``wall_clock_busy`` the
+        # handler is off and ``enqueue`` retries in Python until ``timeout``
+        # seconds of wall time have passed. Only ``enqueue`` (and opening the
+        # store) retry; the hook calls nothing else.
+        self.wall_clock_busy = wall_clock_busy
         self._init_db()
 
     @contextlib.contextmanager
@@ -182,7 +209,8 @@ class QueueStore:
         In a daemon that runs thousands of jobs that is an unbounded FD leak. This
         wrapper closes the connection on exit so each call is self-contained.
         """
-        conn = sqlite3.connect(str(self.path), timeout=self.timeout)
+        timeout = 0.0 if self.wall_clock_busy else self.timeout
+        conn = sqlite3.connect(str(self.path), timeout=timeout)
         try:
             conn.row_factory = sqlite3.Row
             yield conn
@@ -193,19 +221,45 @@ class QueueStore:
         finally:
             conn.close()
 
+    def _retry_busy(self, attempt):
+        """Run ``attempt`` (one whole transaction), retrying while SQLite is
+        busy, until ``timeout`` seconds of wall time have passed."""
+        if not self.wall_clock_busy:
+            return attempt()
+        deadline = time.monotonic() + self.timeout
+        pause = 0.001
+        while True:
+            try:
+                return attempt()
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(pause, remaining))
+                pause = min(pause * 2, BUSY_RETRY_MAX_SLEEP_SECONDS)
+
+    def _schema_version(self) -> int:
+        with self._connect() as conn:
+            return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
     def _init_db(self) -> None:
         # Fast path for the hook: a queue already at the current schema needs
         # no DDL (WAL mode is persistent in the file), and each DDL statement
         # is a write transaction with its own fsync.
         if self.path.exists():
             try:
-                with self._connect() as conn:
-                    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                version = self._retry_busy(self._schema_version)
                 if version == QUEUE_SCHEMA_VERSION:
                     self._harden_files()
                     return
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as exc:
+                # Still busy at the deadline: fail now. The setup below waits
+                # far longer than the hook budget.
+                if self.wall_clock_busy and isinstance(exc, sqlite3.OperationalError):
+                    if _is_busy(exc):
+                        raise
         with self._connect() as conn:
             # Setup runs once per queue file, but every hook that fires before it
             # lands queues up behind it. That one-time wait gets more than a
@@ -452,7 +506,23 @@ class QueueStore:
         payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         settle = max(0.0, float(settle_seconds or 0.0))
         max_wait = settle if max_wait_seconds is None else max(0.0, float(max_wait_seconds))
-        with self._lock, self._connect() as conn:
+        with self._lock:
+            return self._retry_busy(
+                lambda: self._enqueue_once(
+                    kind, payload_json, dedupe_key, priority, settle, max_wait
+                )
+            )
+
+    def _enqueue_once(
+        self,
+        kind: str,
+        payload_json: str,
+        dedupe_key: str | None,
+        priority: int,
+        settle: float,
+        max_wait: float,
+    ) -> Job:
+        with self._connect() as conn:
             now = float(self.clock())
             if dedupe_key:
                 row = self._coalesce(

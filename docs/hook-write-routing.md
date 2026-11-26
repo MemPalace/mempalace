@@ -69,6 +69,8 @@ A hook never waits on the daemon and never imports the storage stack:
 1. It probes `/health` with a 150 ms timeout, using only the standard library.
 2. It writes the job straight into the daemon's durable SQLite queue
    (`mempalace/daemon_queue.py`, which imports neither chromadb nor numpy).
+   If another writer holds the queue, it retries for at most 150 ms of wall
+   time, then reports the failure and returns.
 
 Diary checkpoints are queued the same way. The daemon files the drawer and
 then writes the checkpoint ack and the session's save marker, so the marker
