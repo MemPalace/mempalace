@@ -8,6 +8,117 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **The first mine that writes to an existing palace after upgrade runs one
+  full integrity check** (no clean result is on record yet) and creates
+  `<palace>/.mempalace/` if it is missing; later mines run the scoped check.
+  If a check finds isolated FTS5 damage, a child process rebuilds and
+  verifies the index while the miner holds the writer lease.
+
+- **The first conversation mine after upgrade re-reads every previously mined
+  transcript in its selected sources.** Older rows have no verified source
+  fingerprint and must be re-mined once, even when their stored mtime and size
+  still match. Those fields cannot rule out a same-size rewrite with restored
+  mtime. This can be a substantial one-time cost for large palaces. Existing
+  text is preserved by the re-mine journal; unchanged chunks reuse stored
+  vectors. Once a transcript has a verified fingerprint, subsequent unchanged
+  passes skip it normally.
+- **Timestamp-preserving, same-size in-place rewrite detection is POSIX-only.**
+  It relies on POSIX ctime. On Windows the fingerprint tracks file identity,
+  size and mtime, but cannot detect an in-place rewrite that preserves size
+  and restores mtime; such a transcript can remain skipped with stale stored
+  text. The fingerprint is filesystem metadata, not a content hash.
+- Conversation re-mining prunes stale drawers only in the destination wing.
+  Re-reading a legacy transcript into another wing keeps the original wing's
+  drawers active; replacements within the destination are still journaled.
+- Source reads use bounded chunks instead of allocating the entire size cap
+  for every file. The byte limit also applies to growth during the read.
+- Conversation read failures, including files over the size limit, remain
+  eligible for retry and produce a warning on each mining pass until resolved.
+  They are not registered as successfully mined, and previously stored drawers
+  remain intact. Resolving a transient read failure allows the next pass to
+  recover without a source edit. Oversized files are retried until they fit
+  the reader's size limit.
+
+### Added
+
+- **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
+  HTTP-capable clients connect to the running hub (`mempalace serve`)
+  directly instead of starting a `mempalace-light-mcp` stdio process per
+  chat; the full catalog stays at `/mcp`. The endpoint uses the same bearer
+  token policy, Host/Origin checks and request size limit as `/mcp`, follows
+  the hub's `--read-only`, and goes through the same writer guards and palace
+  locking. It takes JSON-RPC as `POST` with JSON replies only; `GET` answers
+  `405` because there is no SSE stream. For Codex, set
+  `url = "http://127.0.0.1:8765/mcp/light"` under
+  `[mcp_servers.mempalace-light]` (add `bearer_token_env_var` when the hub
+  has a token). ([#3025](https://github.com/MemPalace/mempalace/pull/3025))
+- **`mempalace_search` takes `candidate_strategy="lexical"`.** It runs the
+  backend's FTS5/BM25 search only, without loading the embedding model, and
+  the hub advertises it as the `search_lexical` capability. The light
+  `palace_query` passes it through.
+  ([#3021](https://github.com/MemPalace/mempalace/pull/3021))
+
+### Performance
+
+- **The post-mine integrity check is scoped to what the mine wrote and runs
+  in a child process** (#2684). A mine that wrote anything used to end with a
+  whole-database `PRAGMA quick_check` (7-12 s on a 1.2 GB palace) in the mining
+  process, beside Chroma's own SQLite. It now scans the rows it wrote for a raw
+  NUL or invalid UTF-8 and quick_checks `embeddings` / `embedding_metadata`
+  (0.2-0.5 s on a 50k-drawer palace). The full check runs on the first mine
+  after a writer died mid-write, every 24 h
+  (`integrity_full_check_interval_hours`), with
+  `post_mine_integrity_check = "full"`, or on demand with the new
+  `mempalace integrity-check`. FTS5 inverted-index damage is now found by that
+  full check rather than by every mine.
+
+- **The Antigravity sidecar no longer loads a second copy of the palace.**
+  Its Python bridge starts on first use instead of with every IDE window
+  (set `MEMPALACE_SIDECAR_WARMUP=1` or `MEMPALACE_EAGER_WARMUP=1` to start
+  it eagerly). When a hub is running, overview, search, drawer, knowledge
+  graph, tunnel, diary, event and artifact requests are proxied to it, so the
+  bridge never imports `mempalace.mcp_server`, chromadb, onnxruntime or a
+  vector matrix; type-ahead search uses the hub's lexical search and falls
+  back to `union` on a hub without `search_lexical`. Without a hub, vectors
+  load on the first vector search and are unloaded after
+  `MEMPALACE_SIDECAR_IDLE_UNLOAD_SECONDS` of no use (default 300).
+  ([#3021](https://github.com/MemPalace/mempalace/pull/3021))
+- **`mempalace-light-mcp` stays light.** Starting it, `--help`, the
+  handshake and `tools/list` no longer import `mempalace.mcp_server`,
+  chromadb or numpy. With a hub running, `palace_query`, `palace_exec` and
+  `palace_coordinate` are forwarded to the hub and search results are
+  enriched from `tunnels.json` directly; the full server is imported only for
+  local operation, or when the hub goes away during a read.
+  ([#3022](https://github.com/MemPalace/mempalace/pull/3022))
+- **Long-lived server processes cap BLAS/OpenMP pools at one thread.**
+  OpenBLAS starts a worker and buffer per logical core when numpy loads, about
+  800 MB of commit charge on a 28-thread Windows host for an MCP server that
+  mostly waits; capped, the server's import costs about 61 MB.
+  `mempalace-mcp`, `mempalace-light-mcp`, `python -m mempalace.mcp_server`,
+  the `mempalace serve` hub and the Antigravity sidecar bridge default
+  `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to `1`;
+  a value you export wins.
+  ([#3022](https://github.com/MemPalace/mempalace/pull/3022))
+- **Looking up a drawer by an ID that is not stored no longer scans a
+  `sqlite_exact` palace.** The fallback filter on `parent_drawer_id` or the
+  legacy `parent_entry_id` decoded the whole collection; both fields are now
+  indexed and the lookup is a union of index seeks. On a 584,289-drawer
+  palace a missing-parent lookup went from 8.6 s to under 1 ms, and the same
+  request to a live hub from 9.0 s to 44 ms. The indexes are added
+  on the first writable open of an existing palace (6.4 s on that palace); a
+  read-only open leaves the schema alone.
+  ([#2998](https://github.com/MemPalace/mempalace/pull/2998))
+- **Every `mempalace` command starts faster.** `mempalace.cli`, `mempalace.palace`,
+  `mempalace.searcher` and `mempalace.mcp_server` execute their source files
+  into one namespace, and compiled those files from source on every start:
+  no bytecode cache applied to them. They now load through the import
+  system's cache, like any module. The HTTP opener that refuses redirects is
+  built on first use instead of at import. `mempalace --version` went from
+  about 340 ms to 180 ms on a busy machine, which every hook run pays.
+  ([#3038](https://github.com/MemPalace/mempalace/pull/3038))
+
 ### Bug Fixes
 
 - `mempalace wake-up` reads a Chroma palace without importing chromadb or
@@ -40,6 +151,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   In an 80,000-drawer palace on a busy machine, `mempalace wake-up --wing`
   for a 50,000-drawer wing went from 2.1–2.3 s, usually without its
   memories, to about 0.55 s with them; the text it prints is unchanged.
+- **Repair rebuilds keep the re-mine journal and `.mempalace/` and create
+  the rebuilt palace owner-only (`0700`).** `repair rebuild-index` and
+  `repair --mode from-sqlite` used to leave the new palace at umask
+  permissions and drop `drawer_revisions.jsonl` and `.mempalace/`, so a
+  user who deleted the archive after a good rebuild lost the prior
+  verbatim text the journal exists to keep. The journal is copied at
+  `0600`, `.mempalace/` is walked without following symlinks, and the
+  archive is left intact. Thanks to [Lautaro Antúnez](https://github.com/Staberman).
+  ([#3059](https://github.com/MemPalace/mempalace/pull/3059),
+  [#3053](https://github.com/MemPalace/mempalace/issues/3053))
+- **Importing `mempalace` no longer caps the thread pools of the process.**
+  The cap from [#3022](https://github.com/MemPalace/mempalace/pull/3022) was
+  set at package import, so CPU embedding (EmbeddingGemma through torch) ran
+  on one thread, `sqlite_exact` exact scans ran on one BLAS thread, and any
+  application that imports mempalace as a library (Hermes, notebooks) lost
+  its threads as well. The cap now lives only in the server entry points
+  listed above; `mempalace mine` and other CLI commands use every core again.
 - Re-mining a conversation transcript or a diary that was rewritten,
   compacted or shortened no longer destroys the text mined from the earlier
   version. Drawer ids are positional, so a re-mine wrote the new text over
@@ -68,7 +196,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [3.12.0] — 2026-11-09
+## [3.12.0] — 2026-11-12
 
 Mining keeps every byte of your sources, never leaves a file without its
 drawers when a write fails part-way, and stores your messages as written.
@@ -2018,6 +2146,7 @@ Agents get lighter ways in: a 3-tool MCP server with Palace Query Language, shar
 
 ### Documentation
 
+- **macOS LaunchAgent template for `mempalace serve`, and why `ProcessType` matters.** Adds `deploy/com.mempalace.server.plist` alongside the systemd unit. A LaunchAgent with no `ProcessType` is CPU and I/O throttled by launchd, which presents as a slow server rather than as a launchd policy. (#2507)
 - **Codex plugin install instructions use the built-in marketplace.** (#2372)
 ---
 

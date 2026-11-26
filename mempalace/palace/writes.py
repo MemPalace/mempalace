@@ -26,13 +26,16 @@ class PriorTextArchiveFailed(StaleDrawerPurgeFailed):
     """
 
 
-def _source_file_delete_ids(collection, source_file: str, extract_mode: Optional[str]) -> list:
+def _source_file_delete_ids(
+    collection, source_file: str, extract_mode: Optional[str], *, wing: Optional[str] = None
+) -> list:
     """Collect drawer IDs for one source file in one extraction mode's scope.
 
     ``extract_mode=None`` is every drawer for the path. Legacy conversation
     drawers did not carry extract_mode; treat those as exchange-mode rows so
     schema rebuilds can still clean them up without deleting newer
-    general-mode drawers for the same transcript.
+    general-mode drawers for the same transcript. When ``wing`` is supplied,
+    keep every row outside that destination wing active.
     """
     ids: list = []
     offset = 0
@@ -46,6 +49,8 @@ def _source_file_delete_ids(collection, source_file: str, extract_mode: Optional
         batch_ids = batch.get("ids") or []
         metadatas = batch.get("metadatas") or []
         for drawer_id, meta in zip(batch_ids, metadatas):
+            if wing is not None and (meta or {}).get("wing") != wing:
+                continue
             if _metadata_matches_extract_mode(meta or {}, extract_mode):
                 ids.append(drawer_id)
         if not batch_ids:
@@ -235,6 +240,7 @@ def write_file_drawers(
     aaak_col=None,
     owner: Optional[str] = None,
     palace_path: Optional[str] = None,
+    prune_wing: Optional[str] = None,
 ) -> int:
     """File one source file's drawers: write the new ones, then drop the stale.
 
@@ -249,6 +255,10 @@ def write_file_drawers(
     ``chunk_total`` set to the real count, as a metadata-only update. A crash
     anywhere leaves the old drawers or the new ones readable and the file
     marked unfinished, so the next mine redoes it.
+
+    ``prune_wing`` limits stale-drawer pruning to that destination wing.
+    Conversation mining supplies it so a legacy re-mine into another wing
+    preserves the original wing's active drawers as well as their text.
 
     Without ``prune`` the drawers are written as given and nothing is removed:
     a skip marker that must not take the last good text with it.
@@ -313,7 +323,9 @@ def write_file_drawers(
     try:
         stale = [
             drawer_id
-            for drawer_id in _source_file_delete_ids(collection, source_file, extract_mode)
+            for drawer_id in _source_file_delete_ids(
+                collection, source_file, extract_mode, wing=prune_wing
+            )
             if drawer_id not in fresh
         ]
         if stale and owner is not None:

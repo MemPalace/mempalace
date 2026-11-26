@@ -34,6 +34,16 @@ Tools (maintenance):
 import os
 import sys
 
+from .._blas_threads import cap_server_blas_threads, launched_as_module
+
+# ``python -m mempalace.mcp_server`` (and ``mempalace serve``, which starts
+# it that way) is a long-lived server: cap its BLAS/OpenMP pools before the
+# imports below load numpy. ``main()`` cannot do it, because this package is
+# imported before ``__main__`` runs. A plain ``import mempalace.mcp_server``
+# from a library or a test leaves the pools alone.
+if launched_as_module(__name__):
+    cap_server_blas_threads()
+
 # --- MCP stdio protection ---------------------------------------------------
 # The MCP protocol multiplexes JSON-RPC over stdio: stdout MUST carry only
 # valid JSON-RPC messages, stderr is for human-readable logs. Some
@@ -63,6 +73,7 @@ if _REAL_STDOUT_FD is None:
 sys.stdout = sys.stderr
 
 import argparse  # noqa: E402  (deferred until after stdio protection above)
+import atexit  # noqa: E402
 import contextlib  # noqa: E402
 import hashlib  # noqa: E402
 import hmac  # noqa: E402
@@ -198,9 +209,9 @@ _FRAGMENTS = (
 
 
 def _exec_fragment(filename: str) -> None:
-    path = _FRAGMENT_DIR / filename
-    source = path.read_text(encoding="utf-8")
-    exec(compile(source, str(path), "exec"), globals())
+    from .._fragments import fragment_code
+
+    exec(fragment_code(__name__, _FRAGMENT_DIR / filename), globals())
 
 
 for _fragment in _FRAGMENTS:

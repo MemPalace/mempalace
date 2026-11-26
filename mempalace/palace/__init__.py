@@ -20,9 +20,10 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from .. import paths
+from .._source_state import source_fingerprint
 from ..backends import (
     BackendClosedError,
     BackendError,
@@ -142,9 +143,9 @@ _FRAGMENTS = (
 
 
 def _exec_fragment(filename: str) -> None:
-    path = _FRAGMENT_DIR / filename
-    source = path.read_text(encoding="utf-8")
-    exec(compile(source, str(path), "exec"), globals())
+    from .._fragments import fragment_code
+
+    exec(fragment_code(__name__, _FRAGMENT_DIR / filename), globals())
 
 
 for _fragment in _FRAGMENTS:

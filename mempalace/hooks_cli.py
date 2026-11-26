@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from mempalace import paths
+from mempalace import paths, transcript_cursor
 from mempalace._env import env_float, env_str, parse_bool
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.config import MempalaceConfig, normalize_wing_name
@@ -191,8 +191,124 @@ def _validate_transcript_path(transcript_path: str) -> Path:
     return path
 
 
+# Bump when the counting rules below change, so stored cursors are recounted.
+_COUNT_RECIPE = "human-messages/1"
+_CURSOR_SUBDIR = "transcript_cursors"
+
+# A counted line always holds the exact string "user" (a role) or
+# "user_message" (a Codex event type). JSON can spell those only literally or
+# with \u005f / \u006X / \u007X escapes, so a line with none of the three is
+# provably not counted and is never parsed.
+_USER_ESCAPE = re.compile(rb"\\u00[5-7]")
+
+
+def _may_count(line: bytes) -> bool:
+    return b'"user"' in line or b'"user_message"' in line or _USER_ESCAPE.search(line) is not None
+
+
+def _new_count_state() -> dict:
+    return {"count": 0, "codex_events": 0, "codex_items": 0}
+
+
+def _count_entry(state: dict, entry) -> None:
+    """Fold one parsed transcript record into the human-message counters."""
+    try:
+        msg = entry.get("message", {})
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                if "<command-message>" in content:
+                    return
+            elif isinstance(content, list):
+                text = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+                if "<command-message>" in text:
+                    return
+            state["count"] += 1
+        # Codex CLI transcripts nest a user turn as an event_msg
+        # whose payload has type user_message and a message field.
+        elif entry.get("type") == "event_msg":
+            payload = entry.get("payload", {})
+            if isinstance(payload, dict) and payload.get("type") == "user_message":
+                msg_text = payload.get("message", "")
+                if isinstance(msg_text, str) and "<command-message>" not in msg_text:
+                    state["codex_events"] += 1
+        # Newer Codex rollouts may only record the turn as a
+        # response_item message.
+        elif entry.get("type") == "response_item":
+            payload = entry.get("payload", {})
+            if isinstance(payload, dict):
+                turn = codex_response_message(payload)
+                if turn and turn[0] == "user":
+                    state["codex_items"] += 1
+    except (AttributeError, TypeError):
+        # Non-dict records, or a list block whose "text" is not a string.
+        pass
+
+
+def _feed_count(state: dict, chunk: bytes) -> None:
+    for entry in transcript_cursor.iter_records(chunk, keep=_may_count):
+        _count_entry(state, entry)
+
+
+def _count_total(state: dict) -> int:
+    return state["count"] + (state["codex_events"] or state["codex_items"])
+
+
+def _cursor_sidecar(path: Path) -> Path:
+    return STATE_DIR / _CURSOR_SUBDIR / transcript_cursor.sidecar_name(path)
+
+
+def _valid_count_state(state: dict) -> bool:
+    keys = _new_count_state().keys()
+    return state.keys() == keys and all(type(state[k]) is int and state[k] >= 0 for k in keys)
+
+
+def _ensure_cursor_dir() -> None:
+    for d in (STATE_DIR, STATE_DIR / _CURSOR_SUBDIR):
+        d.mkdir(parents=True, exist_ok=True)
+        try:
+            d.chmod(0o700)
+        except (OSError, NotImplementedError):
+            pass
+
+
+def _count_with_cursor(path: Path) -> int:
+    """Count via the stored cursor, parsing only what was appended since."""
+    sidecar = _cursor_sidecar(path)
+    previous = transcript_cursor.load_cursor(sidecar)
+    if previous is not None and not _valid_count_state(previous.state):
+        previous = None
+    scan = transcript_cursor.advance(
+        path,
+        previous,
+        recipe=_COUNT_RECIPE,
+        initial_state=_new_count_state,
+        feed=_feed_count,
+    )
+    if scan is None:
+        return 0
+    if previous is not None and not scan.resumed:
+        _log(f"transcript cursor {scan.reason}; recounted {path.name}")
+    if scan.cursor != previous and _palace_root_exists():
+        try:
+            _ensure_cursor_dir()
+            transcript_cursor.save_cursor(sidecar, scan.cursor)
+        except OSError as exc:
+            _log(f"WARNING: could not save transcript cursor: {exc}")
+    state = dict(scan.cursor.state)
+    if scan.tail:
+        # An unterminated last line still counts, but is not committed: the
+        # writer may be mid-line.
+        _feed_count(state, scan.tail)
+    return _count_total(state)
+
+
 def _count_human_messages(transcript_path: str) -> int:
-    """Count human messages in a JSONL transcript, skipping command-messages."""
+    """Count human messages in a JSONL transcript, skipping command-messages.
+
+    Keeps a verified append cursor per transcript under ``hook_state/`` so a
+    Stop only parses the lines appended since the previous one.
+    """
     path = _validate_transcript_path(transcript_path)
     if path is None:
         if transcript_path:
@@ -200,48 +316,38 @@ def _count_human_messages(transcript_path: str) -> int:
         return 0
     if not path.is_file():
         return 0
-    count = 0
-    codex_events = 0
-    codex_items = 0
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                    msg = entry.get("message", {})
-                    if isinstance(msg, dict) and msg.get("role") == "user":
-                        content = msg.get("content", "")
-                        if isinstance(content, str):
-                            if "<command-message>" in content:
-                                continue
-                        elif isinstance(content, list):
-                            text = " ".join(
-                                b.get("text", "") for b in content if isinstance(b, dict)
-                            )
-                            if "<command-message>" in text:
-                                continue
-                        count += 1
-                    # Codex CLI transcripts nest a user turn as an event_msg
-                    # whose payload has type user_message and a message field.
-                    elif entry.get("type") == "event_msg":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict) and payload.get("type") == "user_message":
-                            msg_text = payload.get("message", "")
-                            if isinstance(msg_text, str) and "<command-message>" not in msg_text:
-                                codex_events += 1
-                    # Newer Codex rollouts may only record the turn as a
-                    # response_item message.
-                    elif entry.get("type") == "response_item":
-                        payload = entry.get("payload", {})
-                        if isinstance(payload, dict):
-                            turn = codex_response_message(payload)
-                            if turn and turn[0] == "user":
-                                codex_items += 1
-                except (json.JSONDecodeError, AttributeError):
-                    pass
+        return _count_with_cursor(path)
     except OSError:
         return 0
-    return count + (codex_events or codex_items)
+    except Exception as exc:  # never let cursor bookkeeping break the hook
+        _log(f"WARNING: transcript cursor failed ({exc!r}); counting without it")
+        try:
+            _cursor_sidecar(path).unlink()
+        except OSError:
+            pass
+    try:
+        scan = transcript_cursor.advance(
+            path, None, recipe=_COUNT_RECIPE, initial_state=_new_count_state, feed=_feed_count
+        )
+    except Exception as exc:
+        _log(f"WARNING: could not count transcript messages ({exc!r})")
+        return 0
+    if scan is None:
+        return 0
+    state = dict(scan.cursor.state)
+    _feed_count(state, scan.tail)
+    return _count_total(state)
+
+
+def _clear_transcript_cursor(transcript_path: str) -> None:
+    """Drop the stored count cursor for a transcript whose session ended."""
+    try:
+        path = _validate_transcript_path(transcript_path) if transcript_path else None
+        if path is not None:
+            _cursor_sidecar(path).unlink()
+    except Exception:  # best-effort cleanup inside a finally; never raise
+        pass
 
 
 _state_dir_initialized = False
@@ -1788,6 +1894,7 @@ def hook_session_end(data: dict, harness: str):
     # Parse inside the try so a malformed payload (e.g. non-dict stdin that
     # makes _parse_harness_input raise) still runs the finally cleanup below.
     session_id = "unknown"
+    transcript_path = ""
     try:
         parsed = _parse_harness_input(data, harness)
         session_id = parsed["session_id"]
@@ -1858,6 +1965,7 @@ def hook_session_end(data: dict, harness: str):
         _output({})
     finally:
         _clear_session_last_save(session_id)
+        _clear_transcript_cursor(transcript_path)
 
 
 def hook_precompact(data: dict, harness: str):

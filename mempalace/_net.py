@@ -37,7 +37,15 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
-_OPENER = urllib.request.build_opener(NoRedirectHandler)
+_opener = None
+
+
+def _no_redirect_opener():
+    """Built on first use: building it loads ``ssl``, which most commands never need."""
+    global _opener
+    if _opener is None:
+        _opener = urllib.request.build_opener(NoRedirectHandler)
+    return _opener
 
 
 def urlopen(url, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
@@ -45,7 +53,7 @@ def urlopen(url, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
 
     Same arguments and return value; a 3xx reply raises ``HTTPError``.
     """
-    return _OPENER.open(url, data, timeout)
+    return _no_redirect_opener().open(url, data, timeout)
 
 
 def bind_without_reverse_dns(server: socketserver.TCPServer) -> None:

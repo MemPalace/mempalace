@@ -1010,6 +1010,28 @@ def _call_kg(op, read=False):
             raise
 
 
+def _close_cached_kgs() -> None:
+    """Close and drop every cached KnowledgeGraph handle.
+
+    Registered with ``atexit`` below so a shutting-down server checkpoints its
+    WAL instead of leaving a hot ``-wal`` file for the next process to
+    recover. Registration is module level, on the server-owned cache only:
+    registering ``close`` per instance in ``KnowledgeGraph.__init__`` would
+    make the atexit registry a strong reference to every short-lived KG in the
+    process and pin its SQLite handle open until exit.
+    """
+    with _kg_cache_lock:
+        for kg in _kg_by_path.values():
+            try:
+                kg.close()
+            except Exception:
+                pass
+        _kg_by_path.clear()
+
+
+atexit.register(_close_cached_kgs)
+
+
 def _resolve_logstream_path() -> str:
     """Resolve the RFC 003 logstream database path in the active palace.
 
