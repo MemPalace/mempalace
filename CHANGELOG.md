@@ -42,10 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   so it keeps its old per-row `source_fingerprint`, `chunk_total`, `filed_at`
   and `authored_at`. An older binary reads those per-row stamps, sees an
   incomplete set and re-mines the file. It does redundant work but never
-  loses data. Code that calls `file_already_mined`, `prefetch_mined_set` or
-  `prefetch_complete_mtimes` directly should pass the palace's
-  `SourceStateStore` as `source_state`. Without it, such a source reads as
-  not mined, which also errs toward redundant work.
+  loses data. `file_already_mined`, `prefetch_mined_set` and
+  `prefetch_complete_mtimes` read the palace's record even when called
+  without `source_state`; only a collection whose palace path is unknown
+  falls back to the per-row stamps, and then reads such a source as not
+  mined. `mempalace_delete_by_source` also deletes the source's records.
 
 ### Added
 
@@ -74,7 +75,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   written at all. Previously every drawer of a grown transcript was upserted
   with its stored vector and then updated again for `chunk_total`. A touched
   but unchanged source now re-mines with zero Chroma writes, so the hallway
-  recompute and post-mine `quick_check` are skipped. A project file whose
+  recompute and post-mine `quick_check` are skipped. Unchanged drawers now
+  keep their original `authored_at` and `filed_at` on re-mine, which the
+  ranking tie-break and Layer 1 wake-up read per drawer. A project file whose
   `content_date` falls back to its mtime still gets a metadata update when touched, because that date really changed.
 - **The Antigravity sidecar no longer loads a second copy of the palace.**
   Its Python bridge starts on first use instead of with every IDE window

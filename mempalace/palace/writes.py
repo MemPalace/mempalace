@@ -514,6 +514,9 @@ def _unusable_vectors(collection, ids: list, dimension_cache: dict) -> set:
     ``dimension_cache`` holds the probed dimension for the rest of one
     filing: a failed probe is not cached process-wide and costs an embedder
     call, which per batch made an unchanged re-mine of a large file slow.
+
+    Reading the stored vectors of unchanged drawers on every re-file is
+    deliberate: it costs one read per batch and is how a re-mine repairs them.
     """
     if not ids:
         return set()
@@ -667,6 +670,9 @@ def _refile_changed(
     if rewritten or stale:
         drawers_removed(None, aaak_ids=rewritten + stale, aaak_col=aaak_col, reraise=MINE_ABORTS)
     finished = written + restamp
+    # A second write, even for rows that only got a metadata update: they were
+    # written with chunk_total one too high, so a reader of per-row stamps
+    # (an older binary) never sees a complete set before the prune is done.
     for start in range(0, len(finished), DRAWER_UPSERT_BATCH_SIZE):
         batch = finished[start : start + DRAWER_UPSERT_BATCH_SIZE]
         collection.update(ids=batch, metadatas=[{"chunk_total": total}] * len(batch))
