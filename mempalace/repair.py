@@ -62,7 +62,7 @@ from .backends.chroma import (
 # backends._inproc_sqlite, which opens them with connect_sqlite_read under the
 # palace's in-process lock.
 from .config import connect_sqlite_read, sqlite_read_uri  # noqa: F401
-from .fsio import atomic_write_text
+from .fsio import atomic_write_text, make_private_dir
 from .stored_text import decode_record
 from .timeutil import filename_stamp
 
@@ -1392,7 +1392,9 @@ _FTS5_NOT_RECOGNIZED_AS_ISOLATED = (
 )
 
 
-def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=print) -> list[str]:
+def maybe_autoheal_fts5_index(
+    palace_path: str, errors: list[str], *, progress=print, run_locked=None
+) -> list[str]:
     """Rebuild a malformed FTS5 inverted index in place; return remaining errors.
 
     The repair preflight aborts when ``PRAGMA quick_check`` reports SQLite-layer
@@ -1441,70 +1443,11 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
         "\n  Isolated FTS5 inverted-index corruption detected; checking the content\n"
         "  table against embedding_metadata before rebuilding the index from it."
     )
-    declined = False
-    to_restore = checked = unverifiable = unkeyed = 0
+    if run_locked is None:
+        run_locked = _heal_fts5_index_locked
     try:
         with mine_palace_lock(palace_path):
-            with closing(open_palace_writer(sqlite_path, isolation_level=None)) as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                try:
-                    to_restore = _fts5_content_rows_to_restore(conn)
-                    checked, unverifiable, unkeyed = _fts5_content_census(conn)
-                except sqlite3.Error as exc:
-                    # Suppressed: a failing ROLLBACK would replace the message
-                    # that says why the heal declined. Closing the connection
-                    # rolls the transaction back either way.
-                    with suppress(sqlite3.Error):
-                        conn.execute("ROLLBACK")
-                    declined = True
-                    progress(
-                        "  Skipped FTS5 rebuild: the content table cannot be checked against "
-                        f"embedding_metadata ({exc}). The index still holds the terms it was "
-                        "built from."
-                    )
-                if not declined and unverifiable and not checked and not to_restore:
-                    with suppress(sqlite3.Error):
-                        conn.execute("ROLLBACK")
-                    declined = True
-                    progress(
-                        "  Skipped FTS5 rebuild: no content row has an embedding_metadata "
-                        "document to check it against. The index still holds the terms it "
-                        "was built from."
-                    )
-                if not declined and to_restore:
-                    # Present tense on purpose: this prints before COMMIT, so it
-                    # is also what an operator sees on a run that then rolls back.
-                    progress(
-                        f"  Restoring {to_restore} content row(s) from embedding_metadata "
-                        "before rebuilding."
-                    )
-                    conn.execute(_FTS5_CONTENT_RESTORE_SQL)
-                    if _fts5_content_rows_to_restore(conn):
-                        with suppress(sqlite3.Error):
-                            conn.execute("ROLLBACK")
-                        declined = True
-                        progress(
-                            "  Skipped FTS5 rebuild: the content table still disagrees with "
-                            "embedding_metadata after restoring it. Nothing was written."
-                        )
-                    else:
-                        # Re-taken: a restore can add content rows the authority
-                        # has and the shadow table had lost, so the census from
-                        # before it would under-report what the rebuild reads.
-                        checked, unverifiable, unkeyed = _fts5_content_census(conn)
-                if not declined:
-                    if unverifiable:
-                        progress(
-                            f"  {unverifiable} content row(s) have no embedding_metadata document "
-                            "to check against; the rebuild indexes them as they stand."
-                        )
-                    if unkeyed:
-                        progress(
-                            f"  {unkeyed} content row(s) sit at an id no embeddings row uses; "
-                            "this table was not written by the current chromadb schema."
-                        )
-                    conn.execute(_FTS5_REBUILD_SQL)
-                    conn.execute("COMMIT")
+            return run_locked(palace_path, errors, progress=progress)
     except MineAlreadyRunning as exc:
         progress(
             f"  Skipped FTS5 rebuild: palace is being written by another process ({exc}). "
@@ -1517,6 +1460,73 @@ def maybe_autoheal_fts5_index(palace_path: str, errors: list[str], *, progress=p
         # heal that raises must never be what fails a mine.
         progress(f"  FTS5 heal failed (leaving palace untouched): {exc}")
         return errors
+
+
+def _heal_fts5_index_locked(palace_path: str, errors: list[str], *, progress) -> list[str]:
+    """Restore and verify the index while the caller owns the palace writer lease."""
+    sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    declined = False
+    to_restore = checked = unverifiable = unkeyed = 0
+    with closing(open_palace_writer(sqlite_path, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            to_restore = _fts5_content_rows_to_restore(conn)
+            checked, unverifiable, unkeyed = _fts5_content_census(conn)
+        except sqlite3.Error as exc:
+            # Suppressed: a failing ROLLBACK would replace the message
+            # that says why the heal declined. Closing the connection
+            # rolls the transaction back either way.
+            with suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            declined = True
+            progress(
+                "  Skipped FTS5 rebuild: the content table cannot be checked against "
+                f"embedding_metadata ({exc}). The index still holds the terms it was "
+                "built from."
+            )
+        if not declined and unverifiable and not checked and not to_restore:
+            with suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
+            declined = True
+            progress(
+                "  Skipped FTS5 rebuild: no content row has an embedding_metadata "
+                "document to check it against. The index still holds the terms it "
+                "was built from."
+            )
+        if not declined and to_restore:
+            # Present tense on purpose: this prints before COMMIT, so it
+            # is also what an operator sees on a run that then rolls back.
+            progress(
+                f"  Restoring {to_restore} content row(s) from embedding_metadata "
+                "before rebuilding."
+            )
+            conn.execute(_FTS5_CONTENT_RESTORE_SQL)
+            if _fts5_content_rows_to_restore(conn):
+                with suppress(sqlite3.Error):
+                    conn.execute("ROLLBACK")
+                declined = True
+                progress(
+                    "  Skipped FTS5 rebuild: the content table still disagrees with "
+                    "embedding_metadata after restoring it. Nothing was written."
+                )
+            else:
+                # Re-taken: a restore can add content rows the authority
+                # has and the shadow table had lost, so the census from
+                # before it would under-report what the rebuild reads.
+                checked, unverifiable, unkeyed = _fts5_content_census(conn)
+        if not declined:
+            if unverifiable:
+                progress(
+                    f"  {unverifiable} content row(s) have no embedding_metadata document "
+                    "to check against; the rebuild indexes them as they stand."
+                )
+            if unkeyed:
+                progress(
+                    f"  {unkeyed} content row(s) sit at an id no embeddings row uses; "
+                    "this table was not written by the current chromadb schema."
+                )
+            conn.execute(_FTS5_REBUILD_SQL)
+            conn.execute("COMMIT")
 
     if declined:
         return errors
@@ -2398,6 +2408,50 @@ def _preserve_logstream_and_replica(source_palace: str, dest_palace: str) -> lis
     return copied
 
 
+def _preserve_journal_and_state_dir(source_palace: str, dest_palace: str) -> list[str]:
+    """Copy the revision journal and the ``.mempalace/`` state dir into a rebuilt palace.
+
+    Neither is derived from chroma.sqlite3. Left behind, the rebuilt palace
+    has no drawer history (``drawer_revisions.jsonl`` journals the prior
+    verbatim text of re-mined and updated drawers) and loses ``.mempalace/``
+    (e.g. ``origin.json``). The journal is forced to 0600 and every
+    directory created here to 0700; symlinks are skipped.
+    """
+    from .revisions import _REVISION_FILENAME
+
+    if os.path.abspath(source_palace) == os.path.abspath(dest_palace):
+        return []
+
+    copied: list[str] = []
+
+    journal_src = os.path.join(source_palace, _REVISION_FILENAME)
+    journal_dst = os.path.join(dest_palace, _REVISION_FILENAME)
+    if not os.path.islink(journal_src) and os.path.isfile(journal_src):
+        make_private_dir(dest_palace)
+        _copy_file_no_follow(journal_src, journal_dst, replace=True)
+        with suppress(OSError):
+            os.chmod(journal_dst, 0o600)
+        copied.append(_REVISION_FILENAME)
+
+    state_src = os.path.join(source_palace, paths.DIRNAME)
+    if not os.path.islink(state_src) and os.path.isdir(state_src):
+        for root, dirs, files in os.walk(state_src):
+            rel = os.path.relpath(root, source_palace)
+            make_private_dir(os.path.join(dest_palace, rel))
+            dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+            for name in files:
+                src = os.path.join(root, name)
+                if os.path.islink(src) or not os.path.isfile(src):
+                    continue
+                _copy_file_no_follow(src, os.path.join(dest_palace, rel, name), replace=True)
+        copied.append(paths.DIRNAME + "/")
+
+    if copied:
+        print(" Preserved journal and state: " + ", ".join(copied))
+
+    return copied
+
+
 def rebuild_from_sqlite(
     source_palace: str,
     dest_palace: str,
@@ -2769,6 +2823,12 @@ def _rebuild_from_sqlite_locked(
         ts = filename_stamp()
         archive_path = f"{dest_palace}.pre-rebuild-{ts}"
         print(f"  Archiving {dest_palace} -> {archive_path}")
+        # Release this process's own Chroma handles first. A mine no longer
+        # closes them on its way out, and on Windows an open
+        # chroma.sqlite3 / HNSW file makes the directory rename below fail.
+        from .palace import _DEFAULT_BACKEND
+
+        _close_chroma_handles(dest_palace, backend=_DEFAULT_BACKEND)
         # os.rename, NOT shutil.move. When any file inside the palace is
         # held open by another process (MCP server, a running mine, another
         # harness), renaming the directory fails atomically UP FRONT on
@@ -2807,9 +2867,12 @@ def _rebuild_from_sqlite_locked(
                 "in-place rebuild may fail with 'Collection already exists'."
             )
 
-    os.makedirs(dest_palace, exist_ok=True)
+    # The umask would leave a fresh palace at 755; chroma.sqlite3 holds
+    # verbatim transcripts, so create it owner-only like every other path.
+    make_private_dir(dest_palace)
     _preserve_knowledge_graph_sqlite(source_palace, dest_palace)
     _preserve_logstream_and_replica(source_palace, dest_palace)
+    _preserve_journal_and_state_dir(source_palace, dest_palace)
 
     # Backend lifetime is wrapped in try/finally so the dest palace's
     # PersistentClient handle (opened lazily inside ``create_collection``

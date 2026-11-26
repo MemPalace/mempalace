@@ -67,6 +67,45 @@ def cmd_repair_status(args):
     repair_status(palace_path=palace_path)
 
 
+def cmd_integrity_check(args):
+    """Full ``PRAGMA quick_check`` of the palace, in a child process.
+
+    The maintenance half of the post-mine check: a batch runner can set
+    ``MEMPALACE_INTEGRITY_FULL_CHECK_INTERVAL_HOURS=0`` for its mines and run
+    this once at the end. Reuses a clean result while the palace is
+    unchanged unless ``--force``. Reports only; ``mempalace repair`` heals.
+    """
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    if not _maintenance_requires_chroma(palace_path, "integrity-check"):
+        raise SystemExit(2)
+    import time as _time
+
+    from ..integrity_check import all_unverified, run_full_check
+
+    outcome = run_full_check(palace_path, force=getattr(args, "force", False))
+    if outcome.cached:
+        when = (
+            _time.strftime("%Y-%m-%d %H:%M", _time.localtime(outcome.checked_at))
+            if outcome.checked_at
+            else "the last check"
+        )
+        print(f"  ✓ clean: palace unchanged since the full check at {when} (--force to re-run)")
+        return
+    if not outcome.errors:
+        print("  ✓ clean: PRAGMA quick_check found no issues")
+        return
+    print(f"  ✗ integrity check failed: {len(outcome.errors)} issue(s)")
+    for message in outcome.errors[:5]:
+        print(f"    - {message}")
+    if len(outcome.errors) > 5:
+        print(f"    ... and {len(outcome.errors) - 5} more")
+    if all_unverified(outcome.errors):
+        print("  Palace not verified. Re-run the integrity check.")
+        raise SystemExit(1)
+    print("  Stop all MemPalace writers, back up the palace, then run `mempalace repair`.")
+    raise SystemExit(1)
+
+
 def _finish_legacy_repair(backend, palace_path, collection_name, col, total, args):
     """Extract, back up, and rebuild. Caller holds the mine lease."""
     import shutil

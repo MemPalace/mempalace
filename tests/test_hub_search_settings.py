@@ -68,6 +68,9 @@ _NOT_SEARCH_SETTINGS = {
     "MEMPALACE_KG_HALLWAY_MIN_COUNT",
     "MEMPALACE_TOPIC_TUNNEL_MIN_COUNT",
     "MEMPALACE_MAX_BACKUPS",
+    # The post-mine integrity check reads; it never changes what is stored.
+    "MEMPALACE_POST_MINE_INTEGRITY_CHECK",
+    "MEMPALACE_INTEGRITY_FULL_CHECK_INTERVAL_HOURS",
     # Embedding batch size changes throughput, not the vectors.
     "MEMPALACE_EMBEDDINGGEMMA_BATCH_SIZE",
     "MEMPALACE_EMBEDDINGGEMMA2_BATCH_SIZE",
