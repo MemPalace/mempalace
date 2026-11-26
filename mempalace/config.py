@@ -1136,6 +1136,13 @@ class MempalaceConfig:
         with ``mempalace windows build``. Reads ``MEMPALACE_EMBEDDING_SUBWINDOWS``
         first, then ``embedding_subwindows`` in ``config.json``. See
         :mod:`mempalace.subwindows`.
+
+        Turning it on trades some head-of-drawer recall for tail recall: a
+        long drawer's windows compete with other drawers' heads for the same
+        candidate slots. In the PR's benchmark, vector-only queries about a
+        drawer's head fell from 0.390 to 0.240 and hybrid head/paraphrase
+        queries from 0.091 to 0.042, while tail-only facts became findable.
+        Supported on the ``chroma`` and ``sqlite_exact`` backends only.
         """
         env = env_flag("MEMPALACE_EMBEDDING_SUBWINDOWS")
         if env is not None:

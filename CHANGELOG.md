@@ -50,7 +50,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   status` shows how many drawers need them. Deleting or re-mining a drawer
   purges its windows, and windows built by another embedder or for older
   text are ignored. Needs `minilm` or `embeddinggemma`; `openai-compat` and
-  `embeddinggemma2` are not supported yet.
+  `embeddinggemma2` are not supported yet. Needs the `chroma` or
+  `sqlite_exact` backend; any other refuses with a clear error. Turning it on
+  trades some head-of-drawer recall for tail recall: in the PR's benchmark,
+  vector-only queries about a drawer's head fell from 0.390 to 0.240, and
+  hybrid head/paraphrase queries from 0.091 to 0.042, while tail queries
+  gained. Search hits promoted by a window say `matched_via: "window"` and
+  carry `window_span`. `windows build` takes the palace lock per batch, so
+  mines and `sync` keep running during a long build. A wing-scoped search
+  reaches every window of the wing; a room- or source-scoped search whose
+  nearest windows lie outside its scope checks the windows of at most
+  20,000 in-scope drawers and logs at info when it hits that cap.
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**
   HTTP-capable clients connect to the running hub (`mempalace serve`)
   directly instead of starting a `mempalace-light-mcp` stdio process per
