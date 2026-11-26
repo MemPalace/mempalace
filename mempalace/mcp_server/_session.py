@@ -671,6 +671,15 @@ def _supports_metadata_facets(col) -> bool:
     return isinstance(capabilities, (set, frozenset)) and "supports_metadata_facets" in capabilities
 
 
+def _supports_joint_facets(col) -> bool:
+    """Return True if the collection's backend implements joint facet counts."""
+    backend = getattr(col, "_backend", None)
+    if backend is None:
+        return False
+    capabilities = getattr(backend, "capabilities", None)
+    return isinstance(capabilities, (set, frozenset)) and "supports_joint_facets" in capabilities
+
+
 _metadata_cache = None
 _metadata_cache_time = 0
 _METADATA_CACHE_TTL = 5.0  # seconds
@@ -678,19 +687,118 @@ _taxonomy_cache = None
 _taxonomy_cache_time = 0.0
 _TAXONOMY_CACHE_TTL = 5.0  # seconds — same idea as the palace-graph cache
 _graph_rows_cache = None
+# Overview tools (status, list_wings, list_rooms, get_taxonomy) all pay
+# O(collection) SQL on non-chroma backends — count(*) plus wing/room facet
+# scans, and get_taxonomy fires one room-facet query per wing. On a
+# six-figure-drawer palace that is tens of seconds per call, and agents hit
+# these on every wake-up. Cache each tool's payload; writes drop the fresh
+# map via _invalidate_overview_caches() but keep the last good payload in
+# _overview_stale_payloads so reads can serve it while a background thread
+# refreshes — a cold scan under load can exceed proxy/client timeouts, and
+# these payloads are counts/taxonomy, not transactional state.
+_overview_payload_cache = {}
+_overview_stale_payloads = {}
+_overview_refreshing = {}
+_overview_lock = threading.Lock()
+_overview_generation = 0
+try:
+    _OVERVIEW_CACHE_TTL = float(os.environ.get("MEMPALACE_OVERVIEW_CACHE_TTL", "120"))
+except (TypeError, ValueError):
+    _OVERVIEW_CACHE_TTL = 120.0
+try:
+    _OVERVIEW_POST_WRITE_WAIT = float(
+        os.environ.get("MEMPALACE_OVERVIEW_POST_WRITE_WAIT_SECS", "30")
+    )
+except (TypeError, ValueError):
+    _OVERVIEW_POST_WRITE_WAIT = 30.0
 _MAX_RESULTS = 100  # upper bound for search/list limit params
 _DIARY_READ_PAGE_SIZE = 1000
 
 
 def _invalidate_overview_caches():
-    """Drop status/list_wings taxonomy and metadata page caches after writes."""
+    """Drop fresh overview payloads after writes, keeping last-good copies.
+
+    Stale payloads survive invalidation: the next read serves them while a
+    background refresh converges on post-write state, instead of forcing a
+    synchronous cold scan that can exceed client timeouts.
+    """
     global _metadata_cache, _metadata_cache_time, _taxonomy_cache, _taxonomy_cache_time
-    global _graph_rows_cache
+    global _graph_rows_cache, _overview_generation
     _metadata_cache = None
     _metadata_cache_time = 0
     _taxonomy_cache = None
     _taxonomy_cache_time = 0.0
     _graph_rows_cache = None
+    with _overview_lock:
+        for _key, (_ts, _payload) in _overview_payload_cache.items():
+            _overview_stale_payloads[_key] = _payload
+        _overview_payload_cache.clear()
+        _overview_generation += 1
+
+
+def _cached_overview_payload(key):
+    """Return the cached payload for an overview tool while it is fresh."""
+    if _OVERVIEW_CACHE_TTL <= 0:
+        return None
+    entry = _overview_payload_cache.get(key)
+    if entry is not None and (time.time() - entry[0]) < _OVERVIEW_CACHE_TTL:
+        return entry[1]
+    return None
+
+
+def _stale_overview_payload(key):
+    """Last good payload for an overview tool regardless of freshness."""
+    if _OVERVIEW_CACHE_TTL <= 0:
+        return None
+    entry = _overview_payload_cache.get(key)
+    if entry is not None:
+        return entry[1]
+    with _overview_lock:
+        return _overview_stale_payloads.get(key)
+
+
+def _schedule_overview_refresh(key, compute):
+    """Recompute an overview payload off the request path, once per key.
+
+    Returns an Event set when the refresh finishes — stored or dropped — so
+    post-write readers can wait briefly for fresh data. The refresh drops
+    its result when a write invalidated the caches while it ran, so a
+    pre-write scan cannot be pinned as fresh post-write data.
+    """
+    with _overview_lock:
+        existing = _overview_refreshing.get(key)
+        if existing is not None:
+            return existing
+        event = threading.Event()
+        _overview_refreshing[key] = event
+    generation = _overview_generation
+
+    def _run():
+        try:
+            payload = compute()
+            if (
+                isinstance(payload, dict)
+                and not payload.get("error")
+                and generation == _overview_generation
+            ):
+                _store_overview_payload(key, payload)
+        except Exception:
+            logger.debug("overview refresh failed for %s", key, exc_info=True)
+        finally:
+            event.set()
+            with _overview_lock:
+                _overview_refreshing.pop(key, None)
+
+    threading.Thread(target=_run, name=f"mcp-overview-refresh-{key}", daemon=True).start()
+    return event
+
+
+def _store_overview_payload(key, payload) -> None:
+    """Cache a successful overview-tool payload for _OVERVIEW_CACHE_TTL seconds."""
+    if _OVERVIEW_CACHE_TTL <= 0:
+        return
+    with _overview_lock:
+        _overview_payload_cache[key] = (time.time(), payload)
 
 
 def _palace_db_fingerprint():

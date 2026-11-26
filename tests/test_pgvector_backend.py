@@ -64,6 +64,7 @@ class _FakePgVectorClient:
         self.scroll_calls: list = []
         self.id_lookups: list = []
         self.facet_calls: list = []
+        self.joint_facet_calls: list = []
         _FakePgVectorClient.instances.append(self)
 
     def ping(self):
@@ -212,6 +213,18 @@ class _FakePgVectorClient:
             counts[key] = counts.get(key, 0) + 1
         ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
         return dict(ordered[:limit])
+
+    def joint_facet_counts(self, table, *, field_a, field_b, where=None):
+        self.joint_facet_calls.append((table, field_a, field_b, where))
+        counts: dict[tuple[str, str], int] = {}
+        for row in self._filtered(table, where):
+            meta = row.get("metadata") or {}
+            a, b = meta.get(field_a), meta.get(field_b)
+            if a is None or b is None:
+                continue
+            key = (str(a), str(b))
+            counts[key] = counts.get(key, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1])))
 
     def drop_table(self, table):
         self.tables.pop(table, None)
@@ -1820,6 +1833,82 @@ def test_pgvector_facet_counts_passes_filter_to_sql_layer(tmp_path, fake_pgvecto
     _table, field, where, _limit = client.facet_calls[0]
     assert field == "room"
     assert where == {"wing": "engineering"}
+
+
+def test_pgvector_backend_advertises_supports_joint_facets():
+    assert "supports_joint_facets" in PgVectorBackend.capabilities
+
+
+def test_pgvector_joint_facet_counts(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["1", "2", "3", "4", "5"],
+        documents=["a", "b", "c", "d", "e"],
+        metadatas=[
+            {"wing": "alpha", "room": "one"},
+            {"wing": "alpha", "room": "one"},
+            {"wing": "alpha", "room": "two"},
+            {"wing": "beta", "room": "one"},
+            {"wing": "beta", "room": "three"},
+        ],
+        embeddings=[[1, 0]] * 5,
+    )
+    assert col.joint_facet_counts("wing", "room") == {
+        ("alpha", "one"): 2,
+        ("alpha", "two"): 1,
+        ("beta", "one"): 1,
+        ("beta", "three"): 1,
+    }
+
+
+def test_pgvector_joint_facet_counts_ignores_missing_metadata(tmp_path, fake_pgvector):
+    """Rows missing either field are excluded — the caller reconciles them
+    into the ``unknown`` bucket via the single-field facet diff."""
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "alpha", "room": "one"},
+            {"wing": "beta"},
+            {"room": "two"},
+        ],
+        embeddings=[[1, 0]] * 3,
+    )
+    assert col.joint_facet_counts("wing", "room") == {("alpha", "one"): 1}
+
+
+def test_pgvector_joint_facet_counts_where(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    col.upsert(
+        ids=["1", "2", "3"],
+        documents=["a", "b", "c"],
+        metadatas=[
+            {"wing": "engineering", "room": "backend"},
+            {"wing": "engineering", "room": "frontend"},
+            {"wing": "design", "room": "ux"},
+        ],
+        embeddings=[[1, 0]] * 3,
+    )
+    assert col.joint_facet_counts("room", "wing", where={"wing": "engineering"}) == {
+        ("backend", "engineering"): 1,
+        ("frontend", "engineering"): 1,
+    }
+
+
+def test_pgvector_joint_facet_counts_rejects_local_filters(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    with pytest.raises(UnsupportedCapabilityError):
+        col.joint_facet_counts(
+            "wing",
+            "room",
+            where={"$or": [{"wing": "a"}, {"wing": "b"}]},
+        )
+
+
+def test_pgvector_joint_facet_counts_empty_collection(tmp_path, fake_pgvector):
+    _backend, col = _collection(tmp_path)
+    assert col.joint_facet_counts("wing", "room") == {}
 
 
 def _one_database(monkeypatch):

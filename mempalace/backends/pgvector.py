@@ -780,6 +780,38 @@ class _PgVectorClient:
         # (count(*) - sum(facet_values)).
         return {str(decode_value(row[0])): int(row[1]) for row in rows if row[0] is not None}
 
+    def joint_facet_counts(
+        self,
+        table: str,
+        *,
+        field_a: str,
+        field_b: str,
+        where: Optional[dict] = None,
+    ) -> dict[tuple[str, str], int]:
+        """Counts grouped by a metadata field pair in one table scan.
+
+        Returns ``{(a_value, b_value): count}``. Rows where either field is
+        NULL are excluded — callers reconcile the remainder into an
+        "unknown" bucket via the single-field facet diff, same as
+        :meth:`facet_counts`.
+        """
+        qi = _quote_identifier(table)
+        params: list = [field_a, field_b]
+        where_sql = _where_to_sql(where, params) if where else "TRUE"
+        sql = (
+            f"SELECT metadata->>%s AS a, metadata->>%s AS b, count(*) AS c "
+            f"FROM {qi} WHERE {where_sql} "
+            f"AND metadata->>%s IS NOT NULL AND metadata->>%s IS NOT NULL "
+            f"GROUP BY 1, 2 ORDER BY 3 DESC, 1, 2"
+        )
+        params.extend([field_a, field_b])
+        rows = self._execute(sql, params, fetch=True)
+        return {
+            (str(decode_value(row[0])), str(decode_value(row[1]))): int(row[2])
+            for row in rows
+            if row[0] is not None and row[1] is not None
+        }
+
     def drop_table(self, table: str) -> None:
         self._execute(f"DROP TABLE IF EXISTS {_quote_identifier(table)}")
 
@@ -1396,6 +1428,26 @@ class PgVectorCollection(BaseCollection):
             return {}
         return self._client.facet_counts(self._table, field=field, where=where, limit=limit)
 
+    def joint_facet_counts(
+        self,
+        field_a: str,
+        field_b: str,
+        where: Optional[dict] = None,
+    ) -> dict[tuple[str, str], int]:
+        self._ensure_open()
+        validate_where(where)
+        if _requires_local_filter(where):
+            raise UnsupportedCapabilityError(
+                "joint_facet_counts does not support local-only filters"
+            )
+        if not self._table_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return {}
+        return self._client.joint_facet_counts(
+            self._table, field_a=field_a, field_b=field_b, where=where
+        )
+
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         validate_where(where)
         pushdown = None if _requires_local_filter(where) else where
@@ -1496,6 +1548,7 @@ class PgVectorBackend(RemoteMarkerMixin, BaseBackend):
             "supports_metadata_filters",
             "supports_lexical_search",
             "supports_metadata_facets",
+            "supports_joint_facets",
             "supports_recency_order",
             "supports_namespace_isolation",
             "supports_server_side_indexes",
