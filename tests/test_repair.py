@@ -3059,6 +3059,25 @@ def test_preserve_logstream_and_replica_folds_open_wal_and_copies_replica(tmp_pa
     assert (dest / "replica.json").read_text(encoding="utf-8") == '{"replica_id": "rep-1"}'
 
 
+def test_rebuild_from_sqlite_in_place_keeps_peers(tmp_path):
+    """peers.json is the sync membership of this replica; a rebuild that keeps
+    the replica id and the logstream must keep it too."""
+    from mempalace.transport import load_peers
+
+    palace = tmp_path / "palace"
+    _seed_palace_with_logstream_event(palace)
+    (palace / "peers.json").write_text(
+        '{"peers": [{"name": "laptop", "url": "https://laptop.example", "token": "t"}]}',
+        encoding="utf-8",
+    )
+
+    repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    assert load_peers(str(palace)) == [
+        {"name": "laptop", "url": "https://laptop.example", "token": "t"}
+    ]
+
+
 def test_preserve_logstream_and_replica_unreadable_fallback_and_symlink_skip(tmp_path):
     """Unreadable logstream bytes fall back to raw copy; symlinks are skipped."""
     src = tmp_path / "source"
