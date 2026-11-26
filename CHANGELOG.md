@@ -40,6 +40,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   remain intact. Resolving a transient read failure allows the next pass to
   recover without a source edit. Oversized files are retried until they fit
   the reader's size limit.
+- **Upgrade every hook install together.** Conversation and project re-mines
+  now write only the drawers that changed and keep each source's
+  `chunk_total`, snapshot and completion state in one record per source
+  (`source_state.sqlite3` in the palace directory) instead of on every drawer
+  (#3055). A drawer whose text and metadata are unchanged is not rewritten,
+  so it keeps its old per-row `source_fingerprint`, `chunk_total`, `filed_at`
+  and `authored_at`. An older binary reads those per-row stamps, sees an
+  incomplete set and re-mines the file. It does redundant work but never
+  loses data. `file_already_mined`, `prefetch_mined_set` and
+  `prefetch_complete_mtimes` read the palace's record even when called
+  without `source_state`; only a collection whose palace path is unknown
+  falls back to the per-row stamps, and then reads such a source as not
+  mined. `mempalace_delete_by_source` also deletes the source's records.
 
 ### Added
 
@@ -62,6 +75,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Performance
 
+- **A re-mine writes only the drawers that changed (#3055).** New drawers are
+  added. Drawers whose text changed are journaled and rewritten. Drawers whose
+  metadata changed get a metadata-only update. Unchanged drawers are not
+  written at all. Previously every drawer of a grown transcript was upserted
+  with its stored vector and then updated again for `chunk_total`. A touched
+  but unchanged source now re-mines with zero Chroma writes, so the hallway
+  recompute and post-mine `quick_check` are skipped. Unchanged drawers now
+  keep their original `authored_at` and `filed_at` on re-mine, which the
+  ranking tie-break and Layer 1 wake-up read per drawer. A project file whose
+  `content_date` falls back to its mtime still gets a metadata update when touched, because that date really changed.
+- **Drawers with the same text share one vector across source files
+  (#3056).** A forked, resumed or re-exported transcript has a new
+  `source_file`, so its drawer ids are new and the same-id vector reuse
+  missed every chunk. On Chroma and `sqlite_exact` each vector the embedding
+  wrapper computes is now stored with an `embed_key`: a SHA-256 of the
+  embedder's profile (model and tokenizer hashes, max length, pooling,
+  normalization, quantization; for `openai-compat`, the endpoint URL and
+  model) and the exact text the model receives. A write first looks its keys
+  up, 1,000 at a time, and copies the vector of a stored row whose key, recomputed
+  from that row's own text, matches and whose dimension fits; anything else,
+  including a failed lookup, is embedded as before. Identical texts within
+  one batch are embedded once. Only the vector is shared: each drawer keeps
+  its own verbatim text and metadata. EmbeddingGemma 2 puts the title (the
+  `source_file` basename) into its input, so forks still re-embed there.
+  Drawers filed before this change carry no key and are not given one; they
+  simply miss this reuse. Other backends keep embedding every write.
+  `sqlite_exact` adds an index on `embed_key` the first time a palace opens.
 - **The post-mine integrity check is scoped to what the mine wrote and runs
   in a child process** (#2684). A mine that wrote anything used to end with a
   whole-database `PRAGMA quick_check` (7-12 s on a 1.2 GB palace) in the mining

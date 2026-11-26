@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import logging
+import math
 from pathlib import PurePath
 from typing import Optional
 
@@ -12,6 +14,8 @@ from .base import (
     initialize_last_modified_metadata,
     validate_write_batch,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _supports_metadata_aware_documents(embedder) -> bool:
@@ -141,16 +145,176 @@ def _is_native_media(metadata: dict) -> bool:
     return metadata.get("media_type") in {"image", "audio", "video"}
 
 
+def _usable_vector(vector, dimension: int) -> bool:
+    if vector is None or dimension <= 0:
+        return False
+    try:
+        return len(vector) == dimension and all(math.isfinite(float(x)) for x in vector)
+    except (TypeError, ValueError):
+        return False
+
+
+def _with_embed_keys(metadatas: list, keys: list, merges: bool) -> list:
+    """``metadatas`` with each row's ``embed_key`` set to the key its vector has.
+
+    A row without a key drops any key it carried; on a backend that merges
+    upsert metadata that takes an explicit ``None``.
+    """
+    from ..embed_key import EMBED_KEY_FIELD
+
+    rows = []
+    for metadata, key in zip(metadatas, keys):
+        row = dict(metadata or {})
+        if key:
+            row[EMBED_KEY_FIELD] = key
+        elif merges:
+            row[EMBED_KEY_FIELD] = None
+        else:
+            row.pop(EMBED_KEY_FIELD, None)
+        rows.append(row)
+    return rows
+
+
 class EmbeddingCollection(BaseCollection):
     """Wrap a collection that requires explicit vectors.
 
     Backends opt in with the ``requires_explicit_embeddings`` capability.
     Core callers can keep using ``documents=`` and ``query_texts=``; this
     wrapper computes vectors locally before delegating to the backend.
+
+    With ``content_reuse`` (backends with ``supports_embedding_reuse``) every
+    vector this wrapper computes is stored with its ``embed_key``
+    (:mod:`mempalace.embed_key`), and a write first looks those keys up: a
+    stored row with the same key already holds the vector, so it is copied
+    instead of embedded. Only the vector is shared; every drawer keeps its
+    own text and metadata.
     """
 
-    def __init__(self, inner: BaseCollection):
+    def __init__(self, inner: BaseCollection, *, content_reuse: bool = False):
         self._inner = inner
+        self._content_reuse = content_reuse
+
+    def _embed_documents(self, documents: list, metadatas, embedder) -> tuple:
+        """``(vectors, keys)`` for ``documents``; ``keys`` is ``None`` when reuse is off.
+
+        Rows whose key is already stored copy that vector; rows of the batch
+        that share a key are embedded once.
+        """
+        if not self._content_reuse:
+            return _embed_texts(documents, metadatas=metadatas, embedder=embedder), None
+        from ..embed_key import embed_key, embedder_inputs, embedder_profile, profile_identity
+
+        profile = embedder_profile(embedder)
+        if profile is None:
+            return _embed_texts(documents, metadatas=metadatas, embedder=embedder), None
+        identity = profile_identity(profile)
+        try:
+            inputs = embedder_inputs(embedder, _embeddable(documents), metadatas)
+            keys = [
+                embed_key(identity, *model_input)
+                if model_input is not None
+                and not (metadatas is not None and _is_native_media(metadatas[index] or {}))
+                else None
+                for index, model_input in enumerate(inputs)
+            ]
+        except Exception:
+            logger.debug("could not key the batch; embedding all of it", exc_info=True)
+            return _embed_texts(documents, metadatas=metadatas, embedder=embedder), None
+        found = self._stored_vectors_by_key(keys, embedder, identity, profile)
+        vectors: list = [found.get(key) if key else None for key in keys]
+        first_of: dict = {}
+        to_embed = []
+        for index, key in enumerate(keys):
+            if vectors[index] is not None:
+                continue
+            if key is None or key not in first_of:
+                if key is not None:
+                    first_of[key] = index
+                to_embed.append(index)
+        fresh = _embed_texts(
+            [documents[i] for i in to_embed],
+            metadatas=None if metadatas is None else [metadatas[i] for i in to_embed],
+            embedder=embedder,
+        )
+        for index, vector in zip(to_embed, fresh):
+            vectors[index] = vector
+        for index, key in enumerate(keys):
+            if vectors[index] is None:
+                vectors[index] = vectors[first_of[key]]
+        return vectors, keys
+
+    def _stored_vectors_by_key(self, keys: list, embedder, identity: str, profile: dict) -> dict:
+        """``{embed_key: vector}`` for the keys a stored row already holds.
+
+        A hit is used only when the key recomputed from its own text and
+        metadata is the key it carries, and its vector has the embedder's
+        dimension. Lookups go ``LOOKUP_BATCH`` keys at a time; a failed one
+        leaves its keys to be embedded.
+        """
+        from ..embed_key import EMBED_KEY_FIELD, LOOKUP_BATCH, embed_key, embedder_inputs
+
+        wanted = list(dict.fromkeys(key for key in keys if key))
+        found: dict = {}
+        dimension = None
+        for start in range(0, len(wanted), LOOKUP_BATCH):
+            chunk = wanted[start : start + LOOKUP_BATCH]
+            asked = set(chunk)
+            try:
+                got = self._inner.get(
+                    where={EMBED_KEY_FIELD: {"$in": chunk}},
+                    include=["embeddings", "documents", "metadatas"],
+                )
+                ids = list(got.ids or [])
+                documents = list(got.documents or [None] * len(ids))
+                metadatas = [meta or {} for meta in (got.metadatas or [None] * len(ids))]
+                stored = got.embeddings
+                stored = [None] * len(ids) if stored is None else list(stored)
+                hits = [
+                    (doc, meta, vector)
+                    for doc, meta, vector in zip(documents, metadatas, stored)
+                    if meta.get(EMBED_KEY_FIELD) in asked
+                    and meta.get(EMBED_KEY_FIELD) not in found
+                    and isinstance(doc, str)
+                    and not _is_native_media(meta)
+                ]
+                if not hits:
+                    continue
+                inputs = embedder_inputs(
+                    embedder, _embeddable([doc for doc, _, _ in hits]), [m for _, m, _ in hits]
+                )
+                for (_, meta, vector), model_input in zip(hits, inputs):
+                    key = meta[EMBED_KEY_FIELD]
+                    if key in found or model_input is None:
+                        continue
+                    if embed_key(identity, *model_input) != key:
+                        continue
+                    if dimension is None:
+                        dimension = self._reference_dimension(profile)
+                    if _usable_vector(vector, dimension):
+                        found[key] = [float(x) for x in vector]
+            except Exception:
+                logger.debug("embed_key lookup failed; embedding those rows", exc_info=True)
+        return found
+
+    def _keyed_update_metadata(self, ids: list, metadatas, keys):
+        """An update's metadata patch carrying the keys of the vectors it re-embedded."""
+        if keys is None or not any(keys):
+            return metadatas
+        rows = [{} for _ in ids] if metadatas is None else metadatas
+        merges = getattr(self._inner, "upsert_merges_metadata", False) is True
+        return _with_embed_keys(rows, keys, merges=merges)
+
+    def _reference_dimension(self, profile: dict) -> int:
+        """The current embedder's vector width: declared, recorded, or probed."""
+        declared = profile.get("dimension")
+        if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+            return declared
+        recorded = self._inner.get_stored_embedder_identity()
+        if recorded is not None and recorded.dimension > 0:
+            return recorded.dimension
+        from ..embedding import probe_dimension
+
+        return probe_dimension()
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -191,7 +355,10 @@ class EmbeddingCollection(BaseCollection):
         if metadatas is not None:
             metadatas = initialize_last_modified_metadata(_as_list(metadatas))
         if embeddings is None:
-            embeddings = _embed_texts(documents, metadatas=metadatas)
+            embedder = _resolve_document_embedder() if self._content_reuse else None
+            embeddings, keys = self._embed_documents(documents, metadatas, embedder)
+            if keys is not None and metadatas is not None:
+                metadatas = _with_embed_keys(metadatas, keys, merges=False)
         return self._inner.add(
             documents=documents,
             ids=ids,
@@ -227,7 +394,10 @@ class EmbeddingCollection(BaseCollection):
                             metadata, metadatas[index] if metadatas is not None else None
                         )
                     )
-            embeddings = _embed_texts(documents, metadatas=effective, embedder=embedder)
+            embeddings, keys = self._embed_documents(documents, effective, embedder)
+            if keys is not None and metadatas is not None:
+                merges = getattr(self._inner, "upsert_merges_metadata", False) is True
+                metadatas = _with_embed_keys(metadatas, keys, merges=merges)
         guarded = getattr(self._inner, "_upsert_with_metadata_guard", None)
         if expected is not None and callable(guarded):
             return guarded(
@@ -374,15 +544,12 @@ class EmbeddingCollection(BaseCollection):
                     _old_document, old_metadata = old_by_id.get(record_id, ("", {}))
                     update_metadata = (metadatas[index] or {}) if metadatas is not None else {}
                     effective_metadatas.append(_merged_metadata(old_metadata, update_metadata))
-                embeddings = _embed_texts(
-                    documents,
-                    metadatas=effective_metadatas,
-                    embedder=embedder,
-                )
+                embeddings, keys = self._embed_documents(documents, effective_metadatas, embedder)
             else:
                 # Older embedders do not consume metadata. Preserve their
                 # no-read behavior and call their ordinary document method.
-                embeddings = _embed_texts(documents, metadatas=metadatas, embedder=embedder)
+                embeddings, keys = self._embed_documents(documents, metadatas, embedder)
+            metadatas = self._keyed_update_metadata(ids, metadatas, keys)
         elif (
             embeddings is None
             and metadatas is not None
@@ -429,11 +596,10 @@ class EmbeddingCollection(BaseCollection):
                             "mixed native media and text metadata updates cannot re-embed "
                             "safely in one batch; update the records separately"
                         )
-                    embeddings = _embed_texts(
-                        effective_documents,
-                        metadatas=effective_metadatas,
-                        embedder=embedder,
+                    embeddings, keys = self._embed_documents(
+                        effective_documents, effective_metadatas, embedder
                     )
+                    metadatas = self._keyed_update_metadata(ids, metadatas, keys)
         guarded = getattr(self._inner, "_update_with_metadata_guard", None)
         if expected is not None and callable(guarded):
             return guarded(

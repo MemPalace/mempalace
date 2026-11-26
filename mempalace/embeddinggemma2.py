@@ -101,6 +101,22 @@ def _metadata_title(metadata: Optional[dict]) -> Optional[str]:
     return None
 
 
+_TITLED_INPUT = "titled"
+_PROMPTED_INPUT = "prompt=Document"
+
+
+def _document_inputs(texts: list, metadatas: list) -> list:
+    """``(kind, model_input)`` per document: titled text, or text under the Document prompt."""
+    inputs = []
+    for text, metadata in zip(texts, metadatas):
+        title = _metadata_title(metadata)
+        if title:
+            inputs.append((_TITLED_INPUT, f"title: {title} | text: {text}"))
+        else:
+            inputs.append((_PROMPTED_INPUT, text))
+    return inputs
+
+
 def _cap_max_seq_length(model) -> None:
     """Truncate inputs at the model's context window (``_CONTEXT_TOKENS``).
 
@@ -567,12 +583,11 @@ class EmbeddingGemma2EmbeddingFunction:
 
         titled = []
         untitled = []
-        for index, (text, metadata) in enumerate(zip(texts, metadata_rows)):
-            title = _metadata_title(metadata)
-            if title:
-                titled.append((index, f"title: {title} | text: {text}"))
+        for index, (kind, model_input) in enumerate(_document_inputs(texts, metadata_rows)):
+            if kind == _TITLED_INPUT:
+                titled.append((index, model_input))
             else:
-                untitled.append((index, text))
+                untitled.append((index, model_input))
 
         vectors: list[Optional[list[float]]] = [None] * len(texts)
         if untitled:
@@ -584,6 +599,26 @@ class EmbeddingGemma2EmbeddingFunction:
             for (index, _), vector in zip(titled, encoded):
                 vectors[index] = vector
         return vectors
+
+    def embed_profile(self) -> dict:
+        """What decides this model's vectors, for :mod:`mempalace.embed_key`."""
+        return {
+            "model": self.identity,
+            "max_length": _CONTEXT_TOKENS,
+            "normalization": "l2",
+            "quantization": "float32",
+            "dimension": self.dimension,
+        }
+
+    def embed_inputs(self, texts: list, metadatas: Optional[list] = None) -> list:
+        """``(input_kind, exact_input)`` per document, as :meth:`embed_documents` sends it."""
+        rows = [{} for _ in texts] if metadatas is None else list(metadatas)
+        if len(rows) != len(texts):
+            raise ValueError("metadatas length must match documents length")
+        return [
+            None if not isinstance(text, str) else (f"document:{kind}", model_input)
+            for text, (kind, model_input) in zip(texts, _document_inputs(texts, rows))
+        ]
 
     def __call__(self, input):  # noqa: A002 - Chroma embedding function protocol
         return self.embed_documents(input)

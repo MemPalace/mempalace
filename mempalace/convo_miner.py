@@ -51,6 +51,7 @@ from .palace import (
     raise_if_files_failed,
     write_file_drawers,
 )
+from .palace.source_state import SourceStateStore
 from .source_identity import identity_metadata, source_directory_identity
 from .timeutil import parse_timestamp, utc_now_iso
 
@@ -218,6 +219,7 @@ def _register_file(
     extract_mode: str,
     source_mtime: Optional[float] = None,
     source_metadata: Optional[dict] = None,
+    source_state=None,
 ):
     """Write a sentinel so file_already_mined() returns True for 0-chunk files.
 
@@ -255,6 +257,9 @@ def _register_file(
         extract_mode=extract_mode,
         prune=False,
         owner="convo",
+        # Names the source record's stream; nothing is pruned.
+        prune_wing=wing,
+        source_state=source_state,
     )
 
 
@@ -644,6 +649,7 @@ def _file_chunks_locked(
     source_encoding: str = "utf-8",
     aaak_col=None,
     palace_path: Optional[str] = None,
+    source_state=None,
 ):
     """Lock the source file and replace its drawers in this extraction mode.
 
@@ -675,6 +681,7 @@ def _file_chunks_locked(
             extract_mode=extract_mode,
             check_source_fingerprint=True,
             wing=wing,
+            source_state=source_state,
         ):
             return 0, room_counts_delta, True
 
@@ -731,6 +738,7 @@ def _file_chunks_locked(
             owner="convo",
             palace_path=palace_path,
             prune_wing=wing,
+            source_state=source_state,
         )
     return drawers_added, room_counts_delta, False
 
@@ -894,6 +902,7 @@ def _normalize_convo_conversations(
     extract_mode: str,
     dry_run: bool,
     source_metadata: Optional[dict] = None,
+    source_state=None,
 ) -> Optional[tuple[list, float]]:
     """Normalize a transcript file into its individual conversations,
     registering it as filed when there's nothing worth mining. Returns None
@@ -920,7 +929,13 @@ def _normalize_convo_conversations(
     except ValueError:
         if not dry_run:
             _register_file(
-                collection, source_file, wing, agent, extract_mode, source_metadata=source_metadata
+                collection,
+                source_file,
+                wing,
+                agent,
+                extract_mode,
+                source_metadata=source_metadata,
+                source_state=source_state,
             )
         return None
 
@@ -934,6 +949,7 @@ def _normalize_convo_conversations(
                 extract_mode,
                 source_mtime=source_mtime,
                 source_metadata=source_metadata,
+                source_state=source_state,
             )
         return None
 
@@ -1029,6 +1045,9 @@ def _mine_convos_impl(
         dry_run=dry_run,
     )
     aaak_col = None if dry_run else open_aaak_collection(palace_path)
+    # Per-source mining state (chunk_total, snapshot, completion), so a re-mine
+    # writes only the drawers that changed. A dry run never creates it.
+    source_state = SourceStateStore(palace_path, read_only=dry_run)
 
     # Bulk pre-fetch already-mined source_file -> verified fingerprint in one
     # paginated pass instead of `len(files)` separate WHERE-source_file
@@ -1044,12 +1063,15 @@ def _mine_convos_impl(
             source_files=candidate_source_files,
             source_fingerprints=True,
             wing=wing,
+            source_state=source_state,
         )
         if collection is not None
         else {}
     )
 
     total_drawers = 0
+    # Drawers written or pruned: what the hallway recompute depends on.
+    palace_changes = 0
     files_mined = 0
     files_skipped = 0
     files_failed: list = []
@@ -1089,6 +1111,7 @@ def _mine_convos_impl(
                     extract_mode,
                     dry_run,
                     source_metadata=source_metadata,
+                    source_state=source_state,
                 )
             if normalized is None:
                 continue
@@ -1122,6 +1145,7 @@ def _mine_convos_impl(
                         extract_mode,
                         source_mtime=source_mtime,
                         source_metadata=source_metadata,
+                        source_state=source_state,
                     )
                 continue
 
@@ -1171,6 +1195,7 @@ def _mine_convos_impl(
                 source_encoding=normalize_run.encoding,
                 aaak_col=aaak_col,
                 palace_path=palace_path,
+                source_state=source_state,
             )
             if skipped:
                 files_skipped += 1
@@ -1179,6 +1204,7 @@ def _mine_convos_impl(
                 room_counts[r] += n
 
             total_drawers += drawers_added
+            palace_changes += drawers_added + getattr(drawers_added, "pruned", 0)
             files_mined += 1
             print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
             if limit > 0 and files_mined >= limit:
@@ -1194,7 +1220,7 @@ def _mine_convos_impl(
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+        _compute_hallways_for_wing_safe(wing, collection, palace_changes, config=palace_config)
         _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
     print(f"\n{'=' * 55}")

@@ -340,6 +340,29 @@ def _build_ef_class():
         def __call__(self, input):  # noqa: A002 — ChromaDB EF protocol; embed_query routes here
             return super().__call__(as_text_batch(input))
 
+        def embed_profile(self):
+            """What decides this model's vectors, for :mod:`mempalace.embed_key`.
+
+            The archive hash covers model.onnx and the tokenizer; the
+            truncation, pooling and normalization live in chromadb's code,
+            so its version is part of the profile.
+            """
+            import chromadb
+
+            archive = getattr(self, "_MODEL_SHA256", None)
+            if not archive:
+                return None
+            return {
+                "model": self.MODEL_NAME,
+                "archive_sha256": archive,
+                "runtime": f"chromadb-{chromadb.__version__}",
+                "max_length": 256,
+                "pooling": "mean",
+                "normalization": "l2",
+                "quantization": "float32",
+                "dimension": 384,
+            }
+
         def _forward(self, documents, batch_size=32):
             # Every upstream embed path (__call__, embed_query) runs the
             # session here, so this is the one place to serialize it.
@@ -781,6 +804,37 @@ class EmbeddinggemmaONNX:
         """Embed query documents (ChromaDB EF protocol)."""
         return self(input)
 
+    def embed_profile(self):
+        """What decides this model's vectors, for :mod:`mempalace.embed_key`.
+
+        The model and tokenizer are hashed from the local Hugging Face cache;
+        ``None`` (no vector sharing) until they are downloaded.
+        """
+        from huggingface_hub import try_to_load_from_cache
+
+        from .embed_key import file_sha256
+
+        files = {}
+        for filename in (
+            f"onnx/{_EMBEDDINGGEMMA_ONNX}",
+            f"onnx/{_EMBEDDINGGEMMA_ONNX}_data",
+            "tokenizer.json",
+        ):
+            path = try_to_load_from_cache(_EMBEDDINGGEMMA_REPO, filename)
+            if not isinstance(path, str):
+                return None
+            files[filename] = file_sha256(path)
+        return {
+            "model": _EMBEDDINGGEMMA_REPO,
+            "files": files,
+            "prefix": _EMBEDDINGGEMMA_PREFIX,
+            "max_length": _EMBEDDINGGEMMA_MAX_LEN,
+            "pooling": "sentence_embedding",
+            "normalization": "l2",
+            "quantization": "q8",
+            "dimension": _EMBEDDINGGEMMA_DIM,
+        }
+
     def embed_documents(self, input: list[str]) -> list[list[float]]:  # noqa: A002
         """Embed a batch of documents (ChromaDB EF protocol)."""
         return self(input)
@@ -861,6 +915,10 @@ class OpenAICompatEmbeddingFunction:
         # and forces a rebuild_index (vectors from a different model/space are
         # not interchangeable). ChromaDB compares this on every read.
         return f"openai_compat_emb_{self._model}".replace("/", "_")
+
+    def embed_profile(self) -> dict:
+        """The endpoint and its model, for :mod:`mempalace.embed_key`."""
+        return {"model": "openai-compat", "url": self._url, "endpoint_model": self._model}
 
     def embed_query(self, input):  # noqa: A002 — ChromaDB EF protocol uses `input`
         # ChromaDB 1.5 dispatches query embedding through embed_query (add uses
