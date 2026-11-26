@@ -855,6 +855,7 @@ def test_cmd_mine_projects_mode(mock_config_cls):
             respect_gitignore=True,
             include_ignored=[],
             max_chunks_per_file=None,
+            hallways=mock_config_cls.return_value.hallways_mode.return_value,
         )
 
 
@@ -885,6 +886,7 @@ def test_cmd_mine_convos_mode(mock_config_cls):
             dry_run=True,
             extract_mode="general",
             include_subagents=False,
+            hallways=mock_config_cls.return_value.hallways_mode.return_value,
         )
 
 

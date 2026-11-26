@@ -241,6 +241,7 @@ def write_file_drawers(
     owner: Optional[str] = None,
     palace_path: Optional[str] = None,
     prune_wing: Optional[str] = None,
+    before_complete=None,
 ) -> int:
     """File one source file's drawers: write the new ones, then drop the stale.
 
@@ -293,6 +294,7 @@ def write_file_drawers(
     if prune:
         total = len(drawers)
         drawers = [(i, doc, {**meta, "chunk_total": total + 1}) for i, doc, meta in drawers]
+    unfinished = False
     written = []
     rewritten = []
     for start in range(0, len(drawers), DRAWER_UPSERT_BATCH_SIZE):
@@ -300,6 +302,12 @@ def write_file_drawers(
         assert_no_collisions([(drawer_id, meta) for drawer_id, _, meta in batch], collection)
         prior: dict = {}
         to_embed, reuse, reuse_vectors = _split_unchanged(collection, batch, prior)
+        if (
+            prune
+            and before_complete
+            and any(meta.get("chunk_total") == total + 1 for _, meta in prior.values())
+        ):
+            unfinished = True
         if preserving:
             _archive_prior_text(
                 palace_path,
@@ -353,6 +361,10 @@ def write_file_drawers(
         )
     if rewritten or stale:
         drawers_removed(None, aaak_ids=rewritten + stale, aaak_col=aaak_col, reraise=MINE_ABORTS)
+    # Publish completeness only after the pointers to these drawers exist.
+    # The next mine must finish the index even if it reuses every vector.
+    if before_complete and (unfinished or rewritten or stale or not written):
+        before_complete(len(written))
     for start in range(0, len(written), DRAWER_UPSERT_BATCH_SIZE):
         batch = written[start : start + DRAWER_UPSERT_BATCH_SIZE]
         collection.update(

@@ -1877,56 +1877,61 @@ def process_file(
             )
             for chunk in chunks
         ]
+
+        def rebuild_closets(drawers_added):
+            # Build closet — the searchable index pointing to these drawers.
+            # Purge unconditionally: the old drawers this closet pointed at are
+            # gone, so a re-mine that ends up with zero filed drawers must still
+            # end up with zero closets, not stale ones dangling on deleted drawer
+            # IDs (see #24). Only the closet rebuild itself is conditional on
+            # there being new drawers to point at. A re-file that changed nothing
+            # keeps the closets it has, including LLM-generated ones.
+            if closets_col:
+                purge_file_closets(closets_col, source_file)
+            if closets_col and drawers_added > 0:
+                # Pass drawer_metas so build_closet_lines can emit the
+                # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
+                # when line_start / line_end / content_date are present. Falls
+                # back to the legacy 3-segment form automatically when not.
+                closet_lines = build_closet_lines(
+                    source_file,
+                    [drawer_id for drawer_id, _, _ in drawers],
+                    content,
+                    wing,
+                    room,
+                    drawer_metas=[meta for _, _, meta in drawers],
+                )
+                closet_id_base = (
+                    f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+                )
+                entities = _extract_entities_for_metadata(content)
+                closet_meta = {
+                    "wing": wing,
+                    "room": room,
+                    "source_file": source_file,
+                    "drawer_count": int(drawers_added),
+                    "filed_at": utc_now_iso(),
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+                if entities:
+                    closet_meta["entities"] = entities
+                upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
+
         # The project miner's own drawers for this path are replaced; a
         # conversation, diary or manual drawer filed under the same path stays.
         # A failed stale-drawer purge is an error the mine counts, not a skip.
         try:
             drawers_added = write_file_drawers(
-                collection, source_file, drawers, aaak_col=aaak_col, owner="project"
+                collection,
+                source_file,
+                drawers,
+                aaak_col=aaak_col,
+                owner="project",
+                before_complete=rebuild_closets,
             )
         except StaleDrawerPurgeFailed as exc:
             print(f"  ! [error] {filepath.name[:50]:50} {exc}", file=sys.stderr)
             return 0, room, "purge_failed"
-
-        # Build closet — the searchable index pointing to these drawers.
-        # Purge unconditionally: the old drawers this closet pointed at are
-        # gone, so a re-mine that ends up with zero filed drawers must still
-        # end up with zero closets, not stale ones dangling on deleted drawer
-        # IDs (see #24). Only the closet rebuild itself is conditional on
-        # there being new drawers to point at. A re-file that changed nothing
-        # keeps the closets it has, including LLM-generated ones.
-        if getattr(drawers_added, "unchanged", False):
-            closets_col = None
-        if closets_col:
-            purge_file_closets(closets_col, source_file)
-        if closets_col and drawers_added > 0:
-            # Pass drawer_metas so build_closet_lines can emit the
-            # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)
-            # when line_start / line_end / content_date are present. Falls
-            # back to the legacy 3-segment form automatically when not.
-            closet_lines = build_closet_lines(
-                source_file,
-                [drawer_id for drawer_id, _, _ in drawers],
-                content,
-                wing,
-                room,
-                drawer_metas=[meta for _, _, meta in drawers],
-            )
-            closet_id_base = (
-                f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
-            )
-            entities = _extract_entities_for_metadata(content)
-            closet_meta = {
-                "wing": wing,
-                "room": room,
-                "source_file": source_file,
-                "drawer_count": int(drawers_added),
-                "filed_at": utc_now_iso(),
-                "normalize_version": NORMALIZE_VERSION,
-            }
-            if entities:
-                closet_meta["entities"] = entities
-            upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
     return drawers_added, room, None
 
@@ -2095,6 +2100,7 @@ def mine(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    hallways: Optional[str] = None,
 ):
     """Mine a project directory into the palace.
 
@@ -2108,6 +2114,11 @@ def mine(
     :func:`_resolve_max_chunks_per_file`). ``None`` defers to
     ``MEMPALACE_MAX_CHUNKS_PER_FILE`` or ``MAX_CHUNKS_PER_FILE``; ``0``
     disables the cap entirely.
+
+    ``hallways`` ``"inline"`` recomputes the wing's hallways and entity
+    tunnels before returning; ``"defer"`` marks the wing and queues one
+    coalesced recompute of both (:mod:`mempalace.hallway_refresh`); ``None``
+    lets config ``hallways.defer`` decide (default: inline).
     """
     try:
         if dry_run:
@@ -2122,6 +2133,7 @@ def mine(
                 include_ignored=include_ignored,
                 files=files,
                 max_chunks_per_file=max_chunks_per_file,
+                hallways=hallways,
             )
 
         # MineAlreadyRunning propagates so the CLI can render a clear holder-aware
@@ -2139,6 +2151,7 @@ def mine(
                 include_ignored=include_ignored,
                 files=files,
                 max_chunks_per_file=max_chunks_per_file,
+                hallways=hallways,
             )
     finally:
         _cleanup_mine_pid_file()
@@ -2179,6 +2192,7 @@ def _mine_impl(
     include_ignored: list = None,
     files: list = None,
     max_chunks_per_file: Optional[int] = None,
+    hallways: Optional[str] = None,
 ):
     from .config import MempalaceConfig
 
@@ -2324,38 +2338,15 @@ def _mine_impl(
                     file=sys.stderr,
                 )
 
-            # Within-wing hallways: link entities (people, projects, concepts)
-            # that co-occur in drawers across this wing's rooms. Mirrors the
-            # tunnel-compute fault-tolerance pattern — hallway computation
-            # must never fail a mine; it's a derived analytic, not load-bearing
-            # for the drawer write that already committed above.
-            try:
-                hallways_created = compute_hallways_for_wing(
-                    wing, col=collection, config=graph_config
-                )
-                if hallways_created:
-                    print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: hallway computation skipped — {e}",
-                    file=sys.stderr,
-                )
+            from .hallway_refresh import defer_if_configured
 
-            # Cross-wing entity tunnels: derived from the hallway records
-            # materialized just above. When an entity appears in hallways of
-            # this wing AND another wing, a tunnel bridges them. Runs in
-            # parallel with topic tunnels — both kinds coexist via
-            # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
-            # pattern: never fail a mine over a derived analytic.
-            try:
-                entity_tunnels_added = _compute_entity_tunnels_for_wing(wing, config=graph_config)
-                if entity_tunnels_added:
-                    print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
-            except Exception as e:
-                print(
-                    f"\n  WARNING: entity tunnel computation skipped — {e}",
-                    file=sys.stderr,
-                )
+            # A deferred mine marks the wing and queues one coalesced
+            # recompute of its hallways and the entity tunnels derived from
+            # them; otherwise both run here, as below.
+            if not defer_if_configured(
+                wing, palace_path, config=graph_config, mode=hallways, entity_tunnels=True
+            ):
+                _hallways_and_entity_tunnels_inline(wing, collection, graph_config)
 
             _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
@@ -2591,6 +2582,42 @@ def _compute_topic_tunnels_for_wing(wing: str, config=None) -> int:
     min_count = cfg.topic_tunnel_min_count
     created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count, config=cfg)
     return len(created)
+
+
+def _hallways_and_entity_tunnels_inline(wing: str, collection, graph_config) -> None:
+    """A project mine's inline hallway recompute, then the entity tunnels.
+
+    Within-wing hallways link entities (people, projects, concepts) that
+    co-occur in drawers across this wing's rooms. Mirrors the tunnel-compute
+    fault-tolerance pattern — hallway computation must never fail a mine;
+    it's a derived analytic, not load-bearing for the drawer write that
+    already committed.
+    """
+    try:
+        hallways_created = compute_hallways_for_wing(wing, col=collection, config=graph_config)
+        if hallways_created:
+            print(f"\n  Hallways: +{len(hallways_created)} within-wing entity link(s)")
+    except Exception as e:
+        print(
+            f"\n  WARNING: hallway computation skipped — {e}",
+            file=sys.stderr,
+        )
+
+    # Cross-wing entity tunnels: derived from the hallway records
+    # materialized just above. When an entity appears in hallways of
+    # this wing AND another wing, a tunnel bridges them. Runs in
+    # parallel with topic tunnels — both kinds coexist via
+    # ``kind="entity"`` / ``kind="topic"``. Same fault-tolerance
+    # pattern: never fail a mine over a derived analytic.
+    try:
+        entity_tunnels_added = _compute_entity_tunnels_for_wing(wing, config=graph_config)
+        if entity_tunnels_added:
+            print(f"\n  Entity tunnels: +{entity_tunnels_added} cross-wing entity link(s)")
+    except Exception as e:
+        print(
+            f"\n  WARNING: entity tunnel computation skipped — {e}",
+            file=sys.stderr,
+        )
 
 
 def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:

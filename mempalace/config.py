@@ -1515,6 +1515,81 @@ class MempalaceConfig:
             parsed = 2
         return max(1, parsed)
 
+    # Where a mine's hallway recompute runs when nothing chose it explicitly.
+    #   auto   - interactive mines (CLI, MCP) recompute inline; background
+    #            mines (hooks through the daemon) defer it.
+    #   always - every mine defers unless told ``--inline-hallways``.
+    #   never  - every mine recomputes inline, as before deferral existed.
+    HALLWAYS_DEFER_MODES = ("auto", "always", "never")
+    # (settle_seconds, max_wait_seconds) of the coalesced deferred recompute.
+    HALLWAYS_REFRESH_DEFAULTS = (600.0, 3600.0)
+
+    def _hallways_section(self) -> dict:
+        section = self._file_config.get("hallways", {})
+        return section if isinstance(section, dict) else {}
+
+    @property
+    def hallways_defer(self) -> str:
+        """``auto`` / ``always`` / ``never``: see :attr:`HALLWAYS_DEFER_MODES`.
+
+        Env ``MEMPALACE_HALLWAYS_DEFER`` > config ``hallways.defer`` > ``auto``.
+        A boolean reads as ``always`` / ``never``; anything unrecognised is
+        ``auto``, so a typo never silently drops a recompute.
+        """
+        raw = os.environ.get("MEMPALACE_HALLWAYS_DEFER")
+        if raw is None:
+            raw = self._hallways_section().get("defer")
+        if isinstance(raw, bool):
+            return "always" if raw else "never"
+        text = str(raw or "").strip().lower()
+        if text in self.HALLWAYS_DEFER_MODES:
+            return text
+        parsed = parse_bool(text) if text else None
+        if parsed is not None:
+            return "always" if parsed else "never"
+        return "auto"
+
+    def hallways_mode(self, explicit=None, *, background: bool = False) -> str:
+        """``inline`` or ``defer`` for one mine.
+
+        ``explicit`` (a CLI flag or a job payload's ``hallways``) wins when it
+        is ``inline`` or ``defer``. Otherwise :attr:`hallways_defer` decides,
+        with ``auto`` deferring only ``background`` mines.
+        """
+        if explicit in ("inline", "defer"):
+            return explicit
+        mode = self.hallways_defer
+        if mode == "always" or (mode == "auto" and background):
+            return "defer"
+        return "inline"
+
+    @property
+    def hallways_refresh_debounce(self) -> tuple[float, float]:
+        """``(settle_seconds, max_wait_seconds)`` of a deferred recompute.
+
+        A burst of mines into one wing collapses into one recompute that runs
+        ``settle`` after the last of them, but never later than ``max_wait``
+        after the first. Env ``MEMPALACE_HALLWAYS_SETTLE_SECONDS`` /
+        ``MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS`` > config
+        ``hallways.settle_seconds`` / ``max_wait_seconds`` > 600 / 3600. A
+        malformed or negative value falls back to the default.
+        """
+        section = self._hallways_section()
+
+        def _resolve(env: str, key: str, default: float) -> float:
+            val = env_float(env)
+            if val is None:
+                val = parse_number(section.get(key))
+            if val is None or val < 0:
+                return default
+            return float(val)
+
+        settle_default, max_default = self.HALLWAYS_REFRESH_DEFAULTS
+        return (
+            _resolve("MEMPALACE_HALLWAYS_SETTLE_SECONDS", "settle_seconds", settle_default),
+            _resolve("MEMPALACE_HALLWAYS_MAX_WAIT_SECONDS", "max_wait_seconds", max_default),
+        )
+
     @property
     def post_mine_integrity_check(self) -> str:
         """``"scoped"`` (default) or ``"full"``: what a writing mine checks at its end.
@@ -1723,6 +1798,48 @@ class MempalaceConfig:
         """Resolved future routing policy for routine CLI writes."""
 
         return self.resolve_write_routing("cli").policy
+
+    # Debounce defaults for hook-submitted daemon mines, per trigger:
+    # (settle seconds, max wait seconds). Stop fires after every assistant
+    # turn, so bursts are coalesced over a two-minute settle window but never
+    # held past fifteen minutes. PreCompact and SessionEnd run immediately:
+    # they are the last chance to catch a session before it changes shape.
+    DAEMON_DEBOUNCE_DEFAULTS = {
+        "stop": (120.0, 900.0),
+        "precompact": (0.0, 0.0),
+        "session_end": (0.0, 0.0),
+    }
+
+    def daemon_debounce(self, trigger: str) -> tuple[float, float]:
+        """``(settle_seconds, max_wait_seconds)`` for a hook trigger's daemon mine.
+
+        Resolved per value: env ``MEMPALACE_DAEMON_<TRIGGER>_SETTLE_SECONDS`` /
+        ``..._MAX_WAIT_SECONDS`` > ``config.json``
+        ``daemon.debounce.<trigger>.settle_seconds`` / ``max_wait_seconds`` >
+        :attr:`DAEMON_DEBOUNCE_DEFAULTS`. An unknown trigger runs immediately.
+        A malformed value falls back to the default rather than raising: a
+        typo must not stop a hook from queuing its work. A ``max_wait`` below
+        ``settle`` simply caps the window.
+        """
+        key = str(trigger or "").strip().lower()
+        default_settle, default_max = self.DAEMON_DEBOUNCE_DEFAULTS.get(key, (0.0, 0.0))
+        daemon_cfg = self._file_config.get("daemon")
+        debounce = daemon_cfg.get("debounce") if isinstance(daemon_cfg, dict) else None
+        trig_cfg = debounce.get(key) if isinstance(debounce, dict) else None
+        if not isinstance(trig_cfg, dict):
+            trig_cfg = {}
+
+        def _resolve(suffix: str, cfg_key: str, default: float) -> float:
+            val = env_float(f"MEMPALACE_DAEMON_{key.upper()}_{suffix}")
+            if val is None:
+                val = parse_number(trig_cfg.get(cfg_key))
+            if val is None or val < 0:
+                return default
+            return float(val)
+
+        settle = _resolve("SETTLE_SECONDS", "settle_seconds", default_settle)
+        max_wait = _resolve("MAX_WAIT_SECONDS", "max_wait_seconds", default_max)
+        return settle, max_wait
 
     @property
     def hook_use_daemon(self):

@@ -269,6 +269,26 @@ def main():
             "session, and on typical workspaces they dominate file counts."
         ),
     )
+    hallway_timing = p_mine.add_mutually_exclusive_group()
+    hallway_timing.add_argument(
+        "--defer-hallways",
+        dest="hallways",
+        action="store_const",
+        const="defer",
+        default=None,
+        help=(
+            "Do not recompute the wing's hallways before returning: mark the wing and "
+            "let the daemon recompute it once, at idle priority, after mining settles "
+            "(config hallways.defer: always makes this the default)."
+        ),
+    )
+    hallway_timing.add_argument(
+        "--inline-hallways",
+        dest="hallways",
+        action="store_const",
+        const="inline",
+        help="Recompute the wing's hallways before returning, whatever config hallways.defer says.",
+    )
 
     # sweep
     p_sweep = sub.add_parser(
@@ -674,6 +694,12 @@ def main():
         action="store_true",
         help="Recompute hallways from drawer entities for --wing (or every wing); use after "
         "`wings split`, which drops the split wing's records",
+    )
+    p_hallways.add_argument(
+        "--dirty",
+        action="store_true",
+        help="With --rebuild: recompute only the wings a deferred mine marked "
+        "(what the daemon would run next), and list them without --rebuild",
     )
     p_audit = sub.add_parser(
         "audit",

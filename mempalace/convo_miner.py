@@ -813,6 +813,7 @@ def mine_convos(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    hallways: str = None,
 ):
     """Mine a directory of conversation files into the palace.
 
@@ -822,6 +823,11 @@ def mine_convos(
     include_subagents:
         False (default) — skip Claude Code ``subagents/`` directories
         True            — also mine subagent transcripts
+    hallways:
+        "inline" — recompute the wing's hallways before returning
+        "defer"  — mark the wing dirty and queue a coalesced recompute
+                   (:mod:`mempalace.hallway_refresh`)
+        None     — config ``hallways.defer`` decides (default: inline)
 
     The real work is in :func:`_mine_convos_impl`; this wrapper holds the
     per-palace flock around it so two concurrent ``mempalace mine --mode
@@ -852,6 +858,7 @@ def mine_convos(
                 dry_run=dry_run,
                 extract_mode=extract_mode,
                 include_subagents=include_subagents,
+                hallways=hallways,
             )
 
         with mine_palace_lock(palace_path):
@@ -864,19 +871,28 @@ def mine_convos(
                 dry_run=dry_run,
                 extract_mode=extract_mode,
                 include_subagents=include_subagents,
+                hallways=hallways,
             )
     finally:
         _cleanup_mine_pid_file()
 
 
-def _compute_hallways_for_wing_safe(wing, collection, drawers_filed, config=None):
+def _compute_hallways_for_wing_safe(
+    wing, collection, drawers_filed, config=None, palace_path=None, mode=None
+):
     """Auto-populate the associative graph from the entities just mined.
 
     Best-effort: hallway computation must never fail an otherwise-good mine, and is
-    skipped when nothing new was filed.
+    skipped when nothing new was filed. ``mode`` ``"defer"`` (or config saying so)
+    marks the wing for a coalesced background recompute instead.
     """
     if drawers_filed <= 0:
         return
+    if config is not None and palace_path:
+        from .hallway_refresh import defer_if_configured
+
+        if defer_if_configured(wing, palace_path, config=config, mode=mode):
+            return
     try:
         from .hallways import compute_hallways_for_wing
 
@@ -989,6 +1005,7 @@ def _mine_convos_impl(
     dry_run: bool = False,
     extract_mode: str = "exchange",
     include_subagents: bool = False,
+    hallways: str = None,
 ):
     from .config import MempalaceConfig
 
@@ -1194,7 +1211,14 @@ def _mine_convos_impl(
         # Compute hallways before the FTS5 validation: the latter opens a direct sqlite
         # connection to the Chroma DB, which can invalidate the live collection handle on
         # some Chroma builds and make the hallway fetch fail.
-        _compute_hallways_for_wing_safe(wing, collection, total_drawers, config=palace_config)
+        _compute_hallways_for_wing_safe(
+            wing,
+            collection,
+            total_drawers,
+            config=palace_config,
+            palace_path=palace_path,
+            mode=hallways,
+        )
         _validate_palace_fts5_after_mine(palace_path, writes_since=writes_at_start)
 
     print(f"\n{'=' * 55}")

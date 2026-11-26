@@ -41,6 +41,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   recover without a source edit. Oversized files are retried until they fit
   the reader's size limit.
 
+### Behaviour changes
+
+- **Diary checkpoints the daemon files get a new id shape,
+  `diary_<wing>_checkpoint_<sha>`.** The id is derived from the entry and an
+  idempotency key, so a checkpoint job replayed after a crashed worker finds
+  the drawer it already filed instead of filing it twice. Direct writes keep
+  the old id shape.
+- **On the daemon route, PreCompact no longer waits for the mine.** The hook
+  queues the job and returns; the daemon runs it at once.
+- **A Stop-triggered daemon mine lands 2 to 15 minutes later.** Stop jobs wait
+  for 120 s without a new Stop for the same source, and never longer than
+  15 minutes after the first one (`daemon.debounce.stop`). PreCompact and
+  SessionEnd still run at once.
+- **Repeated checkpoints for one session are coalesced while queued.** A
+  newer checkpoint for a session replaces the one still waiting in the queue
+  (latest wins; it covers the most messages). The same holds for repeated
+  mines of one source.
+
 ### Added
 
 - **The HTTP hub serves the three-tool lightweight catalog at `/mcp/light`.**

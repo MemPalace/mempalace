@@ -83,6 +83,8 @@ def execute_job(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
     def _run():
         if kind == "mine":
             return run_mine(payload)
+        if kind == "hallways":
+            return run_hallways(payload)
         if kind == "sync":
             return run_sync(payload)
         if kind == "sweep":
@@ -134,6 +136,10 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
     agent = payload.get("agent") or "mempalace"
     limit = int(payload.get("limit") or 0)
     dry_run = bool(payload.get("dry_run"))
+    # A daemon mine is background work: unless the job says otherwise (an
+    # interactive ``mempalace mine`` routed here sends ``inline``), its
+    # hallway recompute is deferred to one coalesced idle-priority job.
+    hallways = MempalaceConfig().hallways_mode(payload.get("hallways"), background=True)
 
     raw_files = payload.get("files")
     files = None
@@ -235,6 +241,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 dry_run=dry_run,
                 extract_mode=payload.get("extract") or "exchange",
                 include_subagents=bool(payload.get("include_subagents")),
+                hallways=hallways,
             )
         elif mode == "extract":
             from .format_miner import mine_formats
@@ -262,6 +269,7 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
                 include_ignored=include_ignored,
                 max_chunks_per_file=payload.get("max_chunks_per_file"),
                 files=files,
+                hallways=hallways,
             )
         else:
             return {"success": False, "error": f"invalid mine mode: {mode}", "exit_code": 2}
@@ -306,6 +314,22 @@ def run_mine(payload: dict[str, Any]) -> dict[str, Any]:
         "dry_run": dry_run,
         "exit_code": 0,
     }
+
+
+@_restores_palace_env
+def run_hallways(payload: dict[str, Any]) -> dict[str, Any]:
+    """Run one deferred whole-wing hallway recompute (see ``hallway_refresh``)."""
+    palace_path = os.path.abspath(
+        os.path.expanduser(payload.get("palace_path") or MempalaceConfig().palace_path)
+    )
+    os.environ["MEMPALACE_PALACE_PATH"] = palace_path
+    _apply_backend(payload.get("backend"))
+    from .hallway_refresh import run_refresh
+
+    try:
+        return run_refresh({**payload, "palace_path": palace_path})
+    except Exception as exc:
+        return {"success": False, "error": f"hallways failed: {exc}", "exit_code": 1}
 
 
 @_restores_palace_env
@@ -529,8 +553,23 @@ def run_diary_write(payload: dict[str, Any]) -> dict[str, Any]:
         entry=payload.get("entry") or "",
         topic=payload.get("topic") or "general",
         wing=payload.get("wing") or "",
+        **(
+            {"idempotency_key": payload["idempotency_key"]}
+            if payload.get("idempotency_key")
+            else {}
+        ),
     )
     result.setdefault("exit_code", 0 if result.get("success") else 1)
+    hook_ack = payload.get("hook_ack")
+    if result.get("success") and isinstance(hook_ack, dict):
+        # A hook queued this checkpoint and returned at once; the save marker
+        # advances only now that the drawer is filed.
+        try:
+            from .hooks_cli import write_checkpoint_ack
+
+            write_checkpoint_ack(hook_ack)
+        except Exception:  # noqa: BLE001 - the drawer is filed; the ack is best-effort
+            pass
     return result
 
 

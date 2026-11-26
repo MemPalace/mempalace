@@ -650,19 +650,19 @@ def _daemon_mine_dedupe_key(source: str, mode: str) -> str:
 
 
 def _daemon_available() -> bool:
-    """True iff a daemon is already running for the configured palace.
+    """True iff a daemon is already serving the configured palace.
 
-    This is a fast localhost health check, not a spawn: the hook time budget
-    forbids cold-starting a long-lived daemon. ``prefer`` may fall back to the
-    direct path when this returns false; ``require`` must block the write.
+    A short localhost health probe (``HOOK_PROBE_TIMEOUT``) from the
+    stdlib-only ``daemon_queue`` module: importing ``mempalace.daemon`` pulls
+    in the storage stack and alone costs more than the hook budget. A daemon
+    that is registered but does not answer counts as unavailable. Hooks never
+    start the daemon: ``prefer`` may fall back to the direct path when this
+    returns false; ``require`` must block the write.
     """
-    from .daemon import HOOK_PROBE_TIMEOUT, get_client_if_running
+    from .daemon_queue import HOOK_PROBE_TIMEOUT, probe_daemon_health
 
     try:
-        return (
-            get_client_if_running(MempalaceConfig().palace_path, health_timeout=HOOK_PROBE_TIMEOUT)
-            is not None
-        )
+        return probe_daemon_health(MempalaceConfig().palace_path, timeout=HOOK_PROBE_TIMEOUT)
     except Exception:
         return False
 
@@ -777,6 +777,29 @@ def _compute_hook_write_routing() -> HookWriteRouting:
     return routing
 
 
+# Which hook fired ("stop", "precompact", "session_end"). It picks the debounce
+# a daemon mine is queued with: Stop is coalesced over a settle window,
+# PreCompact and SessionEnd run at once (see MempalaceConfig.daemon_debounce).
+_HOOK_TRIGGER = ContextVar("mempalace_hook_trigger", default="")
+
+
+@contextmanager
+def _hook_trigger(name: str):
+    token = _HOOK_TRIGGER.set(str(name or "").replace("-", "_"))
+    try:
+        yield
+    finally:
+        _HOOK_TRIGGER.reset(token)
+
+
+def _mine_debounce() -> tuple:
+    """``(settle_seconds, max_wait_seconds)`` for a mine queued by this hook."""
+    try:
+        return MempalaceConfig().daemon_debounce(_HOOK_TRIGGER.get())
+    except Exception:
+        return 0.0, 0.0
+
+
 def _current_hook_write_routing() -> HookWriteRouting:
     routing = _HOOK_WRITE_ROUTING_CONTEXT.get()
     if routing is not None:
@@ -810,54 +833,35 @@ def _submit_daemon_job(
     *,
     dedupe_key: str = None,
     priority: int = 0,
-    wait: bool = False,
-    timeout: float = 60.0,
-):
-    """Submit to an already-running daemon. Never auto-starts (see _daemon_available).
+) -> dict:
+    """Queue a job for the daemon and return without waiting for it.
 
-    Raises DaemonError on a real failure (job rejected, timeout, daemon died
-    mid-submit). Callers must NOT fall back to the direct path on such errors —
-    the daemon may already have accepted the job, and re-running it would
-    duplicate verbatim content. Only an absent daemon (handled by the caller's
-    _daemon_available() precheck) should fall back.
+    Writes straight into the daemon's durable SQLite queue through the
+    stdlib-only ``daemon_queue`` module -- no HTTP round trip and no import of
+    the storage stack. The running daemon claims the job on its next poll.
+
+    Raises on a real failure (queue unwritable). Callers must NOT fall back to
+    the direct path on such errors: the row may already be committed, and a
+    direct write as well would duplicate verbatim content.
     """
-    from .daemon import submit_job
+    from .daemon_queue import QueueStore, canonical_palace_path, queue_path
 
-    palace_path = MempalaceConfig().palace_path
-    return submit_job(
+    palace_path = canonical_palace_path(MempalaceConfig().palace_path)
+    payload = dict(payload)
+    payload["palace_path"] = palace_path
+    settle, max_wait = _mine_debounce() if kind == "mine" else (0.0, 0.0)
+    # A failed enqueue is reported by the hook. Do not spend the daemon's
+    # 30-second maintenance busy timeout in the foreground hook, and bound the
+    # wait by wall time (see ``QueueStore.wall_clock_busy``).
+    job = QueueStore(queue_path(palace_path), timeout=0.15, wall_clock_busy=True).enqueue(
         kind,
         payload,
-        palace_path=palace_path,
         dedupe_key=dedupe_key,
         priority=priority,
-        wait=wait,
-        auto_start=False,
-        timeout=timeout,
-        # A job refused the palace lock is deferred, not failed, so it
-        # is never terminal while the holder lives. The waiting callers below
-        # wait on purpose, but a parked job cannot reach the state they wait
-        # for: they would burn the whole timeout and then report a failure that
-        # did not happen. Take the parked job back instead; the daemon still
-        # runs it once the lock frees.
-        stop_on_lock_deferral=True,
+        settle_seconds=settle,
+        max_wait_seconds=max_wait,
     )
-
-
-def _job_deferred_by_lock(job: dict) -> bool:
-    """True when the daemon parked this job behind the palace write lock.
-
-    Imported lazily like ``submit_job`` above: only callers that actually reach
-    the daemon pay for the module, and by this point it is already loaded.
-    """
-    from .daemon import job_deferred_by_lock
-
-    return job_deferred_by_lock(job)
-
-
-def _lock_deferral_reason(job: dict) -> str:
-    """Operator-facing reason a job is parked, for the hook log."""
-    reason = (job.get("error") or {}).get("message") or "the palace write lock is held"
-    return f"{reason} (job {job.get('id')} stays queued and runs when the holder exits)"
+    return {"id": job.id, "state": job.state, "run_after": job.run_after}
 
 
 def _maybe_auto_ingest():
@@ -890,7 +894,6 @@ def _maybe_auto_ingest():
                         "mine",
                         {"source": mine_dir, "mode": mode, "agent": "mempalace"},
                         dedupe_key=_daemon_mine_dedupe_key(mine_dir, mode),
-                        wait=False,
                     )
                 except Exception as exc:
                     # Daemon accepted context — don't fall back (would double-mine).
@@ -927,29 +930,18 @@ def _mine_sync():
     for mine_dir, mode in targets:
         try:
             if routing.use_daemon:
-                from .daemon import DaemonWaitTimeout
-
+                # Queued to run at once (PreCompact has no settle window) and
+                # not waited on: the hook budget cannot cover a mine, and the
+                # daemon is the one writer either way.
                 try:
                     job = _submit_daemon_job(
                         "mine",
                         {"source": mine_dir, "mode": mode, "agent": "mempalace"},
                         dedupe_key=_daemon_mine_dedupe_key(mine_dir, mode),
-                        wait=True,
-                        timeout=60,
                     )
-                    result = job.get("result") or {}
-                    if _job_deferred_by_lock(job):
-                        # Parked behind the palace lock, not failed: the daemon
-                        # runs it once the holder exits. Saying "failed" here
-                        # would be a false report.
-                        _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
-                    elif job.get("state") != "succeeded" or not result.get("success", True):
-                        _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
-                except DaemonWaitTimeout as exc:
-                    # Accepted, and the daemon still runs it: not a failure.
-                    _log(f"Daemon sync mine still {exc.state}: job {exc.job_id}")
+                    _log(f"Daemon mine queued: job {job['id']}")
                 except Exception as exc:
-                    # Daemon accepted context — don't fall back (would double-mine).
+                    # The row may be committed — don't fall back (would double-mine).
                     _log(f"Daemon sync mine submission failed: {exc}")
                 continue
             with open(log_path, "a") as log_f:
@@ -1194,7 +1186,7 @@ def _diary_write_locked(tool_diary_write, **kwargs) -> dict:
     server takes before mutating lets the collection open read/write.
     """
     from . import mcp_server as mcp
-    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .daemon_queue import LOCK_REFUSAL_ERROR_CLASS
 
     already_owned = mcp._MCP_WRITER_LOCK_CM is not None
     acquired, reason = mcp._acquire_mcp_writer_lock()
@@ -1216,7 +1208,7 @@ def _diary_write_locked(tool_diary_write, **kwargs) -> dict:
 
 def _diary_write_in_process(arguments: dict) -> dict:
     """File a diary entry in this process, waiting out a briefly held lock."""
-    from .daemon import LOCK_REFUSAL_ERROR_CLASS
+    from .daemon_queue import LOCK_REFUSAL_ERROR_CLASS
     from .mcp_server import tool_diary_write
 
     for delay in _DIARY_LOCK_RETRY_DELAYS + (None,):
@@ -1266,26 +1258,38 @@ def _apply_diary_checkpoint(payload: dict) -> bool:
         _log(f"Diary checkpoint failed: {result.get('error', 'unknown')}")
         return False
     _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
-    messages_folded = int(payload.get("messages_folded") or 0)
+    write_checkpoint_ack(payload)
+    return True
+
+
+def write_checkpoint_ack(ack: dict) -> None:
+    """Record a filed checkpoint: the ack, the session's save marker, a toast.
+
+    Called by whoever filed the drawer -- the detached checkpoint child, or the
+    daemon for a checkpoint a hook queued to it (``hook_ack``) -- so the marker
+    only advances once the entry is really in the palace. Every path written
+    is under ``STATE_DIR``; the session id is sanitized before it names a file.
+    """
+    messages_folded = int(ack.get("messages_folded") or 0)
     try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         (STATE_DIR / "last_checkpoint").write_text(
-            json.dumps({"msgs": messages_folded, "ts": payload.get("ack_ts") or ""}),
+            json.dumps({"msgs": messages_folded, "ts": ack.get("ack_ts") or ""}),
             encoding="utf-8",
         )
     except OSError:
         pass
-    exchange_count = payload.get("exchange_count")
+    exchange_count = ack.get("exchange_count")
     if isinstance(exchange_count, int) and not isinstance(exchange_count, bool):
-        session_id = _sanitize_session_id(str(payload.get("session_id") or "unknown"))
+        session_id = _sanitize_session_id(str(ack.get("session_id") or "unknown"))
         try:
             (STATE_DIR / f"{session_id}_last_save").write_text(
                 str(exchange_count), encoding="utf-8"
             )
         except OSError:
             pass
-    if payload.get("toast"):
+    if ack.get("toast"):
         _desktop_toast(f"Checkpoint saved \u2014 {messages_folded} messages archived")
-    return True
 
 
 def _save_diary_direct(
@@ -1299,11 +1303,14 @@ def _save_diary_direct(
 ) -> dict:
     """Queue a diary checkpoint without importing ``mempalace.mcp_server``.
 
-    The daemon path still waits on a job. The direct path spawns a detached
-    child (``run_detached_diary_checkpoint``) and returns immediately with
-    ``checkpoint_queued`` and ``drawers_filed`` 0. The child files the drawer,
-    writes the ack and the save marker, and then runs the transcript and
-    project mines, so the caller must not start them itself.
+    Neither path waits for the drawer. Both return at once with
+    ``checkpoint_queued`` and ``drawers_filed`` 0. The daemon path queues a
+    ``diary_write`` job; the daemon files the drawer and then writes the ack
+    and the save marker, and the caller still runs the transcript and project
+    mines. The direct path spawns a detached child
+    (``run_detached_diary_checkpoint``) that files the drawer, writes the ack
+    and the save marker, and then runs those mines itself, so the caller must
+    not start them.
 
     The entry is filed under `agent_name` so the agent that later calls
     `mempalace_diary_read(agent_name=...)` discovers it. If `wing` is
@@ -1350,8 +1357,10 @@ def _save_diary_direct(
 
     try:
         if routing.use_daemon:
-            from .daemon import DaemonWaitTimeout
-
+            # Queued, not waited on -- the same contract as the direct path's
+            # detached child: the daemon files the drawer and then writes the
+            # ack and the save marker from ``hook_ack``. The caller still runs
+            # the transcript and project mines, since no child will.
             try:
                 job = _submit_daemon_job(
                     "diary_write",
@@ -1360,44 +1369,38 @@ def _save_diary_direct(
                         "entry": entry,
                         "topic": "checkpoint",
                         "wing": wing,
+                        "idempotency_key": hashlib.sha256(
+                            json.dumps(
+                                [agent_name, wing, session_id, exchange_count, entry]
+                            ).encode()
+                        ).hexdigest(),
+                        "hook_ack": {
+                            "messages_folded": len(messages),
+                            "ack_ts": utc_now_iso(),
+                            "session_id": session_id,
+                            "exchange_count": exchange_count,
+                            "toast": bool(toast),
+                        },
                     },
                     priority=10,
-                    wait=True,
-                    timeout=30,
+                    # One pending checkpoint per session: the save marker only
+                    # moves once the daemon files it, so Stop hooks that fire
+                    # meanwhile would otherwise each queue an overlapping one.
+                    # Latest wins; it covers the most messages.
+                    dedupe_key=f"hook:diary:{_sanitize_session_id(session_id)}",
                 )
-            except DaemonWaitTimeout as exc:
-                # The daemon runs one job at a time, so a checkpoint submitted
-                # while a mine from an earlier Stop hook still runs waits behind
-                # it. It is filed once that mine ends: not a failure, and not a
-                # reason to write it here as well.
-                _log(f"Daemon diary checkpoint still {exc.state}: job {exc.job_id}")
-                return {"drawers_filed": 0, "messages_folded": 0}
             except Exception as exc:
-                # Daemon accepted context — don't fall back (would double-write).
+                # The row may be committed — don't fall back (would double-write).
                 _log(f"Daemon diary checkpoint failed: {exc}")
                 return {"drawers_filed": 0, "messages_folded": 0}
-            result = job.get("result") or {}
-            if job.get("state") == "succeeded" and result.get("success"):
-                _log(f"Diary checkpoint saved: {result.get('entry_id', '?')}")
-                try:
-                    ack_file = STATE_DIR / "last_checkpoint"
-                    ack_file.write_text(
-                        json.dumps({"msgs": len(messages), "ts": utc_now_iso()}),
-                        encoding="utf-8",
-                    )
-                except OSError:
-                    pass
-                if toast:
-                    _desktop_toast(f"Checkpoint saved - {len(messages)} messages archived")
-                return {"drawers_filed": 1, "messages_folded": len(messages), "themes": themes}
-            if _job_deferred_by_lock(job):
-                # Queued behind the palace lock: the entry is held and the daemon
-                # files it once the holder exits. Not a failure, and not a reason
-                # to re-file it here -- that would duplicate verbatim content.
-                _log(f"Daemon diary checkpoint deferred: {_lock_deferral_reason(job)}")
-                return {"drawers_filed": 0, "messages_folded": 0}
-            _log(f"Daemon diary checkpoint failed: {result.get('error', job.get('error'))}")
-            return {"drawers_filed": 0, "messages_folded": 0}
+            _log(f"Diary checkpoint queued for the daemon: job {job['id']}")
+            return {
+                "drawers_filed": 0,
+                "messages_folded": len(messages),
+                "themes": themes,
+                "checkpoint_queued": True,
+                "mines_pending": True,
+            }
 
         queued = _queue_diary_checkpoint(
             {
@@ -1461,7 +1464,6 @@ def _ingest_transcript(transcript_path: str):
                         "agent": "mempalace",
                     },
                     dedupe_key=_daemon_mine_dedupe_key(str(path), "convos"),
-                    wait=False,
                 )
                 _log(f"Transcript ingest submitted to daemon: {path.name}")
             except Exception as exc:
@@ -1779,7 +1781,7 @@ def hook_stop(data: dict, harness: str):
                         exchange_count=exchange_count,
                     )
                 queued = result.get("checkpoint_queued", False)
-                if not queued:
+                if not queued or result.get("mines_pending"):
                     if transcript_path:
                         _ingest_transcript(transcript_path)
                     _maybe_auto_ingest()
@@ -1957,7 +1959,7 @@ def hook_session_end(data: dict, harness: str):
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
                 )
-            if not result.get("checkpoint_queued"):
+            if not result.get("checkpoint_queued") or result.get("mines_pending"):
                 if valid_transcript:
                     _ingest_transcript(valid_transcript)
                 _maybe_auto_ingest()
@@ -1969,7 +1971,12 @@ def hook_session_end(data: dict, harness: str):
 
 
 def hook_precompact(data: dict, harness: str):
-    """Precompact hook: mine transcript synchronously, then allow compaction.
+    """Precompact hook: mine the transcript, then allow compaction.
+
+    On the direct route the mine runs synchronously before compaction. On the
+    daemon route it is queued as an immediate job and not waited on: the
+    transcript file stays on disk, so compaction loses nothing the queued
+    mine will not read.
 
     Respects the ``hooks.auto_save`` config toggle — when disabled, returns
     immediately without mining.
@@ -2026,4 +2033,5 @@ def run_hook(hook_name: str, harness: str):
         print(f"Unknown hook: {hook_name}", file=sys.stderr)
         sys.exit(1)
 
-    handler(data, harness)
+    with _hook_trigger(hook_name):
+        handler(data, harness)
