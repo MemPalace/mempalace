@@ -7,6 +7,26 @@ import math
 import re
 
 TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
+# Chinese and Japanese are written without spaces, so ``\w{2,}`` turns a whole
+# phrase into one token and a short query can never match it. Splitting those
+# runs into overlapping character bigrams gives BM25 something to match
+# without pulling in a segmentation dependency.
+CJK_RUN_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+
+
+def _cjk_tokens(run: str) -> list:
+    """Character bigrams of a CJK run, plus the run itself when long enough.
+
+    The whole run is kept because the sqlite FTS fallback discards tokens
+    shorter than three characters; without it a CJK query would leave that
+    path with no terms at all.
+    """
+    if len(run) == 1:
+        return [run]
+    tokens = [run[i : i + 2] for i in range(len(run) - 1)]
+    if len(run) > 2:
+        tokens.append(run)
+    return tokens
 
 
 def tokenize(text, stop_words: frozenset = frozenset()) -> list:
@@ -14,10 +34,23 @@ def tokenize(text, stop_words: frozenset = frozenset()) -> list:
 
     ``None`` and empty text give no tokens: Chroma can return ``None`` for a
     drawer without text. ``stop_words`` must already be lowercase.
+
+    Runs of CJK characters are split into bigrams (see ``_cjk_tokens``) so a
+    query shorter than the sentence it appears in can still match.
     """
     if not text:
         return []
-    tokens = TOKEN_RE.findall(text.lower())
+    tokens = []
+    for match in TOKEN_RE.finditer(text.lower()):
+        run = match.group()
+        pos = 0
+        for cjk in CJK_RUN_RE.finditer(run):
+            if cjk.start() > pos:
+                tokens.append(run[pos : cjk.start()])
+            tokens.extend(_cjk_tokens(cjk.group()))
+            pos = cjk.end()
+        if pos < len(run):
+            tokens.append(run[pos:])
     if stop_words:
         return [t for t in tokens if t not in stop_words]
     return tokens
