@@ -155,7 +155,7 @@ def _run_stdio_loop() -> None:
     # verdict serialize on _sqlite_integrity_refresh_lock via
     # _ensure_sqlite_integrity_status instead of re-running the probe.
     threading.Thread(
-        target=_startup_preflight,
+        target=_run_internal(_startup_preflight),
         name="mcp-startup-preflight",
         daemon=True,
     ).start()
@@ -313,7 +313,7 @@ def _run_http_loop() -> None:
                     _maybe_eager_warmup_embedder()
 
             threading.Thread(
-                target=_warmup_with_lock,
+                target=_run_internal(_warmup_with_lock),
                 name="mcp-http-eager-warmup",
                 daemon=True,
             ).start()

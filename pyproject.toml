@@ -263,6 +263,7 @@ markers = [
     "slow: tests that take more than 30 seconds",
     "stress: destructive scale tests (100K+ drawers)",
     "resolves_dns: the test drives llm_client's hostname resolution itself (conftest otherwise refuses DNS)",
+    "acl_integration: access-control tests that run a real Chroma palace on tmp dirs",
 ]
 filterwarnings = [
     # Many tests build raw-chromadb palaces directly (no recorded embedder

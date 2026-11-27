@@ -77,6 +77,39 @@ TOOL_CAPABILITIES = {
     "mempalace_patch_submit": ("write", "mutating peer_exempt lock_free integrity_allowed"),
 }
 
+
+# Access control (docs/acl.md): ``(kind, wing_arg)`` for every tool; a missing tool is denied.
+# ``scoped`` acts on the wing in ``wing_arg``, ``kg`` uses a per-group graph, ``deny``
+# answers like a tool that does not exist.
+def _classify(kind, names, wing_arg=None):
+    return {f"mempalace_{n}": (kind, wing_arg) for n in names.split()}
+
+
+ACL_POLICY = {
+    **_classify(
+        "deny",
+        "status get_taxonomy traverse find_tunnels graph_stats mesh_peers create_tunnel "
+        "list_tunnels delete_tunnel list_hallways delete_hallway follow_tunnels "
+        "check_duplicate checkpoint delete_drawer delete_drawers mine delete_by_source sync "
+        "update_drawer hook_settings memories_filed_away reconnect event_append task_create "
+        "event_list event_wait event_ack artifact_put artifact_get patch_submit",
+    ),
+    **_classify("kg", "kg_query kg_add kg_invalidate kg_supersede kg_timeline kg_stats"),
+    **_classify("scoped", "list_wings get_aaak_spec get_drawer get_drawers"),
+    **_classify(
+        "scoped", "list_rooms search add_drawer list_drawers diary_write diary_read", "wing"
+    ),
+}
+
+# Classified above, denied until their leak-free enforcement lands (see docs/acl.md).
+ACL_PENDING = frozenset(
+    f"mempalace_{n}"
+    for n in (
+        "list_wings list_rooms search get_drawer get_drawers list_drawers diary_read "
+        "kg_query kg_add kg_invalidate kg_supersede kg_timeline kg_stats"
+    ).split()
+)
+
 _KNOWN_FLAGS = {
     "mutating",
     "peer_exempt",

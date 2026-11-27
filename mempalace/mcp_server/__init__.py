@@ -91,11 +91,13 @@ from urllib.parse import urlparse  # noqa: E402
 from chromadb.errors import NotFoundError as _ChromaNotFoundError  # noqa: E402
 
 from .. import (  # noqa: E402
+    acl as _acl,
     paths,
     tool_capabilities as _tool_capabilities,
 )
 from .._env import env_bool, env_float, env_int, env_list, env_str  # noqa: E402
 from .._once import first_time  # noqa: E402
+from ..acl import run_internal as _run_internal  # noqa: E402
 from ..backends import BackendMismatchError, PalaceRef, detect_backend_for_path  # noqa: E402
 from ..backends.base import (  # noqa: E402
     DimensionMismatchError,
