@@ -104,7 +104,9 @@ def post(port, body, token=TOKEN, path="/mcp"):
 def run_flow(port, token=TOKEN):
     """name -> [status, body] for every request, plus a bad-token 401 and healthz."""
     out = {name: list(post(port, body, token=token)) for name, body in FLOW}
-    out["bad_token"] = list(post(port, FLOW[1][1], token="wrong"))
+    status, body = post(port, FLOW[1][1], token="wrong")
+    # http.server's error page markup differs between Python versions; keep only the stable line.
+    out["bad_token"] = [status, "Error code: 401" if "<p>Error code: 401</p>" in body else body]
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     try:
         conn.request("GET", "/healthz")

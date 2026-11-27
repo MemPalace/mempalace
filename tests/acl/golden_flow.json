@@ -17,7 +17,7 @@
  ],
  "bad_token": [
   401,
-  "<!DOCTYPE HTML>\n<html lang=\"en\">\n    <head>\n        <meta charset=\"utf-8\">\n        <title>Error response</title>\n    </head>\n    <body>\n        <h1>Error response</h1>\n        <p>Error code: 401</p>\n        <p>Message: Unauthorized.</p>\n        <p>Error code explanation: 401 - No permission -- see authorization schemes.</p>\n    </body>\n</html>\n"
+  "Error code: 401"
  ],
  "healthz": [
   200,
